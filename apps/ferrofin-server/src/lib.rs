@@ -462,7 +462,8 @@ async fn serve_once(
             // the API `ServerConfiguration` so `/System/Configuration` stays
             // byte-identical to Jellyfin. `None`/0 → the sampler's 15 s default.
             let interval = config.metrics_sample_interval.unwrap_or(0);
-            enable_metrics_endpoint(&mut router, &wired.state, &db, interval, metrics)
+            let buckets = config.metrics_scan_duration_buckets.as_deref();
+            enable_metrics_endpoint(&mut router, &wired.state, &db, interval, buckets, metrics)
         })
         .flatten();
 
@@ -517,6 +518,13 @@ async fn serve_once(
 }
 
 /// Stops lifetime-owned services and scheduled runs before closing their database.
+///
+/// The library scan runs on its own worker, detached from every task: it is
+/// stopped explicitly — the running scan cancelled, the queued ones dropped,
+/// new ones refused — and awaited (at most one item's writes), so a restart
+/// never cuts a scan mid-item with the pool closing under it, and a backup
+/// restore (applied by the next lifetime, after this one's teardown) never
+/// races a scan writing into the tree it replaces.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
@@ -524,6 +532,7 @@ async fn tear_down_host(
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
     cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    wired.state.library.shutdown_scans().await;
     stop_background_tasks(wired.background).await;
 }
 
@@ -741,6 +750,7 @@ fn enable_metrics_endpoint(
     state: &ferrofin_api::AppState,
     db: &ferrofin_db::Database,
     sample_interval_seconds: u32,
+    scan_duration_buckets: Option<&[f64]>,
     process: &mut Option<ProcessMetrics>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if process.is_none() {
@@ -752,6 +762,7 @@ fn enable_metrics_endpoint(
         match ferrofin_metrics::init(route_labels, tokio::runtime::Handle::current()) {
             Ok(handle) => {
                 let gauges = metrics_wiring::register_gauges(&handle);
+                metrics_wiring::install_subsystem_instruments(scan_duration_buckets);
                 *process = Some(ProcessMetrics { handle, gauges });
                 tracing::info!("prometheus metrics enabled at /metrics");
             }

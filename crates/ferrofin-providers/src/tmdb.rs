@@ -10,6 +10,8 @@
 //! then fetches full metadata (overview, tagline, genres, studios, rating,
 //! certification, premiere date, and cast + key crew) alongside the artwork.
 
+use crate::rate_limit::CountedBody as _;
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
@@ -231,6 +233,20 @@ pub struct TmdbDetails {
     /// The title's original language, TMDB's ISO 639-1 `original_language`
     /// (`ja`, `en`, …) — what `BaseItems.OriginalLanguage` stores.
     pub original_language: Option<String>,
+    /// Keyword tags attached to this movie or series.
+    pub tags: Vec<String>,
+    /// Movie production-country names.
+    pub production_locations: Vec<String>,
+    /// Series home page.
+    pub home_page_url: Option<String>,
+    /// Series last air date.
+    pub end_date: Option<String>,
+    /// The movie collection's TMDB id.
+    pub collection_id: Option<i64>,
+    /// The movie collection's name.
+    pub collection_name: Option<String>,
+    /// The series' TVRage id.
+    pub tvrage_id: Option<String>,
     /// Plot synopsis.
     pub overview: Option<String>,
     /// Marketing tagline.
@@ -281,8 +297,11 @@ pub struct TmdbPerson {
     pub person_type: String,
     /// The credited role (character for cast, job for crew), when present.
     pub role: Option<String>,
-    /// Display order (cast billing order; crew sort last).
-    pub sort_order: i32,
+    /// The credit's `SortOrder`: the cast member's billing `order`
+    /// (`SortOrder = actor.Order`, `TmdbMovieProvider.cs:299`,
+    /// `TmdbEpisodeProvider.cs:233,264`); `None` for crew, which upstream
+    /// gives none.
+    pub sort_order: Option<i32>,
     /// The person's profile-photo URL (headshot), when TMDB has one.
     pub profile_url: Option<String>,
 }
@@ -352,6 +371,12 @@ fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
 
 #[derive(Debug, Deserialize)]
 struct DetailsResponse {
+    homepage: Option<String>,
+    last_air_date: Option<String>,
+    episode_run_time: Option<Vec<i32>>,
+    production_countries: Option<Vec<NamedEntry>>,
+    keywords: Option<KeywordsResponse>,
+    belongs_to_collection: Option<CollectionRef>,
     /// Movie title.
     #[serde(default)]
     title: Option<String>,
@@ -407,15 +432,106 @@ struct DetailsResponse {
     external_ids: Option<ExternalIds>,
 }
 
+/// Episode fields only available on its detail endpoint.
+#[derive(Debug)]
+pub struct EpisodeExtras {
+    /// IMDb, TVDB and TVRage identities for this episode.
+    pub provider_ids: Vec<(String, String)>,
+    /// Episode trailers.
+    pub trailers: Vec<TmdbTrailer>,
+    /// Credits, absent when the appended credits payload was unavailable.
+    pub people: Option<Vec<TmdbPerson>>,
+}
+
+fn episode_people_from(
+    credits: CreditsResponse,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> Vec<TmdbPerson> {
+    let mut people = Vec::new();
+    // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
+    // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
+    // `.Take(config.MaxCastMembers)` loops, `:212-267`), so the cap is
+    // per-list here too.
+    let hide_cast = cfg.hide_missing_cast_members;
+    let max_cast = cfg.max_cast_members;
+    let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
+        for c in billed_cast(entries, hide_cast, max_cast) {
+            if c.name.is_empty() {
+                continue;
+            }
+            people.push(TmdbPerson {
+                tmdb_id: c.id,
+                name: c.name,
+                person_type: person_type.to_owned(),
+                role: c.character.filter(|r| !r.is_empty()),
+                // `SortOrder = actor.Order` / `guest.Order`
+                // (`TmdbEpisodeProvider.cs:233,264`).
+                sort_order: Some(c.order),
+                profile_url: c
+                    .profile_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+            });
+        }
+    };
+    push_cast(credits.cast, "Actor");
+    push_cast(credits.guest_stars, "GuestStar");
+    for c in credits
+        .crew
+        .into_iter()
+        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| {
+            !cfg.hide_missing_crew_members
+                || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+        })
+        .take(cfg.max_crew_members)
+    {
+        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+            continue;
+        };
+        if c.name.is_empty() {
+            continue;
+        }
+        people.push(TmdbPerson {
+            tmdb_id: c.id,
+            name: c.name,
+            person_type: person_type.to_owned(),
+            role: c.job.filter(|r| !r.is_empty()),
+            sort_order: None,
+            profile_url: c
+                .profile_path
+                .filter(|p| !p.is_empty())
+                .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+        });
+    }
+    people
+}
+
 /// TMDB `external_ids` — the IMDb id (RT lookup key for series) and the TVDB
 /// id, which `TmdbSeriesProvider.MapTvShowToRemoteSearchResult` stamps onto an
 /// Identify result alongside it.
+// Field names mirror TMDB's external_ids payload.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Default, Deserialize)]
 struct ExternalIds {
+    tvrage_id: Option<i64>,
     #[serde(default)]
     imdb_id: Option<String>,
     #[serde(default)]
     tvdb_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionRef {
+    id: Option<i64>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeywordsResponse {
+    // Movies use `keywords`; series use `results`.
+    #[serde(default, alias = "results")]
+    keywords: Vec<NamedEntry>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -464,6 +580,22 @@ struct CastEntry {
     character: Option<String>,
     #[serde(default)]
     profile_path: Option<String>,
+    /// TMDB's billing order (TMDbLib's `Cast.Order`, an `int`: 0 when the
+    /// payload leaves it out). Upstream orders the cast by it and stores it
+    /// as the credit's `SortOrder`.
+    #[serde(default)]
+    order: i32,
+}
+
+/// `castQuery.OrderBy(a => a.Order)` after the settings page's
+/// `HideMissingCastMembers` filter, then `.Take(MaxCastMembers)`
+/// (`TmdbMovieProvider.cs:280-286`, `TmdbEpisodeProvider.cs:217-219,248-250`):
+/// the entries a cast list keeps, in billing order (a stable sort, as LINQ's).
+fn billed_cast(mut entries: Vec<CastEntry>, hide_missing: bool, max: usize) -> Vec<CastEntry> {
+    entries.retain(|c| !hide_missing || c.profile_path.as_deref().is_some_and(|p| !p.is_empty()));
+    entries.sort_by_key(|c| c.order);
+    entries.truncate(max);
+    entries
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,24 +656,15 @@ fn credits_to_people(
 ) -> Vec<TmdbPerson> {
     let mut people = Vec::new();
     if let Some(credits) = credits {
-        // Cast: keep TMDB's billing order, then apply the TMDb settings
-        // page's `HideMissingCastMembers` filter and `MaxCastMembers` cap —
-        // `castQuery.Where(a => !IsNullOrEmpty(a.ProfilePath))` then
-        // `.OrderBy(a => a.Order).Take(config.MaxCastMembers)`
-        // (`TmdbMovieProvider.cs:258-268`, `TmdbSeriesProvider.cs:329-338`).
-        // The index is taken BEFORE the filter so a hidden actor does not
-        // renumber the ones after it: upstream keeps `actor.Order` as the
-        // SortOrder regardless of what the filter dropped.
-        for (order, c) in credits
-            .cast
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                !cfg.hide_missing_cast_members
-                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-            })
-            .take(cfg.max_cast_members)
-        {
+        // Cast: the TMDb settings page's `HideMissingCastMembers` filter,
+        // TMDB's billing order and the `MaxCastMembers` cap
+        // (`TmdbMovieProvider.cs:280-286`); each credit keeps its own
+        // `order` as its `SortOrder` (`SortOrder = actor.Order`, `:299`).
+        for c in billed_cast(
+            credits.cast,
+            cfg.hide_missing_cast_members,
+            cfg.max_cast_members,
+        ) {
             if c.name.is_empty() {
                 continue;
             }
@@ -550,7 +673,7 @@ fn credits_to_people(
                 name: c.name,
                 person_type: "Actor".to_owned(),
                 role: c.character.filter(|r| !r.is_empty()),
-                sort_order: i32::try_from(order).unwrap_or(i32::MAX),
+                sort_order: Some(c.order),
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
@@ -582,7 +705,7 @@ fn credits_to_people(
                 name: c.name,
                 person_type: person_type.to_owned(),
                 role: c.job.filter(|r| !r.is_empty()),
-                sort_order: i32::MAX,
+                sort_order: None,
                 profile_url: c
                     .profile_path
                     .filter(|p| !p.is_empty())
@@ -851,6 +974,7 @@ pub struct TmdbCollection {
 #[derive(Debug)]
 pub struct TmdbClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     /// The key to use when the TMDb settings page names none: Jellyfin's
     /// built-in project key, or one the operator passed to
     /// [`with_api_key`](TmdbClient::with_api_key).
@@ -860,6 +984,9 @@ pub struct TmdbClient {
     /// The TMDb plugin's dashboard settings (`TmdbApiKey`, `IncludeAdult`, the
     /// cast/crew caps, the five image sizes).
     plugin: crate::plugin_config::ConfigSource,
+    /// Image root replacing TMDb's CDN, for tests
+    /// ([`with_image_root`](TmdbClient::with_image_root)).
+    image_root: Option<String>,
 }
 
 impl Default for TmdbClient {
@@ -874,9 +1001,11 @@ impl TmdbClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(DEFAULT_API_KEY),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
+            image_root: None,
         }
     }
 
@@ -885,6 +1014,7 @@ impl TmdbClient {
     pub fn with_api_key(key: String) -> Self {
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tmdb"),
             api_key: SecretString::from(if key.is_empty() {
                 DEFAULT_API_KEY.to_owned()
             } else {
@@ -892,6 +1022,7 @@ impl TmdbClient {
             }),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
+            image_root: None,
         }
     }
 
@@ -910,7 +1041,19 @@ impl TmdbClient {
     /// saving the settings page changes the next lookup, with no restart. The
     /// read is a few hundred bytes off disk in front of a TMDB round trip.
     pub(crate) async fn settings(&self) -> crate::plugin_config::TmdbConfig {
-        self.plugin.load(crate::builtin_plugins::TMDB.id).await
+        let mut cfg: crate::plugin_config::TmdbConfig =
+            self.plugin.load(crate::builtin_plugins::TMDB.id).await;
+        cfg.image_root.clone_from(&self.image_root);
+        cfg
+    }
+
+    /// Points the artwork URLs at a different image root than TMDb's CDN
+    /// (`https://image.tmdb.org/t/p`) — a mock server in tests; the size
+    /// segment and the image path follow it.
+    #[must_use]
+    pub fn with_image_root(mut self, root: &str) -> Self {
+        self.image_root = Some(root.trim_end_matches('/').to_owned());
+        self
     }
 
     /// Points the client at a different API root (a mock server in tests).
@@ -960,19 +1103,19 @@ impl TmdbClient {
         }
 
         tracing::debug!(provider = "tmdb", query = name, ?year, "tmdb image search");
-        let resp = match req.send().await {
+        let resp = match req.send_limited(&self.limiter).await {
             Ok(resp) => resp,
-            // `without_url()` strips the query string — the URL carries the API key.
+            // The limiter strips URLs from transport errors to protect API keys.
             Err(e) => {
-                tracing::warn!(provider = "tmdb", error = %e.without_url(), "tmdb request failed");
+                tracing::debug!(provider = "tmdb", error = %e, "tmdb request failed");
                 return Vec::new();
             }
         };
         if !resp.status().is_success() {
-            tracing::warn!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
+            tracing::debug!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<SearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SearchResponse>().await else {
             tracing::warn!(provider = "tmdb", "tmdb response parse failed");
             return Vec::new();
         };
@@ -980,6 +1123,52 @@ impl TmdbClient {
             return Vec::new();
         };
 
+        let mut images = Vec::new();
+        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Primary,
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
+            });
+        }
+        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Backdrop,
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
+            });
+        }
+        images
+    }
+
+    /// The poster and backdrop TMDB picks for the title `tmdb_id` names —
+    /// `GET /movie/{id}` or `/tv/{id}`, their `poster_path`/`backdrop_path` —
+    /// in the shape [`images_for`](Self::images_for) returns for a name
+    /// search. What the scan's image pass fetches for an item whose TMDB id
+    /// is known: upstream's `TmdbMovieImageProvider`/`TmdbSeriesImageProvider`
+    /// look an item's artwork up by its id, never by its name, so an item
+    /// identified as another title gets that title's artwork. Empty on a miss
+    /// or any failure.
+    pub async fn images_by_id(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<RemoteImage> {
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
+        let path = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Series => "tv",
+        };
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/{path}/{tmdb_id}", self.base_url))
+            .query(&[("api_key", key)])
+            .send_limited(&self.limiter)
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(hit) = resp.counted_json::<SearchHit>().await else {
+            return Vec::new();
+        };
         let mut images = Vec::new();
         if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
@@ -1019,12 +1208,12 @@ impl TmdbClient {
         if let Some(y) = year {
             req = req.query(&[("first_air_date_year", y.to_string())]);
         }
-        let resp = req.send().await.ok()?;
+        let resp = req.send_limited(&self.limiter).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
         let hit = resp
-            .json::<SearchResponse>()
+            .counted_json::<SearchResponse>()
             .await
             .ok()?
             .results
@@ -1064,13 +1253,13 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let parsed = resp.json::<SeasonResponse>().await.ok()?;
+        let parsed = resp.counted_json::<SeasonResponse>().await.ok()?;
         Some(season_details_from(parsed, &cfg))
     }
 
@@ -1095,13 +1284,16 @@ impl TmdbClient {
             .http
             .get(format!("{}/search/collection", self.base_url))
             .query(&[("api_key", key), ("query", name)]);
-        let Ok(resp) = with_language(req, language).send().await else {
+        let Ok(resp) = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+        else {
             return Vec::new();
         };
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<CollectionSearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<CollectionSearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1131,11 +1323,14 @@ impl TmdbClient {
             .http
             .get(format!("{}/collection/{tmdb_id}", self.base_url))
             .query(&[("api_key", key), ("append_to_response", "images")]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let parsed: CollectionResponse = resp.json().await.ok()?;
+        let parsed: CollectionResponse = resp.counted_json().await.ok()?;
         // The single `poster_path`/`backdrop_path` come first (they are TMDB's
         // own pick), then the rest of the `images` lists — same order the C#
         // `ConvertPostersToRemoteImageInfo`/`ConvertBackdrops…` pair yields.
@@ -1195,13 +1390,13 @@ impl TmdbClient {
             req = req.query(&[(year_param, y.to_string())]);
         }
         req = with_language(req, language);
-        let Ok(resp) = req.send().await else {
+        let Ok(resp) = req.send_limited(&self.limiter).await else {
             return Vec::new();
         };
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<SearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1232,7 +1427,7 @@ impl TmdbClient {
             .http
             .get(format!("{}/{path}/{tmdb_id}/similar", self.base_url))
             .query(&[("api_key", key), ("page", &page.max(1).to_string())])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return (Vec::new(), 0);
@@ -1240,7 +1435,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return (Vec::new(), 0);
         }
-        let Ok(parsed) = resp.json::<SimilarResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SimilarResponse>().await else {
             return (Vec::new(), 0);
         };
         (
@@ -1267,7 +1462,7 @@ impl TmdbClient {
             .http
             .get(format!("{}/{path}/{tmdb_id}/images", self.base_url))
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1275,7 +1470,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
         // Borrowed, not moved: the closure is called once per image family and
@@ -1354,7 +1549,7 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", cfg.api_key(self.api_key.expose_secret()))])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1362,7 +1557,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1395,10 +1590,11 @@ impl TmdbClient {
     /// its `guest_stars` (typed `GuestStar`), then the wanted `crew` — which is
     /// what fills an episode page's Cast & Crew upstream.
     ///
-    /// `None` on any network/HTTP/parse failure, distinct from `Some(vec![])`
-    /// for an episode TMDB genuinely credits nobody on. The caller persists
-    /// credits by replacement, so conflating the two lets one 429 during a
-    /// large scan delete an episode's stored cast.
+    /// `None` when TMDB did not answer (a miss, or a network/HTTP/parse
+    /// failure, which the request's failure count records); `Some(vec![])`
+    /// for an episode TMDB answers for and credits nobody on. Either way the
+    /// scan carries no credits for it — `TmdbEpisodeProvider` only
+    /// `AddPerson`s — so neither clears a stored cast.
     pub async fn episode_credits(
         &self,
         series_tmdb_id: i64,
@@ -1418,76 +1614,72 @@ impl TmdbClient {
             .http
             .get(url)
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let credits = resp.json::<CreditsResponse>().await.ok()?;
-        let mut people = Vec::new();
-        // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
-        // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
-        // `.Take(config.MaxCastMembers)` loops, `:212-267`), so the cap is
-        // per-list here too.
-        let hide_cast = cfg.hide_missing_cast_members;
-        let max_cast = cfg.max_cast_members;
-        let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
-            for (order, c) in entries
-                .into_iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    !hide_cast || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-                })
-                .take(max_cast)
-            {
-                if c.name.is_empty() {
-                    continue;
-                }
-                people.push(TmdbPerson {
-                    tmdb_id: c.id,
-                    name: c.name,
-                    person_type: person_type.to_owned(),
-                    role: c.character.filter(|r| !r.is_empty()),
-                    sort_order: i32::try_from(order).unwrap_or(i32::MAX),
-                    profile_url: c
-                        .profile_path
-                        .filter(|p| !p.is_empty())
-                        .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
-                });
-            }
-        };
-        push_cast(credits.cast, "Actor");
-        push_cast(credits.guest_stars, "GuestStar");
-        for c in credits
-            .crew
-            .into_iter()
-            .filter(|c| crew_person_type(c.job.as_deref()).is_some())
-            .filter(|c| {
-                !cfg.hide_missing_crew_members
-                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-            })
-            .take(cfg.max_crew_members)
-        {
-            let Some(person_type) = crew_person_type(c.job.as_deref()) else {
-                continue;
-            };
-            if c.name.is_empty() {
-                continue;
-            }
-            people.push(TmdbPerson {
-                tmdb_id: c.id,
-                name: c.name,
-                person_type: person_type.to_owned(),
-                role: c.job.filter(|r| !r.is_empty()),
-                sort_order: i32::MAX,
-                profile_url: c
-                    .profile_path
-                    .filter(|p| !p.is_empty())
-                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
-            });
+        let credits = resp.counted_json::<CreditsResponse>().await.ok()?;
+        Some(episode_people_from(credits, &cfg))
+    }
+
+    /// Retrieves episode external ids, trailers and credits in one request.
+    /// The season response supplies shared text/artwork; this replaces the
+    /// separate credits request while retaining its failure semantics.
+    pub async fn episode_extras(
+        &self,
+        series: i64,
+        season: i32,
+        episode: i32,
+    ) -> Option<EpisodeExtras> {
+        #[derive(Deserialize)]
+        struct Response {
+            external_ids: Option<ExternalIds>,
+            videos: Option<VideosResults>,
+            credits: Option<CreditsResponse>,
         }
-        Some(people)
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
+        let resp = self
+            .http
+            .get(format!(
+                "{}/tv/{series}/season/{season}/episode/{episode}",
+                self.base_url
+            ))
+            .query(&[
+                ("api_key", key),
+                ("append_to_response", "external_ids,videos,credits"),
+            ])
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let response: Response = resp.counted_json().await.ok()?;
+        let ids = response.external_ids.unwrap_or_default();
+        let mut provider_ids = Vec::new();
+        for (key, value) in [
+            ("Imdb", non_empty(ids.imdb_id)),
+            (
+                "Tvdb",
+                ids.tvdb_id.filter(|id| *id > 0).map(|id| id.to_string()),
+            ),
+            (
+                "TvRage",
+                ids.tvrage_id.filter(|id| *id > 0).map(|id| id.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                provider_ids.push((key.to_owned(), value));
+            }
+        }
+        Some(EpisodeExtras {
+            provider_ids,
+            trailers: youtube_trailers(response.videos),
+            people: response.credits.map(|c| episode_people_from(c, &cfg)),
+        })
     }
 
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
@@ -1515,11 +1707,14 @@ impl TmdbClient {
             .http
             .get(format!("{}/find/{external_id}", self.base_url))
             .query(&[("api_key", key), ("external_source", source)]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let found = resp.json::<FindResponse>().await.ok()?;
+        let found = resp.counted_json::<FindResponse>().await.ok()?;
         let hits = match kind {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
@@ -1569,18 +1764,21 @@ impl TmdbClient {
         let (path, append) = match kind {
             // The movie Identify branch needs `external_ids` too — `/movie/{id}`
             // carries `imdb_id` directly, so only the series arm asks for it.
-            TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
-            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids"),
+            TmdbKind::Movie => ("movie", "credits,release_dates,videos,keywords"),
+            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids,keywords"),
         };
         let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
             .query(&[("api_key", key), ("append_to_response", append)]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let d = resp.json::<DetailsResponse>().await.ok()?;
+        let d = resp.counted_json::<DetailsResponse>().await.ok()?;
 
         let premiere = d
             .release_date
@@ -1602,7 +1800,36 @@ impl TmdbClient {
                 .filter(|s| !s.is_empty())
                 .or_else(|| original_title.clone()),
             original_title,
-            original_language: d.original_language.filter(|s| !s.is_empty()),
+            original_language: non_empty(d.original_language),
+            tags: d
+                .keywords
+                .into_iter()
+                .flat_map(|k| k.keywords)
+                .filter_map(|k| non_empty(k.name))
+                .collect(),
+            production_locations: d
+                .production_countries
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|c| non_empty(c.name))
+                .collect(),
+            home_page_url: (kind == TmdbKind::Series)
+                .then(|| non_empty(d.homepage))
+                .flatten(),
+            end_date: (kind == TmdbKind::Series)
+                .then(|| non_empty(d.last_air_date))
+                .flatten(),
+            collection_id: d
+                .belongs_to_collection
+                .as_ref()
+                .and_then(|c| c.id)
+                .filter(|id| *id > 0),
+            collection_name: d.belongs_to_collection.and_then(|c| non_empty(c.name)),
+            tvrage_id: external_ids
+                .as_ref()
+                .and_then(|e| e.tvrage_id)
+                .filter(|id| *id > 0)
+                .map(|id| id.to_string()),
             overview: d.overview.filter(|s| !s.is_empty()),
             tagline: d.tagline.filter(|s| !s.is_empty()),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
@@ -1611,7 +1838,11 @@ impl TmdbClient {
             official_rating: us_certification(kind, d.release_dates, d.content_ratings),
             production_year: year_from(premiere.as_deref()),
             premiere_date: premiere,
-            runtime_minutes: d.runtime.filter(|m| *m > 0),
+            runtime_minutes: match kind {
+                TmdbKind::Movie => d.runtime,
+                TmdbKind::Series => d.episode_run_time.and_then(|r| r.into_iter().next()),
+            }
+            .filter(|m| *m > 0),
             people,
             trailers,
             imdb_id: d
@@ -1651,7 +1882,7 @@ impl TmdbClient {
             // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
             // the API's own default is `false`, which is also the plugin's.
             .query(&[("include_adult", cfg.include_adult.to_string())])
-            .send()
+            .send_limited(&self.limiter)
             .await
         else {
             return Vec::new();
@@ -1659,7 +1890,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<PersonSearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<PersonSearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1697,11 +1928,14 @@ impl TmdbClient {
                 ("api_key", key),
                 ("append_to_response", "images,external_ids"),
             ]);
-        let resp = with_language(req, language).send().await.ok()?;
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let p = resp.json::<PersonLookupResponse>().await.ok()?;
+        let p = resp.counted_json::<PersonLookupResponse>().await.ok()?;
         Some(TmdbPersonHit {
             tmdb_id: p.id.unwrap_or(tmdb_id),
             name: non_empty(p.name),
@@ -1728,13 +1962,13 @@ impl TmdbClient {
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
             .query(&[("api_key", key)])
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        let p = resp.json::<PersonDetailsResponse>().await.ok()?;
+        let p = resp.counted_json::<PersonDetailsResponse>().await.ok()?;
         let details = TmdbPersonDetails {
             biography: p.biography.filter(|s| !s.is_empty()),
             birthday: p.birthday.filter(|s| !s.is_empty()),
@@ -1753,11 +1987,11 @@ impl TmdbClient {
 
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = self.http.get(url).send().await.ok()?;
+        let resp = crate::image_download::send(&self.http, url).await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        resp.counted_bytes().await.ok()
     }
 }
 
@@ -1855,6 +2089,74 @@ fn year_from(date: Option<&str>) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `200` whose body does not decode is a provider failure, not a
+    /// miss: the scan must not stamp a refresh that only looked empty.
+    #[tokio::test]
+    async fn a_malformed_success_body_counts_as_a_failure() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/season/1", r#"{"episodes": "not a list"}"#.to_owned()),
+            ("/season/2", r#"{"episodes": []}"#.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (details, failures) =
+            crate::rate_limit::count_request_failures(client.season_details(1399, 1)).await;
+        assert!(details.is_none());
+        assert_eq!(failures, 1);
+        let (details, failures) =
+            crate::rate_limit::count_request_failures(client.season_details(1399, 2)).await;
+        assert!(details.is_some());
+        assert_eq!(failures, 0);
+    }
+
+    #[tokio::test]
+    async fn maps_collection_keywords_countries_and_series_fields() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
+            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4}}"#.into()),
+            ("/episode/1", r#"{"external_ids":{"imdb_id":"tt123","tvdb_id":5,"tvrage_id":6},"videos":{"results":[{"site":"YouTube","type":"Trailer","key":"abc","name":"Trailer"}]},"credits":{"cast":[{"id":7,"name":"Actor"}]}}"#.into()),
+        ]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        assert_eq!(movie.collection_id, Some(7));
+        assert_eq!(movie.collection_name.as_deref(), Some("Collection"));
+        assert_eq!(movie.tags, ["samurai"]);
+        assert_eq!(movie.production_locations, ["Japan"]);
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        assert_eq!(series.runtime_minutes, Some(42));
+        assert_eq!(series.end_date.as_deref(), Some("2020-01-02"));
+        assert_eq!(
+            series.home_page_url.as_deref(),
+            Some("https://example.org/show")
+        );
+        assert_eq!(series.tags, ["drama"]);
+        assert_eq!(series.tvdb_id.as_deref(), Some("3"));
+        assert_eq!(series.tvrage_id.as_deref(), Some("4"));
+        let extras = client.episode_extras(2, 1, 1).await.unwrap();
+        assert_eq!(
+            extras.provider_ids,
+            [
+                ("Imdb".into(), "tt123".into()),
+                ("Tvdb".into(), "5".into()),
+                ("TvRage".into(), "6".into())
+            ]
+        );
+        assert_eq!(
+            extras.trailers[0].url,
+            "https://www.youtube.com/watch?v=abc"
+        );
+        assert_eq!(extras.people.unwrap()[0].name, "Actor");
+        // A successful but incomplete response must not clear stored credits.
+        assert!(
+            client
+                .episode_extras(2, 1, 9)
+                .await
+                .unwrap()
+                .people
+                .is_none()
+        );
+    }
 
     #[test]
     fn year_parsed_from_date_prefix() {
@@ -2090,17 +2392,53 @@ mod tests {
         assert_eq!(details.original_language, None);
     }
 
+    /// `credits.GuestStars.OrderBy(a => a.Order)` with `SortOrder =
+    /// guest.Order` (`TmdbEpisodeProvider.cs:248-264`): the guest stars come
+    /// back in billing order whatever the payload's order, each keeping
+    /// TMDB's own `order` — not its position — as its sort order.
+    #[tokio::test]
+    async fn guest_stars_are_billed_by_their_tmdb_order() {
+        use crate::mock_http::MockServer;
+        let body = r#"{
+          "cast": [],
+          "guest_stars": [
+            {"id": 11, "name": "Billed Third", "order": 530},
+            {"id": 12, "name": "Billed First", "order": 510},
+            {"id": 13, "name": "Billed Second", "order": 520}
+          ],
+          "crew": []
+        }"#;
+        let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let people = client
+            .episode_credits(1399, 1, 1)
+            .await
+            .expect("credits fetched");
+        let got: Vec<(&str, Option<i32>)> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.sort_order))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Billed First", Some(510)),
+                ("Billed Second", Some(520)),
+                ("Billed Third", Some(530)),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn episode_credits_map_cast_guests_and_crew() {
         use crate::mock_http::MockServer;
 
         let body = r#"{
           "cast": [
-            {"id": 1, "name": "Regular One", "character": "Hero", "profile_path": "/r1.jpg"},
-            {"id": 2, "name": "Regular Two", "character": "Sidekick"}
+            {"id": 1, "name": "Regular One", "character": "Hero", "profile_path": "/r1.jpg", "order": 0},
+            {"id": 2, "name": "Regular Two", "character": "Sidekick", "order": 1}
           ],
           "guest_stars": [
-            {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg"}
+            {"id": 3, "name": "Guest Star", "character": "Villain", "profile_path": "/g.jpg", "order": 520}
           ],
           "crew": [
             {"id": 4, "name": "Ep Director", "job": "Director"},
@@ -2131,9 +2469,16 @@ mod tests {
             ],
             "unwanted crew jobs and blank names are dropped"
         );
-        // Billing order is preserved for cast, and headshots are absolute URLs.
-        assert_eq!(people[0].sort_order, 0);
-        assert_eq!(people[1].sort_order, 1);
+        // Each credit's own billing `order` is its sort order; headshots
+        // are absolute URLs.
+        assert_eq!(people[0].sort_order, Some(0));
+        assert_eq!(people[1].sort_order, Some(1));
+        assert_eq!(
+            people[2].sort_order,
+            Some(520),
+            "the guest star's own order"
+        );
+        assert_eq!(people[3].sort_order, None, "crew has none");
         assert!(
             people[0]
                 .profile_url

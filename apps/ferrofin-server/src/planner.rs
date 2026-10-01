@@ -1896,9 +1896,6 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| ServiceError::not_found("live stream is not open"))
         }
-        async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-            Ok(())
-        }
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }

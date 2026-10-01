@@ -1042,7 +1042,7 @@ impl FerrofinLiveTvManager {
         // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
         for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
@@ -1193,7 +1193,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<HashMap<String, Option<String>>, ServiceError> {
         let mut existing: HashMap<String, Option<String>> = HashMap::new();
         for chunk in channel_ids.chunks(SQLITE_BIND_LIMIT) {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"SELECT "Id","DateCreated" FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#,
             );
             let mut sep = qb.separated(",");
@@ -1205,7 +1205,7 @@ impl FerrofinLiveTvManager {
                 existing.insert(row.get("Id"), row.get("DateCreated"));
             }
 
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new(r#"DELETE FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#);
             let mut sep = qb.separated(",");
             for id in chunk {
@@ -1405,7 +1405,7 @@ impl FerrofinLiveTvManager {
         let existing_dates = Self::clean_programs(&mut tx, touched).await?;
 
         for chunk in rows.chunks(SQLITE_BIND_LIMIT / 27) {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
@@ -1970,7 +1970,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // paging actually truncated the result.
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
-            let mut cb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
+            let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
             push_program_filters(&mut cb, query, now);
             let count: i64 = cb
                 .build_query_scalar()
@@ -3127,7 +3127,7 @@ impl FerrofinLiveTvManager {
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
         let start_index = query.start_index.unwrap_or(0);
-        let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
         push_program_filters(&mut qb, query, now);
         push_program_order(&mut qb, &query.order_by);
         push_program_paging(&mut qb, query.limit, start_index);
@@ -4362,7 +4362,10 @@ impl FerrofinLiveTvManager {
     }
 
     /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
-    async fn json_list<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, ServiceError> {
+    async fn json_list<T: DeserializeOwned>(
+        &self,
+        sql: &'static str,
+    ) -> Result<Vec<T>, ServiceError> {
         let rows = sqlx::query(sql)
             .fetch_all(self.db.pool())
             .await
@@ -4376,7 +4379,7 @@ impl FerrofinLiveTvManager {
     /// Reads and deserializes a single JSON `Data` column by id.
     async fn json_get<T: DeserializeOwned>(
         &self,
-        sql: &str,
+        sql: &'static str,
         id: &str,
     ) -> Result<Option<T>, ServiceError> {
         let data: Option<String> = sqlx::query_scalar(sql)
@@ -4388,7 +4391,7 @@ impl FerrofinLiveTvManager {
     }
 
     /// Runs a `DELETE … WHERE "Id" = ?1` statement.
-    async fn delete_by_id(&self, sql: &str, id: &str) -> Result<(), ServiceError> {
+    async fn delete_by_id(&self, sql: &'static str, id: &str) -> Result<(), ServiceError> {
         sqlx::query(sql)
             .bind(id)
             .execute(self.db.writer())
@@ -4400,7 +4403,7 @@ impl FerrofinLiveTvManager {
 
 /// Emits `WHERE` for the first predicate of a query and `AND` for each one
 /// after it.
-fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
+fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
     qb.push(if *first { " WHERE " } else { " AND " });
     *first = false;
 }
@@ -4420,7 +4423,7 @@ fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
 /// `get_programs` answers it with the empty result upstream returns when the
 /// series-timer scope cannot be built.
 fn push_program_filters(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
 ) {
@@ -4558,7 +4561,7 @@ fn program_sort_column(sort: ItemSortBy) -> Option<&'static str> {
 /// order C# `LiveTvManager.GetPrograms` relies on ("order by start date to take
 /// advantage of a specialized index"). The id tiebreaker makes paging stable
 /// across requests.
-fn push_program_order(qb: &mut QueryBuilder<'_, Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
+fn push_program_order(qb: &mut QueryBuilder<Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
     let mut wrote = false;
     for (column, order) in order_by {
         let Some(sql) = program_sort_column(*column) else {
@@ -4580,7 +4583,7 @@ fn push_program_order(qb: &mut QueryBuilder<'_, Sqlite>, order_by: &[(ItemSortBy
 }
 
 /// Pushes `LIMIT`/`OFFSET` for the requested page.
-fn push_program_paging(qb: &mut QueryBuilder<'_, Sqlite>, limit: Option<i32>, start_index: i32) {
+fn push_program_paging(qb: &mut QueryBuilder<Sqlite>, limit: Option<i32>, start_index: i32) {
     if let Some(limit) = limit {
         qb.push(" LIMIT ").push_bind(i64::from(limit.max(0)));
     } else if start_index > 0 {
@@ -7292,9 +7295,11 @@ mod tests {
             released.is_some(),
             "the capture must be released, not orphaned"
         );
-        // The recording settled rather than being stuck mid-flight.
-        let in_progress = mgr
-            .get_recordings_matching(
+        // `finish_capture` releases the active entry before `settle_timer`
+        // finishes the async database writes. Wait for that second phase too:
+        // seeing no active path does not yet mean the recording row has settled.
+        let settled = wait_for(|| async {
+            mgr.get_recordings_matching(
                 &ferrofin_model::live_tv::RecordingQuery {
                     is_in_progress: Some(true),
                     ..ferrofin_model::live_tv::RecordingQuery::default()
@@ -7303,9 +7308,14 @@ mod tests {
                 &DtoOptions::default(),
             )
             .await
-            .expect("recordings");
+            .expect("recordings")
+            .items
+            .is_empty()
+            .then_some(())
+        })
+        .await;
         assert!(
-            in_progress.items.is_empty(),
+            settled.is_some(),
             "nothing may still report itself as recording"
         );
         let _ = tokio::fs::remove_file(path).await;

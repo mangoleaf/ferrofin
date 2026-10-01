@@ -14,7 +14,7 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices,
+    FakeAdminUsers, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices,
     FakeDisplayPreferences, FakeDto, FakeLibrary, FakeLyrics, FakeMediaSegments, FakeMediaSources,
     FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions,
     FakeSimilarItems, FakeSubtitles, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData,
@@ -33,6 +33,7 @@ use ferrofin_traits::activity::{ActivityLogQuery, ActivityManager};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
+use ferrofin_traits::library::UserManager;
 use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
@@ -382,10 +383,21 @@ fn full_state() -> AppState {
 /// Builds the same [`AppState`] with the given application paths, so a test can
 /// point the named-configuration store at a real directory.
 fn state_with_paths(paths: StubPaths) -> AppState {
+    state_with(paths, Arc::new(FakeUsers))
+}
+
+/// [`state_with_paths`] whose caller is an administrator, as the elevated
+/// `POST /System/Configuration/{key}` requires.
+fn admin_state_with_paths(paths: StubPaths) -> AppState {
+    state_with(paths, Arc::new(FakeAdminUsers))
+}
+
+/// [`state_with_paths`] with the caller's role decided by `users`.
+fn state_with(paths: StubPaths, users: Arc<dyn UserManager>) -> AppState {
     let auth = Arc::new(OkAuth);
     AppState::new(
         Arc::new(FakeLibrary),
-        Arc::new(FakeUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -445,6 +457,82 @@ async fn get(app: AppState, uri: &str) -> (StatusCode, Vec<u8>) {
 
 fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("valid JSON body")
+}
+
+/// Sends an authenticated JSON POST and returns its status.
+async fn post(app: AppState, uri: &str, body: &serde_json::Value) -> StatusCode {
+    create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("X-Emby-Token", "tok")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// jellyfin-web's Dashboard → Libraries → Display page: it reads
+/// `UseFileCreationTimeForDateAdded` from `GET /System/Configuration/metadata`
+/// (the default, "Use file creation date", before anything is saved) and
+/// saves "Use date scanned into the library" as `false` through the POST —
+/// which the next GET returns and the scan reads from the same document.
+#[tokio::test]
+async fn the_date_added_behavior_round_trips_through_the_metadata_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    };
+
+    let (status, body) = get(
+        admin_state_with_paths(paths.clone()),
+        "/System/Configuration/metadata",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json(&body)["UseFileCreationTimeForDateAdded"],
+        serde_json::json!(true)
+    );
+
+    for saved in [false, true, false] {
+        let status = post(
+            admin_state_with_paths(paths.clone()),
+            "/System/Configuration/metadata",
+            &serde_json::json!({ "UseFileCreationTimeForDateAdded": saved }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = get(
+            admin_state_with_paths(paths.clone()),
+            "/System/Configuration/metadata",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json(&body)["UseFileCreationTimeForDateAdded"],
+            serde_json::json!(saved)
+        );
+    }
+    let on_disk: ferrofin_model::configuration::MetadataConfiguration = serde_json::from_slice(
+        &std::fs::read(dir.path().join("named").join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(!on_disk.use_file_creation_time_for_date_added);
+
+    // Saving it is an administrator's call.
+    let status = post(
+        state_with_paths(paths),
+        "/System/Configuration/metadata",
+        &serde_json::json!({ "UseFileCreationTimeForDateAdded": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

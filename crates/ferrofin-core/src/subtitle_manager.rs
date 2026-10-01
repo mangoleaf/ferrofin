@@ -259,9 +259,34 @@ impl SubtitleManager for FerrofinSubtitleManager {
         let mut request = request.clone();
         self.enrich(&mut request).await;
         let mut results = Vec::new();
-        for provider in &self.providers {
+        let mut providers: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|p| {
+                !request
+                    .disabled_subtitle_fetchers
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(p.name()))
+            })
+            .collect();
+        providers.sort_by_key(|p| {
+            request
+                .subtitle_fetcher_order
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(p.name()))
+                .unwrap_or(usize::MAX)
+        });
+        for provider in providers {
             match provider.search(&request).await {
-                Ok(mut found) => results.append(&mut found),
+                Ok(mut found) => {
+                    if request.is_perfect_match == Some(true) {
+                        found.retain(|r| r.is_hash_match == Some(true));
+                    }
+                    results.append(&mut found);
+                    if request.is_automated && !results.is_empty() {
+                        break;
+                    }
+                }
                 Err(err) => {
                     // Aggregate best-effort: one provider failing must not sink
                     // the whole search (Jellyfin skips the failed provider).
@@ -650,6 +675,69 @@ mod tests {
         let providers = mgr.get_supported_providers(item).await.expect("providers");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name.as_deref(), Some("fake"));
+    }
+
+    struct RankedProvider(&'static str, bool);
+
+    #[async_trait]
+    impl SubtitleProvider for RankedProvider {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        async fn search(
+            &self,
+            _: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            Ok(vec![RemoteSubtitleInfo {
+                id: Some(format!("{}_1", self.0)),
+                is_hash_match: Some(self.1),
+                ..Default::default()
+            }])
+        }
+        async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
+            unreachable!("search only")
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_search_honors_order_disabling_and_perfect_match() {
+        let mgr = manager(
+            test_db().await,
+            vec![
+                Arc::new(RankedProvider("first", false)),
+                Arc::new(RankedProvider("second", true)),
+            ],
+        );
+        let mut request = SubtitleSearchRequest {
+            is_automated: true,
+            subtitle_fetcher_order: vec!["SECOND".to_owned(), "first".to_owned()],
+            ..Default::default()
+        };
+        let results = mgr.search_subtitles(&request).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "stop after the preferred provider answers"
+        );
+        assert_eq!(results[0].id.as_deref(), Some("second_1"));
+        request.subtitle_fetcher_order.clear();
+        request.is_perfect_match = Some(true);
+        let results = mgr.search_subtitles(&request).await.unwrap();
+        assert_eq!(
+            results[0].id.as_deref(),
+            Some("second_1"),
+            "skip a nonmatching provider result"
+        );
+        request.disabled_subtitle_fetchers = vec!["SECOND".to_owned()];
+        assert!(mgr.search_subtitles(&request).await.unwrap().is_empty());
+        request.is_perfect_match = None;
+        request.disabled_subtitle_fetchers.clear();
+        request.is_automated = false;
+        assert_eq!(
+            mgr.search_subtitles(&request).await.unwrap().len(),
+            2,
+            "interactive searches retain provider fan-out"
+        );
     }
 
     #[tokio::test]

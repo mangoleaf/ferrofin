@@ -127,6 +127,12 @@ pub struct TmdbConfig {
     pub profile_size: Option<String>,
     /// The image CDN size segment for episode stills.
     pub still_size: Option<String>,
+    /// Replaces `TMDB_IMAGE_ROOT`, TMDb's image CDN — not a plugin setting
+    /// (never read from the settings page's JSON): the client's test seam
+    /// (`TmdbClient::with_image_root`), so a mock server can serve the
+    /// artwork its API answers point at.
+    #[serde(skip)]
+    pub(crate) image_root: Option<String>,
 }
 
 impl Default for TmdbConfig {
@@ -147,6 +153,7 @@ impl Default for TmdbConfig {
             logo_size: None,
             profile_size: None,
             still_size: None,
+            image_root: None,
         }
     }
 }
@@ -211,7 +218,8 @@ impl TmdbConfig {
     #[must_use]
     pub fn image_url(&self, kind: TmdbImageKind, path: &str) -> String {
         let size = self.image_size(kind).unwrap_or("original");
-        format!("{TMDB_IMAGE_ROOT}/{size}{path}")
+        let root = self.image_root.as_deref().unwrap_or(TMDB_IMAGE_ROOT);
+        format!("{root}/{size}{path}")
     }
 }
 
@@ -458,6 +466,25 @@ mod tests {
             cfg.image_url(TmdbImageKind::Poster, "/p.jpg"),
             "https://image.tmdb.org/t/p/original/p.jpg"
         );
+    }
+
+    /// The client's image root replaces the CDN's, and the settings page's
+    /// JSON can never set it.
+    #[test]
+    fn tmdb_image_root_is_the_clients_not_a_setting() {
+        use super::TmdbImageKind;
+        let cfg = TmdbConfig {
+            image_root: Some("http://127.0.0.1:9/image".to_owned()),
+            ..TmdbConfig::default()
+        };
+        assert_eq!(
+            cfg.image_url(TmdbImageKind::Poster, "/p.png"),
+            "http://127.0.0.1:9/image/original/p.png"
+        );
+        let cfg: TmdbConfig =
+            serde_json::from_str(r#"{"ImageRoot": "http://evil", "image_root": "http://evil"}"#)
+                .expect("parse");
+        assert_eq!(cfg.image_root, None);
     }
 
     #[test]

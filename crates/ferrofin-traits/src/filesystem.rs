@@ -46,8 +46,36 @@ pub trait FileSystem: Send + Sync {
     /// swallow-and-return behaviour.
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo>;
 
+    /// [`get_file_system_entries`](Self::get_file_system_entries), telling a
+    /// directory that could not be listed (a network mount that dropped, a
+    /// permission error, an entry that failed to read) apart from an empty
+    /// one — what the library scan needs so that a listing failure never
+    /// reads as every file under it being gone (`Folder.ValidateChildren`
+    /// stops on an `IOException` rather than removing children).
+    ///
+    /// The default reports every listing as successful.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the directory could not be listed
+    /// completely.
+    fn try_get_file_system_entries(
+        &self,
+        path: &str,
+    ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
+        Ok(self.get_file_system_entries(path))
+    }
+
     /// Lists the available drives / root mounts (C# `IFileSystem.GetDrives`).
     fn get_drives(&self) -> Vec<FileSystemEntryInfo>;
+
+    /// Whether a file or a directory exists at `path`. The default asks
+    /// [`file_exists`](Self::file_exists), then
+    /// [`directory_exists`](Self::directory_exists); a real filesystem
+    /// answers with one stat.
+    fn path_exists(&self, path: &str) -> bool {
+        self.file_exists(path) || self.directory_exists(path)
+    }
 
     /// Whether a regular file exists at the path.
     fn file_exists(&self, path: &str) -> bool;

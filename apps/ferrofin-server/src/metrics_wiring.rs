@@ -5,8 +5,10 @@
 //! HTTP tracking layer; [`register_gauges`] registers the async-sourced gauges
 //! (once per process — OTel instruments are process-global) and
 //! [`spawn_sampler`] drives their background mirror updates for one server
-//! lifetime. All run only when `EnableMetrics` is set (the endpoint is 404 and
-//! no sampler exists otherwise).
+//! lifetime; [`install_subsystem_instruments`] creates the instruments the
+//! library scan and the metadata providers record into themselves. All run only
+//! when `EnableMetrics` is set (the endpoint is 404, nothing is recorded and no
+//! sampler exists otherwise).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +30,44 @@ const DEFAULT_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Run the expensive library-count query only every Nth tick (≈60 s at the 15 s
 /// cadence); item counts change slowly relative to the scrape rate.
 const LIBRARY_COUNT_EVERY_N_TICKS: u64 = 4;
+
+/// Creates the instruments the library crates record into themselves
+/// (`docs/conventions/METRICS.md` rule 8): the library-scan family
+/// (`ferrofin_core::scan_metrics`) and the metadata-provider request family
+/// (`ferrofin_providers::metrics`). Called once per process, right after
+/// [`ferrofin_metrics::init`] installed the meter provider — an instrument
+/// created before the provider exists would stay a noop. Until it runs (and
+/// for good when metrics are disabled) their recording is a no-op.
+///
+/// `scan_duration_buckets` is the configured boundary list of the scan
+/// duration histograms (`Config::metrics_scan_duration_buckets`; `None` = the
+/// default).
+pub fn install_subsystem_instruments(scan_duration_buckets: Option<&[f64]>) {
+    ferrofin_core::scan_metrics::install(scan_duration_buckets);
+    ferrofin_providers::metrics::install();
+}
+
+/// The sampler-fed gauges' names ([`register_gauges`]), for the dashboard
+/// lint test.
+pub const GAUGE_NAMES: &[&str] = &[
+    SESSIONS_ACTIVE,
+    PLAYBACK_STREAMS_ACTIVE,
+    PLAYBACK_STREAMS,
+    TRANSCODE_JOBS_ACTIVE,
+    DB_POOL_CONNECTIONS,
+    DB_POOL_IDLE_CONNECTIONS,
+    LIBRARY_ITEMS,
+    UPTIME_SECONDS,
+];
+
+const SESSIONS_ACTIVE: &str = "ferrofin_sessions_active";
+const PLAYBACK_STREAMS_ACTIVE: &str = "ferrofin_playback_streams_active";
+const PLAYBACK_STREAMS: &str = "ferrofin_playback_streams";
+const TRANSCODE_JOBS_ACTIVE: &str = "ferrofin_transcode_jobs_active";
+const DB_POOL_CONNECTIONS: &str = "ferrofin_db_pool_connections";
+const DB_POOL_IDLE_CONNECTIONS: &str = "ferrofin_db_pool_idle_connections";
+const LIBRARY_ITEMS: &str = "ferrofin_library_items";
+const UPTIME_SECONDS: &str = "ferrofin_uptime_seconds";
 
 /// Adds the `/metrics` route and the post-routing HTTP tracking layer.
 ///
@@ -61,42 +101,38 @@ pub struct SamplerGauges {
 pub fn register_gauges(metrics: &MetricsHandle) -> SamplerGauges {
     SamplerGauges {
         sessions_active: metrics.gauge_cell(
-            "ferrofin_sessions_active",
+            SESSIONS_ACTIVE,
             "Number of active client sessions.",
             vec![],
         ),
         streams_active: metrics.gauge_cell(
-            "ferrofin_playback_streams_active",
+            PLAYBACK_STREAMS_ACTIVE,
             "Number of sessions currently playing an item.",
             vec![],
         ),
         streams_by_method: metrics.gauge_map(
-            "ferrofin_playback_streams",
+            PLAYBACK_STREAMS,
             "Active playback streams by play method.",
             "method",
         ),
         transcode_active: metrics.gauge_cell(
-            "ferrofin_transcode_jobs_active",
+            TRANSCODE_JOBS_ACTIVE,
             "Number of sessions with an active transcode.",
             vec![],
         ),
         pool_connections: metrics.gauge_map(
-            "ferrofin_db_pool_connections",
+            DB_POOL_CONNECTIONS,
             "Total connections in each database pool.",
             "pool",
         ),
         pool_idle: metrics.gauge_map(
-            "ferrofin_db_pool_idle_connections",
+            DB_POOL_IDLE_CONNECTIONS,
             "Idle connections in each database pool.",
             "pool",
         ),
-        library_items: metrics.gauge_map(
-            "ferrofin_library_items",
-            "Library item count by item type.",
-            "type",
-        ),
+        library_items: metrics.gauge_map(LIBRARY_ITEMS, "Library item count by item type.", "type"),
         uptime: metrics.gauge_cell(
-            "ferrofin_uptime_seconds",
+            UPTIME_SECONDS,
             "Seconds since the metrics sampler started.",
             vec![],
         ),

@@ -123,7 +123,7 @@ fn repo(db: &Database) -> FerrofinItemRepository {
 async fn plan(db: &Database, sql: &str) -> String {
     use sqlx::Row as _;
 
-    sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
         .fetch_all(db.pool())
         .await
         .expect("explain")
@@ -144,11 +144,12 @@ async fn movie_page_before_hydration_change(
 
     let mut builder = build_query(filter, QueryShape::IdsOnly);
     let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
     let sql = query
         .sql()
+        .as_str()
         .replacen(r#"SELECT bi."Id" FROM"#, "SELECT bi.* FROM", 1);
-    let args = query.take_arguments().expect("arguments").expect("binds");
-    sqlx::query_as_with(&sql, args)
+    sqlx::query_as_with(sqlx::AssertSqlSafe(sql), args)
         .fetch_all(db.pool())
         .await
         .expect("original movie page")
@@ -307,9 +308,9 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     };
     let mut builder = build_query(&filter, QueryShape::FullRows);
     let mut query = builder.build();
-    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql());
     let args = query.take_arguments().expect("arguments").expect("binds");
-    let plan = sqlx::query_with(&sql, args)
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
         .fetch_all(db.pool())
         .await
         .expect("explain")
@@ -394,6 +395,7 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
         assert!(
             !build_query(&other, QueryShape::FullRows)
                 .sql()
+                .as_str()
                 .contains("movie_page")
         );
     }
@@ -404,7 +406,12 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
         QueryShape::GroupedCount,
         QueryShape::TypeCounts,
     ] {
-        assert!(!build_query(&filter, shape).sql().contains("movie_page"));
+        assert!(
+            !build_query(&filter, shape)
+                .sql()
+                .as_str()
+                .contains("movie_page")
+        );
     }
 }
 
@@ -492,6 +499,79 @@ async fn retrieve_rejects_nil_and_misses_absent() {
             .await
             .expect("query")
             .is_none()
+    );
+}
+
+/// `retrieve_items` is the library scan's stored-row pre-read. Asked for more
+/// ids than one host-variable chunk holds, it must split the read without
+/// truncating or duplicating, return the whole row, and simply leave out ids
+/// that have no row (that absence is how the scan tells a new item).
+#[tokio::test]
+async fn retrieve_items_reads_across_chunks_and_skips_missing_ids() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+
+    // Two and a half chunks of stored rows, with a missing id after each one.
+    let stored_count = ferrofin_db::BATCH_BIND_CHUNK * 2 + ferrofin_db::BATCH_BIND_CHUNK / 2;
+    let mut rows = Vec::new();
+    let mut asked = Vec::new();
+    for i in 0..stored_count {
+        let id = Uuid::from_u128(0x3_0000 + i as u128);
+        let mut row = item(id, BaseItemKind::Episode, &format!("Episode {i}"));
+        // The stored id form (`item` uses the display form, which only
+        // matches for ids without hex letters).
+        row.id = ferrofin_db::store::guid_to_db(id);
+        row.overview = Some(format!("Synopsis {i}"));
+        rows.push(row);
+        asked.push(id);
+        asked.push(Uuid::from_u128(0x9_0000 + i as u128));
+    }
+    rows[7].is_locked = true;
+    persist.save_items(&rows).await.expect("seed");
+
+    let got = repository.retrieve_items(&asked).await.expect("retrieve");
+    assert_eq!(
+        got.len(),
+        stored_count,
+        "one row per stored id, none per missing id"
+    );
+    let mut ids: Vec<Uuid> = got
+        .iter()
+        .map(|row| Uuid::parse_str(&row.id).expect("id parses back"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), stored_count, "no row is returned twice");
+    assert!(
+        ids.iter().all(|id| id.as_u128() < 0x9_0000),
+        "no missing id"
+    );
+
+    // The whole row comes back, not a projection.
+    let seventh = got
+        .iter()
+        .find(|row| Uuid::parse_str(&row.id).ok() == Some(Uuid::from_u128(0x3_0007)))
+        .expect("the seventh row");
+    assert_eq!(seventh.name.as_deref(), Some("Episode 7"));
+    assert_eq!(seventh.overview.as_deref(), Some("Synopsis 7"));
+    assert_eq!(seventh.type_, type_name(BaseItemKind::Episode));
+    assert!(seventh.is_locked);
+
+    // Nothing asked, nothing read; only missing ids, nothing returned.
+    assert!(
+        repository
+            .retrieve_items(&[])
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+    assert!(
+        repository
+            .retrieve_items(&[Uuid::from_u128(0xDEAD)])
+            .await
+            .expect("missing")
+            .is_empty()
     );
 }
 
@@ -1279,8 +1359,8 @@ async fn id_list_queries_are_driven_by_the_primary_key_not_the_type_index() {
     for sql in [
         // item_repository::physical_folders_by_view
         r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = ? AND "Id" IN (?, ?, ?)"#,
-        // item_repository::item_text_rows
-        r#"SELECT "Id", "Name" FROM "BaseItems" WHERE "Id" IN (?, ?, ?) AND +"Type" = ?4"#,
+        // item_repository::retrieve_items (the scan's stored-row pre-read)
+        r#"SELECT * FROM "BaseItems" WHERE "Id" IN (?, ?, ?)"#,
         // translate_query::append_type_filters with an `Ids` list
         r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Id" IN (?, ?, ?) AND +bi."Type" IN (?) AND bi."PrimaryVersionId" IS NULL ORDER BY bi."SortName""#,
         // similar_items_repository: the scored candidate set joins through the key

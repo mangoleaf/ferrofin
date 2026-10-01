@@ -20,6 +20,8 @@ ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
 ferrofin-networking.workspace = true
 async-trait.workspace = true
+# `catch_unwind` on a future: a served lane refresh that panics fails alone.
+futures-util.workspace = true
 tokio = { workspace = true }
 notify.workspace = true
 sqlx.workspace = true
@@ -30,6 +32,9 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+# Deep-internal scan metrics (docs/conventions/METRICS.md rule 8): the OTel API
+# only; the pipeline lives in ferrofin-metrics.
+opentelemetry.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 # The photo embedded-information provider (EXIF) runs during the scan.

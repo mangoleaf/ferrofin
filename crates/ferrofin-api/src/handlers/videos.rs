@@ -28,7 +28,7 @@ use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
 use crate::error::ApiError;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_uuids;
@@ -189,8 +189,8 @@ async fn delete_alternate_sources(
 /// `GET /Items/{itemId}/Download` — download the item's media file.
 ///
 /// Port of `LibraryController.GetDownload`: resolves the item and streams its
-/// on-disk file as an attachment. The `CanDownload` policy check is deferred to
-/// the auth layer; the file is served through the shared streaming helper (Range /
+/// on-disk file as an attachment after enforcing the download permission.
+/// The file is served through the shared streaming helper (Range /
 /// `HEAD` / `404`), with a `Content-Disposition: attachment` header carrying the
 /// file name (matching the C# `FileResult` download semantics).
 #[utoipa::path(
@@ -205,11 +205,19 @@ async fn delete_alternate_sources(
 )]
 async fn get_download(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireDownload(_auth, policy): RequireDownload,
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let path = stream_path(&state, item_id).await?;
+    // The controller's CanDownload(user) check follows the policy check.
+    // Administrators pass the policy, but an explicitly disabled download
+    // permission still fails this per-item check. API keys have no user policy.
+    if policy.is_some_and(|p| !p.enable_content_downloading) {
+        return Err(ApiError::BadRequest(
+            "user cannot download this item".to_owned(),
+        ));
+    }
     let filename = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())

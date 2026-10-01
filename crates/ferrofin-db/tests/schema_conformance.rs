@@ -49,10 +49,12 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
             continue;
         }
         let mut columns = BTreeMap::new();
-        for row in sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
-            .fetch_all(pool)
-            .await
-            .expect("table_info")
+        for row in sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA table_info(\"{table}\")"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("table_info")
         {
             columns.insert(
                 row.get::<String, _>("name"),
@@ -65,10 +67,12 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
             );
         }
         let mut foreign_keys = BTreeSet::new();
-        for row in sqlx::query(&format!("PRAGMA foreign_key_list(\"{table}\")"))
-            .fetch_all(pool)
-            .await
-            .expect("foreign_key_list")
+        for row in sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA foreign_key_list(\"{table}\")"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("foreign_key_list")
         {
             foreign_keys.insert((
                 row.get::<String, _>("table"),
@@ -80,23 +84,27 @@ async fn snapshot(pool: &SqlitePool) -> (BTreeMap<String, TableShape>, BTreeSet<
         // Materialize index_list fully before issuing index_info queries — the
         // original Python differ interleaved them on one cursor and silently
         // truncated the walk (see JELLYFIN_DB_SCHEMA_DIFF.md's correction).
-        let index_rows = sqlx::query(&format!("PRAGMA index_list(\"{table}\")"))
-            .fetch_all(pool)
-            .await
-            .expect("index_list");
+        let index_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA index_list(\"{table}\")"
+        )))
+        .fetch_all(pool)
+        .await
+        .expect("index_list");
         for row in index_rows {
             if row.get::<String, _>("origin") != "c" {
                 continue; // auto PK/unique indexes follow from the column defs
             }
             let name: String = row.get("name");
             let unique: i64 = row.get("unique");
-            let cols: Vec<String> = sqlx::query(&format!("PRAGMA index_info(\"{name}\")"))
-                .fetch_all(pool)
-                .await
-                .expect("index_info")
-                .into_iter()
-                .map(|r| r.get::<Option<String>, _>("name").unwrap_or_default())
-                .collect();
+            let cols: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA index_info(\"{name}\")"
+            )))
+            .fetch_all(pool)
+            .await
+            .expect("index_info")
+            .into_iter()
+            .map(|r| r.get::<Option<String>, _>("name").unwrap_or_default())
+            .collect();
             indexes.insert((name, cols, unique));
         }
         shapes.insert(

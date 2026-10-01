@@ -284,6 +284,166 @@ pub enum BaseItemKind {
     Year,
 }
 
+/// The `(kind, stored-type-name)` pairs, copied from the C#
+/// `ItemTypeLookup.BaseItemKindNames` dictionary. Kinds with no dedicated
+/// `BaseItem` subclass in the C# table (e.g. `AudioBook`, `Program`) are omitted,
+/// exactly as upstream omits them.
+pub const BASE_ITEM_KIND_NAMES: &[(BaseItemKind, &str)] = &[
+    (
+        BaseItemKind::AggregateFolder,
+        "MediaBrowser.Controller.Entities.AggregateFolder",
+    ),
+    (
+        BaseItemKind::Audio,
+        "MediaBrowser.Controller.Entities.Audio.Audio",
+    ),
+    (
+        BaseItemKind::AudioBook,
+        "MediaBrowser.Controller.Entities.AudioBook",
+    ),
+    (
+        BaseItemKind::BasePluginFolder,
+        "MediaBrowser.Controller.Entities.BasePluginFolder",
+    ),
+    (BaseItemKind::Book, "MediaBrowser.Controller.Entities.Book"),
+    (
+        BaseItemKind::BoxSet,
+        "MediaBrowser.Controller.Entities.Movies.BoxSet",
+    ),
+    (
+        BaseItemKind::Channel,
+        "MediaBrowser.Controller.Channels.Channel",
+    ),
+    (
+        BaseItemKind::CollectionFolder,
+        "MediaBrowser.Controller.Entities.CollectionFolder",
+    ),
+    (
+        BaseItemKind::Episode,
+        "MediaBrowser.Controller.Entities.TV.Episode",
+    ),
+    (
+        BaseItemKind::Folder,
+        "MediaBrowser.Controller.Entities.Folder",
+    ),
+    (
+        BaseItemKind::Genre,
+        "MediaBrowser.Controller.Entities.Genre",
+    ),
+    (
+        BaseItemKind::ManualPlaylistsFolder,
+        "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder",
+    ),
+    (
+        BaseItemKind::Movie,
+        "MediaBrowser.Controller.Entities.Movies.Movie",
+    ),
+    (
+        BaseItemKind::LiveTvChannel,
+        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
+    ),
+    (
+        BaseItemKind::LiveTvProgram,
+        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
+    ),
+    (
+        BaseItemKind::MusicAlbum,
+        "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
+    ),
+    (
+        BaseItemKind::MusicArtist,
+        "MediaBrowser.Controller.Entities.Audio.MusicArtist",
+    ),
+    (
+        BaseItemKind::MusicGenre,
+        "MediaBrowser.Controller.Entities.Audio.MusicGenre",
+    ),
+    (
+        BaseItemKind::MusicVideo,
+        "MediaBrowser.Controller.Entities.MusicVideo",
+    ),
+    (
+        BaseItemKind::Person,
+        "MediaBrowser.Controller.Entities.Person",
+    ),
+    (
+        BaseItemKind::Photo,
+        "MediaBrowser.Controller.Entities.Photo",
+    ),
+    (
+        BaseItemKind::PhotoAlbum,
+        "MediaBrowser.Controller.Entities.PhotoAlbum",
+    ),
+    (
+        BaseItemKind::Playlist,
+        "MediaBrowser.Controller.Playlists.Playlist",
+    ),
+    (
+        BaseItemKind::PlaylistsFolder,
+        "Emby.Server.Implementations.Playlists.PlaylistsFolder",
+    ),
+    (
+        BaseItemKind::Season,
+        "MediaBrowser.Controller.Entities.TV.Season",
+    ),
+    (
+        BaseItemKind::Series,
+        "MediaBrowser.Controller.Entities.TV.Series",
+    ),
+    (
+        BaseItemKind::Studio,
+        "MediaBrowser.Controller.Entities.Studio",
+    ),
+    (
+        BaseItemKind::Trailer,
+        "MediaBrowser.Controller.Entities.Trailer",
+    ),
+    (
+        BaseItemKind::TvChannel,
+        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
+    ),
+    (
+        BaseItemKind::TvProgram,
+        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
+    ),
+    (
+        BaseItemKind::UserRootFolder,
+        "MediaBrowser.Controller.Entities.UserRootFolder",
+    ),
+    (
+        BaseItemKind::UserView,
+        "MediaBrowser.Controller.Entities.UserView",
+    ),
+    (
+        BaseItemKind::Video,
+        "MediaBrowser.Controller.Entities.Video",
+    ),
+    (BaseItemKind::Year, "MediaBrowser.Controller.Entities.Year"),
+];
+
+impl BaseItemKind {
+    /// The stored `BaseItems.Type` name of this kind (the C# class's
+    /// `typeof(T).FullName`), or [`None`] for a kind with no dedicated stored
+    /// type (matching the C# dictionary's coverage).
+    #[must_use]
+    pub fn stored_type_name(self) -> Option<&'static str> {
+        BASE_ITEM_KIND_NAMES
+            .iter()
+            .find(|(k, _)| *k == self)
+            .map(|(_, name)| *name)
+    }
+
+    /// The inverse of [`stored_type_name`](Self::stored_type_name): the kind a
+    /// stored `BaseItems.Type` name names, or [`None`] for an unrecognized one.
+    #[must_use]
+    pub fn from_stored_type_name(type_name: &str) -> Option<Self> {
+        BASE_ITEM_KIND_NAMES
+            .iter()
+            .find(|(_, name)| *name == type_name)
+            .map(|(kind, _)| *kind)
+    }
+}
+
 /// Media streaming protocol.
 ///
 /// Members are lowercase for backwards compatibility with the wire contract.
@@ -296,4 +456,28 @@ pub enum MediaStreamProtocol {
     http = 0,
     /// HTTP Live Streaming.
     hls = 1,
+}
+
+#[cfg(test)]
+mod stored_type_name_tests {
+    use super::{BASE_ITEM_KIND_NAMES, BaseItemKind};
+
+    /// Every stored name maps back to a kind stored under that name (a few
+    /// kinds share one — `TvChannel`/`LiveTvChannel` — and the first listed
+    /// wins, as the C# dictionary's reverse lookup does), and the match is
+    /// exact: a name is not recognised by its last segment alone.
+    #[test]
+    fn stored_type_names_round_trip_exactly() {
+        for (kind, name) in BASE_ITEM_KIND_NAMES {
+            assert_eq!(kind.stored_type_name(), Some(*name));
+            let back = BaseItemKind::from_stored_type_name(name).expect("known name");
+            assert_eq!(back.stored_type_name(), Some(*name));
+        }
+        assert_eq!(
+            BaseItemKind::from_stored_type_name("MediaBrowser.Controller.Entities.TV.Episode"),
+            Some(BaseItemKind::Episode)
+        );
+        assert_eq!(BaseItemKind::from_stored_type_name("Episode"), None);
+        assert_eq!(BaseItemKind::from_stored_type_name("Not.A.Kind"), None);
+    }
 }

@@ -164,6 +164,10 @@ ferrofin:
   config: {}
     # FERROFIN_PUBLISHED_URL: "https://ferrofin.example.com"
     # FERROFIN_LOG: "info"   # EnvFilter/RUST_LOG syntax, e.g. "debug" or "ferrofin_api=debug,info"
+    # FERROFIN_ENABLE_METRICS: "true"   # serve Prometheus /metrics (see `metrics` below)
+    # Bucket boundaries (seconds, ascending) of the library-scan duration histograms;
+    # unset = 1-2.5-5 per decade from 0.001 to 5000 (see contrib/metrics/README.md).
+    # FERROFIN_METRICS_SCAN_DURATION_BUCKETS: "0.01,0.1,1,10,60,300,1800,7200"
 
 # -- Liveness probe. Ferrofin serves GET /health/live (process-only 200).
 livenessProbe:
@@ -192,9 +196,10 @@ startupProbe:
   periodSeconds: 10
   failureThreshold: 30
 
-# -- Metrics. NOTE: Ferrofin does not expose /metrics yet, so this is off by default.
-# The ServiceMonitor template exists for contract parity — flip enabled on once Ferrofin
-# grows a metrics endpoint.
+# -- Metrics. Ferrofin serves Prometheus metrics on GET /metrics (the app port) once
+# they are enabled in the app: set FERROFIN_ENABLE_METRICS=true (ferrofin.config or
+# ferrofin.env) or EnableMetrics in system.json. These keys only add the
+# ServiceMonitor that scrapes it; see contrib/metrics/README.md.
 metrics:
   enabled: false
   serviceMonitor:
@@ -207,6 +212,30 @@ metrics:
     path: /metrics
     port: 8096
     scheme: http
+
+# -- Grafana dashboards (golden signals, deep dive, library scans) as a ConfigMap for a
+# Grafana dashboard sidecar (e.g. the kube-prometheus-stack / grafana chart sidecar),
+# which loads every ConfigMap carrying `label: labelValue` and files it in the folder
+# named by the `folderAnnotation` annotation. The dashboards read the metrics above,
+# so enable metrics in the app and scrape them (metrics.serviceMonitor) too.
+dashboards:
+  enabled: false
+  # -- Namespace for the ConfigMap. "" → release namespace. Set it when the sidecar
+  # watches one namespace only (e.g. Grafana's own).
+  namespace: ""
+  # -- The label the sidecar selects dashboard ConfigMaps by (grafana sidecar
+  # `sidecar.dashboards.label`), and its value (`sidecar.dashboards.labelValue`).
+  label: grafana_dashboard
+  labelValue: "1"
+  # -- The annotation the sidecar reads the target folder from
+  # (`sidecar.dashboards.folderAnnotation`), and the folder. "" → no folder annotation
+  # (the sidecar's default folder). An empty `label` likewise adds no selector label.
+  folderAnnotation: grafana_folder
+  folder: Ferrofin
+  # -- Extra labels on the ConfigMap.
+  labels: {}
+  # -- Extra annotations on the ConfigMap.
+  annotations: {}
 
 # -- NetworkPolicy for pod isolation. Needs a CNI that enforces it (Calico, Cilium, etc.).
 networkPolicy:

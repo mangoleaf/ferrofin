@@ -584,7 +584,8 @@ struct MediaUpdateInfoDto {
     updates: Vec<MediaUpdateInfoPathDto>,
 }
 
-/// Reports every changed `path` to the library monitor.
+/// Reports every changed `path` to the library monitor, as a webhook's
+/// (the scan it queues is tagged `trigger=webhook`).
 ///
 /// Ports the `foreach (item) _libraryMonitor.ReportFileSystemChanged(item.Path)`
 /// loop shared by all three webhook actions. Empty paths are skipped (the C#
@@ -597,10 +598,7 @@ async fn report_paths(
         if path.is_empty() {
             continue;
         }
-        state
-            .library_monitor
-            .report_file_system_changed(&path)
-            .await?;
+        state.library_monitor.report_webhook_change(&path).await?;
     }
     Ok(())
 }
@@ -738,10 +736,7 @@ async fn post_updated_media(
             .filter(|p| !p.is_empty())
             .ok_or_else(|| ApiError::BadRequest("Item path can't be null.".to_owned()))?;
         let _ = update.update_type; // Accepted for parity; the monitor ignores it.
-        state
-            .library_monitor
-            .report_file_system_changed(&path)
-            .await?;
+        state.library_monitor.report_webhook_change(&path).await?;
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

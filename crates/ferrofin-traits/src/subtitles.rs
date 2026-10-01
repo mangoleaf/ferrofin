@@ -70,6 +70,10 @@ pub struct SubtitleSearchRequest {
     pub media_path: Option<String>,
     /// The IMDb id (e.g. `tt1234567`), when known.
     pub imdb_id: Option<String>,
+    /// Providers disabled by the library for automatic downloads.
+    pub disabled_subtitle_fetchers: Vec<String>,
+    /// Preferred provider order for automatic downloads.
+    pub subtitle_fetcher_order: Vec<String>,
 }
 
 /// The raw content of a downloaded subtitle.

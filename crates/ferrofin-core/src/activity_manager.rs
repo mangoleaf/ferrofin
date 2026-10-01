@@ -195,7 +195,7 @@ impl ActivityManager for FerrofinActivityManager {
         let count_sql = format!(
             r#"SELECT COUNT(*) FROM "ActivityLogs" a LEFT JOIN "Users" u ON a."UserId" = u."Id"{where_sql}"#
         );
-        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        let mut count_q = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
         for b in &binds {
             count_q = count_q.bind(b);
         }
@@ -208,7 +208,7 @@ impl ActivityManager for FerrofinActivityManager {
                LIMIT ? OFFSET ?"#,
             order = order_by_clause(&query.order_by)
         );
-        let mut select_q = sqlx::query_as::<_, ActivityLogEntity>(&select_sql);
+        let mut select_q = sqlx::query_as::<_, ActivityLogEntity>(sqlx::AssertSqlSafe(select_sql));
         for b in &binds {
             select_q = select_q.bind(b);
         }

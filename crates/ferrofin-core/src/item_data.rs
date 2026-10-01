@@ -182,6 +182,37 @@ pub fn set_data_field(data: Option<&str>, key: &str, value: &str) -> Option<Stri
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// `stored` with the resolver's `VideoType` (read from `resolved`) in place
+/// of its own — `Video.UpdateFromResolvedItem` (`Video.cs:518-522`), which
+/// runs on every existing item a scan resolves, locked or not, before any
+/// refresh. `None` when that changes nothing: `resolved` names no
+/// `VideoType`, `stored` already holds that one, or `stored` is not a JSON
+/// object (a blob that cannot be read is never rewritten). An empty or
+/// absent `stored` is an empty object.
+///
+/// The returned text is `serde_json`'s rendering (keys sorted): an unlocked
+/// row is saved with it. A locked row's save applies the same rule in SQL
+/// instead (`json_set`, `LOCKED_DATA_SQL`), which keeps every other key and
+/// its value in their order but returns the document re-rendered minified;
+/// when nothing changes, the SQL leaves the stored text as it is.
+#[must_use]
+pub fn with_resolved_video_type(stored: Option<&str>, resolved: Option<&str>) -> Option<String> {
+    const KEY: &str = "VideoType";
+    let video_type = read_data_string(&parse_data(resolved), KEY)?;
+    let mut object = match stored.filter(|d| !d.is_empty()) {
+        None => Map::new(),
+        Some(text) => match serde_json::from_str::<Value>(text).ok()? {
+            Value::Object(map) => map,
+            _ => return None,
+        },
+    };
+    if read_data_string(&object, KEY).as_deref() == Some(video_type.as_str()) {
+        return None;
+    }
+    object.insert(KEY.to_owned(), Value::String(video_type));
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
 /// The `Data` key a series' status lives under — C# `Series.Status`
 /// (`SeriesStatus?`), serialized by name (`"Status":"Ended"`) into the blob
 /// like every other non-column property (`BaseItemMapper.cs:234`).

@@ -1246,66 +1246,62 @@ fn fetch_from_itunes_info(xml: &str, info: &mut MediaInfo) {
     if let Some(idx) = xml.to_ascii_lowercase().find("<plist") {
         xml = xml[idx..].to_owned();
     }
-
     let mut reader = Reader::from_str(&xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
-    // Flatten to a sequence of (tag, text) and reconstruct the key/array shape.
     let mut current_key: Option<String> = None;
     let mut in_array = false;
     let mut collecting: Vec<String> = Vec::new();
-    let mut last_element: Option<String> = None;
-    let mut buf = Vec::new();
+    let mut text = String::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "array" {
+                if e.name().as_ref() == "array" {
                     in_array = true;
                     collecting.clear();
                 }
-                last_element = Some(name);
+                text.clear();
+            }
+            Ok(Event::Text(e)) => text.push_str(e.as_ref()),
+            Ok(Event::CData(e)) => text.push_str(e.as_ref()),
+            Ok(Event::GeneralRef(e)) => {
+                if let Ok(value) = quick_xml::escape::unescape(&format!("&{};", e.as_ref())) {
+                    text.push_str(&value);
+                }
             }
             Ok(Event::End(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if name == "array" {
-                    in_array = false;
-                    if let Some(key) = current_key.take() {
-                        process_pairs(&key, &collecting, info);
-                    }
-                    collecting.clear();
-                }
-                last_element = None;
-            }
-            Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default().trim().to_owned();
-                if text.is_empty() {
-                    continue;
-                }
-                match last_element.as_deref() {
-                    Some("key") => {
-                        // A new key ends the previous scalar key/value pair.
-                        if let Some(prev) = current_key.take()
+                // Coalesce text, entity references and CDATA before interpreting
+                // a scalar. One studio name must not become several values.
+                let value = text.trim();
+                match e.name().as_ref() {
+                    "key" if !value.is_empty() => {
+                        if let Some(previous) = current_key.take()
                             && !collecting.is_empty()
                         {
-                            process_pairs(&prev, &collecting, info);
+                            process_pairs(&previous, &collecting, info);
                         }
-                        current_key = Some(text);
+                        current_key = Some(value.to_owned());
                         collecting.clear();
                     }
-                    Some("string") if (in_array || current_key.is_some()) => {
-                        collecting.push(text);
+                    "string" if !value.is_empty() && (in_array || current_key.is_some()) => {
+                        collecting.push(value.to_owned());
+                    }
+                    "array" => {
+                        in_array = false;
+                        if let Some(key) = current_key.take() {
+                            process_pairs(&key, &collecting, info);
+                        }
+                        collecting.clear();
                     }
                     _ => {}
                 }
+                text.clear();
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
-        buf.clear();
     }
-
     if let Some(key) = current_key.take()
         && !collecting.is_empty()
     {
@@ -1514,5 +1510,20 @@ mod musicbrainz_tests {
         set_musicbrainz_ids(&mut info, &t);
         assert_eq!(info.provider_ids["MusicBrainzArtist"], "first-mbid");
         assert!(!info.provider_ids.contains_key("MusicBrainzAlbum"));
+    }
+}
+
+#[cfg(test)]
+mod itunes_tests {
+    use super::{MediaInfo, fetch_from_itunes_info};
+
+    #[test]
+    fn entities_and_cdata_form_one_studio_name() {
+        let mut info = MediaInfo::default();
+        fetch_from_itunes_info(
+            "<plist><dict><key>studio</key><string>Fish &amp; Chips &#33; <![CDATA[<live>]]></string></dict></plist>",
+            &mut info,
+        );
+        assert_eq!(info.studios, vec!["Fish & Chips ! <live>"]);
     }
 }

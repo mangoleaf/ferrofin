@@ -256,7 +256,8 @@ Not implemented, by design: .NET-style native plugin loading (see above), DLNA s
 discovery (SSDP), and the AMF, VideoToolbox, RKMPP and V4L2M2M hardware transcode paths
 (unverifiable without the hardware; selecting one falls back to software with a logged
 warning). Remote metadata providers (TMDB, TVDB, MusicBrainz, TheAudioDB, fanart) are on
-by default and gated per library exactly as in Jellyfin; OMDb needs an API key.
+by default and gated per library exactly as in Jellyfin, including OMDb. Shared
+provider keys are built in; operator keys are optional overrides.
 
 The tiered matrix with verification depth per area is
 **[`docs/FEATURES.md`](docs/FEATURES.md)**.

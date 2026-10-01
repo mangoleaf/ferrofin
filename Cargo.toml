@@ -77,30 +77,30 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 # Decoders for the response-compression tests only (the server never decodes a
-# response it just encoded). Same versions tower-http already links.
-flate2 = "1.1"
+# response it just encoded). Streaming readers validate the wire response.
+flate2 = "1.1.10"
 zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
-brotli = "8.0"
+brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
-futures-core = "0.3"
-# WebSocket client for the /socket integration tests only. Same version axum
-# 0.8 already links for its `ws` feature, so it adds no new compilation.
-tokio-tungstenite = "0.29"
-futures-util = "0.3"
+futures-core = "0.3.34"
+# WebSocket client for the /socket integration tests only. Its version is
+# independent of the WebSocket implementation used internally by axum.
+tokio-tungstenite = "0.30.0"
+futures-util = "0.3.34"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid"] }
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.
-libsqlite3-sys = "0.30.1"
+libsqlite3-sys = "0.37.0"
 
 # ── serde / errors ─────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
@@ -111,7 +111,7 @@ serde_urlencoded = "0.7"
 # its `errors` dictionary by path. ferrofin-api's JsonBody extractor only.
 serde_path_to_error = "0.1"
 secrecy = { version = "0.10", features = ["serde"] }
-thiserror = "2"
+thiserror = "2.0.21"
 anyhow = "1"
 
 # ── allocator (server-only: glibc malloc convoyed under 64 threads) ─
@@ -125,20 +125,20 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
 
 # ── openapi ────────────────────────────────────────────────────────
-utoipa = "5"
+utoipa = "6.0.0"
 
 # ── metrics + traces: OpenTelemetry ────────────────────────────────
 # metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
-# (ferrofin-server only). The 0.33 tracing-opentelemetry pairs with otel 0.32
+# (ferrofin-server only). The 0.34 tracing-opentelemetry pairs with otel 0.33
 # (the expected +1 offset); bump both together if otel ever moves.
-opentelemetry = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "trace"] }
-opentelemetry-prometheus = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
-tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-prometheus = "0.33.0"
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.34.0"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
 prometheus = { version = "0.14", default-features = false }
@@ -146,43 +146,43 @@ prometheus = { version = "0.14", default-features = false }
 # ── WASM plugin host (Tier 1b — see docs/EXTENSIONS.md) ──
 # Component-model runtime for sandboxed third-party plugins. Always compiled
 # in (decision 2026-08-07); MSRV 1.94 ≤ our pinned toolchain.
-wasmtime = "47"
-wasmtime-wasi = "47"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
-wat = "1.256"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
+wasmtime = "49.0.0"
+wasmtime-wasi = "49.0.0"    # locked-down empty WASI ctx (no preopens/sockets) so std guests link
+wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-async-trait = "0.1"
+async-trait = "0.1.92"
 libc = "0.2"
-argon2 = "0.5"
-pbkdf2 = "0.12"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
-sha2 = "0.10"            # PBKDF2-HMAC-SHA512 (default hash id)
-sha1 = "0.10"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
+argon2 = "0.6.0"
+pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
+sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
+sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
-config = "0.15"
-clap = { version = "4.5", features = ["derive"] }
-bitflags = "2"
+config = "0.15.26"
+clap = { version = "4.6.7", features = ["derive"] }
+bitflags = "2.13.2"
 # CRC-32 (reflected zlib polynomial) for the HDHomeRun control protocol's packet
 # checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
 # 0x414fa339 for "The quick brown fox...". Already in the lock file as a
 # transitive dependency of flate2/zip, so it adds no new compilation.
-crc32fast = "1.5"
+crc32fast = "1.5.2"
 regex = "1"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.
-icu_collator = "2"
-icu_casemap = "2"
-fancy-regex = "0.14"    # for C# regexes that use lookaround
-quick-xml = { version = "0.37", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
+icu_collator = "2.3.1"
+icu_casemap = "2.3.0"
+fancy-regex = "0.19.2"    # for C# regexes that use lookaround
+quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
 # ── dev / test ─────────────────────────────────────────────────────
-rstest = "0.23"         # [Theory]/[InlineData] → #[case] transliteration
+rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
 insta = { version = "1", features = ["json"] }   # golden-file parity snapshots
 tempfile = "3"          # temp SQLite files for ferrofin-db tests
 

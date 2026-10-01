@@ -61,7 +61,7 @@ impl GuardedRegex {
         clippy::result_large_err,
         reason = "mirrors fancy_regex::Regex::captures' own signature"
     )]
-    pub fn captures<'t>(&self, text: &'t str) -> Result<Option<Captures<'t>>, Error> {
+    pub fn captures<'t>(&self, text: &'t str) -> Result<Option<Captures<'t, str>>, Error> {
         if self.guard.as_ref().is_some_and(|g| !g.is_match(text)) {
             return Ok(None);
         }

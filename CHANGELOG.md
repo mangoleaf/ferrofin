@@ -42,6 +42,44 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
   library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Per-field metadata locks (`LockedFields`, stored in `BaseItemMetadataFields`): the
+  metadata editor's checkboxes round-trip, and scans and refreshes keep a locked field
+  as the user set it. Editing an item no longer locks it; `LockData` is exactly what the
+  editor sends, and a lock change on a folder reaches every descendant and linked member.
+  A series, season or album edit passes its rating and tag changes to its children, each
+  child's own field locks honoured. A locked item still has its local artwork validated
+  (a new `poster.jpg` is found). See [docs/UPGRADING.md](docs/UPGRADING.md) for items
+  locked by earlier versions
+- Fetcher choices follow Jellyfin's gate for every kind, in scans and single-item refreshes:
+  a kind a library saved no fetcher choices for, and an item in no library (an artist known
+  only by name), now uses the server-wide metadata options — their disabled fetchers and
+  their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
+  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
+  "Use date scanned into the library" dates a new item by the moment Ferrofin first
+  detects it, by a library scan or the disk watcher/webhook alike, and its series'
+  date added follows; "Use file creation date" (the default) keeps the file's
+  creation time, and re-dates a file whose modification time changed, as Jellyfin
+  does. An `.nfo` `<dateadded>` or a photo's EXIF date now also re-dates an item
+  already in the library whenever it is read again. Adopting a Jellyfin install
+  carries the choice over from `metadata.xml`, including an install adopted by an
+  earlier version (on its first boot of this one). Existing items otherwise keep their
+  stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
+
+### Bug Fixes
+- A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
+  first scan, and media deleted from disk is removed from it again. Jellyfin files a
+  library's items under the library location's folder, Ferrofin under the library itself.
+  Browsing, counts, Latest, Next Up and the scan's removal of deleted media (including a
+  watcher or webhook event's) now read both. A scan never removes a library's own folders,
+  nor an entry whose file or folder is still on disk unless a new entry for the same file
+  replaced it. On an adopted database the first scan after upgrading removes the entries
+  for media deleted from disk since Ferrofin first scanned the library (or since adoption,
+  if it was never scanned), with their watched state. Until multi-version grouping is
+  ported, a movie's alternate versions (`Movie - 1080p.mkv` beside `Movie - 2160p.mkv`)
+  are listed as separate movies once the library is browsable again, and a plain
+  subfolder of a movie library shows as an empty folder. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ## [1.0.0] - 2026-09-05
 

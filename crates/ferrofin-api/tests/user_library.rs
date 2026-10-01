@@ -457,13 +457,34 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`UserViewManager`] returning two collection folders as the user's views,
+/// A [`UserViewManager`] returning collection folders and a playlists view,
 /// plus one latest row for the user-scoped-latest forwarding test.
-struct StubUserViews;
+#[derive(Default)]
+struct StubUserViews {
+    hidden: Vec<Uuid>,
+}
 
 #[async_trait]
 impl UserViewManager for StubUserViews {
-    async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views_with_hidden(user_id, false).await
+    }
+    async fn get_user_views_with_hidden(
+        &self,
+        user_id: Uuid,
+        include_hidden: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut views = self.get_media_folders(user_id).await?;
+        if !include_hidden {
+            views.retain(|view| {
+                !self
+                    .hidden
+                    .contains(&Uuid::parse_str(&view.id).expect("view id"))
+            });
+        }
+        Ok(views)
+    }
+    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
@@ -472,9 +493,6 @@ impl UserViewManager for StubUserViews {
             // A virtual view: no library behind it, so no virtual-folder entry.
             item_entity(PLAYLISTS_VIEW_ID, "Playlists", BaseItemKind::UserView),
         ])
-    }
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views(user_id).await
     }
     async fn get_latest_items(
         &self,
@@ -655,10 +673,14 @@ fn virtual_folders() -> ferrofin_api::test_support::FakeVirtualFolders {
 
 /// Builds an [`AppState`] wired with the user-library stubs.
 fn state_as(elevated: bool) -> AppState {
+    state_with_views(elevated, StubUserViews::default())
+}
+
+fn state_with_views(elevated: bool, views: StubUserViews) -> AppState {
     AppState::new(
         Arc::new(StubLibrary),
         Arc::new(OkUsers::default()),
-        Arc::new(StubUserViews),
+        Arc::new(views),
         Arc::new(RecordingUserData::default()),
         Arc::new(FakeMediaSources),
         Arc::new(FakeSessions),
@@ -703,7 +725,16 @@ async fn send_elevated(method: &str, uri: &str, body: Body) -> (StatusCode, Vec<
 }
 
 async fn send_as(method: &str, uri: &str, body: Body, elevated: bool) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state_as(elevated));
+    send_with_state(state_as(elevated), method, uri, body).await
+}
+
+async fn send_with_state(
+    state: AppState,
+    method: &str,
+    uri: &str,
+    body: Body,
+) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state);
     let response = router
         .oneshot(
             Request::builder()
@@ -882,6 +913,62 @@ async fn user_views_returns_query_result() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
     assert_eq!(result.items.len(), 5);
     assert_eq!(result.items[0].id, SHOWS_ID);
+}
+
+// Hiding a home tile must leave it available to both generations of settings clients.
+#[tokio::test]
+async fn hidden_views_can_be_requested_through_both_routes() {
+    for (suffix, expected_count) in [
+        ("", 4),
+        ("&includeHidden=false", 4),
+        ("&includeHidden=true", 5),
+    ] {
+        for route in [
+            format!("/UserViews?userId={USER_ID}{suffix}"),
+            format!("/Users/{USER_ID}/Views?{}", suffix.trim_start_matches('&')),
+        ] {
+            let state = state_with_views(
+                false,
+                StubUserViews {
+                    hidden: vec![MOVIES_ID],
+                },
+            );
+            let (status, body) = send_with_state(state, "GET", &route, Body::empty()).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+            let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("views");
+            assert_eq!(result.items.len(), expected_count, "{route}");
+            assert_eq!(
+                result.items.iter().any(|item| item.id == MOVIES_ID),
+                expected_count == 5,
+                "{route}"
+            );
+        }
+    }
+}
+
+// Grouping is independent of the home tile toggle. The web client saves only
+// the grouping checkboxes returned here, so omitting one clears its setting.
+#[tokio::test]
+async fn hidden_libraries_remain_grouping_options_through_both_routes() {
+    for route in [
+        format!("/UserViews/GroupingOptions?userId={USER_ID}"),
+        format!("/Users/{USER_ID}/GroupingOptions"),
+    ] {
+        let state = state_with_views(
+            false,
+            StubUserViews {
+                hidden: vec![MOVIES_ID],
+            },
+        );
+        let (status, body) = send_with_state(state, "GET", &route, Body::empty()).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        let options: Vec<SpecialViewOptionDto> = serde_json::from_slice(&body).expect("options");
+        let names: Vec<&str> = options
+            .iter()
+            .filter_map(|option| option.name.as_deref())
+            .collect();
+        assert_eq!(names, ["Attic", "Movies", "Shows"], "{route}");
+    }
 }
 
 #[tokio::test]
@@ -1969,9 +2056,6 @@ impl MediaSourceManager for ResumeMediaSources {
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_alternate_versions_batch(
         &self,
         primary_ids: &[Uuid],
@@ -2002,7 +2086,7 @@ fn resume_state(excludes: Vec<Uuid>) -> (AppState, Arc<RecordingResumeLibrary>) 
         Arc::new(OkUsers {
             latest_item_excludes: excludes,
         }),
-        Arc::new(StubUserViews),
+        Arc::new(StubUserViews::default()),
         Arc::new(RecordingUserData::default()),
         Arc::new(ResumeMediaSources),
         Arc::new(ResumeSessions),

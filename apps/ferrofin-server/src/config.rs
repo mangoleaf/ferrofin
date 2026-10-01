@@ -125,6 +125,7 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
+    metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
@@ -153,6 +154,43 @@ enum DbPoolFileValue {
     Count(u32),
     /// A sizing mode by name — only `"auto"` is valid (`db_pool = "auto"`).
     Mode(String),
+}
+
+/// API roots that replace the public hosts of the remote providers a library
+/// scan reaches ([`Config::provider_endpoints`], a test seam). `None` keeps
+/// the provider's public host.
+///
+/// Not here, and why:
+/// - MusicBrainz and the studio artwork repository: each has a real setting
+///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
+/// - LrcLib and ListenBrainz: a scan never calls them (lyrics come from the
+///   "Download missing lyrics" task, similar artists on request), as upstream.
+/// - OpenSubtitles: a scan does not call it yet. Upstream's probe downloads
+///   missing subtitles when a library sets `SubtitleDownloadLanguages`
+///   (`FFProbeVideoInfo.AddExternalSubtitlesAsync`); that is not ported yet,
+///   and Ferrofin downloads them only in the "Download missing subtitles"
+///   task. Porting it needs an `opensubtitles` entry here, or the end-to-end
+///   scan test would reach the real API.
+/// - Image CDNs other than TMDb's: their URLs come from the provider answers
+///   (fanart.tv, TheTVDB, TheAudioDB), which a mock serves.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderEndpoints {
+    /// Replaces `https://api.themoviedb.org/3`.
+    pub tmdb: Option<String>,
+    /// Replaces TMDb's image CDN root, `https://image.tmdb.org/t/p` (the
+    /// artwork URLs TMDb's answers are relative to).
+    pub tmdb_images: Option<String>,
+    /// Replaces `https://www.omdbapi.com/`.
+    pub omdb: Option<String>,
+    /// OpenSubtitles REST endpoint override for integration tests.
+    pub opensubtitles: Option<String>,
+    /// Replaces `https://api4.thetvdb.com/v4`.
+    pub tvdb: Option<String>,
+    /// Replaces `https://webservice.fanart.tv/v3.2`.
+    pub fanart: Option<String>,
+    /// Replaces TheAudioDB's API root (`…/api/v1/json/{key}`).
+    pub audiodb: Option<String>,
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -192,6 +230,12 @@ pub struct Config {
     #[doc(hidden)]
     pub discovery_bind_addr: Option<std::net::SocketAddr>,
 
+    /// Internal provider transport seam: production calls each built-in
+    /// remote provider's public API; the end-to-end scan test points them at
+    /// an in-process mock server. Not a file/env setting.
+    #[doc(hidden)]
+    pub provider_endpoints: ProviderEndpoints,
+
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
 
@@ -206,8 +250,8 @@ pub struct Config {
     /// (`HostNetworkInfo.base_url`). Empty string = root.
     pub base_url: String,
 
-    /// OMDb (omdbapi.com) API key, enabling the Rotten Tomatoes critic rating.
-    /// Empty = disabled (RT ratings stay unpopulated). From `FERROFIN_OMDB_KEY` or
+    /// OMDb (omdbapi.com) API key override. Empty uses Jellyfin's built-in key.
+    /// From `FERROFIN_OMDB_KEY` or
     /// `config.toml`.
     pub omdb_api_key: String,
 
@@ -297,6 +341,20 @@ pub struct Config {
     /// out of the API `ServerConfiguration` so `/System/Configuration` stays
     /// byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
+
+    /// Bucket boundaries (seconds, ascending) of the library-scan duration
+    /// histograms (`ferrofin_library_scan_duration_seconds`,
+    /// `ferrofin_library_scan_pass_duration_seconds`). `None` = the default,
+    /// 1–2.5–5 per decade from 0.001 s to 5000 s
+    /// ([`ferrofin_core::scan_metrics::DEFAULT_DURATION_BUCKETS`]). Resolved
+    /// `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` env (comma-separated, e.g.
+    /// `0.01,0.1,1,10,100,1000`) > `metrics_scan_duration_buckets` in
+    /// `config.toml` (an array of numbers) > default. Only consulted when
+    /// `EnableMetrics` is set. Like the sampler interval, a bad value never
+    /// stops the server: the metrics install refuses a list that is empty,
+    /// non-finite, not above zero or not strictly increasing, warns, and uses
+    /// the default. A bootstrap knob only, never a `ServerConfiguration` field.
+    pub metrics_scan_duration_buckets: Option<Vec<f64>>,
 
     /// How long a graceful shutdown/restart waits for in-flight requests before
     /// the remaining connections are aborted, in seconds. Default 30 — ASP.NET's
@@ -564,6 +622,7 @@ impl Config {
             web_dir,
             bind_addr,
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
+            provider_endpoints: ProviderEndpoints::default(),
             port,
             https_port,
             published_url,
@@ -587,6 +646,11 @@ impl Config {
                 .or(file.disable_extensions)
                 .unwrap_or(false),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
+            metrics_scan_duration_buckets: env
+                .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| parse_bucket_list(&raw))
+                .or(file.metrics_scan_duration_buckets),
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
@@ -673,6 +737,7 @@ impl Config {
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
             discovery_bind_addr: None,
+            provider_endpoints: ProviderEndpoints::default(),
             port: 0,
             https_port: 0,
             published_url: None,
@@ -694,6 +759,7 @@ impl Config {
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
+            metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
@@ -721,6 +787,15 @@ fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
     parse_var(env, "FERROFIN_METRICS_SAMPLE_INTERVAL")
         .or(file)
         .filter(|&s| s > 0)
+}
+
+/// Parses a comma-separated list of bucket boundaries (seconds). An entry
+/// that is not a number becomes `NaN`, so the metrics install refuses the
+/// whole list with a warning instead of silently installing a shorter one.
+fn parse_bucket_list(raw: &str) -> Vec<f64> {
+    raw.split(',')
+        .map(|entry| entry.trim().parse().unwrap_or(f64::NAN))
+        .collect()
 }
 
 /// Resolves the SQLite pool-size override: `FERROFIN_DB_POOL` env (integer or
@@ -1117,6 +1192,48 @@ mod tests {
             Config::load_from(cli(), &env).unwrap().enable_metrics,
             Some(false)
         );
+    }
+
+    #[test]
+    fn scan_duration_buckets_env_beats_file_and_defers_when_unset() {
+        assert_eq!(
+            Config::load_from(Cli::default(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            None,
+            "unset: the default buckets"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        // Integers and floats mix in the TOML array.
+        std::fs::write(&toml, "metrics_scan_duration_buckets = [0.5, 30, 3600]\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.5, 30.0, 3600.0])
+        );
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", " 0.1, 1 ,10");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.1, 1.0, 10.0])
+        );
+        // A typo is kept as NaN for the install to refuse (with a warning),
+        // never dropped into a silently shorter list.
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", "0.1,1s,10");
+        let buckets = Config::load_from(cli(), &env)
+            .unwrap()
+            .metrics_scan_duration_buckets
+            .expect("set");
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets[1].is_nan());
+        assert!(ferrofin_core::scan_metrics::validate_duration_buckets(&buckets).is_err());
     }
 
     #[test]

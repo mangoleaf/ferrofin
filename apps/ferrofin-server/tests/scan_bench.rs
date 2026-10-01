@@ -194,12 +194,13 @@ async fn scan_bench() {
     report("RESCAN    ", &scanner).await;
 }
 
-/// Runs one scan and prints its item count, wall time and items/second.
+/// Runs one scan and prints its item counts, wall time and items/second.
 async fn report(label: &str, scanner: &ferrofin_core::LibraryScanner) {
     let t = Instant::now();
-    let count = scanner.scan_all().await.unwrap();
+    let outcome = scanner.scan_all().await.unwrap();
     let elapsed = t.elapsed().as_secs_f64();
+    let count = outcome.created + outcome.updated + outcome.unchanged;
     #[allow(clippy::cast_precision_loss)]
     let rate = count as f64 / elapsed;
-    eprintln!("{label}: {count} items in {elapsed:.3}s => {rate:.1} items/s");
+    eprintln!("{label}: {count} items ({outcome:?}) in {elapsed:.3}s => {rate:.1} items/s");
 }

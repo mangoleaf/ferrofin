@@ -425,9 +425,6 @@ impl ferrofin_traits::library::MediaSourceManager for NoStaticSources {
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
         unimplemented!("unused")
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }

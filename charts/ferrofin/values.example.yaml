@@ -133,6 +133,11 @@ ferrofin:
       value: "all"
     - name: NVIDIA_DRIVER_CAPABILITIES
       value: "all"
+  # Metadata provider keys from an existing Secret (e.g. FERROFIN_OMDB_KEY,
+  # FERROFIN_TVDB_KEY), created once in the release namespace.
+  # envFrom:
+  #   - secretRef:
+  #       name: <ferrofin-provider-keys>
   config:
     # Move the cache dir explicitly if you don't want the {data_dir}/cache default.
     # If you set this, mount your cache volume HERE instead of /data/cache.
@@ -141,9 +146,20 @@ ferrofin:
     # The URL clients reach this server on (behind your ingress/reverse proxy).
     # FERROFIN_PUBLISHED_URL: "https://ferrofin.example.com"
 
-    # Prometheus /metrics endpoint (scraped by the ServiceMonitor below).
+    # Prometheus /metrics endpoint (scraped by the ServiceMonitor below; charted
+    # by the Grafana dashboards further down).
     FERROFIN_ENABLE_METRICS: "true"
     FERROFIN_METRICS_SAMPLE_INTERVAL: "30"
+    # Library-scan duration histogram buckets (seconds, ascending). Unset = the
+    # default 1-2.5-5 per decade from 0.001 to 5000; set it only if your scans
+    # routinely fall outside that range (a first scan of a huge NFS library).
+    # FERROFIN_METRICS_SCAN_DURATION_BUCKETS: "0.01,0.1,1,10,60,300,1800,7200"
+
+    # Log filter (EnvFilter syntax). Scan and provider detail is at debug.
+    # FERROFIN_LOG: "info"
+    # How many ffprobe processes a library scan runs at once (default: 8, capped
+    # at the core count). Lower it for libraries on NFS or spinning disks.
+    # FERROFIN_SCAN_PROBE_CONCURRENCY: "4"
 
     # Export sampled request traces over OTLP gRPC to your collector (→ Tempo/Jaeger).
     # Off unless set; stdout stays structured JSON with a trace_id on each line.
@@ -182,6 +198,21 @@ metrics:
     interval: 30s
 
 # -----------------------------------------------------------------------------
+# Grafana dashboards (golden signals, deep dive, library scans) as a ConfigMap
+# for the Grafana dashboard sidecar (kube-prometheus-stack / grafana chart with
+# sidecar.dashboards.enabled). The label and folder annotation below are the
+# sidecar's usual defaults; set them to whatever your sidecar watches.
+# -----------------------------------------------------------------------------
+dashboards:
+  enabled: true
+  # Only when the sidecar watches a single namespace (e.g. Grafana's own):
+  # namespace: <grafana-namespace>
+  label: grafana_dashboard
+  labelValue: "1"
+  folderAnnotation: grafana_folder
+  folder: Ferrofin
+
+# -----------------------------------------------------------------------------
 # Ingress — expose Ferrofin outside the cluster. Pick ingress OR httpRoute.
 # -----------------------------------------------------------------------------
 # ingress:
@@ -198,3 +229,11 @@ metrics:
 #     - secretName: ferrofin-tls
 #       hosts:
 #         - ferrofin.example.com
+#
+# httpRoute:            # Gateway API alternative to ingress
+#   enabled: true
+#   parentRefs:
+#     - name: <gateway>
+#       namespace: <gateway-namespace>
+#   hostnames:
+#     - ferrofin.example.com

@@ -79,6 +79,10 @@ pub enum MetadataRefreshMode {
 /// to the fields the manager surface actually needs. [`Default`] mirrors the
 /// C# constructor: both modes `Default` (fetch what is missing), nothing
 /// replaced.
+// Upstream's independent flags, one field each (`ReplaceAllMetadata`,
+// `ReplaceAllImages`, `RemoveOldMetadata`, `ForceSave`,
+// `RegenerateTrickplay`): they are not states of one machine.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataRefreshOptions {
     /// How metadata should be (re)fetched.
@@ -102,9 +106,19 @@ pub struct MetadataRefreshOptions {
     /// (C# `MetadataService.RefreshWithProviders` skips its "add existing
     /// metadata to provider result" `MergeData` when this is set), and with
     /// `replace_all_images` the existing images are removed first. Only the
-    /// Identify flow (`POST /Items/RemoteSearch/Apply/{itemId}`) sets it —
-    /// picking a new record must not leave the old record's genres behind.
+    /// Identify flow (`POST /Items/RemoteSearch/Apply/{itemId}`) and a folder
+    /// refresh with `ReplaceAllMetadata` (`ItemRefreshController`:
+    /// `RemoveOldMetadata = replaceAllMetadata`) set it — picking a new record
+    /// must not leave the old record's genres behind.
     pub remove_old_metadata: bool,
+    /// `MetadataRefreshOptions.ForceSave`: save every refreshed item whatever
+    /// the refresh changed. The scan triggers leave it off; the item-refresh
+    /// route sets it by [`Self::for_item_refresh`]'s rule.
+    pub force_save: bool,
+    /// `MetadataRefreshOptions.RegenerateTrickplay`: replace an item's
+    /// trickplay tiles during the refresh (upstream's `TrickplayProvider`
+    /// honours it only in a `FullRefresh`).
+    pub regenerate_trickplay: bool,
 }
 
 impl Default for MetadataRefreshOptions {
@@ -117,6 +131,37 @@ impl Default for MetadataRefreshOptions {
             replace_all_images: false,
             search_result: None,
             remove_old_metadata: false,
+            force_save: false,
+            regenerate_trickplay: false,
+        }
+    }
+}
+
+impl MetadataRefreshOptions {
+    /// The options `POST /Items/{itemId}/Refresh` refreshes with — port of
+    /// `ItemRefreshController.RefreshItem` (`ItemRefreshController.cs:76-89`):
+    /// `ForceSave` for a full refresh of either kind or any replace, and
+    /// `RemoveOldMetadata` exactly when replacing all metadata.
+    #[must_use]
+    pub fn for_item_refresh(
+        metadata_refresh_mode: MetadataRefreshMode,
+        image_refresh_mode: MetadataRefreshMode,
+        replace_all_metadata: bool,
+        replace_all_images: bool,
+        regenerate_trickplay: bool,
+    ) -> Self {
+        Self {
+            metadata_refresh_mode,
+            image_refresh_mode,
+            replace_all_metadata,
+            replace_all_images,
+            search_result: None,
+            remove_old_metadata: replace_all_metadata,
+            force_save: metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+                || image_refresh_mode == MetadataRefreshMode::FullRefresh
+                || replace_all_images
+                || replace_all_metadata,
+            regenerate_trickplay,
         }
     }
 }
@@ -454,5 +499,36 @@ mod tests {
         assert_eq!(o.metadata_refresh_mode, MetadataRefreshMode::Default);
         assert_eq!(o.image_refresh_mode, MetadataRefreshMode::Default);
         assert!(o.search_result.is_none());
+        assert!(!o.force_save);
+        assert!(!o.regenerate_trickplay);
+    }
+
+    /// `ItemRefreshController.cs:76-89`: `ForceSave` is any full refresh or
+    /// any replace, `RemoveOldMetadata` is `replaceAllMetadata`. The three
+    /// dashboard choices (`refreshdialog.js:76-90`) map as the plan's table.
+    #[test]
+    fn item_refresh_options_follow_the_controller_rule() {
+        use MetadataRefreshMode::{Default, FullRefresh, None as NoRefresh};
+        let scan = MetadataRefreshOptions::for_item_refresh(Default, Default, false, false, false);
+        assert!(!scan.force_save && !scan.remove_old_metadata);
+        let missing =
+            MetadataRefreshOptions::for_item_refresh(FullRefresh, FullRefresh, false, true, true);
+        assert!(missing.force_save && !missing.remove_old_metadata);
+        assert!(missing.replace_all_images && missing.regenerate_trickplay);
+        let replace =
+            MetadataRefreshOptions::for_item_refresh(FullRefresh, FullRefresh, true, false, false);
+        assert!(replace.force_save && replace.remove_old_metadata);
+        // The route's own defaults (`None`/`None`) save nothing by force.
+        let bare =
+            MetadataRefreshOptions::for_item_refresh(NoRefresh, NoRefresh, false, false, false);
+        assert!(!bare.force_save);
+        assert!(
+            MetadataRefreshOptions::for_item_refresh(NoRefresh, FullRefresh, false, false, false)
+                .force_save
+        );
+        assert!(
+            MetadataRefreshOptions::for_item_refresh(NoRefresh, NoRefresh, false, true, false)
+                .force_save
+        );
     }
 }

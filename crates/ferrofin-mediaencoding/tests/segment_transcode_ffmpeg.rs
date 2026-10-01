@@ -263,8 +263,13 @@ async fn manager_start_ffmpeg_ts_waits_for_first_segment_then_completes() {
         .await
         .expect("start_ffmpeg");
 
-    // Step 4: the wait target — the first segment — is a non-empty file.
+    // Step 4: start_ffmpeg waits for creation; ffmpeg may not have flushed
+    // bytes yet. Wait for data before checking the first segment's contents.
     assert!(first_segment.exists(), "out0.ts should exist");
+    wait_until(Duration::from_secs(20), || {
+        std::fs::metadata(&first_segment).is_ok_and(|m| m.len() > 0)
+    })
+    .await;
     assert!(
         std::fs::metadata(&first_segment).unwrap().len() > 0,
         "out0.ts should be non-empty"

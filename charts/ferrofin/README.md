@@ -43,7 +43,11 @@ registry, set `image.repository` and `imagePullSecrets` in your values.
 | `httpRoute.enabled` | `false` | Gateway API `HTTPRoute` (alternative to ingress) |
 | `networkPolicy.enabled` | `false` | Pod isolation (needs a policy-enforcing CNI) |
 | `serviceAccount.create` | `true` | Dedicated service account |
-| `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | Scrape Ferrofin's Prometheus `/metrics` endpoint via a `ServiceMonitor` |
+| `metrics.enabled` / `metrics.serviceMonitor.enabled` | `false` | Scrape Ferrofin's Prometheus `/metrics` endpoint via a `ServiceMonitor` (enable metrics in the app too: `FERROFIN_ENABLE_METRICS=true`) |
+| `dashboards.enabled` | `false` | Ship the Grafana dashboards as a ConfigMap for a Grafana dashboard sidecar |
+| `dashboards.label` / `dashboards.labelValue` | `grafana_dashboard` / `"1"` | The label the sidecar selects dashboard ConfigMaps by |
+| `dashboards.folderAnnotation` / `dashboards.folder` | `grafana_folder` / `Ferrofin` | The annotation the sidecar reads the Grafana folder from, and the folder (`""` = no annotation) |
+| `dashboards.namespace` | `""` (release namespace) | Where the ConfigMap goes, for a sidecar that watches one namespace |
 
 To expose Ferrofin on most clusters, enable ingress:
 
@@ -61,6 +65,48 @@ ingress:
 
 Health probes target Ferrofin's real endpoints (`GET /health/live`, `GET /health/ready`);
 there is no Jellyfin-style `/health`.
+
+## Grafana dashboards
+
+With `dashboards.enabled`, the chart renders one ConfigMap holding Ferrofin's three
+Grafana dashboards — **Golden Signals** (`ferrofin-golden-signals`), **Deep Dive**
+(`ferrofin-deep-dive`) and **Library Scans** (`ferrofin-library-scans`) — for the Grafana
+dashboard sidecar that the `grafana` and `kube-prometheus-stack` charts ship
+(`sidecar.dashboards.enabled: true`). The sidecar loads every ConfigMap carrying its
+label and files it in the folder named by its folder annotation; the defaults match
+the sidecar's usual `grafana_dashboard: "1"` label and `grafana_folder` annotation:
+
+```yaml
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+dashboards:
+  enabled: true
+  folder: Ferrofin
+ferrofin:
+  config:
+    FERROFIN_ENABLE_METRICS: "true"
+```
+
+The dashboards pick their Prometheus through a `datasource` variable, so they need no
+datasource uid, and every query is scoped to a `job` variable (Golden Signals and Deep
+Dive default to the job `ferrofin`, which the ServiceMonitor produces for a release
+named `ferrofin`). What each panel shows, and what healthy looks like, is in
+[`contrib/metrics/README.md`](../../contrib/metrics/README.md). Server-side metric
+settings are ordinary environment variables, e.g. the library-scan histogram buckets:
+
+```yaml
+ferrofin:
+  config:
+    FERROFIN_METRICS_SCAN_DURATION_BUCKETS: "0.01,0.1,1,10,60,300,1800,7200"
+```
+
+The JSON files under `dashboards/` are **copies** of `contrib/metrics/grafana-*.json`:
+Helm reads only files inside the chart, and tools that render the chart straight from
+git (Argo CD, for one) reject a symlink that points outside it. After editing a dashboard in `contrib/metrics/`, copy it
+over (`cp contrib/metrics/grafana-*.json charts/ferrofin/dashboards/`); the
+`dashboards` test in `apps/ferrofin-server` fails while the copies differ.
 
 ## LAN server discovery
 

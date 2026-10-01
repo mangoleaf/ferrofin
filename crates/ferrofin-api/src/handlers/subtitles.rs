@@ -696,7 +696,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// Ports the OpenSubtitles plugin's login-check action: the posted
 /// `{ApiKey,Username,Password}` body is validated by attempting a real login via
 /// the provider. `200` means the credentials work; a rejected login is `401`, a
-/// missing key `400`.
+/// missing account and API key override `400`. The API key is optional when
+/// account credentials are provided (Jellyfin's shared key is used).
 async fn validate_open_subtitles_login(
     RequireAuth(_auth): RequireAuth,
     State(state): State<AppState>,

@@ -1222,48 +1222,6 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         }
         Ok(())
     }
-
-    async fn refresh_media_streams(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        let Some(item) = self.items.retrieve_item(item_id).await? else {
-            return Ok(());
-        };
-        let is_audio = item.media_type.as_deref() == Some("Audio");
-        let is_media = is_audio || item.media_type.as_deref() == Some("Video");
-        if item.is_folder || !is_media || item.path.is_none() {
-            return Ok(());
-        }
-        let request = ferrofin_traits::media_encoding::MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                path: item.path.clone(),
-                ..Default::default()
-            },
-            extract_chapters: false,
-            media_is_audio: is_audio,
-        };
-        // Re-probe and rewrite the item's stream rows (which carry the codec/HDR/
-        // Dolby-Vision fields). Duration/size persistence lives with the item
-        // repository's scan path, not this manager, so they are left as scanned.
-        let probed = self.encoder.get_media_info(&request).await?;
-        let streams: Vec<_> = probed
-            .media_streams
-            .iter()
-            .map(|s| stream_dto_to_entity(&item.id, s))
-            .collect();
-        self.streams.save_media_streams(item_id, &streams).await?;
-        // Only the video prober persists attachments (`FFProbeVideoInfo`); the
-        // audio prober never writes the attachment table.
-        if !is_audio {
-            let attachments: Vec<_> = probed
-                .media_attachments
-                .iter()
-                .map(|a| attachment_dto_to_entity(&item.id, a))
-                .collect();
-            self.attachments
-                .save_media_attachments(item_id, &attachments)
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -211,8 +211,15 @@ struct OkAuth {
 impl AuthService for OkAuth {
     async fn authenticate(
         &self,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
+        if !request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ServiceError::unauthorized("no credentials"));
+        }
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
@@ -226,8 +233,15 @@ impl AuthService for OkAuth {
 impl AuthorizationContext for OkAuth {
     async fn get_authorization_info(
         &self,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
+        if !request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ServiceError::unauthorized("no credentials"));
+        }
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
@@ -1460,6 +1474,24 @@ async fn untagged_image_is_public_and_client_no_cache_is_mirrored() {
     );
 }
 
+#[tokio::test]
+async fn file_metadata_validators_do_not_override_image_tags() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let path = format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123");
+    for condition in ["If-Match", "If-None-Match"] {
+        let (status, headers, body) = send_with_headers(
+            &s,
+            &path,
+            &[("Cache-Control", "no-cache"), (condition, "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"PNGDATA");
+        assert!(headers.get("etag").is_none());
+    }
+}
+
 // The legacy `/Users/{userId}/Images/{imageType}[/{index}]` forms (upstream
 // [Obsolete] + hidden from OpenAPI; jellyfin-web's apiclient still requests
 // avatars this way) forward to the /UserImage handlers — the path's image
@@ -1530,4 +1562,57 @@ async fn legacy_user_image_upload_and_delete_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn profile_images_are_public_on_all_read_routes() {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    for method in ["GET", "HEAD"] {
+        for path in [
+            format!("/UserImage?userId={USER_ID}"),
+            format!("/Users/{USER_ID}/Images/Primary"),
+            format!("/Users/{USER_ID}/Images/Primary/0"),
+        ] {
+            let app = state(&s);
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                if method == "HEAD" {
+                    b"".as_slice()
+                } else {
+                    b"PROFILE".as_slice()
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn anonymous_profile_image_requires_a_nonempty_user_id() {
+    let s = stubs(String::new(), String::new());
+    for path in [
+        "/UserImage".to_owned(),
+        format!("/UserImage?userId={}", Uuid::nil()),
+    ] {
+        let app = state(&s);
+        let response = create_router(app)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

@@ -58,9 +58,12 @@ jobs:
 
 
   shell-tests:
-    # The shell tooling has its own tests: scripts/version.sh (release versioning) and
+    # The shell tooling has its own tests: scripts/version.sh (release versioning),
     # adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
-    # throwaway SQLite files; the real fixtures never run here).
+    # throwaway SQLite files; the real fixtures never run here) and verify/ (the live
+    # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
+    # against a python3 static file server, and whole runs against verify/tests/fake_server.py,
+    # which plays back a scripted server's scans).
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -69,10 +72,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3
-      - run: shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats
-      - run: bats scripts/tests adoption/tests
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil
+      - run: shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats verify/tests/verify.bats
+      - run: bats scripts/tests adoption/tests verify/tests
 
   coverage:
     runs-on: ubuntu-latest
@@ -112,7 +115,10 @@ jobs:
             # `-p X` still instruments X's workspace deps, so their (uncovered) source
             # lands in the TOTAL the gate compares against. Exclude every sibling.
             others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
-            cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-              --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
+            if ! cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
+              --ignore-filename-regex "(crates/($others)|apps)/"; then
+              echo "::error::Tests or coverage failed for $crate"
+              fail=1
+            fi
           done
           exit $fail

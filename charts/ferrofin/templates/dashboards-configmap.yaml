@@ -1,0 +1,31 @@
+{{- if .Values.dashboards.enabled }}
+# Ferrofin's Grafana dashboards (golden signals, deep dive, library scans) for a
+# Grafana dashboard sidecar, which loads every ConfigMap carrying the configured
+# label and files it under the folder named by the configured annotation. The
+# JSON files are copies of contrib/metrics/grafana-*.json (Helm reads only files
+# inside the chart); a test fails when the copies drift.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ferrofin.fullname" . }}-dashboards
+  namespace: {{ .Values.dashboards.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "ferrofin.labels" . | nindent 4 }}
+    {{- with .Values.dashboards.label }}
+    {{ . }}: {{ $.Values.dashboards.labelValue | quote }}
+    {{- end }}
+    {{- with .Values.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or .Values.dashboards.folderAnnotation .Values.dashboards.annotations }}
+  annotations:
+    {{- with .Values.dashboards.folderAnnotation }}
+    {{ . }}: {{ $.Values.dashboards.folder | quote }}
+    {{- end }}
+    {{- with .Values.dashboards.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+data:
+{{ (.Files.Glob "dashboards/*.json").AsConfig | indent 2 }}
+{{- end }}

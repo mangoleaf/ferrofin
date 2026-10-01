@@ -475,18 +475,38 @@ pub async fn build_app_state(
     // The shared TMDB client — the scan's automatic artwork, the remote-search
     // ("Identify") providers, and the remote-image ("Choose Image") methods all
     // use Jellyfin's built-in key.
-    let tmdb_client = Arc::new(ferrofin_providers::TmdbClient::new());
+    //
+    // `config.provider_endpoints` is a test seam (never set from a file or the
+    // environment): the end-to-end scan test points every provider a scan
+    // reaches at its mock server. Unset, each client keeps its public host.
+    let endpoints = &config.provider_endpoints;
+    let mut tmdb_client = ferrofin_providers::TmdbClient::new();
+    if let Some(base) = endpoints.tmdb.as_deref() {
+        tmdb_client = tmdb_client.with_base_url(base);
+    }
+    if let Some(root) = endpoints.tmdb_images.as_deref() {
+        tmdb_client = tmdb_client.with_image_root(root);
+    }
+    let tmdb_client = Arc::new(tmdb_client);
     let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
     // TheTVDB — the TV authority. Ships on with the built-in project key (like
     // TMDB); a user key/PIN override enables their subscription tier.
-    let the_tvdb = Arc::new(ferrofin_providers::TvdbClient::with_config(
+    let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
-    ));
+    );
+    let the_tvdb = Arc::new(match endpoints.tvdb.as_deref() {
+        Some(base) => the_tvdb.with_base_url(base),
+        None => the_tvdb,
+    });
     // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
-    // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
-    // `omdb_api_key`) is set: every call returns nothing without a key.
-    let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
+    // critic score TMDB has no data for. Uses Jellyfin's built-in key unless
+    // FERROFIN_OMDB_KEY (config `omdb_api_key`) overrides it.
+    let omdb_client = ferrofin_providers::OmdbClient::new(&config.omdb_api_key);
+    let omdb_client = Arc::new(match endpoints.omdb.as_deref() {
+        Some(base) => omdb_client.with_base_url(base),
+        None => omdb_client,
+    });
     // MusicBrainz — the music authority (keyless; a mirror URL lifts the 1
     // req/sec limit). Shared by the scan's enrichment pass and the
     // MusicAlbum/MusicArtist "Identify" providers.
@@ -496,14 +516,21 @@ pub async fn build_app_state(
     ));
     // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
     // (built-in free key). Shared by the scan and the "Choose Image" methods.
-    let audiodb_client = Arc::new(ferrofin_providers::AudioDbClient::new());
+    let audiodb_client = Arc::new(match endpoints.audiodb.as_deref() {
+        Some(base) => ferrofin_providers::AudioDbClient::with_base_url(base),
+        None => ferrofin_providers::AudioDbClient::new(),
+    });
     // fanart.tv — logos/clear-art/disc/banners keyed off the Tmdb/Imdb/Tvdb/
     // MusicBrainz ids. Built-in key works keyless; FERROFIN_FANART_KEY adds a
     // personal client_key. Shared by the scan and the "Choose Image" methods.
-    let fanart_client = Arc::new(ferrofin_providers::FanartClient::new(
+    let fanart_client = ferrofin_providers::FanartClient::new(
         (!config.fanart_personal_api_key.is_empty())
             .then(|| config.fanart_personal_api_key.clone()),
-    ));
+    );
+    let fanart_client = Arc::new(match endpoints.fanart.as_deref() {
+        Some(base) => fanart_client.with_base_url(base),
+        None => fanart_client,
+    });
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),
@@ -643,6 +670,7 @@ pub async fn build_app_state(
         Arc::new(FerrofinActivityManager::new(db.clone()));
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
+            .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
                 std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
@@ -836,7 +864,7 @@ pub async fn build_app_state(
             .with_studios(Arc::clone(&studios_client))
             // The other "Choose Image" providers: fanart.tv (movies/series/
             // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
-            // (movies/trailers/episodes; inert without an API key).
+            // (movies/trailers/episodes; shared API key by default).
             .with_fanart(Arc::clone(&fanart_client))
             .with_audiodb(Arc::clone(&audiodb_client))
             .with_omdb(Arc::clone(&omdb_client))
@@ -978,6 +1006,9 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
     )
     .with_id_derivation(id_derivation)
+    // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
+    // validation (the same expansion every image reader applies).
+    .with_virtual_paths(virtual_paths.clone())
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
@@ -1012,8 +1043,7 @@ pub async fn build_app_state(
     .with_fanart(Arc::clone(&fanart_client))
     // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
     // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
-    // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
-    // config.toml `omdb_api_key`).
+    // Uses the built-in key by default; gated by the library's fetcher settings.
     .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
@@ -1032,7 +1062,23 @@ pub async fn build_app_state(
     .with_studio_images(Arc::clone(&studios_client))
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
-    .with_image_processor(Arc::clone(&image_processor));
+    .with_image_processor(Arc::clone(&image_processor))
+    // The SERVER-WIDE per-item-type MetadataOptions: the fetcher gate for a
+    // kind a library saved no checkboxes for, and for an item in no library
+    // (a by-name artist), as upstream's `IsMetadataFetcherEnabled` falls
+    // back to them. Read live, once per scan.
+    .with_metadata_options({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().metadata_options.clone()
+    })
+    // The `metadata` named configuration's "Date added behavior for new
+    // content" (Dashboard → Libraries → Display): whether a new item is
+    // dated by its file's creation time or by the moment the scan finds it.
+    // Read live, once per scan, from the document the dashboard saves.
+    .with_metadata_configuration({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.metadata_configuration()
+    });
     // Scan-progress log cadence (bootstrap knob); `None` keeps the 100-item default.
     if let Some(every) = config.scan_progress_every {
         scanner = scanner.with_progress_every(every as usize);
@@ -1325,10 +1371,12 @@ pub async fn build_app_state(
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
 
+    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins));
+    if let Some(endpoint) = &config.provider_endpoints.opensubtitles {
+        opensubtitles = opensubtitles.with_base_url(endpoint);
+    }
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
-        vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
-            Arc::clone(&plugins),
-        ))];
+        vec![Arc::new(opensubtitles)];
     let subtitles: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
         Arc::new(FerrofinSubtitleManager::new(
             db.clone(),
@@ -1337,6 +1385,12 @@ pub async fn build_app_state(
             subtitle_providers,
             paths.internal_metadata_path(),
         ));
+    let subtitle_downloader =
+        Arc::new(ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
+            &subtitles,
+            Arc::clone(&media_stream_repository),
+        ));
+    library_scanner.attach_subtitle_downloader(Arc::clone(&subtitle_downloader));
     let media_segments: Arc<dyn ferrofin_traits::media_segments::MediaSegmentManager> = Arc::new(
         FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
     );
@@ -1466,8 +1520,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
-            Arc::clone(&subtitles),
-            Arc::clone(&media_stream_repository),
+            Arc::clone(&subtitle_downloader),
         )));
         task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
             Arc::clone(&library),

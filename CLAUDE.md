@@ -69,7 +69,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
-| `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb needs a key) |
+| `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb uses a built-in key) |
 | `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
@@ -95,7 +95,7 @@ bodies is **legacy debt to remove by porting the thing**, not a precedent to lea
   the upstream C# (a checkout of github.com/jellyfin/jellyfin at `UPSTREAM_TAG`), test it,
   and run it live.
 - The only accepted divergences are the ones listed under **Current scope** below (native .NET
-  plugin loading, SSDP discovery, OMDb without a key). Adding to that list is the owner's call,
+  plugin loading, SSDP discovery). Adding to that list is the owner's call,
   never an agent's.
 - Never write the word "deferred" into a classification, a doc, or a comment as a reason to
   skip work. If something cannot be finished in the current task, say so in the summary and
@@ -370,10 +370,11 @@ The real remaining gaps are **by design**, not un-ported routes:
   supported set, so an idle GPU is never a silent mystery. Supporting one means porting
   its chain **and** its `GetEncoderParam`/`GetVideoBitrateParam` arms, verifying on real
   hardware, and adding it to `hardware_path_is_ported`.
-- **OMDb** ships compiled in but **inert without an API key** (`FERROFIN_OMDB_KEY` /
-  config `omdb_api_key`). Every other remote provider (TMDB/TVDB/MusicBrainz/AudioDb/
-  fanart/Studio Images) is on by default with a built-in key, gated per library by the
-  "Metadata downloaders" / "Image fetchers" checkboxes.
+- **OMDb** uses Jellyfin's shared key by default; `FERROFIN_OMDB_KEY` / config
+  `omdb_api_key` optionally overrides it. Remote providers use built-in keys where
+  needed and are gated per library by "Metadata downloaders" / "Image fetchers".
+  OpenSubtitles also has a shared application key; downloads still require the
+  user's account credentials, and its `ApiKey` setting is an optional override.
 
 The design invariant still holds for any **future** route added to the contract: every path
 is registered, an un-ported one returns `501` (never `404`), and the pattern is — write the

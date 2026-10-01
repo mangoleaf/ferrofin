@@ -7,17 +7,23 @@
 //! - `POST /Items/{itemId}/ContentType` — sets (or clears) the configured
 //!   content-type override for the item's folder in the server configuration.
 //! - `POST /Items/{itemId}/Refresh` — queues a metadata/image refresh for the
-//!   item at high priority.
+//!   item at high priority: a folder's refresh is a scan of its subtree, a
+//!   file item's a scan of its own path, both with the request's options; an
+//!   item with no file of its own refreshes through the provider manager.
 //! - `GET /Items/{itemId}/MetadataEditor` — the reference data (parental ratings,
 //!   countries, cultures, external-id descriptors, content-type options) a client
 //!   needs to render the item's metadata editor.
 //!
-//! Faithfulness notes / deferrals: the C# `UpdateItem` cascades edits onto a
-//! series' seasons/episodes and an album's tracks (and queues a provider refresh
-//! when a series' display order changes). Those walks need the un-ported `Folder`
-//! OOP child tree, so the portable seam applies the edit to the addressed row and
-//! defers the cascades. Every scalar/collection
-//! field on the row is updated faithfully.
+//! The edit is applied to the addressed row, its `LockedFields` and external
+//! ids, then cascaded as the C# `UpdateItem` does: a series' name, rating and
+//! tag edits onto its seasons and their episodes, a season's onto its
+//! episodes, an album's onto its tracks (each child's own `LockedFields`
+//! honoured), and a change of `LockData` onto every descendant of a folder.
+//!
+//! TODO(parity, open work item): two parts of `UpdateItem` are not ported
+//! yet — the `request.People` write (`_libraryManager.UpdatePeople`) and the
+//! `FullRefresh`/`ReplaceAllMetadata` refresh queued when a series'
+//! `DisplayOrder` changes (`ItemUpdateController.cs:83-86,120-132`).
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -26,8 +32,14 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{MetadataEditorInfo, NameGuidPair, NameValuePair};
+use ferrofin_model::entities::MetadataField;
+use ferrofin_traits::library::ScanTarget;
+use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+
+use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -62,34 +74,18 @@ pub(crate) async fn update_item(
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    let before = item.clone();
+    // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
+    let lock_changed = item.is_locked != request.lock_data.unwrap_or(false);
+    let current_tags = split_list(item.tags.as_deref());
+    // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
+    // 418`) — exactly, inside `apply_update`. Editing a field never locks the
+    // row: the scan merges onto the stored row and honours `LockedFields`,
+    // so an unlocked edit survives a rescan that runs no provider.
     apply_update(&mut item, &request);
-    // TODO(parity, open work item — NOT an accepted divergence): v10.11.8
-    // `Jellyfin.Api/Controllers/ItemUpdateController.cs:389` is exactly
-    // `item.IsLocked = request.LockData ?? false;` — editing a field never
-    // locks the row. Ferrofin auto-locks because its library scan rebuilds
-    // rows from disk and preserves the editable columns only for locked rows
-    // ("the scan upsert writes `excluded` for unlocked rows", see
-    // `library_scan.rs`), so without this an edit is reverted by the next scan.
-    //
-    // Measured consequence, not theoretical: on the parity lab an item edited
-    // through this handler comes back `LockData=True` where Jellyfin has
-    // `False`, and because `library_scan.rs::persist_item_media` then skips the
-    // whole artwork pass for a locked row, that item's Primary freezes at
-    // whatever was stored — while Jellyfin re-discovers the sidecar
-    // `poster.jpg` on every scan (`ILocalImageProvider` short-circuits BEFORE
-    // the `IsLocked` check in `MediaBrowser.Providers/Manager/
-    // ProviderManager.cs:412`).
-    //
-    // Un-defer path (the two halves MUST land together — see the twin note in
-    // `library_scan.rs::persist_item_media`): port `MetadataService`'s per-field
-    // merge rules so an edited column survives a scan because `LockedFields` /
-    // `shouldReplace` says so, then delete this block and un-gate local image
-    // discovery. Removing either half alone regresses the other.
-    if !item.is_locked && editor_fields_changed(&before, &item) {
-        item.is_locked = true;
-    }
-    state.library.update_items(&[item], None).await?;
+    state
+        .library
+        .update_items(std::slice::from_ref(&item), None)
+        .await?;
     // External ids live in their own table (`BaseItemProviders`), so they are a
     // second write rather than a column on the row. C# strips empty values and
     // then ASSIGNS the dictionary, which is why this replaces the set instead of
@@ -106,6 +102,25 @@ pub(crate) async fn update_item(
             .library
             .update_item_provider_ids(item_id, &pairs)
             .await?;
+    }
+    // `if (request.LockedFields is not null) item.LockedFields =
+    // request.LockedFields;` — its own table too (`BaseItemMetadataFields`);
+    // an absent key leaves the stored set alone.
+    if let Some(fields) = &request.locked_fields {
+        state
+            .library
+            .update_item_locked_fields(item_id, fields)
+            .await?;
+    }
+    cascade_to_children(&state, &item, &request, &current_tags).await?;
+    // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
+    // new lock (`ItemUpdateController.cs:104-113`).
+    if lock_changed && item.is_folder {
+        let mut descendants = recursive_children(&state, item_id).await?;
+        for child in &mut descendants {
+            child.is_locked = item.is_locked;
+        }
+        state.library.update_items(&descendants, None).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -167,6 +182,10 @@ pub(crate) struct UpdateItemRequest {
     preferred_metadata_language: Option<String>,
     #[serde(default)]
     lock_data: Option<bool>,
+    /// The fields locked against provider updates. An absent key leaves the
+    /// stored set alone (`if (request.LockedFields is not null)`).
+    #[serde(default, deserialize_with = "opt_metadata_fields")]
+    locked_fields: Option<Vec<i32>>,
     #[serde(default)]
     album: Option<String>,
     #[serde(default)]
@@ -256,6 +275,50 @@ fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Err
     }
 }
 
+/// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
+/// enum, into the stored `MetadataField` values (`MetadataField.cs`: `Cast`
+/// = 0 … `OfficialRating` = 8): a member name (case-insensitively), an
+/// integer, or an integer in a string. Like a C# enum, an integer names a
+/// value even when no member has it; it is stored as sent and skipped on
+/// read.
+///
+/// # Errors
+///
+/// Fails on a string that is neither a member name nor an integer.
+fn opt_metadata_fields<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<i32>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(i32),
+        Name(String),
+    }
+    let Some(values) = Option::<Vec<Lenient>>::deserialize(d)? else {
+        return Ok(None);
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            Lenient::Number(n) => Ok(n),
+            Lenient::Name(name) => {
+                let name = name.trim();
+                if let Ok(n) = name.parse::<i32>() {
+                    return Ok(n);
+                }
+                MetadataField::ALL
+                    .iter()
+                    .find(|field| format!("{field:?}").eq_ignore_ascii_case(name))
+                    .map(|field| ferrofin_db::enums::metadata_field::to_i32(*field))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("not a MetadataField: {name:?}"))
+                    })
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 /// Deserializes an optional timestamp the way Jellyfin reads one: a cleared
 /// field (`null` or `""`) is `None`, and a bare date — what jellyfin-web's
 /// metadata editor sends for a date the user changed — is midnight UTC.
@@ -263,47 +326,9 @@ fn opt_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Ut
     ferrofin_model::json::datetime::option::deserialize(d)
 }
 
-/// Whether any editor-owned field differs between the stored row and the
-/// applied request — the auto-lock trigger.
-///
-/// jellyfin-web round-trips the values it did not edit through the item DTO,
-/// which narrows ratings to `f32` and dates to its own serialization, so the
-/// comparison normalizes both (ratings through `f32`, dates to whole seconds)
-/// to keep an untouched save from reading as a change and spuriously locking.
-#[allow(clippy::cast_possible_truncation)]
-fn editor_fields_changed(before: &BaseItemEntity, after: &BaseItemEntity) -> bool {
-    let rating = |v: Option<f64>| v.map(|x| x as f32);
-    let date = |v: Option<DateTime<Utc>>| v.map(|d| d.timestamp());
-    before.name != after.name
-        || before.forced_sort_name != after.forced_sort_name
-        || before.original_title != after.original_title
-        || rating(before.critic_rating) != rating(after.critic_rating)
-        || rating(before.community_rating) != rating(after.community_rating)
-        || before.index_number != after.index_number
-        || before.parent_index_number != after.parent_index_number
-        || before.overview != after.overview
-        || before.genres != after.genres
-        || before.tagline != after.tagline
-        || before.studios != after.studios
-        || date(before.date_created) != date(after.date_created)
-        || before.series_name != after.series_name
-        || date(before.end_date) != date(after.end_date)
-        || date(before.premiere_date) != date(after.premiere_date)
-        || before.production_year != after.production_year
-        || before.official_rating != after.official_rating
-        || before.custom_rating != after.custom_rating
-        || before.tags != after.tags
-        || before.production_locations != after.production_locations
-        || before.preferred_metadata_country_code != after.preferred_metadata_country_code
-        || before.preferred_metadata_language != after.preferred_metadata_language
-        || before.album != after.album
-        || before.artists != after.artists
-        || before.album_artists != after.album_artists
-}
-
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and
 /// collection assignments of C# `ItemUpdateController.UpdateItem`; the
-/// series/season/album child cascades are deferred (see the module docs).
+/// series/season/album child cascades are [`cascade_to_children`].
 fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
@@ -370,6 +395,209 @@ fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
             .collect::<Vec<_>>();
         item.album_artists = Some(join_distinct(&names));
     }
+}
+
+/// `Folder.GetRecursiveChildren()` (`Folder.cs:1627-1682`): every physical
+/// descendant, plus the folder's own linked children (a box set's or
+/// playlist's members) — `AddChildrenToList(includeLinkedChildren: true)`
+/// includes those for the first folder only, and does not descend into them.
+async fn recursive_children(
+    state: &AppState,
+    folder: Uuid,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    let mut all = state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            ancestor_ids: vec![folder],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        })
+        .await?;
+    // A non-recursive, non-physical `parent_id` browse merges the folder's
+    // `LinkedChildren` into its direct children.
+    let direct = state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            parent_id: folder,
+            ..InternalItemsQuery::default()
+        })
+        .await?;
+    for child in direct {
+        if !all
+            .iter()
+            .any(|known| known.id.eq_ignore_ascii_case(&child.id))
+        {
+            all.push(child);
+        }
+    }
+    Ok(all)
+}
+
+/// The values of a `|`-joined list column.
+fn split_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split('|')
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// `a.Except(b)` — ordinal, and distinct like every LINQ set operator.
+fn except(a: &[String], b: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in a {
+        if !b.contains(value) && !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
+/// The tag edit the cascade applies to each child: which tags the request
+/// added to the item and which it removed. No `Tags` in the request changes
+/// nothing (`removedTags = []; addedTags = []`).
+struct TagEdit {
+    /// `newTags.Except(currentTags)`.
+    added: Vec<String>,
+    /// `currentTags.Except(newTags)`.
+    removed: Vec<String>,
+}
+
+impl TagEdit {
+    fn of(current: &[String], request: &UpdateItemRequest) -> Self {
+        let Some(tags) = &request.tags else {
+            return Self {
+                added: Vec::new(),
+                removed: Vec::new(),
+            };
+        };
+        // `request.Tags.Select(t => t.Trim()).Distinct(OrdinalIgnoreCase)`,
+        // as the item's own column stores it.
+        let new = split_list(Some(&join_distinct(tags)));
+        Self {
+            added: except(&new, current),
+            removed: except(current, &new),
+        }
+    }
+
+    /// `child.Tags.Concat(addedTags).Except(removedTags)
+    /// .Distinct(StringComparer.OrdinalIgnoreCase)`.
+    fn apply(&self, child: &mut BaseItemEntity) {
+        let mut tags = split_list(child.tags.as_deref());
+        tags.extend(self.added.iter().cloned());
+        let kept = except(&tags, &self.removed);
+        let joined = join_distinct(&kept);
+        child.tags = (!joined.is_empty() || child.tags.is_some()).then_some(joined);
+    }
+}
+
+/// The children an edit cascades onto: `Children.OfType<kind>()` (a direct,
+/// physical child of `parent`), or every direct child when `kind` is `None`.
+async fn children_of(
+    state: &AppState,
+    parent: Uuid,
+    kind: Option<BaseItemKind>,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    Ok(state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            parent_id: parent,
+            physical_children_only: true,
+            include_item_types: kind.into_iter().collect(),
+            ..InternalItemsQuery::default()
+        })
+        .await?)
+}
+
+/// The rating and tag half of the cascade on one child, skipping a field in
+/// the child's own `LockedFields` (`ItemUpdateController.cs:321-381`):
+/// `OfficialRating` unless locked, `CustomRating` always, the tag edit
+/// unless `Tags` is locked.
+fn cascade_onto(
+    child: &mut BaseItemEntity,
+    locked: &[MetadataField],
+    official_rating: Option<&String>,
+    custom_rating: Option<&String>,
+    tags: &TagEdit,
+) {
+    if !locked.contains(&MetadataField::OfficialRating) {
+        child.official_rating = official_rating.cloned();
+    }
+    child.custom_rating = custom_rating.cloned();
+    if !locked.contains(&MetadataField::Tags) {
+        tags.apply(child);
+    }
+}
+
+/// Port of the child walks in `ItemUpdateController.UpdateItem`
+/// (`ItemUpdateController.cs:315-381`): a `Series` passes its name, rating
+/// and tag edits to its seasons and their episodes, a `Season` its rating
+/// and tags to its episodes, a `MusicAlbum` its rating and tags to its
+/// children. Each child's `LockedFields` shields its `OfficialRating` and
+/// `Tags`; `SeriesName` and `CustomRating` are always written.
+async fn cascade_to_children(
+    state: &AppState,
+    item: &BaseItemEntity,
+    request: &UpdateItemRequest,
+    current_tags: &[String],
+) -> Result<(), ApiError> {
+    let kind = BaseItemKind::from_stored_type_name(&item.type_);
+    if !matches!(
+        kind,
+        Some(BaseItemKind::Series | BaseItemKind::Season | BaseItemKind::MusicAlbum)
+    ) {
+        return Ok(());
+    }
+    let Ok(item_id) = Uuid::parse_str(&item.id) else {
+        return Ok(());
+    };
+    let tags = TagEdit::of(current_tags, request);
+    // `request.OfficialRating = string.IsNullOrWhiteSpace(...) ? null : ...`
+    // — the same value the item itself took.
+    let official_rating = item.official_rating.as_ref();
+    let custom_rating = request.custom_rating.as_ref();
+    // The direct children the walk visits, then (for a series) the seasons'
+    // episodes.
+    let mut children = match kind {
+        Some(BaseItemKind::Series) => {
+            children_of(state, item_id, Some(BaseItemKind::Season)).await?
+        }
+        Some(BaseItemKind::Season) => {
+            children_of(state, item_id, Some(BaseItemKind::Episode)).await?
+        }
+        _ => children_of(state, item_id, None).await?,
+    };
+    if kind == Some(BaseItemKind::Series) {
+        let mut episodes = Vec::new();
+        for season in &children {
+            if let Ok(season_id) = Uuid::parse_str(&season.id) {
+                episodes.extend(children_of(state, season_id, Some(BaseItemKind::Episode)).await?);
+            }
+        }
+        children.extend(episodes);
+    }
+    if children.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = children
+        .iter()
+        .filter_map(|c| Uuid::parse_str(&c.id).ok())
+        .collect();
+    let locks = state.library.get_locked_fields_batch(&ids).await?;
+    for child in &mut children {
+        if kind == Some(BaseItemKind::Series) {
+            // `season.SeriesName = rseries.Name` / `ep.SeriesName = ...`.
+            child.series_name.clone_from(&item.name);
+        }
+        let locked = Uuid::parse_str(&child.id)
+            .ok()
+            .and_then(|id| locks.get(&id))
+            .map_or(&[][..], Vec::as_slice);
+        cascade_onto(child, locked, official_rating, custom_rating, &tags);
+    }
+    state.library.update_items(&children, None).await?;
+    Ok(())
 }
 
 /// Returns the trimmed value, or [`None`] when it is blank — mirrors the C#
@@ -486,9 +714,185 @@ struct RefreshQuery {
     /// Whether to replace all images (only for a full refresh).
     #[serde(default)]
     replace_all_images: Option<bool>,
-    /// Whether to regenerate trickplay images (accepted; deferred subsystem).
+    /// Whether to regenerate trickplay images (only for a full refresh).
     #[serde(default)]
     regenerate_trickplay: Option<bool>,
+}
+
+/// How `POST /Items/{itemId}/Refresh` refreshes an item — upstream's
+/// `ProviderManager.RefreshItem` and `RefreshArtist`
+/// (`ProviderManager.cs:1211-1290`).
+struct RefreshRoute {
+    /// The folders validated, or the file refreshed, with the request's
+    /// options, as a scan.
+    scan: Option<ScanTarget>,
+    /// The item's own refresh through the provider manager (an item with no
+    /// file of its own).
+    item: bool,
+}
+
+impl RefreshRoute {
+    /// A scan of `target`, which refreshes the item too.
+    fn scan(target: ScanTarget) -> Self {
+        Self {
+            scan: Some(target),
+            item: false,
+        }
+    }
+
+    /// The item's own refresh only.
+    fn item_only() -> Self {
+        Self {
+            scan: None,
+            item: true,
+        }
+    }
+}
+
+/// Routes an item's refresh. A music artist refreshes as
+/// [`artist_refresh_route`] says; everything else as
+/// [`refresh_scan_target`] says, and the item refreshes itself through the
+/// provider manager when no scan covers it.
+async fn refresh_route(
+    state: &AppState,
+    item: &BaseItemEntity,
+    item_id: Uuid,
+) -> Result<RefreshRoute, ApiError> {
+    if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::MusicArtist) {
+        return artist_refresh_route(state, item, item_id).await;
+    }
+    Ok(match refresh_scan_target(item, item_id) {
+        Some(target) => RefreshRoute::scan(target),
+        None => RefreshRoute::item_only(),
+    })
+}
+
+/// The scan an item's refresh is (`ProviderManager.RefreshItem`), if any. A
+/// CollectionFolder refreshes its physical folders
+/// (`RefreshCollectionFolderChildren`), the root every library, and any
+/// other folder validates its own children — its subtree, not its whole
+/// library — which the scan refreshes along with the folder itself.
+///
+/// A file item (a movie, an episode, a track, a book, a photo, a video…)
+/// refreshes itself (`RefreshSingleItem`) through the same metadata service
+/// the scan runs: here the scan of its one path, so it gets the scan's
+/// refresh decision, merge, field locks, probe, NFO and every metadata
+/// provider, and nothing else of its library is walked.
+///
+/// No scan covers an item upstream validates no children for and that has
+/// no file of its own: a box set's members and a playlist's entries are
+/// linked, not physical (`BoxSet.GetNonCachedChildren` returns none,
+/// `Playlist.ValidateChildrenInternal` is a no-op), a view's folder holds
+/// none, a folder with no path of its own — a virtual season, whose episodes
+/// sit in the series folder — is not `IsFileProtocol`, so
+/// `ValidateChildrenInternal2` validates and refreshes no child
+/// (`Folder.cs:430-436,780-812`), and a person, genre, studio or channel
+/// item has no file. Those refresh through the provider manager.
+pub(crate) fn refresh_scan_target(item: &BaseItemEntity, item_id: Uuid) -> Option<ScanTarget> {
+    if !item.is_folder {
+        return refresh_scan_path(item).map(|path| ScanTarget::Items(vec![path]));
+    }
+    match BaseItemKind::from_stored_type_name(&item.type_) {
+        Some(BaseItemKind::CollectionFolder) => Some(ScanTarget::Library(item_id)),
+        Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder) => Some(ScanTarget::All),
+        Some(
+            BaseItemKind::BoxSet
+            | BaseItemKind::Playlist
+            | BaseItemKind::ManualPlaylistsFolder
+            | BaseItemKind::PlaylistsFolder
+            | BaseItemKind::UserView,
+        ) => None,
+        _ => item
+            .path
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(|path| ScanTarget::Paths(vec![path])),
+    }
+}
+
+/// `ProviderManager.RefreshArtist` (`ProviderManager.cs:1258-1290`): the
+/// albums credited to the artist (`ArtistIds`) each name their
+/// `MusicArtist` — the nearest artist folder above them
+/// (`MusicAlbum.GetMusicArtist`) — and those artist folders validate their
+/// CHILDREN with the request's options (`ValidateChildren` refreshes a
+/// folder's children, never the folder itself, `Folder.cs:831-870`); then
+/// the artist refreshes itself (`item.RefreshMetadata`).
+///
+/// A folder-backed artist refreshes itself in the same scan
+/// ([`ScanTarget::Artist`]'s `path`); its own folder is validated only when
+/// one of its credited albums sits under it. An artist known only by name
+/// has no folder (`MusicArtist.ValidateChildrenInternal` returns on
+/// `IsAccessedByName`): the scanner refreshes it after its albums' folders
+/// (a `path` of `None`), its music providers under the request's options —
+/// through the scan queue's priority lane when there is no folder to
+/// validate, so it runs inside a running scan and never beside one. An album
+/// with no artist folder above it names the by-name artist, whose validation
+/// is that no-op, so it is not scanned — as upstream.
+async fn artist_refresh_route(
+    state: &AppState,
+    item: &BaseItemEntity,
+    item_id: Uuid,
+) -> Result<RefreshRoute, ApiError> {
+    let own_folder = item
+        .path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .filter(|_| item.top_parent_id.as_deref().is_some_and(|t| !t.is_empty()));
+    let albums = state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::MusicAlbum],
+            artist_ids: vec![item_id],
+            ..InternalItemsQuery::default()
+        })
+        .await?;
+    let mut folders: Vec<String> = Vec::new();
+    for album in &albums {
+        if let Some(path) = artist_folder_above(state, album).await?
+            && !folders.contains(&path)
+        {
+            folders.push(path);
+        }
+    }
+    Ok(RefreshRoute::scan(ScanTarget::Artist {
+        id: item_id,
+        path: own_folder,
+        folders,
+    }))
+}
+
+/// The path of the nearest folder-backed `MusicArtist` above `album` (the
+/// parent chain `MusicAlbum.GetMusicArtist` walks), if any.
+async fn artist_folder_above(
+    state: &AppState,
+    album: &BaseItemEntity,
+) -> Result<Option<String>, ApiError> {
+    let mut seen: Vec<String> = vec![album.id.clone()];
+    let mut next = album.parent_id.clone();
+    while let Some(parent_id) = next.take() {
+        let Ok(parent_uuid) = Uuid::parse_str(&parent_id) else {
+            break;
+        };
+        if seen.contains(&parent_id) {
+            break;
+        }
+        seen.push(parent_id);
+        let Some(parent) = state.library.get_item_by_id(parent_uuid).await? else {
+            break;
+        };
+        match BaseItemKind::from_stored_type_name(&parent.type_) {
+            Some(BaseItemKind::MusicArtist) => {
+                return Ok(parent.path.filter(|p| !p.is_empty()));
+            }
+            Some(
+                BaseItemKind::CollectionFolder
+                | BaseItemKind::AggregateFolder
+                | BaseItemKind::UserRootFolder,
+            ) => break,
+            _ => next = parent.parent_id,
+        }
+    }
+    Ok(None)
 }
 
 /// The wire spelling of the refresh-mode query enum. Mirrors the vendored
@@ -543,59 +947,49 @@ async fn refresh_item(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
-    // Trickplay regeneration is a deferred subsystem; the flag is accepted for
-    // contract parity but does not affect the queued refresh yet.
-    let _ = query.regenerate_trickplay;
-
-    // Refreshing a folder (a library's CollectionFolder, or any container) means
-    // "scan its media" — the C# `ValidateChildren` path — so drive the filesystem
-    // scan, scoped to the owning library. The folder is either a CollectionFolder
-    // itself (jellyfin-web's per-library "Scan library" button; no TopParentId)
-    // or nested inside one (series/season), whose TopParentId is that
-    // CollectionFolder. A scope matching no library falls back to a full scan.
-    if item.is_folder {
-        let library_id = item
-            .top_parent_id
-            .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or(item_id);
-        state.library.queue_library_scan_scoped(library_id).await?;
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // Leaf-item metadata/image refresh goes to the provider queue: the enqueue
-    // spawns a background TMDB refresh (movies/series by title; seasons/episodes
-    // via their parent series) and this request 204s immediately, like the C#
-    // queued refresh. Kinds with no provider (music) no-op faithfully.
     let metadata_refresh_mode = query
         .metadata_refresh_mode
         .map_or(MetadataRefreshMode::None, MetadataRefreshMode::from);
     let image_refresh_mode = query
         .image_refresh_mode
         .map_or(MetadataRefreshMode::None, MetadataRefreshMode::from);
-    let options = MetadataRefreshOptions {
+
+    // Every refresh runs with the request's options: both modes (`None`
+    // when omitted, `ItemRefreshController.cs:64-65`), the replace flags,
+    // `ForceSave` and `RemoveOldMetadata` as the controller sets them
+    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
+    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    let options = MetadataRefreshOptions::for_item_refresh(
         metadata_refresh_mode,
         image_refresh_mode,
-        replace_all_metadata: query.replace_all_metadata.unwrap_or(false),
-        replace_all_images: query.replace_all_images.unwrap_or(false),
-        search_result: None,
-        // `ItemRefreshController` builds a plain `MetadataRefreshOptions`; only
-        // the Identify "Apply" endpoint sets `RemoveOldMetadata`.
-        remove_old_metadata: false,
-    };
+        query.replace_all_metadata.unwrap_or(false),
+        query.replace_all_images.unwrap_or(false),
+        query.regenerate_trickplay.unwrap_or(false),
+    );
+    // Refreshing a folder (a library's CollectionFolder, a series, a season,
+    // an album…) means "validate its children" — `folder.ValidateChildren(…,
+    // options)` — so it drives the filesystem scan over that folder's subtree,
+    // and every item in it refreshes with those options. A file item's
+    // refresh is the scan of its own path: the scan's refresh decision and
+    // merge, with the probe (upstream probes inside `RefreshMetadata`, so a
+    // "Search for missing metadata" re-probes the file and a Default refresh
+    // of an unchanged one does not), the NFO and every metadata provider.
+    let route = refresh_route(&state, &item, item_id).await?;
+    if let Some(target) = route.scan {
+        state.library.queue_refresh_scan(target, &options).await?;
+    }
+    if !route.item {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // An item with no file of its own — a box set, a playlist, a view, a
+    // virtual season, a person, a by-name artist — refreshes through the
+    // provider queue: the enqueue spawns the refresh and this request 204s
+    // immediately, like the C# queued refresh.
     state
         .providers
         .queue_refresh(item_id, &options, RefreshPriority::High)
         .await?;
-    // Re-probe the file so a metadata refresh also corrects stale media info
-    // (duration, codecs, HDR/Dolby-Vision fields added since the first scan).
-    // This is the media-info half of the C# refresh; best-effort, so a probe
-    // failure doesn't fail the request.
-    if !matches!(metadata_refresh_mode, MetadataRefreshMode::None)
-        && let Err(e) = state.media_sources.refresh_media_streams(item_id).await
-    {
-        tracing::warn!(%item_id, error = %e, "media re-probe during refresh failed");
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -753,6 +1147,23 @@ mod tests {
             "empty date string → None, not an error"
         );
         assert_eq!(req.name.as_deref(), Some("Inception"));
+    }
+
+    /// `JsonStringEnumConverter` reads an enum from its name (any case) or
+    /// its integer value; anything else is refused.
+    #[test]
+    fn locked_fields_accept_names_and_integer_values() {
+        let req: UpdateItemRequest =
+            serde_json::from_str(r#"{"LockedFields": ["Overview", 8, "cast", "7", 0, 42]}"#)
+                .expect("names and numbers");
+        // Overview 6, OfficialRating 8, Cast 0, Runtime 7; 42 is kept as sent.
+        assert_eq!(req.locked_fields, Some(vec![6, 8, 0, 7, 0, 42]));
+        let req: UpdateItemRequest =
+            serde_json::from_str(r#"{"LockedFields": null}"#).expect("null");
+        assert_eq!(req.locked_fields, None);
+        assert!(
+            serde_json::from_str::<UpdateItemRequest>(r#"{"LockedFields": ["Plot"]}"#).is_err()
+        );
     }
 
     #[test]

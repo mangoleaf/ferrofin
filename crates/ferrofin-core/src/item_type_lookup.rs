@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BASE_ITEM_KIND_NAMES, BaseItemKind};
 use ferrofin_traits::persistence::ItemTypeLookup as ItemTypeLookupTrait;
 
 /// The fully-qualified stored type names for the music-related kinds
@@ -23,143 +23,6 @@ pub(crate) const MUSIC_GENRE_TYPES: &[&str] = &[
     "MediaBrowser.Controller.Entities.MusicVideo",
     "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
     "MediaBrowser.Controller.Entities.Audio.MusicArtist",
-];
-
-/// The `(kind, stored-type-name)` pairs, copied from the C#
-/// `ItemTypeLookup.BaseItemKindNames` dictionary. Kinds with no dedicated
-/// `BaseItem` subclass in the C# table (e.g. `AudioBook`, `Program`) are omitted,
-/// exactly as upstream omits them.
-const BASE_ITEM_KIND_NAMES: &[(BaseItemKind, &str)] = &[
-    (
-        BaseItemKind::AggregateFolder,
-        "MediaBrowser.Controller.Entities.AggregateFolder",
-    ),
-    (
-        BaseItemKind::Audio,
-        "MediaBrowser.Controller.Entities.Audio.Audio",
-    ),
-    (
-        BaseItemKind::AudioBook,
-        "MediaBrowser.Controller.Entities.AudioBook",
-    ),
-    (
-        BaseItemKind::BasePluginFolder,
-        "MediaBrowser.Controller.Entities.BasePluginFolder",
-    ),
-    (BaseItemKind::Book, "MediaBrowser.Controller.Entities.Book"),
-    (
-        BaseItemKind::BoxSet,
-        "MediaBrowser.Controller.Entities.Movies.BoxSet",
-    ),
-    (
-        BaseItemKind::Channel,
-        "MediaBrowser.Controller.Channels.Channel",
-    ),
-    (
-        BaseItemKind::CollectionFolder,
-        "MediaBrowser.Controller.Entities.CollectionFolder",
-    ),
-    (
-        BaseItemKind::Episode,
-        "MediaBrowser.Controller.Entities.TV.Episode",
-    ),
-    (
-        BaseItemKind::Folder,
-        "MediaBrowser.Controller.Entities.Folder",
-    ),
-    (
-        BaseItemKind::Genre,
-        "MediaBrowser.Controller.Entities.Genre",
-    ),
-    (
-        BaseItemKind::ManualPlaylistsFolder,
-        "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder",
-    ),
-    (
-        BaseItemKind::Movie,
-        "MediaBrowser.Controller.Entities.Movies.Movie",
-    ),
-    (
-        BaseItemKind::LiveTvChannel,
-        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
-    ),
-    (
-        BaseItemKind::LiveTvProgram,
-        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
-    ),
-    (
-        BaseItemKind::MusicAlbum,
-        "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
-    ),
-    (
-        BaseItemKind::MusicArtist,
-        "MediaBrowser.Controller.Entities.Audio.MusicArtist",
-    ),
-    (
-        BaseItemKind::MusicGenre,
-        "MediaBrowser.Controller.Entities.Audio.MusicGenre",
-    ),
-    (
-        BaseItemKind::MusicVideo,
-        "MediaBrowser.Controller.Entities.MusicVideo",
-    ),
-    (
-        BaseItemKind::Person,
-        "MediaBrowser.Controller.Entities.Person",
-    ),
-    (
-        BaseItemKind::Photo,
-        "MediaBrowser.Controller.Entities.Photo",
-    ),
-    (
-        BaseItemKind::PhotoAlbum,
-        "MediaBrowser.Controller.Entities.PhotoAlbum",
-    ),
-    (
-        BaseItemKind::Playlist,
-        "MediaBrowser.Controller.Playlists.Playlist",
-    ),
-    (
-        BaseItemKind::PlaylistsFolder,
-        "Emby.Server.Implementations.Playlists.PlaylistsFolder",
-    ),
-    (
-        BaseItemKind::Season,
-        "MediaBrowser.Controller.Entities.TV.Season",
-    ),
-    (
-        BaseItemKind::Series,
-        "MediaBrowser.Controller.Entities.TV.Series",
-    ),
-    (
-        BaseItemKind::Studio,
-        "MediaBrowser.Controller.Entities.Studio",
-    ),
-    (
-        BaseItemKind::Trailer,
-        "MediaBrowser.Controller.Entities.Trailer",
-    ),
-    (
-        BaseItemKind::TvChannel,
-        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
-    ),
-    (
-        BaseItemKind::TvProgram,
-        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
-    ),
-    (
-        BaseItemKind::UserRootFolder,
-        "MediaBrowser.Controller.Entities.UserRootFolder",
-    ),
-    (
-        BaseItemKind::UserView,
-        "MediaBrowser.Controller.Entities.UserView",
-    ),
-    (
-        BaseItemKind::Video,
-        "MediaBrowser.Controller.Entities.Video",
-    ),
-    (BaseItemKind::Year, "MediaBrowser.Controller.Entities.Year"),
 ];
 
 /// Returns the shared kind → stored-type-name map, built once on first use.
@@ -180,10 +43,7 @@ fn kind_names() -> &'static HashMap<BaseItemKind, String> {
 /// has no dedicated stored type (matching the C# dictionary's coverage).
 #[must_use]
 pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
-    BASE_ITEM_KIND_NAMES
-        .iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, name)| *name)
+    kind.stored_type_name()
 }
 
 /// How stable item ids are derived from kind + path — a **per-database** mode.
@@ -420,10 +280,7 @@ pub fn derive_item_id(kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
 /// heuristics, search-hint mapping, …) so the mapping is spelled out once.
 #[must_use]
 pub fn kind_from_type_name(type_name: &str) -> Option<BaseItemKind> {
-    BASE_ITEM_KIND_NAMES
-        .iter()
-        .find(|(_, name)| *name == type_name)
-        .map(|(kind, _)| *kind)
+    BaseItemKind::from_stored_type_name(type_name)
 }
 
 /// The static item-kind lookup tables.

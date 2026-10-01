@@ -303,6 +303,10 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            policy: Some(ferrofin_model::users::UserPolicy {
+                enable_content_deletion: true,
+                ..Default::default()
+            }),
             ..ferrofin_model::dto::UserDto::default()
         })
     }
@@ -364,7 +368,11 @@ impl LibraryManager for OkLibrary {
                 BaseItemKind::CollectionFolder,
             )));
         }
-        Ok((id == self.item_id).then(|| base_item_entity(self.item_id)))
+        Ok((id == self.item_id).then(|| {
+            let mut item = base_item_entity(self.item_id);
+            item.path = Some("/synthetic/movie.mkv".to_owned());
+            item
+        }))
     }
     async fn get_ancestors(
         &self,
@@ -1582,4 +1590,53 @@ async fn file_missing_item_is_404() {
     let missing = Uuid::from_u128(0x9999_9999_9999_9999_9999_9999_9999_9999);
     let (status, _) = send("GET", &format!("/Items/{missing}/File"), Body::empty()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn deletion_respects_library_grants_and_path_boundaries() {
+    use ferrofin_api::test_support::{FakeVirtualFolders, PolicyUsers};
+    use ferrofin_model::entities_media::VirtualFolderInfo;
+    use ferrofin_model::users::UserPolicy;
+    let library_id = Uuid::from_u128(0xAB50);
+    let item_id = Uuid::from_u128(0xAB51);
+    for (location, granted_id, expected) in [
+        ("/synthetic", library_id, StatusCode::NO_CONTENT),
+        ("/synth", library_id, StatusCode::UNAUTHORIZED),
+        (
+            "/synthetic",
+            Uuid::from_u128(0xAB52),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let state = ok_state_with_users(
+            OkLibrary {
+                item_id,
+                adopted_tree: false,
+            },
+            Arc::new(PolicyUsers(UserPolicy {
+                enable_content_deletion: false,
+                enable_content_deletion_from_folders: vec![granted_id.simple().to_string()],
+                ..Default::default()
+            })),
+        )
+        .with_virtual_folders(Arc::new(FakeVirtualFolders::seeded(vec![
+            VirtualFolderInfo {
+                item_id: Some(library_id.to_string()),
+                locations: vec![location.to_owned()],
+                ..Default::default()
+            },
+        ])));
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/Items/{item_id}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "library location: {location}");
+    }
 }

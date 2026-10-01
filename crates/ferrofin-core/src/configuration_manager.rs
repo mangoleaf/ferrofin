@@ -57,7 +57,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use ferrofin_model::branding::BrandingOptions;
-use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};
+use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, ServerConfiguration};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
@@ -211,8 +211,17 @@ pub struct FerrofinServerConfigurationManager {
     config_file: PathBuf,
     branding_file: PathBuf,
     encoding_file: PathBuf,
+    metadata_file: PathBuf,
+    /// The `metadata.json` the last "unusable" warning was logged for, so a
+    /// broken document warns once per change, not on every read.
+    metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
     configuration: RwLock<Arc<ServerConfiguration>>,
 }
+
+/// A file a warning was logged for, by its modification time (`None` when
+/// it has none to read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarnedFile(Option<std::time::SystemTime>);
 
 impl std::fmt::Debug for FerrofinServerConfigurationManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -242,6 +251,11 @@ impl FerrofinServerConfigurationManager {
     /// `network` configuration). This one is not merely served back: the
     /// request path enforces it (`ferrofin_api::ip_access`).
     const NETWORK_FILE_NAME: &'static str = "network.json";
+
+    /// The on-disk metadata configuration file name (Jellyfin's named
+    /// `metadata` configuration, `MetadataConfigurationStore`): the "Date
+    /// added behavior for new content" the library scan dates new items by.
+    const METADATA_FILE_NAME: &'static str = "metadata.json";
 
     /// Loads (or initializes) the configuration for the given paths.
     ///
@@ -273,6 +287,7 @@ impl FerrofinServerConfigurationManager {
         let named_dir = user_config_dir.join(Self::NAMED_SUBDIR);
         let branding_file = named_dir.join(Self::BRANDING_FILE_NAME);
         let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
+        let metadata_file = named_dir.join(Self::METADATA_FILE_NAME);
 
         // The named configurations live in their own files and are read on
         // demand, so adoption has to materialize them or the imported values
@@ -312,6 +327,17 @@ impl FerrofinServerConfigurationManager {
                 ferrofin_networking::NetworkConfiguration::default(),
                 "NetworkConfiguration",
                 config_import::NETWORK_XML_DENY,
+            )
+            .await?;
+            // "Date added behavior for new content": the library scan dates
+            // every new item by it, so an operator who chose "Use date
+            // scanned into the library" keeps that choice.
+            seed_named(
+                &config_dir.join("metadata.xml"),
+                &metadata_file,
+                MetadataConfiguration::default(),
+                "MetadataConfiguration",
+                &[],
             )
             .await
         };
@@ -388,8 +414,84 @@ impl FerrofinServerConfigurationManager {
             config_file,
             branding_file,
             encoding_file,
+            metadata_file,
+            metadata_warned: std::sync::Mutex::new(None),
             configuration: RwLock::new(Arc::new(configuration)),
         })
+    }
+
+    /// The metadata configuration as saved now — C#
+    /// `GetMetadataConfiguration()` (`MetadataConfigurationExtensions.cs:12`,
+    /// `GetConfiguration<MetadataConfiguration>("metadata")`): the document
+    /// `POST /System/Configuration/metadata` writes, read on every call, so
+    /// a dashboard change applies to the next reader without a restart.
+    ///
+    /// A document never saved is the default. One that cannot be read or
+    /// parsed is the default too (upstream's `ConfigurationHelper` falls back
+    /// the same way), and says so at `warn` once per change of the file (its
+    /// modification time): the library scan reads this on every plan pass —
+    /// each scan, watcher batch and item refresh — and would otherwise repeat
+    /// the same warning for each.
+    ///
+    /// A synchronous read of one small local file: its readers are the scan's
+    /// planning pass, which stats every path it resolves the same way.
+    #[must_use]
+    pub fn metadata_configuration(&self) -> MetadataConfiguration {
+        let bytes = match std::fs::read(&self.metadata_file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.metadata_usable();
+                return MetadataConfiguration::default();
+            }
+            Err(e) => {
+                if self.first_metadata_warning() {
+                    tracing::warn!(
+                        path = %self.metadata_file.display(),
+                        error = %e,
+                        "could not read the metadata configuration; using its defaults"
+                    );
+                }
+                return MetadataConfiguration::default();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(config) => {
+                self.metadata_usable();
+                config
+            }
+            Err(e) => {
+                if self.first_metadata_warning() {
+                    tracing::warn!(
+                        path = %self.metadata_file.display(),
+                        error = %e,
+                        "the saved metadata configuration is not valid; using its defaults"
+                    );
+                }
+                MetadataConfiguration::default()
+            }
+        }
+    }
+
+    /// Whether the unusable `metadata.json` as it stands now has not been
+    /// warned about yet; records that it now has.
+    fn first_metadata_warning(&self) -> bool {
+        let mtime = std::fs::metadata(&self.metadata_file)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut warned = self
+            .metadata_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+    }
+
+    /// Forgets the last warning once the document reads again, so breaking
+    /// it later warns anew whatever its modification time.
+    fn metadata_usable(&self) {
+        self.metadata_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// A shared handle to the current configuration.
@@ -1415,5 +1517,140 @@ mod tests {
             ferrofin_model::entities::HardwareAccelerationType::none,
             "the operator turned it off; adoption must not turn it back on"
         );
+    }
+
+    /// `GetMetadataConfiguration()`: the default until the dashboard saves
+    /// one, then what it saved, read live; a document that will not parse
+    /// is the default.
+    #[tokio::test]
+    async fn the_metadata_configuration_is_read_live_from_the_named_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert_eq!(
+            mgr.metadata_configuration(),
+            MetadataConfiguration::default()
+        );
+        assert!(
+            mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+
+        // What `POST /System/Configuration/metadata` writes for "Use date
+        // scanned into the library".
+        std::fs::create_dir_all(mgr.metadata_file.parent().expect("named dir")).expect("mkdir");
+        std::fs::write(
+            &mgr.metadata_file,
+            br#"{"UseFileCreationTimeForDateAdded":false}"#,
+        )
+        .expect("save");
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+
+        std::fs::write(
+            &mgr.metadata_file,
+            b"{\"UseFileCreationTimeForDateAdded\": fal",
+        )
+        .expect("corrupt");
+        assert_eq!(
+            mgr.metadata_configuration(),
+            MetadataConfiguration::default()
+        );
+    }
+
+    /// Counts the `WARN` events logged while it is the default subscriber.
+    struct CountWarnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A broken `metadata.json` warns once per change of the file, not on
+    /// every read (each scan, watcher batch and item refresh reads it); a
+    /// document that reads again resets that, so breaking it anew warns.
+    #[tokio::test]
+    async fn a_broken_metadata_configuration_warns_once_per_change() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CountWarnings(Arc::clone(&warnings))),
+        );
+        let count = || warnings.load(std::sync::atomic::Ordering::SeqCst);
+        let write = |body: &[u8], at: u64| {
+            std::fs::write(&mgr.metadata_file, body).expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&mgr.metadata_file)
+                .expect("open")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at))
+                .expect("mtime");
+        };
+        std::fs::create_dir_all(mgr.metadata_file.parent().expect("named dir")).expect("mkdir");
+
+        write(b"{\"UseFileCreationTimeForDateAdded\": fal", 1_000_000_000);
+        for _ in 0..3 {
+            assert_eq!(
+                mgr.metadata_configuration(),
+                MetadataConfiguration::default()
+            );
+        }
+        assert_eq!(count(), 1, "one warning for three reads of the same file");
+
+        write(b"not json either", 1_000_000_100);
+        let _ = mgr.metadata_configuration();
+        let _ = mgr.metadata_configuration();
+        assert_eq!(count(), 2, "a changed file warns again, once");
+
+        write(
+            br#"{"UseFileCreationTimeForDateAdded":false}"#,
+            1_000_000_200,
+        );
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert_eq!(count(), 2, "a valid document does not warn");
+        write(b"{", 1_000_000_100);
+        let _ = mgr.metadata_configuration();
+        assert_eq!(count(), 3, "broken again after it read: warns anew");
+    }
+
+    /// Adoption carries Jellyfin's `metadata.xml` over, so "Use date scanned
+    /// into the library" survives the move.
+    #[tokio::test]
+    async fn adoption_imports_the_date_added_behavior() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        std::fs::write(
+            tmp.path().join("config").join("metadata.xml"),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <MetadataConfiguration>\
+             <UseFileCreationTimeForDateAdded>false</UseFileCreationTimeForDateAdded>\
+             </MetadataConfiguration>",
+        )
+        .expect("metadata.xml");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert!(mgr.metadata_file.exists(), "seeded as the named JSON");
     }
 }

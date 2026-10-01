@@ -10,7 +10,7 @@
 //! The registry reflects what is actually compiled into this build: the local
 //! Kodi/XBMC **Nfo** reader/saver and **Local Images** provider are always
 //! present; **The Open Movie Database** (OMDb) and **IntroSkipper** segments are
-//! always compiled (OMDb needs a key at runtime, which the checkbox gates);
+//! always compiled (shared API keys are supplied where required);
 //! **TheMovieDb** and **Open Subtitles** appear only when their crate features
 //! are enabled. Nothing here is a placeholder — a provider is listed iff its
 //! code is in the binary.
@@ -33,60 +33,59 @@ fn type_entry<'a>(
     })
 }
 
-/// Whether the library enables metadata fetcher `name` for item type `kind`.
+/// Whether metadata fetcher `name` is enabled for item type `kind`.
 ///
-/// Port of `BaseItemManager.IsMetadataFetcherEnabled` (v10.11.8
-/// `MediaBrowser.Controller/BaseItemManager/BaseItemManager.cs`): when the
-/// library saved a `TypeOptions` entry for the kind, the answer is exactly
-/// `libraryTypeOptions.MetadataFetchers.Contains(name, OrdinalIgnoreCase)` —
-/// so an EMPTY list disables every remote fetcher. With no entry the library
-/// never customised that type and the built-in default (enabled) stands.
+/// Port of `BaseItemManager.IsMetadataFetcherEnabled` (upstream master
+/// `MediaBrowser.Controller/BaseItemManager/BaseItemManager.cs:26-47`): when
+/// the item's library saved a `TypeOptions` entry for the kind, the answer is
+/// exactly `libraryTypeOptions.MetadataFetchers.Contains(name,
+/// OrdinalIgnoreCase)` — so an EMPTY list disables every remote fetcher.
+/// With no entry (the library never customised that type, or the item is in
+/// no library at all — a by-name artist, which `GetLibraryOptions` gives a
+/// bare `new LibraryOptions()`, `LibraryManager.cs:2884-2896`), the SERVER-WIDE options for the kind decide
+/// (`:45-46`): `itemConfig is null ||
+/// !itemConfig.DisabledMetadataFetchers.Contains(name)`. `global` is that
+/// server-wide entry ([`global_metadata_options`]); `None` when the server
+/// configuration names none for the kind (every fetcher enabled).
 ///
 /// This is the ONE gate: C# routes both the scan and the on-demand
 /// `POST /Items/{id}/Refresh` through `ProviderManager.CanRefreshMetadata`,
 /// which calls it. Anything in Ferrofin that fetches remote metadata must ask
 /// here too, or clearing the checkboxes stops meaning anything.
 ///
-/// TWO ARMS OF `IsMetadataFetcherEnabled` ARE NOT PORTED HERE, named rather
-/// than left silent. Neither is reachable from this signature, which takes a
-/// kind and not the item:
-///
-/// 1. The NO-ENTRY arm falls back to the SERVER-WIDE options
-///    (`BaseItemManager.cs:45-46`): `itemConfig is null ||
-///    !itemConfig.DisabledMetadataFetchers.Contains(name)`. Ferrofin answers a
-///    flat `true`, so a server-wide *disabled* fetcher is honoured only where
-///    a library ticked its own list. The reader now exists —
-///    [`global_metadata_options`] plus `LocalProviderManager`'s
-///    `with_metadata_options` — but the scan reaches this function through
-///    `library_scan::FetcherPolicy`, which is built from `VirtualFolderInfo`
-///    alone and has no configuration handle. Port path: give `FetcherPolicy` a
-///    `MetadataOptions` slice from the scan's config manager and thread it
-///    through both call sites together, so the scan and the refresh keep
-///    answering with ONE implementation; it is a scan-path change and wants
-///    its own measurement.
-/// 2. The two `// Hack alert.` arms at `BaseItemManager.cs:29-37`: a `Channel`
-///    item is always enabled, and an item whose `SourceType` is `Channel` is
-///    enabled iff `!EnableMediaSourceDisplay`. The first is expressible from
-///    `kind` alone; the second needs the item row, so both belong with the
-///    same threading change rather than half of each.
+/// TODO(parity, open work item — NOT an accepted divergence): the two
+/// `// Hack alert.` arms at `BaseItemManager.cs:28-38` are not ported: a
+/// `Channel` item is always enabled, and an item whose `SourceType` is
+/// `Channel` is enabled iff `!EnableMediaSourceDisplay`. Neither is reachable
+/// from this signature, which takes a kind and not the item; porting them
+/// means passing the item's kind and `SourceType` here from both callers.
 #[must_use]
 pub fn metadata_fetcher_enabled(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
     kind: &str,
     name: &str,
 ) -> bool {
-    type_entry(options, kind).is_none_or(|t| {
-        t.metadata_fetchers
+    match type_entry(options, kind) {
+        Some(t) => t
+            .metadata_fetchers
             .iter()
-            .any(|f| f.eq_ignore_ascii_case(name))
-    })
+            .any(|f| f.eq_ignore_ascii_case(name)),
+        None => global.is_none_or(|g| {
+            !g.disabled_metadata_fetchers
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+        }),
+    }
 }
 
 /// The admin-chosen order position of metadata fetcher `name` for item type
 /// `kind` — lower sorts first, and a fetcher absent from the list sorts last.
 ///
-/// Port of `ProviderManager.GetConfiguredOrder` (v10.11.8
-/// `MediaBrowser.Providers/Manager/ProviderManager.cs`), whose
+/// Port of `ProviderManager.GetConfiguredOrder` over
+/// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.MetadataFetcherOrder`
+/// (`ProviderManager.cs:523-525`): the library's order when it saved a
+/// `TypeOptions` entry for the kind, else the server-wide one (`global`).
 /// `Array.IndexOf(order, providerName)` returns `-1` → `int.MaxValue` for a
 /// fetcher the admin never ranked. Order is load-bearing wherever results from
 /// several fetchers are merged first-writer-wins: `GetRemoteSearchResults`
@@ -95,15 +94,54 @@ pub fn metadata_fetcher_enabled(
 #[must_use]
 pub fn metadata_fetcher_rank(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
     kind: &str,
     name: &str,
 ) -> usize {
-    type_entry(options, kind).map_or(usize::MAX, |t| {
-        t.metadata_fetcher_order
-            .iter()
-            .position(|f| f.eq_ignore_ascii_case(name))
-            .unwrap_or(usize::MAX)
-    })
+    let order = match type_entry(options, kind) {
+        Some(t) => t.metadata_fetcher_order.as_slice(),
+        None => global.map_or(&[][..], |g| g.metadata_fetcher_order.as_slice()),
+    };
+    configured_order(order, name)
+}
+
+/// [`metadata_fetcher_rank`] for the image fetchers:
+/// `typeOptions?.ImageFetcherOrder ?? options.ImageFetcherOrder`
+/// (`ProviderManager.cs:405-406`).
+#[must_use]
+pub fn image_fetcher_rank(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+    kind: &str,
+    name: &str,
+) -> usize {
+    let order = match type_entry(options, kind) {
+        Some(t) => t.image_fetcher_order.as_slice(),
+        None => global.map_or(&[][..], |g| g.image_fetcher_order.as_slice()),
+    };
+    configured_order(order, name)
+}
+
+/// Default order for built-in artwork providers. Explicit library order is
+/// applied before this tie-breaker. Fanart leads movie and series artwork,
+/// and precedes AudioDB for music, with OMDb as the final poster fallback.
+#[must_use]
+pub fn default_image_order(name: &str) -> usize {
+    match name {
+        fetcher_names::TMDB | fetcher_names::AUDIODB => 1,
+        fetcher_names::TVDB => 50,
+        fetcher_names::OMDB => 90,
+        _ => 0,
+    }
+}
+
+/// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
+/// `name` in `order`, or last.
+fn configured_order(order: &[String], name: &str) -> usize {
+    order
+        .iter()
+        .position(|f| f.eq_ignore_ascii_case(name))
+        .unwrap_or(usize::MAX)
 }
 
 /// The library's configured `MetadataFetcherOrder` for item type `kind`, or
@@ -143,21 +181,31 @@ pub fn global_metadata_options<'a>(
     })
 }
 
-/// Whether the library enables image fetcher `name` for item type `kind`.
+/// Whether image fetcher `name` is enabled for item type `kind`.
 ///
-/// Port of `BaseItemManager.IsImageFetcherEnabled`, the image half of the same
-/// gate (`ProviderManager.CanRefreshImages`).
+/// Port of `BaseItemManager.IsImageFetcherEnabled` (`BaseItemManager.cs:
+/// 50-71`), the image half of the same gate (`ProviderManager.
+/// CanRefreshImages`): the library's `TypeOptions.ImageFetchers` when it saved
+/// an entry for the kind, else the server-wide `DisabledImageFetchers`
+/// (`global`), as [`metadata_fetcher_enabled`] does.
 #[must_use]
 pub fn image_fetcher_enabled(
     options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
     kind: &str,
     name: &str,
 ) -> bool {
-    type_entry(options, kind).is_none_or(|t| {
-        t.image_fetchers
+    match type_entry(options, kind) {
+        Some(t) => t
+            .image_fetchers
             .iter()
-            .any(|f| f.eq_ignore_ascii_case(name))
-    })
+            .any(|f| f.eq_ignore_ascii_case(name)),
+        None => global.is_none_or(|g| {
+            !g.disabled_image_fetchers
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+        }),
+    }
 }
 
 /// The advertised provider names — the EXACT strings clients round-trip in
@@ -430,8 +478,7 @@ fn metadata_providers() -> Vec<Provider> {
             images: Some(omdb_images),
         },
         Provider {
-            // Optional at runtime (needs an API key/config), like OMDb —
-            // the checkbox gates; absence of config just yields no hits.
+            // Uses a built-in project key; the library checkbox gates requests.
             name: fetcher_names::TVDB,
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Series", "Season", "Episode"],
@@ -831,22 +878,26 @@ mod tests {
         };
         assert!(!metadata_fetcher_enabled(
             Some(&cleared),
+            None,
             "Movie",
             super::fetcher_names::TMDB
         ));
         assert!(!image_fetcher_enabled(
             Some(&cleared),
+            None,
             "Movie",
             super::fetcher_names::TMDB
         ));
         // A type the library never customised keeps the built-in default…
         assert!(metadata_fetcher_enabled(
             Some(&cleared),
+            None,
             "Series",
             super::fetcher_names::TMDB
         ));
         // …as does a library with no saved options at all.
         assert!(metadata_fetcher_enabled(
+            None,
             None,
             "Movie",
             super::fetcher_names::TMDB
@@ -866,18 +917,86 @@ mod tests {
         };
         assert!(metadata_fetcher_enabled(
             Some(&ticked),
+            None,
             "Movie",
             super::fetcher_names::TMDB
         ));
         assert!(image_fetcher_enabled(
             Some(&ticked),
+            None,
             "Movie",
             super::fetcher_names::TMDB
         ));
         assert!(!metadata_fetcher_enabled(
             Some(&ticked),
+            None,
             "Movie",
             super::fetcher_names::TVDB
+        ));
+    }
+
+    /// `IsMetadataFetcherEnabled`/`IsImageFetcherEnabled` with no library
+    /// `TypeOptions` entry for the kind — a library that never customised
+    /// it, or an item in no library (a by-name artist, `new LibraryOptions()`)
+    /// — fall back to the server-wide `MetadataOptions` for the kind
+    /// (`BaseItemManager.cs:45-46,69-70`); a saved library entry still wins
+    /// over them.
+    #[test]
+    fn without_a_library_entry_the_server_wide_options_decide() {
+        use ferrofin_model::configuration::MetadataOptions;
+        // The `ServerConfiguration` constructor's MusicArtist entry.
+        let server = MetadataOptions {
+            item_type: Some("MusicArtist".to_owned()),
+            disabled_metadata_fetchers: vec!["TheAudioDB".to_owned()],
+            disabled_image_fetchers: vec!["FanArt".to_owned()],
+            ..MetadataOptions::default()
+        };
+        let audiodb = super::fetcher_names::AUDIODB;
+        let musicbrainz = super::fetcher_names::MUSICBRAINZ;
+        assert!(!metadata_fetcher_enabled(
+            None,
+            Some(&server),
+            "MusicArtist",
+            audiodb
+        ));
+        assert!(metadata_fetcher_enabled(
+            None,
+            Some(&server),
+            "MusicArtist",
+            musicbrainz
+        ));
+        assert!(!image_fetcher_enabled(
+            None,
+            Some(&server),
+            "MusicArtist",
+            super::fetcher_names::FANART
+        ));
+        assert!(image_fetcher_enabled(
+            None,
+            Some(&server),
+            "MusicArtist",
+            audiodb
+        ));
+        // A library that saved an entry for the kind is the whole answer.
+        let library = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicArtist".to_owned()),
+                metadata_fetchers: vec!["TheAudioDB".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(metadata_fetcher_enabled(
+            Some(&library),
+            Some(&server),
+            "MusicArtist",
+            audiodb
+        ));
+        assert!(!metadata_fetcher_enabled(
+            Some(&library),
+            Some(&server),
+            "MusicArtist",
+            musicbrainz
         ));
     }
 
@@ -1182,6 +1301,59 @@ mod tests {
             plugins
                 .iter()
                 .any(|p| p.item_type.as_deref() == Some("Photo"))
+        );
+    }
+
+    /// `typeOptions?.MetadataFetcherOrder ?? globalMetadataOptions.
+    /// MetadataFetcherOrder` (`ProviderManager.cs:523-525`) and its image
+    /// twin (`:405-406`): a library's saved entry ranks — an empty list
+    /// ranks nothing and does not fall back — and without one the
+    /// server-wide order does.
+    #[test]
+    fn fetcher_ranks_fall_back_to_the_server_wide_order_only_without_an_entry() {
+        use super::{image_fetcher_rank, metadata_fetcher_rank};
+        use ferrofin_model::configuration::MetadataOptions;
+        let global = MetadataOptions {
+            item_type: Some("MusicAlbum".to_owned()),
+            metadata_fetcher_order: vec!["TheAudioDB".to_owned(), "MusicBrainz".to_owned()],
+            image_fetcher_order: vec!["Fanart".to_owned()],
+            ..MetadataOptions::default()
+        };
+        assert_eq!(
+            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "TheAudioDB"),
+            0
+        );
+        assert_eq!(
+            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "musicbrainz"),
+            1
+        );
+        assert_eq!(
+            image_fetcher_rank(None, Some(&global), "MusicAlbum", "Fanart"),
+            0
+        );
+        assert_eq!(
+            image_fetcher_rank(None, Some(&global), "MusicAlbum", "TheAudioDB"),
+            usize::MAX
+        );
+        let saved = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicAlbum".to_owned()),
+                ..TypeOptions::default()
+            }],
+            ..LibraryOptions::default()
+        };
+        assert_eq!(
+            metadata_fetcher_rank(Some(&saved), Some(&global), "MusicAlbum", "TheAudioDB"),
+            usize::MAX,
+            "a saved empty order ranks nothing"
+        );
+        assert_eq!(
+            image_fetcher_rank(Some(&saved), Some(&global), "MusicAlbum", "Fanart"),
+            usize::MAX
+        );
+        assert_eq!(
+            metadata_fetcher_rank(None, None, "MusicAlbum", "TheAudioDB"),
+            usize::MAX
         );
     }
 }

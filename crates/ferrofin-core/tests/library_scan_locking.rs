@@ -5,11 +5,17 @@
 //! to read one boolean. These tests pin the behaviour that read feeds: the
 //! loop's `locked` flag still has to mean `IsLocked`.
 //!
-//! Artwork is the assertion with teeth. The user-owned *metadata* columns are
+//! The NFO is the assertion with teeth. The user-owned *metadata* columns are
 //! protected a second time inside the scan upsert (`CASE WHEN "IsLocked" = 1
 //! THEN "<col>" ELSE excluded."<col>" END`), so a test asserting on those would
-//! still pass with the loop's flag stuck at `false`. The image rows have no such
-//! SQL backstop — they are rewritten purely on the strength of the flag.
+//! still pass with the loop's flag stuck at `false`. The external ids an NFO
+//! pins have no such SQL backstop — they reach `BaseItemProviders` only when
+//! the reader runs, which upstream never does for a locked item
+//! (`RefreshWithProviders` returns on `IsLocked` before its local providers).
+//!
+//! Artwork is the other way round: upstream validates a locked item's local
+//! images like any other's (`CanRefreshImages` enables `ILocalImageProvider`
+//! before its `IsLocked` check), so the scan rediscovers them.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -85,7 +91,7 @@ async fn set_locked(db: &Database, locked: i64) {
 }
 
 #[tokio::test]
-async fn a_locked_item_keeps_its_artwork_across_a_rescan() {
+async fn a_locked_item_still_validates_its_local_artwork() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (scanner, db) = one_movie_library(tmp.path()).await;
 
@@ -96,7 +102,8 @@ async fn a_locked_item_keeps_its_artwork_across_a_rescan() {
         "the first scan discovers the poster"
     );
 
-    // The user locks the item, then clears its artwork.
+    // The item is locked and its image rows are lost; the poster is still
+    // on disk beside the movie.
     set_locked(&db, 1).await;
     sqlx::query(r#"DELETE FROM "BaseItemImageInfos""#)
         .execute(db.writer())
@@ -106,20 +113,56 @@ async fn a_locked_item_keeps_its_artwork_across_a_rescan() {
     scanner.scan_all().await.expect("rescan while locked");
     assert_eq!(
         image_rows(&db).await,
-        0,
-        "a locked item's artwork is user-owned; the rescan must not rewrite it"
+        1,
+        "local image validation runs whatever the lock: the poster is rediscovered"
+    );
+}
+
+/// The `Tmdb` id rows the movie carries.
+async fn tmdb_ids(db: &Database) -> Vec<String> {
+    sqlx::query_scalar(
+        r#"SELECT "ProviderValue" FROM "BaseItemProviders" WHERE "ProviderId" = 'Tmdb'"#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("provider ids")
+}
+
+/// Moves `path`'s mtime an hour ahead, past the NFO reader's one-minute
+/// tolerance over `DateLastSaved`.
+fn touch_ahead(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("set mtime");
+}
+
+#[tokio::test]
+async fn a_locked_item_never_reads_its_nfo() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db) = one_movie_library(tmp.path()).await;
+    scanner.scan_all().await.expect("first scan");
+
+    set_locked(&db, 1).await;
+    let nfo = tmp
+        .path()
+        .join("movies")
+        .join("Movie 0001 (2020)")
+        .join("Movie 0001 (2020).nfo");
+    std::fs::write(&nfo, "<movie><tmdbid>603</tmdbid></movie>").expect("nfo");
+    touch_ahead(&nfo);
+    scanner.scan_all().await.expect("rescan while locked");
+    assert!(
+        tmdb_ids(&db).await.is_empty(),
+        "the NFO's pinned id never reaches a locked item"
     );
 
-    // Control: the poster is still there and still discoverable. Without this,
-    // the assertion above would also pass if the scan had simply stopped
-    // finding the file.
+    // Control: unlocked, the same (changed) NFO is read.
     set_locked(&db, 0).await;
     scanner.scan_all().await.expect("rescan while unlocked");
-    assert_eq!(
-        image_rows(&db).await,
-        1,
-        "an unlocked item's artwork is rediscovered"
-    );
+    assert_eq!(tmdb_ids(&db).await, ["603"]);
 }
 
 #[tokio::test]

@@ -4,10 +4,9 @@
 //!
 //! OMDb supplies IMDb-sourced text (plot, genres, cast/crew, the certificate),
 //! the IMDb community rating, the Rotten Tomatoes critic score TMDB has no data
-//! for, and a poster. OMDb requires an API key (free at
-//! <https://www.omdbapi.com/apikey.aspx>); the composition root supplies it from
-//! config, and an empty key disables the provider entirely — every method
-//! returns `None`, so the scan behaves exactly as it did before OMDb existed.
+//! for, and a poster. Like Jellyfin, it uses a built-in API key by default.
+//! The composition root can supply an operator key to override it; per-library
+//! metadata and image fetcher settings control whether the provider runs.
 //!
 //! # Accepted divergences
 //!
@@ -30,6 +29,9 @@ use serde::Deserialize;
 /// The OMDb API base URL.
 const API_BASE: &str = "https://www.omdbapi.com/";
 
+/// Jellyfin's built-in key (`OmdbProvider.GetOmdbUrl`, v10.11.8).
+const DEFAULT_API_KEY: &str = "2c9d9507";
+
 /// The OMDb `Ratings` source name for the Rotten Tomatoes critic score.
 const ROTTEN_TOMATOES: &str = "Rotten Tomatoes";
 
@@ -40,6 +42,7 @@ const NOT_AVAILABLE: &str = "N/A";
 #[derive(Debug)]
 pub struct OmdbClient {
     http: reqwest::Client,
+    limiter: crate::rate_limit::RateLimiter,
     api_key: SecretString,
     base_url: String,
     /// Season listings already fetched, keyed by `(series id, season)`.
@@ -77,27 +80,35 @@ impl OmdbClient {
         cfg.cast_and_crew
     }
 
-    /// Builds a client with the given API key. An empty (or whitespace) key
-    /// leaves the client [disabled](Self::is_enabled).
+    /// Builds a client with an optional API key override. An empty or
+    /// whitespace-only key uses Jellyfin's built-in key.
     #[must_use]
     pub fn new(api_key: &str) -> Self {
+        let api_key = api_key.trim();
+        let api_key = if api_key.is_empty() {
+            DEFAULT_API_KEY
+        } else {
+            api_key
+        };
         Self {
             http: reqwest::Client::new(),
-            api_key: SecretString::from(api_key.trim()),
+            limiter: crate::rate_limit::RateLimiter::new("omdb"),
+            api_key: SecretString::from(api_key),
             base_url: API_BASE.to_owned(),
             seasons: Arc::default(),
             plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
 
-    /// Points the client at `base_url` (a mock server) for tests.
-    #[cfg(test)]
-    pub(crate) fn with_base_url(mut self, base_url: &str) -> Self {
-        self.base_url = base_url.to_owned();
+    /// Points the client at a different API root (a mock server in tests).
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        base_url.clone_into(&mut self.base_url);
         self
     }
 
-    /// Whether an API key is configured (lookups are attempted).
+    /// Whether the client has credentials, including the built-in default.
+    /// Library fetcher settings separately control whether lookups run.
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         !self.api_key.expose_secret().is_empty()
@@ -191,8 +202,8 @@ impl OmdbClient {
             .unwrap_or_default()
     }
 
-    /// The full title record for an IMDb id, or `None` when the provider is
-    /// disabled, the id is empty, the request fails, or OMDb has no such title.
+    /// The full title record for an IMDb id, or `None` when the id is empty,
+    /// the request fails, or OMDb has no such title.
     ///
     /// Port of `OmdbProvider.GetRootObject`: the id is normalized to the `tt`
     /// form and requested with `plot=short&tomatoes=true&r=json`, exactly as
@@ -284,25 +295,9 @@ impl OmdbClient {
         for (key, value) in params {
             request = request.query(&[(key, value)]);
         }
-        let resp = match request.send().await {
-            Ok(resp) => resp,
-            // `without_url()` strips the query string — the URL carries the API key.
-            Err(e) => {
-                tracing::warn!(provider = "omdb", imdb_id, error = %e.without_url(), "omdb request failed");
-                return None;
-            }
-        };
-        if !resp.status().is_success() {
-            tracing::warn!(provider = "omdb", imdb_id, status = %resp.status(), "omdb returned non-success");
-            return None;
-        }
-        match resp.json::<T>().await {
-            Ok(body) => Some(body),
-            Err(e) => {
-                tracing::warn!(provider = "omdb", imdb_id, error = %e.without_url(), "omdb body did not parse");
-                None
-            }
-        }
+        // OMDb has no configured fixed request interval. Server quota headers
+        // and transient failures still apply a shared cooldown across lookups.
+        self.limiter.get_json(request, Duration::ZERO).await
     }
 }
 
@@ -671,9 +666,16 @@ mod tests {
     }
 
     #[test]
-    fn disabled_without_key() {
-        assert!(!OmdbClient::new("").is_enabled());
-        assert!(OmdbClient::new("abc123").is_enabled());
+    fn default_key_and_override() {
+        for input in ["", "  ", "\t\n"] {
+            let client = OmdbClient::new(input);
+            assert!(client.is_enabled());
+            assert_eq!(client.api_key.expose_secret(), DEFAULT_API_KEY);
+        }
+        assert_eq!(
+            OmdbClient::new(" abc123 ").api_key.expose_secret(),
+            "abc123"
+        );
     }
 
     #[test]
@@ -766,13 +768,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_disabled_client_never_calls_out() {
-        // No mock server: a request would fail, so reaching None proves the
-        // key check short-circuits before the call.
-        let client = OmdbClient::new("");
-        assert!(client.item("tt1375666").await.is_none());
-        assert!(client.episode("tt0903747", 1, 1, None).await.is_none());
-        assert!(client.critic_rating("tt1375666").await.is_none());
+    async fn default_and_override_keys_are_sent_to_omdb() {
+        let server = MockServer::start(vec![
+            ("apikey=2c9d9507&", movie_body()),
+            ("apikey=custom-key&", movie_body()),
+            ("/", r#"{"Response":"False"}"#.to_owned()),
+        ])
+        .await;
+        for key in ["", "  ", " custom-key "] {
+            let client = OmdbClient::new(key).with_base_url(&server.base_url);
+            assert_eq!(
+                client
+                    .item("tt1375666")
+                    .await
+                    .expect("authenticated title")
+                    .title
+                    .as_deref(),
+                Some("Inception")
+            );
+        }
     }
 
     /// A season listing with two episodes.

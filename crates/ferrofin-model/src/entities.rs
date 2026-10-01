@@ -199,6 +199,21 @@ pub enum MetadataField {
     OfficialRating,
 }
 
+impl MetadataField {
+    /// Every member, in declaration (discriminant) order.
+    pub const ALL: [Self; 9] = [
+        Self::Cast,
+        Self::Genres,
+        Self::ProductionLocations,
+        Self::Studios,
+        Self::Tags,
+        Self::Name,
+        Self::Overview,
+        Self::Runtime,
+        Self::OfficialRating,
+    ];
+}
+
 /// The collection type options (library kinds an admin can create).
 ///
 /// Members are lowercase for backwards compatibility with the wire contract.

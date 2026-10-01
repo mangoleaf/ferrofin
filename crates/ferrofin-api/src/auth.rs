@@ -119,13 +119,13 @@ pub async fn auth_context_layer(
 ///   (`user_entity_ext::is_parental_schedule_allowed`) but applies it only at
 ///   **login**, so a token minted inside the window keeps working outside it.
 ///
-/// [`require_live_tv_permission`] ports both arms for the 29 routes behind the
+/// [`require_user_permission`] ports both arms for the 29 routes behind the
 /// two Live TV `UserPermissionRequirement` policies, which is where the
 /// divergence was measured. It is named here rather than left implicit because
 /// the gap is the *default* policy's, not Live TV's.
 ///
 /// The un-defer path is to hoist the two arms out of
-/// [`require_live_tv_permission`] into this extractor (which then makes them
+/// [`require_user_permission`] into this extractor (which then makes them
 /// unconditional for every gated route, as C# does), resolve the caller's
 /// policy once in [`auth_context_layer`] and carry it on [`AuthorizationInfo`]
 /// so the arms cost no extra per-request read, and re-run the parity sweep —
@@ -214,7 +214,7 @@ impl FromRequestParts<AppState> for RequireAdmin {
 /// rendered and the server ignored — an account with it cleared could still
 /// browse the whole guide.
 ///
-/// The policy itself is [`require_live_tv_permission`], which both Live TV
+/// The policy itself is [`require_user_permission`], which both Live TV
 /// extractors share; this one names `EnableLiveTvAccess` as the permission the
 /// non-administrator arm demands. `EnableLiveTvAccess` defaults to `true`
 /// (`UserEntityExtensions.cs:187`), which is why a stock account sees no change.
@@ -228,7 +228,7 @@ impl FromRequestParts<AppState> for RequireLiveTvAccess {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let info = require_live_tv_permission(parts, state, |p| p.enable_live_tv_access).await?;
+        let (info, _) = require_user_permission(parts, state, |p| p.enable_live_tv_access).await?;
         Ok(Self(info))
     }
 }
@@ -243,7 +243,7 @@ impl FromRequestParts<AppState> for RequireLiveTvAccess {
 /// timer — and the rest under [`RequireAdmin`], which refused the
 /// non-administrator the dashboard had explicitly granted recording rights.
 ///
-/// The policy itself is [`require_live_tv_permission`]; this one names
+/// The policy itself is [`require_user_permission`]; this one names
 /// `EnableLiveTvManagement`, which defaults to `false`
 /// (`UserEntityExtensions.cs:188`).
 #[derive(Debug, Clone)]
@@ -256,13 +256,33 @@ impl FromRequestParts<AppState> for RequireLiveTvManagement {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let info =
-            require_live_tv_permission(parts, state, |p| p.enable_live_tv_management).await?;
+        let (info, _) =
+            require_user_permission(parts, state, |p| p.enable_live_tv_management).await?;
         Ok(Self(info))
     }
 }
 
-/// The shared body of the two Live TV permission extractors — a port of the
+/// Enforces Jellyfin's `Download` policy before resolving or serving a file.
+#[derive(Debug, Clone)]
+pub struct RequireDownload(
+    pub AuthorizationInfo,
+    pub Option<ferrofin_model::users::UserPolicy>,
+);
+
+impl FromRequestParts<AppState> for RequireDownload {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (info, policy) =
+            require_user_permission(parts, state, |p| p.enable_content_downloading).await?;
+        Ok(Self(info, policy))
+    }
+}
+
+/// The shared body of the user permission extractors — a port of the
 /// **whole** `UserPermissionRequirement` policy, which is two handlers deep.
 ///
 /// Read alone, `UserPermissionHandler` (v10.11.8
@@ -276,7 +296,7 @@ impl FromRequestParts<AppState> for RequireLiveTvManagement {
 /// `AuthorizationHandler<DefaultAuthorizationRequirement>`, whose base
 /// `HandleAsync` dispatches over `context.Requirements.OfType<TRequirement>()`
 /// and therefore matches every subclass. So `DefaultAuthorizationHandler` runs
-/// against these two policies as well, and its own closing comment says so:
+/// against these permission policies as well, and its own closing comment says so:
 /// "Only succeed if the requirement isn't a subclass as any subclassed
 /// requirement will handle success in its own handler"
 /// (`DefaultAuthorizationHandler.cs:86-90`).
@@ -309,11 +329,11 @@ impl FromRequestParts<AppState> for RequireLiveTvManagement {
 ///
 /// Anything that reaches neither an allow arm nor a `Fail` is `403`: the
 /// requirement is simply never satisfied.
-async fn require_live_tv_permission(
+async fn require_user_permission(
     parts: &mut Parts,
     state: &AppState,
     permission: fn(&ferrofin_model::users::UserPolicy) -> bool,
-) -> Result<AuthorizationInfo, ApiError> {
+) -> Result<(AuthorizationInfo, Option<ferrofin_model::users::UserPolicy>), ApiError> {
     // Read the peer before `RequireAuth` borrows `parts` mutably.
     //
     // C# asks `_networkManager.IsInLocalNetwork(HttpContext.GetNormalizedRemoteIP())`,
@@ -332,17 +352,17 @@ async fn require_live_tv_permission(
 
     // 1. "Api keys are unrestricted."
     if info.is_api_key {
-        return Ok(info);
+        return Ok((info, None));
     }
 
     // C# throws `ResourceNotFoundException` when the token's user has vanished;
     // here an absent policy means the same thing and is refused rather than
     // silently granted.
     let Some(user) = &info.user else {
-        return Err(ApiError::Forbidden("live tv access required".to_owned()));
+        return Err(ApiError::Forbidden("user permission required".to_owned()));
     };
     let Some(policy) = crate::handlers::users::user_policy(state, user).await? else {
-        return Err(ApiError::Forbidden("live tv access required".to_owned()));
+        return Err(ApiError::Forbidden("user permission required".to_owned()));
     };
 
     // 2. "User cannot access remotely and user is remote" — before the admin arm.
@@ -354,7 +374,7 @@ async fn require_live_tv_permission(
 
     // 3. "Admins can do everything."
     if policy.is_administrator {
-        return Ok(info);
+        return Ok((info, Some(policy)));
     }
 
     // 4. The parental/access schedule, which `UserPermissionRequirement` validates.
@@ -366,9 +386,9 @@ async fn require_live_tv_permission(
 
     // 5. The permission the policy names.
     if permission(&policy) {
-        return Ok(info);
+        return Ok((info, Some(policy)));
     }
-    Err(ApiError::Forbidden("live tv access required".to_owned()))
+    Err(ApiError::Forbidden("user permission required".to_owned()))
 }
 
 /// Whether `now` falls inside any of `schedules`, or there are none — C#

@@ -51,8 +51,13 @@
 //!   (`FullRefresh` / `ReplaceAllMetadata`, [`DynamicImageProviders::refresh_item`]
 //!   with `force`).
 //!
-//! The pass runs at the end of every library scan over every supported row
-//! ([`DynamicImageProviders::refresh_all`]). Upstream's `GenresValidator`
+//! The pass runs at the end of every library validation that was not
+//! cancelled — a rescan that changed nothing included, since a genre or a
+//! playlist the metadata editor or `POST /Playlists` created is no scan
+//! change — over every supported row, each gated by the rule above
+//! ([`DynamicImageProviders::refresh_all_between`], which serves the scan's
+//! item-refresh lane between two rows). An item or folder refresh runs
+//! none of it. Upstream's `GenresValidator`
 //! only refreshes genres it is seeing for the first time, so a genre whose
 //! movies gained posters *after* it was created stays blank there until a
 //! manual refresh; Ferrofin re-evaluates the (cheap) `HasChanged` gate each
@@ -183,6 +188,10 @@ pub struct DynamicImageReport {
     pub generated: usize,
 }
 
+/// What [`DynamicImageProviders::refresh_all_between`] awaits between two
+/// rows.
+pub type BetweenFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
 /// The dynamic image providers over the item repository + persistence seams.
 ///
 /// One value serves every kind; [`refresh_all`](Self::refresh_all) is the
@@ -244,6 +253,20 @@ impl DynamicImageProviders {
     /// Only when a supported kind's row list cannot be read; a failure on one
     /// row is logged and the pass continues.
     pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        self.refresh_all_between(&nothing).await
+    }
+
+    /// [`refresh_all`](Self::refresh_all), awaiting `between` before each
+    /// row — the library scan serves its priority lane there.
+    ///
+    /// # Errors
+    ///
+    /// As [`refresh_all`](Self::refresh_all).
+    pub async fn refresh_all_between<'b>(
+        &self,
+        between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
+    ) -> Result<DynamicImageReport, ServiceError> {
         if !self.processor.supports_image_collage_creation() {
             return Ok(DynamicImageReport::default());
         }
@@ -268,6 +291,7 @@ impl DynamicImageProviders {
                 })
                 .await?;
             for row in rows {
+                between().await;
                 report.examined += 1;
                 match self.refresh_item(&row, false).await {
                     Ok(ItemUpdateType::ImageUpdate) => report.generated += 1,

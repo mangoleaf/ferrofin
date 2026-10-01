@@ -19,9 +19,10 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -38,8 +39,18 @@ pub struct NotifyFileSystemWatcher {
     /// a `std::sync::Mutex` — safe here because the guard never spans an
     /// `.await` (both calls are synchronous).
     inner: Mutex<RecommendedWatcher>,
-    /// Roots currently watched, for `unwatch_all`.
-    watched: Mutex<HashSet<String>>,
+    /// Roots currently watched (without a trailing slash), for
+    /// `unwatch_all` — and for the event callback, which drops a
+    /// metadata-only change of a root itself.
+    watched: Arc<Mutex<HashSet<String>>>,
+}
+
+/// `path` without its trailing slashes (`/` stays `/`).
+fn root_key(path: &str) -> String {
+    match path.trim_end_matches('/') {
+        "" if path.starts_with('/') => "/".to_owned(),
+        path => path.to_owned(),
+    }
 }
 
 impl std::fmt::Debug for NotifyFileSystemWatcher {
@@ -62,6 +73,8 @@ impl NotifyFileSystemWatcher {
     /// (e.g. inotify limits exhausted).
     pub fn new() -> Result<(Self, mpsc::UnboundedReceiver<String>), ServiceError> {
         let (tx, rx) = mpsc::unbounded_channel();
+        let root_set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let roots = Arc::clone(&root_set);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let event = match res {
                 Ok(event) => event,
@@ -78,9 +91,33 @@ impl NotifyFileSystemWatcher {
             ) {
                 return;
             }
+            // A directory's own `Modify` is never about its entries (those
+            // arrive as their own create/remove events): an attribute change
+            // (`IN_ATTRIB`), or its mtime set alone (`IN_MODIFY`).
+            let metadata_only = matches!(
+                event.kind,
+                EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Data(_))
+            );
             for path in event.paths {
                 let path = path.to_string_lossy().into_owned();
                 if should_ignore_path(&path) {
+                    continue;
+                }
+                // A library root's own attributes or times changing
+                // (`touch`, `chmod`, `rsync -a` of the root) says nothing
+                // about its contents, but the root is the whole library:
+                // reporting it would rescan the library for a metadata-only
+                // change. A file or folder created or removed in it arrives
+                // with its own path.
+                // A poisoned set still holds whole entries (each update is
+                // one insert or remove).
+                if metadata_only
+                    && roots
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .contains(&root_key(&path))
+                {
+                    tracing::trace!(path, "metadata-only change of a library root ignored");
                     continue;
                 }
                 // Send fails only when the receiver is gone (shutdown) — drop.
@@ -91,7 +128,7 @@ impl NotifyFileSystemWatcher {
         Ok((
             Self {
                 inner: Mutex::new(watcher),
-                watched: Mutex::new(HashSet::new()),
+                watched: root_set,
             },
             rx,
         ))
@@ -109,7 +146,7 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
         self.watched
             .lock()
             .expect("watched set not poisoned")
-            .insert(path.to_owned());
+            .insert(root_key(path));
         tracing::info!(path, "watching library root for changes");
         Ok(())
     }
@@ -128,7 +165,7 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
         self.watched
             .lock()
             .expect("watched set not poisoned")
-            .remove(path);
+            .remove(&root_key(path));
         Ok(())
     }
 
@@ -215,6 +252,51 @@ mod tests {
         assert!(
             !seen.iter().any(|p| p.ends_with("AlbumArt.jpg")),
             "ignored artwork must be filtered, saw: {seen:?}"
+        );
+    }
+
+    /// A library root's own metadata changing (`touch` of the root) is not
+    /// reported — it would rescan the whole library for nothing — while a
+    /// file created in the root, and a metadata change of a folder inside
+    /// it, still are.
+    #[tokio::test]
+    async fn a_metadata_only_change_of_a_root_is_not_reported() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Not the tempdir itself: its hidden `.tmp…` name is ignored anyway.
+        let library = dir.path().join("tv");
+        let sub = library.join("Show");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let root = library.to_string_lossy().into_owned();
+        let (watcher, mut rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        watcher.watch(&format!("{root}/")).await.expect("watch");
+
+        // Its mtime set alone (`IN_MODIFY`), then its mode (`IN_ATTRIB`).
+        let later = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        std::fs::File::open(&library)
+            .expect("root")
+            .set_modified(later)
+            .expect("touch root");
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod root");
+        std::fs::File::open(&sub)
+            .expect("sub")
+            .set_modified(later)
+            .expect("touch sub");
+        std::fs::write(library.join("new.mkv"), b"x").expect("write");
+
+        let seen = recv_until(&mut rx, |p| p.ends_with("new.mkv")).await;
+        assert!(
+            seen.iter().any(|p| p.ends_with("new.mkv")),
+            "the new file is reported: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|p| Path::new(p) == sub),
+            "a folder inside the root is reported: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| root_key(p) == root_key(&root)),
+            "the root's own metadata change is not: {seen:?}"
         );
     }
 

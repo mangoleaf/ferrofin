@@ -46,12 +46,13 @@ use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::{KeyframeRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager};
 use ferrofin_traits::stubs::LyricManager;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleMediaType, SubtitleSearchRequest};
+#[cfg(test)]
+use ferrofin_traits::subtitles::{SubtitleManager, SubtitleSearchRequest};
 use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
-use crate::db_error::{db_err, media_stream_type_from_disc};
+use crate::db_error::db_err;
 
 use super::{ScheduledTask, TaskProgress};
 
@@ -863,10 +864,13 @@ const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
 ///
 /// 1. deduplicates `Peoples` rows sharing (name, type), re-pointing their item
 ///    links to one survivor, and removes people with no item links;
-/// 2. removes `Person` items whose people row is gone (the
-///    `ValidatePeopleAsync` sweep);
-/// 3. refreshes `Person` items missing a primary image or overview through the
-///    provider manager (30-day backoff via `DateLastRefreshed`).
+/// 2. `PeopleValidator`: removes `Person` items whose people row is gone,
+///    and refreshes the new and never-refreshed ones (`isNew ||
+///    neverRefreshed`, `PeopleValidator.cs:76-80`) with the default options;
+/// 3. `RefreshPeopleImagesAsync`: refreshes the `Person` items missing a
+///    primary image or overview that were not refreshed in the last 30 days,
+///    fetching only what each lacks (a `FullRefresh` of the missing half,
+///    `ValidationOnly` of the other).
 pub struct PeopleValidationTask {
     db: Database,
     providers: Arc<dyn ProviderManager>,
@@ -948,44 +952,52 @@ impl PeopleValidationTask {
         Ok(())
     }
 
-    /// Phase 3: refresh person items missing a primary image or overview.
-    async fn refresh_person_items(
+    /// The rest of phase 2 (`PeopleValidator.Run`): every person item that is
+    /// new or was never refreshed (`DateLastRefreshed` unset — a person item
+    /// is created unrefreshed) refreshes with the default options, whose
+    /// first refresh runs its providers. A person already refreshed is left
+    /// alone here.
+    async fn refresh_new_person_items(
         &self,
         progress: &TaskProgress,
         base: f64,
         span: f64,
     ) -> Result<(), ServiceError> {
-        let cutoff = datetime_to_db(Utc::now() - chrono::Duration::days(PEOPLE_REFRESH_DAYS));
-        let ids: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "BaseItems" b
-               WHERE "Type" = ?1
-                 AND ("DateLastRefreshed" IS NULL OR "DateLastRefreshed" < ?2)
-                 AND (("Overview" IS NULL OR "Overview" = '')
-                      OR NOT EXISTS (SELECT 1 FROM "BaseItemImageInfos" i
-                                     WHERE i."ItemId" = b."Id" AND i."ImageType" = 0))
-               ORDER BY "Id""#,
-        )
-        .bind(PERSON_TYPE)
-        .bind(cutoff)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        tracing::info!(count = ids.len(), "people needing image/overview refresh");
+        let ids =
+            crate::item_persistence_service::never_refreshed_items(&self.db, PERSON_TYPE).await?;
+        let refreshed = self
+            .refresh_people(&ids, progress, base, span, |_| {
+                MetadataRefreshOptions::default()
+            })
+            .await;
+        tracing::info!(refreshed, total = ids.len(), "refreshed new people");
+        Ok(())
+    }
+
+    /// Refreshes the person items `ids` with the options `options_for`
+    /// builds for each, reporting progress over `base..base + span`; returns
+    /// how many were refreshed. Stops at the first failure: a provider-manager
+    /// failure (no network, no image store) repeats identically for every
+    /// person, and the next scheduled run retries.
+    async fn refresh_people(
+        &self,
+        ids: &[String],
+        progress: &TaskProgress,
+        base: f64,
+        span: f64,
+        options_for: impl Fn(&str) -> MetadataRefreshOptions,
+    ) -> usize {
         let total = ids.len().max(1);
         let mut refreshed = 0usize;
         for (index, id) in ids.iter().enumerate() {
             if let Ok(item_id) = Uuid::parse_str(id) {
                 match self
                     .providers
-                    .refresh_single_item(item_id, &MetadataRefreshOptions::default())
+                    .refresh_single_item(item_id, &options_for(id))
                     .await
                 {
                     Ok(_) => refreshed += 1,
                     Err(e) => {
-                        // One representative warning, then stop the pass: a
-                        // provider-manager failure (no network, no image store)
-                        // repeats identically for every person. The next
-                        // scheduled run retries.
                         tracing::warn!(person = id, error = %e, "person refresh failed");
                         break;
                     }
@@ -994,6 +1006,51 @@ impl PeopleValidationTask {
             #[allow(clippy::cast_precision_loss)]
             progress.report(base + span * ((index + 1) as f64 / total as f64));
         }
+        refreshed
+    }
+
+    /// Phase 3 (`RefreshPeopleImagesAsync`): refresh the person items missing
+    /// a primary image or an overview that were not refreshed in the last 30
+    /// days, each with `ImageRefreshMode`/`MetadataRefreshMode` a
+    /// `FullRefresh` for the half it lacks and `ValidationOnly` for the half
+    /// it has.
+    async fn refresh_person_items(
+        &self,
+        progress: &TaskProgress,
+        base: f64,
+        span: f64,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_traits::providers::MetadataRefreshMode;
+        let cutoff = datetime_to_db(Utc::now() - chrono::Duration::days(PEOPLE_REFRESH_DAYS));
+        let rows = crate::item_persistence_service::items_lacking_overview_or_primary(
+            &self.db,
+            PERSON_TYPE,
+            &cutoff,
+        )
+        .await?;
+        tracing::info!(count = rows.len(), "people needing image/overview refresh");
+        let has: std::collections::HashMap<String, (bool, bool)> = rows
+            .iter()
+            .map(|(id, overview, image)| (id.clone(), (*overview, *image)))
+            .collect();
+        let ids: Vec<String> = rows.into_iter().map(|(id, _, _)| id).collect();
+        let mode = |present: bool| {
+            if present {
+                MetadataRefreshMode::ValidationOnly
+            } else {
+                MetadataRefreshMode::FullRefresh
+            }
+        };
+        let refreshed = self
+            .refresh_people(&ids, progress, base, span, |id| {
+                let (overview, image) = has.get(id).copied().unwrap_or_default();
+                MetadataRefreshOptions {
+                    metadata_refresh_mode: mode(overview),
+                    image_refresh_mode: mode(image),
+                    ..MetadataRefreshOptions::default()
+                }
+            })
+            .await;
         tracing::info!(refreshed, "refreshed people missing images or overview");
         Ok(())
     }
@@ -1027,6 +1084,7 @@ impl ScheduledTask for PeopleValidationTask {
         self.dedupe_and_orphans().await?;
         progress.report(33.0);
         self.validate_person_items().await?;
+        self.refresh_new_person_items(progress, 50.0, 16.0).await?;
         progress.report(66.0);
         self.refresh_person_items(progress, 66.0, 34.0).await?;
         progress.report(100.0);
@@ -1047,103 +1105,22 @@ impl ScheduledTask for PeopleValidationTask {
 pub struct SubtitleDownloadTask {
     library: Arc<dyn LibraryManager>,
     folders: Arc<dyn VirtualFolderManager>,
-    subtitles: Arc<dyn SubtitleManager>,
-    streams: Arc<dyn MediaStreamRepository>,
+    downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
 }
 
 impl SubtitleDownloadTask {
-    /// Builds the task over the library, subtitle-manager and stream seams.
+    /// Builds the task with the same downloader used by library scans.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         folders: Arc<dyn VirtualFolderManager>,
-        subtitles: Arc<dyn SubtitleManager>,
-        streams: Arc<dyn MediaStreamRepository>,
+        downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) -> Self {
         Self {
             library,
             folders,
-            subtitles,
-            streams,
+            downloader,
         }
-    }
-
-    /// Whether `item_id` still needs subtitles in `lang`, per the library
-    /// options flags.
-    async fn needs_language(
-        &self,
-        item_id: Uuid,
-        lang: &str,
-        options: &LibraryOptions,
-    ) -> Result<bool, ServiceError> {
-        let streams = self
-            .streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id,
-                stream_type: None,
-                index: None,
-            })
-            .await?;
-        let lang_matches =
-            |l: &Option<String>| l.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(lang));
-        for stream in &streams {
-            match media_stream_type_from_disc(stream.stream_type) {
-                MediaStreamType::Audio
-                    if options.skip_subtitles_if_audio_track_matches
-                        && lang_matches(&stream.language) =>
-                {
-                    return Ok(false);
-                }
-                // An external subtitle always satisfies the language; an
-                // embedded one only when the library says so.
-                MediaStreamType::Subtitle
-                    if lang_matches(&stream.language)
-                        && (options.skip_subtitles_if_embedded_subtitles_present
-                            || stream.is_external) =>
-                {
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-        Ok(true)
-    }
-
-    /// Searches and downloads the best subtitle for one video + language.
-    async fn download_for(
-        &self,
-        video: &BaseItemEntity,
-        item_id: Uuid,
-        lang: &str,
-        options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
-        let is_episode = video.season_id.is_some() || video.series_name.is_some();
-        let request = SubtitleSearchRequest {
-            item_id,
-            language: lang.to_owned(),
-            is_perfect_match: options.require_perfect_subtitle_match.then_some(true),
-            is_automated: true,
-            content_type: if is_episode {
-                SubtitleMediaType::Episode
-            } else {
-                SubtitleMediaType::Movie
-            },
-            name: video.name.clone(),
-            series_name: video.series_name.clone(),
-            production_year: video.production_year.and_then(|y| i32::try_from(y).ok()),
-            parent_index_number: video
-                .parent_index_number
-                .and_then(|n| i32::try_from(n).ok()),
-            index_number: video.index_number.and_then(|n| i32::try_from(n).ok()),
-            runtime_ticks: video.run_time_ticks,
-            media_path: video.path.clone(),
-            ..SubtitleSearchRequest::default()
-        };
-        let results = self.subtitles.search_subtitles(&request).await?;
-        let Some(first) = results.first().and_then(|r| r.id.clone()) else {
-            return Ok(());
-        };
-        self.subtitles.download_subtitles(item_id, &first).await
     }
 }
 
@@ -1195,31 +1172,15 @@ impl ScheduledTask for SubtitleDownloadTask {
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
-            let Ok(item_id) = Uuid::parse_str(&video.id) else {
-                continue;
-            };
             let Some(path) = video.path.as_deref() else {
                 continue;
             };
             let Some(options) = options_for_path(&folders, path) else {
                 continue;
             };
-            let Some(langs) = options.subtitle_download_languages.clone() else {
-                continue;
-            };
-            for lang in &langs {
-                match self.needs_language(item_id, lang, options).await {
-                    Ok(true) => {
-                        if let Err(e) = self.download_for(video, item_id, lang, options).await {
-                            tracing::warn!(item = %video.id, lang, error = %e, "subtitle download failed");
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(item = %video.id, error = %e, "subtitle check failed");
-                    }
-                }
-            }
+            self.downloader
+                .download_missing(video, options, &crate::ScanCancel::new())
+                .await;
         }
         progress.report(100.0);
         Ok(())
@@ -1787,6 +1748,7 @@ mod tests {
             self.searches.lock().expect("lock").push(request.clone());
             Ok(vec![RemoteSubtitleInfo {
                 id: Some("sub-1".to_owned()),
+                is_hash_match: Some(true),
                 ..RemoteSubtitleInfo::default()
             }])
         }
@@ -1803,13 +1765,20 @@ mod tests {
         }
         async fn upload_subtitle(
             &self,
-            _item_id: Uuid,
-            _response: &SubtitleResponse,
+            item_id: Uuid,
+            response: &SubtitleResponse,
         ) -> Result<(), ServiceError> {
-            unimplemented!("fake")
+            self.downloads.lock().expect("lock").push((
+                item_id,
+                String::from_utf8(response.content.clone()).unwrap(),
+            ));
+            Ok(())
         }
-        async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
-            unimplemented!("fake")
+        async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError> {
+            Ok(SubtitleResponse {
+                content: id.as_bytes().to_vec(),
+                ..Default::default()
+            })
         }
         async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
             unimplemented!("fake")
@@ -2178,8 +2147,10 @@ mod tests {
                 None,
                 &media.path().to_string_lossy(),
             )),
-            subtitles.clone(),
-            Arc::new(streams),
+            Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
+                &(subtitles.clone() as Arc<dyn SubtitleManager>),
+                Arc::new(streams),
+            )),
         );
         assert_eq!(task.key(), "DownloadSubtitles");
         task.execute(&TaskProgress::default()).await.expect("run");
@@ -2413,6 +2384,7 @@ mod tests {
 
     #[tokio::test]
     async fn people_validation_dedupes_and_removes_orphans() {
+        use ferrofin_traits::providers::MetadataRefreshMode::FullRefresh;
         let db = test_db().await;
         let item = Uuid::from_u128(0x81);
         seed_item(&db, item, BaseItemKind::Movie).await;
@@ -2455,6 +2427,24 @@ mod tests {
         seed_named_item(&db, person_item, BaseItemKind::Person, "John Smith").await;
         seed_named_item(&db, dead_item, BaseItemKind::Person, "Gone").await;
 
+        // A person already refreshed with everything it needs: left alone.
+        let complete = Uuid::from_u128(0xA3);
+        seed_named_item(&db, complete, BaseItemKind::Person, "John Smith").await;
+        crate::item_persistence_service::seed_refreshed_overview(
+            &db,
+            complete,
+            "2026-09-01 00:00:00.0000000",
+            "Bio.",
+        )
+        .await;
+        crate::item_persistence_service::seed_primary_image(
+            &db,
+            Uuid::from_u128(0xA4),
+            complete,
+            "/p.jpg",
+        )
+        .await;
+
         let providers = Arc::new(RecordingProviders::default());
         let task = PeopleValidationTask::new(db.clone(), providers.clone());
         assert_eq!(task.key(), "RefreshPeople");
@@ -2482,21 +2472,74 @@ mod tests {
         .expect("items");
         assert_eq!(
             person_items,
-            vec![guid_to_db(person_item)],
+            vec![guid_to_db(person_item), guid_to_db(complete)],
             "dead item removed"
         );
 
+        // `PeopleValidator` refreshes the never-refreshed person with the
+        // default options (its first refresh runs the providers); the
+        // image/overview pass then asks a full refresh of both halves it
+        // still lacks (the fake stamps nothing). The complete, recently
+        // refreshed person is refreshed by neither.
+        let refreshed = providers.refreshed.lock().expect("lock").clone();
+        let modes: Vec<(Uuid, _, _)> = refreshed
+            .iter()
+            .map(|(id, o)| (*id, o.metadata_refresh_mode, o.image_refresh_mode))
+            .collect();
         assert_eq!(
-            providers.refreshed.lock().expect("lock").as_slice(),
-            &[person_item],
-            "surviving person refreshed"
+            modes,
+            vec![
+                (
+                    person_item,
+                    ferrofin_traits::providers::MetadataRefreshMode::Default,
+                    ferrofin_traits::providers::MetadataRefreshMode::Default
+                ),
+                (person_item, FullRefresh, FullRefresh),
+            ],
         );
+    }
+
+    /// The image/overview pass fetches only the half a person lacks: a
+    /// person with an overview but no image asks a `FullRefresh` of its
+    /// images and `ValidationOnly` of its metadata.
+    #[tokio::test]
+    async fn the_people_image_pass_fetches_only_the_missing_half() {
+        use ferrofin_traits::providers::MetadataRefreshMode::{FullRefresh, ValidationOnly};
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xB1);
+        seed_named_item(&db, person, BaseItemKind::Person, "Jane Doe").await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xB2), "Jane Doe", "Actor")
+            .await;
+        crate::item_persistence_service::seed_refreshed_overview(
+            &db,
+            person,
+            "2020-01-01 00:00:00.0000000",
+            "Bio.",
+        )
+        .await;
+        let providers = Arc::new(RecordingProviders::default());
+        let task = PeopleValidationTask::new(db.clone(), providers.clone());
+        task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("new people");
+        assert!(
+            providers.refreshed.lock().expect("lock").is_empty(),
+            "an already-refreshed person is not new"
+        );
+        task.refresh_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("image pass");
+        let refreshed = providers.refreshed.lock().expect("lock").clone();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].0, person);
+        assert_eq!(refreshed[0].1.metadata_refresh_mode, ValidationOnly);
+        assert_eq!(refreshed[0].1.image_refresh_mode, FullRefresh);
     }
 
     /// A [`ProviderManager`] fake recording `refresh_single_item` calls.
     #[derive(Default)]
     struct RecordingProviders {
-        refreshed: Mutex<Vec<Uuid>>,
+        refreshed: Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
     }
 
     #[async_trait]
@@ -2519,9 +2562,12 @@ mod tests {
         async fn refresh_single_item(
             &self,
             item_id: Uuid,
-            _options: &MetadataRefreshOptions,
+            options: &MetadataRefreshOptions,
         ) -> Result<ferrofin_traits::providers::ItemUpdateType, ServiceError> {
-            self.refreshed.lock().expect("lock").push(item_id);
+            self.refreshed
+                .lock()
+                .expect("lock")
+                .push((item_id, options.clone()));
             Ok(ferrofin_traits::providers::ItemUpdateType::default())
         }
         async fn save_image_from_url(

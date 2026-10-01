@@ -8,6 +8,157 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — subtitles download during library scans
+
+Libraries with subtitle download languages now fetch missing subtitles when a movie
+or episode is probed during a normal scan or full metadata refresh. Configure an
+OpenSubtitles account in its plugin settings. The shared application key is built in.
+
+Existing subtitles are retained, and unchanged scans make no subtitle requests.
+Enabling languages for an already scanned library takes effect on its next video
+probe or full refresh; the daily subtitle task also fills missing languages.
+Provider outages leave the media scan and existing subtitles intact.
+
+Both paths now respect provider disabling/order and perfect-match settings. Text
+subtitles already embedded in a video satisfy their language, even when skipping
+embedded image subtitles is disabled. The audio-language skip checks default audio
+tracks, falling back to the first audio track when none is marked default.
+
+## Unreleased — a database adopted from Jellyfin shows its libraries and removes deleted media
+
+This applies only to a database adopted from a Jellyfin install (a
+`jellyfin.db.pre-ferrofin` copy sits next to the database). A database Ferrofin created
+itself is not affected.
+
+Jellyfin files each library item under the folder of its library location, while
+Ferrofin files the items it scans under the library itself. Earlier versions read an
+adopted library through Jellyfin's folders only. After Ferrofin's first scan, each library
+browsed empty (with empty counts, Latest and Next Up), and media deleted from disk was never
+removed. Ferrofin now reads every library through both, and a scan (including one started
+by the disk watcher or a `*arr` webhook) removes deleted media.
+
+**The first library scan after this upgrade removes the entries for media deleted from
+disk since Ferrofin first scanned the library (or since adoption, if it was never
+scanned), with their watched state, resume positions and favourites.** Ferrofin does not
+yet keep a deleted item's user data for when the file comes back, as Jellyfin does. So
+before that scan, make sure your media is where the libraries expect it: a file that was
+moved or renamed is removed, then added again as a new item without its watched state. A
+scan never removes anything under a library location that is missing, empty or cannot be
+listed (an unmounted drive or share), nor an entry whose file or folder is still on disk,
+unless the scan replaced it with a new entry for the same file.
+
+Two things you may notice once an adopted library browses again, both gaps in how
+Ferrofin's scan groups files (they are open work, not intended behaviour):
+
+- **Alternate versions show as separate movies.** Jellyfin lists a movie with several
+  versions (`Movie (2010) - 1080p.mkv` beside `Movie (2010) - 2160p.mkv`) once, with a
+  version picker. Ferrofin does not group versions yet, so after its scan each file is a
+  movie of its own, and the movie count rises by one per extra version.
+- **A plain subfolder in a movie library shows as an empty folder.** Jellyfin lists a
+  folder that is not a movie's own (`Movies/Collection/Movie (2010)/…`) as a folder
+  holding its movies. Ferrofin's scan lists those movies at the top of the library
+  instead, and the folder Jellyfin created stays behind, empty, while its directory
+  exists.
+
+Adoption is still one-way: going back to Jellyfin means restoring the
+`jellyfin.db.pre-ferrofin` copy taken at adoption, which predates every change Ferrofin
+made.
+
+## Unreleased — "Date added behavior for new content" is honoured
+
+**Dashboard → Libraries → Display → Date added behavior for new content** now decides how
+a new item's date added (`DateCreated`, what "Date Added" sorts and "Recently added"
+read) is set. Earlier versions ignored it and always used the file's creation time.
+
+- **Use file creation date** (the default, unchanged behaviour): a new file is dated by
+  its creation time on disk. On Linux that is the file's birth time where the
+  filesystem records one (ext4, btrfs, XFS, tmpfs), else the older of its change and
+  modification times. A copy (`cp`, a download client's move across filesystems) is born
+  when it is written, whatever its modification time says; a rename within a
+  filesystem keeps its birth time. As in Jellyfin, a file whose modification time
+  changes is re-dated to its creation time at the next scan.
+- **Use date scanned into the library**: a new item is dated by the moment Ferrofin
+  first detects it, whether a library scan or the disk watcher / a `*arr` webhook
+  found it. Its series' date added moves with it at once.
+
+Existing items keep their stored date: switching the setting re-dates nothing, and a
+rescan never moves an unchanged item's date in either mode. The setting applies from the
+next scan or watcher event, without a restart.
+
+A date an item's own metadata supplies still wins, whichever the setting, and now also on
+an item already in the library: an `.nfo` `<dateadded>` is applied whenever the `.nfo`
+is read again (after it is edited), and a photo's EXIF date whenever the photo file
+changes. Earlier versions applied either one only when the item was first added.
+
+**If you adopted a Jellyfin install with an earlier Ferrofin, check this setting after
+upgrading.** Adopting a Jellyfin install now imports its `metadata.xml`, and the import
+also runs on the first boot of this version for an install adopted earlier, as long as its
+configuration directory still holds Jellyfin's `metadata.xml` and the setting was never
+saved in Ferrofin. If "Use date scanned into the library" was chosen in Jellyfin, this
+version starts dating new items by when it detects them, and the dashboard shows that
+choice, without any action from you. Items already in the library keep their dates. To go
+back, choose **Use file creation date** under **Dashboard → Libraries → Display** and
+save.
+
+## Unreleased — items without per-library fetcher choices follow the server-wide metadata options
+
+Scans and single-item refreshes (`POST /Items/{id}/Refresh`, Identify) now decide which
+remote providers run for an item, and in what order, the way Jellyfin does. This applies to
+every kind of item (movies, series, seasons, episodes, music videos, albums, artists, …):
+
+- A library that saved its own choices for the item's kind keeps them: the **Metadata
+  downloaders** and **Image fetchers** checkboxes and their order, under **Dashboard →
+  Libraries → Manage library**.
+- A kind the library never saved choices for (a library created by an earlier Ferrofin, or
+  over the API without `TypeOptions`), and an item in no library at all (an artist known
+  only by name, such as a compilation's album artist), now follow the **server-wide
+  metadata options**: their disabled metadata and image fetchers and their fetcher orders.
+  Earlier versions ignored those and ran every fetcher in the built-in order.
+
+The server-wide options ship with Jellyfin's defaults, which turn off:
+
+- **TheAudioDB** as a metadata downloader for music albums and music artists (its artwork
+  stays on). Earlier versions asked it for every album and artist.
+- **The Open Movie Database** as a metadata downloader and image fetcher for music videos
+  (the library must enable it for those types).
+
+If you customised the server-wide options — their disabled fetchers or their order, stored
+in the server configuration's `MetadataOptions` — those settings now also apply to movies,
+series and every other kind whose library saved no choices of its own. The web client has
+no page for the server-wide options: they are edited through `POST /System/Configuration`
+(`MetadataOptions`, one entry per item type), and stored in `system.json`.
+
+The upgrade removes nothing already stored: descriptions and artwork a now-disabled
+provider supplied stay, until a "Replace all metadata" refresh of the item clears what its
+enabled providers do not return. To keep a provider for a library's items, open
+**Dashboard → Libraries**, choose **Manage library**, tick the provider for each kind
+(for TheAudioDB, **Music Albums** and **Music Artists**; for OMDb, **Music Videos**) and
+save: the library then has saved choices, and its next scan uses them. Artists known only
+by name have no library: remove `TheAudioDB` from the `MusicArtist` entry's
+`DisabledMetadataFetchers` in the server-wide options to turn it back on for them.
+
+## Unreleased — editing an item no longer locks it
+
+Earlier versions locked an item (`LockData`) whenever a metadata-editor save changed one of
+its fields, whether or not "Lock this item" was ticked. This version saves exactly what the
+editor sends, and protects individual fields through the editor's per-field checkboxes
+(`LockedFields`) instead, as Jellyfin does.
+
+Items locked by an earlier version are not changed by the upgrade: there is no way to
+tell an automatic lock from one you set on purpose. For those items:
+
+- they stay locked, so no remote metadata provider (TMDB, TVDB, MusicBrainz, …) updates
+  them;
+- they do not read their `.nfo` while locked, which is how Jellyfin treats a locked
+  item;
+- their sidecar artwork next to the media (`poster.jpg`, `fanart.jpg`, …) is rediscovered
+  on the next scan, as it would be for any locked item in Jellyfin;
+- the metadata editor shows "Lock this item" ticked. Untick it and save to unlock the
+  item; on a series, season, album, collection or other folder, that unlocks everything
+  under it too.
+
+To find them, list `GET /Items?Recursive=true&IsLocked=true`.
+
 ## Unreleased — the schema moves to Jellyfin 12.0
 
 Back up the data directory before starting this version. On first boot migration `0032`
@@ -93,3 +244,16 @@ functions that standalone `sqlite3` and `sqlx migrate` do not register. No
 persistent schema objects depend on these functions, so external database
 inspection remains possible after migration. Follow the backup and rollback
 steps above before upgrading.
+
+## Shared provider keys
+
+OMDb now uses Jellyfin's built-in API key when `FERROFIN_OMDB_KEY` / `omdb_api_key`
+is unset or blank. Existing explicit keys still take precedence. Libraries that
+have OMDb enabled can now fetch its metadata and artwork without extra setup;
+to disable it, uncheck its metadata and image fetchers in the library settings.
+This can add provider requests on installations where the checked provider was
+previously inactive because no key was configured.
+
+OpenSubtitles also defaults to Jellyfin's shared application key. Configure your
+OpenSubtitles username and password in its plugin settings; `ApiKey` is optional.
+The shared key does not replace the account required to download subtitles.

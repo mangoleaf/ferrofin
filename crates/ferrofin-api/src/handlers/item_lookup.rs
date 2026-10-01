@@ -17,7 +17,9 @@
 //! MusicBrainz + TheAudioDb for albums/artists); the type-specific lookup
 //! fields (album artists, song infos, …) ride along on the request. `Apply`
 //! resolves the item (`404` when absent), replaces its provider ids with the
-//! chosen result's and refreshes against that exact record.
+//! chosen result's and refreshes against that exact record: an item with a
+//! path through the library scan (its own path, or a folder's subtree), any
+//! other through the provider manager.
 
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -33,6 +35,8 @@ use ferrofin_traits::providers::{
 };
 use serde::Deserialize;
 use uuid::Uuid;
+
+use ferrofin_traits::error::ServiceError;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
@@ -271,11 +275,20 @@ fn default_true() -> bool {
 /// `POST /Items/RemoteSearch/Apply/{itemId}` — apply a chosen result + refresh.
 ///
 /// Port of `ItemLookupController.ApplySearchCriteria`: resolves the item (`404`
-/// when absent), then drives a `FullRefresh` (`ReplaceAllMetadata = true`,
-/// `ReplaceAllImages = <query>`) carrying the chosen result — the provider
-/// manager replaces the item's provider ids with the result's
-/// (`item.ProviderIds = searchResult.ProviderIds`) and fetches against that
-/// exact record rather than re-searching by title.
+/// when absent), replaces its provider ids with the result's
+/// (`item.SetProviderIds(searchResult.ProviderIds)`), then drives a
+/// `FullRefresh` (`ReplaceAllMetadata = true`, `RemoveOldMetadata = true`,
+/// `ReplaceAllImages = <query>`) carrying the chosen result and returns once
+/// it has run (`RefreshFullItem` is awaited).
+///
+/// The refresh is `ProviderManager.RefreshItem`'s: an item with a path — a
+/// movie, a series and its whole subtree, an album, an artist folder —
+/// refreshes through the library scan of that path, whose metadata service
+/// skips the local readers (the NFO) when identifying and pins every fetcher
+/// (TMDB, TVDB, OMDb, MusicBrainz, TheAudioDB) to the chosen ids, the
+/// fetcher the result came from first; an artist known only by name through
+/// the scanner's own refresh of it; any other item with no file of its own
+/// (a box set, a person) through the provider manager.
 #[utoipa::path(
     post,
     path = "/Items/RemoteSearch/Apply/{itemId}",
@@ -309,9 +322,11 @@ async fn apply_search_criteria(
 
     // Full metadata + image refresh, replacing everything (the C# builds
     // `FullRefresh` for both modes with `ReplaceAllMetadata = true`), bound to
-    // the chosen result (`SearchResult = searchResult`), and — the flag only
-    // this endpoint sets — `RemoveOldMetadata = true`, so the previously
-    // identified record's fields do not survive under the new one.
+    // the chosen result (`SearchResult = searchResult`), and
+    // `RemoveOldMetadata = true`, so the previously identified record's
+    // fields do not survive under the new one. The chosen ids become the
+    // item's (`item.SetProviderIds(searchResult.ProviderIds)`) with the
+    // refresh's save of it — never ahead of a refresh that then fails.
     let options = MetadataRefreshOptions {
         metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
         image_refresh_mode: MetadataRefreshMode::FullRefresh,
@@ -319,10 +334,98 @@ async fn apply_search_criteria(
         replace_all_images: query.replace_all_images,
         search_result: Some(search_result),
         remove_old_metadata: true,
+        ..MetadataRefreshOptions::default()
     };
-    state.providers.refresh_full_item(item_id, &options).await?;
+    // An artist known only by name has no folder of its own: the scanner
+    // refreshes it as `RefreshFullItem` → `RefreshItem` does — itself, with
+    // the chosen ids — in the scan queue's priority lane (its by-name folder
+    // validation is a no-op upstream).
+    let by_name_artist = BaseItemKind::from_stored_type_name(&item.type_)
+        == Some(BaseItemKind::MusicArtist)
+        && item.top_parent_id.as_deref().is_none_or(str::is_empty);
+    let target = if by_name_artist {
+        Some(ferrofin_traits::library::ScanTarget::Artist {
+            id: item_id,
+            path: None,
+            folders: Vec::new(),
+        })
+    } else {
+        crate::handlers::item_update::refresh_scan_target(&item, item_id)
+    };
+    match target {
+        Some(target) => {
+            if !crate::handlers::scan_reaches(&state, &target).await? {
+                tracing::warn!(
+                    %item_id,
+                    path = item.path.as_deref().unwrap_or_default(),
+                    "identify refused: the item's path is under no library location"
+                );
+                return Err(ApiError::Conflict(format!(
+                    "item {item_id} is not under any library location, so it cannot be refreshed"
+                )));
+            }
+            // Awaited like upstream's `RefreshFullItem`, which runs with
+            // `CancellationToken.None`: on a task of its own, so a client that
+            // hangs up does not withdraw the refresh it asked for. It runs in
+            // the scan queue's priority lane — inside a running scan, between
+            // two of its items — so it never waits for a library scan.
+            let library = std::sync::Arc::clone(&state.library);
+            let ran = tokio::spawn(async move { library.run_refresh_scan(target, &options).await })
+                .await
+                .map_err(|err| {
+                    ApiError::Service(ServiceError::backend(format!(
+                        "identify refresh task failed: {err}"
+                    )))
+                })??;
+            if !ran {
+                // Logged once, by the error boundary (a 5xx).
+                return Err(ApiError::ServiceUnavailable(format!(
+                    "the refresh of item {item_id} was stopped before it finished"
+                )));
+            }
+        }
+        None if needs_the_scan(&item) => {
+            tracing::warn!(
+                %item_id,
+                path = item.path.as_deref().unwrap_or_default(),
+                "identify refused: the item belongs to no library"
+            );
+            return Err(ApiError::Conflict(format!(
+                "item {item_id} belongs to no library, so it cannot be refreshed"
+            )));
+        }
+        None => state.providers.refresh_full_item(item_id, &options).await?,
+    }
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Whether `item`'s metadata comes only from the library scan: a file- or
+/// folder-backed kind with a path of its own (a movie, a series, an album…)
+/// — as against the kinds the provider manager refreshes (a box set, a
+/// person, a by-name artist, a path-less season or episode).
+fn needs_the_scan(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    let has_path = item
+        .path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty() && !path.contains("://"));
+    has_path
+        && matches!(
+            BaseItemKind::from_stored_type_name(&item.type_),
+            Some(
+                BaseItemKind::Movie
+                    | BaseItemKind::Trailer
+                    | BaseItemKind::MusicVideo
+                    | BaseItemKind::Video
+                    | BaseItemKind::Series
+                    | BaseItemKind::Episode
+                    | BaseItemKind::MusicAlbum
+                    | BaseItemKind::Audio
+                    | BaseItemKind::AudioBook
+                    | BaseItemKind::Book
+                    | BaseItemKind::Photo
+            )
+        )
 }
 
 /// Registers this controller's real routes onto `router`.

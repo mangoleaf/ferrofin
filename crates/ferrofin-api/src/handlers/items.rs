@@ -270,6 +270,9 @@ struct ItemsQuery {
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
     #[serde(default, rename = "is3D")]
     is_3d: Option<bool>,
+    /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
+    #[serde(default)]
+    is_locked: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -416,6 +419,7 @@ async fn get_items(
         is_4k: query.is_4k,
         is_hd: query.is_hd,
         is_3d: query.is_3d,
+        is_locked: query.is_locked,
         video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
         has_subtitles: query.has_subtitles,
         has_trailer: query.has_trailer,
@@ -549,6 +553,80 @@ async fn get_item(
     Ok(Json(dto))
 }
 
+/// The per-item half of Jellyfin's `CanDelete(user)` authorization.
+/// Collection management and playlist ownership have their own permissions;
+/// ordinary media allows either global deletion or a containing library grant.
+async fn require_delete_permission(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    item: &BaseItemEntity,
+) -> Result<(), ApiError> {
+    if auth.is_api_key {
+        return Ok(());
+    }
+    let denied = || ApiError::Unauthorized("Unauthorized access".to_owned());
+    let user = auth.user.as_ref().ok_or_else(denied)?;
+    let policy = super::users::user_policy(state, user)
+        .await?
+        .ok_or_else(denied)?;
+    let allowed = match item.type_.rsplit('.').next().unwrap_or_default() {
+        "Playlist" => {
+            policy.is_administrator
+                || state
+                    .playlists
+                    .get_playlist_access(
+                        Uuid::parse_str(&item.id).map_err(|_| denied())?,
+                        auth.user_id(),
+                    )
+                    .await?
+                    .level
+                    == ferrofin_traits::collections::PlaylistAccessLevel::Owner
+        }
+        "BoxSet" => policy.is_administrator || policy.enable_collection_management,
+        _ => {
+            if policy.enable_content_deletion {
+                return Ok(());
+            }
+            let grants: Vec<Uuid> = policy
+                .enable_content_deletion_from_folders
+                .iter()
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            if grants.is_empty() {
+                return Err(denied());
+            }
+            if let Some(channel) = item
+                .channel_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+            {
+                grants.contains(&channel)
+            } else {
+                state
+                    .virtual_folders
+                    .get_virtual_folders()
+                    .await?
+                    .iter()
+                    .any(|folder| {
+                        folder
+                            .item_id
+                            .as_deref()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .is_some_and(|id| grants.contains(&id))
+                            && item.path.as_deref().is_some_and(|path| {
+                                folder
+                                    .locations
+                                    .iter()
+                                    .any(|root| super::path_is_under(path, root))
+                            })
+                    })
+            }
+        }
+    };
+    if allowed { Ok(()) } else { Err(denied()) }
+}
+
 /// `DELETE /Items/{itemId}` — deletes one item from the library.
 ///
 /// Port of `LibraryController.DeleteItem`. A missing item is a `404`; on success
@@ -567,16 +645,17 @@ async fn get_item(
 )]
 async fn delete_item(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     // Confirm the item exists first so a bogus id is a `404` (C# `GetItemById`
     // null-check) rather than a silently-idempotent `204`.
-    state
+    let item = state
         .library
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    require_delete_permission(&state, &auth, &item).await?;
     state
         .library
         .delete_item(item_id, &DeleteOptions::default())
@@ -608,16 +687,17 @@ struct DeleteItemsQuery {
 )]
 async fn delete_items(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<DeleteItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;
     for id in ids {
-        state
+        let item = state
             .library
             .get_item_by_id(id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
+        require_delete_permission(&state, &auth, &item).await?;
         state
             .library
             .delete_item(id, &DeleteOptions::default())
@@ -1297,6 +1377,16 @@ mod tests {
         for short in ["CollectionFolder", "Folder", "UserRootFolder", "Series"] {
             assert!(!is_direct_children_browse(short), "{short}");
         }
+    }
+
+    /// `[FromQuery] bool? isLocked` → `IsLocked = isLocked`
+    /// (`ItemsController.cs:243,400`).
+    #[test]
+    fn items_query_reads_is_locked() {
+        let q: ItemsQuery = serde_urlencoded::from_str("isLocked=true").expect("parses");
+        assert_eq!(q.is_locked, Some(true));
+        let q: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
+        assert_eq!(q.is_locked, None);
     }
 
     // GET /Items must honour the camelCase `fields` param (the OpenAPI contract's casing, what

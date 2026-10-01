@@ -43,8 +43,14 @@ uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Provider request metrics (docs/conventions/METRICS.md rule 8): the OTel API
+# only; the pipeline lives in ferrofin-metrics.
+opentelemetry.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 rstest.workspace = true
 tempfile.workspace = true
 chrono.workspace = true

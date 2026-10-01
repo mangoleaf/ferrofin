@@ -334,12 +334,19 @@ pub struct LibraryOptionsResultDto {
     pub type_options: Vec<LibraryTypeOptionsDto>,
 }
 
-/// Metadata configuration.
+/// Metadata configuration (the named configuration `metadata`).
+///
+/// Deserialized with `#[serde(default)]`: a saved document that lacks a
+/// field reads it as its default, as upstream's `XmlSerializer` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct MetadataConfiguration {
     /// Gets or sets a value indicating whether to use the file creation time
     /// for the date added.
+    ///
+    /// jellyfin-web's Dashboard → Libraries → Display "Date added behavior
+    /// for new content": `true` is "Use file creation date", `false` "Use
+    /// date scanned into the library".
     pub use_file_creation_time_for_date_added: bool,
 }
 
@@ -1353,6 +1360,17 @@ mod tests {
         assert!(cfg.use_file_creation_time_for_date_added);
         let json = serde_json::to_value(cfg).unwrap();
         assert_eq!(json["UseFileCreationTimeForDateAdded"], true);
+    }
+
+    /// What jellyfin-web's Display page posts round-trips, and a document
+    /// without the field reads as the default.
+    #[test]
+    fn metadata_configuration_reads_the_dashboard_document() {
+        let scanned: MetadataConfiguration =
+            serde_json::from_str(r#"{"UseFileCreationTimeForDateAdded":false}"#).unwrap();
+        assert!(!scanned.use_file_creation_time_for_date_added);
+        let empty: MetadataConfiguration = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, MetadataConfiguration::default());
     }
 
     #[test]

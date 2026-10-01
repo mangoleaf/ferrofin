@@ -92,6 +92,10 @@ struct UserViewsQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
+    /// Include views the user hid from the home screen. Profile settings use
+    /// this to keep hidden views available for re-enabling.
+    #[serde(default)]
+    include_hidden: bool,
 }
 
 /// `GET /UserViews` — the target user's library views.
@@ -100,6 +104,10 @@ struct UserViewsQuery {
 #[utoipa::path(
     get,
     path = "/UserViews",
+    params(
+        ("userId" = Option<String>, Query, description = "The user id"),
+        ("includeHidden" = Option<bool>, Query, description = "Include views hidden from the home screen"),
+    ),
     // Body schema omitted: `BaseItemDto` is self-referential and its derived
     // `utoipa::ToSchema` recurses without bound (a `ferrofin-model` DTO defect),
     // overflowing the OpenAPI generator when inlined.
@@ -113,7 +121,10 @@ async fn get_user_views(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
-    let folders = state.user_views.get_user_views(user_id).await?;
+    let folders = state
+        .user_views
+        .get_user_views_with_hidden(user_id, query.include_hidden)
+        .await?;
     // C# `GetUserViews` builds `new DtoOptions()` — ALL item fields (minus the two
     // default-excluded ones); its `AddClientFields` + explicit appends are subsumed.
     // `with_all_fields(false)` served views with NO fields — strict-SDK clients
@@ -136,7 +147,7 @@ async fn get_user_views(
 /// `GET /UserViews/GroupingOptions` — the user's grouping-eligible views.
 ///
 /// Port of `UserViewsController.GetGroupingOptions`: resolves the user (a missing
-/// user is `404`), takes their top-level view folders, keeps the ones
+/// user is `404`), takes their root media folders, keeps the ones
 /// `UserView.IsEligibleForGrouping` accepts (movies, tvshows, untyped), and
 /// returns each as a [`SpecialViewOptionDto`] `{ Name, Id }`, id rendered as a
 /// dashless guid and the list ordered by name. A folder that is not a configured
@@ -159,7 +170,9 @@ async fn get_grouping_options(
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
-    let folders = state.user_views.get_user_views(user_id).await?;
+    // Grouping options come from root libraries, independently of which home
+    // views the user hid (`MyMediaExcludes`).
+    let folders = state.user_views.get_media_folders(user_id).await?;
     let by_id = collection_types_by_id(&state).await?;
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()
@@ -185,10 +198,9 @@ async fn get_user_views_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    Query(mut query): Query<UserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let query = UserViewsQuery {
-        user_id: Some(user_id),
-    };
+    query.user_id = Some(user_id);
     get_user_views(state, auth, Query(query)).await
 }
 
@@ -201,6 +213,7 @@ async fn get_grouping_options_for_user(
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let query = UserViewsQuery {
         user_id: Some(user_id),
+        include_hidden: false,
     };
     get_grouping_options(state, auth, Query(query)).await
 }
@@ -235,5 +248,15 @@ mod tests {
         );
         // A mixed library has no single type → None (a generic view).
         assert_eq!(map_collection_type(CollectionTypeOptions::mixed), None);
+    }
+
+    #[test]
+    fn user_views_can_request_hidden_views() {
+        let hidden: UserViewsQuery =
+            serde_urlencoded::from_str("includeHidden=true").expect("query parses");
+        assert!(hidden.include_hidden);
+
+        let defaulted: UserViewsQuery = serde_urlencoded::from_str("").expect("empty query");
+        assert!(!defaulted.include_hidden);
     }
 }

@@ -19,12 +19,12 @@
 //!   requested, its children) through the persistence service; the physical
 //!   file deletion the C# path performs is out of scope for this seam and is
 //!   noted deferred.
-//! - The `IProgress`/`CancellationToken` scan plumbing is dropped;
-//!   `queue_library_scan` records intent through the injected monitor/no-op.
+//! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
+//!   queue's own worker task and is cancelled cooperatively, between two
+//!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use tracing::Instrument as _;
@@ -33,31 +33,28 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, image_type_allows_multiple};
+use ferrofin_traits::library::{
+    LibraryManager, ScanTarget, ScanTrigger, image_type_allows_multiple,
+};
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
 };
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
+use ferrofin_traits::library::ScanProgressSink;
 
 /// The placeholder item row seeded by the initial migration, which every real
 /// item query excludes (the `Uuid` form of
 /// [`PLACEHOLDER_ID`](crate::translate_query::PLACEHOLDER_ID),
 /// `00000000-0000-0000-0000-000000000001`).
 const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
-
-/// How often [`FerrofinLibraryManager::run_scan`] re-checks whether the scan it
-/// coalesced into has finished.
-///
-/// Only reached when a second scan request arrives while one is already
-/// running, so it costs one atomic load per tick and nothing at all on the
-/// common path. Small enough that "the task finished" is not visibly later than
-/// the scan itself; large enough not to spin.
-const SCAN_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The concrete library manager.
 ///
@@ -72,17 +69,16 @@ pub struct FerrofinLibraryManager {
     people: Arc<dyn PeopleRepository>,
     /// The filesystem scanner, set by the composition root. When present,
     /// `queue_library_scan` runs it; `None` (unit tests) keeps it a no-op.
-    scanner: Option<Arc<crate::library_scan::LibraryScanner>>,
-    /// Coalescing guard for `queue_library_scan`: `true` while a scan task runs.
-    /// A queue request during a running scan merges into [`Self::scan_pending`]
-    /// instead of spawning a second scan (the library monitor fans a webhook
-    /// batch into one report per path, and `/Library/Refresh` can be
-    /// double-clicked).
-    scan_in_flight: Arc<AtomicBool>,
-    /// The scope a rerun should cover, merged from every request that arrived
-    /// while a scan was running; the running task loops once more over it so
-    /// changes landing mid-scan are not missed.
-    scan_pending: Arc<std::sync::Mutex<Option<ScanScope>>>,
+    scanner: Option<Arc<dyn ScanRunner>>,
+    /// The single-scan claim and the scans queued behind it. One scan runs
+    /// at a time; a request arriving meanwhile queues (coalesced by
+    /// [`ScanQueue::enqueue`]) instead of starting a second one — the
+    /// library monitor fans a webhook batch into one report per path, and
+    /// `/Library/Refresh` can be double-clicked.
+    scan_queue: Arc<Mutex<ScanQueue>>,
+    /// Bumped whenever a queued scan finishes or the claim is released, so
+    /// the callers waiting on a queued scan re-check it.
+    scan_progress: Arc<tokio::sync::watch::Sender<u64>>,
     /// Chapter rows, for serving chapter thumbnails. Set by the composition
     /// root; `None` (unit tests) means an item has no chapter images. The
     /// repository (not the `ChapterManager`) is held because the manager is
@@ -105,30 +101,847 @@ pub struct FerrofinLibraryManager {
     changed: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
 }
 
-/// What a queued scan covers.
-#[derive(Debug, Clone)]
-enum ScanScope {
-    /// Every library.
-    Full,
-    /// One library (by CollectionFolder id).
-    Library(Uuid),
-    /// Only the items touched by these changed filesystem paths.
-    Paths(Vec<String>),
+/// One scan request: what it covers, the options its items refresh with,
+/// and why it was made.
+#[derive(Debug, Clone, PartialEq)]
+struct ScanRequest {
+    /// The libraries, library or paths it covers.
+    scope: ScanTarget,
+    /// The refresh options every item in scope refreshes with.
+    options: MetadataRefreshOptions,
+    /// The options for the ancestors a path-scoped scan carries along for
+    /// context: the defaults for the library monitor's refresh, `None`/`None`
+    /// for a folder refresh (upstream validates a folder's subtree and never
+    /// refreshes the folders above it).
+    ancestors: MetadataRefreshOptions,
+    /// Why it runs: its `library_scan` span's `trigger`, and the label of the
+    /// scan metrics it records.
+    trigger: ScanTrigger,
+    /// Its closing passes: the whole library's for library validation, only
+    /// the touched items' for a refresh over the API.
+    passes: ScanPasses,
+    /// It waits in the priority lane: an item refresh a caller is waiting
+    /// for, which runs ahead of every queued scan and inside a running one.
+    priority: bool,
 }
 
-impl ScanScope {
-    /// Merges a new request into a pending slot: path sets union; anything
-    /// mixed with a full/library request widens to a full scan (over-scanning
-    /// is the safe direction — the scopes are not otherwise combinable).
-    fn merge_into(self, slot: &mut Option<ScanScope>) {
-        *slot = Some(match (slot.take(), self) {
-            (None, new) => new,
-            (Some(ScanScope::Paths(mut a)), ScanScope::Paths(b)) => {
-                a.extend(b);
-                ScanScope::Paths(a)
-            }
-            _ => ScanScope::Full,
+impl ScanRequest {
+    /// A request refreshing with the `MetadataRefreshOptions` constructor
+    /// defaults — every trigger but a refresh over the API.
+    fn defaults(trigger: ScanTrigger, scope: ScanTarget) -> Self {
+        Self {
+            scope,
+            options: MetadataRefreshOptions::default(),
+            ancestors: MetadataRefreshOptions::default(),
+            trigger,
+            passes: ScanPasses::Library,
+            priority: false,
+        }
+    }
+
+    /// A folder's `POST /Items/{itemId}/Refresh`.
+    fn folder_refresh(scope: ScanTarget, options: MetadataRefreshOptions) -> Self {
+        Self {
+            scope,
+            options,
+            ancestors: MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::None,
+                image_refresh_mode: MetadataRefreshMode::None,
+                ..MetadataRefreshOptions::default()
+            },
+            // A request over the API (`LOGGING.md`'s trigger vocabulary).
+            trigger: ScanTrigger::Api,
+            // `RefreshItem` runs no post-scan task.
+            passes: ScanPasses::Touched,
+            priority: false,
+        }
+    }
+
+    /// An item refresh a caller waits on or expects promptly — a file
+    /// item's `POST /Items/{itemId}/Refresh`, an Identify's Apply, the
+    /// refresh after a subtitle or lyric change: upstream's provider refresh
+    /// queue, which runs alongside library validation, not behind it.
+    fn item_refresh(scope: ScanTarget, options: MetadataRefreshOptions) -> Self {
+        Self {
+            priority: true,
+            ..Self::folder_refresh(scope, options)
+        }
+    }
+
+    /// The library monitor's settled change batch — the disk watcher's or
+    /// the *arr webhooks' (`trigger`): `FileRefresher`'s `ChangedExternally`
+    /// refresh (`FileRefresher.cs:135-208`, `BaseItem.cs:2275-2278`), the
+    /// default options for the item each changed path refreshes, nothing for
+    /// the folders above it (a refresh never touches them), and no post-scan
+    /// task (`ProviderManager.RefreshItem` runs none).
+    fn changed(paths: Vec<String>, trigger: ScanTrigger) -> Self {
+        Self {
+            scope: ScanTarget::Changed(paths),
+            options: MetadataRefreshOptions::default(),
+            ancestors: MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::None,
+                image_refresh_mode: MetadataRefreshMode::None,
+                ..MetadataRefreshOptions::default()
+            },
+            trigger,
+            passes: ScanPasses::Touched,
+            priority: false,
+        }
+    }
+
+    /// Whether this queued request does everything `other` asks for, so
+    /// `other` may join it: the same options (a replace never widens, a
+    /// default never swallows one) in the same lane, over a scope that
+    /// covers `other`'s — a full scan any, a library or artist scan an
+    /// identical one — with closing passes that include `other`'s (the
+    /// library's include the touched items'). A scan narrower than a
+    /// library must also treat the folders it carries for context alike; a
+    /// library's validation refreshes every item with its options, so a
+    /// full scan covers a path-scoped request's context folders too.
+    fn covers(&self, other: &Self) -> bool {
+        let scope = match (&self.scope, &other.scope) {
+            (ScanTarget::All, _) => true,
+            (ScanTarget::Library(queued), ScanTarget::Library(new)) => queued == new,
+            (queued @ ScanTarget::Artist { .. }, new @ ScanTarget::Artist { .. }) => queued == new,
+            _ => false,
+        };
+        let whole_libraries = matches!(self.scope, ScanTarget::All | ScanTarget::Library(_));
+        scope
+            && self.options == other.options
+            && self.priority == other.priority
+            && (self.passes == other.passes || self.passes == ScanPasses::Library)
+            && (whole_libraries || self.ancestors == other.ancestors)
+    }
+
+    /// Whether two requests refresh alike, so that one may cover the other.
+    fn refreshes_like(&self, other: &Self) -> bool {
+        self.options == other.options
+            && self.ancestors == other.ancestors
+            && self.passes == other.passes
+            && self.priority == other.priority
+    }
+}
+
+/// Who waits for a scan, queued or running.
+#[derive(Debug, Default)]
+struct Waiters {
+    /// The tickets of the callers waiting for it.
+    tickets: Vec<u64>,
+    /// The requests nobody waits for (the fire-and-forget entry points: the
+    /// API's refreshes, the watcher) — never withdrawn.
+    detached: usize,
+}
+
+impl Waiters {
+    /// Adds a request: its caller's ticket, or a detached one.
+    fn add(&mut self, ticket: Option<u64>) {
+        match ticket {
+            Some(ticket) => self.tickets.push(ticket),
+            None => self.detached += 1,
+        }
+    }
+
+    /// Takes over another scan's waiters (the scan covering it runs for
+    /// them).
+    fn absorb(&mut self, other: Self) {
+        self.tickets.extend(other.tickets);
+        self.detached += other.detached;
+    }
+
+    /// Nobody wants the scan any more.
+    fn is_empty(&self) -> bool {
+        self.tickets.is_empty() && self.detached == 0
+    }
+}
+
+/// A scan waiting its turn.
+#[derive(Debug)]
+struct PendingScan {
+    /// What it will run.
+    request: ScanRequest,
+    /// Who waits for it.
+    waiters: Waiters,
+}
+
+/// A priority-lane refresh a running scan is serving.
+#[derive(Debug)]
+struct ServingRefresh {
+    /// What it runs (back to the lane if the worker dies under it).
+    request: ScanRequest,
+    /// Who waits for it.
+    waiters: Waiters,
+    /// Stops it.
+    cancel: ScanCancel,
+}
+
+/// The scan being run.
+#[derive(Debug)]
+struct RunningScan {
+    /// Who waits for it.
+    waiters: Waiters,
+    /// Stops it between two items once nobody wants it any more.
+    cancel: ScanCancel,
+}
+
+/// How a scan a caller waited for ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanResult {
+    /// It ran to the end.
+    Completed,
+    /// It was cancelled and stopped early (or never ran: the server is
+    /// shutting down).
+    Stopped,
+    /// It failed, or panicked; the message says why.
+    Failed(String),
+}
+
+impl ScanResult {
+    /// The `result` label of the scan metrics.
+    fn metric_end(&self) -> crate::scan_metrics::ScanEnd {
+        match self {
+            Self::Completed => crate::scan_metrics::ScanEnd::Completed,
+            Self::Stopped => crate::scan_metrics::ScanEnd::Stopped,
+            Self::Failed(_) => crate::scan_metrics::ScanEnd::Failed,
+        }
+    }
+}
+
+/// The scan queue: at most one scan runs at a time, on the queue's own
+/// worker task, and the requests that arrive meanwhile wait their turn.
+#[derive(Default)]
+struct ScanQueue {
+    /// A worker task is draining the queue.
+    worker: bool,
+    /// The host is shutting down: no scan is queued any more.
+    closed: bool,
+    /// The scan the worker is running.
+    running: Option<RunningScan>,
+    /// The requests waiting their turn, in the order they run.
+    pending: VecDeque<PendingScan>,
+    /// The priority lane: item refreshes that run ahead of `pending` and,
+    /// while a scan runs, inside it ([`PriorityLane`]).
+    lane: VecDeque<PendingScan>,
+    /// The lane refreshes a running scan is serving, by key.
+    serving: HashMap<u64, ServingRefresh>,
+    /// The key of the next lane refresh served.
+    next_lane_key: u64,
+    /// The next ticket to hand a waiting caller.
+    next_ticket: u64,
+    /// How the scans of the tickets not yet collected by their callers
+    /// ended.
+    finished: HashMap<u64, ScanResult>,
+    /// Where a waiting caller wants its scan's progress reported.
+    sinks: HashMap<u64, ScanProgressSink>,
+    /// The worker's task, for a test to simulate it dying.
+    #[cfg(test)]
+    worker_task: Option<tokio::task::AbortHandle>,
+}
+
+impl std::fmt::Debug for ScanQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanQueue")
+            .field("worker", &self.worker)
+            .field("closed", &self.closed)
+            .field("running", &self.running)
+            .field("pending", &self.pending)
+            .field("lane", &self.lane)
+            .field("serving", &self.serving)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScanQueue {
+    /// Queues `request` and returns the ticket its caller waits on (`None`
+    /// for a request nobody waits for). A request coalesces only with a
+    /// queued one that does everything it asks ([`ScanRequest::covers`]),
+    /// or that refreshes alike ([`ScanRequest::refreshes_like`]) when their
+    /// paths union, so no request ever runs with another's options — a
+    /// "Replace all metadata" on one library never widens to every library,
+    /// and a default scan never swallows it:
+    ///
+    /// - a full scan covers a queued library, path, changed-path or artist
+    ///   scan: it takes the place of the earliest one and the waiters of all
+    ///   of them;
+    /// - a library, path, changed-path or artist scan joins a queued full
+    ///   scan (which will see its files), and a library or artist scan an
+    ///   identical queued one;
+    /// - folder path scans union their paths, and so do the library
+    ///   monitor's changed-path scans — never with each other. A watcher
+    ///   batch and a webhook batch join like any two (the trigger is a label
+    ///   only); the joined scan keeps the queued request's trigger;
+    /// - a library scan never becomes a full one, and path scans never join
+    ///   a library scan: a watcher or webhook report queued behind a
+    ///   library scan runs after it, scoped (by then its item is current,
+    ///   so it is nearly free).
+    ///
+    /// Everything else queues after what is already there. The running scan
+    /// is never joined: it may already be past the files a new request is
+    /// about, so a report that arrives while a scan runs queues a scoped
+    /// rerun behind it.
+    fn enqueue(&mut self, request: ScanRequest, waiting: bool) -> Option<u64> {
+        let ticket = waiting.then(|| {
+            let ticket = self.next_ticket;
+            self.next_ticket += 1;
+            ticket
         });
+        // The priority lane keeps its own order; an identical refresh
+        // already waiting there runs once for both.
+        if request.priority {
+            if let Some(pending) = self.lane.iter_mut().find(|p| p.request == request) {
+                pending.waiters.add(ticket);
+            } else {
+                let mut waiters = Waiters::default();
+                waiters.add(ticket);
+                self.lane.push_back(PendingScan { request, waiters });
+            }
+            return ticket;
+        }
+        // A queued scan that already covers this request: a full scan covers
+        // anything, a library or artist scan an identical one.
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.request.covers(&request)) {
+            pending.waiters.add(ticket);
+            return ticket;
+        }
+        let mut waiters = Waiters::default();
+        waiters.add(ticket);
+        match request.scope {
+            ScanTarget::All => {
+                // Covers every queued scan that refreshes alike: it takes the
+                // earliest one's place and all their waiters.
+                let mut at = None;
+                let mut kept = VecDeque::with_capacity(self.pending.len() + 1);
+                for pending in self.pending.drain(..) {
+                    if request.covers(&pending.request) {
+                        at.get_or_insert(kept.len());
+                        waiters.absorb(pending.waiters);
+                    } else {
+                        kept.push_back(pending);
+                    }
+                }
+                let at = at.unwrap_or(kept.len());
+                kept.insert(at, PendingScan { request, waiters });
+                self.pending = kept;
+            }
+            ScanTarget::Paths(ref paths) | ScanTarget::Changed(ref paths) => {
+                let same_kind = |queued: &ScanTarget| {
+                    std::mem::discriminant(queued) == std::mem::discriminant(&request.scope)
+                };
+                if let Some(pending) = self
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.request.refreshes_like(&request) && same_kind(&p.request.scope))
+                {
+                    if let ScanTarget::Paths(queued) | ScanTarget::Changed(queued) =
+                        &mut pending.request.scope
+                    {
+                        let mut known: std::collections::HashSet<String> =
+                            queued.iter().cloned().collect();
+                        for path in paths {
+                            if known.insert(path.clone()) {
+                                queued.push(path.clone());
+                            }
+                        }
+                    }
+                    pending.waiters.absorb(waiters);
+                } else {
+                    self.pending.push_back(PendingScan { request, waiters });
+                }
+            }
+            ScanTarget::Library(_) | ScanTarget::Artist { .. } | ScanTarget::Items(_) => {
+                self.pending.push_back(PendingScan { request, waiters });
+            }
+        }
+        ticket
+    }
+
+    /// Withdraws a caller that stopped waiting (it returned, or its task was
+    /// cancelled). A queued scan nobody wants any more is dropped — a
+    /// cancelled request does not run — and a running one is told to stop
+    /// (`CancelIfRunningAndQueue` cancelling the running validation's
+    /// token). A scan another caller still waits for, or that a
+    /// fire-and-forget request queued, runs on.
+    fn withdraw(&mut self, ticket: u64) {
+        self.finished.remove(&ticket);
+        self.sinks.remove(&ticket);
+        for pending in self.pending.iter_mut().chain(self.lane.iter_mut()) {
+            pending.waiters.tickets.retain(|t| *t != ticket);
+        }
+        self.pending.retain(|pending| !pending.waiters.is_empty());
+        self.lane.retain(|pending| !pending.waiters.is_empty());
+        for serving in self.serving.values_mut() {
+            if serving.waiters.tickets.contains(&ticket) {
+                serving.waiters.tickets.retain(|t| *t != ticket);
+                if serving.waiters.is_empty() {
+                    serving.cancel.cancel();
+                }
+            }
+        }
+        if let Some(running) = &mut self.running
+            && running.waiters.tickets.contains(&ticket)
+        {
+            running.waiters.tickets.retain(|t| *t != ticket);
+            if running.waiters.is_empty() {
+                running.cancel.cancel();
+            }
+        }
+    }
+
+    /// Records how the running scan ended, for its waiters.
+    fn finish_running(&mut self, result: &ScanResult) {
+        if let Some(done) = self.running.take() {
+            for ticket in done.waiters.tickets {
+                self.sinks.remove(&ticket);
+                self.finished.insert(ticket, result.clone());
+            }
+        }
+    }
+
+    /// Settles as failed every lane refresh still marked as being served —
+    /// the scan serving it ended without handing it back (it panicked or was
+    /// aborted), and nobody else will.
+    fn fail_serving(&mut self) {
+        let lost: Vec<ServingRefresh> = self.serving.drain().map(|(_, s)| s).collect();
+        for refresh in lost {
+            refresh.cancel.cancel();
+            for ticket in refresh.waiters.tickets {
+                self.sinks.remove(&ticket);
+                self.finished.insert(
+                    ticket,
+                    ScanResult::Failed(
+                        "the scan serving this item refresh ended before it finished".to_owned(),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Whether `ticket`'s request is still waiting its turn.
+    fn is_queued(&self, ticket: u64) -> bool {
+        self.pending
+            .iter()
+            .chain(self.lane.iter())
+            .any(|p| p.waiters.tickets.contains(&ticket))
+    }
+
+    /// Reports `percent` to the running scan's waiting callers.
+    fn report(&self, percent: f64) {
+        let Some(running) = &self.running else {
+            return;
+        };
+        for ticket in &running.waiters.tickets {
+            if let Some(sink) = self.sinks.get(ticket) {
+                sink(percent);
+            }
+        }
+    }
+}
+
+/// Locks the scan queue, recovering it from a panic elsewhere: every update
+/// under the lock is a few field writes, so a poisoned guard still holds a
+/// consistent queue.
+fn lock_queue(queue: &Mutex<ScanQueue>) -> std::sync::MutexGuard<'_, ScanQueue> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What the manager runs a scan on: the [`LibraryScanner`] in production,
+/// a controllable stand-in in tests.
+///
+/// [`LibraryScanner`]: crate::library_scan::LibraryScanner
+#[async_trait]
+pub(crate) trait ScanRunner: Send + Sync {
+    /// Scans `scope` as `run` says.
+    async fn run(
+        &self,
+        scope: &ScanTarget,
+        run: ScanRun<'_>,
+    ) -> Result<crate::library_scan::ScanOutcome, ServiceError>;
+}
+
+#[async_trait]
+impl ScanRunner for crate::library_scan::LibraryScanner {
+    async fn run(
+        &self,
+        scope: &ScanTarget,
+        run: ScanRun<'_>,
+    ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+        // Boxed: the scan future is ~16 KB — a whole pass over the planner
+        // lives in it (`clippy::large_futures`).
+        Box::pin(self.scan_target(scope, run)).await
+    }
+}
+
+/// The scope's kind, for the scan log lines.
+fn scope_label(scope: &ScanTarget) -> &'static str {
+    match scope {
+        ScanTarget::All => "all",
+        ScanTarget::Library(_) => "library",
+        ScanTarget::Paths(_) => "paths",
+        ScanTarget::Changed(_) => "changed",
+        ScanTarget::Items(_) => "items",
+        ScanTarget::Artist { .. } => "artist",
+    }
+}
+
+/// The queue's worker: it runs the queued scans one at a time, each on a
+/// task of its own, until the queue is empty.
+///
+/// The scan is never run on — and so never dropped with — a caller's
+/// future. Cancelling a caller only withdraws its request
+/// ([`ScanQueue::withdraw`]); a running scan nobody wants any more stops
+/// cooperatively (between two items, or in a wait before an item writes
+/// anything), and only then does the next request run. A scan that fails
+/// or panics is contained in its own task: the worker records it for the
+/// scan's waiters and goes on with the queue.
+struct ScanWorker {
+    runner: Arc<dyn ScanRunner>,
+    queue: Arc<Mutex<ScanQueue>>,
+    progress: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl ScanWorker {
+    /// Drains the queue, then stands down. Runs inside the `library_scan`
+    /// span of the request that started it.
+    async fn drain(self) {
+        let mut release = WorkerRelease {
+            queue: Arc::clone(&self.queue),
+            progress: Arc::clone(&self.progress),
+            request: None,
+            scan_task: None,
+            done: false,
+        };
+        let started = std::time::Instant::now();
+        // `ferrofin_library_scan_in_progress` while the queue drains.
+        let _in_progress = crate::scan_metrics::ScanInProgress::enter();
+        tracing::info!("library scan started");
+        let mut total = crate::library_scan::ScanOutcome::default();
+        loop {
+            let next = {
+                let mut queue = lock_queue(&self.queue);
+                // The priority lane runs ahead of every queued scan.
+                let next = match queue.lane.pop_front() {
+                    Some(pending) => Some(pending),
+                    None => queue.pending.pop_front(),
+                };
+                if let Some(pending) = next {
+                    let cancel = ScanCancel::new();
+                    let waited = !pending.waiters.tickets.is_empty();
+                    queue.running = Some(RunningScan {
+                        waiters: pending.waiters,
+                        cancel: cancel.clone(),
+                    });
+                    Some((pending.request, cancel, waited))
+                } else {
+                    // Standing down under the same lock that a new request
+                    // checks, so it is never left queued with no worker.
+                    queue.worker = false;
+                    queue.running = None;
+                    None
+                }
+            };
+            let Some((request, cancel, waited)) = next else {
+                release.done = true;
+                self.progress.send_modify(|n| *n = n.wrapping_add(1));
+                break;
+            };
+            let span = tracing::info_span!(
+                "library_scan_pass",
+                trigger = request.trigger.as_str(),
+                scope = scope_label(&request.scope)
+            );
+            let begun = std::time::Instant::now();
+            let task = self.spawn_scan(&request, &cancel, &span);
+            release.request = Some(request.clone());
+            release.scan_task = Some(task.abort_handle());
+            let (result, pass) = Self::finish(task, &request, span, waited).await;
+            crate::scan_metrics::scan_finished(
+                request.trigger,
+                result.metric_end(),
+                pass.as_ref(),
+                begun.elapsed(),
+            );
+            release.request = None;
+            release.scan_task = None;
+            if let Some(pass) = pass {
+                total += pass;
+            }
+            {
+                let mut queue = lock_queue(&self.queue);
+                queue.finish_running(&result);
+                // A scan that ends normally has handed every refresh it
+                // served back; one that panicked has not.
+                queue.fail_serving();
+            }
+            self.progress.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        let (created, updated, unchanged, removed) =
+            (total.created, total.updated, total.unchanged, total.removed);
+        // A drain that included a stopped pass did not complete.
+        if total.stopped {
+            tracing::info!(
+                created,
+                updated,
+                unchanged,
+                removed,
+                elapsed_ms,
+                "library scan stopped"
+            );
+        } else {
+            tracing::info!(
+                created,
+                updated,
+                unchanged,
+                removed,
+                elapsed_ms,
+                "library scan complete"
+            );
+        }
+    }
+
+    /// Starts one scan on a task of its own, under `span`, reporting its
+    /// progress to the waiting callers.
+    fn spawn_scan(
+        &self,
+        request: &ScanRequest,
+        cancel: &ScanCancel,
+        span: &tracing::Span,
+    ) -> tokio::task::JoinHandle<Result<crate::library_scan::ScanOutcome, ServiceError>> {
+        let runner = Arc::clone(&self.runner);
+        let queue = Arc::clone(&self.queue);
+        let lane = QueueLane {
+            queue: Arc::clone(&self.queue),
+            progress: Arc::clone(&self.progress),
+        };
+        let request = request.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(
+            async move {
+                let report = move |percent: f64| lock_queue(&queue).report(percent);
+                runner
+                    .run(
+                        &request.scope,
+                        ScanRun::new(&request.options, &request.ancestors, &cancel)
+                            .with_progress(&report)
+                            .with_passes(request.passes)
+                            .with_lane(&lane),
+                    )
+                    .await
+            }
+            .instrument(span.clone()),
+        )
+    }
+
+    /// Waits for one scan's task and logs how it ended, inside `span` (only
+    /// while polled: the span never stays entered on a parked thread). A
+    /// failure a caller waits for (`waited`) is that caller's to report.
+    async fn finish(
+        task: tokio::task::JoinHandle<Result<crate::library_scan::ScanOutcome, ServiceError>>,
+        request: &ScanRequest,
+        span: tracing::Span,
+        waited: bool,
+    ) -> (ScanResult, Option<crate::library_scan::ScanOutcome>) {
+        let ended = task.instrument(span.clone()).await;
+        let _entered = span.enter();
+        match ended {
+            Ok(Ok(pass)) if pass.stopped => {
+                tracing::info!(
+                    created = pass.created,
+                    updated = pass.updated,
+                    unchanged = pass.unchanged,
+                    removed = pass.removed,
+                    "library scan stopped before it finished"
+                );
+                (ScanResult::Stopped, Some(pass))
+            }
+            Ok(Ok(pass)) => {
+                tracing::info!(
+                    metadata_mode = ?request.options.metadata_refresh_mode,
+                    image_mode = ?request.options.image_refresh_mode,
+                    replace_all_metadata = request.options.replace_all_metadata,
+                    replace_all_images = request.options.replace_all_images,
+                    created = pass.created,
+                    updated = pass.updated,
+                    unchanged = pass.unchanged,
+                    removed = pass.removed,
+                    "library scan pass complete"
+                );
+                (ScanResult::Completed, Some(pass))
+            }
+            // Logged exactly once, at the outermost layer: here, unless a
+            // caller waits for the scan and reports its failure itself (an
+            // Identify refresh that ran as the worker's own pass).
+            Ok(Err(err)) => {
+                if waited {
+                    tracing::debug!(%err, "library scan failed; its caller reports it");
+                } else {
+                    tracing::error!(%err, "library scan failed");
+                }
+                (ScanResult::Failed(err.to_string()), None)
+            }
+            // The panic itself is reported by the panic hook.
+            Err(err) if err.is_panic() => {
+                tracing::error!(%err, "library scan panicked");
+                (
+                    ScanResult::Failed(format!("library scan panicked: {err}")),
+                    None,
+                )
+            }
+            Err(_) => (ScanResult::Stopped, None),
+        }
+    }
+}
+
+/// The scan queue's priority lane, as the running scan serves it.
+struct QueueLane {
+    queue: Arc<Mutex<ScanQueue>>,
+    progress: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl PriorityLane for QueueLane {
+    fn next(&self) -> Option<LaneRefresh> {
+        let mut queue = lock_queue(&self.queue);
+        if queue.closed {
+            return None;
+        }
+        let pending = queue.lane.pop_front()?;
+        let key = queue.next_lane_key;
+        queue.next_lane_key += 1;
+        let cancel = ScanCancel::new();
+        let refresh = LaneRefresh {
+            target: pending.request.scope.clone(),
+            options: pending.request.options.clone(),
+            ancestors: pending.request.ancestors.clone(),
+            passes: pending.request.passes,
+            cancel: cancel.clone(),
+            key,
+        };
+        queue.serving.insert(
+            key,
+            ServingRefresh {
+                request: pending.request,
+                waiters: pending.waiters,
+                cancel,
+            },
+        );
+        Some(refresh)
+    }
+
+    fn done(
+        &self,
+        refresh: LaneRefresh,
+        outcome: &Result<crate::library_scan::ScanOutcome, ServiceError>,
+    ) {
+        let result = match outcome {
+            Ok(pass) if pass.stopped => ScanResult::Stopped,
+            Ok(pass) => {
+                tracing::info!(
+                    scope = scope_label(&refresh.target),
+                    created = pass.created,
+                    updated = pass.updated,
+                    unchanged = pass.unchanged,
+                    removed = pass.removed,
+                    "item refresh served inside the running scan"
+                );
+                ScanResult::Completed
+            }
+            Err(err) => ScanResult::Failed(err.to_string()),
+        };
+        let mut queue = lock_queue(&self.queue);
+        let serving = queue.serving.remove(&refresh.key);
+        let trigger = serving
+            .as_ref()
+            .map_or(ScanTrigger::Api, |serving| serving.request.trigger);
+        let waited = serving.is_some_and(|serving| {
+            let waited = !serving.waiters.tickets.is_empty();
+            for ticket in serving.waiters.tickets {
+                queue.sinks.remove(&ticket);
+                queue.finished.insert(ticket, result.clone());
+            }
+            waited
+        });
+        drop(queue);
+        crate::scan_metrics::lane_refresh_finished(
+            trigger,
+            result.metric_end(),
+            outcome.as_ref().ok(),
+        );
+        // Logged once, at the outermost layer: a caller waiting for the
+        // refresh (Identify → Apply) reports its failure itself; a queued
+        // one's is reported here.
+        if let (ScanResult::Failed(err), false) = (&result, waited) {
+            tracing::error!(%err, scope = scope_label(&refresh.target), "item refresh failed");
+        }
+        self.progress.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// Releases the worker's claim if its task is dropped before it drained
+/// the queue (the runtime shutting down, or the worker panicking), so the
+/// queue never waits on a worker that no longer exists. The scan it was
+/// running is aborted — it cannot outlive its worker and overlap the next
+/// one — and goes back to the head of the queue for its waiters, one of
+/// which starts a new worker.
+struct WorkerRelease {
+    queue: Arc<Mutex<ScanQueue>>,
+    progress: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The request the worker is running.
+    request: Option<ScanRequest>,
+    /// The task running it.
+    scan_task: Option<tokio::task::AbortHandle>,
+    done: bool,
+}
+
+impl Drop for WorkerRelease {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Some(task) = self.scan_task.take() {
+            task.abort();
+        }
+        let mut queue = lock_queue(&self.queue);
+        queue.worker = false;
+        if let (Some(running), Some(request)) = (queue.running.take(), self.request.take()) {
+            running.cancel.cancel();
+            if !queue.closed {
+                let pending = PendingScan {
+                    request,
+                    waiters: running.waiters,
+                };
+                if pending.request.priority {
+                    queue.lane.push_front(pending);
+                } else {
+                    queue.pending.push_front(pending);
+                }
+            }
+        }
+        // The lane refreshes the aborted scan was serving go back to the
+        // head of the lane for their waiters.
+        let serving: Vec<ServingRefresh> = queue.serving.drain().map(|(_, s)| s).collect();
+        for refresh in serving {
+            refresh.cancel.cancel();
+            if !queue.closed {
+                queue.lane.push_front(PendingScan {
+                    request: refresh.request,
+                    waiters: refresh.waiters,
+                });
+            }
+        }
+        drop(queue);
+        self.progress.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// A waiting caller's ticket, withdrawn however the caller stops waiting.
+struct QueuedTicket {
+    queue: Arc<Mutex<ScanQueue>>,
+    ticket: u64,
+}
+
+impl Drop for QueuedTicket {
+    fn drop(&mut self) {
+        lock_queue(&self.queue).withdraw(self.ticket);
     }
 }
 
@@ -154,8 +967,8 @@ impl FerrofinLibraryManager {
             persistence,
             people,
             scanner: None,
-            scan_in_flight: Arc::new(AtomicBool::new(false)),
-            scan_pending: Arc::new(std::sync::Mutex::new(None)),
+            scan_queue: Arc::new(Mutex::new(ScanQueue::default())),
+            scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
             chapters: None,
             user_root: None,
             years: None,
@@ -342,19 +1155,26 @@ impl FerrofinLibraryManager {
         self.scanner = Some(scanner);
         self
     }
+
+    /// Attaches a scan stand-in in place of the filesystem scanner.
+    #[cfg(test)]
+    fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
+        self.scanner = Some(runner);
+        self
+    }
 }
 
 #[async_trait]
 impl crate::library_monitor::LibraryScanTrigger for FerrofinLibraryManager {
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        // Reached via the filesystem watcher / Radarr-Sonarr webhooks.
-        self.spawn_scan("watcher", ScanScope::Full);
-        Ok(())
-    }
-
-    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
-        // The monitor's settled change batch: ingest just the touched paths.
-        self.spawn_scan("watcher", ScanScope::Paths(paths));
+    async fn queue_scan_paths(
+        &self,
+        paths: Vec<String>,
+        trigger: ScanTrigger,
+    ) -> Result<(), ServiceError> {
+        // The monitor's settled change batch (the watcher, the Radarr/Sonarr
+        // webhooks): each path's `ChangedExternally` refresh, scoped to the
+        // item it refreshes (`FileRefresher.cs:135-208`).
+        self.spawn_scan(ScanRequest::changed(paths, trigger));
         Ok(())
     }
 }
@@ -651,6 +1471,23 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
+    async fn get_locked_fields_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        self.persistence.locked_fields_for_items(item_ids).await
+    }
+
+    async fn update_item_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        self.persistence
+            .replace_locked_fields(item_id, field_ids)
+            .await
+    }
+
     async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
@@ -889,139 +1726,282 @@ impl LibraryManager for FerrofinLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        self.spawn_scan("api", ScanScope::Full);
+        self.spawn_scan(ScanRequest::defaults(ScanTrigger::Api, ScanTarget::All));
         Ok(())
     }
 
     async fn queue_library_scan_with_trigger(
         &self,
-        trigger: &'static str,
+        trigger: ScanTrigger,
     ) -> Result<(), ServiceError> {
-        self.spawn_scan(trigger, ScanScope::Full);
+        self.spawn_scan(ScanRequest::defaults(trigger, ScanTarget::All));
         Ok(())
     }
 
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
-        self.spawn_scan("api", ScanScope::Library(library_id));
+        self.spawn_scan(ScanRequest::defaults(
+            ScanTrigger::Api,
+            ScanTarget::Library(library_id),
+        ));
         Ok(())
     }
 
-    async fn run_library_scan(&self) -> Result<(), ServiceError> {
-        // Boxed because the scan future is ~16 KB — a whole pass over the
-        // planner lives in it — and this is the one place it is awaited on a
-        // caller's stack instead of on a `tokio::spawn`ed task of its own
-        // (`clippy::large_futures`).
-        Box::pin(self.run_scan("schedule", ScanScope::Full)).await;
+    async fn queue_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        if self.scanner.is_none() {
+            // The trait's contract: the options cannot be honoured, and a
+            // silent no-op would look like a refresh that ran.
+            return Err(ServiceError::backend(
+                "queue_refresh_scan needs a library scanner, which this library manager has none of",
+            ));
+        }
+        // A file item's own refresh — and a by-name artist's, which has no
+        // folder to validate — waits in the priority lane; a folder's
+        // validation — as large as a whole library — queues like a scan.
+        let item_only = match &target {
+            ScanTarget::Items(_) => true,
+            ScanTarget::Artist { path, folders, .. } => path.is_none() && folders.is_empty(),
+            _ => false,
+        };
+        let request = if item_only {
+            ScanRequest::item_refresh(target, options.clone())
+        } else {
+            ScanRequest::folder_refresh(target, options.clone())
+        };
+        self.spawn_scan(request);
         Ok(())
+    }
+
+    async fn run_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        if self.scanner.is_none() {
+            return Err(ServiceError::backend(
+                "run_refresh_scan needs a library scanner, which this library manager has none of",
+            ));
+        }
+        // Through the priority lane: it runs ahead of every queued scan, and
+        // inside a running one between two of its items, so the caller waits
+        // for about one item plus its own refresh — never a library scan.
+        self.run_scan(ScanRequest::item_refresh(target, options.clone()), None)
+            .await
+    }
+
+    async fn run_library_scan(
+        &self,
+        trigger: ScanTrigger,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        // The scan runs on the queue's worker; this future only waits for it.
+        self.run_scan(ScanRequest::defaults(trigger, ScanTarget::All), progress)
+            .await
+    }
+
+    async fn shutdown_scans(&self) {
+        let mut progress = self.scan_progress.subscribe();
+        {
+            let mut queue = lock_queue(&self.scan_queue);
+            queue.closed = true;
+            let mut dropped: Vec<u64> = queue
+                .pending
+                .drain(..)
+                .flat_map(|pending| pending.waiters.tickets)
+                .collect();
+            dropped.extend(
+                queue
+                    .lane
+                    .drain(..)
+                    .flat_map(|pending| pending.waiters.tickets),
+            );
+            for serving in queue.serving.values() {
+                serving.cancel.cancel();
+            }
+            for ticket in dropped {
+                queue.sinks.remove(&ticket);
+                queue.finished.insert(ticket, ScanResult::Stopped);
+            }
+            if let Some(running) = &queue.running {
+                running.cancel.cancel();
+                tracing::info!("stopping the running library scan for shutdown");
+            }
+        }
+        self.scan_progress.send_modify(|n| *n = n.wrapping_add(1));
+        // The running scan stops before its next item (or out of a wait
+        // before its current one writes anything), so this is bounded by
+        // one item's writes.
+        loop {
+            if !lock_queue(&self.scan_queue).worker {
+                return;
+            }
+            if progress.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
 impl FerrofinLibraryManager {
-    /// Spawns the coalescing background library scan under a `library_scan` root
-    /// span tagged with `trigger`, returning immediately (Jellyfin's refresh is
-    /// fire-and-forget — it must not block the HTTP handler). Shared by every
-    /// entry point so the coalescing guard and the span are defined once.
-    /// `scope` restricts the scan to one library or to a set of changed paths;
-    /// [`ScanScope::Full`] scans everything.
-    fn spawn_scan(&self, trigger: &'static str, scope: ScanScope) {
-        let Some(work) = self.claim_scan(trigger, scope) else {
-            return;
+    /// Queues `request` and returns the ticket its caller waits on (`None`
+    /// when nobody waits, with no scanner attached, or once the host is
+    /// shutting down), starting the queue's worker if none is running.
+    fn submit(
+        &self,
+        request: ScanRequest,
+        waiting: bool,
+        progress: Option<ScanProgressSink>,
+    ) -> Option<u64> {
+        let Some(runner) = &self.scanner else {
+            tracing::debug!(
+                trigger = request.trigger.as_str(),
+                "library scan queued (no scanner attached — no-op)"
+            );
+            return None;
         };
-        // Its own root span — a scan is a background unit of work, never parented
-        // under the request span. `.instrument()` carries it onto the spawned task.
-        tokio::spawn(work.instrument(tracing::info_span!("library_scan", trigger)));
+        let request_trigger = request.trigger;
+        let trigger = request_trigger.as_str();
+        let scope = scope_label(&request.scope);
+        let (ticket, start, behind) = {
+            let mut queue = lock_queue(&self.scan_queue);
+            if queue.closed {
+                tracing::debug!(trigger, scope, "library scan refused: shutting down");
+                return None;
+            }
+            let behind = queue.running.is_some();
+            let ticket = queue.enqueue(request, waiting);
+            if let (Some(ticket), Some(progress)) = (ticket, progress) {
+                queue.sinks.insert(ticket, progress);
+            }
+            let start = !queue.worker;
+            queue.worker = true;
+            (ticket, start, behind)
+        };
+        if behind {
+            tracing::debug!(
+                trigger,
+                scope,
+                "library scan already running; queued behind it"
+            );
+        }
+        if start {
+            self.start_worker(Arc::clone(runner), request_trigger);
+        }
+        ticket
     }
 
-    /// The awaiting twin of [`spawn_scan`](Self::spawn_scan): runs the scan on
-    /// the CALLER's future and returns only once it has finished.
+    /// Starts the queue's worker on a task of its own, inside a
+    /// `library_scan` root span tagged with the trigger that started it — a
+    /// scan is a background unit of work, never parented under the request
+    /// span.
+    fn start_worker(&self, runner: Arc<dyn ScanRunner>, trigger: ScanTrigger) {
+        let worker = ScanWorker {
+            runner,
+            queue: Arc::clone(&self.scan_queue),
+            progress: Arc::clone(&self.scan_progress),
+        };
+        let span = tracing::info_span!(parent: None, "library_scan", trigger = trigger.as_str());
+        let task = tokio::spawn(worker.drain().instrument(span));
+        #[cfg(test)]
+        {
+            lock_queue(&self.scan_queue).worker_task = Some(task.abort_handle());
+        }
+        drop(task);
+    }
+
+    /// Queues the library scan for `request` and returns at once (Jellyfin's
+    /// refresh is fire-and-forget — it must not block the HTTP handler).
+    /// Shared by every queueing entry point.
+    fn spawn_scan(&self, request: ScanRequest) {
+        self.submit(request, false, None);
+    }
+
+    /// Queues the scan for `request` and returns only once it has run,
+    /// reporting its progress to `progress`.
     ///
     /// Used by the "Scan Media Library" scheduled task, whose upstream
     /// counterpart awaits the validation pass (`RefreshMediaLibraryTask
-    /// .ExecuteAsync` → `await ValidateMediaLibraryInternal`). When another scan
-    /// already owns the work this merges its scope into that scan's rerun — the
-    /// same coalescing as the spawning path — and then waits for the in-flight
-    /// flag to clear, so "the task finished" still means "the library is
-    /// scanned" and not merely "someone else is scanning".
-    async fn run_scan(&self, trigger: &'static str, scope: ScanScope) {
-        match self.claim_scan(trigger, scope) {
-            Some(work) => {
-                work.instrument(tracing::info_span!("library_scan", trigger))
-                    .await;
-            }
-            None => {
-                while self.scan_in_flight.load(Ordering::Acquire) {
-                    tokio::time::sleep(SCAN_WAIT_POLL).await;
+    /// .ExecuteAsync` → `await ValidateMediaLibraryInternal`), so "the task
+    /// finished" means "the library is scanned", and a scan that failed or
+    /// panicked fails the task.
+    ///
+    /// The scan runs on the queue's worker, never on this future.
+    /// Cancelling this future — `POST /Library/Refresh`'s
+    /// `CancelIfRunningAndQueue` cancelling the scheduled task, or the
+    /// dashboard's stop button — withdraws only this caller's request: still
+    /// queued, it is dropped unless a fire-and-forget request or another
+    /// caller shares it; running, it stops cooperatively once nobody else
+    /// wants it, with the item in progress written whole or not at all. Only
+    /// then does the next queued scan start, so a refresh's replacement task
+    /// waits for the cancelled scan to end: at most one item — plus, when
+    /// the scan is serving a priority-lane item refresh at that moment, the
+    /// rest of that refresh (it is not the cancelled caller's to stop).
+    async fn run_scan(
+        &self,
+        request: ScanRequest,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        // Subscribed before the request is queued, so no progress between
+        // the check below and the wait is missed.
+        let mut changed = self.scan_progress.subscribe();
+        // A replacement worker (below) keeps the request's own trigger.
+        let trigger = request.trigger;
+        // Refused: scanning has shut down.
+        let Some(ticket) = self.submit(request, true, progress) else {
+            return Ok(false);
+        };
+        let _withdraw = QueuedTicket {
+            queue: Arc::clone(&self.scan_queue),
+            ticket,
+        };
+        loop {
+            let (result, restart, lost) = {
+                let mut queue = lock_queue(&self.scan_queue);
+                let result = queue.finished.remove(&ticket);
+                // A worker that went away before it drained the queue (its
+                // task dropped) is replaced, so this request still runs —
+                // only while the request is still queued: with no worker, a
+                // request neither queued nor settled is gone, and starting
+                // workers for it would only drain an empty queue over and
+                // over.
+                let orphaned = result.is_none() && !queue.worker && !queue.closed;
+                let queued = queue.is_queued(ticket);
+                let restart = orphaned && queued;
+                queue.worker |= restart;
+                (result, restart, orphaned && !queued)
+            };
+            match result {
+                Some(ScanResult::Completed) => return Ok(true),
+                Some(ScanResult::Stopped) => return Ok(false),
+                Some(ScanResult::Failed(message)) => return Err(ServiceError::backend(message)),
+                None if lost => {
+                    return Err(ServiceError::backend(
+                        "the scan request was lost before it ran".to_owned(),
+                    ));
                 }
+                None => {}
+            }
+            if restart && let Some(runner) = &self.scanner {
+                self.start_worker(Arc::clone(runner), trigger);
+            }
+            if changed.changed().await.is_err() {
+                return Ok(false);
             }
         }
     }
 
-    /// Takes the single-scan claim and hands back the work to run, or `None`
-    /// when there is nothing for this caller to run — no scanner attached, or a
-    /// scan already in flight (in which case `scope` is merged into that scan's
-    /// queued rerun).
-    ///
-    /// Coalesce: a full scan fetches remote metadata + artwork for every item,
-    /// so it can run for minutes. The library-monitor webhooks report one path
-    /// at a time (a Radarr/Sonarr batch = many calls) and `/Library/Refresh`
-    /// can be double-clicked, so overlapping requests must fold into one scan.
-    fn claim_scan(
-        &self,
-        trigger: &'static str,
-        scope: ScanScope,
-    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
-        let Some(scanner) = &self.scanner else {
-            tracing::debug!(trigger, "library scan queued (no scanner attached — no-op)");
-            return None;
-        };
-        if self.scan_in_flight.swap(true, Ordering::AcqRel) {
-            scope.merge_into(&mut self.scan_pending.lock().expect("pending not poisoned"));
-            tracing::debug!(
-                trigger,
-                "library scan already running; coalesced (rerun queued)"
-            );
-            return None;
-        }
-        let scanner = Arc::clone(scanner);
-        let in_flight = Arc::clone(&self.scan_in_flight);
-        let pending = Arc::clone(&self.scan_pending);
-        Some(async move {
-            let started = std::time::Instant::now();
-            tracing::info!("library scan started");
-            let mut total_created = 0usize;
-            let mut scope = scope;
-            loop {
-                let result = match scope {
-                    ScanScope::Full => scanner.scan(None).await,
-                    ScanScope::Library(id) => scanner.scan(Some(id)).await,
-                    ScanScope::Paths(ref paths) => scanner.scan_paths(paths).await,
-                };
-                match result {
-                    Ok(created) => {
-                        total_created += created;
-                        tracing::info!(created, "library scan pass complete");
-                    }
-                    // Logged exactly once, here, at the scan task's top level.
-                    Err(err) => tracing::error!(%err, "library scan failed"),
-                }
-                // A request that arrived during the scan queued a rerun over
-                // its merged scope.
-                match pending.lock().expect("pending not poisoned").take() {
-                    Some(next) => scope = next,
-                    None => break,
-                }
-            }
-            in_flight.store(false, Ordering::Release);
-            tracing::info!(
-                created = total_created,
-                elapsed_ms = started.elapsed().as_millis(),
-                "library scan complete"
-            );
-            // ponytail: a request landing in the gap between the pending take
-            // and clearing in_flight loses its rerun — harmless (the next webhook
-            // or a manual refresh re-triggers). Tighten only if webhook-driven
-            // scans start missing changes.
-        })
+    /// Whether no scan is running and none is queued.
+    #[cfg(test)]
+    fn scan_idle(&self) -> bool {
+        let queue = lock_queue(&self.scan_queue);
+        !queue.worker
+            && queue.running.is_none()
+            && queue.pending.is_empty()
+            && queue.lane.is_empty()
+            && queue.serving.is_empty()
     }
 }
 
@@ -1095,55 +2075,1336 @@ mod tests {
         assert_eq!(trigger.as_deref(), Some("api"));
     }
 
+    /// One run a [`GatedRunner`] made.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Run {
+        scope: ScanTarget,
+        options: MetadataRefreshOptions,
+        ancestors: MetadataRefreshOptions,
+        /// Items it finished.
+        items: usize,
+        /// It stopped at an item boundary because it was cancelled.
+        stopped: bool,
+    }
+
+    /// A scan stand-in of [`GatedRunner::ITEMS`] items: each item waits for a
+    /// permit the test releases, and cancellation is checked between items
+    /// (as the scanner does). Panics once told to, after its first permit.
+    struct GatedRunner {
+        runs: Mutex<Vec<Run>>,
+        started: tokio::sync::watch::Sender<usize>,
+        gate: tokio::sync::Semaphore,
+        panic_next: std::sync::atomic::AtomicBool,
+        fail_next: std::sync::atomic::AtomicBool,
+        /// Serve the priority lane between two items, as the scanner does.
+        serves_lane: std::sync::atomic::AtomicBool,
+        /// The lane refreshes served inside a run: `(run index, target)`.
+        served: Mutex<Vec<(usize, ScanTarget)>>,
+        /// The next lane refresh taken panics the run serving it (before
+        /// handing it back).
+        panic_serving: std::sync::atomic::AtomicBool,
+    }
+
+    impl GatedRunner {
+        const ITEMS: usize = 2;
+
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                runs: Mutex::new(Vec::new()),
+                started: tokio::sync::watch::Sender::new(0),
+                gate: tokio::sync::Semaphore::new(0),
+                panic_next: std::sync::atomic::AtomicBool::new(false),
+                fail_next: std::sync::atomic::AtomicBool::new(false),
+                serves_lane: std::sync::atomic::AtomicBool::new(true),
+                served: Mutex::new(Vec::new()),
+                panic_serving: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn served(&self) -> Vec<(usize, ScanTarget)> {
+            self.served.lock().expect("served").clone()
+        }
+
+        fn runs(&self) -> Vec<Run> {
+            self.runs.lock().expect("runs").clone()
+        }
+
+        /// Waits until `n` runs have started.
+        async fn started(&self, n: usize) {
+            let mut started = self.started.subscribe();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                started.wait_for(|s| *s >= n),
+            )
+            .await
+            .expect("the scan started in time")
+            .expect("runner alive");
+        }
+
+        fn release(&self, n: usize) {
+            self.gate.add_permits(n);
+        }
+    }
+
+    #[async_trait]
+    impl ScanRunner for GatedRunner {
+        async fn run(
+            &self,
+            scope: &ScanTarget,
+            run: ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            let index = {
+                let mut runs = self.runs.lock().expect("runs");
+                runs.push(Run {
+                    scope: scope.clone(),
+                    options: run.options.clone(),
+                    ancestors: run.ancestors.clone(),
+                    items: 0,
+                    stopped: false,
+                });
+                runs.len() - 1
+            };
+            self.started.send_modify(|s| *s += 1);
+            for item in 1..=Self::ITEMS {
+                // Between two items: the lane's refreshes run inline.
+                if let Some(lane) = run
+                    .lane
+                    .filter(|_| self.serves_lane.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    while let Some(refresh) = lane.next() {
+                        assert!(
+                            !self
+                                .panic_serving
+                                .swap(false, std::sync::atomic::Ordering::SeqCst),
+                            "a served refresh panicked"
+                        );
+                        self.served
+                            .lock()
+                            .expect("served")
+                            .push((index, refresh.target.clone()));
+                        lane.done(refresh, &Ok(crate::library_scan::ScanOutcome::default()));
+                    }
+                }
+                if run.cancel.is_cancelled() {
+                    self.runs.lock().expect("runs")[index].stopped = true;
+                    return Ok(crate::library_scan::ScanOutcome {
+                        stopped: true,
+                        ..crate::library_scan::ScanOutcome::default()
+                    });
+                }
+                self.gate.acquire().await.expect("gate open").forget();
+                assert!(
+                    !self
+                        .panic_next
+                        .swap(false, std::sync::atomic::Ordering::SeqCst),
+                    "scan blew up"
+                );
+                self.runs.lock().expect("runs")[index].items += 1;
+                if let Some(progress) = run.progress {
+                    let percent = u32::try_from(item * 96 / Self::ITEMS).expect("percent");
+                    progress(f64::from(percent));
+                }
+            }
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ServiceError::backend("disk full"));
+            }
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    /// Waits (bounded) until the manager holds no running and no queued scan.
+    async fn until_idle(mgr: &FerrofinLibraryManager) {
+        for _ in 0..500 {
+            if mgr.scan_idle() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the scan queue never went idle");
+    }
+
+    /// Waits (bounded) until the queue holds `scans` scans with `tickets`
+    /// waiting callers between them.
+    async fn until_queued(mgr: &FerrofinLibraryManager, scans: usize, tickets: usize) {
+        for _ in 0..500 {
+            {
+                let queue = lock_queue(&mgr.scan_queue);
+                let waiting: usize = queue.pending.iter().map(|p| p.waiters.tickets.len()).sum();
+                if queue.pending.len() == scans && waiting == tickets {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{scans} scans with {tickets} waiters never queued");
+    }
+
+    fn replace_all() -> MetadataRefreshOptions {
+        MetadataRefreshOptions::for_item_refresh(
+            ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+            ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+            true,
+            false,
+            false,
+        )
+    }
+
+    fn none_none() -> MetadataRefreshOptions {
+        MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        }
+    }
+
+    /// A finished run of `scope` with the default options.
+    fn default_run(scope: ScanTarget) -> Run {
+        Run {
+            scope,
+            options: MetadataRefreshOptions::default(),
+            ancestors: MetadataRefreshOptions::default(),
+            items: GatedRunner::ITEMS,
+            stopped: false,
+        }
+    }
+
+    fn spawn_scheduled(mgr: &FerrofinLibraryManager) -> tokio::task::JoinHandle<()> {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            mgr.run_library_scan(ScanTrigger::Schedule, None)
+                .await
+                .expect("scan runs");
+        })
+    }
+
     #[tokio::test]
     async fn run_library_scan_returns_only_once_the_scan_has_finished() {
         // Upstream's "Scan Media Library" task awaits the validation pass
         // (`RefreshMediaLibraryTask.ExecuteAsync`:57-64), so the task is still
         // `Running` while the library is being written. This asserts both
-        // halves of that: the owning caller returns with the in-flight claim
-        // released, and a caller that coalesced into someone else's scan waits
-        // for THAT scan rather than returning immediately.
-        use crate::file_system::FerrofinFileSystem;
-        use crate::library_scan::LibraryScanner;
-        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
-        use ferrofin_traits::library::VirtualFolderManager;
-
+        // halves of that: the caller returns once its scan ran and the queue
+        // is idle, and a caller queued behind someone else's scan waits until
+        // ITS OWN scan has run rather than returning immediately.
         let db = test_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = Arc::new(LibraryScanner::new(
-            vf,
-            Arc::new(FerrofinFileSystem::new()),
-            persistence,
-        ));
-        let mgr = Arc::new(manager(&db).with_scanner(scanner));
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
 
-        mgr.run_library_scan().await.expect("scan runs");
+        runner.release(GatedRunner::ITEMS);
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("scan runs");
+        until_idle(&mgr).await;
+        assert_eq!(runner.runs(), vec![default_run(ScanTarget::All)]);
+
+        // Queued path: a watcher scan runs; the scheduled run queues behind
+        // it and returns only once its own scan ran.
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(2).await;
+        let waiter = spawn_scheduled(&mgr);
+        until_queued(&mgr, 1, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            !mgr.scan_in_flight.load(Ordering::Acquire),
-            "the awaiting form must not return while its own scan is still claimed"
+            !waiter.is_finished(),
+            "a queued run must wait for its scan, not return at once"
+        );
+        runner.release(2 * GatedRunner::ITEMS);
+        waiter.await.expect("joined");
+        assert_eq!(runner.runs().len(), 3, "the queued run scanned");
+        until_idle(&mgr).await;
+    }
+
+    /// `POST /Library/Refresh` cancels the running scan task and starts a new
+    /// one (`CancelIfRunningAndQueue`). Cancelling the task stops its scan
+    /// between two items — the item in progress finishes — and releases the
+    /// queue when the scan has really ended, so the next scan runs: nothing
+    /// queues behind a scan that no longer exists (observed before this: two
+    /// refreshes 0.5 s apart wedged scanning until restart).
+    #[tokio::test]
+    async fn cancelling_a_running_scan_stops_it_between_items_and_the_next_one_runs() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        let first = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        first.abort();
+        assert!(first.await.expect_err("aborted").is_cancelled());
+        assert!(
+            !mgr.scan_idle(),
+            "the scan finishes the item in progress before it stops"
+        );
+        runner.release(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.runs(),
+            vec![Run {
+                items: 1,
+                stopped: true,
+                ..default_run(ScanTarget::All)
+            }],
+            "one item finished, then the scan stopped at the boundary"
         );
 
-        // Coalesced path: pretend another scan owns the claim, release it after
-        // a beat, and check the waiter observed the release instead of racing
-        // past it.
-        mgr.scan_in_flight.store(true, Ordering::Release);
-        let releaser = Arc::clone(&mgr);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            releaser.scan_in_flight.store(false, Ordering::Release);
+        runner.release(GatedRunner::ITEMS);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mgr.run_library_scan(ScanTrigger::Schedule, None),
+        )
+        .await
+        .expect("the next scan is not wedged")
+        .expect("scan runs");
+        assert_eq!(runner.runs()[1], default_run(ScanTarget::All));
+        until_idle(&mgr).await;
+    }
+
+    /// The refresh race: the new scan task queues behind the one being
+    /// cancelled before the cancellation lands. The cancelled scan stops at
+    /// its next item boundary, and only then does the queued one run — not
+    /// coalesced into nothing — and its caller returns once it has.
+    #[tokio::test]
+    async fn a_scan_queued_behind_a_cancelled_one_runs_after_it_stops() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        let first = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        let second = spawn_scheduled(&mgr);
+        until_queued(&mgr, 1, 1).await;
+        first.abort();
+        assert!(first.await.expect_err("aborted").is_cancelled());
+        runner.release(1 + GatedRunner::ITEMS);
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("the queued run returns")
+            .expect("joined");
+        assert_eq!(
+            runner.runs(),
+            vec![
+                Run {
+                    items: 1,
+                    stopped: true,
+                    ..default_run(ScanTarget::All)
+                },
+                default_run(ScanTarget::All),
+            ]
+        );
+        until_idle(&mgr).await;
+    }
+
+    /// Two callers waiting on one queued scan: cancelling one of them while
+    /// the scan runs does not stop it — the other still wants it.
+    #[tokio::test]
+    async fn cancelling_one_of_two_waiters_keeps_their_shared_scan_running() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let a = spawn_scheduled(&mgr);
+        let b = spawn_scheduled(&mgr);
+        until_queued(&mgr, 1, 2).await;
+        runner.release(GatedRunner::ITEMS);
+        runner.started(2).await;
+        a.abort();
+        assert!(a.await.expect_err("aborted").is_cancelled());
+        runner.release(GatedRunner::ITEMS);
+        tokio::time::timeout(std::time::Duration::from_secs(5), b)
+            .await
+            .expect("the other waiter returns")
+            .expect("joined");
+        assert_eq!(
+            runner.runs(),
+            vec![default_run(ScanTarget::All), default_run(ScanTarget::All)],
+            "the shared scan ran to the end"
+        );
+        until_idle(&mgr).await;
+    }
+
+    /// A caller cancelled while its request is still queued withdraws it: a
+    /// cancelled request does not run.
+    #[tokio::test]
+    async fn a_cancelled_waiter_withdraws_its_queued_request() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let waiter = spawn_scheduled(&mgr);
+        until_queued(&mgr, 1, 1).await;
+        waiter.abort();
+        assert!(waiter.await.expect_err("aborted").is_cancelled());
+        until_queued(&mgr, 0, 0).await;
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(runner.runs(), vec![default_run(ScanTarget::All)]);
+    }
+
+    /// Two callers queued behind a scan that is cancelled: it stops at its
+    /// item boundary, then both queued scans run in order and both callers
+    /// return.
+    #[tokio::test]
+    async fn two_callers_queued_behind_a_cancelled_scan_both_run_in_order() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let library = Uuid::from_u128(0xA);
+
+        let first = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        let replace = tokio::spawn({
+            let mgr = mgr.clone();
+            async move {
+                mgr.run_scan(
+                    ScanRequest::folder_refresh(ScanTarget::Library(library), replace_all()),
+                    None,
+                )
+                .await
+                .expect("scan runs");
+            }
         });
-        let started = std::time::Instant::now();
-        mgr.run_library_scan().await.expect("scan runs");
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(100),
-            "a coalesced run must wait for the in-flight scan, not return at once"
+        until_queued(&mgr, 1, 1).await;
+        let full = spawn_scheduled(&mgr);
+        until_queued(&mgr, 2, 2).await;
+        first.abort();
+        assert!(first.await.expect_err("aborted").is_cancelled());
+        runner.release(1 + 2 * GatedRunner::ITEMS);
+        for caller in [replace, full] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await
+                .expect("the caller returns")
+                .expect("joined");
+        }
+        assert_eq!(
+            runner.runs(),
+            vec![
+                Run {
+                    items: 1,
+                    stopped: true,
+                    ..default_run(ScanTarget::All)
+                },
+                Run {
+                    options: replace_all(),
+                    ancestors: none_none(),
+                    ..default_run(ScanTarget::Library(library))
+                },
+                default_run(ScanTarget::All),
+            ]
         );
-        assert!(!mgr.scan_in_flight.load(Ordering::Acquire));
+        until_idle(&mgr).await;
+    }
+
+    /// The Identify refresh (`run_refresh_scan`) goes into the priority lane:
+    /// with a scan running, that scan serves it between two of its items, so
+    /// the caller waits about one item — not for the scan — and the scan
+    /// then goes on. Without a scanner it refuses rather than pretending.
+    #[tokio::test]
+    async fn an_identify_is_served_inside_the_running_scan() {
+        let db = test_db().await;
+        assert!(
+            manager(&db)
+                .run_refresh_scan(ScanTarget::All, &replace_all())
+                .await
+                .is_err(),
+            "no scanner: refused"
+        );
+        let runner = GatedRunner::new();
+        let mgr = Arc::new(manager(&db).with_scan_runner(runner.clone()));
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let item = ScanTarget::Items(vec!["/media/movies/Heat (1995)/Heat (1995).mkv".into()]);
+        let waiting = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            let item = item.clone();
+            async move { mgr.run_refresh_scan(item, &replace_all()).await }
+        });
+        // Not queued behind the running scan: waiting in the lane.
+        for _ in 0..500 {
+            if !lock_queue(&mgr.scan_queue).lane.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!waiting.is_finished());
+        // The running scan finishes one item and serves the lane.
+        runner.release(1);
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("returned without waiting for the scan")
+            .expect("task")
+            .expect("refresh");
+        assert!(ran);
+        assert_eq!(runner.served(), vec![(0, item)]);
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1, "no scan of its own");
+        assert_eq!(runs[0].items, 1, "the scan is still running");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(runner.runs()[0].items, GatedRunner::ITEMS);
+    }
+
+    /// A scan that panics while it serves a lane refresh (past the scanner's
+    /// own guard) cannot strand the refresh's waiter: the worker settles it
+    /// as failed, the waiter gets the error, and no worker is started for a
+    /// request that no longer exists (it used to restart workers over an
+    /// empty queue in a hot loop).
+    #[tokio::test]
+    async fn a_refresh_lost_with_a_panicking_scan_fails_its_waiter() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = Arc::new(manager(&db).with_scan_runner(runner.clone()));
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let waiting = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move {
+                mgr.run_refresh_scan(ScanTarget::Items(vec!["/m/a.mkv".into()]), &replace_all())
+                    .await
+            }
+        });
+        for _ in 0..500 {
+            if !lock_queue(&mgr.scan_queue).lane.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        runner
+            .panic_serving
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(1);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter was not stranded")
+            .expect("task")
+            .expect_err("its refresh was lost");
+        assert!(
+            err.to_string().contains("ended before it finished"),
+            "{err}"
+        );
+        until_idle(&mgr).await;
+        // No worker churn: nothing more runs, and the queue stays quiet.
+        let progress = *mgr.scan_progress.borrow();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*mgr.scan_progress.borrow(), progress, "no worker restarted");
+        assert_eq!(runner.runs().len(), 1);
+        // And the queue still works.
+        runner.release(GatedRunner::ITEMS);
+        mgr.run_refresh_scan(ScanTarget::Items(vec!["/m/b.mkv".into()]), &replace_all())
+            .await
+            .expect("the next refresh runs");
+    }
+
+    /// With no scan to serve it, a file item's refresh runs ahead of every
+    /// queued scan (the lane first), and lane refreshes keep their order.
+    #[tokio::test]
+    async fn item_refreshes_run_ahead_of_queued_scans_in_order() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        runner
+            .serves_lane
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let library = Uuid::from_u128(0xA);
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        mgr.queue_refresh_scan(ScanTarget::Library(library), &replace_all())
+            .await
+            .expect("folder refresh");
+        let first = ScanTarget::Items(vec!["/m/a.mkv".into()]);
+        let second = ScanTarget::Items(vec!["/m/b.mkv".into()]);
+        for item in [&first, &second] {
+            mgr.queue_refresh_scan(item.clone(), &replace_all())
+                .await
+                .expect("item refresh");
+        }
+        runner.release(4 * GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        let scopes: Vec<ScanTarget> = runner.runs().into_iter().map(|r| r.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![ScanTarget::All, first, second, ScanTarget::Library(library)]
+        );
+    }
+
+    /// A by-name artist's refresh has no folder to validate: it is an item
+    /// refresh, served by a running scan at its next item boundary (so its
+    /// music pass never runs beside the scan's); an artist whose albums'
+    /// folders must be validated queues like a folder refresh.
+    #[tokio::test]
+    async fn a_by_name_artist_refresh_rides_the_lane() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let by_name = ScanTarget::Artist {
+            id: Uuid::from_u128(0xA1),
+            path: None,
+            folders: Vec::new(),
+        };
+        let with_folders = ScanTarget::Artist {
+            id: Uuid::from_u128(0xA2),
+            path: None,
+            folders: vec!["/music/Artist".to_owned()],
+        };
+        for target in [&by_name, &with_folders] {
+            mgr.queue_refresh_scan(target.clone(), &replace_all())
+                .await
+                .expect("artist refresh");
+        }
+        runner.release(3 * GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.served(),
+            vec![(0, by_name)],
+            "served inside the scan"
+        );
+        let scopes: Vec<ScanTarget> = runner.runs().into_iter().map(|r| r.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![ScanTarget::All, with_folders],
+            "queued after it"
+        );
+    }
+
+    /// A running scan serves every waiting lane refresh at its next item
+    /// boundary, in the order they were queued.
+    #[tokio::test]
+    async fn a_running_scan_serves_the_lane_in_order() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let targets: Vec<ScanTarget> = ["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]
+            .iter()
+            .map(|p| ScanTarget::Items(vec![(*p).to_owned()]))
+            .collect();
+        for target in &targets {
+            mgr.queue_refresh_scan(target.clone(), &replace_all())
+                .await
+                .expect("item refresh");
+        }
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.served(),
+            targets.into_iter().map(|t| (0, t)).collect::<Vec<_>>()
+        );
+        assert_eq!(runner.runs().len(), 1);
+    }
+
+    /// A scan that panics must not wedge scanning either: it is contained in
+    /// its own task, and what was queued behind it still runs.
+    #[tokio::test]
+    async fn a_panicking_scan_does_not_wedge_the_next_one() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let library = Uuid::from_u128(0xA);
+
+        // Fire-and-forget scan that panics once released.
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        // A folder refresh queued behind it.
+        mgr.queue_refresh_scan(ScanTarget::Library(library), &replace_all())
+            .await
+            .expect("queued");
+        until_queued(&mgr, 1, 0).await;
+        runner
+            .panic_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(1 + GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 2, "the queued refresh ran after the panic");
+        assert_eq!(
+            runs[1],
+            Run {
+                options: replace_all(),
+                ancestors: none_none(),
+                ..default_run(ScanTarget::Library(library))
+            }
+        );
+
+        runner.release(GatedRunner::ITEMS);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mgr.run_library_scan(ScanTrigger::Schedule, None),
+        )
+        .await
+        .expect("not wedged")
+        .expect("scan runs");
+        assert_eq!(runner.runs().len(), 3);
+    }
+
+    /// "Replace all metadata" on library A queued with a default full scan
+    /// behind a running scan: both run, in order, and the replace applies to
+    /// A only — the default scan neither swallows it nor is widened by it.
+    #[tokio::test]
+    async fn a_replace_on_one_library_and_a_default_full_scan_both_run() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let library = Uuid::from_u128(0xA);
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        mgr.queue_refresh_scan(ScanTarget::Library(library), &replace_all())
+            .await
+            .expect("queued");
+        until_queued(&mgr, 1, 0).await;
+        mgr.queue_library_scan().await.expect("queued");
+        until_queued(&mgr, 2, 0).await;
+        runner.release(3 * GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.runs(),
+            vec![
+                default_run(ScanTarget::All),
+                Run {
+                    options: replace_all(),
+                    ancestors: none_none(),
+                    ..default_run(ScanTarget::Library(library))
+                },
+                default_run(ScanTarget::All),
+            ]
+        );
+    }
+
+    /// The scheduled task fails when its scan failed or panicked (upstream
+    /// records the exception as a `Failed` run), and gets the scan's
+    /// progress while it runs.
+    #[tokio::test]
+    async fn the_waiting_run_gets_its_scans_progress_and_failure() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink: ScanProgressSink = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |percent| seen.lock().expect("seen").push(percent))
+        };
+        runner.release(GatedRunner::ITEMS);
+        assert!(
+            mgr.run_library_scan(ScanTrigger::Schedule, Some(sink))
+                .await
+                .expect("scan runs")
+        );
+        assert_eq!(*seen.lock().expect("seen"), vec![48.0, 96.0]);
+
+        runner
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(GatedRunner::ITEMS);
+        let err = mgr
+            .run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect_err("failed");
+        assert!(err.to_string().contains("disk full"), "{err}");
+
+        runner
+            .panic_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(GatedRunner::ITEMS);
+        let err = mgr
+            .run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect_err("panicked");
+        assert!(err.to_string().contains("panicked"), "{err}");
+
+        runner.release(GatedRunner::ITEMS);
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("scanning goes on");
+        until_idle(&mgr).await;
+    }
+
+    /// The dashboard's "Scan Media Library": the task's progress moves with
+    /// the scan (`GET /ScheduledTasks` shows it while it runs), and a scan
+    /// that failed records the run as `Failed`, not `Completed`.
+    #[tokio::test]
+    async fn the_scan_media_library_task_shows_progress_and_fails_with_its_scan() {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr))));
+        let info = |tasks: &FerrofinTaskManager| tasks.get("RefreshLibrary").expect("task");
+        let until_idle = |tasks: FerrofinTaskManager| async move {
+            for _ in 0..500 {
+                if info(&tasks).state == TaskState::Idle {
+                    return info(&tasks);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the task never finished");
+        };
+
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        runner.release(1);
+        for _ in 0..500 {
+            if info(&tasks).current_progress_percentage == Some(48.0) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let running = info(&tasks);
+        assert_eq!(running.state, TaskState::Running);
+        assert_eq!(running.current_progress_percentage, Some(48.0));
+        runner.release(1);
+        let done = until_idle(tasks.clone()).await;
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Completed
+        );
+
+        runner
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.release(GatedRunner::ITEMS);
+        let failed = until_idle(tasks.clone()).await;
+        let result = failed.last_execution_result.expect("result");
+        assert_eq!(result.status, TaskCompletionStatus::Failed);
+        assert!(
+            result
+                .error_message
+                .is_some_and(|m| m.contains("disk full")),
+            "the scan's error is the run's"
+        );
+    }
+
+    /// A scan the host's shutdown stops — or refuses, once it has shut
+    /// down — ends the "Scan Media Library" run as `Cancelled`, not
+    /// `Completed` (upstream's `OperationCanceledException` out of
+    /// `ExecuteAsync`).
+    #[tokio::test]
+    async fn the_scan_media_library_task_is_cancelled_when_shutdown_stops_its_scan() {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr.clone()))));
+        let status = |tasks: FerrofinTaskManager| async move {
+            for _ in 0..500 {
+                let info = tasks.get("RefreshLibrary").expect("task");
+                if info.state == TaskState::Idle {
+                    return info.last_execution_result.expect("result").status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the task never finished");
+        };
+
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        let shutdown = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.shutdown_scans().await }
+        });
+        // The running scan is cancelled under the same lock that closes the
+        // queue; then its item in progress may finish.
+        while !lock_queue(&mgr.scan_queue).closed {
+            tokio::task::yield_now().await;
+        }
+        runner.release(1);
+        shutdown.await.expect("joined");
+        assert_eq!(
+            status(tasks.clone()).await,
+            TaskCompletionStatus::Cancelled,
+            "a stopped scan cancels the run"
+        );
+
+        tasks.queue("RefreshLibrary").expect("queued");
+        assert_eq!(
+            status(tasks.clone()).await,
+            TaskCompletionStatus::Cancelled,
+            "a refused scan cancels the run"
+        );
+        assert_eq!(runner.runs().len(), 1, "nothing ran after shutdown");
+    }
+
+    /// The host's teardown: the running scan stops at its next item
+    /// boundary and is awaited, the queued ones are dropped (their callers
+    /// return), and nothing is queued any more.
+    #[tokio::test]
+    async fn shutdown_stops_the_running_scan_and_refuses_new_ones() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        let first = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        mgr.queue_refresh_scan(ScanTarget::Library(Uuid::from_u128(0xA)), &replace_all())
+            .await
+            .expect("queued");
+        let queued = spawn_scheduled(&mgr);
+        until_queued(&mgr, 2, 1).await;
+
+        let shutdown = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.shutdown_scans().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown waits for the item in progress"
+        );
+        runner.release(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown returns")
+            .expect("joined");
+        assert!(mgr.scan_idle());
+        for caller in [first, queued] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+                .await
+                .expect("the caller returns")
+                .expect("joined");
+        }
+        assert_eq!(
+            runner.runs(),
+            vec![Run {
+                items: 1,
+                stopped: true,
+                ..default_run(ScanTarget::All)
+            }],
+            "the running scan stopped at its boundary; the queued ones never ran"
+        );
+
+        mgr.queue_library_scan().await.expect("refused quietly");
+        assert!(
+            !mgr.run_library_scan(ScanTrigger::Schedule, None)
+                .await
+                .expect("refused quietly"),
+            "a refused scan did not run to its end"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(runner.runs().len(), 1, "nothing runs after shutdown");
+        assert!(mgr.scan_idle());
+    }
+
+    /// A worker whose task dies (the runtime dropping it, or a panic in the
+    /// worker itself) aborts the scan it was running — it cannot overlap the
+    /// next one — and hands the request back to its waiter, which starts a
+    /// new worker.
+    #[tokio::test]
+    async fn a_worker_that_dies_hands_its_scan_back_to_the_waiter() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+
+        let waiter = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        lock_queue(&mgr.scan_queue)
+            .worker_task
+            .take()
+            .expect("a worker")
+            .abort();
+        // The waiter restarts the request on a new worker.
+        runner.started(2).await;
+        runner.release(GatedRunner::ITEMS);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter returns")
+            .expect("joined");
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].items, 0, "the aborted scan did no more work");
+        assert_eq!(runs[1], default_run(ScanTarget::All));
+        until_idle(&mgr).await;
+    }
+
+    fn request(scope: ScanTarget, options: MetadataRefreshOptions) -> ScanRequest {
+        ScanRequest {
+            scope,
+            options,
+            ancestors: MetadataRefreshOptions::default(),
+            trigger: ScanTrigger::Api,
+            passes: ScanPasses::Library,
+            priority: false,
+        }
+    }
+
+    fn scopes(queue: &ScanQueue) -> Vec<(ScanTarget, bool)> {
+        queue
+            .pending
+            .iter()
+            .map(|p| {
+                (
+                    p.request.scope.clone(),
+                    p.request.options == MetadataRefreshOptions::default(),
+                )
+            })
+            .collect()
+    }
+
+    fn paths(list: &[&str]) -> ScanTarget {
+        ScanTarget::Paths(list.iter().map(|p| (*p).to_owned()).collect())
+    }
+
+    #[test]
+    fn queued_path_scans_union_only_when_they_refresh_alike() {
+        let mut queue = ScanQueue::default();
+        let a = queue.enqueue(
+            request(paths(&["/m/a"]), MetadataRefreshOptions::default()),
+            true,
+        );
+        let b = queue.enqueue(
+            request(paths(&["/m/b", "/m/a"]), MetadataRefreshOptions::default()),
+            true,
+        );
+        queue.enqueue(
+            request(paths(&["/m/d"]), MetadataRefreshOptions::default()),
+            false,
+        );
+        let c = queue.enqueue(request(paths(&["/m/c"]), replace_all()), true);
+        // A folder refresh's path scan (its ancestors take `None`/`None`)
+        // does not join the watcher's, even with equal options.
+        queue.enqueue(
+            ScanRequest::folder_refresh(paths(&["/m/e"]), MetadataRefreshOptions::default()),
+            false,
+        );
+        assert_eq!(
+            scopes(&queue),
+            vec![
+                (paths(&["/m/a", "/m/b", "/m/d"]), true),
+                (paths(&["/m/c"]), false),
+                (paths(&["/m/e"]), true),
+            ]
+        );
+        assert_eq!(
+            queue.pending[0].waiters.tickets,
+            vec![a.unwrap(), b.unwrap()]
+        );
+        assert_eq!(queue.pending[0].waiters.detached, 1);
+        assert_eq!(queue.pending[1].waiters.tickets, vec![c.unwrap()]);
+    }
+
+    #[test]
+    fn a_queued_full_scan_covers_library_and_path_scans_that_refresh_alike() {
+        let mut queue = ScanQueue::default();
+        let lib = ScanTarget::Library(Uuid::from_u128(1));
+        let replace = queue.enqueue(request(lib.clone(), replace_all()), true);
+        let p = queue.enqueue(
+            request(paths(&["/m/a"]), MetadataRefreshOptions::default()),
+            true,
+        );
+        let l = queue.enqueue(
+            request(lib.clone(), MetadataRefreshOptions::default()),
+            false,
+        );
+        assert_eq!(l, None, "a fire-and-forget request gets no ticket");
+        let full = queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            true,
+        );
+        // The full scan takes the earliest covered scan's place and their
+        // waiters; the replace (other options) is untouched.
+        assert_eq!(
+            scopes(&queue),
+            vec![(lib.clone(), false), (ScanTarget::All, true)]
+        );
+        assert_eq!(queue.pending[0].waiters.tickets, vec![replace.unwrap()]);
+        assert_eq!(
+            queue.pending[1].waiters.tickets,
+            vec![full.unwrap(), p.unwrap()]
+        );
+        assert_eq!(queue.pending[1].waiters.detached, 1);
+        // Later library/path scans that refresh alike join it.
+        let late_p = queue.enqueue(
+            request(paths(&["/m/z"]), MetadataRefreshOptions::default()),
+            true,
+        );
+        let late_l = queue.enqueue(
+            request(lib.clone(), MetadataRefreshOptions::default()),
+            true,
+        );
+        assert_eq!(queue.pending.len(), 2);
+        assert_eq!(
+            queue.pending[1].waiters.tickets,
+            vec![full.unwrap(), p.unwrap(), late_p.unwrap(), late_l.unwrap()]
+        );
+        // A second full scan of the same options joins too.
+        queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            false,
+        );
+        assert_eq!(queue.pending.len(), 2);
+    }
+
+    #[test]
+    fn a_queued_full_scan_does_not_swallow_other_options() {
+        let mut queue = ScanQueue::default();
+        queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            false,
+        );
+        let lib = ScanTarget::Library(Uuid::from_u128(1));
+        queue.enqueue(request(lib.clone(), replace_all()), false);
+        queue.enqueue(request(paths(&["/m/a"]), replace_all()), false);
+        assert_eq!(
+            scopes(&queue),
+            vec![
+                (ScanTarget::All, true),
+                (lib, false),
+                (paths(&["/m/a"]), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_library_scan_never_becomes_a_full_scan() {
+        let mut queue = ScanQueue::default();
+        let a = ScanTarget::Library(Uuid::from_u128(1));
+        let b = ScanTarget::Library(Uuid::from_u128(2));
+        queue.enqueue(request(a.clone(), MetadataRefreshOptions::default()), false);
+        queue.enqueue(
+            request(paths(&["/m/x"]), MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(request(b.clone(), MetadataRefreshOptions::default()), false);
+        // The same library again joins its queued scan.
+        queue.enqueue(request(a.clone(), MetadataRefreshOptions::default()), false);
+        assert_eq!(
+            scopes(&queue),
+            vec![(a, true), (paths(&["/m/x"]), true), (b, true)]
+        );
+        assert_eq!(queue.pending[0].waiters.detached, 2);
+        assert!(
+            queue
+                .pending
+                .iter()
+                .all(|p| p.request.scope != ScanTarget::All)
+        );
+    }
+
+    fn changed(list: &[&str]) -> ScanTarget {
+        ScanTarget::Changed(list.iter().map(|p| (*p).to_owned()).collect())
+    }
+
+    /// The library monitor's request (the watcher, the *arr webhooks):
+    /// `ChangedExternally`'s default refresh of what the paths belong to,
+    /// nothing for the folders above it, and only the touched items'
+    /// closing passes — never a full scan.
+    #[test]
+    fn a_watcher_report_is_a_changed_path_scan_of_the_default_options() {
+        let request = ScanRequest::changed(vec!["/m/a.mkv".to_owned()], ScanTrigger::Watcher);
+        assert_eq!(request.scope, changed(&["/m/a.mkv"]));
+        assert_eq!(request.options, MetadataRefreshOptions::default());
+        assert_eq!(request.ancestors, none_none());
+        assert_eq!(request.passes, ScanPasses::Touched);
+        assert_eq!(request.trigger, ScanTrigger::Watcher);
+        assert!(!request.priority);
+    }
+
+    /// A watcher report never escalates: beside a queued library scan it
+    /// queues on its own (no full scan appears), reports union among
+    /// themselves only, and a folder refresh's path scan never joins them.
+    #[test]
+    fn changed_path_scans_union_and_never_turn_a_library_scan_into_a_full_one() {
+        let mut queue = ScanQueue::default();
+        let lib = ScanTarget::Library(Uuid::from_u128(1));
+        queue.enqueue(
+            request(lib.clone(), MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::folder_refresh(paths(&["/m/f"]), MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(
+                vec!["/m/b".to_owned(), "/m/a".to_owned()],
+                ScanTrigger::Watcher,
+            ),
+            false,
+        );
+        // A library scan arriving after the report does not swallow it either.
+        let other = ScanTarget::Library(Uuid::from_u128(2));
+        queue.enqueue(
+            request(other.clone(), MetadataRefreshOptions::default()),
+            false,
+        );
+        assert_eq!(
+            scopes(&queue),
+            vec![
+                (lib, true),
+                (changed(&["/m/a", "/m/b"]), true),
+                (paths(&["/m/f"]), true),
+                (other, true),
+            ]
+        );
+        assert_eq!(queue.pending[1].waiters.detached, 2);
+        assert!(
+            queue
+                .pending
+                .iter()
+                .all(|p| p.request.scope != ScanTarget::All),
+            "no request escalated into a full scan"
+        );
+    }
+
+    /// A webhook batch joins a queued watcher batch like any two reports
+    /// (the trigger never changes what runs); the joined scan keeps the
+    /// queued request's trigger.
+    #[test]
+    fn webhook_and_watcher_batches_join_under_the_queued_trigger() {
+        let mut queue = ScanQueue::default();
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/b".to_owned()], ScanTrigger::Webhook),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/c".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/d".to_owned()], ScanTrigger::Webhook),
+            false,
+        );
+        let queued: Vec<(ScanTarget, ScanTrigger)> = queue
+            .pending
+            .iter()
+            .map(|p| (p.request.scope.clone(), p.request.trigger))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![(
+                changed(&["/m/a", "/m/b", "/m/c", "/m/d"]),
+                ScanTrigger::Watcher
+            )]
+        );
+    }
+
+    /// A report that arrives while a full scan is still queued joins it (the
+    /// full scan will see the file); a full scan queued after reports takes
+    /// them over. A full scan of other options covers neither.
+    #[test]
+    fn a_queued_full_scan_covers_changed_path_scans() {
+        let mut queue = ScanQueue::default();
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(request(ScanTarget::All, replace_all()), false);
+        let full = queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            true,
+        );
+        assert_eq!(
+            scopes(&queue),
+            vec![(ScanTarget::All, true), (ScanTarget::All, false)],
+            "the default full scan took the report's place"
+        );
+        let late = queue.enqueue(
+            ScanRequest::changed(vec!["/m/z".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        assert_eq!(late, None);
+        assert_eq!(
+            queue.pending.len(),
+            2,
+            "the late report joined the full scan"
+        );
+        assert_eq!(queue.pending[0].waiters.tickets, vec![full.unwrap()]);
+        assert_eq!(queue.pending[0].waiters.detached, 2);
+    }
+
+    #[test]
+    fn a_withdrawn_request_leaves_the_queue_unless_someone_else_wants_it() {
+        let mut queue = ScanQueue::default();
+        let lib = ScanTarget::Library(Uuid::from_u128(1));
+        let alone = queue
+            .enqueue(request(lib, MetadataRefreshOptions::default()), true)
+            .unwrap();
+        let shared_a = queue
+            .enqueue(
+                request(paths(&["/m/a"]), MetadataRefreshOptions::default()),
+                true,
+            )
+            .unwrap();
+        let shared_b = queue
+            .enqueue(
+                request(paths(&["/m/b"]), MetadataRefreshOptions::default()),
+                true,
+            )
+            .unwrap();
+        let detached = queue.enqueue(request(ScanTarget::All, replace_all()), false);
+        assert_eq!(detached, None);
+        let joined = queue
+            .enqueue(request(ScanTarget::All, replace_all()), true)
+            .unwrap();
+        queue.withdraw(alone);
+        queue.withdraw(shared_a);
+        queue.withdraw(joined);
+        assert_eq!(
+            scopes(&queue),
+            vec![(paths(&["/m/a", "/m/b"]), true), (ScanTarget::All, false)],
+            "the path scan still has a waiter; the full scan a detached request"
+        );
+        assert_eq!(queue.pending[0].waiters.tickets, vec![shared_b]);
+        // A finished ticket is collected by the withdrawal too: no leak.
+        queue.finished.insert(shared_b, ScanResult::Completed);
+        queue.withdraw(shared_b);
+        assert!(queue.finished.is_empty());
+    }
+
+    /// Withdrawing from the RUNNING scan stops it only when nobody else —
+    /// no other caller, no fire-and-forget request — wants it.
+    #[test]
+    fn a_running_scan_is_cancelled_only_when_its_last_waiter_withdraws() {
+        let running = |tickets: Vec<u64>, detached| ScanQueue {
+            worker: true,
+            running: Some(RunningScan {
+                waiters: Waiters { tickets, detached },
+                cancel: ScanCancel::new(),
+            }),
+            ..ScanQueue::default()
+        };
+        let cancelled = |queue: &ScanQueue| {
+            queue
+                .running
+                .as_ref()
+                .is_some_and(|r| r.cancel.is_cancelled())
+        };
+
+        let mut queue = running(vec![1, 2], 0);
+        queue.withdraw(1);
+        assert!(!cancelled(&queue), "caller 2 still waits");
+        queue.withdraw(2);
+        assert!(cancelled(&queue));
+
+        let mut queue = running(vec![1], 1);
+        queue.withdraw(1);
+        assert!(
+            !cancelled(&queue),
+            "a fire-and-forget request still wants it"
+        );
+
+        let mut queue = running(vec![1], 0);
+        queue.withdraw(7);
+        assert!(!cancelled(&queue), "an unrelated ticket changes nothing");
     }
 
     #[tokio::test]
@@ -1219,9 +3480,7 @@ mod tests {
             }
         };
         for _ in 0..200 {
-            if count(BaseItemKind::Episode).await == 1
-                && !mgr.scan_in_flight.load(Ordering::Acquire)
-            {
+            if count(BaseItemKind::Episode).await == 1 && mgr.scan_idle() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1235,6 +3494,40 @@ mod tests {
             count(BaseItemKind::Movie).await,
             0,
             "the movie library must not be scanned"
+        );
+    }
+
+    /// `LibraryScanTrigger::queue_scan_paths` has no full-scan default any
+    /// more; the manager's queues the reported paths as a changed-path scan.
+    /// A report that arrives while a full scan RUNS is not folded into it
+    /// (the scan may be past its files): it queues and runs, scoped, after.
+    #[tokio::test]
+    async fn a_report_during_a_running_full_scan_runs_after_it_scoped() {
+        use crate::library_monitor::LibraryScanTrigger;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let waiter = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        mgr.queue_scan_paths(
+            vec!["/media/tv/Show/Season 1/e.mkv".to_owned()],
+            ScanTrigger::Watcher,
+        )
+        .await
+        .expect("queued");
+        until_queued(&mgr, 1, 0).await;
+        runner.release(2 * GatedRunner::ITEMS);
+        waiter.await.expect("joined");
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.runs(),
+            vec![
+                default_run(ScanTarget::All),
+                Run {
+                    ancestors: none_none(),
+                    ..default_run(changed(&["/media/tv/Show/Season 1/e.mkv"]))
+                },
+            ]
         );
     }
 
@@ -1289,9 +3582,12 @@ mod tests {
 
         // Report the episode's path (what the monitor dispatches after a settle
         // window): its hierarchy lands, the movie library is never planned.
-        mgr.queue_scan_paths(vec![episode.to_string_lossy().into_owned()])
-            .await
-            .expect("queued");
+        mgr.queue_scan_paths(
+            vec![episode.to_string_lossy().into_owned()],
+            ScanTrigger::Webhook,
+        )
+        .await
+        .expect("queued");
         let count = |kind| {
             let mgr = &mgr;
             async move {
@@ -1306,9 +3602,7 @@ mod tests {
             }
         };
         for _ in 0..200 {
-            if count(BaseItemKind::Episode).await == 1
-                && !mgr.scan_in_flight.load(Ordering::Acquire)
-            {
+            if count(BaseItemKind::Episode).await == 1 && mgr.scan_idle() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1615,6 +3909,23 @@ mod tests {
         let db = test_db().await;
         let mgr = manager(&db);
         mgr.queue_library_scan().await.expect("queue");
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("run");
+        mgr.shutdown_scans().await;
+    }
+
+    /// A folder refresh's options cannot be honoured without a scanner: the
+    /// request is refused, as the trait promises, rather than silently
+    /// dropped.
+    #[tokio::test]
+    async fn queue_refresh_scan_without_a_scanner_is_refused() {
+        let db = test_db().await;
+        let err = manager(&db)
+            .queue_refresh_scan(ScanTarget::All, &MetadataRefreshOptions::default())
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::Backend(_)), "{err}");
     }
 
     #[tokio::test]

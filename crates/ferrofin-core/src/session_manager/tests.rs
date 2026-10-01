@@ -1100,9 +1100,6 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
             .push(id.to_owned());
         Ok(())
     }
-    async fn refresh_media_streams(&self, _item_id: Uuid) -> Result<(), ServiceError> {
-        unreachable!("not reached from the session manager")
-    }
 }
 
 /// A stopped playback closes the live stream it names (C# `OnPlaybackStopped` →

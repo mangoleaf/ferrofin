@@ -168,7 +168,7 @@ impl FerrofinUserDataManager {
                WHERE "ItemId" = ?1 AND "UserId" = ?2
                  AND "CustomDataKey" IN ({placeholders})"#,
         );
-        let mut query = sqlx::query_as::<_, UserDataEntity>(&sql)
+        let mut query = sqlx::query_as::<_, UserDataEntity>(sqlx::AssertSqlSafe(sql))
             .bind(guid_to_db(item_id))
             .bind(guid_to_db(user_id));
         for key in &keys {
@@ -1006,7 +1006,7 @@ impl FerrofinUserDataManager {
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -1059,7 +1059,8 @@ impl FerrofinUserDataManager {
                    WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
                    ORDER BY "CustomDataKey""#,
             );
-            let mut query = sqlx::query_as::<_, UserDataEntity>(&sql).bind(guid_to_db(user_id));
+            let mut query = sqlx::query_as::<_, UserDataEntity>(sqlx::AssertSqlSafe(sql))
+                .bind(guid_to_db(user_id));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }

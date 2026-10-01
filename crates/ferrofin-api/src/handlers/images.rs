@@ -46,7 +46,6 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
-use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::drawing::ImageFormat;
 use ferrofin_model::dto::ImageInfo;
@@ -482,6 +481,13 @@ async fn serve_image_file(
         return Ok(response);
     }
 
+    // Image validators belong to the tag-based contract above. ServeFile's
+    // metadata ETag is a different identity and must not decide these requests.
+    let mut request = request;
+    request.headers_mut().remove(axum::http::header::IF_MATCH);
+    request
+        .headers_mut()
+        .remove(axum::http::header::IF_NONE_MATCH);
     let mut response = ServeFile::new(&serve_path)
         .oneshot(request)
         .await
@@ -496,6 +502,7 @@ async fn serve_image_file(
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
+    response.headers_mut().remove(axum::http::header::ETAG);
     append_image_cache_headers(response.headers_mut(), no_cache, tag, image);
     Ok(response)
 }
@@ -1031,14 +1038,22 @@ by_name_image_handlers!(
 )]
 async fn get_user_image(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    auth: Result<RequireAuth, ApiError>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let user: UserEntity =
-        crate::handlers::items::resolve_user(&state, &auth, query.user_id).await?;
-    let user_id =
-        Uuid::parse_str(&user.id).map_err(|e| ApiError::NotFound(format!("bad user id: {e}")))?;
+    // Jellyfin exposes profile images on the unauthenticated login screen.
+    // An explicit id is public; without one, use the authenticated caller.
+    let user_id = query
+        .user_id
+        .or_else(|| auth.ok().map(|RequireAuth(info)| info.user_id()))
+        .filter(|id| !id.is_nil())
+        .ok_or_else(|| ApiError::BadRequest("UserId is required if unauthenticated".to_owned()))?;
+    state
+        .users
+        .get_user_by_id(user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("user {user_id}")))?;
     let image = state
         .users
         .get_profile_image(user_id)
@@ -1133,7 +1148,7 @@ async fn delete_user_image(
 /// and ignored, as upstream does.
 async fn get_user_image_legacy(
     state: State<AppState>,
-    auth: RequireAuth,
+    auth: Result<RequireAuth, ApiError>,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
@@ -1146,7 +1161,7 @@ async fn get_user_image_legacy(
 /// path-scoped form of `GET /UserImage`.
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
-    auth: RequireAuth,
+    auth: Result<RequireAuth, ApiError>,
     Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,

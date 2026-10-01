@@ -145,10 +145,7 @@ pub(crate) fn group_by_presentation_unique_key(filter: &InternalItemsQuery) -> b
 /// [`QueryShape::IdAndCleanName`]; the count shapes stop after the `WHERE`
 /// clause.
 #[must_use]
-pub fn build_query<'a>(
-    filter: &'a InternalItemsQuery,
-    shape: QueryShape,
-) -> QueryBuilder<'a, Sqlite> {
+pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuilder<Sqlite> {
     let page_movie_keys = shape == QueryShape::FullRows && pages_movie_keys(filter);
     let projection = match shape {
         QueryShape::FullRows if page_movie_keys => {
@@ -166,7 +163,7 @@ pub fn build_query<'a>(
         }
         QueryShape::TypeCounts => r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE "#,
     };
-    let mut qb: QueryBuilder<'a, Sqlite> = QueryBuilder::new(projection);
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(projection);
 
     // Grouping belongs to the row-returning shapes and to the total that
     // labels them; see [`QueryShape::Count`] for why the count shapes are out.
@@ -244,7 +241,7 @@ fn pages_movie_keys(filter: &InternalItemsQuery) -> bool {
 /// SQLite reports the bare `"Id"` from whichever row produced the `MIN`, so the
 /// aggregate is what picks it; without that a merged movie could be listed
 /// under an alternate cut's title.
-fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
+fn push_group_head(qb: &mut QueryBuilder<Sqlite>) {
     qb.push(r#"bi."Id" IN (SELECT "rep" FROM (SELECT bi."Id" AS "rep", MIN("#)
         .push(r#"CASE WHEN bi."PrimaryVersionId" IS NULL THEN 0 ELSE 1 END) FROM "BaseItems" AS bi WHERE bi."Id" <> "#)
         .push_bind(PLACEHOLDER_ID);
@@ -281,7 +278,7 @@ fn push_group_head(qb: &mut QueryBuilder<'_, Sqlite>) {
 /// key reintroduces exactly that, and no query-shape test will see it — the
 /// guard is `presentation_key_backfill_rescues_a_grouped_query` plus the
 /// per-insert tests, not this comment.
-fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
+fn push_group_tail(qb: &mut QueryBuilder<Sqlite>) {
     qb.push(r#" GROUP BY bi."PresentationUniqueKey"))"#);
 }
 
@@ -308,10 +305,8 @@ fn push_group_tail(qb: &mut QueryBuilder<'_, Sqlite>) {
 /// container per group), and porting that is its own work item, not part of the
 /// music branch.
 #[must_use]
-pub(crate) fn build_latest_item_list_query(
-    filter: &InternalItemsQuery,
-) -> QueryBuilder<'_, Sqlite> {
-    let mut qb: QueryBuilder<'_, Sqlite> =
+pub(crate) fn build_latest_item_list_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> =
         QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE "#);
     // `GetLatestItemList` runs `ApplyGroupingFilter` over the main query too
     // (`BaseItemRepository.cs:363`), so "latest" collapses merged versions the
@@ -372,25 +367,16 @@ pub(crate) fn build_latest_item_list_query(
 /// .ThenByDescending(Id)` and the limit caps ALBUMS — the caller's `order_by`
 /// and `start_index` are both ignored, as they are in the C#.
 ///
-/// `ApplyParentalRestrictions` (`:172`) is **not** ported, and upstream's
-/// comment above it (`:169-171`) says exactly what that costs: neither arm
-/// reads the album through the user's filters, so "a matching track does not
-/// make an album the user may not see visible" — that call is the only guard,
-/// and here the album comes back unguarded. This is not a gap this arm opened:
-/// Ferrofin's query layer carries no parental predicates anywhere (see
-/// [`ACCESSIBLE_LEAF`], which records the same absence on the leaf-access path,
-/// and the standing work item noted in `ferrofin-api` `handlers/mod.rs`). The
-/// one user scoping Ferrofin *does* have — `top_parent_ids` — is applied.
+/// Maximum parental scores apply to the returned albums as well as the
+/// tracks in the ancestor-scoped arm.
 ///
 /// Upstream's closing `LoadLatestByIds` (`:180`) is folded in: it re-selects the
 /// same ids under the same `DateCreated DESC, Id DESC` purely to attach EF
 /// navigations, and `SELECT bi.*` already carries the whole row.
 #[must_use]
-pub(crate) fn build_latest_music_albums_query(
-    filter: &InternalItemsQuery,
-) -> QueryBuilder<'_, Sqlite> {
+pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
     let album_type = stored_type_name(BaseItemKind::MusicAlbum).unwrap_or_default();
-    let mut qb: QueryBuilder<'_, Sqlite> =
+    let mut qb: QueryBuilder<Sqlite> =
         QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" AS bi WHERE bi."Type" = "#);
     qb.push_bind(album_type);
     if filter.top_parent_ids.is_empty() {
@@ -416,6 +402,7 @@ pub(crate) fn build_latest_music_albums_query(
             &to_guid_strings(&filter.top_parent_ids),
         );
     }
+    append_parental_rating(&mut qb, filter);
     qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
     // `limit.HasValue ? orderedAlbums.Take(limit.Value) : orderedAlbums` — a
     // `limit` of 0 really does mean no albums, as `Take(0)` does.
@@ -434,15 +421,52 @@ pub(crate) fn build_latest_music_albums_query(
     qb
 }
 
+/// Jellyfin's maximum parental score, including sub-scores and manual containers.
+fn append_parental_rating(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let limit = filter
+        .max_parental_rating
+        .as_ref()
+        .map(|rating| {
+            (
+                i64::from(rating.score),
+                i64::from(rating.sub_score.unwrap_or(0)),
+            )
+        })
+        .or_else(|| {
+            filter.user.as_ref().and_then(|user| {
+                user.max_parental_rating_score
+                    .map(|score| (score, user.max_parental_rating_sub_score.unwrap_or(0)))
+            })
+        });
+    let Some((score, subscore)) = limit else {
+        return;
+    };
+    qb.push(" AND ");
+    push_rating_limit(qb, "bi", score, subscore);
+    qb.push(r#" AND (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc
+        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0)
+        OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" rated ON rated."Id" = lc."ChildId"
+        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0 AND "#);
+    push_rating_limit(qb, "rated", score, subscore);
+    qb.push("))");
+}
+
+fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, subscore: i64) {
+    qb.push(format!(r#"({alias}."InheritedParentalRatingValue" IS NULL OR {alias}."InheritedParentalRatingValue" < "#))
+        .push_bind(score)
+        .push(format!(r#" OR ({alias}."InheritedParentalRatingValue" = "#))
+        .push_bind(score)
+        .push(format!(r#" AND COALESCE({alias}."InheritedParentalRatingSubValue", 0) <= "#))
+        .push_bind(subscore).push("))");
+}
+
 /// Appends every `AND <predicate>` clause derived from the filter.
 ///
 /// Each block mirrors one C# `if (filter.X …) baseQuery = baseQuery.Where(…)`.
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn append_predicates<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    filter: &'a InternalItemsQuery,
-) {
+pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    append_parental_rating(qb, filter);
     // --- resolution (own-row form; the folder-descendant roll-up is an open
     // work item, see `append_resolution_predicate`) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
@@ -815,14 +839,14 @@ pub(crate) fn append_predicates<'a>(
 /// keeps a folder whose leaf descendant, or an alternate version, satisfies the
 /// bound; that half is an open work item: port it with the played/resumable
 /// descendant helpers (`push_folders_with_leaf`) once a browse needs it.
-fn append_resolution_predicate(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let standard_def = filter.is_hd == Some(false);
     let high_def = filter.is_hd == Some(true);
     let ultra_hd = filter.is_4k == Some(true);
 
     qb.push(r#" AND (bi."Width" > 0 AND ("#);
     let mut first = true;
-    let mut push_clause = |qb: &mut QueryBuilder<'_, Sqlite>, clause: &str| {
+    let mut push_clause = |qb: &mut QueryBuilder<Sqlite>, clause: &str| {
         if !first {
             qb.push(" OR ");
         }
@@ -862,7 +886,7 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
 /// wins — a scan of every row of that type (3,001 movies on the bench corpus)
 /// instead of a handful of key lookups. The `Ids` list is always the selective
 /// side, so the pin loses nothing.
-fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a InternalItemsQuery) {
+fn append_type_filters(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let column = if filter.item_ids.is_empty() {
         r#"bi."Type""#
     } else {
@@ -893,7 +917,7 @@ fn append_type_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a Intern
 
 /// Appends the date-range predicates, including the `HasAired` sugar that maps to
 /// an end-date bound relative to now.
-fn append_date_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_date_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let now = chrono::Utc::now();
     let mut min_end = filter.min_end_date;
     let mut max_end = filter.max_end_date;
@@ -961,7 +985,7 @@ fn append_date_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalIt
 /// Appends the exact-name and name-range predicates (`Name`, `NameContains`,
 /// `NameStartsWith`, `NameStartsWithOrGreater`, `NameLessThan`).
 fn append_name_predicates(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     _tags: &[String],
     _exclude_tags: &[String],
@@ -1026,10 +1050,7 @@ fn append_name_predicates(
 /// `Video3DFormat` matches. The folder roll-up branch (v12
 /// `WhereItemOrDescendantMatches`: a series "has subtitles" when any episode
 /// does) is an open work item, to port with `push_folders_with_leaf`'s walk.
-fn append_media_attribute_predicates(
-    qb: &mut QueryBuilder<'_, Sqlite>,
-    filter: &InternalItemsQuery,
-) {
+fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence: an `EXISTS` over the item's stream rows
     // (`StreamType` 2 = Subtitle).
     if let Some(want) = filter.has_subtitles {
@@ -1131,7 +1152,7 @@ fn append_media_attribute_predicates(
 /// itself); v12's `BuildIsPlayedFilter` (`:39-56`) additionally counts a
 /// folder as played once no leaf descendant is unplayed — an open work item
 /// for the played filter, tracked with the other folder roll-ups.
-fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_user_data_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let Some(user_id) = filter.user_id() else {
         return;
     };
@@ -1163,13 +1184,13 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Inter
 /// Alternates are hidden from general queries, so this is what lets the
 /// version that was actually watched mark the title played. Same
 /// uncorrelated-`IN` shape as [`push_user_data_exists`], for the same plan.
-fn push_is_played(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, want: bool) {
-    let played_groups = |qb: &mut QueryBuilder<'_, Sqlite>| {
+fn push_is_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str, want: bool) {
+    let played_groups = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
             .push_bind(user_id.to_owned())
             .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
     };
-    let played_items = |qb: &mut QueryBuilder<'_, Sqlite>| {
+    let played_items = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
             .push_bind(user_id.to_owned())
             .push(r#" AND ud."Played" = 1)"#);
@@ -1198,7 +1219,7 @@ fn push_is_played(qb: &mut QueryBuilder<'_, Sqlite>, user_id: &str, want: bool) 
 /// uncorrelated `SELECT` so SQLite materializes the user's list once and
 /// drives the outer query through the `BaseItems` primary key — the IN form
 /// [`push_user_data_exists`] measures at 105× the correlated `EXISTS`.
-fn push_in_progress_ids(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str) {
+fn push_in_progress_ids(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
     qb.push(r#"(SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#)
         .push_bind(uid.to_owned())
         .push(r#" AND ud."PlaybackPositionTicks" > 0)"#);
@@ -1232,12 +1253,7 @@ const ACCESSIBLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0
 /// predicate is ever applied to are `Series` and `Season`
 /// (`_resumableFolderKinds`), and neither has linked children — the arm can
 /// never match for them.
-fn push_folders_with_leaf(
-    qb: &mut QueryBuilder<'_, Sqlite>,
-    uid: &str,
-    leaf_set: &str,
-    ud_cond: &str,
-) {
+fn push_folders_with_leaf(qb: &mut QueryBuilder<Sqlite>, uid: &str, leaf_set: &str, ud_cond: &str) {
     qb.push(format!(
         r#"bi."Id" IN (SELECT a."ParentItemId" FROM "UserData" ud
             JOIN "BaseItems" l ON l."Id" = ud."ItemId" AND {leaf_set}
@@ -1257,7 +1273,7 @@ fn push_folders_with_leaf(
 /// Alternate versions keep their own progress, so they count towards the
 /// in-progress check ([`COUNTABLE_LEAF`], `includeOwnedItems: true`) but not
 /// towards the played/unplayed one ([`ACCESSIBLE_LEAF`]).
-fn push_folder_is_resumable(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str) {
+fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
     // `_resumableFolderKinds` (v12 `BaseItemRepository.cs:66-72`): "the only
     // folder kinds whose children form a single viewing sequence, so playback
     // progress on a child rolls up to them".
@@ -1308,7 +1324,7 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str) {
 /// `want == true` additionally keeps, of several in-progress versions of one
 /// item, only the most recently played (`:586-602`) — id as the tiebreaker;
 /// `want == false` operates on primaries only (`:604-613`).
-fn push_resumable_predicate(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str, want: bool) {
+fn push_resumable_predicate(qb: &mut QueryBuilder<Sqlite>, uid: &str, want: bool) {
     if want {
         qb.push(r#" AND ((bi."IsFolder" = 0 AND bi."Id" IN "#);
         push_in_progress_ids(qb, uid);
@@ -1338,7 +1354,7 @@ fn push_resumable_predicate(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str, want: 
         push_in_progress_ids(qb, uid);
         qb.push(r#" AND COALESCE(s."PrimaryVersionId", s."Id") = COALESCE(bi."PrimaryVersionId", bi."Id")"#);
         // `inProgress.Where(u => u.ItemId == <alias>.Id).Max(u => u.LastPlayedDate)`.
-        let push_max_played = |qb: &mut QueryBuilder<'_, Sqlite>, alias: &str| {
+        let push_max_played = |qb: &mut QueryBuilder<Sqlite>, alias: &str| {
             qb.push(format!(
                 r#"(SELECT MAX(pu."LastPlayedDate") FROM "UserData" pu
                     WHERE pu."ItemId" = {alias}."Id" AND pu."UserId" = "#
@@ -1378,7 +1394,7 @@ fn push_resumable_predicate(qb: &mut QueryBuilder<'_, Sqlite>, uid: &str, want: 
 /// Appends `AND [NOT] EXISTS (SELECT 1 FROM UserData ud WHERE ud.ItemId = bi.Id
 /// AND ud.UserId = <uid> AND <cond>)`.
 pub(crate) fn push_user_data_exists(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     user_id: &str,
     cond: &str,
     want: bool,
@@ -1407,7 +1423,7 @@ pub(crate) fn push_user_data_exists(
 /// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
 /// join, so `/Items?PersonIds=<id>` returns everything that person is credited
 /// on (port of C# `WhereContainsPerson` / the `people` sub-query).
-fn append_people_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     if let Some(name) = non_blank(filter.person.as_ref()) {
         qb.push(
             r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
@@ -1443,7 +1459,7 @@ fn append_people_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Internal
 /// Each is an `EXISTS`/`NOT EXISTS` over `ItemValuesMap ⨝ ItemValues` filtered by
 /// the value `Type` discriminant (mirrors the C# `e.ItemValues!.Any(…)`).
 fn append_item_value_predicates(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     tags: &[String],
     exclude_tags: &[String],
@@ -1499,7 +1515,7 @@ fn append_item_value_predicates(
 /// Appends an `EXISTS`/`NOT EXISTS` over the item's `ItemValues` of the given
 /// discriminant types whose `CleanValue` is in `clean_values`.
 fn push_item_value_exists(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     types: &[ItemValueType],
     clean_values: &[String],
     want: bool,
@@ -1524,7 +1540,7 @@ fn push_item_value_exists(
 /// Port of C# `WhereReferencedItem` — the by-id form resolves the referenced
 /// items' `CleanName` via a sub-select rather than binding the names directly.
 fn push_referenced_item(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     types: &[ItemValueType],
     ids: &[Uuid],
     exclude: bool,
@@ -1545,7 +1561,7 @@ fn push_referenced_item(
 
 /// Appends the `IsDead*` by-name predicate: the by-name item's `Name` no longer
 /// appears as any `ItemValues` value of the given types.
-fn append_is_dead_item_value(qb: &mut QueryBuilder<'_, Sqlite>, types: &[ItemValueType]) {
+fn append_is_dead_item_value(qb: &mut QueryBuilder<Sqlite>, types: &[ItemValueType]) {
     qb.push(r#" AND NOT EXISTS (SELECT 1 FROM "ItemValues" iv WHERE iv."Value" = bi."Name" AND "#);
     push_in_list(qb, r#"iv."Type""#, &item_value_type_ints(types));
     qb.push(")");
@@ -1553,7 +1569,7 @@ fn append_is_dead_item_value(qb: &mut QueryBuilder<'_, Sqlite>, types: &[ItemVal
 
 /// Appends provider-id presence predicates (`HasImdbId` / `HasTmdbId` /
 /// `HasTvdbId`) as `EXISTS` over `BaseItemProviders`.
-fn append_provider_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_provider_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     for (flag, provider) in [
         (filter.has_imdb_id, "imdb"),
         (filter.has_tmdb_id, "tmdb"),
@@ -1621,7 +1637,7 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
 /// `AncestorIds` is an `EXISTS` over the `AncestorIds` closure table; top-parent
 /// is a direct `TopParentId` in-list, widened for the by-name types when the
 /// caller asked for them.
-fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     if !filter.top_parent_ids.is_empty() {
         // C# `BaseItemRepository.TranslateQuery`
         // (v10.11.8 `Jellyfin.Server.Implementations/Item/BaseItemRepository.cs`):
@@ -1688,7 +1704,7 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
 /// other prefix, `3` a match found anywhere else (including one that only hit
 /// `OriginalTitle`). `substr(…) = ?` is the `StartsWith` translation: it needs
 /// no `LIKE` escaping, so a term carrying `%`/`_` still ranks literally.
-fn push_search_relevance(qb: &mut QueryBuilder<'_, Sqlite>, term: &str) {
+fn push_search_relevance(qb: &mut QueryBuilder<Sqlite>, term: &str) {
     let clean = get_clean_value(term);
     let with_space = format!("{clean} ");
     let clean_len = i64::try_from(clean.chars().count()).unwrap_or(i64::MAX);
@@ -1777,7 +1793,7 @@ fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bo
 /// also what earns C#'s `ThenBy(e.Name)` tiebreaker. Ranking in SQL rather than
 /// after the fact is what makes the `LIMIT` keep the *best* matches instead of
 /// the alphabetically first ones.
-pub(crate) fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let ordered: Vec<&(ItemSortBy, SortOrder)> = filter
         .order_by
         .iter()
@@ -1900,7 +1916,7 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<'_, Sqlite>, filter: &Intern
 /// sub-selects scoped to the query's user (upstream `OrderMapper`'s
 /// `UserData`-backed cases); everything else is a plain column.
 fn push_order_expression(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     by: ItemSortBy,
     filter: &InternalItemsQuery,
 ) {
@@ -2045,7 +2061,7 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
 }
 
 /// Appends `LIMIT`/`OFFSET` from `start_index`/`limit` (C# `ApplyQueryPaging`).
-fn append_paging(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery) {
+fn append_paging(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     if let Some(limit) = filter.limit {
         qb.push(" LIMIT ").push_bind(i64::from(limit));
         let offset = filter.start_index.unwrap_or(0);
@@ -2064,7 +2080,7 @@ fn append_paging(qb: &mut QueryBuilder<'_, Sqlite>, filter: &InternalItemsQuery)
 ///
 /// Values are cloned into the builder, so the source slice need not outlive it;
 /// the cloned owned values (`String`/`i64`/`bool`) satisfy the `'a` encode bound.
-pub(crate) fn push_in_list<'a, T>(qb: &mut QueryBuilder<'a, Sqlite>, column: &str, values: &[T])
+pub(crate) fn push_in_list<'a, T>(qb: &mut QueryBuilder<Sqlite>, column: &str, values: &[T])
 where
     T: sqlx::Type<Sqlite> + sqlx::Encode<'a, Sqlite> + Clone + 'a,
 {
@@ -2129,7 +2145,7 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         let qb = build_latest_item_list_query(&filter);
-        let sql = qb.sql();
+        let sql = qb.sql().as_str().to_owned();
 
         assert!(
             sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC LIMIT "#),
@@ -2162,7 +2178,7 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         let qb = build_latest_item_list_query(&filter);
-        let sql = qb.sql();
+        let sql = qb.sql().as_str().to_owned();
         assert!(
             sql.contains(r#"GROUP BY bi."SeriesName" ORDER BY "m" DESC) AS g)"#),
             "{sql}"
@@ -2189,7 +2205,10 @@ mod tests {
             ],
             ..InternalItemsQuery::default()
         };
-        let sql = build_latest_music_albums_query(&filter).into_sql();
+        let sql = build_latest_music_albums_query(&filter)
+            .into_sql()
+            .as_str()
+            .to_owned();
 
         assert_eq!(
             sql,
@@ -2216,7 +2235,9 @@ mod tests {
             },
             QueryShape::FullRows,
         )
-        .into_sql();
+        .into_sql()
+        .as_str()
+        .to_owned();
         assert!(
             with_ids.contains(r#"AND +bi."Type" IN (?)"#)
                 && with_ids.contains(r#"bi."Id" IN (?, ?)"#),
@@ -2230,7 +2251,9 @@ mod tests {
             },
             QueryShape::FullRows,
         )
-        .into_sql();
+        .into_sql()
+        .as_str()
+        .to_owned();
         assert!(
             without.contains(r#"AND bi."Type" IN (?)"#) && !without.contains(r#"+bi."Type""#),
             "{without}"
@@ -2248,7 +2271,10 @@ mod tests {
             ancestor_ids: vec![uuid::Uuid::from_u128(2)],
             ..InternalItemsQuery::default()
         };
-        let sql = build_latest_music_albums_query(&filter).into_sql();
+        let sql = build_latest_music_albums_query(&filter)
+            .into_sql()
+            .as_str()
+            .to_owned();
 
         assert!(
             sql.contains(r#"bi."Id" IN (SELECT lam."ParentItemId" FROM "AncestorIds" AS lam"#),
@@ -2269,7 +2295,10 @@ mod tests {
     }
     /// The `ORDER BY …` tail of the statement `filter` translates to.
     fn order_by(filter: &InternalItemsQuery) -> String {
-        let sql = build_query(filter, QueryShape::FullRows).into_sql();
+        let sql = build_query(filter, QueryShape::FullRows)
+            .into_sql()
+            .as_str()
+            .to_owned();
         let at = sql.find(" ORDER BY ").expect("statement has an ORDER BY");
         sql[at + 1..].to_owned()
     }
@@ -2350,7 +2379,9 @@ mod tests {
             },
             QueryShape::FullRows,
         )
-        .into_sql();
+        .into_sql()
+        .as_str()
+        .to_owned();
         assert!(
             filtered.contains(r#"EXISTS (SELECT 1 FROM "BaseItemImageInfos" ii"#),
             "{filtered}"
@@ -2359,7 +2390,10 @@ mod tests {
             filtered.contains(r#"ii."ImageType" IN (?, ?)"#),
             "{filtered}"
         );
-        let plain = build_query(&InternalItemsQuery::default(), QueryShape::FullRows).into_sql();
+        let plain = build_query(&InternalItemsQuery::default(), QueryShape::FullRows)
+            .into_sql()
+            .as_str()
+            .to_owned();
         assert!(!plain.contains("BaseItemImageInfos"), "{plain}");
     }
 

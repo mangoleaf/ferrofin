@@ -15,8 +15,8 @@
 //! from the injected [`VirtualFolderManager`] (C# `CollectionFolder.CollectionType`).
 //!
 //! Not ported here: the special "grouped" views (all-movies/all-tv merges),
-//! channel views, and per-user view ordering from display preferences. Those
-//! layer on top of the row set returned here.
+//! channel views, and per-user view ordering from display preferences. Hidden
+//! views (`MyMediaExcludes`) are filtered from the row set returned here.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -505,36 +505,25 @@ impl FerrofinUserViewManager {
 
     /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
     /// the folder — or of its physical folders, for a `CollectionFolder` that
-    /// has some — is visible to `user`. One key lookup per parent, ungrouped,
-    /// stored columns only.
+    /// has some — is visible to `user`. One key lookup, ungrouped, stored
+    /// columns only: the item repository's direct-children read of a
+    /// collection folder already takes its physical folders' children with
+    /// its own (`parent_physical_folder_ids`), which covers an adopted
+    /// library's rows whether they still hang off Jellyfin's physical folder
+    /// or a Ferrofin scan saved them under the collection folder.
     async fn has_visible_child(
         &self,
         folder: Uuid,
         user: &UserEntity,
     ) -> Result<bool, ServiceError> {
-        let mut parents = vec![folder];
-        if let Some(db) = &self.db {
-            let physical = crate::item_repository::physical_folders_by_view(db, &[folder])
-                .await?
-                .remove(&folder)
-                .unwrap_or_default();
-            if !physical.is_empty() {
-                parents = physical;
-            }
-        }
-        for parent in parents {
-            let query = InternalItemsQuery {
-                parent_id: parent,
-                user: Some(user.clone()),
-                group_by_presentation_unique_key: false,
-                limit: Some(1),
-                ..Default::default()
-            };
-            if !self.items.get_item_list(&query).await?.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let query = InternalItemsQuery {
+            parent_id: folder,
+            user: Some(user.clone()),
+            group_by_presentation_unique_key: false,
+            limit: Some(1),
+            ..Default::default()
+        };
+        Ok(!self.items.get_item_list(&query).await?.is_empty())
     }
 
     async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
@@ -736,6 +725,14 @@ impl FerrofinUserViewManager {
 #[async_trait]
 impl UserViewManager for FerrofinUserViewManager {
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views_with_hidden(user_id, false).await
+    }
+
+    async fn get_user_views_with_hidden(
+        &self,
+        user_id: Uuid,
+        include_hidden: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // Upstream materializes the Live TV view on read, from inside
         // `GetUserViews` itself (UserViewManager.cs:128-133).
         self.ensure_live_tv_view(user_id).await?;
@@ -758,7 +755,12 @@ impl UserViewManager for FerrofinUserViewManager {
         let views = self
             .without_childless_linked_libraries(user_id, views)
             .await?;
-        self.without_disabled_live_tv(user_id, views).await
+        let views = self.without_disabled_live_tv(user_id, views).await?;
+        if include_hidden {
+            Ok(views)
+        } else {
+            self.without_hidden_views(user_id, views).await
+        }
     }
 
     async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
@@ -1030,6 +1032,33 @@ pub(crate) fn exclude_item_types_for(
 }
 
 impl FerrofinUserViewManager {
+    /// `UserViewManager.GetUserViews` omits views in the user's
+    /// `MyMediaExcludes` preference unless `IncludeHidden` was requested.
+    /// This applies only to home views; media folders and latest-item
+    /// exclusions are independent preferences.
+    async fn without_hidden_views(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(db) = &self.db else {
+            return Ok(views);
+        };
+        let excluded = user_entity_ext::guid_preference(
+            db.pool(),
+            &ferrofin_db::store::guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+        )
+        .await?;
+        if excluded.is_empty() {
+            return Ok(views);
+        }
+        Ok(views
+            .into_iter()
+            .filter(|view| Uuid::parse_str(&view.id).is_ok_and(|id| !excluded.contains(&id)))
+            .collect())
+    }
+
     /// The collection type of every configured library keyed by its folder
     /// item id (C# `CollectionFolder.CollectionType`). Empty without a
     /// virtual-folder manager wired (unit tests), which makes every parent a
@@ -1056,8 +1085,8 @@ impl FerrofinUserViewManager {
 
     /// The parents of a latest-items request (C# `GetItemsForLatestItems`,
     /// first half): the `parent_id` folder when it is one, else the user's
-    /// views minus `latest_item_excludes`. Also settles `is_played`, which a
-    /// music parent clears — decided on the EXPLICIT parent, before the views
+    /// root media folders minus `latest_item_excludes`. Also settles `is_played`,
+    /// which a music parent clears — decided on the EXPLICIT parent, before the
     /// fallback, exactly as upstream orders it. `Ok(None)` is the Channel
     /// early exit (an empty result).
     async fn latest_parents(
@@ -1109,7 +1138,7 @@ impl FerrofinUserViewManager {
                 .and_then(|u| Uuid::parse_str(&u.id).ok())
                 .unwrap_or_default();
             parents = self
-                .get_user_views(user_id)
+                .get_media_folders(user_id)
                 .await?
                 .iter()
                 .filter_map(classify)
@@ -1492,6 +1521,41 @@ mod tests {
             names(manager.get_user_views(user_id).await.expect("views"))
                 .contains(&"Playlists".to_owned()),
             "a visible child lists the view"
+        );
+
+        // The profile's "Display on home screen" toggle stores the view id in
+        // MyMediaExcludes. That hides the home view while leaving the playlist
+        // folder and playlist endpoints untouched.
+        let playlist_view_id = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .find(|view| view.name.as_deref() == Some("Playlists"))
+            .and_then(|view| Uuid::parse_str(&view.id).ok())
+            .expect("derived Playlists view");
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(playlist_view_id)],
+        )
+        .await
+        .expect("hide Playlists on home");
+        assert!(
+            !names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "MyMediaExcludes hides the Playlists home view"
+        );
+        assert!(
+            names(
+                manager
+                    .get_user_views_with_hidden(user_id, true)
+                    .await
+                    .expect("views including hidden")
+            )
+            .contains(&"Playlists".to_owned()),
+            "profile settings can still list the hidden view to re-enable it"
         );
     }
 
@@ -2493,6 +2557,72 @@ mod tests {
         )
         .await;
         assert_eq!(shape(&groups), vec![(None, vec![e])]);
+    }
+
+    #[tokio::test]
+    async fn hidden_home_library_still_supplies_latest_items() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0xAA19);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let movie = Uuid::from_u128(0xAA20);
+        seed(
+            &db,
+            &[Row::new(
+                movie,
+                BaseItemKind::Movie,
+                "Movie",
+                day(9),
+                MOVIES,
+            )],
+        )
+        .await;
+        let mgr = manager(&db).with_database(db.clone());
+        let mut query = LatestItemsQuery {
+            user: Some(user),
+            ..Default::default()
+        };
+        let expected = vec![(None, vec![movie])];
+        assert_eq!(shape(&latest(&mgr, query.clone()).await), expected);
+
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(MOVIES)],
+        )
+        .await
+        .expect("hide home tile");
+        assert!(
+            mgr.get_user_views(user_id)
+                .await
+                .expect("home views")
+                .is_empty()
+        );
+        assert_eq!(
+            mgr.get_media_folders(user_id)
+                .await
+                .expect("media folders")
+                .len(),
+            1
+        );
+        assert_eq!(
+            shape(&latest(&mgr, query.clone()).await),
+            expected,
+            "MyMediaExcludes must not suppress latest items"
+        );
+
+        query.latest_item_excludes = vec![MOVIES];
+        assert!(
+            latest(&mgr, query.clone()).await.is_empty(),
+            "LatestItemExcludes still applies"
+        );
+        query.parent_id = Some(MOVIES);
+        assert_eq!(
+            shape(&latest(&mgr, query).await),
+            expected,
+            "an explicit parent remains browsable regardless of home preferences"
+        );
     }
 
     /// Stored view ids are uppercase-hyphenated (`guid_to_db`); a `parentId`

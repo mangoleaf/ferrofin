@@ -26,13 +26,13 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::{
-    AttachmentStreamInfoEntity, BaseItemEntity, ChapterEntity, ItemTextRow, KeyframeDataEntity,
+    AttachmentStreamInfoEntity, BaseItemEntity, ChapterEntity, KeyframeDataEntity,
     MediaStreamInfoEntity, PeopleEntity,
 };
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -62,6 +62,19 @@ pub struct PlayedAndTotal {
     pub played: i32,
     /// Total number of descendant items.
     pub total: i32,
+}
+
+/// A folder's stored value of a children-derived column next to the value
+/// its descendants give it now
+/// ([`ItemPersistenceService::folder_run_time_sums`],
+/// [`ItemPersistenceService::folder_last_media_added`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderAggregate<T> {
+    /// The column as stored.
+    pub stored: Option<T>,
+    /// The value the descendants give it; `None` when there is none to give
+    /// (no descendant carries it).
+    pub aggregate: Option<T>,
 }
 
 /// Filter selecting media streams to fetch.
@@ -173,6 +186,22 @@ pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// The stored rows of the given items, in as few queries as the
+    /// host-variable limit allows (`ferrofin_db::BATCH_BIND_CHUNK` ids each).
+    ///
+    /// The batch twin of [`retrieve_item`](Self::retrieve_item), for the
+    /// library scan: it needs what is already stored for the items it planned
+    /// (whether each one exists at all, and later its dates, `Data` and lock
+    /// state), and asking once per item is an N-query per scan.
+    ///
+    /// Returns rows only for ids that exist, in no particular order; an id with
+    /// no row is simply absent. Callers bound their own memory by how many ids
+    /// they ask for at once — every row is the whole `BaseItems` row.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
+    async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
     /// The library ids `user` is allowed to see — the collection folders and
     /// views left after `BlockedMediaFolders`, `EnableAllFolders` and
     /// `EnabledFolders` are applied.
@@ -192,35 +221,6 @@ pub trait ItemRepository: Send + Sync {
     /// rare — usually none — so the whole answer is one small query, and the
     /// scan reads it from the returned set instead.
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
-
-    /// The stored `Name`/`SortName`/`Overview`/`Path` of the given items of
-    /// `kind`, chunked into as few queries as the host-variable limit allows.
-    ///
-    /// The episode metadata providers gate a re-fetch on what a previous scan
-    /// already achieved, which only the stored row knows — `Planned.entity` is
-    /// rebuilt from the filesystem every scan, so its name is always the file
-    /// stem and its overview always `None`. Asking per item would reinstate the
-    /// `SELECT *`-per-item cost that
-    /// [`locked_item_ids`](Self::locked_item_ids) removed, so the scan asks
-    /// once for the set it planned.
-    ///
-    /// **Scoped by `ids` on purpose.** Reading every row of `kind` instead
-    /// looks similar but is not: `locked_item_ids` rides a partial index and
-    /// touches no rows in the normal case, whereas a whole-kind read of these
-    /// four text columns is a non-covering index scan — ~113 ms and ~30 MB for
-    /// 60k episodes, paid even by `scan_paths`, the library-monitor path that
-    /// runs for a single changed file. Keep this O(planned).
-    ///
-    /// Returns rows only for ids that exist; callers must not assume a row per
-    /// id.
-    ///
-    /// # Errors
-    /// Propagates the repository failure.
-    async fn item_text_rows(
-        &self,
-        kind: BaseItemKind,
-        ids: &[Uuid],
-    ) -> Result<Vec<ItemTextRow>, ServiceError>;
 
     /// Walks the `ParentId` chain from `item_id` upward in a single query
     /// (recursive CTE), returning ancestors nearest-first. Returns `None` if
@@ -501,10 +501,25 @@ fn _assert_object_safe_item_repository(_: &dyn ItemRepository) {}
 /// [`BaseItemEntity`] rows; every method is `async` since it touches storage.
 #[async_trait]
 pub trait ItemPersistenceService: Send + Sync {
-    /// Deletes the items with the given ids.
-    async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError>;
+    /// Deletes the items with the given ids and everything under them —
+    /// their `ParentId` descendants and the extras they own (`OwnerId`),
+    /// recursively — in one transaction, first clearing every
+    /// `LinkedChildren` row (playlist and collection membership) that names
+    /// any of them: upstream's `ItemPersistenceService.DeleteItem`. Either
+    /// all of it is deleted or none of it. Returns the ids deleted (ids with
+    /// no stored row, and the placeholder row, are not).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is deleted
+    /// then.
+    async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError>;
 
     /// Persists (inserts or updates) the given item rows.
+    ///
+    /// An update stamps `DateLastSaved` with the save time
+    /// (`LibraryManager.UpdateItemsAsync`); an insert keeps the row's own value
+    /// (`NULL` for a new item — `CreateItems` never stamps it).
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
     /// Persists item rows rebuilt from disk by the library scan, preserving the
@@ -515,10 +530,32 @@ pub trait ItemPersistenceService: Send + Sync {
     ///   would erase every merged alternate version on each scan.
     /// - `DateCreated` — the item's first-import timestamp; re-stamping it with
     ///   the scan time breaks "date added" ordering.
+    /// - `DateLastRefreshed`, `DateLastMediaAdded`, `DateModified`, `Size` —
+    ///   set but never cleared, so a row the scan could not read or a path it
+    ///   could not stat keeps them.
+    /// - on a locked row, the user-editable metadata columns and `Data`.
+    ///
+    /// Like [`save_items`](Self::save_items), an update stamps `DateLastSaved`.
     ///
     /// The default delegates to [`save_items`](Self::save_items) (for stub/fake
     /// services); the real service uses a scan-specific upsert.
     async fn save_scanned_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
+        self.save_items(items).await
+    }
+
+    /// [`save_scanned_items`](Self::save_scanned_items), except that each
+    /// row's own `DateCreated` replaces the stored one (a `NULL` still keeps
+    /// it): the save of a stored file whose modification time drifted under
+    /// "Use file creation date", which upstream re-dates to the file's
+    /// creation time (`MetadataService.BeforeSaveInternal`). Every other
+    /// guard of the scan save holds.
+    ///
+    /// The default delegates to [`save_items`](Self::save_items) (for
+    /// stub/fake services).
+    async fn save_scanned_items_with_date_created(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<(), ServiceError> {
         self.save_items(items).await
     }
 
@@ -673,8 +710,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `images` — the write path the library scan uses to persist discovered
     /// artwork (posters/backdrops/…) so the image routes can serve it.
     ///
-    /// The default is a no-op (for stub/fake services); the real service deletes
-    /// the item's existing rows and inserts the given set.
+    /// The default is a no-op (for stub/fake services). The real service keeps
+    /// identical rows, updates changed image metadata, inserts new images and
+    /// deletes only images absent from the supplied set.
     ///
     /// # Errors
     ///
@@ -711,6 +749,355 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<Vec<StoredImageMetadata>, ServiceError> {
         let _ = item_ids;
         Ok(Vec::new())
+    }
+
+    /// What the library scan's change detection compares a rescan of each of
+    /// `item_ids` against, besides its `BaseItems` row: its image rows, its
+    /// ancestor closure, the external subtitle/audio files its stored
+    /// streams came from, and its locked metadata fields (which the scan's
+    /// merge must honour). Read one window of the plan at a time.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then treats every item as changed and
+    /// every lockable field as locked. An
+    /// item with no rows of a kind simply has an empty list.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn scan_stored_links(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Option<HashMap<Uuid, StoredItemLinks>>, ServiceError> {
+        let _ = item_ids;
+        Ok(None)
+    }
+
+    /// The stored items whose `Path` is exactly one of `paths` — a batched
+    /// `LibraryManager.FindByPath`, which the library monitor asks for each
+    /// changed path and each folder above it to find the nearest existing
+    /// item (`FileRefresher.GetAffectedBaseItem`).
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then refreshes the changed paths
+    /// themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn items_at_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = paths;
+        Ok(None)
+    }
+
+    /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
+    /// carry: the library itself, which is what every row Ferrofin writes
+    /// carries, and — on a database adopted from Jellyfin — the physical
+    /// folders its `PhysicalFolderIds` names, which is what Jellyfin wrote
+    /// (`BaseItem.GetTopParent`: the item's ancestor directly under the
+    /// `AggregateFolder`). An adopted row keeps the physical folder until a
+    /// scan saves it, so a library's rows are read by both until then. The
+    /// library id comes first; a native library answers it alone.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then scopes the library by its own id.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_top_parents(&self, library: Uuid) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        let _ = library;
+        Ok(None)
+    }
+
+    /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
+    /// library's, [`library_top_parents`](Self::library_top_parents)) that a
+    /// library scan's pruning weighs: every one of them but an owned
+    /// non-extra (a part or a version stored under its owner) and an
+    /// alternate version whose primary is in the same library — the rows a
+    /// library read lists. Only the columns the pruning needs, unordered.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then reads the library through the item
+    /// repository.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_items(
+        &self,
+        top_parent_ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = top_parent_ids;
+        Ok(None)
+    }
+
+    /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
+    /// library's, [`library_top_parents`](Self::library_top_parents)) that a
+    /// path-scoped scan's pruning weighs: those whose `Path` is one of
+    /// `roots` or lies under one (component-wise), and the path-less ones (a
+    /// virtual season) whose parent is one of those — less the rows
+    /// [`library_items`](Self::library_items) leaves out, so both prunes
+    /// weigh the same rows. Read by path and parent — never every row of the
+    /// library.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then reads the whole library as a
+    /// library scan does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn items_in_scope(
+        &self,
+        top_parent_ids: &[Uuid],
+        roots: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = (top_parent_ids, roots);
+        Ok(None)
+    }
+
+    /// The stored rows whose `ParentId` or `OwnerId` is one of `parents`:
+    /// what deleting those rows would take with them — the `ParentId`
+    /// cascade, and the extras `delete_items` removes with their owner. The
+    /// pruning reads them to keep a row that still has a child it keeps.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the pruning then removes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn child_links(
+        &self,
+        parents: &[Uuid],
+    ) -> Result<Option<Vec<ItemChildLink>>, ServiceError> {
+        let _ = parents;
+        Ok(None)
+    }
+
+    /// Writes only the file facts of a scanned item whose stored row could
+    /// not be read — its `Path`, `ParentId`, `TopParentId` and, when the
+    /// stat has them, `DateModified` and `Size` — and only when one of them
+    /// differs from what is stored (stamping `DateLastSaved` then). Every
+    /// other column keeps its stored value, except that `date_if_changed`,
+    /// when given, becomes `DateCreated` if the new `DateModified` differs
+    /// from the stored one by more than a second (an unset one included) —
+    /// `MetadataService.BeforeSaveInternal`'s re-date of a changed file,
+    /// judged on the row itself since it cannot be read. Returns whether the
+    /// row was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_file_facts(
+        &self,
+        item: &BaseItemEntity,
+        date_if_changed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, date_if_changed);
+        Ok(false)
+    }
+
+    /// Writes an existing row's `RunTimeTicks` — the cumulative runtime of a
+    /// music album or artist — when it differs, with the `DateLastSaved`
+    /// stamp every save carries (the DTO `Etag` hashes it), and nothing else.
+    /// An update, never an insert: a row deleted meanwhile stays deleted, and
+    /// the other columns keep whatever a concurrent refresh wrote. Returns
+    /// whether the row was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_run_time_ticks(&self, item_id: Uuid, ticks: i64) -> Result<bool, ServiceError> {
+        let _ = (item_id, ticks);
+        Ok(false)
+    }
+
+    /// The cumulative runtime of each of `folder_ids`, in one aggregate read:
+    /// its stored `RunTimeTicks` and the sum of the `RunTimeTicks` of its
+    /// non-folder descendants of `child_kinds` (a missing one counts 0) over
+    /// the `AncestorIds` closure — upstream's `UpdateCumulativeRunTimeTicks`
+    /// (`MetadataService.cs:485-503`) over the service's
+    /// `GetChildrenForMetadataUpdates`. A folder with no such descendant sums
+    /// to `Some(0)`; an id with no row is absent.
+    ///
+    /// The default knows of no folder (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn folder_run_time_sums(
+        &self,
+        folder_ids: &[Uuid],
+        child_kinds: &[BaseItemKind],
+    ) -> Result<HashMap<Uuid, FolderAggregate<i64>>, ServiceError> {
+        let _ = (folder_ids, child_kinds);
+        Ok(HashMap::new())
+    }
+
+    /// The date media was last added under each of `folder_ids`, in one
+    /// aggregate read: its stored `DateLastMediaAdded` and the latest
+    /// `DateCreated` of its non-folder, non-virtual descendants over the
+    /// `AncestorIds` closure — upstream's `UpdateDateLastMediaAdded`
+    /// (`MetadataService.cs:509-541`). `None` as the aggregate means no such
+    /// descendant; an id with no row is absent.
+    ///
+    /// The default knows of no folder (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn folder_last_media_added(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, FolderAggregate<chrono::DateTime<chrono::Utc>>>, ServiceError> {
+        let _ = folder_ids;
+        Ok(HashMap::new())
+    }
+
+    /// Writes an existing row's `DateLastMediaAdded`, when it differs, with
+    /// its `DateLastSaved` stamp and nothing else — the targeted write of
+    /// [`folder_last_media_added`](Self::folder_last_media_added)'s answer,
+    /// as [`update_run_time_ticks`](Self::update_run_time_ticks) is of the
+    /// runtime. `None` stores `NULL`: upstream's `DateTime.MinValue` for a
+    /// folder with no media, which its mapper persists as `NULL`
+    /// (`BaseItemMapper.cs:418`) and reads back as `MinValue` (`:234`).
+    /// Returns whether the row was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_date_last_media_added(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, at);
+        Ok(false)
+    }
+
+    /// The ids of the rows of `kind` never refreshed (`DateLastRefreshed`
+    /// unset), in id order — with `by_name_only`, only those in no library
+    /// (no `TopParentId`: an artist known only by name). The persisted
+    /// selection of the closing passes that refresh a by-name item once,
+    /// when it is new (`ArtistsValidator.cs:86-91`, `StudiosValidator.cs:
+    /// 69-84`): a refresh that fails leaves the row unstamped, so the next
+    /// library validation selects it again.
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn never_refreshed_ids(
+        &self,
+        kind: BaseItemKind,
+        by_name_only: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let _ = (kind, by_name_only);
+        Ok(Vec::new())
+    }
+
+    /// The ids of the `MusicArtist` rows in no library (no `TopParentId`)
+    /// that a folder-resolved artist of the same `CleanName` supersedes, in
+    /// id order — the persisted selection of the by-name artist
+    /// retirement.
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn superseded_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Stamps `DateLastRefreshed = at` on existing rows, with the
+    /// `DateLastSaved = at` of the save that records it, and nothing else —
+    /// the record of a completed refresh of an item whose refresh wrote
+    /// nothing of its own (a by-name studio whose artwork the refresh looked
+    /// for; upstream saves a first refresh). Returns how many rows were
+    /// written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn stamp_date_last_refreshed(
+        &self,
+        item_ids: &[Uuid],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, ServiceError> {
+        let _ = (item_ids, at);
+        Ok(0)
+    }
+
+    /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
+    /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
+    /// item with none is absent from the map.
+    ///
+    /// The default knows of no locks (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn locked_fields_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        let _ = item_ids;
+        Ok(HashMap::new())
+    }
+
+    /// Replaces an item's whole locked-field set with `field_ids` — the
+    /// `BaseItemMetadataFields` half of upstream's item save, which deletes
+    /// the item's rows and inserts the current `LockedFields`
+    /// (`ItemPersistenceService.SaveItems`). The ids are `MetadataField`
+    /// values as stored; like upstream's enum, a value this server does not
+    /// name is kept (the read skips it). Duplicates are written once.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn replace_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
+        Ok(())
+    }
+
+    /// Adds `field_ids` to an item's locked-field set without removing any it
+    /// already has — upstream's `LockedFields.Concat(…).Distinct()` union for
+    /// an NFO's `<lockedfields>`, which keeps stored ids this server does not
+    /// name (a plain replace would drop them).
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
+        Ok(())
     }
 
     /// Sets a single image (`image`) on an item, replacing any existing rows of
@@ -1128,6 +1515,54 @@ pub trait MediaAttachmentRepository: Send + Sync {
 }
 
 fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentRepository) {}
+
+/// One item's stored rows besides its `BaseItems` row, as
+/// [`ItemPersistenceService::scan_stored_links`] reads them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoredItemLinks {
+    /// The item's `BaseItemImageInfos` rows, in type-then-row order.
+    pub images: Vec<ItemImageInfo>,
+    /// The item's `AncestorIds` closure.
+    pub ancestors: Vec<Uuid>,
+    /// The paths of its external subtitle streams (`IsExternal`), upstream's
+    /// `Video.SubtitleFiles`.
+    pub external_subtitles: Vec<String>,
+    /// The paths of its external audio streams, upstream's `Video.AudioFiles`.
+    pub external_audio: Vec<String>,
+    /// Its locked metadata fields (`BaseItemMetadataFields`), which the scan's
+    /// merge never overwrites.
+    pub locked_fields: Vec<MetadataField>,
+}
+
+/// One stored item as a path-scoped scan reads it: enough to find the item
+/// a changed path belongs to ([`ItemPersistenceService::items_at_paths`])
+/// and to tell whether a row under a scanned path is gone
+/// ([`ItemPersistenceService::items_in_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPathRow {
+    /// The item's id.
+    pub id: Uuid,
+    /// Its stored `Type` (the full type name).
+    pub item_type: String,
+    /// Its `Path`, `None` for a path-less item (a virtual season).
+    pub path: Option<String>,
+    /// Its `ParentId`: where a path-less item sits.
+    pub parent_id: Option<Uuid>,
+}
+
+/// One stored row under another, as
+/// [`ItemPersistenceService::child_links`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemChildLink {
+    /// The row's id.
+    pub id: Uuid,
+    /// Its `ParentId`.
+    pub parent_id: Option<Uuid>,
+    /// Its `OwnerId` (an extra's owner).
+    pub owner_id: Option<Uuid>,
+    /// Its `Path`.
+    pub path: Option<String>,
+}
 
 /// What a previous scan already recorded about one image file: the probed
 /// dimensions, the blurhash, and the file mtime those were computed from.

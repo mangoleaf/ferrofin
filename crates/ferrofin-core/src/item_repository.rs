@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity, ItemTextRow};
+use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{ItemValueType, PermissionKind, PreferenceKind};
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
@@ -233,9 +233,14 @@ impl FerrofinItemRepository {
     /// (`PhysicalFolderIds`); the physical folders themselves hang off the
     /// AggregateFolder, so there is no relational path to follow instead.
     ///
-    /// A Ferrofin-written database keeps no `Data` blob and hangs items off the
-    /// collection folder directly, so every lookup here comes back empty and
-    /// the query is left exactly as it was.
+    /// Ferrofin's scan hangs what it saves off the collection folder itself
+    /// (`ParentId` and `TopParentId`), so on an adopted database a library's
+    /// rows carry either: a view is translated to itself AND its physical
+    /// folders ([`library_top_parents_by_view`]), never to the folders alone.
+    ///
+    /// A Ferrofin-written database keeps no `PhysicalFolderIds` and hangs items
+    /// off the collection folder directly, so every lookup here comes back
+    /// empty and the query is left exactly as it was.
     async fn resolve_views(
         &self,
         filter: &InternalItemsQuery,
@@ -306,8 +311,9 @@ impl FerrofinItemRepository {
             let mut resolved = filter.clone();
             resolved.top_parent_ids = folders;
             // …and the `ParentId` equality has to go with it, or the two scopes
-            // intersect to nothing: no row carries a collection folder as its
-            // parent.
+            // intersect to the library's direct children: an adopted row hangs
+            // off a physical folder, and only a row a Ferrofin scan saved
+            // carries the collection folder as its parent.
             resolved.parent_id = Uuid::nil();
             return Ok(Some(resolved));
         }
@@ -352,14 +358,14 @@ impl FerrofinItemRepository {
         if !filter.top_parent_ids.is_empty() {
             // Per id, as C# does it: `TopParentIds = parents.SelectMany(i =>
             // GetTopParentIdsForQuery(i, user))`. A collection folder
-            // contributes its physical folders; anything else — a `UserView`
+            // contributes its physical folders — and itself, which is what
+            // the rows a Ferrofin scan saved carry
+            // ([`library_top_parents_by_view`]); anything else — a `UserView`
             // like Live TV or Playlists, or any id on a Ferrofin database,
             // where the view IS the top parent — contributes itself. Replacing
             // the whole set whenever *one* id expanded would silently drop the
             // scopes that did not.
-            let by_view = self
-                .physical_folders_by_view(&filter.top_parent_ids)
-                .await?;
+            let by_view = library_top_parents_by_view(&self.db, &filter.top_parent_ids).await?;
             let mut expanded = Vec::with_capacity(filter.top_parent_ids.len());
             let changed = !by_view.is_empty();
             for id in &filter.top_parent_ids {
@@ -368,6 +374,10 @@ impl FerrofinItemRepository {
                     None => expanded.push(*id),
                 }
             }
+            // A caller that already named a library's physical folders
+            // beside it (the pruning's scope) gets each once.
+            let mut seen = std::collections::HashSet::with_capacity(expanded.len());
+            expanded.retain(|id| seen.insert(*id));
             if changed {
                 resolved
                     .get_or_insert_with(|| filter.clone())
@@ -393,7 +403,8 @@ impl FerrofinItemRepository {
     /// 1. a Live TV view stands for itself;
     /// 2. a `DisplayParentId` is followed (and a dangling one resolves to nothing);
     /// 3. so is a `ParentId`;
-    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`;
+    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`, and itself
+    ///    ([`library_top_parents_by_view`]);
     /// 5. anything else a view could be resolves to nothing.
     ///
     /// Both of the views a real 10.11.8 database carries take one of the first two
@@ -437,7 +448,10 @@ impl FerrofinItemRepository {
         };
         let kind = crate::item_type_lookup::kind_from_type_name(&type_name);
         if kind == Some(BaseItemKind::CollectionFolder) {
-            let folders = physical_folders_by_view(db, &[id])
+            // The physical folders AND the collection folder itself: an
+            // adopted row carries the first until a scan saves it with the
+            // second ([`library_top_parents_by_view`]).
+            let folders = library_top_parents_by_view(db, &[id])
                 .await?
                 .remove(&id)
                 .unwrap_or_default();
@@ -713,7 +727,7 @@ impl FerrofinItemRepository {
         }
         sql.push_str(r#" ORDER BY iv."Value""#);
 
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
         for t in &type_ints {
             query = query.bind(*t);
         }
@@ -1186,11 +1200,7 @@ fn clamp_count(n: i64) -> i32 {
 /// `(Type, CleanValue)`, then the map's primary key and the content row's.
 /// Shared by the page query and the total-count query so their WHERE stays
 /// identical.
-fn push_value_exists<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    inner: InnerScope,
-) {
+fn push_value_exists(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
     qb.push(
         r#" AND EXISTS (SELECT 1 FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
@@ -1206,10 +1216,10 @@ fn push_value_exists<'a>(
 /// `ByName.cs:314-317`): the `ItemValues` rows of `scope.type_ints` whose
 /// `CleanValue` is one of `clean_names`, joined to the content rows (`ci`)
 /// that carry them. Ends inside the `WHERE`, ready for more `AND` terms.
-fn push_value_links<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    clean_names: &'a [String],
+fn push_value_links(
+    qb: &mut QueryBuilder<Sqlite>,
+    scope: &ByNameScope<'_>,
+    clean_names: &[String],
 ) {
     qb.push(
         r#""ItemValues" iv
@@ -1241,11 +1251,7 @@ enum InnerScope {
 /// to any query that does not ask for owned items: no alternate versions, no
 /// owned non-extras (`TranslateQuery.cs:796-807`).
 #[allow(clippy::too_many_lines)] // one predicate per C# field, kept in the C# order
-fn push_content_scope<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    inner: InnerScope,
-) {
+fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
     let ByNameScope {
         filter,
         content_type_names,
@@ -1440,7 +1446,7 @@ struct ByNameScope<'a> {
 /// row's own columns come back with it; ids are stored as the uppercase
 /// hyphenated GUID text, so the ordering is the text ordering of that form.
 fn push_representative_rank(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     return_type: &str,
     top_parents: &[String],
 ) {
@@ -1468,9 +1474,11 @@ fn push_representative_rank(
 /// [`FerrofinItemRepository::physical_folders_by_view`], which is the doc for
 /// why this translation exists at all.
 ///
-/// A free function because the child-count service needs the same one: a
-/// library's `ChildCount` is its physical folders' children, and grouping on
-/// the raw `ParentId` reports 0 for every library on an adopted database.
+/// A free function because the child-count service and the user views need
+/// the same one: a library's `ChildCount` counts its physical folders'
+/// children too, and grouping on the raw `ParentId` reports 0 for every
+/// library on an adopted database Ferrofin has not scanned yet. Reads that
+/// scope a library by `TopParentId` take [`library_top_parents_by_view`].
 pub(crate) async fn physical_folders_by_view(
     db: &Database,
     ids: &[Uuid],
@@ -1499,6 +1507,35 @@ pub(crate) async fn physical_folders_by_view(
             Some((Uuid::parse_str(id).ok()?, folders))
         })
         .collect())
+}
+
+/// The `TopParentId`s the items of each of `ids` carry, for those that are
+/// Jellyfin collection folders: the folder itself first, then its
+/// `PhysicalFolderIds` ([`physical_folders_by_view`]). Ids that are not —
+/// every id on a Ferrofin-written database — are absent from the map, and a
+/// query scoped to one stays scoped to it alone.
+///
+/// Jellyfin stores the physical folder as a library item's `TopParentId`
+/// (`BaseItem.GetTopParent`: the ancestor directly under the
+/// `AggregateFolder`), and upstream reads a library through
+/// `CollectionFolder.PhysicalFolderIds` (`GetTopParentIdsForQuery`). Ferrofin
+/// writes the collection folder instead, so on an adopted database a
+/// library's rows carry the physical folder until a scan saves them and the
+/// collection folder after — both at once whenever a scan has not saved
+/// every row (a first scan still running or cancelled, a row the scan does
+/// not plan). Every read of "the items of this library" takes the union, or
+/// the rows a scan saved vanish from the library's browse, counts, next-up
+/// and pruning.
+pub(crate) async fn library_top_parents_by_view(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+    let mut by_view = physical_folders_by_view(db, ids).await?;
+    for (view, folders) in &mut by_view {
+        folders.retain(|folder| folder != view);
+        folders.insert(0, *view);
+    }
+    Ok(by_view)
 }
 
 /// Reads `PhysicalFolderIds` out of a Jellyfin `BaseItems.Data` blob.
@@ -1601,14 +1638,16 @@ impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
 /// studios and genres, excluded ids — is the same `TranslateQuery` a browse
 /// runs, so it runs through [`append_predicates`] over `outer`, the filter
 /// narrowed to exactly those fields (see [`by_name_outer_filter`]).
-fn append_by_name_filters<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    filter: &'a InternalItemsQuery,
-    outer: &'a InternalItemsQuery,
+fn append_by_name_filters(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    outer: &InternalItemsQuery,
 ) {
-    let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    fn non_blank(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
     append_predicates(qb, outer);
-    if let Some(term) = non_blank(&filter.search_term) {
+    if let Some(term) = non_blank(filter.search_term.as_deref()) {
         let lowered = lower_invariant(term);
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
             let like = format!("%{}%", lowered.trim_matches('%'));
@@ -1622,7 +1661,7 @@ fn append_by_name_filters<'a>(
             qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
         }
     }
-    if let Some(prefix) = non_blank(&filter.name_starts_with) {
+    if let Some(prefix) = non_blank(filter.name_starts_with.as_deref()) {
         qb.push(r#" AND ferrofin_upper_invariant(COALESCE(bi."SortName", bi."Name")) LIKE "#)
             .push_bind(format!("{}%", upper_invariant(prefix)));
     }
@@ -1632,11 +1671,11 @@ fn append_by_name_filters<'a>(
     // only the first character, case-sensitively, made `nameLessThan=Jb` and
     // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
     // `>=` dropped the boundary row itself.
-    if let Some(boundary) = non_blank(&filter.name_starts_with_or_greater) {
+    if let Some(boundary) = non_blank(filter.name_starts_with_or_greater.as_deref()) {
         qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
             .push_bind(lower_invariant(boundary));
     }
-    if let Some(boundary) = non_blank(&filter.name_less_than) {
+    if let Some(boundary) = non_blank(filter.name_less_than.as_deref()) {
         qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
             .push_bind(lower_invariant(boundary));
     }
@@ -1686,7 +1725,7 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 /// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
 /// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
 /// [`ImageType::Primary`] (the C# default when parsing a legacy row).
-fn image_type_from_disc(disc: i32) -> ImageType {
+pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
     match disc {
         1 => ImageType::Art,
         2 => ImageType::Backdrop,
@@ -1791,10 +1830,11 @@ pub(crate) async fn scope_to_user_libraries(
     }
 
     let views = visible_views(db, user).await?;
-    let by_view = physical_folders_by_view(db, &views).await?;
+    let by_view = library_top_parents_by_view(db, &views).await?;
     // `GetTopParentIdsForQuery` per view: a collection folder becomes its
-    // physical folders, and anything else — a Live TV view, or any view on
-    // a Ferrofin-written database — stands for itself.
+    // physical folders plus itself (what the rows a Ferrofin scan saved
+    // carry, [`library_top_parents_by_view`]), and anything else — a Live TV
+    // view, or any view on a Ferrofin-written database — stands for itself.
     let mut scope: Vec<Uuid> = views
         .iter()
         .flat_map(|v| match by_view.get(v) {
@@ -1953,6 +1993,22 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(row)
     }
 
+    async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut rows = Vec::new();
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = format!(
+                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+        Ok(rows)
+    }
+
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         let rows: Vec<String> =
             sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "IsLocked" = 1"#)
@@ -1963,36 +2019,6 @@ impl ItemRepository for FerrofinItemRepository {
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
             .collect())
-    }
-
-    async fn item_text_rows(
-        &self,
-        kind: BaseItemKind,
-        ids: &[Uuid],
-    ) -> Result<Vec<ItemTextRow>, ServiceError> {
-        let Some(type_name) = stored_type_name(kind) else {
-            return Ok(Vec::new());
-        };
-        let mut rows = Vec::new();
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            // The anonymous `?` list must come FIRST: SQLite gives an
-            // anonymous parameter the next index after the largest assigned so
-            // far, so an explicit `?N` ahead of the list pushes every `?` in it
-            // past the bound arguments and the query silently matches nothing.
-            let sql = format!(
-                r#"SELECT "Id", "Name", "SortName", "Overview", "Path"
-                   FROM "BaseItems" WHERE "Id" IN ({}) AND +"Type" = ?{}"#,
-                placeholders(chunk.len()),
-                chunk.len() + 1
-            );
-            let mut query = sqlx::query_as::<_, ItemTextRow>(&sql);
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            query = query.bind(type_name);
-            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
-        }
-        Ok(rows)
     }
 
     async fn get_ancestor_chain(
@@ -2207,7 +2233,7 @@ impl ItemRepository for FerrofinItemRepository {
                 placeholders(chunk.len()),
                 chunk.len() + 1
             );
-            let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2424,7 +2450,7 @@ impl ItemRepository for FerrofinItemRepository {
         );
         sql.push_str(&placeholders(ids.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(stream_disc);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(stream_disc);
         for id in &ids {
             query = query.bind(guid_to_db(*id));
         }
@@ -2459,7 +2485,7 @@ impl ItemRepository for FerrofinItemRepository {
         sql.push_str(r#") AND ms."ItemId" IN ("#);
         sql.push_str(&placeholders(ids.len()));
         sql.push(')');
-        let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql));
         for disc in by_disc.keys() {
             query = query.bind(*disc);
         }
@@ -2551,7 +2577,7 @@ impl ItemRepository for FerrofinItemRepository {
                    AND NOT EXISTS (SELECT 1 FROM "UserData" ud
                        WHERE ud."ItemId" = bi."Id" AND ud."UserId" = ?2 AND ud."Played" = 1))"#,
         );
-        let all_played: i64 = sqlx::query_scalar(&sql)
+        let all_played: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(guid_to_db(id))
             .bind(uid)
             .fetch_one(self.db.pool())
@@ -2697,6 +2723,80 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    #[tokio::test]
+    async fn parental_rating_filters_lists_counts_and_linked_containers() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let mut user = seed_user_with_defaults(&db, Uuid::from_u128(0xAB10)).await;
+        user.max_parental_rating_score = Some(10);
+        user.max_parental_rating_sub_score = Some(1);
+        let ids: Vec<_> = (0xAB20..0xAB25).map(Uuid::from_u128).collect();
+        for (id, score, subscore) in [
+            (ids[0], Some(9_i64), Some(9_i64)),
+            (ids[1], Some(10), Some(1)),
+            (ids[2], Some(10), Some(2)),
+            (ids[3], Some(17), None),
+            (ids[4], None, None),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, "Synthetic rating case").await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue"=?,
+                "InheritedParentalRatingSubValue"=? WHERE "Id"=?"#,
+            )
+            .bind(score)
+            .bind(subscore)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        seed_library_over(&db, &ids).await;
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        let rows = repository.get_items(&query).await.unwrap();
+        assert_eq!(rows.total_record_count, 3);
+        for id in [ids[0], ids[1], ids[4]] {
+            assert!(rows.items.iter().any(|row| row.id == guid_to_db(id)));
+        }
+        let collection = Uuid::from_u128(0xAB30);
+        seed_named_item(
+            &db,
+            collection,
+            BaseItemKind::BoxSet,
+            "Synthetic restricted collection",
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "TopParentId" =
+            (SELECT "TopParentId" FROM "BaseItems" WHERE "Id"=?) WHERE "Id"=?"#,
+        )
+        .bind(guid_to_db(ids[0]))
+        .bind(guid_to_db(collection))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        links
+            .upsert_linked_child(collection, ids[3], 0)
+            .await
+            .unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::BoxSet],
+            ..Default::default()
+        };
+        assert!(repository.get_item_list(&query).await.unwrap().is_empty());
+        links
+            .upsert_linked_child(collection, ids[0], 0)
+            .await
+            .unwrap();
+        assert_eq!(repository.get_item_list(&query).await.unwrap().len(), 1);
+    }
 
     #[rstest::rstest]
     #[case("Élodie", "él", true)]
@@ -6139,6 +6239,112 @@ mod tests {
         assert!(
             names.contains(&"Pilot"),
             "the library's physical folder is the scope, got {names:?}"
+        );
+    }
+
+    /// An adopted library whose rows a Ferrofin scan has saved only some of
+    /// (a first scan running or cancelled, or a row it does not plan): the
+    /// adopted rows still hang off the physical folder (Jellyfin's
+    /// `ParentId`/`TopParentId`), the saved ones off the collection folder.
+    /// Every by-library read sees both — the recursive browse, the
+    /// `TopParentIds` scope `Latest` and the similar-items query use, the
+    /// direct children, and a user's unscoped query — or the saved rows
+    /// vanish from the library (measured on the bench corpus before the fix:
+    /// every library browsed empty after the first scan).
+    #[tokio::test]
+    async fn an_adopted_library_holds_the_rows_a_scan_saved_and_the_ones_it_did_not() {
+        use crate::test_support::{fetch_item, save_item};
+        let db = test_db().await;
+        let repository = repo(&db);
+        let view = Uuid::from_u128(0x9C01);
+        let physical = Uuid::from_u128(0x9C02);
+        let adopted = Uuid::from_u128(0x9C03);
+        let saved = Uuid::from_u128(0x9C04);
+        let other_view = Uuid::from_u128(0x9C05);
+        let elsewhere = Uuid::from_u128(0x9C06);
+
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            &collection_folder_data(physical),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "movies").await;
+        seed_named_item(&db, other_view, BaseItemKind::CollectionFolder, "Other").await;
+        for (id, name, top) in [
+            (adopted, "Adopted", physical),
+            (saved, "Saved", view),
+            (elsewhere, "Elsewhere", other_view),
+        ] {
+            seed_top_parented_item(&db, id, BaseItemKind::Movie, name, top).await;
+            let mut row = fetch_item(&db, id).await;
+            row.parent_id = Some(guid_to_db(top));
+            save_item(&db, &row).await;
+        }
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x9C07)).await;
+        let names = |filter: InternalItemsQuery| {
+            let repository = &repository;
+            async move {
+                let mut names: Vec<String> = repository
+                    .get_item_list(&InternalItemsQuery {
+                        include_item_types: vec![BaseItemKind::Movie],
+                        ..filter
+                    })
+                    .await
+                    .expect("browse")
+                    .into_iter()
+                    .filter_map(|r| r.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+
+        assert_eq!(
+            names(InternalItemsQuery {
+                parent_id: view,
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await,
+            ["Adopted", "Saved"],
+            "the recursive browse"
+        );
+        assert_eq!(
+            names(InternalItemsQuery {
+                top_parent_ids: vec![view],
+                ..InternalItemsQuery::default()
+            })
+            .await,
+            ["Adopted", "Saved"],
+            "the TopParentIds scope"
+        );
+        assert_eq!(
+            names(InternalItemsQuery {
+                parent_id: view,
+                ..InternalItemsQuery::default()
+            })
+            .await,
+            ["Adopted", "Saved"],
+            "the direct children"
+        );
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["Adopted", "Elsewhere", "Saved"],
+            "a user's unscoped query, scoped to their libraries"
+        );
+        // Naming the physical folder beside the library (the pruning's
+        // scope) reads each row once.
+        assert_eq!(
+            names(InternalItemsQuery {
+                top_parent_ids: vec![view, physical],
+                ..InternalItemsQuery::default()
+            })
+            .await,
+            ["Adopted", "Saved"],
+            "the library and its physical folder, named together"
         );
     }
 

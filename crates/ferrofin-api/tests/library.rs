@@ -263,10 +263,12 @@ impl LibraryManager for RecordingLibrary {
     }
 }
 
-/// A [`LibraryMonitor`] that records every reported path.
+/// A [`LibraryMonitor`] that records every reported path — the webhooks'
+/// in `reported`, anything reported as the filesystem watcher's in `watcher`.
 #[derive(Default)]
 struct RecordingMonitor {
     reported: Mutex<Vec<String>>,
+    watcher: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -288,6 +290,10 @@ impl LibraryMonitor for RecordingMonitor {
         Ok(())
     }
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
+        self.watcher.lock().unwrap().push(path.to_owned());
+        Ok(())
+    }
+    async fn report_webhook_change(&self, path: &str) -> Result<(), ServiceError> {
         self.reported.lock().unwrap().push(path.to_owned());
         Ok(())
     }
@@ -339,6 +345,11 @@ fn router_with_auth(
 
 /// The paths the monitor observed, in report order.
 fn reported(monitor: &RecordingMonitor) -> Vec<String> {
+    // Every webhook reports as a webhook, so its scan is tagged `webhook`.
+    assert!(
+        monitor.watcher.lock().unwrap().is_empty(),
+        "a webhook reported its path as the filesystem watcher"
+    );
     monitor.reported.lock().unwrap().clone()
 }
 

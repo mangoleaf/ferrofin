@@ -1,168 +1,297 @@
-//! What the episode providers' re-scan gate reads, and what it must not read.
+//! What the episode providers' re-scan gate reads, end to end through a scan.
 //!
 //! `Planned.entity` is rebuilt from the filesystem on every scan, so its `Name`
 //! is always the file stem and its `Overview` always `None`. The gate that
 //! stops every episode re-fetching its metadata on every scan therefore has to
-//! consult the **stored** row — via `ItemRepository::item_text_rows` — and the
-//! scan reads that once for the set it planned.
+//! consult the **stored** row. The scan reads stored rows one window of the
+//! plan at a time (`ItemRepository::retrieve_items`) and hands each episode's
+//! stored title and synopsis to the gate.
 //!
-//! Two properties with teeth here, both of which a mutation testing only the
-//! scan's *output* would miss:
-//!
-//! 1. the projection round-trips (`Id` parses back, the PascalCase columns land
-//!    on the right fields), and
-//! 2. the read is scoped to the ids asked for. An unscoped `WHERE "Type" = ?`
-//!    returns the same data for a full scan and is ~113 ms / ~30 MB on a
-//!    60k-episode library — paid in full by `scan_paths`, which the library
-//!    monitor runs for a single changed file.
+//! The property with teeth: a rescan of an unchanged, already-titled episode
+//! makes **no** episode request to TMDB. A regression anywhere on that path —
+//! the window read, the id lookup, the type filter, the text lift — still
+//! produces correct rows (TMDB just answers again), so only the request count
+//! catches it.
 
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ferrofin_core::FerrofinItemPersistenceService;
-use ferrofin_core::item_type_lookup::{ItemTypeLookup, stored_type_name};
-use ferrofin_core::{FerrofinItemRepository, item_type_lookup};
+use ferrofin_core::file_system::FerrofinFileSystem;
+use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
+use ferrofin_core::{
+    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
+    LibraryScanner, ScanOutcome,
+};
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_db::store::guid_to_db;
+use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use uuid::Uuid;
+use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_providers::TmdbClient;
+use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::persistence::ItemRepository;
 
-/// Seeds `count` episodes plus one movie, and returns the repository and the
-/// episode ids in seed order.
-async fn seeded(count: usize) -> (FerrofinItemRepository, Vec<Uuid>) {
+/// `/search/tv`: gives the series a TMDB id to hang its seasons off.
+const SERIES_SEARCH_JSON: &str = r#"{"results": [{"id": 1399, "name": "GoT"}]}"#;
+
+/// `/tv/{id}`: series details.
+const SERIES_DETAILS_JSON: &str = r#"{"overview": "A series.", "genres": []}"#;
+
+/// `/tv/{id}/season/1`: the episode text. No image paths, so the artwork pass
+/// never reaches for the network.
+const SEASON_JSON: &str = r#"{
+    "name": "Season 1",
+    "overview": "The first season.",
+    "episodes": [
+        {"id": 63056, "episode_number": 1, "name": "Winter Is Coming",
+         "overview": "Ned is summoned south.", "air_date": "2011-04-17",
+         "vote_average": 8.5},
+        {"id": 63057, "episode_number": 2, "name": "The Kingsroad",
+         "overview": "The party rides north.", "air_date": "2011-04-24"}
+    ]
+}"#;
+
+/// `/tv/{id}/season/1/episode/{n}?append_to_response=credits,…`: requested per episode, and only
+/// by the episode provider, so it counts exactly the episodes the gate let
+/// through.
+const CREDITS_JSON: &str =
+    r#"{"credits":{"cast": [{"id": 1, "name": "Sean Bean", "character": "Ned"}]}}"#;
+
+/// `/tv/{id}` for a series that has everything the backfill gates want
+/// (an overview and a trailer), so no heuristic asks for it again.
+const ENRICHED_SERIES_DETAILS_JSON: &str = r#"{"overview": "A series.", "genres": [],
+    "videos": {"results": [{"site": "YouTube", "type": "Trailer", "key": "k", "name": "T"}]}}"#;
+
+/// A TMDB stand-in counting the per-episode credits requests.
+fn spawn_tmdb() -> (String, Arc<AtomicUsize>) {
+    let (base, credits, _) = spawn_tmdb_with(SERIES_DETAILS_JSON);
+    (base, credits)
+}
+
+/// [`spawn_tmdb`] with the given series details, also counting the series
+/// searches.
+fn spawn_tmdb_with(series_details: &'static str) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let credits = Arc::new(AtomicUsize::new(0));
+    let searches = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let counter = Arc::clone(&credits);
+    let search_counter = Arc::clone(&searches);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            // `/credits` first: its path contains `/season/` too.
+            let (status, payload) = if req.contains("/episode/") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                ("200 OK", CREDITS_JSON)
+            } else if req.contains("/season/") {
+                ("200 OK", SEASON_JSON)
+            } else if req.contains("/search/tv") {
+                search_counter.fetch_add(1, Ordering::SeqCst);
+                ("200 OK", SERIES_SEARCH_JSON)
+            } else if req.contains("/tv/") {
+                ("200 OK", series_details)
+            } else {
+                ("404 Not Found", "{}")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
+    });
+    (format!("http://{addr}"), credits, searches)
+}
+
+#[tokio::test]
+async fn a_rescan_hands_the_stored_episode_text_to_the_gate() {
+    let (base, credits) = spawn_tmdb();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let tv = tmp.path().join("tv");
+    let season = tv.join("GoT/Season 01");
+    std::fs::create_dir_all(&season).expect("mkdir");
+    for ep in ["GoT S01E01.mkv", "GoT S01E02.mkv"] {
+        std::fs::write(season.join(ep), b"").expect("write");
+    }
+
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrate");
-    let persistence = FerrofinItemPersistenceService::new(db.clone());
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "TV",
+        Some(CollectionTypeOptions::tvshows),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: tv.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_items(Arc::clone(&items));
 
-    let mut ids = Vec::new();
-    let mut rows = Vec::new();
-    for i in 0..count {
-        let id = Uuid::from_u128(0x5000 + i as u128);
-        ids.push(id);
-        rows.push(BaseItemEntity {
-            id: guid_to_db(id),
-            type_: stored_type_name(BaseItemKind::Episode)
-                .expect("episode type")
-                .to_owned(),
-            name: Some(format!("Episode {i}")),
-            sort_name: Some(format!("001 - {i:04} - Episode {i}")),
-            overview: Some(format!("Synopsis {i}")),
-            path: Some(format!("/tv/Show/Season 01/raw.file.name.{i}.mkv")),
-            ..Default::default()
-        });
+    // First scan: every episode is new, so TMDB titles each one.
+    let first = scanner.scan_all().await.expect("first scan");
+    assert_eq!(
+        first.created, 4,
+        "series, season and two episodes: {first:?}"
+    );
+    assert_eq!(
+        credits.load(Ordering::SeqCst),
+        2,
+        "one credits request per new episode"
+    );
+    let episode_id = derive_item_id(
+        BaseItemKind::Episode,
+        &season.join("GoT S01E01.mkv").to_string_lossy(),
+    )
+    .expect("episode id");
+    let stored = items
+        .retrieve_item(episode_id)
+        .await
+        .expect("read")
+        .expect("episode row");
+    assert_eq!(stored.name.as_deref(), Some("Winter Is Coming"));
+    assert_eq!(stored.overview.as_deref(), Some("Ned is summoned south."));
+    let first = stored;
+    assert!(first.premiere_date.is_some());
+    assert_eq!(first.production_year, Some(2011));
+    assert_eq!(first.community_rating, Some(8.5));
+
+    // Rescan: the stored title and synopsis reach the gate, so no episode is
+    // fetched again, and the save — the stored row with this pass merged on —
+    // keeps everything TMDB supplied: the text, and (the regression the old
+    // hand-carried gate had) the air date, year and rating.
+    //
+    // Since change detection, the unchanged season and episodes run no
+    // provider at all. The series has no remote trailers, so the kept
+    // `wants_trailers` backfill (owner decision D2) asks TMDB again — but
+    // TMDB answers exactly what is stored, so nothing is written for it
+    // either.
+    let rescan = scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        rescan,
+        ScanOutcome {
+            unchanged: 4,
+            ..ScanOutcome::default()
+        }
+    );
+    assert_eq!(
+        credits.load(Ordering::SeqCst),
+        2,
+        "an already-titled episode must not be re-requested on a rescan"
+    );
+    let stored = items
+        .retrieve_item(episode_id)
+        .await
+        .expect("read")
+        .expect("episode row");
+    assert_eq!(stored.name.as_deref(), Some("Winter Is Coming"));
+    assert_eq!(stored.overview.as_deref(), Some("Ned is summoned south."));
+    assert_eq!(stored.premiere_date, first.premiere_date);
+    assert_eq!(stored.production_year, Some(2011));
+    assert_eq!(stored.community_rating, Some(8.5));
+}
+
+/// A changed episode under an unchanged series: the episode runs every
+/// provider, the series none. The episode still resolves, through the TMDB id
+/// the series' earlier scan recorded — nothing matched the series this scan.
+#[tokio::test]
+async fn a_changed_episode_under_an_unchanged_series_resolves_through_the_recorded_id() {
+    let (base, credits, searches) = spawn_tmdb_with(ENRICHED_SERIES_DETAILS_JSON);
+    let tmp = tempfile::tempdir().expect("tmp");
+    let tv = tmp.path().join("tv");
+    let season = tv.join("GoT").join("Season 1");
+    std::fs::create_dir_all(&season).expect("mkdir");
+    for ep in ["GoT S01E01.mkv", "GoT S01E02.mkv"] {
+        std::fs::write(season.join(ep), b"").expect("write");
     }
-    // A movie, so a type-scoped read that forgot its predicate is visible.
-    rows.push(BaseItemEntity {
-        id: guid_to_db(Uuid::from_u128(0x9999)),
-        type_: stored_type_name(BaseItemKind::Movie)
-            .expect("movie type")
-            .to_owned(),
-        name: Some("A Movie".to_owned()),
-        path: Some("/movies/A Movie (2020).mkv".to_owned()),
-        ..Default::default()
-    });
-    persistence.save_items(&rows).await.expect("seed");
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "TV",
+        Some(CollectionTypeOptions::tvshows),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: tv.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_items(Arc::clone(&items));
 
-    let repo = FerrofinItemRepository::new(db, Arc::new(ItemTypeLookup::new()));
-    (repo, ids)
-}
-
-// The projection's columns land on the right fields and the id round-trips.
-// Blanking the query body — which every scan test tolerated — fails here.
-#[tokio::test]
-async fn the_projection_round_trips() {
-    let (repo, ids) = seeded(3).await;
-
-    let rows = repo
-        .item_text_rows(BaseItemKind::Episode, &ids)
-        .await
-        .expect("text rows");
-    assert_eq!(rows.len(), 3, "one row per asked-for episode: {rows:?}");
-
-    let first = rows
-        .iter()
-        .find(|r| r.id == guid_to_db(ids[0]))
-        .expect("the seeded episode");
-    assert_eq!(first.name.as_deref(), Some("Episode 0"));
-    assert_eq!(first.sort_name.as_deref(), Some("001 - 0000 - Episode 0"));
-    assert_eq!(first.overview.as_deref(), Some("Synopsis 0"));
+    assert_eq!(scanner.scan_all().await.expect("first").created, 4);
+    assert_eq!(credits.load(Ordering::SeqCst), 2);
+    let searches_before = searches.load(Ordering::SeqCst);
     assert_eq!(
-        first.path.as_deref(),
-        Some("/tv/Show/Season 01/raw.file.name.0.mkv")
+        scanner.scan_all().await.expect("rescan"),
+        ScanOutcome {
+            unchanged: 4,
+            ..ScanOutcome::default()
+        },
+        "an enriched series and its unchanged episodes are left alone"
     );
-    // The gate keys its map on this; a format the parser rejects would drop the
-    // row silently and read as "no previous scan" forever.
+
+    let file = season.join("GoT S01E01.mkv");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("touch");
     assert_eq!(
-        Uuid::parse_str(&first.id).expect("id parses back"),
-        ids[0],
-        "the stored id must round-trip through guid_to_db"
+        scanner.scan_all().await.expect("rescan"),
+        ScanOutcome {
+            updated: 1,
+            unchanged: 3,
+            ..ScanOutcome::default()
+        }
     );
-}
-
-// The read is scoped to the ids asked for, not to every row of the kind. This
-// is the property that keeps `scan_paths` cheap, and it is invisible to any
-// test that asks for the whole library.
-#[tokio::test]
-async fn the_read_is_scoped_to_the_ids_asked_for() {
-    let (repo, ids) = seeded(50).await;
-
-    let one = repo
-        .item_text_rows(BaseItemKind::Episode, &ids[..1])
-        .await
-        .expect("one");
     assert_eq!(
-        one.len(),
-        1,
-        "asking for one episode must not return the library"
+        credits.load(Ordering::SeqCst),
+        3,
+        "the changed episode asked TMDB for its credits again"
     );
-    assert_eq!(one[0].id, guid_to_db(ids[0]));
-
-    // Above the 500-id chunk boundary the query is split; the result must not
-    // be truncated or duplicated.
-    let all = repo
-        .item_text_rows(BaseItemKind::Episode, &ids)
-        .await
-        .expect("all");
-    assert_eq!(all.len(), 50);
-
-    // Ids that do not exist simply yield no row — callers must not assume a
-    // row per id.
-    let missing = repo
-        .item_text_rows(BaseItemKind::Episode, &[Uuid::from_u128(0xDEAD)])
-        .await
-        .expect("missing");
-    assert!(missing.is_empty());
-}
-
-// The `Type` predicate is real: a movie's id asked for as an Episode yields
-// nothing, and a kind with no stored type name short-circuits.
-#[tokio::test]
-async fn the_kind_predicate_is_applied() {
-    let (repo, ids) = seeded(2).await;
-    let movie = Uuid::from_u128(0x9999);
-
-    let as_episode = repo
-        .item_text_rows(BaseItemKind::Episode, &[movie])
-        .await
-        .expect("movie as episode");
-    assert!(
-        as_episode.is_empty(),
-        "the Type predicate must exclude the movie"
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        searches_before,
+        "without searching for the unchanged series"
     );
-
-    let as_movie = repo
-        .item_text_rows(BaseItemKind::Movie, &[movie])
-        .await
-        .expect("movie as movie");
-    assert_eq!(as_movie.len(), 1, "…which the right kind then finds");
-
-    // A kind the schema stores no type name for returns empty, not an error.
-    assert!(item_type_lookup::stored_type_name(BaseItemKind::Program).is_none());
-    assert!(
-        repo.item_text_rows(BaseItemKind::Program, &ids)
-            .await
-            .expect("unstorable kind")
-            .is_empty()
-    );
+    let id = derive_item_id(BaseItemKind::Episode, &file.to_string_lossy()).expect("id");
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(row.name.as_deref(), Some("Winter Is Coming"));
 }
