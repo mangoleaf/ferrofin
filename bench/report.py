@@ -13,7 +13,7 @@ where the runs disagreed at the precision published, the range they spanned; a c
 did different work than the oracle is marked `⚠[n]` and the reason is printed once,
 numbered, under Notes.
 One rule is applied per cell, from files the run itself wrote:
-  comparable   — same status + record count as the oracle (Jellyfin 12.0-rc7) and a field
+  comparable   — same status + record count as the recorded Jellyfin 12 oracle and a field
                  set ⊇ the oracle's, for every request name behind the cell (shape.log).
 Flagged cells keep their raw number (the work list) but are not publishable.
 The range is reported, never judged. A fixed 15 % band was tried as a reproducibility
@@ -34,16 +34,19 @@ import csv
 import html
 import http.server
 import json
+import math
 import os
+import re
 import statistics
 import sys
 import urllib.parse
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 DELTA_NOISE_PCT = 2  # a baseline change smaller than this is not coloured
 ORACLE = "jellyfin12"  # the source of truth (owner, 2026-09-02): Jellyfin 12 is the newer code
-ORACLE_LABEL = "Jellyfin 12.0-rc7"
-SERVERS = [("jellyfin12", "Jellyfin 12.0-rc7"), ("jellyfin", "Jellyfin 10.11.8"), ("ferrofin", "Ferrofin")]
+ORACLE_LABEL = "Jellyfin reference"
+SERVERS = [("jellyfin12", "Jellyfin 12"), ("jellyfin", "Jellyfin 10.11"), ("ferrofin", "Ferrofin")]
 SCREENS = ["home", "movies", "detail", "series", "search", "playback"]
 #: The load levels a run may contain, lightest first. A run that skipped one (`--only`)
 #: has no entry for it in `windows.json`, and the renderers drop the level.
@@ -58,11 +61,12 @@ def run_levels(d):
     A level that ran and then failed to produce a k6 file must still be reported as a
     missing phase, so "did it run" cannot be inferred from the result file existing."""
     win = load(os.path.join(d, "windows.json"))
+    selected = {lvl for lvl in LOAD_LEVELS if lvl in (load(os.path.join(d, "phases.json")) or {})}
     if win is None:
         # An interrupted run has no record of itself; fall back to what it produced, so
         # a level whose result file is also missing is still named rather than dropped.
-        return {lvl for lvl in LOAD_LEVELS if os.path.isfile(os.path.join(d, f"k6-{lvl}.json"))}
-    return {lvl for lvl in LOAD_LEVELS if lvl in win}
+        return selected | {lvl for lvl in LOAD_LEVELS if os.path.isfile(os.path.join(d, f"k6-{lvl}.json"))}
+    return selected | {lvl for lvl in LOAD_LEVELS if lvl in win}
 MIB = 2 ** 20
 TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "transcodereasons")
 
@@ -70,22 +74,26 @@ TRANSCODE_NOISE = ("playsessionid", "apikey", "deviceid", "tag=", "api_key", "tr
 # ── loading ─────────────────────────────────────────────────────────────────
 def load(path):
     try:
-        return json.load(open(path))
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
         return None
 
 
 def load_shape(d):
-    """shape.log → {request name: {status set, counts, fields}} merged over the responses."""
-    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0})
+    """Load legacy shape summaries and retain individual request observations."""
+    out = defaultdict(lambda: {"status": set(), "count": set(), "total": set(), "fields": set(), "n": 0, "samples": {}})
     try:
-        lines = open(os.path.join(d, "shape.log")).read().splitlines()
+        with open(os.path.join(d, "shape.log")) as f:
+            lines = f.read().splitlines()
     except OSError:
         return None
     for line in lines:
         try:
             rec = json.loads(json.loads(line)["msg"])
         except (ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("shape"), str):
             continue
         s = out[rec["shape"]]
         s["status"].add(rec.get("status"))
@@ -95,34 +103,167 @@ def load_shape(d):
         if "total" in rec and rec["total"] is not None:
             s["total"].add(rec["total"])
         s["fields"].update(rec.get("fields") or [])
+        # Preserve request identity instead of accepting counts swapped between URLs.
+        # Old NextUp URLs used wall-clock cutoffs; retain their historical shape check
+        # without claiming that these legacy inputs were identical.
+        u = urllib.parse.urlsplit(rec.get("url", ""))
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(u.query)
+                 if k.lower() not in {"apikey", "api_key", "playsessionid", "tag", "nextupdatecutoff"}]
+        key = rec.get("key") or (u.path, tuple(sorted(query)))
+        s["samples"].setdefault(key, []).append(rec)
+    # Retain the historical aggregate image row, while each screen owns its images.
+    for name, observations in list(out.items()):
+        if name.endswith(":image"):
+            aggregate = out["image"]
+            for field in ("status", "count", "total", "fields"):
+                aggregate[field].update(observations[field])
+            aggregate["n"] += observations["n"]
+            aggregate["samples"].update(observations["samples"])
     return out
 
 
-def oracle_failed(shape_oracle, names):
+def selection_records(path):
+    records = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(json.loads(line)["msg"])
+                    if isinstance(rec, dict) and "selection" in rec:
+                        records.append(rec)
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return records
+
+
+def actor_problem(record, meta):
+    if not meta.get("user_isolation"):
+        return None
+    role = "playback" if record.get("screen") == "playback" else "browse"
+    users = meta.get("actors") or {}
+    if not users.get("browse") or not users.get("playback") or users["browse"] == users["playback"]:
+        return "invalid isolated user identities"
+    if record.get("actor") != role or record.get("user") != users[role]:
+        return "request actor differs from isolated user role"
+    return None
+
+
+def isolation_problem(d, meta, names):
+    if not meta.get("user_isolation"):
+        return None
+    problem = phase_problem(d, meta, ["isolation-setup"] +
+                            [f"isolation-{name}-{edge}" for name in names for edge in ("before", "after")])
+    if problem:
+        return problem
+    for name in names:
+        for edge in ("before", "after"):
+            evidence = load(os.path.join(d, f"isolation-{name}-{edge}.json")) or {}
+            if evidence.get("ok") is not True or evidence.get("changed_items") != [] or evidence.get("home_changed") is not False:
+                return f"{name}: browse state isolation evidence failed or missing"
+    return None
+
+
+def shape_evidence(d, meta, shape):
+    """Validate bounded coverage once per run, outside the per-cell render loop."""
+    summary = load(os.path.join(d, "shape-summary.json")) or {}
+    records = selection_records(os.path.join(d, "shape.log"))
+    slots = meta.get("slots")
+    if not isinstance(slots, int) or slots <= 0 or slots % 10:
+        return "invalid slot count", {}, {}
+    if any(summary.get(k) != meta.get(k) for k in ("workload", "slots", "seed", "shape_vus")):
+        return "shape workload/seed/slots differ from run metadata", {}, {}
+    if meta.get("user_isolation") and summary.get("user_isolation") != meta["user_isolation"]:
+        return "shape isolation policy differs from run metadata", {}, {}
+    if any(actor_problem(r, meta) for r in records):
+        return "shape actor differs from isolated user role", {}, {}
+    if len(records) != slots or summary.get("iterations") != slots:
+        return "shape slot coverage incomplete", {}, {}
+    if sorted(r.get("iteration", -1) for r in records) != list(range(slots)) or any(r.get("selection") != r.get("iteration") for r in records):
+        return "shape slots missing or duplicated", {}, {}
+    expected = Counter(key for r in records for key in r.get("keys", []))
+    actual = Counter(key for name, obs in (shape or {}).items() if name != "image"
+                     for key, samples in obs["samples"].items() for _ in samples)
+    if expected != actual or any(n != 1 for n in actual.values()) or sum(actual.values()) != summary.get("requests"):
+        return "shape request evidence missing or duplicated", {}, {}
+    index = {r["selection"]: r for r in records}
+    distinct = {json.dumps(json.loads(key)[3:], sort_keys=True) for key in expected}
+    picks = defaultdict(set)
+    for key in expected:
+        _, name, _, _, path, _ = json.loads(key)
+        if name in {"detail:item", "playback:playbackinfo", "series:item", "movies:items", "search:items"}:
+            picks[name].add(path)
+    coverage = {"distinct_picks": {name: len(paths) for name, paths in sorted(picks.items())}, "slots": slots, "requests": sum(actual.values()), "distinct_requests": len(distinct),
+                "elapsed_s": (summary.get("elapsed_ms") or 0) / 1000}
+    return None, index, coverage
+
+
+def selection_problems(path, summary, expected, slots, meta=None):
+    records = selection_records(path)
+    if meta and summary and any(summary.get(k) != meta.get(k) for k in ("workload", "slots", "seed")):
+        return {s: "measured workload/seed/slots differ from validation" for s in SCREENS}
+    if not summary or len(records) != summary.get("iterations") or not records:
+        return {s: "measured selection evidence incomplete" for s in SCREENS}
+    if sorted(r.get("iteration", -1) for r in records) != list(range(len(records))):
+        return {s: "measured iterations missing or duplicated" for s in SCREENS}
+    if sum(len(r.get("keys", [])) for r in records) != summary.get("requests"):
+        return {s: "measured request counts differ from selection evidence" for s in SCREENS}
+    if meta and meta.get("user_isolation") and summary.get("user_isolation") != meta["user_isolation"]:
+        return {s: "measured isolation policy differs from run metadata" for s in SCREENS}
+    problems = {}
+    for r in records:
+        scr = r.get("screen")
+        if problem := actor_problem(r, meta or {}):
+            problems[scr] = problem
+            continue
+        slot = r.get("selection")
+        validation = expected.get(slot)
+        if slot != r["iteration"] % slots or not validation or validation.get("screen") != scr:
+            return {s: "measured slot was not validated" for s in SCREENS}
+        if not r.get("ok") or not validation.get("ok"):
+            problems[scr] = "dependent request or screen failed"
+        elif r.get("keys") != validation.get("keys"):
+            problems[scr] = "measured request selections differ from validated slot"
+    return problems
+
+
+def oracle_failed(shape_oracle, names, oracle_label=ORACLE_LABEL):
     """The oracle's own verdict: a status >= 400 on any request behind the row."""
     if shape_oracle is None:
         return "no shape pass"  # the oracle ran but its shape phase did not
     for n in names:
         o = shape_oracle.get(n)
-        if o and any(st >= 400 for st in o["status"]):
-            return f"{ORACLE_LABEL} failed {n} ({sorted(o['status'])})"
+        if not o:
+            return f"{n}: missing"
+        if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
+            return f"{oracle_label} failed {n} ({sorted(o['status'], key=str)})"
+        if any(r.get("key") and "json" in r.get("content_type", "") and not isinstance(r.get("types"), dict)
+               for rs in o["samples"].values() for r in rs):
+            return f"{n}: missing per-item shape evidence"
+        if any(r.get("invalid_json") for rs in o["samples"].values() for r in rs):
+            return f"{n}: invalid JSON response"
+        if (n == "image" or n.endswith(":image")) and any(r.get("bytes") == 0 for rs in o.get("samples", {}).values() for r in rs):
+            return f"{n}: empty oracle response"
     return None
 
 
-def comparable(shape_srv, shape_oracle, names):
+def comparable(shape_srv, shape_oracle, names, oracle_label=ORACLE_LABEL):
     """None if comparable, else the reason."""
     if shape_oracle is None:
-        return f"no oracle run ({ORACLE_LABEL} not in this run)"
+        return f"no oracle run ({oracle_label} not in this run)"
     if shape_srv is None:
         return "no shape pass"
+    if problem := oracle_failed(shape_oracle, names, oracle_label):
+        return problem
     for n in names:
         o, s = shape_oracle.get(n), shape_srv.get(n)
         if o is None or s is None:
             return f"{n}: missing"
-        if any(st >= 400 for st in o["status"]):
-            return f"{n}: {ORACLE_LABEL} failed ({sorted(o['status'])})"
+        if any(not isinstance(st, int) or not 200 <= st < 400 for st in o["status"]):
+            return f"{n}: {oracle_label} failed ({sorted(o['status'], key=str)})"
         if s["status"] != o["status"]:
-            return f"{n}: status {sorted(s['status'])} vs {sorted(o['status'])}"
+            return f"{n}: status {sorted(s['status'], key=str)} vs {sorted(o['status'], key=str)}"
         if s["count"] != o["count"]:
             return f"{n}: items {sorted(s['count'])} vs {sorted(o['count'])}"
         if s["total"] != o["total"]:
@@ -131,13 +272,109 @@ def comparable(shape_srv, shape_oracle, names):
         if missing:
             more = f" (+{len(missing) - 3} more)" if len(missing) > 3 else ""
             return f"{n}: missing {', '.join(m.lstrip('.') for m in missing[:3])}{more}"
+        if s.get("samples") is not None and o.get("samples") is not None:
+            if s["samples"].keys() != o["samples"].keys():
+                return f"{n}: request picks differ"
+            for key, expected in o["samples"].items():
+                actual = s["samples"][key]
+                if len(actual) != len(expected):
+                    return f"{n}: request count differs"
+                for a, b in zip(actual, expected):
+                    for field in ("status", "count", "total", "content_type", "ids", "invalid_json"):
+                        if a.get(field) != b.get(field):
+                            return f"{n}: {field} differs for a request pick"
+                    if any(a.get("types", {}).get(path) != kind for path, kind in b.get("types", {}).items()):
+                        return f"{n}: per-item fields/types differ for a request pick"
+                    if set(b.get("fields") or []) - set(a.get("fields") or []):
+                        return f"{n}: missing fields for a request pick"
+                    # Encoding sizes vary legitimately. Only an empty image is invalid.
+                    if (n == "image" or n.endswith(":image")) and (a.get("bytes", 1) <= 0 or b.get("bytes", 1) <= 0):
+                        return f"{n}: empty response"
+    return None
+
+
+def phase_problem(d, meta, required):
+    if not meta.get("phase_schema"):
+        return None
+    phases = load(os.path.join(d, "phases.json")) or {}
+    return reasons(*(f"{name}: {phases.get(name, {}).get('status', 'missing')} ({phases.get(name, {}).get('reason', '')})"
+                     for name in required if phases.get(name, {}).get("status") != "completed"))
+
+
+def resource_windows(d, meta):
+    windows = load(os.path.join(d, "windows.json")) or {}
+    try:
+        with open(os.path.join(d, "mem.csv")) as f:
+            rows = list(csv.DictReader(f))
+        times = [float(r["t"]) for r in rows]
+    except (OSError, ValueError, KeyError):
+        rows, times = [], []
+    interval = meta.get("mem_sample_ms", 100) / 1000
+    bracket = meta.get("sample_bracket_intervals", 2) * interval
+    gap_limit = meta.get("sample_gap_intervals", 5) * interval
+    out = {}
+    for name, w in windows.items():
+        rec = {"samples": 0, "cpu_seconds": None}
+        try:
+            if not times or any(b <= a for a, b in zip(times, times[1:])):
+                raise ValueError("missing or nonmonotonic samples")
+            if not any(t <= w["start"] for t in times) or not any(t >= w["end"] for t in times):
+                raise ValueError("sampler does not bracket window")
+            lo = max(i for i, t in enumerate(times) if t <= w["start"])
+            hi = min(i for i, t in enumerate(times) if t >= w["end"])
+            section = rows[lo:hi+1]
+            rec.update(samples=len(section), observed_start=times[lo], observed_end=times[hi],
+                       max_gap_s=max((b-a for a, b in zip(times[lo:hi], times[lo+1:hi+1])), default=0))
+            if hi <= lo or w["end"] <= w["start"]:
+                raise ValueError("invalid observation window")
+            if w["start"] - times[lo] > bracket or times[hi] - w["end"] > bracket:
+                raise ValueError("sample bracket exceeds tolerance")
+            if rec["max_gap_s"] > gap_limit:
+                raise ValueError("sample gap exceeds tolerance")
+            if "cpu_usec" in rows[0]:
+                counters = [int(r["cpu_usec"]) for r in section]
+                if any(b < a for a, b in zip(counters, counters[1:])):
+                    raise ValueError("cumulative CPU counter decreased")
+                rec["cpu_seconds"] = (counters[-1] - counters[0]) / 1e6
+            elif meta.get("resource_schema"):
+                raise ValueError("missing cumulative CPU counter")
+        except (ValueError, KeyError, TypeError) as e:
+            rec["error"] = str(e) or "missing boundary samples"
+        out[name] = rec
+    phases = load(os.path.join(d, "phases.json")) or {}
+    for name in (*LOAD_LEVELS, "steady"):
+        if phases.get(name, {}).get("start") and name not in out:
+            out[name] = {"error": "missing resource window", "samples": 0, "cpu_seconds": None}
+    return out
+
+
+def transcode_parameters(rep):
+    return sorted((k.lower(), v.lower()) for k, v in urllib.parse.parse_qsl(urllib.parse.urlsplit(rep.get("transcoding_url", "")).query)
+                  if k.lower() not in {"playsessionid", "apikey", "api_key", "deviceid", "tag", "transcodereasons"})
+
+
+def streaming_problem(doc, meta, group):
+    if not meta.get("streaming_validation"):
+        return None
+    if not doc or doc.get("validation") != 1:
+        return "missing streaming validation evidence"
+    for rep in doc.get(group, []):
+        if group == "direct":
+            match = re.fullmatch(r"bytes 0-1048575/(\d+)", rep.get("content_range", "") or "")
+            if rep.get("status") != 206 or rep.get("bytes") != 1048576 or not match or int(match[1]) <= 1048575:
+                return "direct range status/header/byte count invalid"
+        else:
+            output = rep.get("output") or {}
+            if not number(output.get("duration_s")) or output["duration_s"] <= 0 or not output.get("streams"):
+                return "missing or invalid first-segment probe"
     return None
 
 
 def mem_numbers(d):
     win = load(os.path.join(d, "windows.json"))
     try:
-        rows = list(csv.DictReader(open(os.path.join(d, "mem.csv"))))
+        with open(os.path.join(d, "mem.csv")) as f:
+            rows = list(csv.DictReader(f))
     except OSError:
         return None
     if not win or not rows:
@@ -174,9 +411,9 @@ class Cell:
         vals = list(vals)
         #: how many runs were selected, whether or not each produced this number
         self.runs = len(vals)
-        self.vals = [v for v in vals if v is not None]
+        self.vals = [v for v in vals if number(v)]
         self.fmt = fmt
-        self.flag = flag
+        self.flag = flag or ("missing or invalid samples in selected runs" if len(self.vals) != self.runs else None)
         self.sub = sub or {}  # extra per-run series, e.g. p95/p99/err for latency
         self.unit = unit
         self.context = context  # describes the run's conditions, not the server: no ratio, no delta
@@ -293,14 +530,123 @@ class Notes:
         return bool(self.index)
 
 
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def reasons(*values):
+    return "; ".join(sorted({v for v in values if v})) or None
+
+
+def latency_problem(x):
+    if not x or not number(x.get("count")) or x["count"] <= 0:
+        return "missing request samples"
+    if not number(x.get("ok")) or x["ok"] > 1:
+        return "missing or invalid request success rate"
+    if x["ok"] < 1:
+        return "measured requests failed"
+    if any(not number(x.get(q)) for q in ("p50", "p95", "p99")):
+        return "missing or invalid latency"
+    if not x["p50"] <= x["p95"] <= x["p99"]:
+        return "invalid latency quantiles"
+    return None
+
+
+def window_problem(x):
+    if not x:
+        return "missing load window"
+    if not number(x.get("iterations")) or x["iterations"] <= 0:
+        return "missing completed iterations"
+    for key in ("dropped_iterations", "aborted_iterations"):
+        if x.get(key):
+            return f"invalid window: {key}={x[key]}"
+    for group in ("screens", "endpoints"):
+        if not x.get(group):
+            return f"missing {group} samples"
+        for value in x[group].values():
+            problem = latency_problem(value)
+            if problem:
+                return problem
+    return None
+
+
 def latency_cell(per_run, flag, fmt=sig3):
-    """per_run: k6 summary entries (or None) for one screen/endpoint across runs.
-    `fmt` is `n0` for screens, whose source data is whole milliseconds."""
-    return Cell([x["p50"] if x else None for x in per_run], fmt, flag, {
-        "p95": Cell([x["p95"] if x else None for x in per_run], fmt),
-        "p99": Cell([x["p99"] if x else None for x in per_run], fmt),
-        "err": max(((1 - x["ok"]) * 100 for x in per_run if x and x.get("ok") is not None), default=0.0),
+    flag = reasons(flag, *(latency_problem(x) for x in per_run))
+    return Cell([x.get("p50") if x else None for x in per_run], fmt, flag, {
+        "p95": Cell([x.get("p95") if x else None for x in per_run], fmt),
+        "p99": Cell([x.get("p99") if x else None for x in per_run], fmt),
+        "err": max(((1 - x["ok"]) * 100 for x in per_run if x and number(x.get("ok")) and x["ok"] <= 1), default=0.0),
     })
+
+
+# Missing legacy fields may agree with other legacy runs, but not with known values.
+CONDITIONS = ("host", "cpu", "memory_limit", "server_cpus", "client_cpus", "k6",
+              "window_s", "mem_sample_ms", "rate_unloaded", "rate_loaded", "rate_stress",
+              "warmup_s", "settle_s", "steady_s", "restarts", "ttfs_reps",
+              "ids_sha256", "screens_sha256", "seed", "warmup_seed", "slots", "shape_vus", "pools", "workload",
+              "testdata_counts", "user_isolation", "actors", "background_policy", "core_idle_min", "phase_schema", "resource_schema", "streaming_validation", "topology",
+              "sample_bracket_intervals", "sample_gap_intervals", "ready_timeout_s", "drain_timeout_s",
+              "http_timeout_s", "stream_http_timeout_s", "phase_timeout_s", "cleanup_timeout_s")
+
+
+def image_id(d):
+    try:
+        with open(os.path.join(d, "image.txt")) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def server_label(d, server):
+    if server == "ferrofin":
+        return "Ferrofin"
+    info = load(os.path.join(d, "system-info.json")) or {}
+    if info.get("Version"):
+        return f"Jellyfin {info['Version']}"
+    # Archived image.txt starts with repository:tag, followed by the image ID.
+    identity = image_id(d)
+    ref = identity.split()[0] if identity else ""
+    if "@" not in ref and ":" in ref.rsplit("/", 1)[-1] and not ref.startswith("sha256:"):
+        return "Jellyfin " + ref.rsplit(":", 1)[-1]
+    return "Jellyfin (version unknown)"
+
+
+def incompatible(runs, compare_builds=False):
+    metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
+    issues = [key for key in CONDITIONS
+              if len({json.dumps(m.get(key), sort_keys=True) for m in metas}) > 1]
+    for k, _ in SERVERS:
+        ds = [os.path.join(r, k) for r in runs]
+        present = [d for d in ds if os.path.isdir(d)]
+        if not present:
+            continue
+        # A missing server is incomplete evidence, not a different build.
+        if len({frozenset(run_levels(d)) for d in present}) > 1:
+            issues.append(f"{k} load levels")
+        if not (compare_builds and k == "ferrofin") and len({image_id(d) for d in present}) > 1:
+            issues.append(f"{k} image")
+        if k != "ferrofin" and len({server_label(d, k) for d in present}) > 1:
+            issues.append(f"{k} reported version")
+        for lvl in LOAD_LEVELS:
+            xs = [load(os.path.join(d, f"k6-{lvl}.json")) for d in present]
+            for field in ("rate", "duration"):
+                values = {str(x.get(field)) for x in xs if x}
+                if len(values) > 1:
+                    issues.append(f"{k} {lvl} {field}")
+    return sorted(set(issues))
+
+
+def timing_cell(documents, group, metric, metas, repeat_key):
+    vals, problems = [], []
+    for doc, meta in zip(documents, metas):
+        reps = (doc or {}).get(group, [])
+        # Archived v3 runs used five repetitions but did not persist the setting.
+        expected = (doc or {}).get("reps", meta.get(repeat_key, 5))
+        good = [r[metric] for r in reps if number(r.get(metric)) and not r.get("error")]
+        vals.append(statistics.median(good) if good else None)
+        if len(reps) != expected or len(good) != expected:
+            problems.append(f"{group}: {len(good)}/{expected} successful repetitions")
+    return Cell(vals, ms, reasons(*problems))
 
 
 def md_cell(c, notes, source=None, oracle_cell=None):
@@ -322,20 +668,31 @@ def md_cell(c, notes, source=None, oracle_cell=None):
 
 def build(runs):
     """Everything both renderers need, computed once from the run dirs."""
+    if not runs:
+        raise ValueError("no selected runs")
+    problems = incompatible(runs)
+    if problems:
+        raise ValueError("incompatible runs: " + ", ".join(problems))
     metas = [load(os.path.join(r, "run.json")) or {} for r in runs]
     meta = metas[0]
-    servers = [(k, label) for k, label in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
+    servers = [(k, server_label(next(os.path.join(r, k) for r in runs if os.path.isdir(os.path.join(r, k))), k))
+               for k, _ in SERVERS if any(os.path.isdir(os.path.join(r, k)) for r in runs)]
+    oracle_label = dict(servers).get(ORACLE, ORACLE_LABEL)
     per = {k: [os.path.join(r, k) for r in runs] for k, _ in servers}
     shapes = {k: [load_shape(d) for d in ds] for k, ds in per.items()}
-    oracle_shape = shapes[ORACLE][0] if ORACLE in shapes else None
+    oracle_shapes = shapes.get(ORACLE, [None] * len(runs))
+    counts = {k: [load(os.path.join(d, "counts.json")) for d in ds] for k, ds in per.items()}
     missing = []
-    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing}
+    m = {"meta": meta, "runs": runs, "servers": servers, "levels": {}, "missing": missing, "load_problems": [], "oracle_label": oracle_label}
 
+    evidence = {k: [shape_evidence(d, metas[i], shapes[k][i]) if metas[i].get("workload") == 4 else (None, {}, {})
+                    for i, d in enumerate(ds)] for k, ds in per.items()}
+    m["coverage"] = {k: [e[2] or {"unavailable": e[0] or "legacy workload"} for e in es] for k, es in evidence.items()}
     for level in LOAD_LEVELS:
         data = {k: [load(os.path.join(d, f"k6-{level}.json")) for d in ds] for k, ds in per.items()}
         # `windows.json` says the level ran; a missing k6 file then means it failed,
         # which has to be reported. Only a level no run executed disappears silently.
-        ran = any(level in run_levels(d) for ds in per.values() for d in ds)
+        ran = any(level in run_levels(d) or level in (load(os.path.join(d, "phases.json")) or {}) for ds in per.values() for d in ds)
         for k, ds in per.items():
             for d, x in zip(ds, data[k]):
                 if x is None and level in run_levels(d):
@@ -346,18 +703,40 @@ def build(runs):
                 if x:
                     for n in x["endpoints"]:
                         names_of[n.split(":")[0]].add(n)
-        dropped = {k: sum((x or {}).get("dropped_iterations", 0) for x in data[k]) for k in data}
-
+        observed = {k: [selection_problems(os.path.join(d, f"selections-{level}.log"), data[k][i], evidence[k][i][1], metas[i].get("slots"), metas[i])
+                        if metas[i].get("workload") == 4 and not evidence[k][i][0] else {}
+                        for i, d in enumerate(ds)] for k, ds in per.items()}
+        for xs in shapes.values():
+            for shape in xs:
+                for name in shape or {}:
+                    names_of[name.split(":")[0]].add(name)
         def flag(k, names):
-            if dropped.get(k):
-                return f"invalid window: k6 dropped {dropped[k]} iterations"
-            if k == ORACLE:
-                return oracle_failed(oracle_shape, names)
-            return comparable(shapes[k][0], oracle_shape, names)
+            problems = []
+            for i, x in enumerate(data[k]):
+                problems.append(window_problem(x))
+                for server in {k, ORACLE} & per.keys():
+                    problems.append(isolation_problem(per[server][i], metas[i], ["shape", f"warmup-{level}", level]))
+                    problems.append(phase_problem(per[server][i], metas[i], ["startup", "startup-drain", "shape", f"drain-{level}", f"warmup-{level}", level]))
+                for server in {k, ORACLE} & evidence.keys():
+                    problems.append(evidence[server][i][0])
+                    for name in names:
+                        scr = name.split(":")[0]
+                        problems.append(observed[server][i].get(scr))
+                        if scr == "image":
+                            problems.extend(observed[server][i].values())
+                    for rec in evidence[server][i][1].values():
+                        if not rec.get("ok") and any(n.startswith(rec.get("screen", "") + ":") or n == "image" for n in names):
+                            problems.append("shape dependency failed")
+                problems.append(oracle_failed(oracle_shapes[i], names, oracle_label) if k == ORACLE else
+                                comparable(shapes[k][i], oracle_shapes[i], names, oracle_label))
+                if k != ORACLE:
+                    problems.append(window_problem(data.get(ORACLE, [None] * len(runs))[i]))
+                # Inventory is diagnostic only. Request-level counts and shapes above
+                # determine whether a latency cell represents comparable work.
+            return reasons(*problems)
 
-        # a screen row is judged on its API requests; poster fetches ('image') show up in the
-        # image endpoint row and in err%, and the list endpoints' ImageTags superset check
-        # already proves the same posters exist on every server
+        # Legacy logs do not associate poster observations with a screen. Keep their
+        # image verdict separate; the bounded-slot producer will supply that identity.
         screens = [(scr, {k: latency_cell([x["screens"].get(scr) if x else None for x in data[k]], flag(k, sorted(names_of[scr])), n0)
                           for k, _ in servers}) for scr in SCREENS]
         names = [n for scr in SCREENS for n in sorted(names_of[scr])] + (["image"] if "image" in names_of else [])
@@ -370,40 +749,52 @@ def build(runs):
             rates = {r["rate_" + level] for r in metas if r.get("rate_" + level) is not None}
             rate = rates.pop() if len(rates) == 1 else ("?" if not rates else
                                                         "/".join(str(x) for x in sorted(rates)))
+            for k, xs in data.items():
+                for i, x in enumerate(xs):
+                    if problem := window_problem(x):
+                        m["load_problems"].append(f"{os.path.basename(runs[i])}/{k}/{level}: {problem}")
             m["levels"][level] = {"rate": rate, "screens": screens,
-                                  "endpoints": endpoints, "any_data": True}
+                                  "endpoints": endpoints, "any_data": True,
+                                  "image_bytes": {k: [x.get("image_bytes") if x else None for x in xs] for k, xs in data.items()}}
 
     # time to first screen
-    cold, hls, direct, turl = {}, {}, {}, {}
+    cold, hls, direct, streams = {}, {}, {}, {}
     for k, ds in per.items():
         cs = [load(os.path.join(d, "coldstart.json")) for d in ds]
         if any(c is None for c in cs):
             missing.append(f"{k}: coldstart.json")
-        cold[k] = Cell([statistics.median([r["home_ms"] for r in c["runs"] if r["home_ms"]]) if c and any(r["home_ms"] for r in c["runs"]) else None for c in cs], ms)
+        cold[k] = timing_cell(cs, "runs", "home_ms", metas, "restarts")
         ts = [load(os.path.join(d, "ttfs.json")) for d in ds]
         if any(t is None for t in ts):
             missing.append(f"{k}: ttfs.json")
-        errs = [h["error"] for t in ts if t for h in t["hls"] if "error" in h]
-        # fewer successful reps than specified is different work, so failures flag the cell
-        hls[k] = Cell([statistics.median([h["ttfs_ms"] for h in t["hls"] if "ttfs_ms" in h]) if t and any("ttfs_ms" in h for h in t["hls"]) else None for t in ts], ms,
-                      f"{len(errs)} rep(s) failed: {errs[0][:60]}" if errs else None)
-        direct[k] = Cell([statistics.median([h["ttfb_ms"] for h in t["direct"] if "ttfb_ms" in h]) if t and any("ttfb_ms" in h for h in t["direct"]) else None for t in ts], ms)
-        for t in ts:
-            for h in (t or {}).get("hls", []):
-                if h.get("transcoding_url"):
-                    # ffmpeg-relevant parameters only: session/auth/tag identify the request and
-                    # TranscodeReasons is informational (it differs between versions without changing an ffmpeg argument)
-                    turl[k] = sorted(p.lower() for p in h["transcoding_url"].split("?")[-1].split("&")
-                                     if p and not p.lower().startswith(TRANSCODE_NOISE))
-                    break
-    if ORACLE in turl:
-        for k in turl:
-            if k != ORACLE and turl[k] != turl[ORACLE]:
-                diff = sorted(set(turl[k]) ^ set(turl[ORACLE]))
-                reason = f"transcode parameters differ: {', '.join(diff)[:200]}"
-                hls[k].flag = f"{hls[k].flag}; {reason}" if hls[k].flag else reason
-    m["ttfs"] = [("cold start (restart → home screen)", cold), ("HLS first segment (forced transcode)", hls), ("direct-play TTFB (1 MiB range)", direct)]
+        hls[k] = timing_cell(ts, "hls", "ttfs_ms", metas, "ttfs_reps")
+        direct[k] = timing_cell(ts, "direct", "ttfb_ms", metas, "ttfs_reps")
+        streams[k] = ts
+        for group, cell, phase_name in (("runs", cold[k], "coldstart"), ("hls", hls[k], "ttfs"), ("direct", direct[k], "ttfs")):
+            for i, d in enumerate(ds):
+                cell.flag = reasons(cell.flag, phase_problem(d, metas[i], ["startup", "startup-drain", phase_name]),
+                                    isolation_problem(d, metas[i], [phase_name]))
+                if group != "runs":
+                    cell.flag = reasons(cell.flag, streaming_problem(ts[i], metas[i], group))
+    if ORACLE in streams:
+        for k, docs in streams.items():
+            for i, doc in enumerate(docs):
+                reps = (doc or {}).get("hls", [])
+                expected = (streams[ORACLE][i] or {}).get("hls", [])
+                for j, rep in enumerate(reps):
+                    if j >= len(expected):
+                        hls[k].flag = reasons(hls[k].flag, "missing oracle transcode repetition")
+                        continue
+                    if transcode_parameters(rep) != transcode_parameters(expected[j]):
+                        hls[k].flag = reasons(hls[k].flag, f"transcode parameters differ (run {i+1}, rep {j+1})")
+                    if metas[i].get("streaming_validation") and rep.get("output") != expected[j].get("output"):
+                        hls[k].flag = reasons(hls[k].flag, f"first-segment properties differ (run {i+1}, rep {j+1})")
+                    if reps and (transcode_parameters(rep) != transcode_parameters(reps[0]) or rep.get("output") != reps[0].get("output")):
+                        hls[k].flag = reasons(hls[k].flag, "transcode work differs between repetitions")
+    m["ttfs"] = [("cold start (restart → authenticated views; host caches retained)", cold), ("HLS first segment (forced transcode)", hls), ("direct-play TTFB (1 MiB range)", direct)]
 
+    m["phases"] = {k: [load(os.path.join(d, "phases.json")) for d in ds] for k, ds in per.items()}
+    m["resources"] = {k: [resource_windows(d, metas[i]) for i, d in enumerate(ds)] for k, ds in per.items()}
     # memory
     mems = {k: [mem_numbers(d) for d in ds] for k, ds in per.items()}
     for k, x in mems.items():
@@ -416,17 +807,21 @@ def build(runs):
                for k, ds in per.items()}
     mixed = None if same_load_shape([d for ds in per.values() for d in ds]) else (
         "runs measured different load levels, so this row mixes two definitions")
-    peak = {}
+    peak, memory_flags = {}, {}
     for k, ds in per.items():
-        bad = [x for x in windows[k] if x is None or x.get("dropped_iterations")]
+        bad = [window_problem(x) for x in windows[k] if window_problem(x)]
+        resource_bad = [phase_problem(d, metas[i], ["startup", "startup-drain", "sampler"]) for i, d in enumerate(ds)]
+        resource_bad += [isolation_problem(d, metas[i], [name for level in run_levels(d) for name in (f"warmup-{level}", level)]) for i, d in enumerate(ds)]
+        resource_bad += [r.get("error") for i, windows in enumerate(m["resources"][k]) if metas[i].get("resource_schema") for r in windows.values()]
+        memory_flags[k] = reasons(mixed, *bad, *resource_bad)
         # the peak is only meaningful if the loaded window that produced it was the specified load
         peak[k] = Cell([(x or {}).get("peak") for x in mems[k]], mib,
-                       mixed or ("a load window is missing or dropped iterations" if bad else None),
+                       memory_flags[k],
                        unit="MiB")
     pct = lambda v: f"{v * 100:.0f}%"
     m["memory"] = [
         ("peak under load", peak),
-        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, mixed, unit="MiB")
+        ("steady idle", {k: Cell([(x or {}).get("steady") for x in mems[k]], mib, memory_flags[k], unit="MiB")
                          for k, _ in servers}),
         # interference and swap describe the host while that server ran, not the server
         ("interference on the server's cores, p95", {k: Cell([(x or {}).get("interference_p95") for x in mems[k]], pct, unit="%", context=True) for k, _ in servers}),
@@ -435,30 +830,71 @@ def build(runs):
     ]
     m["sample_ms"] = meta.get("mem_sample_ms", "?")
 
-    # the work list: every divergence from the oracle, per server
-    counts = {k: [load(os.path.join(d, "counts.json")) for d in ds] for k, ds in per.items()}
+    # Retain divergences from every repetition, with deterministic de-duplication.
     work = {}
     for k, _ in servers:
-        if k == ORACLE or not shapes[k][0] or not oracle_shape:
+        if k == ORACLE:
             continue
-        items = []
-        for n in sorted(oracle_shape):
-            r = comparable(shapes[k][0], oracle_shape, [n])
-            if r and " failed (" not in r:  # the oracle's own failures are not this server's work
-                items.append(r)
-        if counts[k][0] and counts[ORACLE][0] and counts[k][0] != counts[ORACLE][0]:
-            for n in counts[ORACLE][0]:
-                if counts[k][0].get(n) != counts[ORACLE][0].get(n):
-                    items.append(f"count {n}: {counts[k][0].get(n)} vs {counts[ORACLE][0].get(n)}")
-        work[k] = items
+        items = set()
+        for i, oracle in enumerate(oracle_shapes):
+            for n in sorted(oracle or {}):
+                problem = comparable(shapes[k][i], oracle, [n], oracle_label)
+                if problem:
+                    items.add(problem)
+            a, b = counts[k][i], counts.get(ORACLE, [None] * len(runs))[i]
+            if not a or not b:
+                items.add("missing counts.json")
+            else:
+                for n in sorted(set(a) | set(b)):
+                    if a.get(n) != b.get(n):
+                        items.add(f"count {n}: {a.get(n)} vs {b.get(n)}")
+        work[k] = sorted(items)
     m["work"] = work
-    m["oracle_failures"] = [n for n in sorted(oracle_shape or {}) if oracle_failed(oracle_shape, [n])]
-    m["work_total"] = len(oracle_shape or {}) - len(m["oracle_failures"])
+    all_names = set().union(*(set(x or {}) for x in oracle_shapes))
+    m["oracle_failures"] = sorted(n for n in all_names if any(oracle_failed(x, [n], oracle_label) for x in oracle_shapes))
+    m["work_total"] = len(all_names) - len(m["oracle_failures"])
+
     return m
+
+
+def cpu_tables(m):
+    """Keep each repetition and its resource validity visible, including missing data."""
+    cpu, coverage = [], []
+    for i, _ in enumerate(m["runs"]):
+        for window in (*LOAD_LEVELS, "steady"):
+            records = {k: m["resources"][k][i].get(window, {}) for k, _ in m["servers"]}
+            if not any(records.values()):
+                continue
+            label = f"{window} · run {i + 1}"
+            values, details = {}, {}
+            for k, _ in m["servers"]:
+                r = records[k]
+                phases = m["phases"][k][i] or {}
+                failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
+                            for name in ("startup", "startup-drain", "sampler", window)
+                            if name in phases and phases[name].get("status") != "completed"]
+                problem = reasons(r.get("error"), *failures)
+                seconds = r.get("cpu_seconds")
+                values[k] = (f"{seconds:.3f}" if number(seconds) else "unavailable") + (" ⚠" if problem else "")
+                start, end = r.get("observed_start"), r.get("observed_end")
+                stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
+                details[k] = {
+                    "Observed duration (s)": f"{end-start:.3f}" if number(start) and number(end) else "unavailable",
+                    "Samples": str(r.get("samples", 0)),
+                    "Largest gap (ms)": f"{r['max_gap_s']*1000:.3f}" if number(r.get("max_gap_s")) else "unavailable",
+                    "Observed start (UTC)": stamp(start),
+                    "Observed end (UTC)": stamp(end),
+                    "CPU evidence": "⚠ " + problem if problem else ("available" if number(seconds) else "unavailable — no cumulative CPU counters"),
+                }
+            cpu.append((label, values))
+            for metric in next(iter(details.values())):
+                coverage.append((f"{label} · {metric}", {k: d[metric] for k, d in details.items()}))
+    return [("CPU consumption (CPU-seconds)", cpu), ("CPU sample coverage", coverage)]
 
 
 # ── markdown (the README tables) ────────────────────────────────────────────
 def render_md(m):
+    oracle_label = m["oracle_label"]
     meta, servers, out = m["meta"], m["servers"], []
     notes = Notes()
     p = out.append
@@ -468,9 +904,9 @@ def render_md(m):
       + " · ".join(f"{lvl} {m['levels'][lvl]['rate']} screens/s" for lvl in LOAD_LEVELS if lvl in m["levels"]))
     p("Cells are the median across runs"
       + ("; where the runs disagreed, the range they spanned follows in brackets" if len(m["runs"]) > 1 else "")
-      + f". `⚠[n]` means the server did different work than {ORACLE_LABEL} (status / record count / "
+      + f". `⚠[n]` means the server did different work than {oracle_label} (status / record count / "
       "missing fields), so the number is not comparable: it is kept for the work list, not for publication, "
-      f"and note `n` says why. `X.Y× faster` compares the cell with {ORACLE_LABEL} on the same row. It is "
+      f"and note `n` says why. `X.Y× faster` compares the cell with {oracle_label} on the same row. It is "
       "shown on flagged cells too — the note says the two servers did not do identical work, so read it as "
       "an indication rather than a like-for-like result.\n")
     head = "| {} | " + " | ".join(f"{label} p50 / p95 / p99 ms (err)" for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1)
@@ -488,6 +924,22 @@ def render_md(m):
                 md_cell(cells[k], notes, f"{lbl} · {name} ({level} endpoints)",
                         cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
         p("")
+        p("Image response bytes (diagnostic, per run): " + "; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers) + "\n")
+    for k, coverage in m["coverage"].items():
+        p(f"Shape coverage — {dict(servers)[k]}: `{json.dumps(coverage)}`\n")
+    p("### CPU and sample coverage — invocation and idle windows\n")
+    p("CPU seconds use cumulative counters at the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable.\n")
+    p("Each row retains its individual run; these are diagnostic observations, not speedup claims. See the latency/work flags for differences in executed work.\n")
+    for title, rows in cpu_tables(m):
+        p(f"#### {title}\n")
+        p("| Window / metric | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
+        for label, cells in rows:
+            escape = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
+            p("| " + escape(label) + " | " + " | ".join(escape(cells[k]) for k, _ in servers) + " |")
+        p("")
+    p("### Phase outcomes\n")
+    for k, phases in m["phases"].items():
+        p(f"**{dict(servers)[k]}**: `{json.dumps(phases)}`\n")
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["ttfs"]:
@@ -501,14 +953,14 @@ def render_md(m):
             md_cell(cells[k], notes, f"{lbl} · {name} (memory)",
                     cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
     if m["work"]:
-        p(f"\n### Response shape vs {ORACLE_LABEL} (supporting evidence, not the parity number)\n")
+        p(f"\n### Response shape vs {oracle_label} (supporting evidence, not the parity number)\n")
         for k, items in m["work"].items():
             p(f"**{k}**: {len(items)} divergence(s) across {m['work_total']} compared requests")
             for it in items:
                 p(f"- {it}")
             p("")
     if m["oracle_failures"]:
-        p(f"**{ORACLE_LABEL} failed**: " + ", ".join(m["oracle_failures"]) + "\n")
+        p(f"**{oracle_label} failed**: " + ", ".join(m["oracle_failures"]) + "\n")
     if m["missing"]:
         p("### Missing phases\n")
         for x in sorted(set(m["missing"])):
@@ -533,14 +985,14 @@ README_LEVEL = "loaded"
 #: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
 #: excluded on purpose: the three servers pick different transcode parameters, so no two
 #: of them are comparable. The interference/swap rows describe the run, not the server.
-README_TTFS = ("cold start (restart → home screen)", "direct-play TTFB (1 MiB range)")
+README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "direct-play TTFB (1 MiB range)")
 README_MEMORY = ("peak under load", "steady idle")
 
 
 
 def _ratio(c, oracle_cell):
     """theirs/mine as a float, or None — the number behind `speedup()`'s sentence."""
-    if c is None or oracle_cell is None or c.context:
+    if c is None or oracle_cell is None or c.context or c.flag or oracle_cell.flag:
         return None
     mine, theirs = displayed(c), displayed(oracle_cell)
     return theirs / mine if mine and theirs else None
@@ -551,7 +1003,10 @@ def render_readme(m, run_dirs):
     "Ferrofin vs oracle" column, the per-endpoint range sentence, the spread sentence
     computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
     everything inside the markers is generated — edit the prose here, not in the README."""
+    oracle_label = m["oracle_label"]
     meta, servers = m["meta"], m["servers"]
+    if "ferrofin" not in dict(servers):
+        raise ValueError("README comparison requires Ferrofin")
     lv = m["levels"].get(README_LEVEL)
     if not lv:
         sys.exit(f"the runs have no '{README_LEVEL}' level; the README section needs it")
@@ -564,36 +1019,45 @@ def render_readme(m, run_dirs):
     cmd = "python3 bench/report.py --readme README.md " + " ".join(f"bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
     p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
     cpus = str(meta.get("server_cpus", ""))
-    ncores = sum(int(b) - int(a) + 1 if "-" in part else 1 for part in cpus.split(",") if part for a, b in [part.split("-")] ) if cpus and all(x.replace("-", "").isdigit() for x in cpus.split(",")) else "?"
+    try:
+        ncores = sum(int(part.split("-")[-1]) - int(part.split("-")[0]) + 1 for part in cpus.split(","))
+    except ValueError:
+        ncores = "?"
     limit = str(meta.get("memory_limit", "?")).replace("g", " GiB")
     article = "an" if limit[:1] in "8aeiou" else "a"
-    p(f"Ferrofin `{tag}` against **{servers[0][1]}** and **{servers[1][1]}**, measured {meta.get('date', '')[:10]} "
+    opponents = " and ".join(f"**{label}**" for k, label in servers if k != "ferrofin")
+    comparison = f" against {opponents}" if opponents else " (no Jellyfin reference selected)"
+    p(f"Ferrofin `{tag}`{comparison}, measured {meta.get('date', '')[:10]} "
       f"on one machine ({meta.get('cpu', '?').replace(' 16-Core Processor', '')}), each server alone in a container pinned to "
-      f"{ncores} dedicated cores with {article} {limit} limit and no swap, over the same library of "
-      f"{tc.get('movies', '?'):,} movies, {tc.get('series', '?'):,} series and {tc.get('episodes', '?'):,} episodes. "
-      f"Every figure is the **median of {nruns} full run{'s' if nruns != 1 else ''}**. No request failed on any server at any load level.\n")
-    p(f"The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that "
-      f"screen, replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). Latency reads "
-      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {ORACLE_LABEL}.\n")
+      f"{ncores} logical CPUs with {article} {limit} limit, over a fixture of "
+      f"{tc.get('movies', '?')} movies, {tc.get('series', '?')} series and {tc.get('episodes', '?')} episodes. "
+      f"Published figures are medians across {nruns} selected run{'s' if nruns != 1 else ''}; "
+      "incomplete or non-comparable cells are withheld.")
+    if m.get("load_problems"):
+        p("Measured load windows contain failures or incomplete evidence; see the full report.\n")
+    else:
+        p("No measured request failed in the recorded load windows (" + ", ".join(m["levels"]) + ").\n")
+    p(f"The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, "
+      f"replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). They include "
+      "API and poster requests, not browser rendering. Latency reads "
+      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {oracle_label}.\n")
     # ── headline table ──
-    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {ORACLE_LABEL.split()[1]} |")
+    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {oracle_label.split()[1]} |")
     p("|---|" + "---|" * (len(servers) + 1))
 
     def row(name, cells, label_md, unit_suffix=""):
         cols = []
-        for k, _ in servers:
+        for k, label in servers:
             c = cells[k]
-            # `value()` already carries the unit for single-number cells; latency
-            # cells print p50 / p95 / p99 with the unit named in the intro sentence.
-            txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
+            if c.flag or not c.vals:
+                reason = c.flag or "missing measurement"
+                txt = f"— ⚠[{notes.add(reason, f'{label}: {name}')}]"
+            else:
+                txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
             cols.append(f"**{txt}**" if k == "ferrofin" else txt)
         f, o = cells["ferrofin"], cells.get(ORACLE)
-        sp = speedup(f, o) or "—"
-        mark = ""
-        if provisional(f, o):
-            n = notes.add((f.flag or o.flag), f"{name}")
-            mark = f" ⚠[{n}]"
-        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp}**{mark} |")
+        sp = speedup(f, o) if _ratio(f, o) is not None else None
+        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp or '—'}** |")
 
     for name, cells in lv["screens"]:
         row(name, cells, f"**{name}** screen")
@@ -607,19 +1071,21 @@ def render_readme(m, run_dirs):
     eps = [(name, _ratio(cells["ferrofin"], cells.get(ORACLE))) for name, cells in lv["endpoints"]]
     eps = [(n, r) for n, r in eps if r]
     if eps:
-        lo, hi = min(eps, key=lambda x: x[1]), max(eps, key=lambda x: x[1])
-        p(f"Per endpoint, same level and runs, Ferrofin is faster than {ORACLE_LABEL} on all {len(eps)} "
-          f"compared requests, from {lo[1]:.1f}× (`{lo[0]}`) to {hi[1]:.1f}× (`{hi[0]}`); the full three-server "
-          f"table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
-    # ── notes on marked rows ──
+        ties = sum(f"{r:.1f}" == "1.0" for _, r in eps)
+        wins = sum(r > 1 and f"{r:.1f}" != "1.0" for _, r in eps)
+        losses = len(eps) - wins - ties
+        p(f"Among {len(eps)} comparable endpoint measurements at this level, Ferrofin is faster on "
+          f"{wins}, about the same on {ties}, and slower on {losses} against {oracle_label}. "
+          "Flagged or missing endpoints are excluded from these counts. The full tables are in "
+          "[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
+    else:
+        p("No endpoint speed comparisons have complete, comparable evidence in this selection.\n")
     if notes:
-        p("⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather "
-          "than a like-for-like result:\n")
+        p("⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. "
+          "Raw diagnostic numbers remain in the full report.\n")
         for n, text, sources in notes.items:
             p(f"{n}. {', '.join(sources)}: {text}")
         p("")
-        p(f"Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows "
-          f"up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.\n")
     # ── spread sentence, computed ──
     def moved(part):
         return len(part.vals) > 1 and part.median and (max(part.vals) - min(part.vals)) > 0.15 * part.median
@@ -784,7 +1250,7 @@ def speedup(c, oracle_cell):
     return f"{ratio:.1f}× {better}" if ratio > 1 else f"{1 / ratio:.1f}× {worse}"
 
 
-def ratio_html(c, oracle_cell):
+def ratio_html(c, oracle_cell, oracle_label=ORACLE_LABEL):
     """The speedup against the oracle, for a table cell. A caveated one is muted rather
     than green and says so on hover, so a win that is not like for like never reads as
     a clean one."""
@@ -794,7 +1260,7 @@ def ratio_html(c, oracle_cell):
     caveat = provisional(c, oracle_cell)
     won = "faster" in text or "lighter" in text
     cls = "ratio provisional" if caveat else ("ratio win" if won else "ratio")
-    title = f"vs {ORACLE_LABEL}" + (" — not like for like, see the note" if caveat else "")
+    title = f"vs {oracle_label}" + (" — not like for like, see the note" if caveat else "")
     return f"<span class='{cls}' title='{html.escape(title)}'>{html.escape(text)}</span>"
 
 
@@ -811,7 +1277,7 @@ def comparable_levels(m, base):
     meaning across that boundary — "peak under load" spans a heavier set of windows and
     "steady idle" follows a different last window — so a delta between them would report
     a definition change as a regression."""
-    return base is None or set(m["levels"]) == set(base["levels"])
+    return base is None or not incompatible(m["runs"] + base["runs"], compare_builds=True)
 
 
 def delta_html(c, base):
@@ -827,7 +1293,7 @@ def delta_html(c, base):
     return f"<span class='delta {cls}' title='vs baseline {base.fmt(base.median)}'>{ch:+.0f}%</span>"
 
 
-def td_html(c, oracle_cell, base, notes, source=None):
+def td_html(c, oracle_cell, base, notes, source=None, oracle_label=ORACLE_LABEL):
     """One table cell: the numbers, then markers. The spread lands in the hover text
     and the comparability reason in a numbered note, because inline they made a
     three-server table unreadable."""
@@ -845,7 +1311,7 @@ def td_html(c, oracle_cell, base, notes, source=None):
         body += " <span class='tail'>/</span> " + one(part, "tail")
     if c.sub.get("err", 0) > 0:
         body += f" <span class='err'>{c.sub['err']:.2f}% err</span>"
-    body += ratio_html(c, oracle_cell) + delta_html(c, base)
+    body += ratio_html(c, oracle_cell, oracle_label) + delta_html(c, base)
     cls = "num"
     if c.flag:
         cls += " flagged"
@@ -877,7 +1343,8 @@ def table_html(first, rows, servers, base_rows, notes, where=""):
     for name, cells in rows:
         bcells = base_rows.get(name, {}) if base_rows else {}
         tds = "".join(td_html(cells[k], cells.get(ORACLE) if k != ORACLE else None, bcells.get(k), notes,
-                              f"{lbl} · {name}" + (f" ({where})" if where else ""))
+                              f"{lbl} · {name}" + (f" ({where})" if where else ""),
+                              oracle_label=dict(servers).get(ORACLE, ORACLE_LABEL))
                       for k, lbl in servers)
         body.append(f"<tr><th>{e(name)}</th>{tds}</tr>")
     return f"<div class='scroll'><table><thead><tr><th>{e(first)}</th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
@@ -901,6 +1368,9 @@ def prewalk_notes(m, notes):
 
 
 def render_html(m, base=None, picker=""):
+    oracle_label = m["oracle_label"]
+    if base and not comparable_levels(m, base):
+        raise ValueError("incompatible baseline conditions or oracle build")
     e = html.escape
     notes = Notes()
     prewalk_notes(m, notes)
@@ -919,9 +1389,9 @@ def render_html(m, base=None, picker=""):
              + (", and where those runs disagreed you can hover a cell for the range they spanned"
                 if len(m["runs"]) > 1 else "")
              + ". An amber cell is <em>not comparable</em>: "
-             f"the server did different work than {ORACLE_LABEL} — the number stays for the work list, not for the README, "
+             f"the server did different work than {oracle_label} — the number stays for the work list, not for the README, "
              "and the superscript points at the reason under Notes. "
-             f"<b>X.Y× faster</b> compares the cell with {ORACLE_LABEL} on the same row (memory says lighter); "
+             f"<b>X.Y× faster</b> compares the cell with {oracle_label} on the same row (memory says lighter); "
              "on an amber cell it is shown in amber italics, because the two servers did not do identical work. "
              "A coloured % is the change against the baseline run.</p>",
              f"<p class='meta'>{e(meta.get('date', '')[:16].replace('T', ' '))} UTC · {e(meta.get('cpu', '?'))} · server cores {e(str(meta.get('server_cpus', '?')))} · "
@@ -936,7 +1406,7 @@ def render_html(m, base=None, picker=""):
             c = cells[k]
             val = sig3(c.median) if c.median is not None else "—"
             unit = c.unit
-            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
+            extra = ratio_html(c, cells.get(ORACLE) if k != ORACLE else None, oracle_label) + delta_html(c, (base_ttfs.get(name) or base_mem.get(name) or {}).get(k))
             why = ""
             if c.flag:
                 n = notes.add(c.flag, f"{lbl} · {name} (headline)")
@@ -955,20 +1425,29 @@ def render_html(m, base=None, picker=""):
         bl = base_l.get(level, {})
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
+        parts.append("<p>Image response bytes (diagnostic, per run): " + e("; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers)) + "</p>")
+    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable. Each row retains its individual run; these are diagnostic observations, not speedup claims. See latency/work flags for differences in executed work.</p>")
+    for title, rows in cpu_tables(m):
+        head = "".join(f"<th>{e(label)}</th>" for _, label in servers)
+        body = "".join("<tr><th>" + e(label) + "</th>" + "".join(
+            f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
+        parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
+    parts.append("<h2>Phase outcomes</h2><pre>" + e(json.dumps(m["phases"], indent=2)) + "</pre>")
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
     mem_note = "" if comparable_levels(m, base) else (
         "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
         "memory rows: <em>peak under load</em> spans a different set of windows and "
         "<em>steady idle</em> follows a different one, which would read as a regression.</p>")
+    parts.append("<p>Shape coverage: " + e(json.dumps(m["coverage"])) + "</p>")
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
                  + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
-        parts.append(f"<h2>The work list — divergences from {ORACLE_LABEL}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
+        parts.append(f"<h2>The work list — divergences from {oracle_label}</h2><p class='lede'>From the shape pass (status, record count, field set) and the item counts. Each is a server fix or a recorded, accepted divergence.</p>")
         for k, items in m["work"].items():
             lis = "".join(f"<li>{e(it)}</li>" for it in items)
             parts.append(f"<div class='work'><h3>{e(dict(servers)[k])} <span class='n'>{len(items)} divergence(s) across {m['work_total']} compared requests</span></h3><ul>{lis}</ul></div>")
     if m["oracle_failures"]:
-        parts.append(f"<p class='lede'><b>{ORACLE_LABEL} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
+        parts.append(f"<p class='lede'><b>{oracle_label} failed</b>: " + e(", ".join(m["oracle_failures"])) + "</p>")
     if m["missing"]:
         parts.append("<h2>Missing phases</h2><ul>" + "".join(f"<li>{e(x)}</li>" for x in sorted(set(m["missing"]))) + "</ul>")
     parts.append(notes_html(notes))
@@ -1028,7 +1507,7 @@ def serve(port, runs_dir):
                 else:
                     body = f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main><h1>Ferrofin benchmark runs</h1>{picker}</main></body></html>"
             except Exception as ex:  # a run still being written, or a malformed file: say which, keep the picker
-                status = 500
+                status = 400 if isinstance(ex, ValueError) else 500
                 body = (f"<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Ferrofin Benchmark</title><style>{CSS}</style></head><body><main>"
                         f"<h1>Could not render {html.escape(', '.join(sel))}</h1><p class='lede'>{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — "
                         f"a run that is still in progress renders once it finishes.</p>{picker}</main></body></html>")
@@ -1052,6 +1531,31 @@ def serve(port, runs_dir):
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "--resource-check":
+        d = args[1]
+        windows = resource_windows(d, load(os.path.join(os.path.dirname(d), "run.json")) or {})
+        print("  resources: " + json.dumps(windows))
+        if not windows or any(r.get("error") for r in windows.values()):
+            raise ValueError("resource coverage incomplete")
+        return
+    if args and args[0] == "--window-check":
+        if problem := window_problem(load(args[1])):
+            raise ValueError(problem)
+        return
+    if args and args[0] == "--shape-coverage":
+        d = args[1]
+        summary = load(os.path.join(d, "shape-summary.json")) or {}
+        meta = load(os.path.join(os.path.dirname(d), "run.json")) or summary
+        problem, _, coverage = shape_evidence(d, meta, load_shape(d))
+        if problem:
+            raise ValueError(problem)
+        print("  coverage: " + json.dumps(coverage))
+        shape = load_shape(d)
+        if problem := oracle_failed(shape, list(shape or {}), os.path.basename(os.path.normpath(d))):
+            raise ValueError(problem)
+        if any(not r.get("ok") for r in selection_records(os.path.join(d, "shape.log"))):
+            raise ValueError("shape dependency failed")
+        return
     if args and args[0] == "--serve":
         port = int(args[1]) if len(args) > 1 and args[1].isdigit() else 8097
         runs_dir = args[2] if len(args) > 2 else (args[1] if len(args) > 1 and not args[1].isdigit() else os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs"))
@@ -1085,4 +1589,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        sys.exit(str(error))
