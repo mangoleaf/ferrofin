@@ -19,6 +19,18 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
   - DTO work in `ferrofin-model`: `jq '.components.schemas.<Type>' contracts/jellyfin-openapi-10.11.8.json`
     is the oracle for field names, casing and nullability.
 
+## `jellyfin-openapi-12.1.0.json`
+
+- **What:** the spec of the latest Jellyfin, **12.1.0** (OpenAPI 3.0.4, 294 paths,
+  364 operations), as published at
+  `https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json` (Jellyfin's own
+  generated spec for the stable release; `info.version` is `12.1.0`).
+- **Captured:** 2026-10-03.
+- **Used by:** the `items_query_binds_every_contract_parameter` guard in
+  `crates/ferrofin-api/src/handlers/items.rs`, which checks `GET /Items` parameters
+  against the union of both contracts — 12.1.0 adds `audioLanguages` and
+  `subtitleLanguages` to 10.11.8's 86. It is not the route gate's pin (see below).
+
 ## Why 10.11.8 and not 12.0
 
 Two different pins, both deliberate. The **contract** is 10.11.8 because that is the API

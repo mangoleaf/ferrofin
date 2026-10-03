@@ -1454,7 +1454,8 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
 }
 
 /// Appends the `ItemValues`-backed predicates: genres, genre ids, studios, studio
-/// ids, artist ids, album-artist ids, tags, and exclude-tags.
+/// ids, artist ids, album-artist ids, contributing-artist ids, tags, and
+/// exclude-tags.
 ///
 /// Each is an `EXISTS`/`NOT EXISTS` over `ItemValuesMap ⨝ ItemValues` filtered by
 /// the value `Type` discriminant (mirrors the C# `e.ItemValues!.Any(…)`).
@@ -1488,6 +1489,23 @@ fn append_item_value_predicates(
             &[ItemValueType::AlbumArtist],
             &filter.album_artist_ids,
             false,
+        );
+    }
+    // A contributing artist is credited on the item (`Artist`) but is not one
+    // of its album artists (TranslateQuery.cs:627-640) — the artist page's
+    // "Appears On" section.
+    if !filter.contributing_artist_ids.is_empty() {
+        push_referenced_item(
+            qb,
+            &[ItemValueType::Artist],
+            &filter.contributing_artist_ids,
+            false,
+        );
+        push_referenced_item(
+            qb,
+            &[ItemValueType::AlbumArtist],
+            &filter.contributing_artist_ids,
+            true,
         );
     }
     if !filter.exclude_artist_ids.is_empty() {

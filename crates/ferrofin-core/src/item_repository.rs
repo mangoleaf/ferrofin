@@ -2732,6 +2732,82 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    /// The artist id filters over one artist's albums (TranslateQuery.cs:
+    /// 617-650): `ArtistIds` is any credit, `AlbumArtistIds` the albums the
+    /// artist leads (the artist page's Albums), `ContributingArtistIds` the
+    /// albums crediting the artist under someone else's name (Appears On) and
+    /// `ExcludeArtistIds` every album not crediting the artist.
+    #[tokio::test]
+    async fn artist_id_filters_split_an_artists_albums() {
+        async fn albums(
+            repository: &FerrofinItemRepository,
+            filter: InternalItemsQuery,
+        ) -> Vec<String> {
+            let rows = repository
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::MusicAlbum],
+                    ..filter
+                })
+                .await
+                .unwrap();
+            let mut names: Vec<String> = rows.into_iter().filter_map(|row| row.name).collect();
+            names.sort();
+            names
+        }
+
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (alpha, beta) = (Uuid::from_u128(0xAA01), Uuid::from_u128(0xAA02));
+        for (id, name) in [(alpha, "Alpha"), (beta, "Beta")] {
+            seed_named_item(&db, id, BaseItemKind::MusicArtist, name).await;
+            set_clean_name(&db, id, &name.to_lowercase()).await;
+        }
+        for (id, name, album_artist, artists) in [
+            (0xAA10, "Own", "Alpha", &["Alpha"][..]),
+            (0xAA11, "Featured", "Beta", &["Beta", "Alpha"][..]),
+            (0xAA12, "Other", "Beta", &["Beta"][..]),
+        ] {
+            let album = Uuid::from_u128(id);
+            seed_named_item(&db, album, BaseItemKind::MusicAlbum, name).await;
+            seed_item_value(&db, album, ItemValueType::AlbumArtist, album_artist).await;
+            for artist in artists {
+                seed_item_value(&db, album, ItemValueType::Artist, artist).await;
+            }
+        }
+
+        let by = |ids: fn(&mut InternalItemsQuery) -> &mut Vec<Uuid>, artist: Uuid| {
+            let mut filter = InternalItemsQuery::default();
+            ids(&mut filter).push(artist);
+            filter
+        };
+        assert_eq!(
+            albums(&repository, InternalItemsQuery::default()).await,
+            ["Featured", "Other", "Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.artist_ids, alpha)).await,
+            ["Featured", "Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.album_artist_ids, alpha)).await,
+            ["Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.contributing_artist_ids, alpha)).await,
+            ["Featured"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.exclude_artist_ids, alpha)).await,
+            ["Other"]
+        );
+        // Beta leads every album crediting Beta, so it appears on none.
+        assert!(
+            albums(&repository, by(|q| &mut q.contributing_artist_ids, beta))
+                .await
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn parental_rating_filters_lists_counts_and_linked_containers() {
         use ferrofin_traits::persistence::LinkedChildrenService as _;
