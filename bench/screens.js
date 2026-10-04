@@ -8,7 +8,7 @@
 //
 // Iteration i always opens the same screen with the same picks on every server
 // (weighted round-robin + a seeded LCG), so the arrival pattern and the work are
-// identical by construction.
+// shared for primary picks. Dependent selections are observed and compared explicitly.
 import http from 'k6/http';
 import exec from 'k6/execution';
 import { Trend, Rate, Counter } from 'k6/metrics';
@@ -16,17 +16,28 @@ import { Trend, Rate, Counter } from 'k6/metrics';
 const URL = __ENV.URL;
 const IDS = JSON.parse(open(__ENV.IDS));
 const SHAPE = __ENV.SHAPE === '1';
-const SEED = Number(__ENV.SEED || 0);  // per-phase offset so a warm-up never replays the window's exact picks
+const SEED = Number(__ENV.SEED || 0);
+const SLOTS = Number(__ENV.SLOTS || 600);
+const SHAPE_VUS = Number(__ENV.SHAPE_VUS || 1);
+if (!Number.isInteger(SHAPE_VUS) || SHAPE_VUS <= 0) throw new Error('SHAPE_VUS must be a positive integer');
+if (!Number.isInteger(SLOTS) || SLOTS <= 0 || SLOTS % 10) throw new Error('SLOTS must be a positive multiple of ten');
 const U = IDS.user;
-const HDR = { Authorization: `MediaBrowser Client="bench", Device="bench", DeviceId="bench-k6", Version="3", Token="${IDS.token}"` };
-const JSON_HDR = Object.assign({ 'Content-Type': 'application/json' }, HDR);
+if (IDS.user_isolation !== 1 || !IDS.user || !IDS.viewer || IDS.user.replace(/-/g, '').toLowerCase() === IDS.viewer.replace(/-/g, '').toLowerCase() || !IDS.browse_token || !IDS.playback_token)
+    throw new Error('distinct authenticated browse/playback roles required');
+function actor() { return screen === 'playback' ? 'playback' : 'browse'; }
+function headers(json) {
+    const role = actor();
+    const result = { Authorization: `MediaBrowser Client="bench", Device="bench", DeviceId="bench-${role}", Version="3", Token="${IDS[role + '_token']}"` };
+    if (json) result['Content-Type'] = 'application/json';
+    return result;
+}
 const IMAGES_PER_SCREEN = 12;
 
 // weighted mix (D4): home 3 : movies 2 : detail 2 : series 1 : search 1 : playback 1
 const MIX = ['home', 'movies', 'detail', 'home', 'movies', 'detail', 'home', 'series', 'search', 'playback'];
 
 export const options = SHAPE
-    ? { scenarios: { shape: { executor: 'shared-iterations', vus: 1, iterations: MIX.length } } }
+    ? { scenarios: { shape: { executor: 'shared-iterations', vus: SHAPE_VUS, iterations: SLOTS, maxDuration: '10m' } } }
     : {
         scenarios: {
             screens: {
@@ -49,52 +60,74 @@ const NAMES = [
     'image',
 ];
 const SCREENS = ['home', 'movies', 'detail', 'series', 'search', 'playback'];
+NAMES.push(...SCREENS.filter(s => s !== 'playback').map(s => s + ':image'));
 const lat = {}, ok = {};
 const mid = (n) => n.replace(/[^A-Za-z0-9_]/g, '_');
 for (const n of NAMES.concat(SCREENS)) { lat[n] = new Trend(`lat_${mid(n)}`, true); ok[n] = new Rate(`ok_${mid(n)}`); }
 const requests = new Counter('requests');
+const imageBytes = new Counter('image_bytes');
+let slot = 0, screen = '', occurrences = {}, selections = [];
 let iterOk = true;  // AND of the current screen's request statuses
 
 function lcg(seed) { let s = (seed * 2654435761) >>> 0; return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296); }
 function q(p) { return Object.entries(p).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&'); }
-// Map keys that are data, not schema (image tags, item ids, provider ids), collapse to {key}.
+// Retain each item's field types; array indices preserve duplicates and order.
 const DATA_KEY = /^[0-9a-f]{16,}$/i;
-function fieldSet(v, out, prefix) {
-    // union over every array element: item shape varies with data (logo on 20 % of movies, …)
-    if (Array.isArray(v)) { for (const e of v) fieldSet(e, out, prefix + '[]'); return; }
-    if (v && typeof v === 'object') for (const k of Object.keys(v)) { const kk = DATA_KEY.test(k) ? '{key}' : k; out.add(prefix + '.' + kk); fieldSet(v[k], out, prefix + '.' + kk); }
+function fieldTypes(v, out, prefix = '$') {
+    out[prefix] = v === null ? 'null' : Array.isArray(v) ? `array(${v.length})` : typeof v;
+    if (Array.isArray(v)) v.forEach((x, i) => fieldTypes(x, out, `${prefix}[${i}]`));
+    else if (v && typeof v === 'object') for (const k of Object.keys(v).sort())
+        fieldTypes(v[k], out, prefix + '.' + (DATA_KEY.test(k) ? '{key}' : k));
 }
-function record(name, res) {
-    const good = res.status >= 200 && res.status < 400;
-    lat[name].add(res.timings.duration);
-    ok[name].add(good);
+function requestKey(name, method, path, body) {
+    const [route, query = ''] = path.split('?');
+    // Image cache tags and playback session IDs vary between equivalent servers.
+    const stableQuery = query.split('&').filter(x => x && !['tag', 'apikey', 'api_key', 'playsessionid'].includes(x.split('=')[0].toLowerCase())).sort();
+    const stableBody = Object.assign({}, body || {});
+    delete stableBody.PlaySessionId;
+    const occurrence = occurrences[name] || 0;
+    occurrences[name] = occurrence + 1;
+    return JSON.stringify([slot, name, occurrence, method, route + (stableQuery.length ? '?' + stableQuery.join('&') : ''), stableBody]);
+}
+function record(name, res, method, path, body) {
+    const isImage = name === 'image';
+    const scoped = isImage ? screen + ':image' : name;
+    const key = requestKey(scoped, method, path, body);
+    selections.push(key);
+    const contentType = (res.headers['Content-Type'] || '').split(';')[0].trim().toLowerCase();
+    const bytes = isImage && res.body ? res.body.byteLength : 0;
+    const good = res.status >= 200 && res.status < 300 && (!isImage || (bytes > 0 && contentType.startsWith('image/')));
+    for (const n of isImage ? [name, scoped] : [name]) {
+        lat[n].add(res.timings.duration); ok[n].add(good);
+    }
     if (!good) iterOk = false;
     requests.add(1);
+    if (isImage) imageBytes.add(bytes);
     if (!SHAPE) return;
-    const s = { status: res.status };
-    if ((res.headers['Content-Type'] || '').includes('json')) {
-        let body = null;
-        try { body = res.json(); } catch (e) { /* shape of a non-JSON body: status only */ }
-        if (body !== null) {
-            const f = new Set(); fieldSet(body, f, ''); s.fields = Array.from(f).sort();
-            // count = items actually returned; total = the server's TotalRecordCount (which Jellyfin
-            // sets to 0 when the client passes EnableTotalRecordCount=false) — compared separately
-            s.count = Array.isArray(body) ? body.length : Array.isArray(body.Items) ? body.Items.length : undefined;
-            if (!Array.isArray(body) && body.TotalRecordCount !== undefined) s.total = body.TotalRecordCount;
-        }
-    } else { s.bytes = res.body ? res.body.length : 0; }
-    // VU state is invisible to handleSummary; shape lines go out via the console log
-    // (run with --log-format json --console-output shape.log; report.py parses them).
-    console.log(JSON.stringify(Object.assign({ shape: name, url: res.url }, s)));
+    const observation = { shape: scoped, slot, key, status: res.status, content_type: contentType };
+    if (contentType.includes('json')) {
+        try {
+            const body = res.json();
+            const types = {}; fieldTypes(body, types); observation.types = types;
+            const rows = Array.isArray(body) ? body : body && Array.isArray(body.Items) ? body.Items : null;
+            if (rows) { observation.count = rows.length; observation.ids = rows.map(x => x && x.Id !== undefined ? x.Id : null); }
+            else if (body && body.Id !== undefined) observation.ids = [body.Id];
+            if (body && body.TotalRecordCount !== undefined) observation.total = body.TotalRecordCount;
+        } catch (e) { observation.invalid_json = true; iterOk = false; }
+    }
+    if (isImage) observation.bytes = bytes;
+    console.log(JSON.stringify(observation));
+}
+function params(name, body) {
+    return { headers: headers(Boolean(body)), tags: { name }, responseType: name === 'image' ? 'binary' : 'text' };
 }
 function batch(reqs) {
-    // reqs: [name, method, path, body?]
-    const rs = http.batch(reqs.map(([n, m, p, b]) => [m, URL + p, b ? JSON.stringify(b) : null, { headers: b ? JSON_HDR : HDR, tags: { name: n } }]));
-    rs.forEach((r, i) => record(reqs[i][0], r));
+    const rs = http.batch(reqs.map(([n, m, p, b]) => [m, URL + p, b ? JSON.stringify(b) : null, params(n, b)]));
+    rs.forEach((r, i) => record(reqs[i][0], r, reqs[i][1], reqs[i][2], reqs[i][3]));
     return rs;
 }
-function get(name, path) { const r = http.get(URL + path, { headers: HDR, tags: { name } }); record(name, r); return r; }
-function post(name, path, body) { const r = http.post(URL + path, JSON.stringify(body), { headers: JSON_HDR, tags: { name } }); record(name, r); return r; }
+function get(name, path) { const r = http.get(URL + path, params(name)); record(name, r, 'GET', path); return r; }
+function post(name, path, body) { const r = http.post(URL + path, JSON.stringify(body), params(name, body)); record(name, r, 'POST', path, body); return r; }
 function items(res) { try { const b = res.json(); return Array.isArray(b) ? b : b.Items ? b.Items : b.Id ? [b] : []; } catch (e) { return []; } }
 function images(responses) {
     // the posters the cards would load — jellyfin-web card image URL (fillHeight/fillWidth/quality/tag)
@@ -123,19 +156,17 @@ const PROFILE = {
 };
 
 export function setup() {
-    // Deterministic pools shared by every server: first 500 movies / 100 series by SortName
-    // (gen.py makes sort names unique, so the Limit boundary has no ties to break).
-    const m = http.get(URL + `/Users/${U}/Items?` + q({ IncludeItemTypes: 'Movie', Recursive: true, SortBy: 'SortName', SortOrder: 'Ascending', Limit: 500, Fields: 'ImageTags', ParentId: IDS.movies_view }), { headers: HDR }).json();
-    const s = http.get(URL + `/Users/${U}/Items?` + q({ IncludeItemTypes: 'Series', Recursive: true, SortBy: 'SortName', SortOrder: 'Ascending', Limit: 100, ParentId: IDS.shows_view }), { headers: HDR }).json();
-    const words = new Set();
-    for (const it of m.Items) for (const w of it.Name.split(' ')) if (w.length > 3 && w !== 'The') words.add(w);
-    return { movies: m.Items.map(i => i.Id), series: s.Items.map(i => i.Id), movieCount: m.TotalRecordCount, terms: Array.from(words).sort().slice(0, 40) };
+    const pool = IDS.pools;
+    if (!pool || !['movies', 'series', 'terms'].every(k => Array.isArray(pool[k]) && pool[k].length) ||
+        !Number.isInteger(pool.movieCount) || pool.movieCount <= 0 || !pool.nextUpCutoff)
+        throw new Error('fixture pools missing or invalid; run build.sh --export-pools');
+    return pool;
 }
 
 const screens = {
     // src/components/homesections/sections/{libraryTiles,resume,nextUp,recentlyAdded}.ts
     home(pool, rnd) {
-        const cutoff = new Date(Date.now() - 365 * 86400000).toISOString();
+        const cutoff = pool.nextUpCutoff;
         const rs = batch([
             ['home:views', 'GET', `/Users/${U}/Views`],
             ['home:resume-video', 'GET', `/Users/${U}/Items/Resume?` + q({ Limit: 12, Recursive: true, ...CARD, MediaTypes: 'Video' })],
@@ -150,7 +181,7 @@ const screens = {
     },
     // src/controllers/movies/movies.js — a random page of the library (page size 100)
     movies(pool, rnd) {
-        const pages = Math.max(1, Math.floor(pool.movieCount / 100));
+        const pages = Math.max(1, Math.ceil(pool.movieCount / 100));
         const rs = batch([['movies:items', 'GET', `/Users/${U}/Items?` + q({ SortBy: 'SortName,ProductionYear', SortOrder: 'Ascending', IncludeItemTypes: 'Movie', Recursive: true, Fields: 'PrimaryImageAspectRatio,MediaSourceCount', ImageTypeLimit: 1, EnableImageTypes: 'Primary,Backdrop,Banner,Thumb', StartIndex: Math.floor(rnd() * pages) * 100, Limit: 100, ParentId: IDS.movies_view })]]);
         images(rs);
     },
@@ -178,7 +209,7 @@ const screens = {
         if (seasons.length) {
             const ep = get('series:episodes', `/Shows/${id}/Episodes?` + q({ seasonId: seasons[0].Id, userId: U, Fields: f + ',Overview' }));
             images([rs[1], ep]);
-        }
+        } else { iterOk = false; }
     },
     // src/apps/stable/features/search/api/* — the global search request set
     search(pool, rnd) {
@@ -195,11 +226,11 @@ const screens = {
     // src/components/playback/playbackmanager.js — start (direct play) and stop right away
     playback(pool, rnd) {
         const id = pool.movies[Math.floor(rnd() * pool.movies.length)];
-        const pi = post('playback:playbackinfo', `/Items/${id}/PlaybackInfo?` + q({ UserId: U, StartTimeTicks: 0, IsPlayback: true, AutoOpenLiveStream: true, MaxStreamingBitrate: 120000000 }), { DeviceProfile: PROFILE });
+        const pi = post('playback:playbackinfo', `/Items/${id}/PlaybackInfo?` + q({ UserId: IDS.viewer, StartTimeTicks: 0, IsPlayback: true, AutoOpenLiveStream: true, MaxStreamingBitrate: 120000000 }), { DeviceProfile: PROFILE });
         let ms = id, ps = `bench${Math.floor(rnd() * 1e9)}`;
-        try { ms = pi.json('MediaSources.0.Id') || id; ps = pi.json('PlaySessionId') || ps; } catch (e) { /* keep fallbacks */ }
+        try { ms = pi.json('MediaSources.0.Id'); ps = pi.json('PlaySessionId'); if (!ms || !ps) iterOk = false; } catch (e) { iterOk = false; }
         batch([
-            ['playback:intros', 'GET', `/Users/${U}/Items/${id}/Intros`],
+            ['playback:intros', 'GET', `/Users/${IDS.viewer}/Items/${id}/Intros`],
             ['playback:segments', 'GET', `/MediaSegments/${id}?includeSegmentTypes=Intro&includeSegmentTypes=Outro&includeSegmentTypes=Recap&includeSegmentTypes=Preview&includeSegmentTypes=Commercial`],
         ]);
         const base = { ItemId: id, MediaSourceId: ms, PlaySessionId: ps, PlayMethod: 'DirectPlay', CanSeek: true, IsPaused: false, IsMuted: false, VolumeLevel: 100, RepeatMode: 'RepeatNone' };
@@ -210,13 +241,17 @@ const screens = {
 
 export default function (pool) {
     const i = exec.scenario.iterationInTest;
-    const name = MIX[i % MIX.length];
+    slot = i % SLOTS;
+    const name = MIX[slot % MIX.length];
+    screen = name; occurrences = {}; selections = [];
     exec.vu.tags.screen = name;
     const t0 = Date.now();
     iterOk = true;
-    screens[name](pool, lcg(i + 1 + SEED));
+    screens[name](pool, lcg(slot + 1 + SEED));
     lat[name].add(Date.now() - t0);
     ok[name].add(iterOk);
+    // Compact selection evidence is emitted after the screen latency is recorded.
+    console.log(JSON.stringify({ selection: slot, iteration: i, screen, actor: actor(), user: actor() === 'playback' ? IDS.viewer : U, keys: selections, ok: iterOk }));
 }
 
 export function handleSummary(data) {
@@ -227,6 +262,8 @@ export function handleSummary(data) {
         return { count: t.values.count, p50: t.values['p(50)'], p95: t.values['p(95)'], p99: t.values['p(99)'], max: t.values.max, ok: r ? r.values.rate : null };
     };
     const out = {
+        user_isolation: 1, workload: 4, slots: SLOTS, seed: SEED, shape_vus: SHAPE_VUS, elapsed_ms: data.state.testRunDurationMs,
+        image_bytes: m.image_bytes ? m.image_bytes.values.count : 0,
         url: URL, rate: __ENV.RATE || null, duration: __ENV.DURATION || null, shape: SHAPE,
         dropped_iterations: m.dropped_iterations ? m.dropped_iterations.values.count : 0,
         iterations: m.iterations ? m.iterations.values.count : 0,
