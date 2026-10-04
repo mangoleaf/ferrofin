@@ -188,17 +188,40 @@ impl RemoteAnswer {
             language: language.map(str::to_owned),
         }
     }
+
+    /// The answer a shared provider mapping built
+    /// (`ferrofin_providers::season`), for `row`'s kind: its item carries
+    /// the row's identity, type and path, as [`for_row`](Self::for_row)'s.
+    fn of_result(
+        row: &BaseItemEntity,
+        result: ferrofin_providers::metadata_merge::MetadataResult,
+        language: Option<&str>,
+    ) -> Self {
+        Self {
+            item: BaseItemEntity {
+                id: row.id.clone(),
+                type_: row.type_.clone(),
+                path: row.path.clone(),
+                ..result.item
+            },
+            people: result.people,
+            provider_ids: result.provider_ids,
+            language: language.map(str::to_owned),
+        }
+    }
 }
 
 /// A remote metadata provider the scan runs for an item — upstream's
 /// `IRemoteMetadataProvider<TItemType, TIdType>` of the item's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemoteSource {
-    /// `TmdbMovieProvider`, `TmdbSeriesProvider`, `TmdbEpisodeProvider`.
+    /// `TmdbMovieProvider`, `TmdbSeriesProvider`, `TmdbSeasonProvider`,
+    /// `TmdbEpisodeProvider`.
     Tmdb,
     /// `OmdbItemProvider`, `OmdbEpisodeProvider`.
     Omdb,
-    /// The TVDB plugin's `TvdbSeriesProvider` and `TvdbEpisodeProvider`.
+    /// The TVDB plugin's `TvdbSeriesProvider`, `TvdbSeasonProvider` and
+    /// `TvdbEpisodeProvider`.
     Tvdb,
 }
 
@@ -6730,6 +6753,16 @@ impl LibraryScanner {
     /// (`GetProviders`, `MetadataService.cs:696-705`). The critic rating
     /// `wants_rating` asks for is then OMDb's to supply, as upstream's
     /// `CriticRating` is.
+    ///
+    /// A season, like every kind outside those three, has no gate: its
+    /// providers run on upstream's triggers alone — a first refresh, a
+    /// changed folder (D3), the refresh interval, "Search for missing
+    /// metadata" or "Replace all metadata". D2 is not widened to a new kind
+    /// (owner, 2026-09-24: do not widen the heuristics), and a season gate
+    /// could not be like the episode's either: a season has no placeholder
+    /// title to replace, and an overview gate would ask both season
+    /// providers again on every scan for each season neither has an overview
+    /// for — a common case (specials, most seasons of long-running shows).
     fn wants_backfill(&self, stored: &BaseItemEntity, policy: FetcherPolicy<'_>) -> bool {
         let short = stored.type_.rsplit('.').next().unwrap_or(&stored.type_);
         if !matches!(short, "Movie" | "Series" | "Episode") {
@@ -7095,6 +7128,14 @@ impl LibraryScanner {
     /// TheMovieDb and OMDb by type discovery order, which its source does not
     /// fix; Ferrofin registers TheMovieDb first, as its Identify providers are
     /// registered.
+    ///
+    /// A season has two: `TmdbSeasonProvider` and the plugin's
+    /// `TvdbSeasonProvider`, neither declaring an `IHasOrder`
+    /// ([`DEFAULT_ORDER`], 50), so with no saved order between them
+    /// registration decides: TheMovieDb's built-in provider first. OMDb has
+    /// no season provider.
+    ///
+    /// [`DEFAULT_ORDER`]: ferrofin_providers::season::DEFAULT_ORDER
     fn remote_sources(
         &self,
         policy: FetcherPolicy<'_>,
@@ -7102,13 +7143,18 @@ impl LibraryScanner {
         prefer: Option<&'static str>,
     ) -> Vec<RemoteSource> {
         let video = matches!(short, "Movie" | "Series" | "Episode");
-        let tv = matches!(short, "Series" | "Episode");
+        let season = short == "Season";
+        let tv = matches!(short, "Series" | "Season" | "Episode");
         let candidates = [
             (
                 RemoteSource::Tmdb,
                 fetcher_names::TMDB,
-                1,
-                video && self.tmdb.is_some(),
+                if season {
+                    ferrofin_providers::season::DEFAULT_ORDER
+                } else {
+                    1
+                },
+                (video || season) && self.tmdb.is_some(),
             ),
             (
                 RemoteSource::Tvdb,
@@ -7183,6 +7229,13 @@ impl LibraryScanner {
         let row = entity.clone();
         for source in sources {
             let answer = match source {
+                RemoteSource::Tmdb if short == "Season" => {
+                    self.fetch_tmdb_season(&row, cache, lookup).await
+                }
+                RemoteSource::Tvdb if short == "Season" => {
+                    self.fetch_tvdb_season(&row, cache, lookup, &preferred_language)
+                        .await
+                }
                 RemoteSource::Tmdb => {
                     self.fetch_tmdb_metadata(&row, &short, cache, &fold.lookup, lookup)
                         .await
@@ -7489,7 +7542,7 @@ impl LibraryScanner {
             }
         }
         // `TmdbMovieProvider`/`TmdbSeriesProvider` only `AddPerson`.
-        answer.people = added(tmdb_people(&details.people));
+        answer.people = added(ferrofin_providers::tmdb::people_entities(&details.people));
         Some(answer)
     }
 
@@ -7565,7 +7618,7 @@ impl LibraryScanner {
         answer.people = extras
             .as_ref()
             .and_then(|e| e.people.as_ref())
-            .map(|p| tmdb_people(p))
+            .map(|p| ferrofin_providers::tmdb::people_entities(p))
             .and_then(added);
         let trailers = extras
             .as_ref()
@@ -7593,6 +7646,146 @@ impl LibraryScanner {
             answer.provider_ids.extend(extras.provider_ids);
         }
         Some(answer)
+    }
+
+    /// The TMDB **season** provider — port of `TmdbSeasonProvider`
+    /// (`TmdbSeasonProvider.cs:41-158`), mapped by
+    /// [`ferrofin_providers::season::tmdb_answer`].
+    ///
+    /// The season is looked up by its number under the series' `Tmdb` id —
+    /// this scan's match, the one TheTVDB carried, else the one recorded for
+    /// the series ([`series_tmdb_id_of`]); without a number or a series id
+    /// there is no answer and no request (`:53-56`). Its response is the
+    /// series' `/tv/{id}/season/{n}`, fetched at most once per scan and
+    /// shared with the season's episodes and its poster
+    /// ([`season_details_cached`](Self::season_details_cached)), as
+    /// upstream's `TmdbClientManager.GetSeasonAsync` serves the season
+    /// provider, the episode provider and the image providers from one
+    /// cached response (`:238-262`): a season and its episodes cost one
+    /// TMDB season request between them. `None` when TMDB has no such
+    /// season; a failed request is counted.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence):
+    /// `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`
+    /// (`SeasonMetadataService.cs:46`) is not ported; Ferrofin derives it for
+    /// albums only ([`apply_album_child_metadata`]). Upstream's `BeforeSave`
+    /// (`MetadataService.cs:150`, before the providers, on a first, required
+    /// or full refresh) sets an unlocked season's `PremiereDate` and
+    /// `ProductionYear` from its earliest episode (`UpdatePremiereDate`,
+    /// `:543-575`). With the providers after it, that date stands wherever no
+    /// provider replaces it: "Search for missing metadata" (fill-only) keeps
+    /// the episode-derived date over TheMovieDb's, and a library running
+    /// TheTVDB alone (which supplies no season date) still gets a date and a
+    /// year; a Default refresh takes TheMovieDb's air date over it. The rule
+    /// (`UpdatePremiereDate`): the earliest episode premiere date sets the
+    /// premiere date and the year; when no episode has one, the year becomes
+    /// `Min(ProductionYear ?? 0)` over the episodes, applied only when above
+    /// zero — so one episode with no year leaves the season's year alone.
+    /// [`apply_album_child_metadata`] already implements exactly this rule
+    /// for albums. To port: the season arm of that child aggregation, applied
+    /// to the stored row before the merge, under the same refresh gate
+    /// (`isFullRefresh || updateType > None`, unlocked).
+    async fn fetch_tmdb_season(
+        &self,
+        row: &BaseItemEntity,
+        cache: &mut ArtworkCache,
+        lookup: &ResolverGuesses,
+    ) -> Option<RemoteAnswer> {
+        let tmdb = self.tmdb.as_ref()?;
+        let (Some(series_id), Some(number)) = (row.series_id.clone(), lookup.index(row)) else {
+            return None;
+        };
+        let details = self
+            .season_details_cached(cache, &series_id, number)
+            .await?;
+        let import_season_name = tmdb.import_season_name().await;
+        // Upstream asks in `info.MetadataLanguage` and claims it as the
+        // `ResultLanguage` (`:43-46`). The scan asks TMDB in no language
+        // (en-US) and, like the other TMDB arms, names none: a library of
+        // another language gets TMDB's English season overview, counted as
+        // preferred. TODO(parity, open work item — NOT an accepted
+        // divergence): the localisation TODO in `fetch_tmdb_metadata` covers
+        // this request too (kept out of the season port, owner 2026-10-04).
+        Some(RemoteAnswer::of_result(
+            row,
+            ferrofin_providers::season::tmdb_answer(details, number, import_season_name),
+            None,
+        ))
+    }
+
+    /// The TheTVDB **season** provider — port of the TVDB plugin's
+    /// `TvdbSeasonProvider` (jellyfin-plugin-tvdb `5c4592f`, `:53-123`),
+    /// through [`ferrofin_providers::season::tvdb_season`]: the season's id
+    /// from its series' record by number and ordering, then the season's
+    /// record, whose overview is the translation into `language` (the item's
+    /// preferred metadata language, matched through the culture table's
+    /// ISO 639-2 codes, `IsMatch`).
+    ///
+    /// It resolves under the series' `Tvdb` id — this scan's TVDB match, else
+    /// the recorded one (TMDB's answer for the series hands its TVDB id on
+    /// to the record) — and without one there is no answer and no request.
+    /// A failed request counts as a provider failure, as upstream counts it
+    /// for this provider: `TvdbSeasonProvider.GetMetadata` has no try/catch
+    /// (the series and episode providers' swallow is the divergence
+    /// documented at [`fetch_tvdb_metadata`](Self::fetch_tvdb_metadata)).
+    ///
+    /// The plugin's settings (`FallbackLanguages`, `ImportSeasonName`) keep
+    /// their defaults: the TVDB localisation TODO in the
+    /// `ferrofin_providers::tvdb` module doc, which also covers the series'
+    /// and episodes' translations.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence): the plugin
+    /// orders by the series' `DisplayOrder` (`info.SeriesDisplayOrder`,
+    /// `official` when blank, `:65-74`); the scan always asks for the
+    /// `official` ordering, as its episode arm does
+    /// ([`DEFAULT_SEASON_TYPE`]). To port: read the series row's
+    /// `DisplayOrder` from its `Data` blob when the series is planned and
+    /// pass it to both arms.
+    ///
+    /// [`DEFAULT_SEASON_TYPE`]: ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
+    async fn fetch_tvdb_season(
+        &self,
+        row: &BaseItemEntity,
+        cache: &ArtworkCache,
+        lookup: &ResolverGuesses,
+        language: &str,
+    ) -> Option<RemoteAnswer> {
+        let tvdb = self.tvdb.as_ref()?;
+        let (Some(series_id), Some(number)) = (row.series_id.as_deref(), lookup.index(row)) else {
+            return None;
+        };
+        let series_tvdb = cache
+            .series_tvdb
+            .get(series_id)
+            .map(|d| d.tvdb_id)
+            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
+            .filter(|id| *id > 0)?;
+        let result = ferrofin_providers::season::tvdb_season(
+            tvdb,
+            series_tvdb,
+            ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
+            number,
+            language,
+            &self.three_letter_language_names(language),
+        )
+        .await?;
+        // `MapSeasonToResult` names no `ResultLanguage`.
+        Some(RemoteAnswer::of_result(row, result, None))
+    }
+
+    /// The ISO 639-2 codes (`ThreeLetterISOLanguageNames`) the server's
+    /// culture table lists for `language`, which the TVDB plugin matches a
+    /// translation's language against (`TvdbCultureInfo.GetCultureInfo` over
+    /// `ILocalizationManager.GetCultures`).
+    fn three_letter_language_names(&self, language: &str) -> Vec<String> {
+        let fallback;
+        let localization = if let Some(localization) = &self.localization {
+            localization.as_ref()
+        } else {
+            fallback = crate::localization_manager::LocalizationManager::new("");
+            &fallback
+        };
+        ferrofin_providers::tvdb::three_letter_language_names(localization.get_cultures(), language)
     }
 
     /// The TheTVDB provider — port of the TVDB plugin's `TvdbSeriesProvider`
@@ -13449,23 +13642,6 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
         .collect()
 }
 
-/// Maps TMDB credited people to persistable [`PeopleEntity`] rows, keeping
-/// TMDB's person id (which keys the biography/headshot enrichment).
-fn tmdb_people(people: &[ferrofin_providers::TmdbPerson]) -> Vec<PeopleEntity> {
-    people
-        .iter()
-        .map(|p| PeopleEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            name: p.name.clone(),
-            person_type: Some(p.person_type.clone()),
-            role: p.role.clone(),
-            primary_image_url: p.profile_url.clone(),
-            provider_id: Some(p.tmdb_id),
-            sort_order: p.sort_order.map(i64::from),
-        })
-        .collect()
-}
-
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
@@ -15407,7 +15583,35 @@ mod tests {
             scanner.remote_sources(default, "Episode", None),
             [Tmdb, Omdb, Tvdb]
         );
-        assert!(scanner.remote_sources(default, "Season", None).is_empty());
+        // `TmdbSeasonProvider` and `TvdbSeasonProvider` both declare no
+        // `IHasOrder` (50): registration order, TheMovieDb's built-in first.
+        // OMDb has no season provider.
+        assert_eq!(
+            scanner.remote_sources(default, "Season", None),
+            [Tmdb, Tvdb]
+        );
+        let season_tvdb_first = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Season".to_owned()),
+                metadata_fetchers: vec![TVDB.to_owned(), TMDB.to_owned()],
+                metadata_fetcher_order: vec![TVDB.to_owned(), TMDB.to_owned()],
+                ..TypeOptions::default()
+            }],
+            ..Default::default()
+        };
+        let season_saved = super::FetcherPolicy {
+            options: Some(&season_tvdb_first),
+            global: None,
+        };
+        assert_eq!(
+            scanner.remote_sources(season_saved, "Season", None),
+            [Tvdb, Tmdb]
+        );
+        assert_eq!(
+            scanner.remote_sources(season_saved, "Season", Some(TMDB)),
+            [Tmdb, Tvdb],
+            "Identify's provider first"
+        );
         assert!(scanner.remote_sources(default, "Audio", None).is_empty());
         let tvdb_first = tvdb_first_options();
         let saved = super::FetcherPolicy {

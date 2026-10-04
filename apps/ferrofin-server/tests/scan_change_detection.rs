@@ -44,14 +44,14 @@
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
 //! | 5 | webhook and watcher: add one file | 1 created; parent via decision; nothing else |
-//! | 6 | webhook and watcher: delete one file | 1 removed; nothing else |
+//! | 6 | webhook and watcher: delete one file | 1 removed; the watched season asks its season providers once |
 //! | 7 | edit Overview (no LockData), rescan | edit survives; `LockData` false |
 //! | 8 | "Search for missing metadata" | empty fields filled, edited Overview kept |
 //! | 9 | "Replace all metadata", Overview unlocked | Overview replaced |
 //! | 10 | lock Overview, "Replace all metadata" | Overview kept, other fields replaced |
 //! | 11 | `LockData=true`, add `poster.png`, rescan | poster discovered; 0 provider requests |
 //! | 12 | locked item saved by a rescan | `Data` (trailers) intact |
-//! | 13 | episode with TMDB date/rating, rescans | fields intact |
+//! | 13 | episode with TMDB date/rating, rescans | fields intact; the season whose folder changed asks its season providers once |
 //! | 14 | pending library refresh + webhook path | no full scan queued |
 //! | 15 | movie refresh: TMDB 429 and missing ffprobe | text retained; images follow replacement flags |
 //!
@@ -68,6 +68,25 @@
 //! twice: through `POST /Library/Media/Updated` on the movies library, and
 //! through the real inotify watcher on a library with real-time monitoring
 //! on, with `LibraryMonitorDelay` at 1 s.
+//!
+//! Rows 6 (watcher) and 13 refresh a season because its folder changed (a
+//! file left or joined it): upstream's `requiresRefresh`
+//! (`BaseItem.RequiresRefresh`, `Folder.RequiresRefresh`) makes
+//! `GetProviders` run every remote provider of the season
+//! (`MetadataService.cs:655-658`), and the Shows and Live libraries tick
+//! TheMovieDb alone for seasons. `TmdbSeasonProvider` then asks for the
+//! season by its series' recorded `Tmdb` id: exactly one
+//! `/tmdb/tv/{series}/season/1` request, which an episode refreshed in the
+//! same scan shares (row 5). Every other row's 0 holds: an unchanged season
+//! runs no provider.
+//!
+//! The pinned count is the request the refresh decision makes, not
+//! upstream's network count. Upstream's `TmdbClientManager` keeps each season
+//! response in memory for an hour (`season-{id}-s{n}-{lang}`,
+//! `TmdbClientManager.cs:238-262`), so it would serve rows 6 and 13 from
+//! memory a few seconds after row 1 fetched the same seasons, with 0 network
+//! requests. Ferrofin's TMDB season cache lasts one scan, so each of those
+//! rows asks once.
 //!
 //! One test function, one process: the metrics pipeline is process-global.
 
@@ -1672,6 +1691,25 @@ fn assert_no_provider_request(seen: &Seen, row: &str) {
     );
 }
 
+/// Asserts the row's only provider request was TheMovieDb's season lookup
+/// `season` (`/tmdb/tv/{series}/season/{n}`) — what a season refreshed for
+/// its changed folder asks for in a library that ticks only TheMovieDb for
+/// seasons (see the module docs, rows 6 and 13).
+fn assert_only_the_season_request(seen: &Seen, season: &str, row: &str) {
+    assert_eq!(
+        seen.provider_metric,
+        BTreeMap::from([("tmdb".to_owned(), 1.0)]),
+        "row {row}: provider metric {seen:?}"
+    );
+    let paths: Vec<&str> = seen
+        .requests
+        .iter()
+        .filter_map(|r| r.split_whitespace().nth(1))
+        .map(|target| target.split('?').next().unwrap_or(target))
+        .collect();
+    assert_eq!(paths, [season], "row {row}: provider requests {seen:?}");
+}
+
 /// Asserts the row wrote exactly the item tables in `tables` (every one,
 /// and none else), so a rewrite of `Peoples`, `ItemValues`,
 /// `LinkedChildren`… can't hide behind the right set of items.
@@ -1863,6 +1901,49 @@ async fn rows(h: &Harness) {
         "row 1: TMDB's air date, not TVDB's {}",
         harbor_e1["PremiereDate"]
     );
+    // The seasons take TheMovieDb's season answer (`TmdbSeasonProvider`:
+    // overview, air date, the season's own Tmdb id; no name while the TMDb
+    // settings' `ImportSeasonName` is off), from the one season response
+    // the season, its episodes and its poster share: one request per season.
+    let harbor_season = h
+        .item(&h.id(m.harbor_e1.parent().expect("season")).await)
+        .await;
+    assert_eq!(
+        harbor_season["Overview"], "The first season.",
+        "row 1: {harbor_season}"
+    );
+    assert!(
+        harbor_season["PremiereDate"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("2010-01-01")),
+        "row 1: the season's air date {}",
+        harbor_season["PremiereDate"]
+    );
+    assert_eq!(
+        harbor_season["ProductionYear"], 2010,
+        "row 1: {harbor_season}"
+    );
+    assert_eq!(
+        harbor_season["Name"], "Season 1",
+        "row 1: the folder's name"
+    );
+    assert_eq!(
+        harbor_season["ProviderIds"]["Tmdb"], "1",
+        "row 1: {harbor_season}"
+    );
+    for series in ["201", "202"] {
+        let season = format!("/tmdb/tv/{series}/season/1?");
+        assert_eq!(
+            first
+                .requests
+                .iter()
+                .filter(|r| r.contains(&season))
+                .count(),
+            1,
+            "row 1: one season request for series {series} {:?}",
+            first.requests
+        );
+    }
     let alpha = h.id(&m.alpha).await;
     let beta = h.id(&m.beta).await;
     let gamma = h.id(&m.gamma_nfo.with_extension("mkv")).await;
@@ -2128,7 +2209,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    // The season goes through the decision again (its folder changed).
+    // The season goes through the decision again (its folder changed):
+    // `requiresRefresh` runs its one ticked season provider, TheMovieDb's,
+    // which asks for the season once — nothing else is asked for.
     assert_eq!(
         removed.item("watcher", "updated"),
         1.0,
@@ -2136,7 +2219,8 @@ async fn rows(h: &Harness) {
     );
     assert_eq!(removed.outcome("created"), 0.0, "row 6: {removed:?}");
     assert_no_probe(&removed, "6");
-    assert_no_provider_request(&removed, "6");
+    assert_only_the_season_request(&removed, "/tmdb/tv/202/season/1", "6");
+    assert_no_artwork_or_people(&removed, "6");
     assert_eq!(removed.written_items(), expected, "row 6: {removed:?}");
     assert_tables(&removed, NEW_FILE_TABLES, "6");
     assert_only_newest_media_date_moved(&lantern, &h.writes.row("Lantern").await, "6");
@@ -2343,7 +2427,10 @@ async fn rows(h: &Harness) {
     // A new sidecar re-probes the episode and saves it without asking its
     // providers (only the probe's change monitor fired): the stored date and
     // rating must survive that save. Its season goes through the decision
-    // for its changed folder.
+    // for its changed folder: `requiresRefresh` runs every season provider
+    // the library ticks — TheMovieDb's — which asks for the season by the
+    // series' recorded Tmdb id, once. The series and the other episode are
+    // unchanged and ask nothing.
     put(
         &m.harbor_e1.with_file_name("Harbor - S01E01.en.srt"),
         b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
@@ -2359,7 +2446,7 @@ async fn rows(h: &Harness) {
         resaved.probed("Harbor - S01E01.mkv"),
         "row 13: re-probed {resaved:?}"
     );
-    assert_no_provider_request(&resaved, "13");
+    assert_only_the_season_request(&resaved, "/tmdb/tv/201/season/1", "13");
     assert_no_artwork_or_people(&resaved, "13");
     assert_eq!(
         resaved.written_items(),

@@ -25,9 +25,42 @@ library's metadata settings.
   list stands on its own, as in Jellyfin.
 - The scans that re-ask about incomplete titles only fill empty fields. They no
   longer overwrite stored values, so your edits (even unlocked ones) and the
-  stored cast and provider ids stay as they are.
+  stored cast and provider ids stay as they are. This is the automatic
+  re-asking only: **Search for missing metadata**, which you start, also fills
+  only empty fields but, as in Jellyfin, replaces an item's unlocked cast
+  wherever a provider credits someone.
+- **Seasons get remote metadata.** TheMovieDb's and TheTVDB's season providers
+  now fill a season, as in Jellyfin, in the library's order for seasons:
+  TheMovieDb its overview, premiere date and year, cast and ids; TheTVDB its
+  overview (in the library's language) and its TheTVDB id only, no date or
+  year. A new library checks only TheTVDB for seasons, so there a season gets
+  an overview and an id. A season keeps its folder's name unless TheMovieDb's
+  "Import season name" setting is on. TheMovieDb's season overviews are in
+  English for now, whatever the library's language (TheTVDB's follow it);
+  asking TheMovieDb in the library's language is open work.
+  - When: a season asks its providers when it is first scanned, when a file
+    joins or leaves its folder, on **Search for missing metadata** and
+    **Replace all metadata**, and when the library's refresh interval passes —
+    never on an unchanged scan. Seasons without a folder of their own get the
+    same from their **Refresh metadata** dialog.
+  - Requests: where the library also uses TheMovieDb for episodes or for
+    season images, the season's answer comes from the season request those
+    already make, so a first scan asks nothing more; where it uses
+    TheMovieDb for seasons only, each season's first scan costs one request.
+    A season refreshed on its own (a file joining or leaving its folder, or
+    its refresh dialog) costs one TheMovieDb request. TheTVDB asks one
+    request per season, plus the series' season list at most once per
+    `FERROFIN_TVDB_CACHE_HOURS` (default one hour; none when the series was
+    just refreshed).
+  - A season scanned before this release has no overview until one of those
+    refreshes runs. To fill them now, run **Search for missing metadata** on
+    the TV library once. Know what it costs first: it re-asks every checked
+    provider about every series, season and episode of the library and
+    re-reads every episode file. It only fills empty fields, except the cast:
+    as in Jellyfin, a provider that credits someone replaces an item's
+    unlocked cast. Lock the cast (or the item) where you have edited it.
 
-No manual step is needed.
+No manual step is needed beyond that optional refresh.
 
 ## Unreleased — extras no longer appear as library children
 

@@ -91,6 +91,7 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 |---|---|
 | `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. |
 | `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | Optional TheTVDB API key override and subscriber PIN. |
+| `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
 | `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. |
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |

@@ -179,14 +179,30 @@ struct ImageEntry {
     iso_639_1: Option<String>,
 }
 
-/// One season's metadata + artwork from `/tv/{id}/season/{n}`: the season's
-/// name/overview/poster and every episode's metadata, in a single request.
+/// One season's metadata + artwork from `/tv/{id}/season/{n}` with its
+/// `credits` and `external_ids` appended: everything `TmdbSeasonProvider`
+/// maps for the season itself, its poster, and every episode's metadata, in
+/// a single request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SeasonDetails {
+    /// The season's own TMDB id (`seasonResult.Id`), which
+    /// `TmdbSeasonProvider` sets as the season's `Tmdb` provider id
+    /// (`TmdbSeasonProvider.cs:81`).
+    pub tmdb_id: Option<i64>,
     /// The season's display name (e.g. "Season 2"), if any.
     pub name: Option<String>,
     /// The season's synopsis, if any.
     pub overview: Option<String>,
+    /// The season's air date (`YYYY-MM-DD`): its premiere date and year
+    /// (`TmdbSeasonProvider.cs:72-73`).
+    pub air_date: Option<String>,
+    /// The season's TheTVDB id, from its `external_ids`
+    /// (`TmdbSeasonProvider.cs:82`).
+    pub tvdb_id: Option<String>,
+    /// The season's credits — its cast in billing order, then the wanted
+    /// crew — under the TMDb settings page's caps and profile filters
+    /// (`TmdbSeasonProvider.cs:84-155`). Empty when TMDB credits nobody.
+    pub people: Vec<TmdbPerson>,
     /// The season poster URL, if any.
     pub poster: Option<String>,
     /// The season's episodes, in TMDB order.
@@ -294,6 +310,29 @@ pub struct TmdbPerson {
     pub sort_order: Option<i32>,
     /// The person's profile-photo URL (headshot), when TMDB has one.
     pub profile_url: Option<String>,
+}
+
+/// TheMovieDb's credited people as persistable [`PeopleEntity`] rows, keeping
+/// TMDB's person id (which keys the biography/headshot enrichment) and each
+/// credit's `SortOrder`.
+///
+/// [`PeopleEntity`]: ferrofin_db::entities::base_items::PeopleEntity
+#[must_use]
+pub fn people_entities(
+    people: &[TmdbPerson],
+) -> Vec<ferrofin_db::entities::base_items::PeopleEntity> {
+    people
+        .iter()
+        .map(|p| ferrofin_db::entities::base_items::PeopleEntity {
+            id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
+            name: p.name.clone(),
+            person_type: Some(p.person_type.clone()),
+            role: p.role.clone(),
+            primary_image_url: p.profile_url.clone(),
+            provider_id: Some(p.tmdb_id),
+            sort_order: p.sort_order.map(i64::from),
+        })
+        .collect()
 }
 
 /// A person's biographical detail, from TMDB `/person/{id}`.
@@ -745,11 +784,19 @@ fn us_certification(
 #[derive(Debug, Deserialize)]
 struct SeasonResponse {
     #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
+    air_date: Option<String>,
+    #[serde(default)]
     poster_path: Option<String>,
+    #[serde(default)]
+    credits: Option<CreditsResponse>,
+    #[serde(default)]
+    external_ids: Option<ExternalIds>,
     #[serde(default)]
     episodes: Vec<SeasonEpisode>,
 }
@@ -781,8 +828,20 @@ fn season_details_from(
 ) -> SeasonDetails {
     let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
     SeasonDetails {
+        tmdb_id: resp.id.filter(|id| *id > 0),
         name: non_empty(resp.name),
         overview: non_empty(resp.overview),
+        air_date: non_empty(resp.air_date),
+        tvdb_id: resp
+            .external_ids
+            .and_then(|ids| ids.tvdb_id)
+            .filter(|id| *id > 0)
+            .map(|id| id.to_string()),
+        // `TmdbSeasonProvider` runs the same cast and crew LINQ as the movie
+        // and series providers (`:84-155`): billed cast under
+        // `HideMissingCastMembers`/`MaxCastMembers`, then the wanted crew
+        // under `HideMissingCrewMembers`/`MaxCrewMembers`.
+        people: credits_to_people(resp.credits, cfg),
         poster: non_empty(resp.poster_path)
             .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &p)),
         episodes: resp
@@ -1037,6 +1096,14 @@ impl TmdbClient {
         cfg
     }
 
+    /// The TMDb settings page's `ImportSeasonName`: whether
+    /// `TmdbSeasonProvider` names a season after TMDB's season name
+    /// (`TmdbSeasonProvider.cs:76-79`; off by default, so a season keeps
+    /// the name its folder or the season-zero setting gives it).
+    pub async fn import_season_name(&self) -> bool {
+        self.settings().await.import_season_name
+    }
+
     /// Points the artwork URLs at a different image root than TMDb's CDN
     /// (`https://image.tmdb.org/t/p`) — a mock server in tests; the size
     /// segment and the image path follow it.
@@ -1176,8 +1243,16 @@ impl TmdbClient {
     }
 
     /// Fetches one season's metadata + artwork (`/tv/{id}/season/{n}`): the
-    /// season name/overview/poster and every episode's name/overview/still, in a
-    /// single request. `None` on any failure.
+    /// season's own fields, credits and external ids, its poster, and every
+    /// episode's name/overview/still, in a single request. `None` on any
+    /// failure.
+    ///
+    /// `TmdbClientManager.GetSeasonAsync` (`:238-262`) appends `credits`,
+    /// `images`, `external_ids` and `videos` to this one request, which
+    /// `TmdbSeasonProvider` (the credits and the TVDB id) and the season and
+    /// episode image providers share. The scan reads the poster from the
+    /// season's own `poster_path` and no season video, so only the two the
+    /// season provider maps are appended.
     pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
@@ -1188,7 +1263,10 @@ impl TmdbClient {
         let resp = self
             .http
             .get(url)
-            .query(&[("api_key", key)])
+            .query(&[
+                ("api_key", key),
+                ("append_to_response", "credits,external_ids"),
+            ])
             .send_limited(&self.limiter)
             .await
             .ok()?;

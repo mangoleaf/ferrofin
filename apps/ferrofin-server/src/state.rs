@@ -489,13 +489,16 @@ pub async fn build_app_state(
     }
     let tmdb_client = Arc::new(tmdb_client);
     let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
-    // TheTVDB — a remote provider of series and episodes. Ships on with the
-    // built-in project key (like TMDB); a user key/PIN override enables their
-    // subscription tier.
+    // TheTVDB — a remote provider of series, seasons and episodes. Ships on
+    // with the built-in project key (like TMDB); a user key/PIN override
+    // enables their subscription tier. The plugin's `CacheDurationInHours`
+    // (FERROFIN_TVDB_CACHE_HOURS, config `tvdb_cache_hours`; a bad value
+    // warns and keeps the one-hour default) bounds its resolved-id caches.
     let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
-    );
+    )
+    .with_cache_duration(config.tvdb_cache_duration());
     let the_tvdb = Arc::new(match endpoints.tvdb.as_deref() {
         Some(base) => the_tvdb.with_base_url(base),
         None => the_tvdb,
@@ -873,6 +876,13 @@ pub async fn build_app_state(
             .with_fanart(Arc::clone(&fanart_client))
             .with_audiodb(Arc::clone(&audiodb_client))
             .with_omdb(Arc::clone(&omdb_client))
+            // A path-less (virtual) season's refresh runs both season
+            // providers, TheMovieDb's and TheTVDB's, in the library's order
+            // (as the scan does), matches TheTVDB's translations against the
+            // culture table, and saves the credits they answer with.
+            .with_tvdb(Arc::clone(&the_tvdb))
+            .with_localization(Arc::clone(&localization))
+            .with_people(Arc::clone(&people_repository))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no
