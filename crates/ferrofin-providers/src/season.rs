@@ -13,8 +13,15 @@
 //!
 //! Neither provider declares an `IHasOrder`, so both rank
 //! [`DEFAULT_ORDER`] (`ProviderManager.GetDefaultOrder`, `:630-640`); with no
-//! saved order between them, registration decides, and TheMovieDb's built-in
-//! provider registers before the plugin's — TheMovieDb first.
+//! saved order between them, registration decides. Jellyfin registers its
+//! plugins' assemblies before the server's
+//! (`ApplicationHost.GetComposablePartAssemblies:881-886`), so the TVDB
+//! plugin's season provider runs before TheMovieDb's, and Ferrofin registers
+//! its compiled-in TheTVDB first among its built-ins for the same reason
+//! ([`BUILT_IN_METADATA_FETCHERS`]) — TheTVDB first.
+//!
+//! [`DEFAULT_ORDER`]: crate::library_options::DEFAULT_ORDER
+//! [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
 //!
 //! Language: upstream asks TheMovieDb in the lookup's `MetadataLanguage` and
 //! claims it as the answer's `ResultLanguage` (`:43-46`); TheTVDB's season
@@ -34,12 +41,6 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use crate::metadata_merge::MetadataResult;
 use crate::tmdb::SeasonDetails;
 use crate::tvdb::{TvdbClient, TvdbSeasonDetails};
-
-/// `ProviderManager.GetDefaultOrder` for a provider that declares no
-/// `IHasOrder` — "after items that want to be first (~0) but before items
-/// that want to be last (~100)" (`ProviderManager.cs:630-640`). Both season
-/// providers declare none.
-pub const DEFAULT_ORDER: i32 = 50;
 
 /// `TmdbSeasonProvider.GetMetadata`'s answer (`:41-158`) for season
 /// `season_number`, from the season's `/tv/{id}/season/{n}` response.

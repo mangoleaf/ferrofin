@@ -223,6 +223,11 @@ enum RemoteSource {
     /// The TVDB plugin's `TvdbSeriesProvider`, `TvdbSeasonProvider` and
     /// `TvdbEpisodeProvider`.
     Tvdb,
+    /// A dynamic (Tier-1b WASM plugin) metadata source: the index of its
+    /// [`DynamicMetadataProvider`] in the scanner's registration order.
+    ///
+    /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
+    Dynamic(usize),
 }
 
 /// `MetadataLanguageUtils.GetLanguageSubtag`: the language subtag of a
@@ -273,20 +278,33 @@ fn preferred_language(row: &BaseItemEntity, policy: FetcherPolicy<'_>) -> String
 /// the provider the chosen result came from (`prefer`) to the front ("When
 /// identifying, run the provider the user picked first so the correct IDs
 /// are used", `MetadataService.cs:876-882`, a stable `OrderBy`).
-/// `candidates` are `(provider, name, IHasOrder)`.
+/// `candidates` are `(provider, name, IHasOrder)`, in registration order (the
+/// plugins' dynamic sources first, then the built-in providers in
+/// [`BUILT_IN_METADATA_FETCHERS`] order), which breaks the remaining ties
+/// (LINQ's `OrderBy`/`ThenBy` are stable). A provider with no name — a
+/// dynamic source the fetcher lists do not advertise — can be neither ranked
+/// nor preferred: it ranks as a provider the order leaves out
+/// (`int.MaxValue`).
+///
+/// [`BUILT_IN_METADATA_FETCHERS`]: ferrofin_providers::library_options::BUILT_IN_METADATA_FETCHERS
 fn provider_order<S: Copy>(
     policy: FetcherPolicy<'_>,
     kind: &str,
-    candidates: &[(S, &str, i32)],
+    candidates: &[(S, Option<&str>, i32)],
     prefer: Option<&str>,
 ) -> Vec<S> {
-    let mut ranked: Vec<(S, &str, usize, i32)> = candidates
+    let mut ranked: Vec<(S, Option<&str>, usize, i32)> = candidates
         .iter()
-        .map(|&(source, name, order)| (source, name, policy.metadata_rank(kind, name), order))
+        .map(|&(source, name, order)| {
+            let rank = name.map_or(usize::MAX, |name| policy.metadata_rank(kind, name));
+            (source, name, rank, order)
+        })
         .collect();
     ranked.sort_by_key(|&(_, _, rank, order)| (rank, order));
     if let Some(preferred) = prefer {
-        ranked.sort_by_key(|&(_, name, _, _)| !name.eq_ignore_ascii_case(preferred));
+        ranked.sort_by_key(|&(_, name, _, _)| {
+            !name.is_some_and(|name| name.eq_ignore_ascii_case(preferred))
+        });
     }
     ranked.into_iter().map(|(source, ..)| source).collect()
 }
@@ -1307,43 +1325,36 @@ impl Drop for ProbePipeline<'_> {
     }
 }
 
-/// Applies one dynamic provider's answer onto the pass's row,
-/// supplement-only: a field is taken only where the row is still empty.
-fn supplement_from_dynamic(
-    entity: &mut BaseItemEntity,
-    result: &ferrofin_traits::providers::DynamicMetadataResult,
-) {
-    if entity.overview.as_deref().is_none_or(str::is_empty) {
-        entity.overview = result.overview.clone().filter(|o| !o.is_empty());
-    }
-    if entity.production_year.is_none() {
-        entity.production_year = result.production_year.map(i64::from);
-    }
-    if entity.community_rating.is_none() {
-        entity.community_rating = result.community_rating;
-    }
-    if entity.tagline.as_deref().is_none_or(str::is_empty) {
-        entity.tagline = result.tagline.clone().filter(|t| !t.is_empty());
-    }
-    if entity.studios.as_deref().is_none_or(str::is_empty) && !result.studios.is_empty() {
-        entity.studios = Some(result.studios.join("|"));
-    }
-    if entity.tags.as_deref().is_none_or(str::is_empty) && !result.tags.is_empty() {
-        entity.tags = Some(result.tags.join("|"));
-    }
-    if entity.official_rating.as_deref().is_none_or(str::is_empty) {
-        entity.official_rating = result.official_rating.clone().filter(|r| !r.is_empty());
-    }
-    if entity.end_date.is_none() {
-        entity.end_date = result
-            .end_date
-            .as_deref()
-            .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-            .map(|d| d.with_timezone(&chrono::Utc));
-    }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !result.genres.is_empty() {
-        entity.genres = Some(result.genres.join("|"));
-    }
+/// A dynamic (Tier-1b WASM plugin) provider's answer for `row`, as the
+/// provider's own fresh item (`new TItemType()` carrying only what it
+/// supplied), for [`RemoteFold::take`] to fold like a built-in provider's.
+/// A plugin reports no `ResultLanguage` ("a provider that doesn't report a
+/// language cannot be judged, assume it honored the request") and no
+/// credits (a null `People`). Blank strings and lists supply nothing; an
+/// end date that is not RFC 3339 is dropped.
+fn dynamic_answer(
+    row: &BaseItemEntity,
+    result: ferrofin_traits::providers::DynamicMetadataResult,
+) -> RemoteAnswer {
+    let text = |value: Option<String>| value.filter(|v| !v.is_empty());
+    let list = |values: &[String]| (!values.is_empty()).then(|| values.join("|"));
+    let mut answer = RemoteAnswer::for_row(row, None);
+    let item = &mut answer.item;
+    item.overview = text(result.overview);
+    item.production_year = result.production_year.map(i64::from);
+    item.community_rating = result.community_rating;
+    item.genres = list(&result.genres);
+    item.tagline = text(result.tagline);
+    item.studios = list(&result.studios);
+    item.tags = list(&result.tags);
+    item.official_rating = text(result.official_rating);
+    item.end_date = result
+        .end_date
+        .as_deref()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    answer.provider_ids = result.provider_ids;
+    answer
 }
 
 /// Stops a running scan cooperatively, as upstream's `CancellationToken`
@@ -2741,9 +2752,11 @@ pub struct LibraryScanner {
     /// its artwork feeds the image pass. Paired with
     /// [`metadata_dir`](Self::metadata_dir).
     tvdb: Option<Arc<ferrofin_providers::TvdbClient>>,
-    /// Dynamically-registered metadata sources (Tier-1b WASM plugins). Run
-    /// per item AFTER the built-in chain; supplement-only (they fill gaps,
-    /// never overwrite).
+    /// Dynamically-registered metadata sources (Tier-1b WASM plugins):
+    /// remote providers of the item's kind, folded with the built-in ones at
+    /// their rank in the library's fetcher order
+    /// ([`remote_sources`](Self::remote_sources); albums and artists in the
+    /// music pass).
     dynamic_providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
     /// Optional fanart.tv client — supplies high-quality artwork for movies (by
     /// Tmdb/Imdb id) and series (by Tvdb id) on top of the primary provider's
@@ -3186,7 +3199,9 @@ impl LibraryScanner {
     }
 
     /// Registers dynamically-loaded metadata sources (Tier-1b WASM plugins),
-    /// called per item after the built-in provider chain. Supplement-only.
+    /// in registration order: each runs as a remote provider of the item's
+    /// kind, folded with the built-in providers at its rank in the library's
+    /// `MetadataFetcherOrder`.
     #[must_use]
     pub fn with_dynamic_providers(
         mut self,
@@ -4670,6 +4685,19 @@ impl LibraryScanner {
         // save: a refresh that stops or fails before it saves the item
         // leaves its ids as they were.
         let identified = state.refresh.identified(item);
+        // Photos and books carry their metadata inside the file, not on any
+        // remote provider — local readers, run with the NFO and before the
+        // remote providers (a book's readers are upstream's
+        // `ILocalMetadataProvider`s), so a remote provider fills only what
+        // they left. A photo's Primary image is the file itself; a book's is
+        // the cover extracted from its archive.
+        let (embedded_people, embedded_images, embedded_read) = if plan.local_metadata {
+            self.enrich_from_file(&mut entity, locked).await
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        let embedded_found =
+            embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
         // A pass whose remote providers run only because a D2 backfill
         // heuristic asked (none of upstream's triggers fired) merges like
         // "Search for missing metadata": its answers only fill what the item
@@ -4687,15 +4715,22 @@ impl LibraryScanner {
         // gaps the NFO left (`ExecuteRemoteProviders`, see
         // `fetch_remote_metadata`), so a bare file with no NFO shows the same
         // detail page Jellyfin does — when the plan runs the remote
-        // providers. Best-effort: failures don't abort (they only keep the
-        // refresh from being stamped), and NFO-provided values and people
-        // take precedence.
+        // providers. The plugins' (Tier-1b WASM) metadata sources are remote
+        // providers of the fold too, each at its rank in the library's order.
+        // Best-effort: failures don't abort (they only keep the refresh from
+        // being stamped), and NFO-provided values and people take
+        // precedence.
         let remote = if plan.remote_metadata && !locked && !nfo_locked {
             // Identifying runs the provider the chosen result came from
             // first ("When identifying, run the provider the user picked
             // first so the correct IDs are used", `MetadataService.cs:
             // 876-882`).
             let prefer = preferred_fetcher(search.and_then(|r| r.search_provider_name.as_deref()));
+            // The lookup info's ids are the item's own, which the probe (a
+            // pre-refresh provider, `AudioFileProber`) has already given its
+            // tag ids where the item had none: `GetLookupInfo` shares the
+            // item's `ProviderIds`.
+            let lookup_ids = merge_provider_ids(known_ids.clone(), tag_provider_ids.clone());
             // Boxed: the provider fold below this is the deepest branch of
             // the per-item future.
             let fetched = cancel
@@ -4705,7 +4740,7 @@ impl LibraryScanner {
                         state.art_cache,
                         policy,
                         prefer,
-                        &known_ids,
+                        &lookup_ids,
                         &guesses,
                     ),
                 )))
@@ -4718,58 +4753,19 @@ impl LibraryScanner {
         } else {
             RemoteMetadata::default()
         };
-        let mut remote_answers = remote.credits;
+        let remote_answers = remote.credits;
         // `hasRemoteMetadata` (`MetadataService.cs:884-886`): a remote
         // provider answered with metadata.
-        let mut has_remote_metadata = remote.answered;
-        // Photos and books carry their metadata inside the file, not on any
-        // remote provider — local readers, run with the others. A photo's
-        // Primary image is the file itself; a book's is the cover extracted
-        // from its archive.
-        let (embedded_people, embedded_images, embedded_read) = if plan.local_metadata {
-            self.enrich_from_file(&mut entity, locked).await
-        } else {
-            (Vec::new(), Vec::new(), false)
-        };
-        let embedded_found =
-            embedded_read || !embedded_people.is_empty() || !embedded_images.is_empty();
+        let has_remote_metadata = remote.answered;
         // The first local reader that found metadata supplies `temp`'s
         // credits: the NFO, else the file's embedded reader (which, like
         // upstream's book readers, only ever adds people).
         let local_people =
             nfo_people.or_else(|| (!embedded_people.is_empty()).then_some(embedded_people));
-        // Dynamic (Tier-1b WASM plugin) metadata sources run last and
-        // supplement whatever the built-in chain left unfilled; the
-        // helper merges their (filtered) ids with the built-ins'. They are
-        // remote providers, so they run when the remote ones do.
-        let built_in_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
-        // The ids the pass's providers answered with; the probe's tag ids
-        // settle apart from them (`AudioFileProber`'s own rule).
-        let pass_ids = if plan.remote_metadata && !nfo_locked {
-            let dynamic = cancel
-                .unless_cancelled(count_request_failures(self.apply_dynamic_metadata(
-                    &mut entity,
-                    &built_in_ids,
-                    tag_provider_ids.clone(),
-                    locked,
-                    policy,
-                    &guesses,
-                )))
-                .await;
-            let Some(((ids, answered), failed)) = dynamic else {
-                return Ok(ItemSaved::Cancelled);
-            };
-            failures += failed;
-            has_remote_metadata |= answered;
-            // A plugin source that answered carries no credits: a null
-            // `People`, folded in after the built-in chain's answer.
-            if answered {
-                remote_answers.push(None);
-            }
-            ids
-        } else {
-            built_in_ids
-        };
+        // The ids the pass's readers and providers answered with, the NFO's
+        // first; the probe's tag ids settle apart from them
+        // (`AudioFileProber`'s own rule).
+        let pass_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
         // refresh), never as the row rebuilt from disk.
@@ -6999,182 +6995,175 @@ impl LibraryScanner {
         }
     }
 
-    /// Enriches a movie/series row from TMDB (overview, tagline, genres, studios,
-    /// community rating, US certification, premiere date) and returns its cast +
-    /// key crew to persist. No-op when TMDB is unconfigured, the item already has
-    /// an overview (a local NFO or a prior scan), or the item isn't a movie/series.
-    /// Best-effort — a network/parse failure returns no people and leaves the row.
-    /// Runs every registered [`DynamicMetadataProvider`] for one item and
-    /// applies the results **supplement-only within this pass**: a field is
-    /// taken only when the built-in chain left it empty. The pass's result is
-    /// then merged onto a stored row like every provider's (Default mode), so
-    /// a value a plugin supplies does replace the stored one. Returns the
-    /// pass's provider ids: the built-ins' (`remote_ids`) followed by the
-    /// sources' contributions, filtered so a plugin id never displaces one
-    /// the pass (or a probe tag) already has — and whether a source answered
-    /// with metadata (a remote provider's `HasMetadata`). The tag ids settle
-    /// separately ([`settle_provider_ids`]).
-    ///
-    /// [`DynamicMetadataProvider`]: ferrofin_traits::providers::DynamicMetadataProvider
-    async fn apply_dynamic_metadata(
-        &self,
-        entity: &mut BaseItemEntity,
-        remote_ids: &[(String, String)],
-        tag_ids: Vec<(String, String)>,
-        locked: bool,
-        policy: FetcherPolicy<'_>,
-        lookup: &ResolverGuesses,
-    ) -> (Vec<(String, String)>, bool) {
-        // Locked items and provider-less scans skip the pass entirely;
-        // best-effort per source — one bad plugin never fails a scan.
-        if locked || self.dynamic_providers.is_empty() {
-            return (remote_ids.to_vec(), false);
-        }
-        // An unparseable row id must not reach guests as a nil UUID they
-        // could then write segments against — skip the item instead.
-        let Ok(item_id) = Uuid::parse_str(&entity.id) else {
-            tracing::warn!(
-                id = entity.id,
-                "skipping dynamic metadata: unparseable item id"
-            );
-            return (remote_ids.to_vec(), false);
-        };
-        // The plugins look up by every id the item has this pass, its tag
-        // ids included; what they contribute joins the pass's ids.
-        let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
-        let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
-            item_id,
-            kind: entity
-                .type_
-                .rsplit('.')
-                .next()
-                .unwrap_or(&entity.type_)
-                .to_owned(),
-            name: lookup.name(entity).unwrap_or_default(),
-            production_year: lookup.year(entity),
-            path: entity.path.clone(),
-            provider_ids: known_ids.clone(),
-        };
-        let mut contributed_ids = Vec::new();
-        // NAMED providers (declared provider-info) honor the library's
-        // fetcher checkboxes and order; unnamed sources always supplement,
-        // last, in registration order (stable sort keeps their relative
-        // order at equal rank).
-        let mut sources: Vec<_> = self
-            .dynamic_providers
-            .iter()
-            .filter(|p| !p.library_gated() || policy.metadata_enabled(&lookup.kind, p.name()))
-            .collect();
-        sources.sort_by_key(|p| {
-            if p.library_gated() {
-                policy.metadata_rank(&lookup.kind, p.name())
-            } else {
-                usize::MAX
-            }
-        });
-        let mut answered = false;
-        for provider in sources {
-            let result = match provider.lookup(&lookup).await {
-                Ok(Some(result)) => {
-                    answered = true;
-                    result
-                }
-                Ok(None) => continue,
-                Err(err) => {
-                    // A failure, not a miss: the refresh is not recorded as
-                    // complete (see `count_request_failures`).
-                    ferrofin_providers::rate_limit::note_request_failure();
-                    tracing::warn!(
-                        provider = provider.name(),
-                        item = %lookup.item_id,
-                        %err,
-                        "dynamic metadata provider failed; continuing"
-                    );
-                    continue;
-                }
-            };
-            supplement_from_dynamic(entity, &result);
-            // Supplement-only holds for ids too: a key the built-in chain
-            // (or an earlier plugin) already recorded is not replaceable.
-            for (key, value) in result.provider_ids {
-                let taken = known_ids
-                    .iter()
-                    .chain(contributed_ids.iter())
-                    .any(|(k, _)| k.eq_ignore_ascii_case(&key));
-                if !taken {
-                    contributed_ids.push((key, value));
-                }
-            }
-        }
-        let mut all = remote_ids.to_vec();
-        all.extend(contributed_ids);
-        (all, answered)
-    }
-
-    /// The built-in remote metadata providers of an item of kind `short`, in
-    /// the order upstream runs them (`GetMetadataProvidersInternal`,
+    /// The remote metadata providers of an item of kind `short`, in the order
+    /// upstream runs them (`GetMetadataProvidersInternal`,
     /// `ProviderManager.cs:523-540`): the enabled ones, by the admin's
     /// `MetadataFetcherOrder` for the kind (the library's, else the
     /// server-wide one), then by each provider's own `IHasOrder`
-    /// (`GetDefaultOrder`, `:630-640`; 50 for one that declares none), then by
+    /// (`GetDefaultOrder`, `:630-640`; [`default_metadata_order`]), then by
     /// registration. With `prefer` — an Identify result's provider — that one
     /// moves to the front ("When identifying, run the provider the user picked
     /// first so the correct IDs are used", `MetadataService.cs:876-882`, a
     /// stable `OrderBy`).
     ///
     /// The `IHasOrder` values: TheMovieDb's movie, series and episode
-    /// providers declare 1; OMDb's item provider 2 and its episode provider 1;
-    /// the TVDB plugin's none (50). Upstream breaks the episode tie between
-    /// TheMovieDb and OMDb by type discovery order, which its source does not
-    /// fix; Ferrofin registers TheMovieDb first, as its Identify providers are
-    /// registered.
+    /// providers declare 1 (its season provider none: 50); OMDb's item
+    /// provider 2 and its episode provider 1; the TVDB plugin's none (50). So
+    /// TheMovieDb leads a series and an episode with no saved order.
     ///
-    /// A season has two: `TmdbSeasonProvider` and the plugin's
-    /// `TvdbSeasonProvider`, neither declaring an `IHasOrder`
-    /// ([`DEFAULT_ORDER`], 50), so with no saved order between them
-    /// registration decides: TheMovieDb's built-in provider first. OMDb has
-    /// no season provider.
+    /// Registration breaks a full tie — the same saved rank (or none) and the
+    /// same `IHasOrder` — by Ferrofin's three-category rule: the plugins'
+    /// (Tier-1b WASM) metadata sources first, compiled-in extensions second
+    /// (none provides one), the built-in providers last, TheTVDB first among
+    /// them ([`BUILT_IN_METADATA_FETCHERS`], where the rule and its Jellyfin
+    /// rationale are spelled out). So a season with no saved order asks
+    /// TheTVDB before TheMovieDb (both 50), as Jellyfin, where TheTVDB is a
+    /// plugin, does; and TheMovieDb breaks its episode tie with OMDb (both
+    /// 1) as Ferrofin always has. OMDb has no season provider.
     ///
-    /// [`DEFAULT_ORDER`]: ferrofin_providers::season::DEFAULT_ORDER
+    /// The plugins' sources ([`dynamic_sources`](Self::dynamic_sources)) are
+    /// remote providers of every kind: a named one at its rank in the saved
+    /// order, each by upstream's default order for a provider that declares
+    /// no `IHasOrder` (`DEFAULT_ORDER`, 50: a plugin cannot declare one). An
+    /// album or an artist runs its providers in the music pass, not here
+    /// ([`music::owns_providers`]).
+    ///
+    /// [`default_metadata_order`]: ferrofin_providers::library_options::default_metadata_order
+    /// [`BUILT_IN_METADATA_FETCHERS`]: ferrofin_providers::library_options::BUILT_IN_METADATA_FETCHERS
     fn remote_sources(
         &self,
         policy: FetcherPolicy<'_>,
         short: &str,
         prefer: Option<&'static str>,
     ) -> Vec<RemoteSource> {
+        use ferrofin_providers::library_options::{
+            BUILT_IN_METADATA_FETCHERS, default_metadata_order,
+        };
+        if music::owns_providers(short) {
+            return Vec::new();
+        }
         let video = matches!(short, "Movie" | "Series" | "Episode");
         let season = short == "Season";
         let tv = matches!(short, "Series" | "Season" | "Episode");
-        let candidates = [
-            (
-                RemoteSource::Tmdb,
-                fetcher_names::TMDB,
-                if season {
-                    ferrofin_providers::season::DEFAULT_ORDER
-                } else {
-                    1
-                },
-                (video || season) && self.tmdb.is_some(),
-            ),
-            (
-                RemoteSource::Tvdb,
-                fetcher_names::TVDB,
-                50,
-                tv && self.tvdb.is_some(),
-            ),
-            (
-                RemoteSource::Omdb,
-                fetcher_names::OMDB,
-                if short == "Episode" { 1 } else { 2 },
-                video && self.omdb.as_ref().is_some_and(|o| o.is_enabled()),
-            ),
-        ];
-        let enabled: Vec<(RemoteSource, &str, i32)> = candidates
+        // A built-in provider of `short` whose client is wired.
+        let built_in = |name: &str| match name {
+            fetcher_names::TVDB if tv && self.tvdb.is_some() => Some(RemoteSource::Tvdb),
+            fetcher_names::TMDB if (video || season) && self.tmdb.is_some() => {
+                Some(RemoteSource::Tmdb)
+            }
+            fetcher_names::OMDB if video && self.omdb.as_ref().is_some_and(|o| o.is_enabled()) => {
+                Some(RemoteSource::Omdb)
+            }
+            _ => None,
+        };
+        let mut enabled: Vec<(RemoteSource, Option<&str>, i32)> = self
+            .dynamic_sources(policy, short)
             .into_iter()
-            .filter(|&(_, name, _, wired)| wired && policy.metadata_enabled(short, name))
-            .map(|(source, name, order, _)| (source, name, order))
+            .map(|(index, name, order)| (RemoteSource::Dynamic(index), name, order))
             .collect();
+        enabled.extend(
+            BUILT_IN_METADATA_FETCHERS
+                .iter()
+                .filter(|&&name| policy.metadata_enabled(short, name))
+                .filter_map(|&name| {
+                    built_in(name)
+                        .map(|source| (source, Some(name), default_metadata_order(name, short)))
+                }),
+        );
         provider_order(policy, short, &enabled, prefer)
+    }
+
+    /// The dynamic (Tier-1b WASM plugin) metadata sources an item of kind
+    /// `short` asks, as `(index, advertised name, IHasOrder)` in registration
+    /// order: a named source (`provider-info`) only where its library — else
+    /// the server-wide options — enables it for the kind
+    /// (`CanRefreshMetadata`), the others always, and without a name, so the
+    /// saved order cannot rank them ([`provider_order`]). Each takes
+    /// [`DEFAULT_ORDER`], the `IHasOrder` `/Libraries/AvailableOptions`
+    /// lists a plugin by too ([`library_options_info`]): one table.
+    ///
+    /// [`DEFAULT_ORDER`]: ferrofin_providers::library_options::DEFAULT_ORDER
+    /// [`library_options_info`]: ferrofin_providers::library_options::library_options_info
+    fn dynamic_sources(
+        &self,
+        policy: FetcherPolicy<'_>,
+        short: &str,
+    ) -> Vec<(usize, Option<&str>, i32)> {
+        self.dynamic_providers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.library_gated() || policy.metadata_enabled(short, p.name()))
+            .map(|(index, p)| {
+                let name = p.library_gated().then(|| p.name());
+                (
+                    index,
+                    name,
+                    ferrofin_providers::library_options::DEFAULT_ORDER,
+                )
+            })
+            .collect()
+    }
+
+    /// Asks dynamic source `index` about `request`, returning its answer as a
+    /// remote provider's answer for `row` ([`dynamic_answer`]).
+    ///
+    /// A source that errors is a provider that failed, not one that found
+    /// nothing: the failure is counted (the refresh is then not recorded as
+    /// complete, so the next scan asks again — `count_request_failures`),
+    /// logged, and the fold runs on without it.
+    async fn ask_dynamic(
+        &self,
+        index: usize,
+        request: &ferrofin_traits::providers::DynamicMetadataLookup,
+        row: &BaseItemEntity,
+    ) -> Option<RemoteAnswer> {
+        let provider = self.dynamic_providers.get(index)?;
+        match provider.lookup(request).await {
+            Ok(Some(result)) => Some(dynamic_answer(row, result)),
+            Ok(None) => None,
+            Err(err) => {
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::warn!(
+                    provider = provider.name(),
+                    item_id = %request.item_id,
+                    %err,
+                    "dynamic metadata provider failed; continuing"
+                );
+                None
+            }
+        }
+    }
+
+    /// A dynamic (Tier-1b WASM plugin) metadata source's turn in the fold
+    /// for `row`: it is asked by the lookup info every provider of the pass
+    /// is asked by — the item's name and year as they stood before the first
+    /// provider ran, and the ids `known_ids` holds by now (the item's own,
+    /// then each earlier answer's). A row whose id is not a UUID is never
+    /// offered to a plugin (it could not be addressed back).
+    async fn fetch_dynamic_metadata(
+        &self,
+        index: usize,
+        row: &BaseItemEntity,
+        short: &str,
+        known_ids: &[(String, String)],
+        lookup: &ResolverGuesses,
+    ) -> Option<RemoteAnswer> {
+        let Ok(item_id) = Uuid::parse_str(&row.id) else {
+            tracing::warn!(
+                id = row.id,
+                "skipping dynamic metadata: unparseable item id"
+            );
+            return None;
+        };
+        let request = ferrofin_traits::providers::DynamicMetadataLookup {
+            item_id,
+            kind: short.to_owned(),
+            name: lookup.name(row).unwrap_or_default(),
+            production_year: lookup.year(row),
+            path: row.path.clone(),
+            provider_ids: known_ids.to_vec(),
+        };
+        self.ask_dynamic(index, &request, row).await
     }
 
     /// The remote metadata pass of one item — port of
@@ -7188,7 +7177,10 @@ impl LibraryScanner {
     /// join the lookup the next provider resolves by (`MergeNewData`), so an
     /// id one provider found is what the next one looks up by: TMDB's
     /// `Tvdb`/`Imdb` external ids for TVDB and OMDb, TVDB's `Tmdb`/`Imdb`
-    /// remote ids for TMDB.
+    /// remote ids for TMDB. A plugin's (Tier-1b WASM) metadata source is one
+    /// of these providers, at its rank: ranked first, its answer wins every
+    /// field it fills; ranked after a built-in one, it fills what that one
+    /// left.
     ///
     /// No provider stops the others: a hit is not authoritative, a miss or a
     /// failure (counted by the request, see `count_request_failures`) only
@@ -7246,6 +7238,10 @@ impl LibraryScanner {
                 }
                 RemoteSource::Omdb => {
                     self.fetch_omdb_metadata(&row, &short, cache, policy, &fold.lookup, lookup)
+                        .await
+                }
+                RemoteSource::Dynamic(index) => {
+                    self.fetch_dynamic_metadata(index, &row, &short, &fold.lookup, lookup)
                         .await
                 }
             };
@@ -15555,10 +15551,11 @@ mod tests {
 
     /// The remote providers run in `GetMetadataProvidersInternal`'s order
     /// (`ProviderManager.cs:523-540`): the saved order, then `IHasOrder`
-    /// (TheMovieDb 1; OMDb's item provider 2 and its episode provider 1; the
-    /// TVDB plugin 50), then registration; only the ones the library enabled
-    /// and that are wired; Identify's provider first (`MetadataService.cs:
-    /// 876-882`).
+    /// (TheMovieDb 1, its season provider 50; OMDb's item provider 2 and its
+    /// episode provider 1; the TVDB plugin 50), then registration (TheTVDB
+    /// first among the built-ins, a plugin in Jellyfin); only the ones the
+    /// library enabled and that are wired; Identify's provider first
+    /// (`MetadataService.cs:876-882`).
     #[tokio::test]
     async fn remote_providers_run_in_upstreams_order() {
         use super::RemoteSource::{Omdb, Tmdb, Tvdb};
@@ -15584,11 +15581,12 @@ mod tests {
             [Tmdb, Omdb, Tvdb]
         );
         // `TmdbSeasonProvider` and `TvdbSeasonProvider` both declare no
-        // `IHasOrder` (50): registration order, TheMovieDb's built-in first.
-        // OMDb has no season provider.
+        // `IHasOrder` (50): registration order, TheTVDB first (Jellyfin
+        // registers the TVDB plugin before the server's providers). OMDb has
+        // no season provider.
         assert_eq!(
             scanner.remote_sources(default, "Season", None),
-            [Tmdb, Tvdb]
+            [Tvdb, Tmdb]
         );
         let season_tvdb_first = LibraryOptions {
             type_options: vec![TypeOptions {
@@ -15649,6 +15647,258 @@ mod tests {
         let (keyless, _cache, _ep) = tmdb_episode_fixture("http://127.0.0.1:1", tmp.path()).await;
         let keyless = keyless.with_omdb(Arc::new(ferrofin_providers::OmdbClient::new("")));
         assert_eq!(keyless.remote_sources(default, "Movie", None), [Tmdb, Omdb]);
+    }
+
+    /// A library that ticked `fetchers` for movies and saved `order` as
+    /// their order.
+    fn movie_fetchers(
+        fetchers: &[&str],
+        order: &[&str],
+    ) -> ferrofin_model::configuration::LibraryOptions {
+        ferrofin_model::configuration::LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                metadata_fetchers: fetchers.iter().map(|n| (*n).to_owned()).collect(),
+                metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// The fetcher policy of a library saved with `options`.
+    fn library_policy(
+        options: &ferrofin_model::configuration::LibraryOptions,
+    ) -> super::FetcherPolicy<'_> {
+        super::FetcherPolicy {
+            options: Some(options),
+            global: None,
+        }
+    }
+
+    /// A scanner with TheMovieDb, TheTVDB and OMDb wired (to an address
+    /// nothing answers on) and `plugins` as its dynamic sources.
+    async fn ordering_scanner(
+        tmp: &std::path::Path,
+        plugins: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
+    ) -> LibraryScanner {
+        let (scanner, _cache, _ep) = tmdb_episode_fixture("http://127.0.0.1:1", tmp).await;
+        scanner
+            .with_tvdb(Arc::new(
+                ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
+            ))
+            .with_omdb(Arc::new(
+                ferrofin_providers::OmdbClient::new("key").with_base_url("http://127.0.0.1:1"),
+            ))
+            .with_dynamic_providers(plugins)
+    }
+
+    /// A plugin's (Tier-1b WASM) metadata source runs among the remote
+    /// providers of every kind like any provider
+    /// (`GetMetadataProvidersInternal`, `ProviderManager.cs:523-540`): a
+    /// named one at its rank in the saved order — ahead of TheMovieDb when
+    /// the admin put it there — and else by its `IHasOrder`, which a WASM
+    /// plugin cannot declare (upstream's 50: after TheMovieDb's 1 and OMDb's
+    /// 2, and before TheTVDB's 50 by registration — plugins register before
+    /// the built-in providers). A source the library unticked never runs. An
+    /// album's or an artist's providers run in the music pass, so none runs
+    /// here.
+    #[tokio::test]
+    async fn plugin_sources_run_at_their_rank_among_the_remote_providers() {
+        use super::RemoteSource::{Dynamic, Omdb, Tmdb, Tvdb};
+        use ferrofin_providers::library_options::fetcher_names::{OMDB, TMDB};
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = ordering_scanner(tmp.path(), vec![Arc::new(NamedProvider("WatDb"))]).await;
+        let default = super::FetcherPolicy::default();
+        assert_eq!(
+            scanner.remote_sources(default, "Movie", None),
+            [Tmdb, Omdb, Dynamic(0)]
+        );
+        assert_eq!(
+            scanner.remote_sources(default, "Series", None),
+            [Tmdb, Omdb, Dynamic(0), Tvdb],
+            "TheTVDB's 50 ties with the plugin's: registration, the plugin first"
+        );
+        assert_eq!(
+            scanner.remote_sources(default, "Season", None),
+            [Dynamic(0), Tvdb, Tmdb],
+            "three providers at 50: the plugin, then TheTVDB, then TheMovieDb"
+        );
+        assert_eq!(
+            scanner.remote_sources(default, "Audio", None),
+            [Dynamic(0)],
+            "a kind no built-in provider serves"
+        );
+        assert!(
+            scanner
+                .remote_sources(default, "MusicAlbum", None)
+                .is_empty()
+                && scanner
+                    .remote_sources(default, "MusicArtist", None)
+                    .is_empty(),
+            "the music pass runs an album's and an artist's"
+        );
+        let first = movie_fetchers(&[TMDB, OMDB, "WatDb"], &["watdb", TMDB, OMDB]);
+        assert_eq!(
+            scanner.remote_sources(library_policy(&first), "Movie", None),
+            [Dynamic(0), Tmdb, Omdb],
+            "ranked first by the admin (names match case-insensitively)"
+        );
+        let between = movie_fetchers(&[TMDB, OMDB, "WatDb"], &[TMDB, "WatDb", OMDB]);
+        assert_eq!(
+            scanner.remote_sources(library_policy(&between), "Movie", None),
+            [Tmdb, Dynamic(0), Omdb]
+        );
+        let unranked = movie_fetchers(&[TMDB, OMDB, "WatDb"], &[OMDB]);
+        assert_eq!(
+            scanner.remote_sources(library_policy(&unranked), "Movie", None),
+            [Omdb, Tmdb, Dynamic(0)],
+            "left out of the order: by IHasOrder, TheMovieDb's 1 before the plugin's 50"
+        );
+        assert_eq!(
+            scanner.remote_sources(library_policy(&first), "Movie", Some(TMDB)),
+            [Tmdb, Dynamic(0), Omdb],
+            "Identify's provider first, the rest in order"
+        );
+        let unticked = movie_fetchers(&[TMDB, OMDB], &["WatDb", TMDB, OMDB]);
+        assert_eq!(
+            scanner.remote_sources(library_policy(&unticked), "Movie", None),
+            [Tmdb, Omdb],
+            "an unticked plugin never runs"
+        );
+    }
+
+    /// A plugin source that declares no `provider-info` is in no fetcher
+    /// list, so the admin can neither untick nor rank it: it runs whatever
+    /// the checkboxes say and ranks as a provider the order leaves out — even
+    /// when the order happens to name a fetcher as it is called.
+    #[tokio::test]
+    async fn an_unnamed_plugin_source_runs_unticked_and_unranked() {
+        use super::RemoteSource::{Dynamic, Omdb, Tmdb};
+        use ferrofin_providers::library_options::fetcher_names::{OMDB, TMDB};
+        /// An ungated source that happens to carry a fetcher's name.
+        struct Unnamed;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for Unnamed {
+            fn name(&self) -> &'static str {
+                "WatDb"
+            }
+            async fn lookup(
+                &self,
+                _item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Ok(None)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = ordering_scanner(tmp.path(), vec![Arc::new(Unnamed)]).await;
+        let names_it = movie_fetchers(&[TMDB, OMDB], &["WatDb", TMDB, OMDB]);
+        assert_eq!(
+            scanner.remote_sources(library_policy(&names_it), "Movie", None),
+            [Tmdb, Omdb, Dynamic(0)]
+        );
+    }
+
+    /// A plugin's metadata source is asked by the lookup info every remote
+    /// provider of the pass is asked by: the item's own ids, then each
+    /// earlier answer's (`MergeNewData`, `MetadataService.cs:1004,1079-1100`).
+    /// Ranked after TheMovieDb it sees the episode's `Tmdb` id TheMovieDb
+    /// answered with, and fills only what TheMovieDb left; ranked before, it
+    /// sees only the item's own ids, and its overview wins.
+    #[rstest::rstest]
+    #[case::after_tmdb(false)]
+    #[case::before_tmdb(true)]
+    #[tokio::test]
+    async fn a_plugin_source_is_asked_by_the_ids_the_providers_before_it_found(
+        #[case] first: bool,
+    ) {
+        use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+        use ferrofin_providers::library_options::fetcher_names::TMDB;
+        /// Records the ids it is asked by and answers with an overview.
+        struct EpDb(std::sync::Mutex<Vec<Vec<(String, String)>>>);
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for EpDb {
+            fn name(&self) -> &'static str {
+                "EpDb"
+            }
+            fn library_gated(&self) -> bool {
+                true
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(item.provider_ids.clone());
+                Ok(Some(ferrofin_traits::providers::DynamicMetadataResult {
+                    overview: Some("EpDb overview.".to_owned()),
+                    tagline: Some("EpDb tagline.".to_owned()),
+                    ..Default::default()
+                }))
+            }
+        }
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let plugin = Arc::new(EpDb(std::sync::Mutex::new(Vec::new())));
+        let scanner =
+            scanner
+                .with_dynamic_providers(vec![Arc::clone(&plugin)
+                    as Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>]);
+        let order = if first {
+            ["EpDb", TMDB]
+        } else {
+            [TMDB, "EpDb"]
+        };
+        let options = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Episode".to_owned()),
+                metadata_fetchers: vec![TMDB.to_owned(), "EpDb".to_owned()],
+                metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+                ..TypeOptions::default()
+            }],
+            ..Default::default()
+        };
+        let mut episode = BaseItemEntity {
+            id: uuid::Uuid::from_u128(0xE1).to_string(),
+            ..planned_episode(1)
+        };
+        let guesses = super::ResolverGuesses::take(&mut episode, None, false);
+        let own = vec![("Imdb".to_owned(), "tt0944947".to_owned())];
+        let remote = scanner
+            .fetch_remote_metadata(
+                &mut episode,
+                &mut cache,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    global: None,
+                },
+                None,
+                &own,
+                &guesses,
+            )
+            .await;
+        let asked = plugin.0.lock().unwrap().clone();
+        assert_eq!(remote.credits.len(), 2, "both providers answered");
+        assert_eq!(episode.tagline.as_deref(), Some("EpDb tagline."));
+        if first {
+            assert_eq!(asked, [own]);
+            assert_eq!(episode.overview.as_deref(), Some("EpDb overview."));
+        } else {
+            assert_eq!(
+                asked,
+                [vec![
+                    ("Imdb".to_owned(), "tt0944947".to_owned()),
+                    ("Tmdb".to_owned(), "63056".to_owned())
+                ]]
+            );
+            assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+        }
     }
 
     #[test]
@@ -23893,7 +24143,7 @@ mod tests {
     }
 
     /// A named (library-gated) dynamic provider whose contribution is its
-    /// own name — so which provider "won" a supplement-only field is
+    /// own name — so which provider won a field the fold fills once is
     /// observable in the row.
     struct NamedProvider(&'static str);
     #[async_trait::async_trait]
@@ -23961,8 +24211,8 @@ mod tests {
     // The per-library gate is REAL: a named dynamic provider a library's
     // TypeOptions leaves unchecked never runs for that library's items,
     // and the saved fetcher order decides which enabled provider wins a
-    // supplement-only field. The flat local-reader list gates the NFO
-    // reader the same way.
+    // field (the first answer fills it, a later one only what is still
+    // empty). The flat local-reader list gates the NFO reader the same way.
     #[tokio::test]
     async fn library_options_gate_and_order_fetchers_per_library() {
         use ferrofin_model::configuration::TypeOptions;
@@ -24001,7 +24251,7 @@ mod tests {
         );
 
         // Library B: both checked, order says beta first → beta wins the
-        // supplement-only overview even though alpha registered first.
+        // overview even though alpha registered first.
         let tmp = tempfile::tempdir().unwrap();
         let (persistence, vf, db) = gated_library(
             tmp.path(),
@@ -24030,8 +24280,9 @@ mod tests {
             "the saved fetcher order picks the winner"
         );
 
-        // Library C: no TypeOptions entry at all → everything enabled in
-        // registration order; NFO enabled → the year lands.
+        // Library C: no TypeOptions entry at all → everything enabled,
+        // equal `IHasOrder` (50), so registration order; NFO enabled → the
+        // year lands.
         let tmp = tempfile::tempdir().unwrap();
         let (persistence, vf, db) =
             gated_library(tmp.path(), LibraryOptions::default(), true).await;
@@ -24206,14 +24457,136 @@ mod tests {
         );
     }
 
-    // The dynamic (Tier-1b WASM) metadata pass is SUPPLEMENT-ONLY: it fills
-    // fields the built-in chain left empty and merges its provider ids, but a
-    // value already present (here: the NFO year) must never be overwritten.
+    /// A plugin's answer reports no `ResultLanguage`, so the fold counts it
+    /// as one in the preferred language (`MatchesPreferredLanguage`: "a
+    /// provider that doesn't report a language cannot be judged, assume it
+    /// honored the request", `MetadataService.cs:977-999`): in a French
+    /// library its overview and tagline replace the English ones an earlier
+    /// OMDb answer (`ResultLanguage = "en"`) supplied only as fallbacks,
+    /// though it runs after OMDb; in an English library OMDb's stand.
+    #[test]
+    fn a_plugin_answer_counts_as_one_in_the_preferred_language() {
+        use ferrofin_traits::providers::DynamicMetadataResult;
+        let row = BaseItemEntity {
+            id: "movie".into(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            ..BaseItemEntity::default()
+        };
+        for (preferred, overview, tagline) in [
+            ("fr", "Plugin overview.", "Plugin tagline."),
+            ("en", "OMDb overview.", "OMDb tagline."),
+        ] {
+            let mut temp = super::RemoteAnswer::for_row(&row, None).item;
+            let mut fold = super::RemoteFold::new(&[], preferred);
+            let mut omdb = super::RemoteAnswer::for_row(&row, Some("en"));
+            omdb.item.overview = Some("OMDb overview.".into());
+            omdb.item.tagline = Some("OMDb tagline.".into());
+            fold.take(&mut temp, omdb);
+            let plugin = super::dynamic_answer(
+                &row,
+                DynamicMetadataResult {
+                    overview: Some("Plugin overview.".into()),
+                    tagline: Some("Plugin tagline.".into()),
+                    ..DynamicMetadataResult::default()
+                },
+            );
+            fold.take(&mut temp, plugin);
+            assert_eq!(temp.overview.as_deref(), Some(overview), "{preferred}");
+            assert_eq!(temp.tagline.as_deref(), Some(tagline), "{preferred}");
+        }
+    }
+
+    /// A book's embedded metadata (here a `.cbz`'s `<stem>.xml` ComicInfo
+    /// sidecar) is read by its local readers — upstream's
+    /// `ILocalMetadataProvider<Book>`s, merged into `temp` before any remote
+    /// provider (`MetadataService.cs:803-850`) — so a plugin's answer only
+    /// fills what they left: the ComicInfo summary and genre stand over the
+    /// plugin's overview and genres, and the plugin's tagline fills the gap.
+    #[tokio::test]
+    async fn a_books_embedded_metadata_stands_over_a_plugins_answer() {
+        struct BookDb;
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for BookDb {
+            fn name(&self) -> &'static str {
+                "book-db"
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                Ok((item.kind == "Book").then(|| {
+                    ferrofin_traits::providers::DynamicMetadataResult {
+                        overview: Some("Plugin overview.".to_owned()),
+                        genres: vec!["Plugin genre".to_owned()],
+                        tagline: Some("Plugin tagline.".to_owned()),
+                        ..Default::default()
+                    }
+                }))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("books");
+        std::fs::create_dir_all(&media).unwrap();
+        // Not a ZIP: no archive comment, no cover — only the sidecar reads.
+        std::fs::write(media.join("Comic.cbz"), b"not an archive").unwrap();
+        std::fs::write(
+            media.join("Comic.xml"),
+            b"<ComicInfo><Title>Comic</Title><Summary>Comic summary.</Summary>\
+              <Genre>Superhero</Genre></ComicInfo>",
+        )
+        .unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Books",
+            Some(CollectionTypeOptions::books),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_dynamic_providers(vec![Arc::new(BookDb)])
+            .scan_all()
+            .await
+            .unwrap();
+        let id = crate::item_type_lookup::derive_item_id(
+            BaseItemKind::Book,
+            &media.join("Comic.cbz").to_string_lossy(),
+        )
+        .expect("id");
+        let book = crate::test_support::item_repository_over(db)
+            .retrieve_item(id)
+            .await
+            .unwrap()
+            .expect("the book");
+        assert_eq!(book.overview.as_deref(), Some("Comic summary."));
+        assert_eq!(book.genres.as_deref(), Some("Superhero"));
+        assert_eq!(book.tagline.as_deref(), Some("Plugin tagline."));
+    }
+
+    // A dynamic (Tier-1b WASM) metadata source is a remote provider of the
+    // fold: the local readers' values come first (here: the NFO year, which
+    // its answer cannot replace), its answer fills what is still empty, its
+    // provider ids are recorded, and an id of a name an answer before it
+    // gave stands. A source that fails fails no scan.
     #[tokio::test]
     // Three provider structs + full scan harness + layered assertions; the
     // sequence is the point.
     #[allow(clippy::too_many_lines)]
-    async fn dynamic_provider_supplements_but_never_overwrites() {
+    async fn a_dynamic_provider_folds_after_the_local_readers() {
         struct HelloDb;
         #[async_trait::async_trait]
         impl ferrofin_traits::providers::DynamicMetadataProvider for HelloDb {
@@ -24242,8 +24615,8 @@ mod tests {
                 }))
             }
         }
-        /// A later source trying to steal an id an earlier one recorded
-        /// (case-insensitively) — supplement-only applies to ids too.
+        /// A later source answering with an id of a name an earlier one
+        /// recorded (case-insensitively): the fold keeps the first.
         struct IdThief;
         #[async_trait::async_trait]
         impl ferrofin_traits::providers::DynamicMetadataProvider for IdThief {

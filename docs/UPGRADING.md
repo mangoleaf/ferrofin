@@ -8,6 +8,93 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — plugin metadata sources run at their rank
+
+This applies only if you run WASM plugins that supply metadata (a plugin listed under
+**Metadata downloaders** in a library's settings, or one whose documentation says it
+fills metadata).
+
+A plugin's metadata now takes its place among the library's metadata downloaders like
+any provider, as in Jellyfin: the providers run in the order the library's settings
+list them, and the first one to supply a field wins it. Before, a plugin always ran
+after TheMovieDb, OMDb, TheTVDB, MusicBrainz and TheAudioDB and could only fill fields
+they left empty.
+
+- **Check the Metadata downloaders order of every library that uses a plugin.** A
+  plugin listed above TheMovieDb (or another built-in provider) now wins the fields
+  both supply: its overview, rating or genres replace TheMovieDb's on the next refresh
+  that asks the providers. **This is likely even if you never moved it:** the dashboard
+  shows a downloader that is missing from a library's saved order at the top of the
+  list, and saving the library's settings stores the order shown. So in a library
+  whose settings were saved before you installed the plugin, enabling the plugin put it
+  first. To keep the old behaviour, move the plugin below the built-in providers and
+  save.
+- Where nothing ranks a plugin (a library that never saved its settings for that kind
+  of item, or a plugin that does not appear in the list at all, which is never ranked),
+  it runs after the built-in providers that come first by default (TheMovieDb for
+  movies, series and episodes; OMDb; MusicBrainz; TheAudioDB) and only fills what they
+  left. **Seasons are the exception:** TheTVDB and TheMovieDb's season provider have no
+  default position either, and a plugin comes before them, so an unranked plugin runs
+  first for seasons and wins every season field it supplies. That includes a plugin
+  that does not list seasons among the kinds it supports: in a library with no saved
+  season settings it is still asked about seasons (the supported kinds are not enforced
+  yet, an open item). In a library with saved season settings, a plugin runs for
+  seasons only where it is ticked, at its saved position (the top, if the saved order
+  predates the plugin); one without `provider-info` (not in the list) runs after
+  TheTVDB and TheMovieDb.
+- Two things differ from before even where a plugin only fills gaps: its studios and
+  tags are added to the other providers', and in a library whose language is not
+  English its overview and tagline replace the English ones OMDb or TheAudioDB supplied
+  (a plugin reports no language, so it counts as answering in the library's language,
+  as in Jellyfin).
+- **In a library you create from the dashboard, a plugin starts unticked** under
+  *Metadata downloaders* and *Image fetchers*, as in Jellyfin: it is listed (for
+  seasons, first), but runs only once you tick it. Before, it started ticked.
+- For albums and artists, a plugin is now asked together with MusicBrainz and
+  TheAudioDB, in the library's order, instead of during the file walk (after which
+  MusicBrainz and TheAudioDB replaced whatever they also supplied). Artists that exist
+  only as names on tracks are now asked too.
+- An `album.nfo` or `artist.nfo` now wins over every remote provider, as in Jellyfin:
+  MusicBrainz, TheAudioDB and plugins only fill what the NFO leaves empty. Before,
+  MusicBrainz and TheAudioDB replaced the NFO's values (its genres, overview, year) on
+  every refresh that asked them, and "Replace all metadata" erased NFO values they did
+  not supply. Albums and artists refreshed before this release keep the replaced values
+  until their next refresh that replaces values. **Search for missing metadata** fills
+  only empty fields, so it does not bring them back; **Replace all metadata** on the
+  music library does, but it also replaces every unlocked value you edited, so lock
+  those first or refresh only the affected albums and artists.
+- A plugin that fails (its metadata lookup returns an error) counts as a failed
+  provider, as before: the item is asked again on the next scan, and the failure erases
+  nothing.
+- What a plugin can reach does not change: no filesystem, network only to the hosts it
+  declares, the same memory and time limits.
+
+For plugin authors: nothing to rebuild. The `ferrofin:plugin@0.5.0` world is unchanged
+and existing components load as they are. Return only values you are confident in: your
+plugin may well sit above TheMovieDb in a library's order (see above), and then your
+answer wins. Your lookup's `provider-ids` now include the ids that providers ranked
+before yours found in the same refresh (TheMovieDb's ids, for example). See
+`docs/EXTENSIONS.md`.
+
+No manual step is needed beyond checking the order.
+
+## Unreleased — seasons ask TheTVDB before TheMovieDb by default
+
+This affects TV libraries with no saved season settings: libraries created through the
+API without season options, or whose metadata settings were never saved. There, both
+TheTVDB and TheMovieDb are asked about seasons, and TheTVDB now goes first, as in Jellyfin
+(where TheTVDB is a plugin, and plugins come first when two providers have no order). So
+TheTVDB's season overview and id win, and TheMovieDb fills what it leaves (the dates, the
+year, the cast). This includes seasons without a folder of their own, which were filled
+from TheMovieDb alone before. Each season changes on its next refresh that replaces
+values (a file joining or leaving its folder, **Replace all metadata**, or its own
+**Refresh metadata** dialog); an unchanged scan changes nothing.
+
+The dashboard now lists TheTVDB before TheMovieDb for seasons, and a new library saves
+that order. Libraries whose settings were saved from the dashboard keep their saved order.
+To keep TheMovieDb first, move it above TheTVDB under the library's season downloaders
+and save.
+
 ## Unreleased — every checked metadata provider runs, in order
 
 Metadata refreshes now ask every metadata downloader a library has checked, one
@@ -30,7 +117,8 @@ library's metadata settings.
   only empty fields but, as in Jellyfin, replaces an item's unlocked cast
   wherever a provider credits someone.
 - **Seasons get remote metadata.** TheMovieDb's and TheTVDB's season providers
-  now fill a season, as in Jellyfin, in the library's order for seasons:
+  now fill a season, as in Jellyfin, in the library's order for seasons (with no
+  saved order, TheTVDB first: in Jellyfin it is a plugin, and plugins come first):
   TheMovieDb its overview, premiere date and year, cast and ids; TheTVDB its
   overview (in the library's language) and its TheTVDB id only, no date or
   year. A new library checks only TheTVDB for seasons, so there a season gets

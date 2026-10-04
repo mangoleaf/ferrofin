@@ -357,12 +357,40 @@ interface types {
         end-ticks: s64,
     }
 
-    /// Metadata a plugin contributes for one item from `metadata-lookup`.
-    /// SUPPLEMENT-ONLY: the scanner applies each field only where the item
-    /// still lacks a value — a plugin can fill gaps, never overwrite the
-    /// built-in providers or user edits. Image contribution is deliberately
-    /// absent from 0.x (the image pipeline is a bigger contract; it lands
-    /// when a real plugin needs it).
+    /// Metadata a plugin contributes for one item from `metadata-lookup`:
+    /// one remote provider's answer. FOLDED AT THE PROVIDER'S CONFIGURED
+    /// RANK, like any provider's (Jellyfin's `ExecuteRemoteProviders`): the
+    /// scanner runs the item kind's remote providers — the built-in ones and
+    /// every plugin's — one after the other in the library's metadata
+    /// fetcher order (Dashboard → Libraries → Metadata downloaders), then by
+    /// each provider's own default order (a plugin's is 50, Jellyfin's value
+    /// for a provider that declares none), then by registration: plugins
+    /// first, then compiled-in extensions, then the built-in providers (as
+    /// Jellyfin registers its plugins before the server's providers). So a
+    /// plugin the order leaves out runs after the built-in providers that
+    /// declare a lower default order (TheMovieDb for movies, series and
+    /// episodes; OMDb; MusicBrainz; TheAudioDB), but before TheTVDB and
+    /// TheMovieDb's season provider when the order leaves them out too — so
+    /// for seasons a plugin nothing ranks runs first (supported kinds are not
+    /// enforced yet, so this holds for a plugin that does not list Season).
+    /// jellyfin-web lists a fetcher missing from a library's saved order at
+    /// the TOP and saves the order it shows, so a plugin enabled in a library
+    /// saved before it was installed is usually ranked first; a library
+    /// created from the dashboard lists every plugin unticked, as Jellyfin
+    /// does. Local metadata comes first whatever the rank: a provider only
+    /// fills what the item's NFO, embedded book metadata, EXIF or audio tags
+    /// left. The first
+    /// answer to supply a field wins it; a later one fills only what is
+    /// still empty (studios and tags union). So ranked first a plugin's
+    /// values win over the built-in providers'; ranked after them it fills
+    /// their gaps. A plugin reports no answer language, so its overview and
+    /// tagline count as in the library's language: they replace an English
+    /// one an earlier provider supplied (OMDb, TheAudioDB) in a library of
+    /// another language, whatever the rank. The pass's result then merges
+    /// onto the stored item by the refresh mode, as every
+    /// provider's does (a field the user locked is never touched). Image
+    /// contribution is deliberately absent from 0.x (the image pipeline is a
+    /// bigger contract; it lands when a real plugin needs it).
     record metadata-result {
         /// Plot/description text.
         overview: option<string>,
@@ -370,21 +398,23 @@ interface types {
         production-year: option<s32>,
         /// Community rating on Jellyfin's 0–10 scale.
         community-rating: option<f64>,
-        /// Genre names (applied only when the item has none).
+        /// Genre names (taken only when no provider ranked above supplied
+        /// any).
         genres: list<string>,
         /// External ids to record, as (provider name, id) pairs — e.g. a
-        /// plugin for a niche database records its own id here.
+        /// plugin for a niche database records its own id here. An id of a
+        /// name a provider ranked above already answered with stands; the
+        /// providers ranked below are asked by these ids.
         provider-ids: list<tuple<string, string>>,
-        /// Tagline (applied only when the item has none).
+        /// Tagline.
         tagline: option<string>,
-        /// Studio names (applied only when the item has none).
+        /// Studio names (unioned with the other providers').
         studios: list<string>,
-        /// Tag names (applied only when the item has none).
+        /// Tag names (unioned with the other providers').
         tags: list<string>,
-        /// Parental/official rating, e.g. `PG-13` (applied only when the
-        /// item has none).
+        /// Parental/official rating, e.g. `PG-13`.
         official-rating: option<string>,
-        /// End date, ISO-8601 (series/albums; applied only when unset).
+        /// End date, ISO-8601 / RFC 3339 (series/albums).
         end-date: option<string>,
     }
 }
@@ -538,10 +568,12 @@ world plugin {
 
     /// This plugin's identity as a NAMED metadata provider, when it is
     /// one (`none` for everyone else — the common case). A named provider
-    /// appears in the dashboard's library-options fetcher lists; its
-    /// metadata still applies through `metadata-lookup` under the
-    /// supplement-only rule (full provider ordering is a server-side
-    /// roadmap item that applies to built-in providers too).
+    /// appears in the dashboard's library-options fetcher lists for its
+    /// supported kinds, under its `name`: the admin ticks it per library and
+    /// ranks it among the built-in providers, and `metadata-lookup` runs at
+    /// that rank (see `metadata-result`). A plugin without one is in no
+    /// list: it is asked about every item, ranked like a provider the admin
+    /// left out of the order.
     export provider-info: func() -> option<provider-descriptor>;
 
     /// Remote-artwork candidates for one item (empty for non-providers).
@@ -580,11 +612,16 @@ world plugin {
     /// consumer loses oldest events rather than slowing the server.
     export on-event: func(event-name: string, event-json: string);
 
-    /// Offers metadata for one library item during a scan, after the
-    /// built-in providers ran. `item` describes the item as scanned so far;
-    /// `provider-ids` are its known external ids. Return `none` when this
-    /// plugin has nothing to offer (the common case — a plugin that is not
-    /// a metadata source returns `none` unconditionally). Results are
-    /// supplement-only (see `metadata-result`).
+    /// Offers metadata for one library item when the library scanner
+    /// refreshes it, as one of the item kind's remote providers, at this
+    /// plugin's rank among them
+    /// (see `metadata-result`). `item` identifies the item (id, name, kind,
+    /// path); `provider-ids` are the item's known external ids plus every id
+    /// a provider ranked above this one answered with in the same pass.
+    /// Return `none` when this plugin has nothing to offer (the common case
+    /// — a plugin that is not a metadata source returns `none`
+    /// unconditionally). An `err` counts as a provider failure, as a
+    /// built-in provider's failed request does: the item's refresh is not
+    /// recorded as complete, so the next scan asks again.
     export metadata-lookup: func(item: item-summary, provider-ids: list<tuple<string, string>>) -> result<option<metadata-result>, string>;
 }

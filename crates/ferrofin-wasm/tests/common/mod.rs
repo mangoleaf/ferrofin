@@ -937,3 +937,114 @@ pub fn named_provider_fixture(id: &str, provider_name: &str) -> String {
             ),
         )
 }
+
+/// What [`metadata_provider_fixture`]'s `metadata-lookup` answers, for every
+/// item it is offered.
+#[derive(Debug, Clone, Copy)]
+pub enum LookupAnswer {
+    /// `ok(some(metadata-result))`: overview [`FIXTURE_OVERVIEW`], community
+    /// rating [`FIXTURE_RATING`], tagline [`FIXTURE_TAGLINE`] and the
+    /// provider id `WatDb` = `w1`; every other field empty.
+    Metadata,
+    /// `err("down")`: an orderly guest error (no trap, so the plugin's
+    /// breaker never opens and every offer fails the same way).
+    Down,
+}
+
+/// The overview a [`LookupAnswer::Metadata`] fixture answers with.
+pub const FIXTURE_OVERVIEW: &str = "WatDb overview.";
+/// The tagline a [`LookupAnswer::Metadata`] fixture answers with.
+pub const FIXTURE_TAGLINE: &str = "WatDb tagline.";
+/// The community rating a [`LookupAnswer::Metadata`] fixture answers with.
+pub const FIXTURE_RATING: f64 = 6.5;
+
+/// A NAMED metadata provider built from the shared WAT fixture: its
+/// `provider-info` is `some({name: provider_name, supported-kinds:
+/// ["Movie"]})` and its `metadata-lookup` answers as `answer` says.
+///
+/// Canonical-ABI layout of the `result<option<metadata-result>, string>`
+/// ret area at 832 (8-aligned, the record carries an f64): result tag @832;
+/// `ok` → option tag @840, record @848 (overview tag/ptr/len @848/852/856,
+/// production-year tag @860, community-rating tag @872 + f64 @880, genres
+/// @888/892, provider-ids @896/900, tagline tag/ptr/len @904/908/912,
+/// studios @916/920, tags @924/928, official-rating tag @932, end-date tag
+/// @944); `err` → string ptr/len @840/844. The strings live in otherwise
+/// unused memory from 1280 (below the bump allocator's 4096).
+pub fn metadata_provider_fixture(id: &str, provider_name: &str, answer: LookupAnswer) -> String {
+    assert_eq!(id.len(), 36, "must byte-replace the 36-char fixture id");
+    let data = format!(
+        "(data (i32.const 488) \"Movie\")\n    \
+         (data (i32.const 1280) \"{provider_name}\")\n    \
+         (data (i32.const 1344) \"{FIXTURE_OVERVIEW}\")\n    \
+         (data (i32.const 1376) \"{FIXTURE_TAGLINE}\")\n    \
+         (data (i32.const 1408) \"WatDb\")\n    \
+         (data (i32.const 1416) \"w1\")\n    \
+         (data (i32.const 1456) \"down\")"
+    );
+    let provider_info = format!(
+        "    (func (export \"provider-info\") (result i32)\n      \
+         (i32.store (i32.const 1312) (i32.const 488))\n      \
+         (i32.store (i32.const 1316) (i32.const 5))\n      \
+         (i32.store (i32.const 1184) (i32.const 1))\n      \
+         (i32.store (i32.const 1188) (i32.const 1280))\n      \
+         (i32.store (i32.const 1192) (i32.const {len}))\n      \
+         (i32.store (i32.const 1196) (i32.const 1312))\n      \
+         (i32.store (i32.const 1200) (i32.const 1))\n      \
+         i32.const 1184)",
+        len = provider_name.len()
+    );
+    let lookup_body = match answer {
+        LookupAnswer::Metadata => format!(
+            "(i32.store (i32.const 832) (i32.const 0))\n      \
+             (i32.store (i32.const 840) (i32.const 1))\n      \
+             (i32.store (i32.const 848) (i32.const 1))\n      \
+             (i32.store (i32.const 852) (i32.const 1344))\n      \
+             (i32.store (i32.const 856) (i32.const {overview}))\n      \
+             (i32.store (i32.const 860) (i32.const 0))\n      \
+             (i32.store (i32.const 872) (i32.const 1))\n      \
+             (f64.store (i32.const 880) (f64.const {FIXTURE_RATING}))\n      \
+             (i32.store (i32.const 888) (i32.const 0))\n      \
+             (i32.store (i32.const 892) (i32.const 0))\n      \
+             (i32.store (i32.const 1424) (i32.const 1408))\n      \
+             (i32.store (i32.const 1428) (i32.const 5))\n      \
+             (i32.store (i32.const 1432) (i32.const 1416))\n      \
+             (i32.store (i32.const 1436) (i32.const 2))\n      \
+             (i32.store (i32.const 896) (i32.const 1424))\n      \
+             (i32.store (i32.const 900) (i32.const 1))\n      \
+             (i32.store (i32.const 904) (i32.const 1))\n      \
+             (i32.store (i32.const 908) (i32.const 1376))\n      \
+             (i32.store (i32.const 912) (i32.const {tagline}))\n      \
+             (i32.store (i32.const 916) (i32.const 0))\n      \
+             (i32.store (i32.const 920) (i32.const 0))\n      \
+             (i32.store (i32.const 924) (i32.const 0))\n      \
+             (i32.store (i32.const 928) (i32.const 0))\n      \
+             (i32.store (i32.const 932) (i32.const 0))\n      \
+             (i32.store (i32.const 944) (i32.const 0))",
+            overview = FIXTURE_OVERVIEW.len(),
+            tagline = FIXTURE_TAGLINE.len(),
+        ),
+        LookupAnswer::Down => "(i32.store (i32.const 832) (i32.const 1))\n      \
+             (i32.store (i32.const 840) (i32.const 1456))\n      \
+             (i32.store (i32.const 844) (i32.const 4))"
+            .to_owned(),
+    };
+    let lookup = format!(
+        "    (func (export \"metadata-lookup\")\n      (param i32)\n      (result i32)\n      \
+         {lookup_body}\n      i32.const 832)"
+    );
+    let fixture = ferrofin_wasm::TEST_FIXTURE_WAT;
+    let original_lookup = "    (func (export \"metadata-lookup\")\n      (param i32)\n      \
+         (result i32)\n      (i32.store (i32.const 832) (i32.const 0))\n      \
+         (i32.store (i32.const 840) (i32.const 0))\n      i32.const 832)";
+    let original_info = "    (func (export \"provider-info\") (result i32)\n      \
+         (i32.store (i32.const 1184) (i32.const 0))\n      i32.const 1184)";
+    assert!(
+        fixture.contains(original_lookup) && fixture.contains(original_info),
+        "the shared fixture's metadata-lookup/provider-info changed shape"
+    );
+    fixture
+        .replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
+        .replace("(data (i32.const 488) \"Movie\")", &data)
+        .replace(original_info, &provider_info)
+        .replace(original_lookup, &lookup)
+}

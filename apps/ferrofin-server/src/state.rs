@@ -1109,10 +1109,10 @@ pub async fn build_app_state(
     // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
     // registered below (once the session manager exists) forward them to
     // clients over the WebSocket so open views refresh after a scan.
-    // The scan's dynamic metadata pass: every loaded WASM plugin is offered
-    // each item after the built-in provider chain (supplement-only; inert
-    // until the collaborators are armed below and while a plugin is
-    // disabled).
+    // The plugins' metadata sources: every loaded WASM plugin is a remote
+    // metadata provider the scan folds with the built-in ones at its rank in
+    // the library's fetcher order (inert until the collaborators are armed
+    // below and while a plugin is disabled).
     scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
     scanner = scanner
         .with_events(Arc::clone(&event_manager))

@@ -122,6 +122,62 @@ pub fn image_fetcher_rank(
     configured_order(order, name)
 }
 
+/// `ProviderManager.GetDefaultOrder` (`ProviderManager.cs:630-640`) for a
+/// provider that declares no `IHasOrder`: "after items that want to be first
+/// (~0) but before items that want to be last (~100)". TheMovieDb's season,
+/// person and box-set providers, every TheTVDB provider and every WASM
+/// plugin's metadata source rank by it.
+pub const DEFAULT_ORDER: i32 = 50;
+
+/// `GetDefaultOrder` of built-in metadata fetcher `name` for item type `kind`
+/// (`ProviderManager.cs:630-640`): its `IHasOrder.Order`, else
+/// [`DEFAULT_ORDER`]. Upstream master `96bca6f0bd`: `TmdbMovieProvider`,
+/// `TmdbSeriesProvider` and `TmdbEpisodeProvider` declare 1 (the season,
+/// person and box-set providers nothing); `OmdbItemProvider` 2 and
+/// `OmdbEpisodeProvider` 1; `MusicBrainzAlbumProvider`/
+/// `MusicBrainzArtistProvider` 0 and `AudioDbAlbumProvider`/
+/// `AudioDbArtistProvider` 1; the TVDB plugin's providers nothing.
+#[must_use]
+pub fn default_metadata_order(name: &str, kind: &str) -> i32 {
+    match name {
+        fetcher_names::TMDB if matches!(kind, "Movie" | "Series" | "Episode") => 1,
+        fetcher_names::OMDB if kind == "Episode" => 1,
+        fetcher_names::OMDB => 2,
+        fetcher_names::MUSICBRAINZ => 0,
+        fetcher_names::AUDIODB => 1,
+        _ => DEFAULT_ORDER,
+    }
+}
+
+/// The built-in remote metadata providers in Ferrofin's registration order —
+/// the last key of the provider order, which breaks a FULL tie (the same
+/// saved rank, or none, and the same `IHasOrder`).
+///
+/// Ferrofin's tie rule has three categories where Jellyfin has two:
+/// **WASM plugins first (in load order), compiled-in extensions second,
+/// built-in providers third** (owner decision, 2026-10-04). Jellyfin
+/// registers its plugins' assemblies before the server's own
+/// (`ApplicationHost.GetComposablePartAssemblies:881-886` →
+/// `GetExportTypes` → `ProviderManager.AddParts:163`), and its provider
+/// order is a stable `OrderBy(GetConfiguredOrder).ThenBy(GetDefaultOrder)`,
+/// so a plugin's provider wins a full tie with a server one. Ferrofin keeps
+/// that for the third-party code it loads (WASM plugins), places the
+/// plugins it compiled in (extensions — none provides a metadata source
+/// today) after them, and its built-ins last. Among the built-ins TheTVDB
+/// registers first, because in Jellyfin it is a plugin: a season with no
+/// saved order asks TheTVDB before TheMovieDb (both declare no
+/// `IHasOrder`), as Jellyfin does. TheMovieDb then precedes OMDb, which
+/// breaks their episode tie (both 1) as Ferrofin always has (upstream's
+/// order there is type discovery within one assembly, which its source does
+/// not fix).
+pub const BUILT_IN_METADATA_FETCHERS: &[&str] = &[
+    fetcher_names::TVDB,
+    fetcher_names::TMDB,
+    fetcher_names::OMDB,
+    fetcher_names::MUSICBRAINZ,
+    fetcher_names::AUDIODB,
+];
+
 /// Default order for built-in artwork providers. Explicit library order is
 /// applied before this tie-breaker. Fanart leads movie and series artwork,
 /// and precedes AudioDB for music, with OMDb as the final poster fallback.
@@ -239,11 +295,17 @@ pub mod fetcher_names {
     /// provider with its own name
     /// (`MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs:51`).
     pub const AUDIO_IMAGES: &str = "Image Extractor";
+    /// Upstream's `VideoImageProvider` (frame grabs), which Ferrofin does
+    /// not register. Its name is on the new-library image allowlist
+    /// (`IsImageFetcherEnabledByDefault`), so it is reserved: a plugin
+    /// calling itself that would start ticked in a new library.
+    pub const SCREEN_GRABBER: &str = "Screen Grabber";
 
     /// Every built-in fetcher name — the reserved set a dynamically
     /// registered (WASM) provider name must not collide with: a plugin
     /// declaring `"TheMovieDb"` would ride TMDB's checkbox/order and
-    /// appear twice in the dashboard lists.
+    /// appear twice in the dashboard lists, and one declaring a name on a
+    /// new-library allowlist would start ticked there.
     pub const ALL: &[&str] = &[
         NFO,
         TMDB,
@@ -255,6 +317,7 @@ pub mod fetcher_names {
         LOCAL_IMAGES,
         EMBEDDED_IMAGES,
         AUDIO_IMAGES,
+        SCREEN_GRABBER,
     ];
 }
 
@@ -316,12 +379,12 @@ impl Provider {
         self.types.is_empty() || self.types.contains(&type_name)
     }
     /// The provider's `LibraryOptionInfoDto`, with `DefaultEnabled` resolved
-    /// through the C# new-library rules rather than the registry's standing
-    /// default.
-    fn info_for(&self, cap: Cap, type_name: &str, is_new_library: bool) -> LibraryOptionInfoDto {
+    /// through the C# helpers ([`default_enabled_for`]) rather than the
+    /// registry's standing default.
+    fn info_for(&self, cap: Cap, type_name: &str, defaults: Defaults<'_>) -> LibraryOptionInfoDto {
         LibraryOptionInfoDto {
             name: Some(self.name.to_owned()),
-            default_enabled: default_enabled_for(self.name, cap, type_name, is_new_library)
+            default_enabled: default_enabled_for(self.name, cap, type_name, defaults)
                 .unwrap_or(self.default_enabled),
         }
     }
@@ -331,55 +394,76 @@ impl Provider {
     }
 }
 
-/// The `ServerConfiguration` constructor's built-in `MetadataOptions`
-/// blocklist: `MusicVideo` disables "The Open Movie Database" for both metadata
-/// and images, and `MusicAlbum`/`MusicArtist` disable "TheAudioDB" for metadata
-/// (v10.11.8 `ServerConfiguration.cs:20-63`). Everything else is unrestricted.
-///
-/// Returns `None` when nothing in the array applies, leaving the registry
-/// default in place.
-fn default_metadata_options_blocklist(name: &str, cap: Cap, type_name: &str) -> Option<bool> {
-    let eq = |a: &str| name.eq_ignore_ascii_case(a);
-    let type_is = |a: &str| type_name.eq_ignore_ascii_case(a);
-    let blocked = match cap {
-        Cap::MetadataFetcher => {
-            (type_is("MusicVideo") && eq(fetcher_names::OMDB))
-                || ((type_is("MusicAlbum") || type_is("MusicArtist")) && eq(fetcher_names::AUDIODB))
-        }
-        Cap::ImageFetcher => type_is("MusicVideo") && eq(fetcher_names::OMDB),
-        _ => false,
-    };
-    blocked.then_some(false)
+/// What a library-options request's `DefaultEnabled` flags depend on
+/// besides the provider: whether the library is new (the `isNewLibrary`
+/// query flag), the request's representative item types, and the server's
+/// per-type `MetadataOptions` (`ServerConfiguration.MetadataOptions`, read
+/// live by the caller; it carries the constructor's built-in `Disabled*`
+/// defaults — `ServerConfiguration.cs:20-63`, Ferrofin's
+/// `default_metadata_options` — plus any admin edit).
+#[derive(Clone, Copy)]
+struct Defaults<'a> {
+    is_new_library: bool,
+    item_types: &'a [String],
+    global: &'a [ferrofin_model::configuration::MetadataOptions],
 }
 
 /// The `DefaultEnabled` a fetcher/saver reports, ported from
 /// `LibraryController.IsSaverEnabledByDefault` /
 /// `IsMetadataFetcherEnabledByDefault` / `IsImageFetcherEnabledByDefault`
-/// (byte-identical between v10.11.8 and master).
+/// (`LibraryController.cs:1033-1087`, master `96bca6f0bd`).
 ///
 /// `None` means "the C# helper does not apply to this capability", leaving the
 /// registry default in place.
 ///
-/// The non-new-library branch of each helper consults
-/// `MetadataOptions.Disabled*` — a per-server admin blocklist Ferrofin has no
-/// store for — whose `metadataOptions is null || !Contains(name)` shape yields
-/// `true` for an empty store, which is what the registry default already says.
+/// In a new library the helpers tick only their allowlists. Otherwise they
+/// read the server's `MetadataOptions`: a saver is ticked when no entry
+/// names one of the request's item types, or any of those entries does not
+/// disable it (`metadataOptions.Length == 0 || metadataOptions.Any(i =>
+/// !i.DisabledMetadataSavers.Contains(name))`); a fetcher when the type's
+/// entry (`GetMetadataOptionsForType`) is missing or does not list it in
+/// `DisabledMetadataFetchers` / `DisabledImageFetchers` — the same
+/// server-wide lists the scan's gate falls back to
+/// ([`metadata_fetcher_enabled`], [`image_fetcher_enabled`]), so the
+/// dashboard shows unticked what the scan would not run.
 fn default_enabled_for(
     name: &str,
     cap: Cap,
     type_name: &str,
-    is_new_library: bool,
+    defaults: Defaults<'_>,
 ) -> Option<bool> {
+    let Defaults {
+        is_new_library,
+        item_types,
+        global,
+    } = defaults;
     if !is_new_library {
-        // The non-new-library branch of each C# helper reads
-        // `ServerConfiguration.MetadataOptions`, which ships a small BUILT-IN
-        // blocklist in its constructor (v10.11.8
-        // `MediaBrowser.Model/Configuration/ServerConfiguration.cs:20-63`) —
-        // not just admin edits. Those defaults are ported here; Ferrofin has no
-        // admin-editable `Disabled*` store, and for a type the array does not
-        // name, `metadataOptions is null || !Contains(name)` is `true`, which is
-        // what the registry default already says.
-        return default_metadata_options_blocklist(name, cap, type_name);
+        let names = |list: &[String]| list.iter().any(|n| n.eq_ignore_ascii_case(name));
+        return match cap {
+            Cap::MetadataSaver => {
+                let entries: Vec<_> = global
+                    .iter()
+                    .filter(|o| {
+                        o.item_type
+                            .as_deref()
+                            .is_some_and(|t| item_types.iter().any(|i| i.eq_ignore_ascii_case(t)))
+                    })
+                    .collect();
+                Some(
+                    entries.is_empty()
+                        || entries.iter().any(|o| !names(&o.disabled_metadata_savers)),
+                )
+            }
+            Cap::MetadataFetcher => Some(
+                global_metadata_options(global, type_name)
+                    .is_none_or(|o| !names(&o.disabled_metadata_fetchers)),
+            ),
+            Cap::ImageFetcher => Some(
+                global_metadata_options(global, type_name)
+                    .is_none_or(|o| !names(&o.disabled_image_fetchers)),
+            ),
+            _ => None,
+        };
     }
     let eq = |a: &str| name.eq_ignore_ascii_case(a);
     let type_is = |types: &[&str]| types.iter().any(|t| type_name.eq_ignore_ascii_case(t));
@@ -400,9 +484,10 @@ fn default_enabled_for(
             // which is deliberately absent — a new library does not pre-tick
             // frame/cover extraction for video. "Screen Grabber" is upstream's
             // `VideoImageProvider`, which Ferrofin does not register yet; the
-            // name is kept so the arm stays a faithful transliteration.
+            // name is kept so the arm stays a faithful transliteration (and is
+            // reserved against plugins, `fetcher_names::ALL`).
             eq(fetcher_names::TVDB)
-                || eq("Screen Grabber")
+                || eq(fetcher_names::SCREEN_GRABBER)
                 || eq(fetcher_names::AUDIODB)
                 || eq(fetcher_names::AUDIO_IMAGES)
         }),
@@ -763,25 +848,51 @@ fn supported_image_types(provs: &[Provider], type_name: &str) -> Vec<ImageType> 
 /// item types are `item_types`. `dynamic_fetchers` are runtime-registered
 /// named metadata providers (WASM plugins) as (name, supported kinds) —
 /// they appear in the fetcher lists exactly like compiled providers.
+///
+/// Each type's `MetadataFetchers` come in the order a library that saved no
+/// order runs them (`GetPluginSummary` → `AddMetadataPlugins` →
+/// `GetMetadataProvidersInternal` over `new LibraryOptions()` and the
+/// server-wide options, `ProviderManager.cs:657-760`): the server-wide
+/// `MetadataFetcherOrder` for the type (`global`), then each provider's
+/// `IHasOrder` ([`default_metadata_order`]; a WASM plugin's is
+/// [`DEFAULT_ORDER`]), then registration — the plugins first, then the
+/// built-ins in [`BUILT_IN_METADATA_FETCHERS`] order. jellyfin-web shows a
+/// new library's fetchers in this order and saves it as the library's
+/// `MetadataFetcherOrder` (`libraryoptionseditor.js` `getOrderedPlugins`,
+/// `setMetadataFetchersIntoOptions`), so the order a new library is shown is
+/// the order its scans run.
 #[must_use]
 pub fn library_options_info(
     item_types: &[String],
     is_new_library: bool,
     dynamic_fetchers: &[(String, Vec<String>)],
+    global: &[ferrofin_model::configuration::MetadataOptions],
 ) -> LibraryOptionsResultDto {
-    let dynamic_info = |name: &str| LibraryOptionInfoDto {
+    let defaults = Defaults {
+        is_new_library,
+        item_types,
+        global,
+    };
+    // A plugin's fetcher takes `DefaultEnabled` from the same port of
+    // `IsMetadataFetcherEnabledByDefault` / `IsImageFetcherEnabledByDefault`
+    // (`LibraryController.cs:1047-1087`) as a built-in one: in a new library
+    // only the allowlisted built-ins are ticked, so a plugin starts
+    // unticked, as Jellyfin shows a plugin's provider; otherwise the
+    // server's `Disabled*` lists decide, as for any fetcher.
+    let dynamic_info = |name: &str, cap: Cap, type_name: &str| LibraryOptionInfoDto {
         name: Some(name.to_owned()),
-        default_enabled: true,
+        default_enabled: default_enabled_for(name, cap, type_name, defaults).unwrap_or(true),
     };
     let provs = providers();
     let flat = |cap: Cap| -> Vec<LibraryOptionInfoDto> {
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
-            // The saver/reader lists are not per-type, so the new-library rule
-            // sees the whole request (C# `IsSaverEnabledByDefault(name,
-            // itemTypes, isNewLibrary)` ignores the types when isNewLibrary).
-            .map(|p| p.info_for(cap, "", is_new_library))
+            // The saver/reader lists are not per-type, so the saver rule sees
+            // the whole request (C# `IsSaverEnabledByDefault(name, itemTypes,
+            // isNewLibrary)`: no saver in a new library, else the server's
+            // entries for the request's item types).
+            .map(|p| p.info_for(cap, "", defaults))
             .collect()
     };
     let type_options = item_types
@@ -791,22 +902,47 @@ pub fn library_options_info(
                 provs
                     .iter()
                     .filter(|p| p.compiled && p.caps.contains(&cap) && p.applies_to(type_name))
-                    .map(|p| p.info_for(cap, type_name, is_new_library))
+                    .map(|p| p.info_for(cap, type_name, defaults))
                     .collect()
             };
-            let mut metadata_fetchers = per_type(Cap::MetadataFetcher);
-            metadata_fetchers.extend(
-                dynamic_fetchers
-                    .iter()
-                    .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
-                    .map(|(name, _)| dynamic_info(name)),
-            );
+            let mut metadata_fetchers: Vec<LibraryOptionInfoDto> = dynamic_fetchers
+                .iter()
+                .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
+                .map(|(name, _)| dynamic_info(name, Cap::MetadataFetcher, type_name))
+                .collect();
+            let plugins = metadata_fetchers.len();
+            metadata_fetchers.extend(per_type(Cap::MetadataFetcher));
+            let order = global_metadata_options(global, type_name)
+                .map_or(&[][..], |g| g.metadata_fetcher_order.as_slice());
+            // Stable, so the plugins keep their load order among themselves.
+            let mut keyed: Vec<(usize, LibraryOptionInfoDto)> =
+                metadata_fetchers.into_iter().enumerate().collect();
+            keyed.sort_by_key(|(position, info)| {
+                let name = info.name.as_deref().unwrap_or_default();
+                let registration = if *position < plugins {
+                    *position
+                } else {
+                    plugins
+                        + BUILT_IN_METADATA_FETCHERS
+                            .iter()
+                            .position(|n| n.eq_ignore_ascii_case(name))
+                            .unwrap_or(BUILT_IN_METADATA_FETCHERS.len())
+                };
+                let default_order = if *position < plugins {
+                    DEFAULT_ORDER
+                } else {
+                    default_metadata_order(name, type_name)
+                };
+                (configured_order(order, name), default_order, registration)
+            });
+            let metadata_fetchers: Vec<LibraryOptionInfoDto> =
+                keyed.into_iter().map(|(_, info)| info).collect();
             let mut image_fetchers = per_type(Cap::ImageFetcher);
             image_fetchers.extend(
                 dynamic_fetchers
                     .iter()
                     .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
-                    .map(|(name, _)| dynamic_info(name)),
+                    .map(|(name, _)| dynamic_info(name, Cap::ImageFetcher, type_name)),
             );
             // C# `LibraryController`: local similarity providers are ticked by
             // default, remote ones are not.
@@ -1018,9 +1154,144 @@ mod tests {
         ));
     }
 
+    /// A type's `MetadataFetchers` come in the order a library with no saved
+    /// order runs them, which jellyfin-web shows a new library and saves as
+    /// its `MetadataFetcherOrder`: the server-wide order, then `IHasOrder`
+    /// (TheMovieDb 1 for movies, series and episodes, OMDb 2 / 1 for
+    /// episodes, MusicBrainz 0, TheAudioDB 1, 50 for the rest and every
+    /// plugin), then registration — plugins first, then TheTVDB, TheMovieDb,
+    /// OMDb, MusicBrainz, TheAudioDB.
+    #[test]
+    fn metadata_fetchers_are_listed_in_the_order_they_run() {
+        use super::fetcher_names::{AUDIODB, MUSICBRAINZ, OMDB, TMDB, TVDB};
+        let names = |info: &ferrofin_model::configuration::LibraryOptionsResultDto, kind: &str| {
+            info.type_options
+                .iter()
+                .find(|t| t.type_.as_deref() == Some(kind))
+                .expect("the type")
+                .metadata_fetchers
+                .iter()
+                .filter_map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let kinds: Vec<String> = ["Movie", "Series", "Season", "Episode", "MusicAlbum"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        let plugin = (
+            "PluginDb".to_owned(),
+            vec![
+                "Movie".to_owned(),
+                "Series".to_owned(),
+                "Season".to_owned(),
+                "MusicAlbum".to_owned(),
+            ],
+        );
+        let builtin = library_options_info(&kinds, true, &[], &[]);
+        assert_eq!(names(&builtin, "Movie"), [TMDB, OMDB]);
+        assert_eq!(names(&builtin, "Series"), [TMDB, OMDB, TVDB]);
+        assert_eq!(
+            names(&builtin, "Season"),
+            [TVDB, TMDB],
+            "both 50: TheTVDB registers first, a plugin in Jellyfin"
+        );
+        assert_eq!(
+            names(&builtin, "Episode"),
+            [TMDB, OMDB, TVDB],
+            "TheMovieDb and OMDb both 1: TheMovieDb registers first"
+        );
+        assert_eq!(names(&builtin, "MusicAlbum"), [MUSICBRAINZ, AUDIODB]);
+        let with_plugin = library_options_info(&kinds, true, std::slice::from_ref(&plugin), &[]);
+        assert_eq!(names(&with_plugin, "Movie"), [TMDB, OMDB, "PluginDb"]);
+        assert_eq!(
+            names(&with_plugin, "Series"),
+            [TMDB, OMDB, "PluginDb", TVDB],
+            "a full tie at 50: the plugin registers before every built-in"
+        );
+        assert_eq!(names(&with_plugin, "Season"), ["PluginDb", TVDB, TMDB]);
+        assert_eq!(names(&with_plugin, "Episode"), [TMDB, OMDB, TVDB]);
+        assert_eq!(
+            names(&with_plugin, "MusicAlbum"),
+            [MUSICBRAINZ, AUDIODB, "PluginDb"]
+        );
+        let server = [ferrofin_model::configuration::MetadataOptions {
+            item_type: Some("Series".to_owned()),
+            metadata_fetcher_order: vec![TVDB.to_owned(), "PluginDb".to_owned()],
+            ..Default::default()
+        }];
+        let ordered = library_options_info(&kinds, false, &[plugin], &server);
+        assert_eq!(
+            names(&ordered, "Series"),
+            [TVDB, "PluginDb", TMDB, OMDB],
+            "the server-wide order ranks first, the rest by IHasOrder"
+        );
+        assert_eq!(names(&ordered, "Season"), ["PluginDb", TVDB, TMDB]);
+    }
+
+    /// A plugin's fetcher takes `DefaultEnabled` from upstream's
+    /// `IsMetadataFetcherEnabledByDefault` / `IsImageFetcherEnabledByDefault`
+    /// (`LibraryController.cs:1047-1087`), as a built-in's does: in a new
+    /// library a name outside their allowlists starts unticked, so
+    /// jellyfin-web saves the plugin listed but not checked (in a TV library
+    /// it is listed first for seasons, where everything declares 50, yet
+    /// never runs until the admin ticks it); in an existing library the
+    /// server's `Disabled*` lists decide, and they name no plugin.
+    #[test]
+    fn a_plugin_fetcher_starts_unticked_in_a_new_library() {
+        let kinds: Vec<String> = ["Series", "Season", "Episode"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        let plugin = (
+            "PluginDb".to_owned(),
+            vec!["Series".to_owned(), "Season".to_owned()],
+        );
+        let ticked = |info: &ferrofin_model::configuration::LibraryOptionsResultDto,
+                      kind: &str,
+                      images: bool| {
+            let entry = info
+                .type_options
+                .iter()
+                .find(|t| t.type_.as_deref() == Some(kind))
+                .expect("the type");
+            let list = if images {
+                &entry.image_fetchers
+            } else {
+                &entry.metadata_fetchers
+            };
+            list.iter()
+                .find(|f| f.name.as_deref() == Some("PluginDb"))
+                .expect("the plugin is listed")
+                .default_enabled
+        };
+        let fresh = library_options_info(&kinds, true, std::slice::from_ref(&plugin), &[]);
+        for kind in ["Series", "Season"] {
+            assert!(!ticked(&fresh, kind, false), "{kind} metadata, new library");
+            assert!(!ticked(&fresh, kind, true), "{kind} images, new library");
+        }
+        let season = &fresh
+            .type_options
+            .iter()
+            .find(|t| t.type_.as_deref() == Some("Season"))
+            .expect("Season")
+            .metadata_fetchers;
+        assert_eq!(season[0].name.as_deref(), Some("PluginDb"), "listed first");
+        assert!(
+            season
+                .iter()
+                .any(|f| f.name.as_deref() == Some(super::fetcher_names::TVDB) && f.default_enabled),
+            "TheTVDB is ticked for seasons in a new library"
+        );
+        let existing = library_options_info(&kinds, false, &[plugin], &[]);
+        for kind in ["Series", "Season"] {
+            assert!(ticked(&existing, kind, false), "{kind} metadata, existing");
+            assert!(ticked(&existing, kind, true), "{kind} images, existing");
+        }
+    }
+
     #[test]
     fn movie_options_expose_real_fetchers_and_savers() {
-        let info = library_options_info(&["Movie".to_owned()], false, &[]);
+        let info = library_options_info(&["Movie".to_owned()], false, &[], &[]);
         // Nfo is a local reader + saver.
         assert!(
             info.metadata_readers
@@ -1061,7 +1332,12 @@ mod tests {
 
     #[test]
     fn tmdb_listed_for_series_and_opensubtitles_gated_by_feature() {
-        let info = library_options_info(&["Series".to_owned(), "Episode".to_owned()], false, &[]);
+        let info = library_options_info(
+            &["Series".to_owned(), "Episode".to_owned()],
+            false,
+            &[],
+            &[],
+        );
         let series = info.type_options.first().expect("series block");
         // TheMovieDb is always wired, so it is always offered for a series.
         assert!(
@@ -1094,6 +1370,7 @@ mod tests {
                 "Person".to_owned(),
             ],
             false,
+            &[],
             &[],
         );
         let block = |name: &str| {
@@ -1159,6 +1436,7 @@ mod tests {
             ],
             false,
             &[],
+            &[],
         );
         let opts = |name: &str| {
             info.type_options
@@ -1201,6 +1479,95 @@ mod tests {
         assert!(opts("Photo").is_empty());
     }
 
+    /// The per-type `MetadataOptions` the C# `ServerConfiguration`
+    /// constructor seeds (`ServerConfiguration.cs:20-63`; Ferrofin's
+    /// `configuration_manager::default_metadata_options`): OMDb disabled for
+    /// music videos (metadata and images), TheAudioDB's metadata for albums
+    /// and artists.
+    fn server_defaults() -> Vec<ferrofin_model::configuration::MetadataOptions> {
+        use ferrofin_model::configuration::MetadataOptions;
+        let entry = |kind: &str, fetchers: &[&str], images: &[&str]| MetadataOptions {
+            item_type: Some(kind.to_owned()),
+            disabled_metadata_fetchers: fetchers.iter().map(|n| (*n).to_owned()).collect(),
+            disabled_image_fetchers: images.iter().map(|n| (*n).to_owned()).collect(),
+            ..MetadataOptions::default()
+        };
+        vec![
+            entry("Book", &[], &[]),
+            entry("Movie", &[], &[]),
+            entry(
+                "MusicVideo",
+                &["The Open Movie Database"],
+                &["The Open Movie Database"],
+            ),
+            entry("Series", &[], &[]),
+            entry("MusicAlbum", &["TheAudioDB"], &[]),
+            entry("MusicArtist", &["TheAudioDB"], &[]),
+            entry("BoxSet", &[], &[]),
+            entry("Season", &[], &[]),
+            entry("Episode", &[], &[]),
+        ]
+    }
+
+    /// In an existing library a fetcher or saver is ticked unless the
+    /// server's `MetadataOptions` disable it (`IsMetadataFetcherEnabledByDefault`
+    /// / `IsImageFetcherEnabledByDefault` / `IsSaverEnabledByDefault`'s
+    /// non-new branches, read live): an admin's `Disabled*` entry unticks it,
+    /// a plugin included, as the scan's gate would not run it; a type the
+    /// configuration names no entry for ticks everything.
+    #[test]
+    fn the_servers_disabled_lists_untick_a_fetcher_in_an_existing_library() {
+        use ferrofin_model::configuration::MetadataOptions;
+        let global = [MetadataOptions {
+            item_type: Some("Movie".to_owned()),
+            disabled_metadata_fetchers: vec!["themoviedb".to_owned(), "PluginDb".to_owned()],
+            disabled_image_fetchers: vec!["FanArt".to_owned()],
+            disabled_metadata_savers: vec!["Nfo".to_owned()],
+            ..MetadataOptions::default()
+        }];
+        let plugin = ("PluginDb".to_owned(), vec!["Movie".to_owned()]);
+        let ticked = |info: &ferrofin_model::configuration::LibraryOptionsResultDto,
+                      images: bool,
+                      name: &str| {
+            let entry = &info.type_options[0];
+            let list = if images {
+                &entry.image_fetchers
+            } else {
+                &entry.metadata_fetchers
+            };
+            list.iter()
+                .find(|f| f.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} listed"))
+                .default_enabled
+        };
+        let movie = ["Movie".to_owned()];
+        let info = library_options_info(&movie, false, std::slice::from_ref(&plugin), &global);
+        assert!(
+            !ticked(&info, false, "TheMovieDb"),
+            "disabled, case-insensitively"
+        );
+        assert!(
+            !ticked(&info, false, "PluginDb"),
+            "a plugin the admin disabled"
+        );
+        assert!(ticked(&info, false, "The Open Movie Database"));
+        assert!(!ticked(&info, true, "FanArt"));
+        assert!(
+            ticked(&info, true, "TheMovieDb"),
+            "images are their own list"
+        );
+        assert!(
+            info.metadata_savers
+                .iter()
+                .all(|o| o.name.as_deref() != Some("Nfo") || !o.default_enabled),
+            "the only entry for the request's types disables the NFO saver"
+        );
+        let unnamed = library_options_info(&movie, false, &[plugin], &[]);
+        assert!(ticked(&unnamed, false, "TheMovieDb"), "no entry: ticked");
+        assert!(ticked(&unnamed, false, "PluginDb"));
+        assert!(unnamed.metadata_savers.iter().all(|o| o.default_enabled));
+    }
+
     /// `isNewLibrary=true` is the add-library wizard's pre-ticked set: no saver,
     /// and only the allowlisted fetchers.
     #[test]
@@ -1233,6 +1600,7 @@ mod tests {
             ],
             false,
             &[],
+            &server_defaults(),
         );
         let fresh = library_options_info(
             &[
@@ -1242,10 +1610,11 @@ mod tests {
             ],
             true,
             &[],
+            &[],
         );
 
-        // An existing library pre-ticks everything the built-in
-        // `ServerConfiguration.MetadataOptions` blocklist does not name.
+        // An existing library pre-ticks everything the server's
+        // `MetadataOptions` (here the constructor's defaults) do not disable.
         assert!(existing.metadata_savers.iter().all(|o| o.default_enabled));
         assert!(enabled(
             &existing,
@@ -1254,8 +1623,8 @@ mod tests {
             "The Open Movie Database"
         ));
 
-        // ...and it DOES name three entries, which come back unticked even on an
-        // existing library (v10.11.8 `ServerConfiguration.cs:20-63`).
+        // ...and the defaults DO disable three entries, which come back
+        // unticked even on an existing library (`ServerConfiguration.cs:20-63`).
         let music = library_options_info(
             &[
                 "MusicAlbum".to_owned(),
@@ -1264,6 +1633,7 @@ mod tests {
             ],
             false,
             &[],
+            &server_defaults(),
         );
         assert!(!enabled(&music, "MusicAlbum", false, "TheAudioDB"));
         assert!(!enabled(&music, "MusicArtist", false, "TheAudioDB"));
@@ -1289,7 +1659,7 @@ mod tests {
         // The VIDEO-side extractor is NOT on the allowlist; the audio-side
         // "Image Extractor" is.
         assert!(!enabled(&fresh, "Movie", true, "Embedded Image Extractor"));
-        let fresh_music = library_options_info(&["Audio".to_owned()], true, &[]);
+        let fresh_music = library_options_info(&["Audio".to_owned()], true, &[], &[]);
         assert!(enabled(&fresh_music, "Audio", true, "Image Extractor"));
     }
 

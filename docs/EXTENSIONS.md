@@ -216,19 +216,101 @@ plugins like Home Screen Sections possible):
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
   text). This is how a plugin injects its client-side hooks into jellyfin-web.
 
-Plugins can also act as **metadata and artwork providers**: the scan offers every item
-to each enabled plugin's `metadata-lookup` export after the built-in providers
-(NFO/TVDB/TMDB/OMDb) ran, and applies results **supplement-only** — a plugin fills fields
-that are still empty and records its own external ids; it can never overwrite a built-in
-provider or a user edit. A plugin that declares `provider-info` becomes a **named
-provider**: its name appears in each library's *Metadata downloaders* / *Image fetchers*
-checkboxes, and the per-library selection and order are enforced during the scan — for
-named plugins and for the built-ins alike (the built-ins run one after the other in the
-saved order, the first answer winning a field and later ones filling the gaps; a fetcher
-a library unchecked never runs for its items).
+Plugins can also act as **metadata and artwork providers**. A plugin's `metadata-lookup`
+export is a **remote metadata provider folded at its configured rank**, exactly like the
+built-in ones (Jellyfin's `ExecuteRemoteProviders` over `MetadataFetcherOrder` +
+`IHasOrder`): when the scan refreshes an item, it runs the item kind's remote providers —
+TheMovieDb, OMDb, TheTVDB, MusicBrainz, TheAudioDB and every plugin — one after the other,
+after the local readers. What the local readers found comes first, and a remote provider,
+built-in or plugin, only fills what they left: an NFO (`movie.nfo`, `tvshow.nfo`, a
+season's or episode's, `album.nfo`, `artist.nfo`) and a book's embedded metadata, as in
+Jellyfin, where they are local providers merged in before the remote ones. Ferrofin also
+puts a photo's EXIF and an audio track's tags first, where Jellyfin does not: it writes a
+track's tags onto the item before the refresh, so a remote answer for the track (only a
+plugin can give one) replaces them there, and its photo reader writes the EXIF fields
+onto the item after the providers' result merged. Both are open parity items. The order is:
+
+1. the library's saved *Metadata downloaders* order for the kind (else the server-wide one);
+2. each provider's own default order: TheMovieDb 1 for movies, series and episodes, OMDb 2
+   (1 for episodes), MusicBrainz 0, TheAudioDB 1, and Jellyfin's 50 for a provider that
+   declares none — TheTVDB, TheMovieDb's season provider, and every plugin (a plugin
+   cannot declare one);
+3. registration, for a full tie: **plugins first, compiled-in extensions second, built-in
+   providers last**, TheTVDB first among those. This is Ferrofin's rule, from Jellyfin's:
+   Jellyfin registers its plugins' providers before the server's own, so a plugin wins a
+   full tie there, and TheTVDB is one of those plugins. Ferrofin has three categories
+   where Jellyfin has two; no compiled-in extension provides metadata today.
+
+So a plugin the order leaves out runs after TheMovieDb (movies, series, episodes), OMDb,
+MusicBrainz and TheAudioDB, but before TheTVDB and TheMovieDb's season provider when the
+order leaves them out too: **for seasons, a plugin nothing ranks runs first and wins every
+season field it supplies.** That includes a named plugin that does not list seasons among
+its supported kinds — in a library with no saved season settings it is still asked about
+seasons, because the supported kinds are not enforced yet (an open item) — and a plugin
+without `provider-info`, which is never ranked. A season with no saved order asks TheTVDB
+before TheMovieDb.
+
+A new library shows its downloaders in exactly this order and saves it, **with every
+plugin unticked**, as Jellyfin starts a plugin's provider: in a new library only
+TheMovieDb (not for seasons, episodes or music videos), TheTVDB, MusicBrainz and
+TheAudioDB are ticked for metadata, and only TheMovieDb (not for series, seasons, episodes
+or music videos), TheTVDB, TheAudioDB and the audio "Image Extractor" for images
+(`LibraryController.IsMetadataFetcherEnabledByDefault` /
+`IsImageFetcherEnabledByDefault`). A plugin runs in such a library once the admin ticks it.
+
+**Check where your plugins sit in existing libraries.** jellyfin-web shows a downloader
+that is missing from a library's saved order at the **top** of the list and saves the
+order it shows, so a plugin enabled in a library whose settings were saved before the
+plugin was installed is stored first, above TheMovieDb. Move it down to keep it filling
+gaps only.
+
+The first answer to supply a field wins it and a later one fills only what is still empty
+(studios and tags union), so **a plugin ranked first wins the fields it answers, over
+TheMovieDb's too**, and one ranked after the built-ins fills their gaps. One exception
+follows Jellyfin's language rule: a plugin reports no answer language, so its overview and
+tagline count as being in the library's language, and in a library of another language
+they replace the English overview or tagline OMDb or TheAudioDB supplied (those count as
+fallbacks) even when the plugin is ranked after them. The pass's result then merges onto
+the stored item by the refresh mode, like every provider's, and a field the user locked is
+never touched. The ids a provider answers with are what the providers ranked after it are
+asked by (a plugin's lookup carries TheMovieDb's ids when it runs after TheMovieDb). A
+plugin whose `metadata-lookup` returns an error counts as a failed provider: the item's
+refresh is not recorded as complete, so the next scan asks again. Albums and artists run
+their providers in the music pass, after their tracks, plugins included; an `album.nfo` /
+`artist.nfo` comes first there too.
+
+A plugin that declares `provider-info` becomes a **named provider**: its name appears in
+each library's *Metadata downloaders* / *Image fetchers* lists for the kinds it supports,
+where the admin ticks it per library and moves it to its rank; a fetcher a library
+unchecked never runs for its items. A plugin without `provider-info` appears in no list:
+it is asked about every item, ranked like a provider the admin left out of the order.
 A declared provider name that collides with a built-in fetcher or another loaded
 plugin (case-insensitively) is refused at load — it would ride that fetcher's
-checkbox/order and be impossible to toggle apart.
+checkbox/order and be impossible to toggle apart. So is "Screen Grabber", a name
+Jellyfin's new-library image allowlist ticks though Ferrofin registers no such
+provider: a plugin by that name would start ticked where every other plugin starts
+unticked.
+
+The rank changes what a plugin's answer can do to the data, not what the plugin can do:
+the sandbox is the same (no filesystem, network only through `http-fetch` and the
+declared egress, the memory and time limits, the capability-gated host API), and the
+scanner, not the guest, applies the answer. Rank a plugin first only if you trust its
+data over TheMovieDb's.
+
+> **Contract change (unreleased, same `ferrofin:plugin@0.5.0` world):** earlier builds
+> applied a plugin's answer *supplement-only*, after every built-in provider, so it could
+> never replace a value a built-in provider supplied. The WIT types did not change, so
+> components built against 0.5.0 load and run unchanged; what changed is how the host
+> folds their answers — at the plugin's position in each library's saved order. That
+> position is often the top: a library saved before the plugin existed lists it first in
+> jellyfin-web, and enabling it saved it there. Such a plugin now wins every field it
+> answers on the next refresh that asks the providers, though nobody moved it. A plugin
+> below the built-in providers, or one the order leaves out, keeps filling their gaps (its
+> studios and tags now join theirs) — except for seasons, where one the order leaves out
+> runs first — and in a library of another language its overview and tagline still
+> replace an English one from OMDb or TheAudioDB. A library created from the dashboard
+> now starts every plugin unticked. See `docs/UPGRADING.md`.
+
 Artwork rides the `remote-images` export: for items still missing a Primary/Backdrop
 after the built-in chain, the host asks each **named** plugin (only those declaring
 `provider-info`) for **image candidates (URLs)** and downloads the winner itself through
@@ -360,7 +442,7 @@ host capabilities are issues on this repository and land as additive WIT changes
   becomes a core feature, never sandbox-hosted third-party code.
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
-  plugins supplement, they never restructure the library.
+  plugins contribute metadata, they never restructure the library.
 - **Internet channels** (Jellyfin's `IChannel`) — upstream's channel backends are .NET
   plugins; neither tier supplies one, so Ferrofin registers no channels. The
   `RefreshInternetChannels` scheduled task exists for API parity and, like a Jellyfin with

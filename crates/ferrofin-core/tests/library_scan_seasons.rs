@@ -346,19 +346,19 @@ fn dashboard(choice: &str) -> MetadataRefreshOptions {
     }
 }
 
-/// With no saved order, TheMovieDb's season provider runs first (both
-/// declare no `IHasOrder`; the built-in registers first) and TheTVDB's fills
-/// only what it left: TMDB's overview, air date and cast stand, and the
-/// season's Tvdb id is the one TMDB's answer carried (the first answer wins
-/// a key). The season's TMDB request is the one its episode shares, and its
-/// TVDB id comes from the series record the series provider read: a first
-/// scan asks TheMovieDb for the season once and TheTVDB for the season's
-/// record once. An unchanged rescan asks nothing; a changed season folder
-/// (D3) asks both season providers again, and nothing else.
+/// A library that runs TheMovieDb before TheTVDB for seasons: TheMovieDb's
+/// season provider runs first and TheTVDB's fills only what it left: TMDB's
+/// overview, air date and cast stand, and the season's Tvdb id is the one
+/// TMDB's answer carried (the first answer wins a key). The season's TMDB
+/// request is the one its episode shares, and its TVDB id comes from the
+/// series record the series provider read: a first scan asks TheMovieDb for
+/// the season once and TheTVDB for the season's record once. An unchanged
+/// rescan asks nothing; a changed season folder (D3) asks both season
+/// providers again, and nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request() {
     let tmp = tempfile::tempdir().expect("tmp");
-    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    let library = Library::new(tmp.path(), season_order(&[TMDB, TVDB])).await;
     let (base, log) = spawn_providers(DEFAULT_ANSWERS);
     let scanner = library.scanner(&base);
 
@@ -424,15 +424,25 @@ async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request()
     );
 }
 
-/// A library that runs TheTVDB before TheMovieDb for seasons: TheTVDB's
-/// season answer (its translated overview and its own Tvdb id) wins, and
+/// A library that runs TheTVDB before TheMovieDb for seasons — by its saved
+/// order, or with no saved order at all: both season providers declare no
+/// `IHasOrder` (50), so registration decides, and TheTVDB registers first
+/// (Jellyfin registers the TVDB plugin's assembly before the server's,
+/// `ApplicationHost.GetComposablePartAssemblies:881-886`). TheTVDB's season
+/// answer (its translated overview and its own Tvdb id) wins, and
 /// TheMovieDb's fills what it lacks — the air date, the year, the Tmdb id
-/// and the cast (TVDB's season answer carries no `People`).
+/// and the cast (TVDB's season answer carries no `People`). The requests
+/// are the same whichever leads: one season request to each.
+#[rstest::rstest]
+#[case::saved_order(season_order(&[TVDB, TMDB]))]
+#[case::no_saved_order(LibraryOptions::default())]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_tvdb_first_season_takes_tvdbs_overview_and_tmdbs_dates_and_cast() {
+async fn a_tvdb_first_season_takes_tvdbs_overview_and_tmdbs_dates_and_cast(
+    #[case] options: LibraryOptions,
+) {
     let tmp = tempfile::tempdir().expect("tmp");
-    let library = Library::new(tmp.path(), season_order(&[TVDB, TMDB])).await;
-    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let library = Library::new(tmp.path(), options).await;
+    let (base, log) = spawn_providers(DEFAULT_ANSWERS);
 
     library.scanner(&base).scan_all().await.expect("scan");
     let season = library.season().await;
@@ -451,6 +461,13 @@ async fn a_tvdb_first_season_takes_tvdbs_overview_and_tmdbs_dates_and_cast() {
         library.cast().await,
         [("Sean Bean".to_owned(), Some("Ned".to_owned()))]
     );
+    assert_eq!(
+        asked(&log, "/tmdb/tv/1399/season/1?"),
+        1,
+        "{:?}",
+        drain(&log)
+    );
+    assert_eq!(asked(&log, "/tvdb/seasons/77/extended"), 1);
 }
 
 /// TheMovieDb first, with no overview for the season: TheTVDB's translated
@@ -458,7 +475,7 @@ async fn a_tvdb_first_season_takes_tvdbs_overview_and_tmdbs_dates_and_cast() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_season_tmdb_has_no_overview_for_takes_tvdbs() {
     let tmp = tempfile::tempdir().expect("tmp");
-    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    let library = Library::new(tmp.path(), season_order(&[TMDB, TVDB])).await;
     let (base, _log) = spawn_providers(Answers {
         season: TMDB_SEASON_NO_OVERVIEW,
         ..DEFAULT_ANSWERS

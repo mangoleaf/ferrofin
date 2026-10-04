@@ -1530,14 +1530,21 @@ impl LocalProviderManager {
     }
 
     /// The remote metadata providers this manager's refresh runs for `kind`,
-    /// in registration order: TheMovieDb's, and for a season the TVDB
-    /// plugin's `TvdbSeasonProvider` too when its client is wired.
+    /// in registration order ([`BUILT_IN_METADATA_FETCHERS`]): TheMovieDb's,
+    /// and for a season the TVDB plugin's `TvdbSeasonProvider` too when its
+    /// client is wired — first, as a plugin registers before the server's
+    /// providers in Jellyfin.
+    ///
+    /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
     fn metadata_fetchers(&self, kind: &str) -> Vec<&'static str> {
-        let mut names = vec![fetcher_names::TMDB];
-        if kind == "Season" && self.tvdb.is_some() {
-            names.push(fetcher_names::TVDB);
-        }
-        names
+        crate::library_options::BUILT_IN_METADATA_FETCHERS
+            .iter()
+            .copied()
+            .filter(|&name| {
+                name == fetcher_names::TMDB
+                    || (name == fetcher_names::TVDB && kind == "Season" && self.tvdb.is_some())
+            })
+            .collect()
     }
 
     /// Resolves what a refresh should fetch for `entity`: a box set or a
@@ -1754,7 +1761,9 @@ impl LocalProviderManager {
     /// season response serves the metadata and the poster
     /// (`GetSeasonAsync`'s cache). TheTVDB's needs the series' `Tvdb` id.
     /// Neither provider declares an `IHasOrder`, so the library's saved
-    /// order ranks them and registration — TheMovieDb first — breaks a tie;
+    /// order ranks them and registration — TheTVDB first, a plugin in
+    /// Jellyfin, whose plugins register before the server's providers
+    /// ([`BUILT_IN_METADATA_FETCHERS`]) — breaks a tie;
     /// identifying runs the chosen result's provider first (`:876-882`).
     /// Neither names a `ResultLanguage` here, so the fold's language
     /// fallback (`:977-999`) never applies to a season — TheMovieDb's season
@@ -1762,6 +1771,8 @@ impl LocalProviderManager {
     /// localisation TODO, see [`crate::season`]). The ids an answer brings
     /// are not looked up by: TheTVDB reads the season's id from its series
     /// under the scan's `IsAutomated` (see [`crate::season::tvdb_season`]).
+    ///
+    /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
     async fn fetch_season_providers(&self, season: SeasonRefresh<'_>) -> Fetched {
         use crate::library_options::metadata_fetcher_rank;
         use crate::metadata_merge::{MetadataResult, merge_data, merge_provider_ids};
@@ -3477,10 +3488,18 @@ impl ProviderManager for LocalProviderManager {
         item_types: &[String],
         is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
+        // The server-wide `MetadataOptions` order the fetchers a new library
+        // is shown (`GetPluginSummary` reads them, `ProviderManager.cs:670`).
+        let global = self
+            .metadata_options
+            .as_ref()
+            .map(|options| options())
+            .unwrap_or_default();
         Ok(crate::library_options::library_options_info(
             item_types,
             is_new_library,
             &self.dynamic_fetchers,
+            &global,
         ))
     }
 
@@ -7806,10 +7825,15 @@ mod tests {
     /// field (here the overview and the season's Tvdb id), a later one fills
     /// what is still empty (TMDB's air date and cast after TVDB's), and the
     /// credits TheMovieDb answers with are saved (`SaveItemAsync` →
-    /// `UpdatePeopleAsync`). Both providers resolve by the series' ids.
+    /// `UpdatePeopleAsync`). Both providers resolve by the series' ids. With
+    /// no saved order (an empty `order` here: no `TypeOptions` at all),
+    /// registration breaks the tie of two providers that declare no
+    /// `IHasOrder`: TheTVDB first, as the TVDB plugin registers before the
+    /// server's providers in Jellyfin.
     #[rstest::rstest]
     #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB], "TMDB season.", "364731")]
     #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB], "TVDB season.", "77")]
+    #[case::no_saved_order(&[], "TVDB season.", "77")]
     #[tokio::test]
     async fn a_virtual_season_runs_every_season_provider_in_the_librarys_order(
         #[case] order: &[&str],
@@ -7817,10 +7841,15 @@ mod tests {
         #[case] tvdb_id: &str,
     ) {
         let (base, log) = spawn_season_providers(false);
+        let options = if order.is_empty() {
+            ferrofin_model::configuration::LibraryOptions::default()
+        } else {
+            season_fetchers(order)
+        };
         let season = VirtualSeason::new(
             &base,
             &[("Tmdb", "1399"), ("Tvdb", "121361")],
-            season_fetchers(order),
+            options,
             |_| {},
         );
         season
