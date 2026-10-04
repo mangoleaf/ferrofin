@@ -489,8 +489,9 @@ pub async fn build_app_state(
     }
     let tmdb_client = Arc::new(tmdb_client);
     let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
-    // TheTVDB — the TV authority. Ships on with the built-in project key (like
-    // TMDB); a user key/PIN override enables their subscription tier.
+    // TheTVDB — a remote provider of series and episodes. Ships on with the
+    // built-in project key (like TMDB); a user key/PIN override enables their
+    // subscription tier.
     let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
@@ -501,8 +502,10 @@ pub async fn build_app_state(
     });
     // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
     // critic score TMDB has no data for. Uses Jellyfin's built-in key unless
-    // FERROFIN_OMDB_KEY (config `omdb_api_key`) overrides it.
-    let omdb_client = ferrofin_providers::OmdbClient::new(&config.omdb_api_key);
+    // FERROFIN_OMDB_KEY (config `omdb_api_key`) overrides it. Its responses
+    // are cached for a day under `{cache}/omdb`, as Jellyfin caches them.
+    let omdb_client = ferrofin_providers::OmdbClient::new(&config.omdb_api_key)
+        .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("omdb"));
     let omdb_client = Arc::new(match endpoints.omdb.as_deref() {
         Some(base) => omdb_client.with_base_url(base),
         None => omdb_client,
@@ -1033,19 +1036,22 @@ pub async fn build_app_state(
     // Embedded attachments (fonts, attached pictures) ride along with the probe,
     // as `FFProbeVideoInfo.SaveMediaAttachments` does.
     .with_attachments(Arc::clone(&media_attachment_repository))
-    // Fetch remote artwork (TMDB) for movies/series with no local images,
-    // using Jellyfin's built-in key so posters/backdrops appear with no setup.
+    // TMDB metadata and remote artwork for movies and TV, using Jellyfin's
+    // built-in key so posters/backdrops appear with no setup.
     .with_metadata(Arc::clone(&tmdb_client), metadata_library)
-    // TheTVDB is the TV authority: series/episode metadata + artwork come from
-    // TVDB during the scan (TMDB stays the fallback for a series TVDB can't match).
+    // TheTVDB for series and episodes. Every enabled remote provider runs, in
+    // the library's fetcher order, each answer filling what the ones before
+    // it left (`ExecuteRemoteProviders`); the artwork follows the image order.
     .with_tvdb(Arc::clone(&the_tvdb))
     // fanart.tv artwork (logos/clear-art/disc/banners on top of TMDB's
     // poster/backdrop), keyed off the Tmdb/Imdb/Tvdb ids persisted during scan.
     // Built-in key works keyless; FERROFIN_FANART_KEY adds a personal client_key.
     .with_fanart(Arc::clone(&fanart_client))
-    // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
-    // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
-    // Uses the built-in key by default; gated by the library's fetcher settings.
+    // OMDb: a remote provider of movies, series and episodes in the library's
+    // fetcher order (plot/genres/cast/certificate/ratings, the Rotten
+    // Tomatoes score, and a last-resort poster). Uses the built-in key by
+    // default (FERROFIN_OMDB_KEY overrides it); gated by the library's
+    // fetcher settings.
     .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))

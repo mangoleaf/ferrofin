@@ -13,9 +13,15 @@
 //!
 //! Faithful port notes (the C# is the oracle):
 //! - Translations: v4 returns a base `name`/`overview` plus per-language
-//!   translations; this port uses the base fields (English-default), matching
-//!   `ReturnOriginalLanguageOrDefault` when no translation is requested. The
-//!   language-fallback chain is a documented follow-up.
+//!   translations; this port maps the base fields.
+//!   TODO(parity, open work item — NOT an accepted divergence): port the
+//!   plugin's translation chain — the name/overview translation in the
+//!   item's metadata language, then each configured `FallbackLanguages`
+//!   entry, then the base field only under `FallbackToOriginalLanguage`
+//!   (`TvdbSdkExtensions.GetTranslatedNamedOrDefault`/
+//!   `GetTranslatedOverviewOrDefault`, `TvdbUtils.
+//!   ReturnOriginalLanguageOrDefault`, `TvdbSeriesProvider.cs:445-446`), with
+//!   the two settings on the TVDB plugin configuration page.
 //! - Episode ordering: TVDB has multiple orderings (`official` = aired, `dvd`,
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
@@ -37,6 +43,15 @@ const API_BASE: &str = "https://api4.thetvdb.com/v4";
 const PROJECT_API_KEY: &str = "7f7eed88-2530-4f84-8ee7-f154471b8f87";
 /// The default episode ordering — TVDB "official" (aired) order.
 pub const DEFAULT_SEASON_TYPE: &str = "official";
+
+/// How long an episode's resolved TVDB id is reused: the plugin's
+/// `CacheDurationInHours` default (`TvdbClientManager.cs:61`), for which its
+/// `GetEpisodeTvdbId` caches the id it found (`:585-683`).
+const EPISODE_ID_TTL: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// `(series id, season type, season, episode)` → the episode's TVDB id and
+/// when it was resolved.
+type EpisodeIdCache = std::collections::HashMap<(i64, String, i32, i32), (std::time::Instant, i64)>;
 
 /// A credited person from TVDB (`Character`), mapped toward a Ferrofin person row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,6 +380,10 @@ pub struct TvdbClient {
     pin: Option<String>,
     token: Mutex<Option<String>>,
     base_url: String,
+    /// The episode ids [`episode_by_number`](Self::episode_by_number)
+    /// resolved, kept for [`EPISODE_ID_TTL`] as the plugin keeps them, so a
+    /// refresh repeated within that time asks for the episode record only.
+    episode_ids: Mutex<EpisodeIdCache>,
 }
 
 impl std::fmt::Debug for TvdbClient {
@@ -405,6 +424,7 @@ impl TvdbClient {
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
             token: Mutex::new(None),
             base_url: API_BASE.to_owned(),
+            episode_ids: Mutex::new(EpisodeIdCache::new()),
         }
     }
 
@@ -605,20 +625,38 @@ impl TvdbClient {
         struct EpisodesPayload {
             episodes: Option<Vec<EpisodeRef>>,
         }
-        let payload: EpisodesPayload = self
-            .get(
-                &format!("/series/{series_id}/episodes/{season_type}"),
-                &[
-                    ("season", season.to_string()),
-                    ("episodeNumber", number.to_string()),
-                ],
-            )
-            .await?;
-        let id = payload
-            .episodes?
-            .into_iter()
-            .find(|e| e.season_number == Some(season) && e.number == Some(number))
-            .and_then(|e| e.id)?;
+        let key = (series_id, season_type.to_owned(), season, number);
+        let cached = self.episode_ids.lock().ok().and_then(|ids| {
+            ids.get(&key)
+                .filter(|(at, _)| at.elapsed() < EPISODE_ID_TTL)
+                .map(|(_, id)| *id)
+        });
+        let id = if let Some(id) = cached {
+            id
+        } else {
+            let payload: EpisodesPayload = self
+                .get(
+                    &format!("/series/{series_id}/episodes/{season_type}"),
+                    &[
+                        ("season", season.to_string()),
+                        ("episodeNumber", number.to_string()),
+                    ],
+                )
+                .await?;
+            let id = payload
+                .episodes?
+                .into_iter()
+                .find(|e| e.season_number == Some(season) && e.number == Some(number))
+                .and_then(|e| e.id)?;
+            // Only a found id is kept, as the plugin keeps it; the expired
+            // entries go on every write, so the map holds at most one TTL's
+            // worth of lookups.
+            if let Ok(mut ids) = self.episode_ids.lock() {
+                ids.retain(|_, (at, _)| at.elapsed() < EPISODE_ID_TTL);
+                ids.insert(key, (std::time::Instant::now(), id));
+            }
+            id
+        };
         self.episode_details(id).await
     }
 
@@ -1109,5 +1147,54 @@ mod tests {
         assert!(format!("{c:?}").contains("TvdbClient"));
         let c = TvdbClient::with_config("userkey", "1234");
         assert_eq!(c.pin.as_deref(), Some("1234"));
+    }
+
+    /// An episode's resolved id is reused within the plugin's cache
+    /// duration: a second lookup of the same episode asks only for its
+    /// record; another episode is looked up again.
+    #[tokio::test]
+    async fn an_episode_id_is_resolved_once_per_cache_duration() {
+        use std::io::{Read as _, Write as _};
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&lookups);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    r#"{"data":{"token":"tok"}}"#
+                } else if req.contains("/episodes/official") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":1},
+                        {"id":10,"seasonNumber":1,"number":2}]}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let c = TvdbClient::new().with_base_url(&format!("http://{addr}"));
+        for _ in 0..2 {
+            assert!(
+                c.episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 1)
+                    .await
+                    .is_some()
+            );
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            c.episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 2)
+                .await
+                .is_some()
+        );
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

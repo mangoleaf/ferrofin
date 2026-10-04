@@ -284,6 +284,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new(root: &Path, interval_days: i32) -> Self {
+        Self::with_omdb(root, interval_days, None).await
+    }
+
+    /// [`new`](Self::new), with OMDb wired to `omdb` (a stand-in's base URL)
+    /// when given.
+    async fn with_omdb(root: &Path, interval_days: i32, omdb: Option<&str>) -> Self {
         let media = root.join("movies");
         let matrix = media
             .join("The Matrix (1999)")
@@ -332,6 +338,12 @@ impl Fixture {
                 root.join("metadata"),
             )
             .with_progress_every(0);
+        let scanner = match omdb {
+            Some(base) => scanner.with_omdb(Arc::new(
+                ferrofin_providers::OmdbClient::new("key").with_base_url(base),
+            )),
+            None => scanner,
+        };
         count_writes(&db).await;
         Self {
             db,
@@ -2041,6 +2053,140 @@ async fn identify_with_an_imdb_id_resolves_through_tmdb_find() {
     assert_eq!(
         edited_fields(&fx, &fx.matrix).await.0.as_deref(),
         Some("About Heat.")
+    );
+}
+
+/// An OMDb stand-in knowing one title, Heat (`tt0113277`), recording each
+/// request line; any other lookup finds nothing.
+struct Omdb {
+    base: String,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl Omdb {
+    fn spawn() -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let log = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_owned();
+                log.lock().expect("lock").push(line.clone());
+                let payload = if line.contains("i=tt0113277") {
+                    r#"{"Title":"Heat","Year":"1995","Plot":"From OMDb.","imdbRating":"8.3",
+                        "imdbID":"tt0113277","Response":"True",
+                        "Ratings":[{"Source":"Rotten Tomatoes","Value":"87%"}]}"#
+                } else {
+                    r#"{"Response":"False","Error":"Movie not found!"}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        Self {
+            base: format!("http://{addr}/"),
+            requests,
+        }
+    }
+
+    /// The request lines since the last call.
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.requests.lock().expect("lock"))
+    }
+}
+
+/// An identified movie's overview, community rating, critic rating,
+/// premiere date and `Data`.
+type IdentifiedRow = (
+    Option<String>,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+);
+
+/// "Identify → Apply" of an OMDb result: OMDb runs first ("When
+/// identifying, run the provider the user picked first", `MetadataService.
+/// cs:876-882`) and TheMovieDb still runs after it (`ExecuteRemoteProviders`
+/// runs every provider, `:968-1023`) — resolving the title by the IMDb id
+/// OMDb's answer carries (`MergeNewData`). The first answer wins a field
+/// and the later one fills what it left empty (`MergeData(result, temp, [],
+/// false, false)`, `:1003`): OMDb's plot and ratings stand, TMDB adds the
+/// premiere date and the trailer OMDb has none of. The first-hit chain
+/// stopped at OMDb's answer and never asked TMDB.
+#[tokio::test(flavor = "multi_thread")]
+async fn identify_with_omdb_first_then_tmdb_fills_what_omdb_left() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let omdb = Omdb::spawn();
+    let fx = Fixture::with_omdb(tmp.path(), 0, Some(&omdb.base)).await;
+    fx.scan().await;
+    let _ = (fx.tmdb.take(), omdb.take(), fx.writes().await);
+
+    let chosen = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Heat".into()),
+        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0113277".to_owned())])),
+        search_provider_name: Some("The Open Movie Database".into()),
+        ..Default::default()
+    };
+    refresh_item(&fx, &fx.matrix, &apply(chosen)).await;
+
+    let by_omdb = omdb.take();
+    let by_the_moviedb = fx.tmdb.take();
+    assert!(
+        by_omdb.iter().any(|l| l.contains("i=tt0113277")),
+        "OMDb looked the chosen id up: {by_omdb:?}"
+    );
+    assert!(
+        by_the_moviedb.iter().any(|l| l.contains("/find/tt0113277"))
+            && by_the_moviedb.iter().any(|l| l.contains("/movie/949?")),
+        "TheMovieDb ran after OMDb, by the IMDb id: {by_the_moviedb:?}"
+    );
+    assert!(
+        by_the_moviedb.iter().all(|l| !l.contains("/search/")),
+        "no search by name: {by_the_moviedb:?}"
+    );
+    let row: IdentifiedRow = sqlx::query_as(
+        r#"SELECT "Overview", "CommunityRating", "CriticRating", "PremiereDate", "Data"
+             FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(Fixture::id(&fx.matrix))
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("row");
+    assert_eq!(row.0.as_deref(), Some("From OMDb."), "OMDb's plot, first");
+    assert!(
+        row.1.is_some_and(|r| (r - 8.3).abs() < 1e-4),
+        "OMDb's IMDb rating, not TMDB's 8.0: {:?}",
+        row.1
+    );
+    assert_eq!(row.2, Some(87.0), "OMDb's Rotten Tomatoes score");
+    assert!(
+        row.3
+            .as_deref()
+            .is_some_and(|d| d.starts_with("1999-03-30")),
+        "TMDB's release date fills the gap: {:?}",
+        row.3
+    );
+    assert!(
+        row.4
+            .as_deref()
+            .is_some_and(|d| d.contains("RemoteTrailers")),
+        "TMDB's trailer fills the gap: {:?}",
+        row.4
+    );
+    let ids = provider_ids(&fx, &fx.matrix).await;
+    assert!(
+        ids.contains(&("Imdb".to_owned(), "tt0113277".to_owned()))
+            && ids.contains(&("Tmdb".to_owned(), "949".to_owned())),
+        "{ids:?}"
     );
 }
 

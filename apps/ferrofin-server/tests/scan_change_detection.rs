@@ -39,7 +39,7 @@
 //!
 //! | # | Scenario | Expect |
 //! |---|---|---|
-//! | 1 | first scan | all created; providers called |
+//! | 1 | first scan | all created; every ticked provider called, in order |
 //! | 2 | rescan, nothing changed | 0 probes, 0 provider requests, 0 writes, all unchanged |
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
@@ -138,6 +138,11 @@ const MOVIES: [(&str, u32); 5] = [
 
 /// The series the TMDB stand-in knows: title → TMDB id.
 const SHOWS: [(&str, u32); 2] = [("Harbor", 201), ("Lantern", 202)];
+
+/// Harbor's TheTVDB id, which TMDB's `external_ids` carry for it — so the
+/// TVDB provider, running after TheMovieDb, resolves Harbor by it without a
+/// search (`MergeNewData`).
+const HARBOR_TVDB: u32 = 301;
 
 /// Every remote provider's stand-in on one port, each under its own path
 /// prefix (`/tmdb`, `/image` for TMDb's image CDN, `/tvdb`, `/fanart`,
@@ -361,11 +366,16 @@ fn answer(target: &str) -> Option<String> {
                     "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5, "credits": {{"cast":[],"crew":[]}}, "external_ids": {{"imdb_id":"tt900{n}","tvdb_id":900{n}}}, "videos": {{"results":[]}}}}"#
             )
         };
+        let external_ids = if *title == "Harbor" {
+            format!(r#"{{"tvdb_id": {HARBOR_TVDB}}}"#)
+        } else {
+            "{}".to_owned()
+        };
         return match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (None, ..) => Some(format!(
                 r#"{{"id": {id}, "name": "{title}", "overview": "About {title}.", "vote_average": 8.1,
                     "first_air_date": "2010-01-01", "videos": {}, "credits": {{"cast": [], "crew": []}},
-                    "content_ratings": {{"results": []}}, "external_ids": {{}}}}"#,
+                    "content_ratings": {{"results": []}}, "external_ids": {external_ids}}}"#,
                 trailer(title)
             )),
             (Some("season"), Some("1"), None, _) => Some(format!(
@@ -382,6 +392,9 @@ fn answer(target: &str) -> Option<String> {
             _ => None,
         };
     }
+    if let Some(rest) = path.strip_prefix("/tvdb/") {
+        return tvdb(rest);
+    }
     if path.starts_with("/mb/ws/2/") {
         return Some(musicbrainz(path));
     }
@@ -396,6 +409,39 @@ fn answer(target: &str) -> Option<String> {
         );
     }
     None
+}
+
+/// TheTVDB's answers (`rest` is the path under `/tvdb/`): a login token, and
+/// Harbor alone — its record, crediting one character (TMDB's credits
+/// nobody on it), and each episode's, with a different title and air date
+/// than TMDB's, crediting nobody. A search finds nothing.
+fn tvdb(rest: &str) -> Option<String> {
+    if rest == "login" {
+        return Some(r#"{"data":{"token":"matrix"}}"#.to_owned());
+    }
+    if rest == "search" {
+        return Some(r#"{"data":[]}"#.to_owned());
+    }
+    if rest == format!("series/{HARBOR_TVDB}/extended") {
+        return Some(format!(
+            r#"{{"data":{{"id":{HARBOR_TVDB},"name":"Harbor","overview":"TVDB's Harbor.",
+                "characters":[{{"personName":"Tess Tvdb","peopleType":"Actor","name":"Keeper"}}]}}}}"#
+        ));
+    }
+    if rest == format!("series/{HARBOR_TVDB}/episodes/official") {
+        return Some(
+            r#"{"data":{"episodes":[{"id":3001,"seasonNumber":1,"number":1},
+                {"id":3002,"seasonNumber":1,"number":2}]}}"#
+                .to_owned(),
+        );
+    }
+    let n = rest
+        .strip_prefix("episodes/300")?
+        .strip_suffix("/extended")?;
+    Some(format!(
+        r#"{{"data":{{"name":"Harbor on TVDB {n}","overview":"TVDB's episode {n}.",
+            "aired":"2011-02-0{n}","characters":[]}}}}"#
+    ))
 }
 
 /// MusicBrainz answers for one album by one artist.
@@ -1270,7 +1316,9 @@ impl Harness {
     /// The settle window, MusicBrainz's pace, and the libraries: movies, a
     /// series, a watched series and music, each with only the remote
     /// fetchers the stand-in answers for ticked — TMDb's image fetcher for
-    /// movies, every other image fetcher off.
+    /// movies, every other image fetcher off. The series library runs
+    /// TheTVDB after TheMovieDb for series and episodes, so the first scan
+    /// shows every provider answering, one after the other.
     async fn configure(&mut self) {
         let mut config = self.get("/System/Configuration").await;
         config["LibraryMonitorDelay"] = json!(SETTLE_SECONDS);
@@ -1307,7 +1355,13 @@ impl Harness {
                 "tvshows",
                 "shows",
                 false,
-                fetchers(&tv, &["TheMovieDb"], &[]),
+                [
+                    fetchers(&["Series", "Episode"], &["TheMovieDb", "TheTVDB"], &[]),
+                    fetchers(&["Season"], &["TheMovieDb"], &[]),
+                ]
+                .into_iter()
+                .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+                .collect(),
             ),
             (
                 "Live",
@@ -1737,7 +1791,7 @@ async fn rows(h: &Harness) {
         "row 1: {:?}",
         first.spawns
     );
-    for provider in ["tmdb", "musicbrainz", "audiodb", "image"] {
+    for provider in ["tmdb", "tvdb", "musicbrainz", "audiodb", "image"] {
         assert!(
             first.provider_metric.get(provider).copied().unwrap_or(0.0) > 0.0,
             "row 1: {provider} was asked {:?}",
@@ -1745,12 +1799,34 @@ async fn rows(h: &Harness) {
         );
     }
     assert_provider_counts_agree(&first, "1");
-    for provider in ["tvdb", "fanart", "studios"] {
+    for provider in ["fanart", "studios"] {
         assert!(
             of(&first.requests, provider).is_empty(),
             "row 1: {provider} is off"
         );
     }
+    // Every provider the Shows library ticks runs, one after the other
+    // (`ExecuteRemoteProviders`): TheTVDB after TheMovieDb, for Harbor and
+    // each of its episodes. It resolves Harbor by the TVDB id TMDB's answer
+    // carried, never by a search (`MergeNewData`); the Live library, TMDB
+    // only, never reaches it.
+    let the_tvdb = of(&first.requests, "tvdb");
+    assert!(
+        the_tvdb
+            .iter()
+            .any(|r| r.contains(&format!("/tvdb/series/{HARBOR_TVDB}/extended")))
+            && the_tvdb
+                .iter()
+                .any(|r| r.contains("/tvdb/episodes/3001/extended"))
+            && the_tvdb
+                .iter()
+                .any(|r| r.contains("/tvdb/episodes/3002/extended")),
+        "row 1: TVDB answered for Harbor and its episodes {the_tvdb:?}"
+    );
+    assert!(
+        the_tvdb.iter().all(|r| !r.contains("/tvdb/search")),
+        "row 1: TVDB looked Harbor up by the id TMDB found {the_tvdb:?}"
+    );
     // Alpha's artwork and its cast member: the person refreshed from TMDb,
     // and both images downloaded.
     let artwork = artwork_and_people(&first);
@@ -1764,6 +1840,29 @@ async fn rows(h: &Harness) {
             "row 1: {wanted} was fetched {artwork:?}"
         );
     }
+    // The first answer wins a field and a later one fills what is still
+    // empty (`MergeData(result, temp, [], false, false)`): Harbor keeps
+    // TMDB's overview, and TheMovieDb credited nobody on it, so TheTVDB's
+    // character is its cast.
+    let harbor_dir = m.harbor_e1.parent().and_then(Path::parent).expect("series");
+    let harbor = h.item(&h.id(harbor_dir).await).await;
+    assert_eq!(harbor["Overview"], "About Harbor.", "row 1: {harbor}");
+    assert!(
+        harbor["People"].as_array().is_some_and(|p| p.len() == 1
+            && p[0]["Name"] == "Tess Tvdb"
+            && p[0]["Role"] == "Keeper"),
+        "row 1: TVDB's cast fills TMDB's empty one {}",
+        harbor["People"]
+    );
+    let harbor_e1 = h.item(&h.id(&m.harbor_e1).await).await;
+    assert_eq!(harbor_e1["Name"], "Harbor episode 1", "row 1: TMDB's title");
+    assert!(
+        harbor_e1["PremiereDate"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("2010-01-01")),
+        "row 1: TMDB's air date, not TVDB's {}",
+        harbor_e1["PremiereDate"]
+    );
     let alpha = h.id(&m.alpha).await;
     let beta = h.id(&m.beta).await;
     let gamma = h.id(&m.gamma_nfo.with_extension("mkv")).await;

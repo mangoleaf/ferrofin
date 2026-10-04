@@ -8,6 +8,27 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — every checked metadata provider runs, in order
+
+Metadata refreshes now ask every metadata downloader a library has checked, one
+after the other in the library's order, as Jellyfin does. Before, the first
+provider that answered was the only one asked. With the defaults that means
+TheTVDB (series and episodes) and OMDb are asked after TheMovieDb. Expect more
+provider requests on first scans and full refreshes, and on the scans that
+re-ask about titles still missing an overview, trailer or Rotten Tomatoes score.
+OMDb answers are cached for a day. To ask fewer providers, uncheck them in the
+library's metadata settings.
+
+- A later provider only fills what an earlier one left empty, cast included:
+  TheTVDB's characters fill a cast TheMovieDb left empty, for example.
+- An NFO's genres are no longer combined with the providers' genres; the NFO's
+  list stands on its own, as in Jellyfin.
+- The scans that re-ask about incomplete titles only fill empty fields. They no
+  longer overwrite stored values, so your edits (even unlocked ones) and the
+  stored cast and provider ids stay as they are.
+
+No manual step is needed.
+
 ## Unreleased — extras no longer appear as library children
 
 Run **Scan All Libraries** once after upgrading if extras or samples appeared as

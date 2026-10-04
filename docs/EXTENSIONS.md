@@ -223,8 +223,9 @@ that are still empty and records its own external ids; it can never overwrite a 
 provider or a user edit. A plugin that declares `provider-info` becomes a **named
 provider**: its name appears in each library's *Metadata downloaders* / *Image fetchers*
 checkboxes, and the per-library selection and order are enforced during the scan — for
-named plugins and for the built-ins alike (TheTVDB vs TheMovieDb authority for a series
-follows the saved order; a fetcher a library unchecked never runs for its items).
+named plugins and for the built-ins alike (the built-ins run one after the other in the
+saved order, the first answer winning a field and later ones filling the gaps; a fetcher
+a library unchecked never runs for its items).
 A declared provider name that collides with a built-in fetcher or another loaded
 plugin (case-insensitively) is refused at load — it would ride that fetcher's
 checkbox/order and be impossible to toggle apart.

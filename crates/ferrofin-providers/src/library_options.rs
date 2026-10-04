@@ -219,7 +219,8 @@ pub mod fetcher_names {
     pub const NFO: &str = "Nfo";
     /// TMDB metadata + images.
     pub const TMDB: &str = "TheMovieDb";
-    /// OMDb (Rotten Tomatoes rating supplement).
+    /// OMDb movie/series/episode metadata (the Rotten Tomatoes rating among
+    /// it) and posters.
     pub const OMDB: &str = "The Open Movie Database";
     /// TheTVDB series/episode metadata + artwork.
     pub const TVDB: &str = "TheTVDB";
@@ -673,19 +674,36 @@ fn audio_extractor_images(_type_name: &str) -> &'static [ImageType] {
     &[ImageType::Primary]
 }
 
-/// `Jellyfin.Plugin.Tvdb`'s series/season/episode image providers.
+/// `Jellyfin.Plugin.Tvdb`'s series/season/episode image providers'
+/// `GetSupportedImages` (`TvdbSeriesImageProvider.cs:59-66`,
+/// `TvdbSeasonImageProvider.cs:59-64`, `TvdbEpisodeImageProvider.cs:49-52`).
+///
+/// TODO(parity, open work item): the scan's image pass does not ask TheTVDB
+/// for a season's artwork yet (see `fetch_tv_still_images`); port
+/// `TvdbSeasonImageProvider.GetImages` — the season's TVDB id from the series'
+/// extended record for its display order, then `/seasons/{id}/extended`'s
+/// artworks by season artwork type.
 fn tvdb_images(type_name: &str) -> &'static [ImageType] {
-    use ImageType::{Backdrop, Banner, Primary};
-    const SERIES: &[ImageType] = &[Primary, Banner, Backdrop];
-    const PRIMARY_ONLY: &[ImageType] = &[Primary];
+    use ImageType::{Art, Backdrop, Banner, Logo, Primary};
+    const SERIES: &[ImageType] = &[Primary, Banner, Backdrop, Logo, Art];
+    const SEASON: &[ImageType] = &[Primary, Banner, Backdrop];
+    const EPISODE: &[ImageType] = &[Primary];
     match type_name {
         "Series" => SERIES,
-        "Season" | "Episode" => PRIMARY_ONLY,
+        "Season" => SEASON,
+        "Episode" => EPISODE,
         _ => &[],
     }
 }
 
 /// fanart.tv's movie/series/artist/album image providers.
+///
+/// TODO(parity, open work item): the plugin's `SeasonProvider` (Backdrop,
+/// Thumb, Banner, Primary — `SeasonProvider.cs:51-60`) is not advertised for
+/// a Season because nothing fetches it yet: port its `GetImages` (the
+/// series' fanart JSON filtered to the season's number) into the season
+/// image pass, then add `"Season"` to fanart's registry types and its list
+/// here.
 fn fanart_images(type_name: &str) -> &'static [ImageType] {
     use ImageType::{Art, Backdrop, Banner, Disc, Logo, Primary, Thumb};
     const MOVIE: &[ImageType] = &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop];
@@ -1106,10 +1124,11 @@ mod tests {
                 ImageType::Thumb
             ]
         );
-        // TmdbSeason/TmdbEpisodeImageProvider both yield Primary only.
+        // TmdbSeasonImageProvider yields Primary; TheTVDB's season provider
+        // adds Banner and Backdrop (`TvdbSeasonImageProvider.cs:59-64`).
         assert_eq!(
             block("Season").supported_image_types,
-            vec![ImageType::Primary]
+            vec![ImageType::Primary, ImageType::Banner, ImageType::Backdrop]
         );
         // Episode also has the embedded extractor, which yields Primary there.
         assert_eq!(
@@ -1354,6 +1373,31 @@ mod tests {
         assert_eq!(
             metadata_fetcher_rank(None, None, "MusicAlbum", "TheAudioDB"),
             usize::MAX
+        );
+    }
+
+    /// The image fetchers' supported types per kind, as `GetSupportedImages`
+    /// declares them (`TmdbSeriesImageProvider.cs:47-53`,
+    /// `TmdbEpisodeImageProvider.cs:46-49`, `TvdbSeriesImageProvider.cs:
+    /// 59-66`, `TvdbSeasonImageProvider.cs:59-64`).
+    #[test]
+    fn image_fetchers_name_the_types_they_supply() {
+        use ferrofin_model::entities::ImageType::{Art, Backdrop, Banner, Logo, Primary, Thumb};
+        assert_eq!(
+            super::tmdb_images("Series"),
+            [Primary, Backdrop, Logo, Thumb]
+        );
+        assert_eq!(super::tmdb_images("Episode"), [Primary]);
+        assert_eq!(
+            super::tvdb_images("Series"),
+            [Primary, Banner, Backdrop, Logo, Art]
+        );
+        assert_eq!(super::tvdb_images("Season"), [Primary, Banner, Backdrop]);
+        assert_eq!(super::tvdb_images("Episode"), [Primary]);
+        assert!(super::tvdb_images("Movie").is_empty());
+        assert!(
+            super::fanart_images("Season").is_empty(),
+            "not advertised until its season fetch is ported"
         );
     }
 }

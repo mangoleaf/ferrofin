@@ -179,16 +179,6 @@ struct ImageEntry {
     iso_639_1: Option<String>,
 }
 
-/// A matched TV series: its TMDB id (for season/episode follow-up) + poster and
-/// backdrop images.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeriesMatch {
-    /// The TMDB series id, used to fetch season/episode artwork.
-    pub tmdb_id: i64,
-    /// The series' poster/backdrop images.
-    pub images: Vec<RemoteImage>,
-}
-
 /// One season's metadata + artwork from `/tv/{id}/season/{n}`: the season's
 /// name/overview/poster and every episode's metadata, in a single request.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1185,60 +1175,6 @@ impl TmdbClient {
         images
     }
 
-    /// Matches a TV series by name/year and returns its TMDB id + poster/backdrop.
-    ///
-    /// Unlike [`images_for`](Self::images_for) this keeps the id so seasons and
-    /// episodes of the same series can be fetched with
-    /// [`season_details`](Self::season_details). `None`
-    /// on no match or any network/parse error.
-    pub async fn series_match(&self, name: &str, year: Option<i32>) -> Option<SeriesMatch> {
-        // The TMDb settings page governs the key, the adult filter, the
-        // cast/crew caps and the image sizes; read per call, the way
-        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
-        let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let mut req = self
-            .http
-            .get(format!("{}/search/tv", self.base_url))
-            .query(&[("api_key", key), ("query", name)])
-            // `include_adult` is `Plugin.Instance.Configuration.IncludeAdult`
-            // on every TMDb search upstream (`TmdbClientManager.cs:396,424,467`);
-            // the API's own default is `false`, which is also the plugin's.
-            .query(&[("include_adult", cfg.include_adult.to_string())]);
-        if let Some(y) = year {
-            req = req.query(&[("first_air_date_year", y.to_string())]);
-        }
-        let resp = req.send_limited(&self.limiter).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let hit = resp
-            .counted_json::<SearchResponse>()
-            .await
-            .ok()?
-            .results
-            .into_iter()
-            .next()?;
-
-        let mut images = Vec::new();
-        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Primary,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
-            });
-        }
-        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
-            images.push(RemoteImage {
-                image_type: ImageType::Backdrop,
-                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
-            });
-        }
-        Some(SeriesMatch {
-            tmdb_id: hit.id,
-            images,
-        })
-    }
-
     /// Fetches one season's metadata + artwork (`/tv/{id}/season/{n}`): the
     /// season name/overview/poster and every episode's name/overview/still, in a
     /// single request. `None` on any failure.
@@ -1582,51 +1518,15 @@ impl TmdbClient {
             .collect()
     }
 
-    /// Fetches ONE episode's credited people via
-    /// `/tv/{id}/season/{season}/episode/{episode}/credits`.
-    ///
-    /// Port of `TmdbEpisodeProvider`'s credits handling: the episode's own
-    /// `cast` (the regulars credited in THIS episode, in billing order), then
-    /// its `guest_stars` (typed `GuestStar`), then the wanted `crew` — which is
-    /// what fills an episode page's Cast & Crew upstream.
-    ///
-    /// `None` when TMDB did not answer (a miss, or a network/HTTP/parse
-    /// failure, which the request's failure count records); `Some(vec![])`
-    /// for an episode TMDB answers for and credits nobody on. Either way the
-    /// scan carries no credits for it — `TmdbEpisodeProvider` only
-    /// `AddPerson`s — so neither clears a stored cast.
-    pub async fn episode_credits(
-        &self,
-        series_tmdb_id: i64,
-        season: i32,
-        episode: i32,
-    ) -> Option<Vec<TmdbPerson>> {
-        // The TMDb settings page governs the key, the adult filter, the
-        // cast/crew caps and the image sizes; read per call, the way
-        // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
-        let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let url = format!(
-            "{}/tv/{series_tmdb_id}/season/{season}/episode/{episode}/credits",
-            self.base_url
-        );
-        let resp = self
-            .http
-            .get(url)
-            .query(&[("api_key", key)])
-            .send_limited(&self.limiter)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let credits = resp.counted_json::<CreditsResponse>().await.ok()?;
-        Some(episode_people_from(credits, &cfg))
-    }
-
     /// Retrieves episode external ids, trailers and credits in one request.
     /// The season response supplies shared text/artwork; this replaces the
     /// separate credits request while retaining its failure semantics.
+    ///
+    /// The credits are `TmdbEpisodeProvider`'s: the episode's own `cast` (the
+    /// regulars credited in THIS episode, in billing order), then its
+    /// `guest_stars` (typed `GuestStar`), then the wanted `crew`. `people` is
+    /// `None` when the answer carries no credits; the request's failure
+    /// count records a failed one.
     pub async fn episode_extras(
         &self,
         series: i64,
@@ -2408,11 +2308,13 @@ mod tests {
           ],
           "crew": []
         }"#;
-        let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
+        let server =
+            MockServer::start(vec![("/episode/", format!(r#"{{"credits":{body}}}"#))]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
         let people = client
-            .episode_credits(1399, 1, 1)
+            .episode_extras(1399, 1, 1)
             .await
+            .and_then(|extras| extras.people)
             .expect("credits fetched");
         let got: Vec<(&str, Option<i32>)> = people
             .iter()
@@ -2447,12 +2349,14 @@ mod tests {
             {"id": 7, "name": "", "job": "Director"}
           ]
         }"#;
-        let server = MockServer::start(vec![("/credits", body.to_owned())]).await;
+        let server =
+            MockServer::start(vec![("/episode/", format!(r#"{{"credits":{body}}}"#))]).await;
         let client = TmdbClient::new().with_base_url(&server.base_url);
 
         let people = client
-            .episode_credits(1399, 1, 1)
+            .episode_extras(1399, 1, 1)
             .await
+            .and_then(|extras| extras.people)
             .expect("credits fetched");
         let rows: Vec<(&str, &str, Option<&str>)> = people
             .iter()
