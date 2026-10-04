@@ -7,6 +7,20 @@ use crate::video::{
     extra_rule_resolver, format_3d_parser, stub_resolver,
 };
 
+/// Whether MovieResolver excludes a filename while recognizing a movie folder.
+/// Jellyfin's `IsIgnoredRegex` is narrower in purpose than IgnorePatterns:
+/// these files may still be resolved individually or as owned Sample extras.
+///
+/// # Panics
+/// Panics if the fixed sample regex cannot compile (a programming error).
+#[must_use]
+pub fn is_sample_filename(name: &str) -> bool {
+    static SAMPLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SAMPLE
+        .get_or_init(|| regex::Regex::new(r"(?i)\bsample\b").expect("valid sample regex"))
+        .is_match(name)
+}
+
 /// Resolves a directory into a [`VideoFileInfo`].
 #[must_use]
 pub fn resolve_directory(
@@ -131,4 +145,27 @@ pub fn try_clean_string(name: Option<&str>, naming_options: &NamingOptions) -> O
 #[must_use]
 pub fn clean_date_time(name: &str, naming_options: &NamingOptions) -> CleanDateTimeResult {
     clean_date_time_parser::clean(name, &naming_options.clean_date_time_regexes)
+}
+
+#[cfg(test)]
+mod sample_filename_tests {
+    #[test]
+    fn movie_folder_sample_regex_uses_word_boundaries() {
+        for name in [
+            "sample.mkv",
+            "Movie.sample.mkv",
+            "Movie-sample.mkv",
+            "A Sample Title.mkv",
+        ] {
+            assert!(super::is_sample_filename(name), "{name}");
+        }
+        for name in [
+            "Movie_sample.mkv",
+            "Samples.mkv",
+            "Sampler.mkv",
+            "Movie.mkv",
+        ] {
+            assert!(!super::is_sample_filename(name), "{name}");
+        }
+    }
 }

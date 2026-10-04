@@ -107,7 +107,7 @@ impl AuthorizationContext for OkAuth {
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
-struct OkUsers;
+struct OkUsers(ferrofin_model::users::UserPolicy);
 
 #[async_trait]
 impl UserManager for OkUsers {
@@ -180,7 +180,10 @@ impl UserManager for OkUsers {
         _user: &UserEntity,
         _server_id: Option<String>,
     ) -> Result<ferrofin_model::dto::UserDto, ServiceError> {
-        unimplemented!()
+        Ok(ferrofin_model::dto::UserDto {
+            policy: Some(self.0.clone()),
+            ..Default::default()
+        })
     }
     async fn update_configuration(
         &self,
@@ -402,6 +405,16 @@ struct Harness {
 
 /// Builds a [`Harness`] serving `path` for streams.
 fn state(path: &str) -> Harness {
+    state_with_policy(
+        path,
+        ferrofin_model::users::UserPolicy {
+            enable_content_downloading: true,
+            ..Default::default()
+        },
+    )
+}
+
+fn state_with_policy(path: &str, policy: ferrofin_model::users::UserPolicy) -> Harness {
     let opened = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(Mutex::new(Vec::new()));
     let sources = StreamSources {
@@ -411,7 +424,7 @@ fn state(path: &str) -> Harness {
     };
     let app = AppState::new(
         Arc::new(StreamLibrary),
-        Arc::new(OkUsers),
+        Arc::new(OkUsers(policy)),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(sources),
@@ -520,6 +533,49 @@ async fn download_sets_content_disposition() {
 }
 
 #[tokio::test]
+async fn download_permission_is_enforced_before_serving_files() {
+    let (_dir, path) = temp_media();
+    for method in ["GET", "HEAD"] {
+        let app = state_with_policy(
+            &path,
+            ferrofin_model::users::UserPolicy {
+                enable_content_downloading: false,
+                ..Default::default()
+            },
+        )
+        .app;
+        let mut request = authed(method, &format!("/Items/{ITEM_ID}/Download"));
+        request
+            .headers_mut()
+            .insert("Range", "bytes=0-4".parse().unwrap());
+        let response = create_router(app).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("content-disposition"));
+        assert!(!response.headers().contains_key("content-range"));
+    }
+}
+
+#[tokio::test]
+async fn administrator_download_still_honors_the_item_permission() {
+    let (_dir, path) = temp_media();
+    let app = state_with_policy(
+        &path,
+        ferrofin_model::users::UserPolicy {
+            is_administrator: true,
+            enable_content_downloading: false,
+            ..Default::default()
+        },
+    )
+    .app;
+    let response = create_router(app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!response.headers().contains_key("content-disposition"));
+}
+
+#[tokio::test]
 async fn bitrate_test_returns_requested_size() {
     let (_dir, path) = temp_media();
     let app = state(&path).app;
@@ -571,4 +627,24 @@ async fn live_stream_open_then_close() {
         .expect("close response");
     assert_eq!(close.status(), StatusCode::NO_CONTENT);
     assert_eq!(closed.lock().unwrap().as_slice(), ["live-123"]);
+}
+
+#[tokio::test]
+async fn deletion_requires_permission_for_single_and_batch_routes() {
+    for uri in [format!("/Items/{ITEM_ID}"), format!("/Items?ids={ITEM_ID}")] {
+        let app = state_with_policy(
+            "unused",
+            ferrofin_model::users::UserPolicy {
+                enable_content_deletion: false,
+                ..Default::default()
+            },
+        )
+        .app;
+        // The stub's delete method panics, proving rejection happens first.
+        let response = create_router(app)
+            .oneshot(authed("DELETE", &uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

@@ -25,12 +25,28 @@ use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::error::ServiceError;
 
+/// An initial task snapshot and all transitions captured after that snapshot.
+/// Construct both under the registry lock so subscribing cannot lose a fast run.
+pub struct TaskSubscription {
+    /// State at the instant this subscription was established.
+    pub snapshot: Vec<TaskInfo>,
+    /// Subsequent lifecycle transitions in registry order.
+    pub updates: tokio::sync::broadcast::Receiver<Vec<TaskInfo>>,
+}
+
 /// Enumerates the server's scheduled tasks and runs one on demand.
 ///
 /// Port of `ITaskManager` (read + manual-run slice). Object-safe so it can be
 /// held as `Arc<dyn TaskManager>`.
 #[async_trait]
 pub trait TaskManager: Send + Sync {
+    /// Subscribes to captured task-start and terminal snapshots in transition order.
+    /// Periodic progress remains available through `get_tasks`. Implementations
+    /// without live transitions return `None` and retain periodic polling.
+    fn subscribe_task_updates(&self) -> Option<TaskSubscription> {
+        None
+    }
+
     /// Lists every registered task as a wire [`TaskInfo`].
     ///
     /// The unfiltered listing, in the C# wire order

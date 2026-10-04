@@ -216,12 +216,13 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extracts a query-string parameter value by exact key (no percent-decoding —
-/// access tokens are URL-safe hex).
+/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
+/// The host normalizes the SDK's `ApiKey` to `apiKey` before this handler.
+/// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == key && !v.is_empty()).then(|| v.to_owned())
+        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_owned())
     })
 }
 
@@ -500,6 +501,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only an authenticated socket may
     // subscribe — the streams answer as the socket's user.
     let mut streams = Streams::default();
+    let mut task_updates = None;
 
     if open {
         loop {
@@ -523,7 +525,12 @@ async fn handle_socket(
                         }
                     }
                     Action::Inbound(inbound) => {
+                        log_task_subscription(inbound, caller.is_some());
                         if caller.is_some() {
+                            let message = update_task_subscription(&state, inbound, &mut task_updates).await;
+                            if !send_optional(&mut socket, message, &overflowed).await {
+                                break;
+                            }
                             streams.apply(inbound);
                         }
                     }
@@ -557,17 +564,21 @@ async fn handle_socket(
                         break;
                     }
                 }
+                update = next_task_update(&mut task_updates) => {
+                    let msg = task_transition_message(&state, update, &mut task_updates).await;
+                    if !send_optional(&mut socket, msg, &overflowed).await {
+                        break;
+                    }
+                }
                 () = tick(&mut streams.tasks) => {
-                    if let Some(msg) = tasks_message(&state).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = periodic_tasks_message(&state, task_updates.as_ref()).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
                 () = tick(&mut streams.activity) => {
-                    if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = activity_message(&state, &mut streams.activity_since).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
@@ -575,17 +586,44 @@ async fn handle_socket(
         }
     }
 
+    unregister_socket(&state, registration).await;
+    drop(tx);
+    tracing::info!(
+        elapsed_s = started.elapsed().as_secs(),
+        "websocket disconnected"
+    );
+}
+
+/// Debug diagnostics for accepted and ignored task subscriptions.
+fn log_task_subscription(inbound: Inbound, authenticated: bool) {
+    if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
+        tracing::debug!(
+            authenticated,
+            subscribing = matches!(inbound, Inbound::TasksStart(_)),
+            "dashboard task subscription requested"
+        );
+    }
+}
+
+async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
             state.sessions.report_session_ended(&sid)
         })
         .await;
     }
-    drop(tx);
-    tracing::info!(
-        elapsed_s = started.elapsed().as_secs(),
-        "websocket disconnected"
-    );
+}
+
+/// Send a stream update when it contains a payload.
+async fn send_optional(
+    socket: &mut WebSocket,
+    message: Option<String>,
+    overflowed: &tokio::sync::Notify,
+) -> bool {
+    match message {
+        Some(message) => send_frame(socket, Message::Text(message.into()), overflowed).await,
+        None => true,
+    }
 }
 
 /// The one `websocket connected` line, which says whether the socket carries a
@@ -772,11 +810,93 @@ async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<Strin
 /// .Where(i => !i.IsHidden)` — name-ordered (which `get_tasks` already is) and
 /// with hidden tasks dropped, unlike the `GET /ScheduledTasks` listing.
 async fn tasks_message(state: &AppState) -> Option<String> {
-    let tasks = visible_tasks(state.tasks.get_tasks().await.ok()?);
+    task_snapshot_message(state.tasks.get_tasks().await.ok()?)
+}
+
+fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<String> {
+    // The dashboard's task feed is distinct from per-library RefreshProgress.
+    // Keep these snapshots available for debugging subscription delivery.
+    for task in &tasks {
+        if task.key.as_deref() == Some("RefreshLibrary")
+            && task.state != ferrofin_model::tasks::TaskState::Idle
+        {
+            tracing::debug!(
+                task = "RefreshLibrary",
+                state = ?task.state,
+                progress = ?task.current_progress_percentage,
+                "dashboard scan task snapshot"
+            );
+        }
+    }
     Some(envelope(
         "ScheduledTasksInfo",
-        &serde_json::to_value(tasks).ok()?,
+        &serde_json::to_value(visible_tasks(tasks)).ok()?,
     ))
+}
+
+type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
+
+/// An initial snapshot and its subscription are acquired atomically by the registry.
+async fn update_task_subscription(
+    state: &AppState,
+    inbound: Inbound,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match inbound {
+        Inbound::TasksStart(_) => match state.tasks.subscribe_task_updates() {
+            Some(subscription) => {
+                *receiver = Some(subscription.updates);
+                task_snapshot_message(subscription.snapshot)
+            }
+            None => tasks_message(state).await,
+        },
+        Inbound::TasksStop => {
+            *receiver = None;
+            None
+        }
+        _ => None,
+    }
+}
+
+async fn task_transition_message(
+    state: &AppState,
+    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match update {
+        Ok(tasks) => task_snapshot_message(tasks),
+        // Resubscribe atomically after lag, dropping obsolete queued snapshots.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            update_task_subscription(state, Inbound::TasksStart(Duration::ZERO), receiver).await
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            *receiver = None;
+            None
+        }
+    }
+}
+
+async fn periodic_tasks_message(
+    state: &AppState,
+    receiver: Option<&TaskUpdateReceiver>,
+) -> Option<String> {
+    let message = tasks_message(state).await;
+    // A transition may race the read. Drain captured transitions before sending
+    // any newer periodic snapshot, otherwise a short run can appear out of order.
+    if receiver.is_some_and(|updates| !updates.is_empty()) {
+        None
+    } else {
+        message
+    }
+}
+
+async fn next_task_update(
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The listener's `.Where(i => !i.IsHidden)` clause.
@@ -849,6 +969,41 @@ mod tests {
     use axum::http::HeaderMap;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
+        use crate::test_support::{
+            FakeLibrary, RecordingTasks, elevated_state_with_library_monitor_and_tasks,
+        };
+        use std::sync::Arc;
+        let state = elevated_state_with_library_monitor_and_tasks(
+            Arc::new(FakeLibrary),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+            Arc::new(RecordingTasks::default()),
+        );
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        let mut receiver = Some(receiver);
+        sender.send(Vec::new()).unwrap();
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_none()
+        );
+        let update = super::next_task_update(&mut receiver).await;
+        assert!(
+            super::task_transition_message(&state, update, &mut receiver)
+                .await
+                .is_some()
+        );
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_some()
+        );
+        super::update_task_subscription(&state, Inbound::TasksStop, &mut receiver).await;
+        assert!(receiver.is_none());
+        assert_eq!(sender.receiver_count(), 0);
+    }
+
     /// A client that stops reading must not make the server buffer without
     /// bound: the sink accepts exactly `PUSH_QUEUE_DEPTH` messages, then drops
     /// the rest and raises the overflow signal that closes the socket.
@@ -907,11 +1062,19 @@ mod tests {
     }
 
     #[test]
-    fn query_param_extracts_by_exact_key() {
+    fn query_param_accepts_jellyfin_and_host_normalized_token_keys() {
         let q = Some("deviceId=dev1&api_key=abc123&x=1");
         assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
         assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
-        assert_eq!(query_param(q, "ApiKey"), None); // case-sensitive
+        assert_eq!(query_param(q, "ApiKey"), None); // underscore is significant
+        for key in ["ApiKey", "apiKey", "apikey", "APIKEY"] {
+            let query = format!("deviceId=dev1&{key}=aBc123&x=1");
+            assert_eq!(
+                query_param(Some(&query), "ApiKey").as_deref(),
+                Some("aBc123")
+            );
+        }
+        assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
     }

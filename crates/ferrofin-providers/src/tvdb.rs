@@ -98,6 +98,8 @@ pub struct TvdbSeriesDetails {
     pub air_time: Option<String>,
     /// The URL slug (`TvdbSlug`).
     pub slug: Option<String>,
+    /// Official TVDB list ids, separated by semicolons as in the plugin.
+    pub collection_ids: Option<String>,
     /// Cross-provider ids resolved from `remoteIds`.
     pub imdb_id: Option<String>,
     /// The TMDB id, if TVDB carries one.
@@ -130,6 +132,16 @@ impl TvdbSeriesDetails {
 /// Mapped episode metadata (`/episodes/{id}/extended`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TvdbEpisodeDetails {
+    /// The episode's own TVDB id.
+    pub tvdb_id: i64,
+    /// The episode's IMDb id.
+    pub imdb_id: Option<String>,
+    /// Special's position in aired order.
+    pub airs_before_episode: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
     /// The episode name.
     pub name: Option<String>,
     /// The overview.
@@ -236,6 +248,7 @@ struct ArtworkWire {
 
 #[derive(Debug, Deserialize)]
 struct SeriesExtendedWire {
+    lists: Option<Vec<ListWire>>,
     name: Option<String>,
     slug: Option<String>,
     overview: Option<String>,
@@ -304,7 +317,20 @@ impl AirsDaysWire {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListWire {
+    id: Option<i64>,
+    #[serde(default)]
+    is_official: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EpisodeExtendedWire {
+    remote_ids: Option<Vec<RemoteIdWire>>,
+    airs_before_episode: Option<i64>,
+    airs_after_season: Option<i64>,
+    airs_before_season: Option<i64>,
     name: Option<String>,
     overview: Option<String>,
     aired: Option<String>,
@@ -475,6 +501,37 @@ impl TvdbClient {
             .collect()
     }
 
+    /// Resolves an IMDb, Zap2It or TMDB id through TVDB's remote-id search.
+    /// Only series results are eligible; unrelated movie/person hits are ignored.
+    pub async fn series_by_remote_id(&self, remote_id: &str) -> Option<i64> {
+        #[derive(Deserialize)]
+        struct SeriesRef {
+            id: Option<i64>,
+        }
+        #[derive(Deserialize)]
+        struct Hit {
+            series: Option<SeriesRef>,
+        }
+        let remote_id = remote_id.trim();
+        if remote_id.is_empty() {
+            return None;
+        }
+        // Provider ids are alphanumeric (Zap2It also uses punctuation).
+        // Do not let malformed stored ids alter the URL path or query.
+        if !remote_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        {
+            return None;
+        }
+        let encoded = remote_id;
+        let hits: Vec<Hit> = self
+            .get(&format!("/search/remoteid/{encoded}"), &[])
+            .await?;
+        hits.into_iter()
+            .find_map(|hit| hit.series.and_then(|s| s.id).filter(|id| *id > 0))
+    }
+
     /// Fetches and maps full series metadata + artwork for `country_code`
     /// (three-letter ISO, for the content-rating pick). Port of
     /// `FetchSeriesMetadata`.
@@ -503,6 +560,21 @@ impl TvdbClient {
             .await?;
         let production_year = wire.aired.as_deref().and_then(year_of);
         Some(TvdbEpisodeDetails {
+            tvdb_id: episode_id,
+            imdb_id: wire
+                .remote_ids
+                .unwrap_or_default()
+                .into_iter()
+                .find(|id| {
+                    id.source_name
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("IMDB"))
+                })
+                .and_then(|id| id.id)
+                .map(|id| remote_id_to_string(&id)),
+            airs_before_episode: wire.airs_before_episode,
+            airs_after_season: wire.airs_after_season,
+            airs_before_season: wire.airs_before_season,
             name: wire.name,
             overview: wire.overview,
             aired: wire.aired,
@@ -726,12 +798,29 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
             .unwrap_or_default(),
         air_time: wire.airs_time.filter(|t| !t.is_empty()),
         slug: wire.slug,
+        collection_ids: official_collection_ids(wire.lists),
         imdb_id: find_remote("IMDB"),
-        tmdb_id: find_remote("TheMovieDB.com"),
+        tmdb_id: find_remote("TheMovieDB.com")
+            .map(|id| id.split('-').next().unwrap_or_default().to_owned()),
         zap2it_id: find_remote("Zap2It"),
         people: map_characters(wire.characters),
         images,
     }
+}
+
+/// TVDB's official list ids use the plugin's trailing-semicolon format.
+fn official_collection_ids(lists: Option<Vec<ListWire>>) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut ids = String::new();
+    for id in lists
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|list| list.is_official)
+        .filter_map(|list| list.id.filter(|id| *id > 0))
+    {
+        let _ = write!(ids, "{id};");
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// A `remoteIds` id is sometimes a JSON string, sometimes a number.
@@ -782,6 +871,35 @@ mod tests {
             }"#,
         )
         .expect("valid series fixture")
+    }
+
+    #[tokio::test]
+    async fn remote_ids_resolve_only_series_and_episode_fields_survive() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"test"}}"#.into()),
+            ("/search/remoteid/tt123", r#"{"data":[{"movie":{"id":1}},{"series":{"id":0}},{"series":{"id":42}}]}"#.into()),
+            ("/search/remoteid/99", r#"{"data":[]}"#.into()),
+            ("/episodes/8/extended", r#"{"data":{"name":"Special","airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,"remoteIds":[{"sourceName":"IMDB","id":"tt456"}]}}"#.into()),
+        ]).await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        assert_eq!(client.series_by_remote_id("tt123").await, Some(42));
+        assert_eq!(client.series_by_remote_id("99").await, None);
+        assert_eq!(client.series_by_remote_id("bad?query").await, None);
+        assert_eq!(client.series_by_remote_id(" ").await, None);
+        let ep = client.episode_details(8).await.unwrap();
+        assert_eq!(ep.tvdb_id, 8);
+        assert_eq!(ep.imdb_id.as_deref(), Some("tt456"));
+        assert_eq!(ep.airs_before_episode, Some(2));
+        assert_eq!(ep.airs_before_season, Some(1));
+        assert_eq!(ep.airs_after_season, Some(0));
+    }
+
+    #[test]
+    fn series_maps_official_lists_and_normalizes_tmdb_urls() {
+        let wire = serde_json::from_str(r#"{"lists":[{"id":1,"isOfficial":true},{"id":2,"isOfficial":false},{"id":3,"isOfficial":true}],"remoteIds":[{"sourceName":"TheMovieDB.com","id":"1399-game-of-thrones"}]}"#).unwrap();
+        let details = map_series(42, wire, "usa");
+        assert_eq!(details.collection_ids.as_deref(), Some("1;3;"));
+        assert_eq!(details.tmdb_id.as_deref(), Some("1399"));
     }
 
     #[test]

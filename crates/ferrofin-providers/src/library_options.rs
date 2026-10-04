@@ -10,7 +10,7 @@
 //! The registry reflects what is actually compiled into this build: the local
 //! Kodi/XBMC **Nfo** reader/saver and **Local Images** provider are always
 //! present; **The Open Movie Database** (OMDb) and **IntroSkipper** segments are
-//! always compiled (OMDb needs a key at runtime, which the checkbox gates);
+//! always compiled (shared API keys are supplied where required);
 //! **TheMovieDb** and **Open Subtitles** appear only when their crate features
 //! are enabled. Nothing here is a placeholder — a provider is listed iff its
 //! code is in the binary.
@@ -120,6 +120,19 @@ pub fn image_fetcher_rank(
         None => global.map_or(&[][..], |g| g.image_fetcher_order.as_slice()),
     };
     configured_order(order, name)
+}
+
+/// Default order for built-in artwork providers. Explicit library order is
+/// applied before this tie-breaker. Fanart leads movie and series artwork,
+/// and precedes AudioDB for music, with OMDb as the final poster fallback.
+#[must_use]
+pub fn default_image_order(name: &str) -> usize {
+    match name {
+        fetcher_names::TMDB | fetcher_names::AUDIODB => 1,
+        fetcher_names::TVDB => 50,
+        fetcher_names::OMDB => 90,
+        _ => 0,
+    }
 }
 
 /// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
@@ -465,8 +478,7 @@ fn metadata_providers() -> Vec<Provider> {
             images: Some(omdb_images),
         },
         Provider {
-            // Optional at runtime (needs an API key/config), like OMDb —
-            // the checkbox gates; absence of config just yields no hits.
+            // Uses a built-in project key; the library checkbox gates requests.
             name: fetcher_names::TVDB,
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Series", "Season", "Episode"],

@@ -20,12 +20,26 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemCountService, NameItemRow, PlayedAndTotal};
+use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow, PlayedAndTotal};
 
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{QueryShape, build_query};
+
+/// `BaseItem.DisplayExtraTypes`: Unknown, Clip, BehindTheScenes,
+/// DeletedScene, Interview, Scene, Sample, Featurette and Short. Trailer (2)
+/// has its own count; theme media (8/9) and NULL are excluded. The OwnerId
+/// index keeps the query scoped to the requested page, including parentless extras.
+fn extra_counts_sql(owner_count: usize) -> String {
+    format!(
+        r#"SELECT "OwnerId",
+            SUM(CASE WHEN "ExtraType" IN (0,1,3,4,5,6,7,10,11) THEN 1 ELSE 0 END),
+            SUM(CASE WHEN "ExtraType" = 2 THEN 1 ELSE 0 END)
+           FROM "BaseItems" WHERE "OwnerId" IN ({}) GROUP BY "OwnerId""#,
+        placeholders(owner_count)
+    )
+}
 
 /// The concrete item-count service.
 #[derive(Clone)]
@@ -250,6 +264,34 @@ impl FerrofinItemCountService {
 
 #[async_trait]
 impl ItemCountService for FerrofinItemCountService {
+    async fn get_extra_counts_batch(
+        &self,
+        owner_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
+        let mut counts = HashMap::new();
+        for chunk in owner_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = extra_counts_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (owner, special_features, local_trailers) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                if let Ok(owner) = Uuid::parse_str(&owner) {
+                    counts.insert(
+                        owner,
+                        ExtraCounts {
+                            special_features: i32::try_from(special_features).unwrap_or(i32::MAX),
+                            local_trailers: i32::try_from(local_trailers).unwrap_or(i32::MAX),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     async fn get_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
         // Same `AddUserToQuery` confinement the item queries get: a user who may
         // see one library must be counted over that library, not the server.
@@ -1117,6 +1159,47 @@ fn placeholders(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn extra_counts_batch_chunks_deduplicates_and_uses_owner_index() {
+        let db = crate::test_support::test_db().await;
+        let owner = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, owner, BaseItemKind::Movie, "Movie").await;
+        let extra = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, extra, BaseItemKind::Video, "Clip").await;
+        let mut row = crate::test_support::fetch_item(&db, extra).await;
+        row.owner_id = Some(guid_to_db(owner));
+        row.extra_type = Some(1);
+        crate::test_support::save_item(&db, &row).await;
+        let svc = FerrofinItemCountService::new(db.clone());
+        assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
+        let mut owners = vec![Uuid::new_v4(); ferrofin_db::BATCH_BIND_CHUNK + 1];
+        owners[0] = owner;
+        owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
+        let counts = svc.get_extra_counts_batch(&owners).await.unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(
+            counts[&owner],
+            ExtraCounts {
+                special_features: 1,
+                local_trailers: 0
+            }
+        );
+        let sql = format!("EXPLAIN QUERY PLAN {}", extra_counts_sql(1));
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(owner))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            plan.iter().any(|r| r
+                .3
+                .contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
+            "{plan:?}"
+        );
+        db.close().await;
+        assert!(svc.get_extra_counts_batch(&[owner]).await.is_err());
+    }
+
     use super::*;
     use crate::test_support::{
         fetch_item, seed_child_item, seed_item, seed_item_genre, seed_item_value,

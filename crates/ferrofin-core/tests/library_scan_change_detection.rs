@@ -2573,3 +2573,43 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
     .expect("season");
     assert_eq!(number, Some(1));
 }
+
+/// Jellyfin stores a local movie version as a generic Video with a different
+/// path-derived id. Scanning it as a new Movie duplicated it in the library.
+#[tokio::test(flavor = "multi_thread")]
+async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = scanned_once(tmp.path(), 0).await;
+    let primary = Fixture::id(&fx.matrix);
+    let path = fx
+        .matrix
+        .parent()
+        .unwrap()
+        .join("The Matrix (1999) - alternate.mkv");
+    std::fs::write(&path, b"0123456789").unwrap();
+    let mut alternate: BaseItemEntity = sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Id"=?"#)
+        .bind(&primary)
+        .fetch_one(fx.db.pool())
+        .await
+        .unwrap();
+    let id = derive_item_id(BaseItemKind::Video, &path.to_string_lossy()).unwrap();
+    alternate.id = guid_to_db(id);
+    alternate.path = Some(path.to_string_lossy().into_owned());
+    alternate.type_ = "MediaBrowser.Controller.Entities.Video".to_owned();
+    alternate.is_movie = false;
+    alternate.primary_version_id = Some(primary.clone());
+    let persistence = FerrofinItemPersistenceService::new(fx.db.clone());
+    persistence.save_items(&[alternate]).await.unwrap();
+    for _ in 0..2 {
+        fx.scan().await;
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as(r#"SELECT "Id", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#)
+                .bind(path.to_string_lossy().as_ref())
+                .fetch_all(fx.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(guid_to_db(id), Some(primary.clone()))]);
+    }
+}

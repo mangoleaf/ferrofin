@@ -7,9 +7,9 @@
 //! `jellyfin-apiclient` (and many third-party clients) still call them, and a
 //! `404` breaks those screens.
 //!
-//! Each alias must be *registered*: with the default rejecting auth fake every
-//! call returns `401` (route exists, guarded), never `404` (unregistered) or
-//! `405` (method not registered on the slot).
+//! Each alias must be registered: protected routes return `401` with rejecting
+//! auth. Public avatar reads use a nil user id and must return `400`, proving
+//! the handler ran rather than returning a route-level `404` or `405`.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -135,12 +135,21 @@ const LEGACY_ROUTES: &[(&str, &str)] = &[
 async fn legacy_user_scoped_aliases_are_registered() {
     let router = create_router(ferrofin_api::test_support::fake_state());
     for (method, path) in LEGACY_ROUTES {
+        let public_image = matches!(*method, "GET" | "HEAD") && path.contains("/Images/");
+        let uri = if public_image {
+            path.replace(
+                "11111111-1111-1111-1111-111111111111",
+                "00000000-0000-0000-0000-000000000000",
+            )
+        } else {
+            (*path).to_owned()
+        };
         let response = router
             .clone()
             .oneshot(
                 Request::builder()
                     .method(method.parse::<Method>().expect("method"))
-                    .uri(*path)
+                    .uri(uri)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -148,8 +157,12 @@ async fn legacy_user_scoped_aliases_are_registered() {
             .unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
-            "{method} {path} must be a registered, auth-guarded route (404 = unregistered, 405 = method missing)"
+            if public_image {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "{method} {path} must reach its registered handler or auth guard"
         );
     }
 }

@@ -24,7 +24,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::entities::ExtraType;
+use ferrofin_model::entities::{ExtraType, ImageType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::dto::DtoService;
@@ -303,6 +303,10 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            policy: Some(ferrofin_model::users::UserPolicy {
+                enable_content_deletion: true,
+                ..Default::default()
+            }),
             ..ferrofin_model::dto::UserDto::default()
         })
     }
@@ -352,6 +356,8 @@ const PHYSICAL_PATH: &str = "/media/movies-real";
 struct OkLibrary {
     item_id: Uuid,
     adopted_tree: bool,
+    /// The last query `query_items` received.
+    last_query: Arc<std::sync::Mutex<Option<InternalItemsQuery>>>,
 }
 
 #[async_trait]
@@ -364,7 +370,11 @@ impl LibraryManager for OkLibrary {
                 BaseItemKind::CollectionFolder,
             )));
         }
-        Ok((id == self.item_id).then(|| base_item_entity(self.item_id)))
+        Ok((id == self.item_id).then(|| {
+            let mut item = base_item_entity(self.item_id);
+            item.path = Some("/synthetic/movie.mkv".to_owned());
+            item
+        }))
     }
     async fn get_ancestors(
         &self,
@@ -409,8 +419,9 @@ impl LibraryManager for OkLibrary {
     }
     async fn query_items(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        *self.last_query.lock().unwrap() = Some(query.clone());
         Ok(QueryResult::new(
             Some(0),
             Some(1),
@@ -658,6 +669,7 @@ fn ok_state(item_id: Uuid) -> AppState {
     ok_state_with(OkLibrary {
         item_id,
         adopted_tree: false,
+        last_query: Arc::default(),
     })
 }
 
@@ -1103,6 +1115,7 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
     let library = || OkLibrary {
         item_id,
         adopted_tree: false,
+        last_query: Arc::default(),
     };
     let get = |state: AppState, uri: &'static str| async move {
         let response = create_router(state)
@@ -1215,6 +1228,88 @@ async fn get_items_with_filters_returns_query_result() {
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
 }
 
+/// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
+/// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
+/// This), through both the query- and the path-scoped route. Each id set
+/// must reach the repository query: a dropped one answers the Albums section
+/// with every album in the library. (The keys are camelCase here because the
+/// server's outer layer folds the client's PascalCase before routing.)
+#[tokio::test]
+async fn get_items_forwards_the_artist_id_filters() {
+    let (album_artist, featured, excluded) = (
+        Uuid::from_u128(0xA1),
+        Uuid::from_u128(0xA2),
+        Uuid::from_u128(0xA3),
+    );
+    let filters = format!(
+        "includeItemTypes=MusicAlbum&recursive=true&albumArtistIds={album_artist}\
+         &contributingArtistIds={featured},{excluded}&excludeArtistIds={excluded}"
+    );
+    for uri in [
+        format!("/Items?{filters}"),
+        format!("/Users/{USER_ID}/Items?{filters}"),
+    ] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let query = seen.lock().unwrap().take().expect("query_items ran");
+        assert_eq!(query.album_artist_ids, [album_artist], "{uri}");
+        assert_eq!(query.contributing_artist_ids, [featured, excluded], "{uri}");
+        assert_eq!(query.exclude_artist_ids, [excluded], "{uri}");
+        assert!(query.artist_ids.is_empty(), "{uri}");
+    }
+}
+
+/// Wholphin's genre grid asks each genre for one random item that has a
+/// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
+/// an item without a backdrop yields a null URL that crashes the whole grid
+/// (`ConcurrentHashMap.put(genreId, null)`). The image type set must reach the
+/// repository query; unknown tokens drop like the binder's.
+#[tokio::test]
+async fn get_items_forwards_the_image_types_filter() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5B),
+        adopted_tree: false,
+        last_query: Arc::default(),
+    };
+    let seen = Arc::clone(&library.last_query);
+    // Wholphin's request, verbatim apart from the ids.
+    let uri = format!(
+        "/Items?userId={USER_ID}&limit=1&recursive=true&parentId={}&fields=Genres\
+         &includeItemTypes=MusicAlbum&imageTypes=Backdrop,Nonsense&sortBy=Random\
+         &imageTypeLimit=1&genreIds={}&enableTotalRecordCount=false&enableImages=true",
+        Uuid::from_u128(0x5C).simple(),
+        Uuid::from_u128(0x5D).simple(),
+    );
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.image_types, [ImageType::Backdrop]);
+}
+
 /// A `GET /Items` with an unknown enum token is a `400`.
 #[tokio::test]
 async fn get_items_unknown_enum_token_is_dropped() {
@@ -1287,6 +1382,7 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
     let state = ok_state_with(OkLibrary {
         item_id,
         adopted_tree: true,
+        last_query: Arc::default(),
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1341,6 +1437,7 @@ async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
     let state = ok_state_with(OkLibrary {
         item_id: Uuid::from_u128(0x56),
         adopted_tree: true,
+        last_query: Arc::default(),
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1582,4 +1679,54 @@ async fn file_missing_item_is_404() {
     let missing = Uuid::from_u128(0x9999_9999_9999_9999_9999_9999_9999_9999);
     let (status, _) = send("GET", &format!("/Items/{missing}/File"), Body::empty()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn deletion_respects_library_grants_and_path_boundaries() {
+    use ferrofin_api::test_support::{FakeVirtualFolders, PolicyUsers};
+    use ferrofin_model::entities_media::VirtualFolderInfo;
+    use ferrofin_model::users::UserPolicy;
+    let library_id = Uuid::from_u128(0xAB50);
+    let item_id = Uuid::from_u128(0xAB51);
+    for (location, granted_id, expected) in [
+        ("/synthetic", library_id, StatusCode::NO_CONTENT),
+        ("/synth", library_id, StatusCode::UNAUTHORIZED),
+        (
+            "/synthetic",
+            Uuid::from_u128(0xAB52),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let state = ok_state_with_users(
+            OkLibrary {
+                item_id,
+                adopted_tree: false,
+                last_query: Arc::default(),
+            },
+            Arc::new(PolicyUsers(UserPolicy {
+                enable_content_deletion: false,
+                enable_content_deletion_from_folders: vec![granted_id.simple().to_string()],
+                ..Default::default()
+            })),
+        )
+        .with_virtual_folders(Arc::new(FakeVirtualFolders::seeded(vec![
+            VirtualFolderInfo {
+                item_id: Some(library_id.to_string()),
+                locations: vec![location.to_owned()],
+                ..Default::default()
+            },
+        ])));
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/Items/{item_id}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "library location: {location}");
+    }
 }

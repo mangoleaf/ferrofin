@@ -1,0 +1,52 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH FERROFIN-SERVER 1 "" Ferrofin "Ferrofin Manual"
+.SH NAME
+ferrofin\-server \- Ferrofin media server
+.SH SYNOPSIS
+\fBferrofin\-server\fR [\fB\-\-data\-dir\fR] [\fB\-\-bind\fR] [\fB\-\-port\fR] [\fB\-\-published\-url\fR] [\fB\-\-ffmpeg\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
+.SH DESCRIPTION
+Ferrofin is a Rust implementation of the Jellyfin media server. It speaks the same HTTP API, so existing Jellyfin web, mobile and TV clients connect to it unchanged.
+.PP
+Pointed at a data directory holding a Jellyfin database, it adopts it in place. Adoption is one\-way: Ferrofin copies the original to jellyfin.db.pre\-ferrofin, then migrates it, and the result may not open under Jellyfin again.
+.SH OPTIONS
+.TP
+\fB\-\-data\-dir\fR \fI<DIR>\fR
+Program\-data root directory (overrides `FERROFIN_DATA_DIR`)
+.TP
+\fB\-\-bind\fR \fI<ADDR>\fR
+Address to bind the HTTP listener to (overrides `FERROFIN_BIND_ADDR`)
+.TP
+\fB\-\-port\fR \fI<PORT>\fR
+HTTP port to listen on (overrides `FERROFIN_PORT`)
+.TP
+\fB\-\-published\-url\fR \fI<URL>\fR
+Publicly reachable base URL advertised to clients (overrides `FERROFIN_PUBLISHED_URL`)
+.TP
+\fB\-\-ffmpeg\fR \fI<PATH>\fR
+Explicit path to the `ffmpeg` executable (overrides `FERROFIN_FFMPEG_PATH`)
+.TP
+\fB\-\-config\fR \fI<FILE>\fR
+Path to an optional `config.toml` bootstrap file.
+
+When omitted, `{data_dir}/config.toml` is consulted if present.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH ENVIRONMENT
+Every setting has a \fBFERROFIN_*\fR environment variable. Flags override the environment, which overrides \fIconfig.toml\fR. The full list is in \fI/usr/share/doc/ferrofin/CONFIG.md\fR.
+.SH FILES
+.TP
+\fI/etc/ferrofin/config.toml\fR
+Configuration read by the packaged systemd unit. It may hold the bootstrap admin password, so it is root:ferrofin, mode 0640.
+.TP
+\fI/var/lib/ferrofin\fR
+Data directory of the packaged service: the database, cache, logs and plugins.
+.TP
+\fI/lib/systemd/system/ferrofin.service\fR
+The systemd unit. The package does not enable or start it.
+.SH "SEE ALSO"
+\fI/usr/share/doc/ferrofin/INSTALL.md\fR, \fI/usr/share/doc/ferrofin/UPGRADING.md\fR, https://github.com/mangoleaf/ferrofin

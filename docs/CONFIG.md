@@ -84,17 +84,21 @@ See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown p
 ## Remote metadata provider keys
 
 Every remote provider is compiled in and enabled per library through the fetcher
-checkboxes, as in Jellyfin. The keyed ones below additionally need their key: without one
-the provider returns empty results rather than failing the scan. Never send user PII to
-these services.
+checkboxes, as in Jellyfin. TMDB, OMDb, TVDB, fanart.tv and TheAudioDB ship with
+Jellyfin's shared keys. The settings below are optional overrides or additions.
 
 | Variable | Purpose |
 |---|---|
-| `FERROFIN_OMDB_KEY` | OMDb API key (Rotten Tomatoes ratings). |
-| `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | TheTVDB API key + subscriber PIN. |
-| `FERROFIN_FANART_KEY` | fanart.tv personal API key. |
+| `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. |
+| `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | Optional TheTVDB API key override and subscriber PIN. |
+| `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. |
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |
+
+TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
+Jellyfin's shared application key with the username/password configured in its
+plugin settings; its `ApiKey` field is an optional override. The shared key does
+not replace the account needed for subtitle downloads.
 
 ## WASM plugins (Tier 1b)
 

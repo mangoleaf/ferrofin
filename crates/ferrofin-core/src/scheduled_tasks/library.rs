@@ -46,12 +46,13 @@ use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::{KeyframeRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager};
 use ferrofin_traits::stubs::LyricManager;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleMediaType, SubtitleSearchRequest};
+#[cfg(test)]
+use ferrofin_traits::subtitles::{SubtitleManager, SubtitleSearchRequest};
 use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
-use crate::db_error::{db_err, media_stream_type_from_disc};
+use crate::db_error::db_err;
 
 use super::{ScheduledTask, TaskProgress};
 
@@ -1104,103 +1105,22 @@ impl ScheduledTask for PeopleValidationTask {
 pub struct SubtitleDownloadTask {
     library: Arc<dyn LibraryManager>,
     folders: Arc<dyn VirtualFolderManager>,
-    subtitles: Arc<dyn SubtitleManager>,
-    streams: Arc<dyn MediaStreamRepository>,
+    downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
 }
 
 impl SubtitleDownloadTask {
-    /// Builds the task over the library, subtitle-manager and stream seams.
+    /// Builds the task with the same downloader used by library scans.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         folders: Arc<dyn VirtualFolderManager>,
-        subtitles: Arc<dyn SubtitleManager>,
-        streams: Arc<dyn MediaStreamRepository>,
+        downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) -> Self {
         Self {
             library,
             folders,
-            subtitles,
-            streams,
+            downloader,
         }
-    }
-
-    /// Whether `item_id` still needs subtitles in `lang`, per the library
-    /// options flags.
-    async fn needs_language(
-        &self,
-        item_id: Uuid,
-        lang: &str,
-        options: &LibraryOptions,
-    ) -> Result<bool, ServiceError> {
-        let streams = self
-            .streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id,
-                stream_type: None,
-                index: None,
-            })
-            .await?;
-        let lang_matches =
-            |l: &Option<String>| l.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(lang));
-        for stream in &streams {
-            match media_stream_type_from_disc(stream.stream_type) {
-                MediaStreamType::Audio
-                    if options.skip_subtitles_if_audio_track_matches
-                        && lang_matches(&stream.language) =>
-                {
-                    return Ok(false);
-                }
-                // An external subtitle always satisfies the language; an
-                // embedded one only when the library says so.
-                MediaStreamType::Subtitle
-                    if lang_matches(&stream.language)
-                        && (options.skip_subtitles_if_embedded_subtitles_present
-                            || stream.is_external) =>
-                {
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-        Ok(true)
-    }
-
-    /// Searches and downloads the best subtitle for one video + language.
-    async fn download_for(
-        &self,
-        video: &BaseItemEntity,
-        item_id: Uuid,
-        lang: &str,
-        options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
-        let is_episode = video.season_id.is_some() || video.series_name.is_some();
-        let request = SubtitleSearchRequest {
-            item_id,
-            language: lang.to_owned(),
-            is_perfect_match: options.require_perfect_subtitle_match.then_some(true),
-            is_automated: true,
-            content_type: if is_episode {
-                SubtitleMediaType::Episode
-            } else {
-                SubtitleMediaType::Movie
-            },
-            name: video.name.clone(),
-            series_name: video.series_name.clone(),
-            production_year: video.production_year.and_then(|y| i32::try_from(y).ok()),
-            parent_index_number: video
-                .parent_index_number
-                .and_then(|n| i32::try_from(n).ok()),
-            index_number: video.index_number.and_then(|n| i32::try_from(n).ok()),
-            runtime_ticks: video.run_time_ticks,
-            media_path: video.path.clone(),
-            ..SubtitleSearchRequest::default()
-        };
-        let results = self.subtitles.search_subtitles(&request).await?;
-        let Some(first) = results.first().and_then(|r| r.id.clone()) else {
-            return Ok(());
-        };
-        self.subtitles.download_subtitles(item_id, &first).await
     }
 }
 
@@ -1252,31 +1172,15 @@ impl ScheduledTask for SubtitleDownloadTask {
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
-            let Ok(item_id) = Uuid::parse_str(&video.id) else {
-                continue;
-            };
             let Some(path) = video.path.as_deref() else {
                 continue;
             };
             let Some(options) = options_for_path(&folders, path) else {
                 continue;
             };
-            let Some(langs) = options.subtitle_download_languages.clone() else {
-                continue;
-            };
-            for lang in &langs {
-                match self.needs_language(item_id, lang, options).await {
-                    Ok(true) => {
-                        if let Err(e) = self.download_for(video, item_id, lang, options).await {
-                            tracing::warn!(item = %video.id, lang, error = %e, "subtitle download failed");
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(item = %video.id, error = %e, "subtitle check failed");
-                    }
-                }
-            }
+            self.downloader
+                .download_missing(video, options, &crate::ScanCancel::new())
+                .await;
         }
         progress.report(100.0);
         Ok(())
@@ -1844,6 +1748,7 @@ mod tests {
             self.searches.lock().expect("lock").push(request.clone());
             Ok(vec![RemoteSubtitleInfo {
                 id: Some("sub-1".to_owned()),
+                is_hash_match: Some(true),
                 ..RemoteSubtitleInfo::default()
             }])
         }
@@ -1860,13 +1765,20 @@ mod tests {
         }
         async fn upload_subtitle(
             &self,
-            _item_id: Uuid,
-            _response: &SubtitleResponse,
+            item_id: Uuid,
+            response: &SubtitleResponse,
         ) -> Result<(), ServiceError> {
-            unimplemented!("fake")
+            self.downloads.lock().expect("lock").push((
+                item_id,
+                String::from_utf8(response.content.clone()).unwrap(),
+            ));
+            Ok(())
         }
-        async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
-            unimplemented!("fake")
+        async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError> {
+            Ok(SubtitleResponse {
+                content: id.as_bytes().to_vec(),
+                ..Default::default()
+            })
         }
         async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
             unimplemented!("fake")
@@ -2235,8 +2147,10 @@ mod tests {
                 None,
                 &media.path().to_string_lossy(),
             )),
-            subtitles.clone(),
-            Arc::new(streams),
+            Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
+                &(subtitles.clone() as Arc<dyn SubtitleManager>),
+                Arc::new(streams),
+            )),
         );
         assert_eq!(task.key(), "DownloadSubtitles");
         task.execute(&TaskProgress::default()).await.expect("run");

@@ -34,3 +34,21 @@ examples/*/target/
 # can never commit private snapshot data (real usernames + watch history).
 suite/
 suite.*/
+
+# Private Jellyfin adoption fixtures and generated reports.
+**/jellyfin-10.*/
+**/jellyfin-12.*/
+**/media-mounts.sh
+**/smoke-jellyfin-*.txt
+adoption/oracle/
+adoption/work/
+adoption/fixtures/
+**/*.metadata.json
+**/*.metadata-after-*.log
+**/*.watch-history.json
+**/*.watch-history-after-*.log
+**/*.boot.log
+**/*.boot2.log
+**/*.server.log
+**/*.smoke.txt
+**/*.smoke2.txt

@@ -10,6 +10,8 @@ description = "Service/manager traits for Ferrofin (the DI seam; port of MediaBr
 workspace = true
 
 [dependencies]
+# Live task lifecycle snapshots for WebSocket subscribers.
+tokio = { workspace = true, features = ["sync"] }
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true

@@ -48,5 +48,18 @@
     "TaskDownloadMissingLyricsDescription": "Niðurtekur sangtekstir",
     "Movies": "Filmar",
     "MixedContent": "Blandað innihald",
-    "Music": "Tónleikur"
+    "Music": "Tónleikur",
+    "NameExtraShort": "Stuttfilmur",
+    "NameExtraThemeSong": "Eyðkennislag",
+    "NameExtraTrailer": "Brellbiti",
+    "NameExtraInterview": "Samrøða",
+    "NameExtraBehindTheScenes": "Aftanfyri leiktjøldini",
+    "NameExtraClip": "Klipp",
+    "NameExtraNumbered": "{0} {1}",
+    "NameExtraFeaturette": "Stuttur heimildarfilmur",
+    "NameExtraSample": "Sýnislutur",
+    "NameExtraThemeVideo": "Eyðkenniskykmynd",
+    "NameExtraDeletedScene": "Úrtikin mynd",
+    "NameExtraScene": "Mynd",
+    "NameExtraUnknown": "Eykatilfar"
 }

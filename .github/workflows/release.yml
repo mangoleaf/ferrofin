@@ -153,10 +153,17 @@ jobs:
           img="ghcr.io/$GITHUB_REPOSITORY"
           echo "previous release: $prev"
           docker volume create upg >/dev/null
-          docker run -d --rm --name old -v upg:/data "$img:$prev"
+          # Probe from the runner: release images do not include curl.
+          docker run -d --rm --name old -v upg:/data -p 127.0.0.1:8096:8096 "$img:$prev"
+          ok=
           for _ in $(seq 1 60); do
-            docker exec old curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1 && break; sleep 1
+            if curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1; then ok=1; break; fi
+            docker ps -q --filter name=old | grep -q . || break
+            sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "the $prev image did not become healthy"; docker logs old 2>&1 | tail -20; exit 1
+          fi
           docker rm -f old
           docker run -d --rm --name new -v upg:/data -p 8096:8096 "$img:$GITHUB_REF_NAME"
           ok=
@@ -194,40 +201,62 @@ jobs:
       # same override the Docker build uses), so a tarball reports the tag.
       FERROFIN_GIT_DESCRIBE: ${{ github.ref_name }}
       CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # = the .deb's `libc6 (>= …)` in apps/ferrofin-server/Cargo.toml. Linking
+      # against the runner's glibc instead silently raised the real floor to 2.38
+      # (v1.3.1), so bookworm/jammy installed a binary that could not start.
+      GLIBC_FLOOR: "2.34"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+          fetch-depth: 0 # the .deb's changelog is rendered from history + tags
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        # A master commit, deliberately without a ref comment: dtolnay rebuilds
+        # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
+        # master and v1, so any ref named here goes stale. The input picks Rust.
         with:
+          toolchain: 1.98.1 # = rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
           lookup-only: true # release builds never write the cache (poisoning surface)
-      # aarch64 Linux is cross-compiled with zig as the C toolchain (bundled
-      # SQLite and ring both need a C compiler for the target).
-      - if: matrix.cross
+      # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
+      # aarch64 cross-build also needs it for bundled SQLite and ring).
+      - if: contains(matrix.target, 'linux')
         run: |
           pip install cargo-zigbuild
-          cargo zigbuild --release -p ferrofin-server --target ${{ matrix.target }}
-      - if: ${{ !matrix.cross }}
+          cargo zigbuild --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
+      - if: ${{ !contains(matrix.target, 'linux') }}
         run: cargo build --release -p ferrofin-server --target ${{ matrix.target }}
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
-      # image bundles); metadata lives in apps/ferrofin-server/Cargo.toml.
-      # --no-build reuses the binary built above (zigbuild's, for aarch64);
-      # --no-strip because the runner has no aarch64 strip and the tarball ships
-      # the same binary (CARGO_PROFILE_RELEASE_DEBUG=0 keeps it small).
+      # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package
         if: contains(matrix.target, 'linux')
         shell: bash
         run: |
           set -eu
-          cargo install cargo-deb --version 3.8.0 --locked
+          cargo install cargo-nfpm --version 0.1.3 --locked
+          pip install git-cliff==2.14.2
           mkdir -p dist
-          cargo deb --no-build --no-strip -p ferrofin-server --target ${{ matrix.target }} \
-            --deb-version "${GITHUB_REF_NAME#v}" -o dist/
+          export FERROFIN_VERSION="${GITHUB_REF_NAME#v}"
+          contrib/debian/gen-docs.sh
+          cargo nfpm package \
+            --no-build -p ferrofin-server --target ${{ matrix.target }} -f deb -o dist/
           ls -l dist
+          # The binary must run on every glibc the package admits.
+          need=$(readelf -V --wide "target/${{ matrix.target }}/release/ferrofin-server" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+          [ "$(printf '%s\n' "GLIBC_$GLIBC_FLOOR" "$need" | sort -V | tail -1)" = "GLIBC_$GLIBC_FLOOR" ] \
+            || { echo "binary needs $need, package declares libc6 (>= $GLIBC_FLOOR)"; exit 1; }
+          # Version and file name are the tag minus its v, no epoch, no -1
+          # revision (issue #36); an rc's "-" becomes "~" so it sorts first.
+          deb=$(ls dist/ferrofin_*.deb)
+          version=$(sed 's/-/~/' <<< "${GITHUB_REF_NAME#v}")
+          [ "$deb" = "dist/ferrofin_${version}_$(dpkg-deb -f "$deb" Architecture).deb" ] \
+            && [ "$(dpkg-deb -f "$deb" Version)" = "$version" ] \
+            || { echo "expected version $version, got $deb ($(dpkg-deb -f "$deb" Version))"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q ' \./usr/share/doc/ferrofin/copyright$' \
+            || { echo "$deb ships no copyright file"; exit 1; }
       # Install it the way a user will: Jellyfin's apt repository first, then
       # the package, which must pull jellyfin-ffmpeg8 + jellyfin-web, create the
       # service user, and boot against jellyfin-ffmpeg (libfdk_aac present).

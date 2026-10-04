@@ -210,6 +210,11 @@ struct ItemsQuery {
     /// Comma-delimited [`ItemFilter`](ferrofin_model::querying::ItemFilter) flags.
     #[serde(default)]
     filters: Option<String>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s an
+    /// item must have — Wholphin's genre grid asks for one `Backdrop` item per
+    /// genre and crashes on an item without one.
+    #[serde(default)]
+    image_types: Option<String>,
     /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate
     /// on each returned DTO (e.g. `Path`, `Genres`). Absent/empty ⇒ the base DTO.
     #[serde(default)]
@@ -244,6 +249,17 @@ struct ItemsQuery {
     /// Comma-delimited artist ids.
     #[serde(default)]
     artist_ids: Option<String>,
+    /// Comma-delimited artist ids to exclude.
+    #[serde(default)]
+    exclude_artist_ids: Option<String>,
+    /// Comma-delimited album artist ids — jellyfin-web's artist page sends
+    /// this for its Albums section.
+    #[serde(default)]
+    album_artist_ids: Option<String>,
+    /// Comma-delimited contributing artist ids — the artist page's
+    /// "Appears On" section.
+    #[serde(default)]
+    contributing_artist_ids: Option<String>,
     /// Comma-delimited album ids.
     #[serde(default)]
     album_ids: Option<String>,
@@ -400,6 +416,7 @@ async fn get_items(
         include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
         exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
         media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        image_types: parse_csv_enums_lenient(query.image_types.as_deref()),
         order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         item_ids: parse_csv_uuids(query.ids.as_deref())?,
         exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
@@ -411,6 +428,9 @@ async fn get_items(
         studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
         person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
         artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
+        exclude_artist_ids: parse_csv_uuids(query.exclude_artist_ids.as_deref())?,
+        album_artist_ids: parse_csv_uuids(query.album_artist_ids.as_deref())?,
+        contributing_artist_ids: parse_csv_uuids(query.contributing_artist_ids.as_deref())?,
         album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
         is_favorite: query.is_favorite,
         is_played: query.is_played,
@@ -553,6 +573,80 @@ async fn get_item(
     Ok(Json(dto))
 }
 
+/// The per-item half of Jellyfin's `CanDelete(user)` authorization.
+/// Collection management and playlist ownership have their own permissions;
+/// ordinary media allows either global deletion or a containing library grant.
+async fn require_delete_permission(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    item: &BaseItemEntity,
+) -> Result<(), ApiError> {
+    if auth.is_api_key {
+        return Ok(());
+    }
+    let denied = || ApiError::Unauthorized("Unauthorized access".to_owned());
+    let user = auth.user.as_ref().ok_or_else(denied)?;
+    let policy = super::users::user_policy(state, user)
+        .await?
+        .ok_or_else(denied)?;
+    let allowed = match item.type_.rsplit('.').next().unwrap_or_default() {
+        "Playlist" => {
+            policy.is_administrator
+                || state
+                    .playlists
+                    .get_playlist_access(
+                        Uuid::parse_str(&item.id).map_err(|_| denied())?,
+                        auth.user_id(),
+                    )
+                    .await?
+                    .level
+                    == ferrofin_traits::collections::PlaylistAccessLevel::Owner
+        }
+        "BoxSet" => policy.is_administrator || policy.enable_collection_management,
+        _ => {
+            if policy.enable_content_deletion {
+                return Ok(());
+            }
+            let grants: Vec<Uuid> = policy
+                .enable_content_deletion_from_folders
+                .iter()
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            if grants.is_empty() {
+                return Err(denied());
+            }
+            if let Some(channel) = item
+                .channel_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+            {
+                grants.contains(&channel)
+            } else {
+                state
+                    .virtual_folders
+                    .get_virtual_folders()
+                    .await?
+                    .iter()
+                    .any(|folder| {
+                        folder
+                            .item_id
+                            .as_deref()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .is_some_and(|id| grants.contains(&id))
+                            && item.path.as_deref().is_some_and(|path| {
+                                folder
+                                    .locations
+                                    .iter()
+                                    .any(|root| super::path_is_under(path, root))
+                            })
+                    })
+            }
+        }
+    };
+    if allowed { Ok(()) } else { Err(denied()) }
+}
+
 /// `DELETE /Items/{itemId}` — deletes one item from the library.
 ///
 /// Port of `LibraryController.DeleteItem`. A missing item is a `404`; on success
@@ -571,16 +665,17 @@ async fn get_item(
 )]
 async fn delete_item(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     // Confirm the item exists first so a bogus id is a `404` (C# `GetItemById`
     // null-check) rather than a silently-idempotent `204`.
-    state
+    let item = state
         .library
         .get_item_by_id(item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    require_delete_permission(&state, &auth, &item).await?;
     state
         .library
         .delete_item(item_id, &DeleteOptions::default())
@@ -612,16 +707,17 @@ struct DeleteItemsQuery {
 )]
 async fn delete_items(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<DeleteItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;
     for id in ids {
-        state
+        let item = state
             .library
             .get_item_by_id(id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
+        require_delete_permission(&state, &auth, &item).await?;
         state
             .library
             .delete_item(id, &DeleteOptions::default())
@@ -1280,6 +1376,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// Both stored spellings of the playlists plugin folder are a direct-children
@@ -1301,6 +1399,123 @@ mod tests {
         for short in ["CollectionFolder", "Folder", "UserRootFolder", "Series"] {
             assert!(!is_direct_children_browse(short), "{short}");
         }
+    }
+
+    /// The query keys [`ItemsQuery`] binds: the field list serde hands
+    /// `deserialize_struct`, captured by a deserializer that reads nothing.
+    fn items_query_keys() -> &'static [&'static str] {
+        struct Keys<'a>(&'a mut &'static [&'static str]);
+        impl<'de> serde::Deserializer<'de> for Keys<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                *self.0 = fields;
+                Err(serde::de::Error::custom("keys captured"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+                enum identifier ignored_any
+            }
+        }
+        let mut keys: &'static [&'static str] = &[];
+        let _ = <ItemsQuery as serde::Deserialize>::deserialize(Keys(&mut keys));
+        keys
+    }
+
+    /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
+    /// does not bind yet. Each is an open port from `ItemsController.GetItems`
+    /// — bind it, honour it, and delete it here; the guard below fails on a
+    /// stale entry, so this list can only shrink.
+    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
+        "adjacentTo",
+        "albums",
+        "artists",
+        // 12.1.0 only.
+        "audioLanguages",
+        "collapseBoxSetItems",
+        "hasImdbId",
+        "hasOfficialRating",
+        "hasOverview",
+        "hasParentalRating",
+        "hasTmdbId",
+        "hasTvdbId",
+        "isKids",
+        "isMissing",
+        "isNews",
+        "isPlaceHolder",
+        "isSports",
+        "isUnaired",
+        "maxHeight",
+        "maxOfficialRating",
+        "maxPremiereDate",
+        "maxWidth",
+        "minDateLastSaved",
+        "minDateLastSavedForUser",
+        "minHeight",
+        "minOfficialRating",
+        "minPremiereDate",
+        "minWidth",
+        "personTypes",
+        "seriesStatus",
+        "studios",
+        // 12.1.0 only.
+        "subtitleLanguages",
+    ];
+
+    /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
+    /// route gate's pin, and 12.1.0, the latest Jellyfin, which adds
+    /// `audioLanguages` and `subtitleLanguages` — is bound by [`ItemsQuery`] or
+    /// listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
+    /// without a word, so a missing field is a filter the client asked for and
+    /// never got: `albumArtistIds` was one, and every artist page listed every
+    /// album in the library.
+    #[test]
+    fn items_query_binds_every_contract_parameter() {
+        let mut contract = BTreeSet::new();
+        for (version, raw) in [
+            (
+                "10.11.8",
+                include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
+            ),
+            (
+                "12.1.0",
+                include_str!("../../../../contracts/jellyfin-openapi-12.1.0.json"),
+            ),
+        ] {
+            let spec: serde_json::Value = serde_json::from_str(raw).expect("contract parses");
+            let parameters = spec["paths"]["/Items"]["get"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{version}: GET /Items lists its parameters"));
+            contract.extend(
+                parameters
+                    .iter()
+                    .filter_map(|p| p["name"].as_str().map(str::to_owned)),
+            );
+        }
+        let keys = items_query_keys();
+        assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
+        let unbound: BTreeSet<&str> = contract
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !keys.contains(name))
+            .collect();
+        let listed: BTreeSet<&str> = UNBOUND_ITEMS_PARAMETERS.iter().copied().collect();
+        assert_eq!(
+            unbound, listed,
+            "left: the contract parameters ItemsQuery drops; right: the open-port list. \
+             A newly dropped parameter must be bound, not listed; a bound one must leave the list"
+        );
     }
 
     /// `[FromQuery] bool? isLocked` → `IsLocked = isLocked`

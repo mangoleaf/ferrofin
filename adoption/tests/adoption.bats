@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Tests for the adoption harness (adoption/lib.sh, run.sh, smoke.sh, build-fixtures.sh).
-# Nothing here needs docker, a Jellyfin database or the network: the checks in lib.sh are
-# driven with canned logs and smoke outputs, and the SQLite checks with throwaway files.
+# Nothing here needs docker, a Jellyfin database or external services: tests use canned
+# logs and smoke outputs, throwaway SQLite files and a local HTTP server.
 
 setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
@@ -10,18 +10,18 @@ setup() {
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"
   cd "$TMP" || exit 1
-  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER
+  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT
 }
 
 # A smoke output in the real format: "status  metric  path".
 smoke() { # smoke <file> <episode-count> [playlists-view-listed]
   cat > "$1" <<EOS
 200  12.1.0 Jellyfin Server                        /System/Info/Public
-200  mango admin=true                              /Users/Me
-200  Movies,${3:+Playlists,}TV                     /Users/9eccc7ec621f47cfadcb3cd4a0c29227/Views
-200  $2                                            /Items?UserId=9eccc7ec621f47cfadcb3cd4a0c29227&Recursive=true&IncludeItemTypes=Episode&Limit=0
+200  synthetic-admin admin=true                              /Users/Me
+200  Movies,${3:+Playlists,}TV                     /Users/dddddddddddddddddddddddddddddddd/Views
+200  $2                                            /Items?UserId=dddddddddddddddddddddddddddddddd&Recursive=true&IncludeItemTypes=Episode&Limit=0
 200  26 running=                                   /ScheduledTasks
-200  (bytes=$RANDOM)                               /Items/acdfe2d0ff1b6e2d9d25b396c3665a05/Images/Primary?maxWidth=200
+200  (bytes=$RANDOM)                               /Items/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Images/Primary?maxWidth=200
 EOS
 }
 
@@ -37,7 +37,7 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 # --- normalise ---------------------------------------------------------------
 
 @test "normalise: redacts ids, drops image byte counts and ignored paths" {
-  smoke a.txt 6451; smoke b.txt 6451
+  smoke a.txt 120; smoke b.txt 120
   run diff <(adoption_normalise a.txt) <(adoption_normalise b.txt)
   [ "$status" -eq 0 ]
   run adoption_normalise a.txt
@@ -48,7 +48,7 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 }
 
 @test "normalise: a real difference survives" {
-  smoke a.txt 6451; smoke b.txt 6307
+  smoke a.txt 120; smoke b.txt 119
   run diff <(adoption_normalise a.txt) <(adoption_normalise b.txt)
   [ "$status" -eq 1 ]
 }
@@ -79,7 +79,7 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 # --- smoke comparison ----------------------------------------------------------
 
 @test "compare_smoke: identical answers pass, a count that moved fails and points at the diff" {
-  smoke oracle.txt 6451 yes; smoke same.txt 6451 yes; smoke fewer.txt 6307 yes
+  smoke oracle.txt 120 yes; smoke same.txt 120 yes; smoke fewer.txt 119 yes
   run adoption_compare_smoke oracle.txt same.txt
   [ -z "$output" ]
   run adoption_compare_smoke oracle.txt fewer.txt
@@ -87,7 +87,7 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 }
 
 @test "compare_smoke: a view that is listed by one server and not the other fails" {
-  smoke oracle.txt 6451; smoke views.txt 6451 yes
+  smoke oracle.txt 120; smoke views.txt 120 yes
   run adoption_compare_smoke oracle.txt views.txt
   [ -n "$output" ]
 }
@@ -128,7 +128,7 @@ EOS
   run adoption_second_boot_repairs second.log
   [ "$status" -eq 0 ]
   [ -z "$output" ]
-  echo '{"fields":{"message":"imported playlist/collection/version membership from Data JSON","rows":2850}}' >> second.log
+  echo '{"fields":{"message":"imported playlist/collection/version membership from Data JSON","rows":12}}' >> second.log
   run adoption_second_boot_repairs second.log
   [ "$status" -eq 0 ]
   [[ "$output" == *"imported playlist/collection/version membership"* ]]
@@ -176,9 +176,9 @@ seed_users_db() {
 CREATE TABLE Users (Id TEXT PRIMARY KEY, Username TEXT);
 CREATE TABLE Permissions (UserId TEXT, Kind INTEGER, Value INTEGER);
 CREATE TABLE Devices (UserId TEXT, AccessToken TEXT, DeviceId TEXT, AppName TEXT, DateLastActivity TEXT);
-INSERT INTO Users VALUES ('AAAA-1', 'mango'), ('BBBB-2', 'shared');
+INSERT INTO Users VALUES ('AAAA-1', 'synthetic-admin'), ('BBBB-2', 'shared');
 INSERT INTO Permissions VALUES ('AAAA-1', 0, 1), ('BBBB-2', 0, 0);
-INSERT INTO Devices VALUES ('AAAA-1', 'tok-mango', 'dev-mango', 'Jellyfin Web', '2026-01-01');
+INSERT INTO Devices VALUES ('AAAA-1', 'tok-synthetic-admin', 'dev-synthetic-admin', 'Jellyfin Web', '2026-01-01');
 INSERT INTO Devices VALUES ('AAAA-1', 'tok-old',   'dev-old',   'Jellyfin Web', '2025-01-01');
 INSERT INTO Devices VALUES ('BBBB-2', 'tok-shared','dev-shared','Jellyfin Web', '2026-09-01');
 INSERT INTO Devices VALUES ('BBBB-2', 'tok-tv',    'dev-tv',    'Wholphin',     '2026-09-15');
@@ -189,7 +189,7 @@ EOS
   seed_users_db
   run adoption_smoke_credentials users.db
   [ "$status" -eq 0 ]
-  [ "$output" = "mango tok-mango dev-mango aaaa1" ]
+  [ "$output" = "synthetic-admin tok-synthetic-admin dev-synthetic-admin aaaa1" ]
 }
 
 @test "smoke_credentials: a named user is honoured even when not an administrator" {
@@ -230,7 +230,7 @@ EOS
 }
 
 @test "run.sh: a missing fixture is skipped, named, and does not fail the run" {
-  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 6451
+  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 1 ]
@@ -258,4 +258,35 @@ EOS
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 2 ]
   [[ "$output" == *"has 3 EF migration ids, a 10.11.8 database has 68"* ]]
+}
+
+@test "metadata: populated fields survive adoption, HTTP presentation and a completed scan" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_metadata.py
+  [ "$status" -eq 0 ]
+}
+
+@test "watch history: watched flags and video progress survive in database and API" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_watch_history.py
+  [ "$status" -eq 0 ]
+}
+
+@test "run.sh: an unreadable metadata baseline fails before starting a container" {
+  fake_docker
+  mkdir -p fixtures/oracle fixtures/jellyfin-12.0/data
+  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  printf 'not a database\n' > fixtures/jellyfin-12.0/data/jellyfin.db
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"metadata baseline: metadata check could not read"* ]]
+  [[ "$output" != *"unexpected docker run"* ]]
+}
+
+@test "synthetic adoption checks detect missing scenarios, changed membership and redundant writes" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_preservation.py
+  [ "$status" -eq 0 ]
+}
+
+@test "user accounts: avatars, login states and complete settings survive adoption" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_user_accounts.py
+  [ "$status" -eq 0 ]
 }

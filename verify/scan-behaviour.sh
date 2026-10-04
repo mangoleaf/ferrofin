@@ -221,14 +221,13 @@ fi
 # a series, its season and its episodes — the gate is per kind): "on" when any of them has a
 # fetcher ticked, and a row that runs the providers must see requests; "off" when every one of
 # them saved an empty choice, and every row must see none; "unknown" otherwise, and neither is
-# checked — a kind with no saved choice follows the server-wide one, and OMDb alone depends on
-# a key the script cannot see (without one it asks nothing).
+# checked — a kind with no saved choice follows the server-wide one. OMDb uses
+# a shared key by default, so its checkbox is sufficient too.
 case $KIND in movies) KINDS='["Movie"]' ;; *) KINDS='["Series","Season","Episode"]' ;; esac
 REMOTE=$(jq -r --argjson kinds "$KINDS" '
   [ $kinds[] as $k | [.LibraryOptions.TypeOptions[]? | select(.Type == $k)][0]
     | if . == null then "unsaved"
-      elif ([.MetadataFetchers[] | select(. != "The Open Movie Database")] | length) > 0 then "on"
-      elif (.MetadataFetchers | length) > 0 then "omdb"
+      elif (.MetadataFetchers | length) > 0 then "on"
       else "off" end ]
   | if any(. == "on") then "on" elif all(. == "off") then "off" else "unknown" end' <<<"$library")
 MONITOR_DELAY=$(api GET /System/Configuration | jq -r '.LibraryMonitorDelay // 0') || MONITOR_DELAY=0

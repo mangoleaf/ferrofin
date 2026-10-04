@@ -388,13 +388,17 @@ async fn fetch_image_files(
     images: Vec<RemoteImage>,
     replace: bool,
 ) -> Vec<ItemImageInfo> {
-    let mut infos = Vec::new();
+    let mut infos: Vec<ItemImageInfo> = Vec::new();
+    let mut satisfied = std::collections::HashSet::new();
     // The stems this pass has written. Several types share one stem (every
     // type `image_type_file_stem` does not name lands on `primary`), and a
     // replace must not overwrite the file an earlier type of this same pass
     // just wrote — the poster would end up holding the disc art.
     let mut written: Vec<&str> = Vec::new();
     for image in images {
+        if satisfied.contains(&image.image_type) {
+            continue;
+        }
         let stem = image_type_file_stem(image.image_type);
         // Reuse any on-disk file of this stem regardless of extension — it is
         // either this download from an earlier scan or a user upload (which
@@ -407,7 +411,9 @@ async fn fetch_image_files(
                 let dest = item_dir.join(format!("{stem}.jpg"));
                 let Some(bytes) = tmdb.download(&image.url).await else {
                     // A failed replacement keeps the image the item had.
-                    if let Some(existing) = existing {
+                    if let Some(existing) = existing
+                        && !infos.iter().any(|i| i.image_type == image.image_type)
+                    {
                         infos.push(ItemImageInfo {
                             date_modified: file_date_modified(&existing),
                             path: existing.to_string_lossy().into_owned(),
@@ -436,6 +442,8 @@ async fn fetch_image_files(
                 dest
             }
         };
+        satisfied.insert(image.image_type);
+        infos.retain(|i| i.image_type != image.image_type);
         infos.push(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type: image.image_type,
@@ -560,6 +568,14 @@ impl<'a> FetcherPolicy<'a> {
             self.global_for(kind),
             kind,
             name,
+        )
+    }
+
+    /// Configured image preference followed by the built-in provider order.
+    fn image_order(self, kind: &str, name: &str) -> (usize, usize) {
+        (
+            self.image_rank(kind, name),
+            ferrofin_providers::library_options::default_image_order(name),
         )
     }
 
@@ -1189,7 +1205,10 @@ impl ScanCancel {
 
     /// Runs `work` unless the scan is asked to stop first; `None` when it
     /// was (and `work` is dropped where it stood).
-    async fn unless_cancelled<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+    pub(crate) async fn unless_cancelled<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
         tokio::select! {
             biased;
             () = self.cancelled() => None,
@@ -1404,6 +1423,8 @@ pub struct ScanRun<'a> {
     pub cancel: &'a ScanCancel,
     /// Where the scan reports its progress, if anywhere.
     pub progress: Option<&'a ScanProgress>,
+    /// The library indicator counters owned by this scan.
+    tracking: Option<&'a crate::scan_progress::ScanProgressRun>,
     /// Which closing passes it runs.
     pub passes: ScanPasses,
     /// The item refreshes it serves while it runs, if any.
@@ -1439,6 +1460,7 @@ impl<'a> ScanRun<'a> {
             ancestors,
             cancel,
             progress: None,
+            tracking: None,
             passes: ScanPasses::Library,
             lane: None,
             touched: None,
@@ -2096,6 +2118,12 @@ struct PlanCtx<'a> {
     scope: PlanScope<'a>,
     /// The directories that failed to list this pass.
     unlisted: std::cell::RefCell<Vec<String>>,
+    /// Paths confirmed excluded by successfully listed discovery entries.
+    excluded: std::cell::RefCell<Vec<String>>,
+    /// Resolved movie owners, including files outside a scoped refresh.
+    owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Raw direct file counts before discovery ignores, for extras folder context.
+    direct_file_counts: std::cell::RefCell<HashMap<String, usize>>,
     /// The library locations of the pass (without a trailing slash).
     locations: std::collections::HashSet<String>,
     /// The locations that listed empty or failed to list this pass.
@@ -2111,6 +2139,9 @@ impl<'a> PlanCtx<'a> {
             naming,
             scope,
             unlisted: std::cell::RefCell::new(Vec::new()),
+            excluded: std::cell::RefCell::new(Vec::new()),
+            owner_paths: std::cell::RefCell::new(HashMap::new()),
+            direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -2160,6 +2191,10 @@ fn trimmed_dir(dir: &str) -> &str {
 struct PlanOutput {
     /// The planned items, in plan order.
     items: Vec<Planned>,
+    /// Successfully observed paths the discovery rules exclude.
+    excluded: Vec<String>,
+    /// Paths needed to reuse adopted alternate-version owner identities.
+    owner_paths: HashMap<Uuid, String>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
     /// is unknown, so nothing at or under them is removed this scan.
@@ -2477,52 +2512,15 @@ impl<'a> Stored<'a> {
     }
 }
 
-/// Per-library done/total counters driving the `RefreshProgress` pushes.
-struct LibraryProgress {
-    /// Planned items per collection folder.
-    totals: HashMap<Uuid, usize>,
-    /// Items processed so far per collection folder.
-    done: HashMap<Uuid, usize>,
-}
-
-impl LibraryProgress {
-    /// Tallies each library's planned item count. An item's library is the
-    /// first entry of its ancestor closure (always the collection folder).
-    fn new(planned: &[Planned]) -> Self {
-        let mut totals: HashMap<Uuid, usize> = HashMap::new();
-        for item in planned {
-            if let Some(&cf) = item.ancestors.first() {
-                *totals.entry(cf).or_default() += 1;
-            }
-        }
-        Self {
-            totals,
-            done: HashMap::new(),
-        }
-    }
-
-    /// Counts `item` as processed. Returns the library id and its completion
-    /// percentage when a progress push is due — at every `cadence` items
-    /// within the library (`0` disables the cadence) and at the library's
-    /// completion — or `None` between pushes.
-    fn advance(&mut self, item: &Planned, cadence: usize) -> Option<(Uuid, f64)> {
-        let cf = *item.ancestors.first()?;
-        let done = self.done.entry(cf).or_default();
-        *done += 1;
-        let total = self.totals.get(&cf).copied().unwrap_or(0).max(1);
-        let complete = *done >= total;
-        let at_cadence = cadence > 0 && done.is_multiple_of(cadence);
-        #[allow(clippy::cast_precision_loss)]
-        (complete || at_cadence).then(|| (cf, (*done as f64 / total as f64) * 100.0))
-    }
-}
-
 /// How many descendant images feed a library tile collage — upstream
 /// `CollectionFolderImageProvider.GetItemsWithImages` samples 8.
 const LIBRARY_COLLAGE_SOURCES: i32 = 8;
 
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
+    /// Live library counts, shared with dashboard readers.
+    scan_progress: crate::scan_progress::ScanProgressTracker,
+    subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
     file_system: Arc<dyn FileSystem>,
     persistence: Arc<dyn ItemPersistenceService>,
@@ -2548,7 +2546,7 @@ pub struct LibraryScanner {
     /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
     tmdb: Option<Arc<TmdbClient>>,
     /// Optional OMDb client for the Rotten Tomatoes critic rating (keyed by the
-    /// title's IMDb id from TMDB). Disabled when no OMDb API key is configured.
+    /// title's IMDb id from TMDB). Uses a shared API key by default.
     omdb: Option<Arc<ferrofin_providers::OmdbClient>>,
     /// Optional TheTVDB client — the TV authority. When present, series/episode
     /// metadata + artwork come from TVDB (falling back to TMDB when TVDB has no
@@ -2558,7 +2556,7 @@ pub struct LibraryScanner {
     /// per item AFTER the built-in chain; supplement-only (they fill gaps,
     /// never overwrite).
     dynamic_providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
-    /// Optional fanart.tv client — appends high-quality artwork for movies (by
+    /// Optional fanart.tv client — supplies high-quality artwork for movies (by
     /// Tmdb/Imdb id) and series (by Tvdb id) on top of the primary provider's
     /// images. Keys off the ids persisted during this scan.
     fanart: Option<Arc<ferrofin_providers::FanartClient>>,
@@ -2615,7 +2613,7 @@ pub struct LibraryScanner {
     progress_every: usize,
     /// Optional domain-event seam. When present the scan publishes
     /// `LibraryChanged` (added/removed items, at scan end) and `RefreshProgress`
-    /// (per-library %, at the progress cadence) — the composition root forwards
+    /// (per-library %, once per second) — the composition root forwards
     /// both to client sessions over the WebSocket, which is how open clients
     /// refresh their views after a scan. Absent in unit tests that don't
     /// exercise events.
@@ -2698,6 +2696,7 @@ impl LibraryScanner {
         Self {
             virtual_folders,
             file_system,
+            scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             media_encoder: None,
@@ -2727,7 +2726,30 @@ impl LibraryScanner {
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             metadata_options: None,
             metadata_configuration: None,
+            subtitle_downloader: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Shares scan progress with the library dashboard reader.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        tracker: crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
+        if let Some(events) = &self.events {
+            tracker.set_events(Arc::clone(events));
+        }
+        self.scan_progress = tracker;
+        self
+    }
+
+    /// Attaches the shared automatic downloader after the library and subtitle
+    /// manager have been constructed. Wiring is set once before scans start.
+    pub fn attach_subtitle_downloader(
+        &self,
+        downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
+    ) {
+        let _ = self.subtitle_downloader.set(downloader);
     }
 
     /// Attaches the reader of the `metadata` named configuration, whose
@@ -2839,6 +2861,7 @@ impl LibraryScanner {
     /// `RefreshProgress` (forwarded to client sessions by the composition root).
     #[must_use]
     pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.scan_progress.set_events(Arc::clone(&events));
         self.events = Some(events);
         self
     }
@@ -2909,7 +2932,7 @@ impl LibraryScanner {
     }
 
     /// Attaches the fanart.tv client so movies/series get fanart artwork
-    /// (posters/logos/clear-art/backgrounds/…) appended during the scan, keyed
+    /// (posters/logos/clear-art/backgrounds/…) ranked during the scan, keyed
     /// off the Tmdb/Imdb/Tvdb ids resolved earlier in the same pass.
     #[must_use]
     pub fn with_fanart(mut self, fanart: Arc<ferrofin_providers::FanartClient>) -> Self {
@@ -3192,6 +3215,7 @@ impl LibraryScanner {
             let planned = TouchedIds::default();
             let served = ScanRun {
                 progress: None,
+                tracking: None,
                 lane: None,
                 touched: Some(&planned),
                 ..ScanRun::new(&refresh.options, &refresh.ancestors, &refresh.cancel)
@@ -3247,6 +3271,14 @@ impl LibraryScanner {
         let widen = *options == MetadataRefreshOptions::default();
         let folders = self.scoped_folders(only, widen).await?;
         let all_folders = self.virtual_folders.get_virtual_folders().await?;
+        let tracking = self
+            .scan_progress
+            .begin(folders.iter().filter_map(collection_folder_id));
+        tracking.started().await;
+        let run = ScanRun {
+            tracking: Some(&tracking),
+            ..run
+        };
         // One library at a time (sync: `NamingOptions` never crosses an
         // await), serving the lane between two: the walk writes nothing, so
         // a refresh served here needs nothing read again. Every library of
@@ -3258,18 +3290,30 @@ impl LibraryScanner {
         };
         for library in folders.chunks(1) {
             if run.cancel.is_cancelled() {
-                return Ok(ScanOutcome::default());
+                return Ok(ScanOutcome {
+                    stopped: true,
+                    ..ScanOutcome::default()
+                });
             }
             Box::pin(self.serve_lane(run)).await;
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
+            plan.owner_paths.extend(part.owner_paths);
+            plan.excluded.extend(part.excluded);
             plan.unlisted.extend(part.unlisted);
             plan.inaccessible.extend(part.inaccessible);
         }
         if run.cancel.is_cancelled() {
-            return Ok(ScanOutcome::default());
+            return Ok(ScanOutcome {
+                stopped: true,
+                ..ScanOutcome::default()
+            });
         }
-        self.run_scan(&folders, &all_folders, plan, None, run).await
+        let result = self.run_scan(&folders, &all_folders, plan, None, run).await;
+        tracking
+            .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
+            .await;
+        result
     }
 
     /// Scans the library monitor's reported `changed` filesystem paths —
@@ -3539,8 +3583,19 @@ impl LibraryScanner {
             return Ok(ScanOutcome::default());
         }
         if run.cancel.is_cancelled() {
-            return Ok(ScanOutcome::default());
+            return Ok(ScanOutcome {
+                stopped: true,
+                ..ScanOutcome::default()
+            });
         }
+        let tracking = self
+            .scan_progress
+            .begin(affected.iter().filter_map(collection_folder_id));
+        tracking.started().await;
+        let run = ScanRun {
+            tracking: Some(&tracking),
+            ..run
+        };
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
@@ -3575,8 +3630,124 @@ impl LibraryScanner {
             pathless: Some(&pathless),
             ..scope
         };
-        self.run_scan(&affected, &folders, plan, Some(scope), run)
-            .await
+        let result = self
+            .run_scan(&affected, &folders, plan, Some(scope), run)
+            .await;
+        tracking
+            .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
+            .await;
+        result
+    }
+
+    /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
+    /// those rows by path before refreshing them, so the movie resolver cannot
+    /// create another item for a file that is already a linked version.
+    // Keep identity selection and owner remapping together so their priority stays visible.
+    #[allow(clippy::too_many_lines)]
+    async fn reuse_adopted_video_versions(
+        &self,
+        planned: &mut [Planned],
+        owner_paths: &HashMap<Uuid, String>,
+    ) -> Result<(), ServiceError> {
+        let paths: Vec<String> = planned
+            .iter()
+            .filter(|p| {
+                p.entity.type_.ends_with(".Movie")
+                    || p.entity.type_.ends_with(".MusicVideo")
+                    || p.entity.owner_id.is_some()
+            })
+            .filter_map(|p| p.entity.path.clone())
+            .chain(owner_paths.values().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
+            return Ok(());
+        };
+        let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let existing_extras: HashMap<String, Uuid> = rows
+            .iter()
+            .filter(|row| {
+                [".Episode", ".Video", ".Trailer", ".Audio"]
+                    .iter()
+                    .any(|kind| row.item_type.ends_with(kind))
+            })
+            .filter_map(|row| Some((row.path.clone()?, row.id)))
+            .collect();
+        let existing_movies: HashMap<String, ItemPathRow> = rows
+            .iter()
+            .filter(|row| {
+                row.item_type.ends_with(".Movie") || row.item_type.ends_with(".MusicVideo")
+            })
+            .filter_map(|row| Some((row.path.clone()?, row.clone())))
+            .collect();
+        let versions: HashMap<String, ItemPathRow> = rows
+            .into_iter()
+            .filter(|row| row.item_type == "MediaBrowser.Controller.Entities.Video")
+            .filter_map(|row| Some((row.path.clone()?, row)))
+            .collect();
+        let owner_ids: HashMap<String, String> = owner_paths
+            .iter()
+            .filter(|(id, _)| !existing.contains(id))
+            .filter_map(|(id, path)| {
+                versions
+                    .get(path)
+                    .or_else(|| existing_movies.get(path))
+                    .map(|row| (guid_to_db(*id), guid_to_db(row.id)))
+            })
+            .collect();
+        for item in planned {
+            if item.entity.type_.ends_with(".MusicVideo")
+                && !existing.contains(&item.id)
+                && let Some(row) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| versions.get(path).or_else(|| existing_movies.get(path)))
+            {
+                item.id = row.id;
+                item.entity.id = guid_to_db(row.id);
+                if row.item_type == "MediaBrowser.Controller.Entities.Video" {
+                    item.entity.type_.clone_from(&row.item_type);
+                }
+            }
+            if item.entity.owner_id.is_some()
+                && !existing.contains(&item.id)
+                && let Some(id) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| existing_extras.get(path))
+            {
+                item.id = *id;
+                item.entity.id = guid_to_db(*id);
+            }
+            if let Some(owner) = item
+                .entity
+                .owner_id
+                .as_ref()
+                .and_then(|id| owner_ids.get(id))
+            {
+                item.entity.owner_id = Some(owner.clone());
+            }
+            if (item.entity.type_.ends_with(".Movie") || item.entity.type_.ends_with(".MusicVideo"))
+                && !existing.contains(&item.id)
+                && let Some(row) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| versions.get(path))
+            {
+                item.id = row.id;
+                item.entity.id = guid_to_db(row.id);
+                item.entity.type_.clone_from(&row.item_type);
+                item.entity.is_movie = false;
+            }
+        }
+        Ok(())
     }
 
     /// The shared scan pipeline over an already-planned item set: probe +
@@ -3615,7 +3786,9 @@ impl LibraryScanner {
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
         let PlanOutput {
-            items: planned,
+            items: mut planned,
+            excluded,
+            owner_paths,
             mut unlisted,
             inaccessible,
             date_added,
@@ -3639,6 +3812,8 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
+        self.reuse_adopted_video_versions(&mut planned, &owner_paths)
+            .await?;
         let options = run.options;
         if let Some(touched) = run.touched {
             touched
@@ -3651,9 +3826,15 @@ impl LibraryScanner {
                 }));
         }
         log_scan_planned(planned.len(), folders.len(), options);
-        // Per-library progress accounting for the `RefreshProgress` pushes: how
-        // many planned items each library has, and how many are done so far.
-        let mut library_progress = LibraryProgress::new(&planned);
+        if let Some(tracking) = run.tracking {
+            let mut totals = HashMap::new();
+            for item in &planned {
+                if let Some(&library) = item.ancestors.first() {
+                    *totals.entry(library).or_default() += 1;
+                }
+            }
+            tracking.planned(totals);
+        }
         // Item ids that did not exist before this scan (→ `ItemsAdded` in the
         // scan-end `LibraryChanged` push). Only tracked when events are wired.
         let mut items_added: Vec<&Planned> = Vec::new();
@@ -3744,8 +3925,10 @@ impl LibraryScanner {
             // refreshed (`superseded_copies`). Nothing is written for it.
             if refresh.superseded.contains(&scanned) {
                 outcome.unchanged += 1;
-                if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                    self.publish_refresh_progress(cf, pct).await;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
                 }
                 continue;
             }
@@ -3779,8 +3962,10 @@ impl LibraryScanner {
                 }
                 log_scoped_item(item, "context", false);
                 outcome.unchanged += 1;
-                if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                    self.publish_refresh_progress(cf, pct).await;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
                 }
                 continue;
             }
@@ -3878,12 +4063,15 @@ impl LibraryScanner {
                         .await);
                 }
             }
-            // Per-library refresh % for open dashboards (`RefreshProgress`),
-            // at the same bounded cadence as the progress log plus each
-            // library's completion.
-            if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                self.publish_refresh_progress(cf, pct).await;
+            // The independent timer samples these counters once per second.
+            if let Some(tracking) = run.tracking
+                && let Some(&library) = item.ancestors.first()
+            {
+                tracking.advance(library);
             }
+        }
+        if let Some(tracking) = run.tracking {
+            tracking.finalizing();
         }
         run.report(96.0);
         // A cancellation that landed during the last item skips the pruning
@@ -3895,7 +4083,8 @@ impl LibraryScanner {
         probes.abort();
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
-        let removed = Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted)).await;
+        let removed =
+            Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted, &excluded)).await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
@@ -3917,7 +4106,7 @@ impl LibraryScanner {
         Ok(outcome)
     }
 
-    /// Drops the rows whose files vanished since the last scan, so deleted
+    /// Drops rows whose files vanished or whose paths were confirmed excluded, so deleted
     /// media stops being listed and served — within `scope`'s roots on a
     /// path-scoped scan. Best-effort: a failure does not fail the scan. An
     /// item's own refresh removes nothing (upstream's `RefreshSingleItem`
@@ -3929,11 +4118,13 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
+        excluded: &[String],
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         if scope.is_some_and(|scope| !scope.prune) {
             return Vec::new();
         }
-        self.prune_deleted(folders, planned, scope, unlisted).await
+        self.prune_deleted(folders, planned, scope, unlisted, excluded)
+            .await
     }
 
     /// Between two items: the item refreshes waiting in `run`'s lane run
@@ -4461,6 +4652,12 @@ impl LibraryScanner {
                 remote_answered: has_remote_metadata,
             },
         );
+        // FindExtras corrects filename-derived names even on existing extras;
+        // an explicit Name field lock is the only opt-out upstream.
+        if entity.owner_id.is_some() && !locked_fields.contains(&MetadataField::Name) {
+            entity.name.clone_from(&item.entity.name);
+            settle_sort_name(&mut entity);
+        }
         self.apply_parental_rating_score(&mut entity);
         // The folder's new mtime is written with the music pass's save, not
         // this one (see `ItemPass::music_pending`).
@@ -4529,6 +4726,23 @@ impl LibraryScanner {
         if cancel.is_cancelled() {
             return Ok(ItemSaved::Cancelled);
         }
+        let subtitle_downloader = self.subtitle_downloader.get().filter(|_| {
+            probe_ran
+                && policy
+                    .options
+                    .and_then(|o| o.subtitle_download_languages.as_ref())
+                    .is_some_and(|languages| !languages.is_empty())
+        });
+        // Acquire before the first file/DB write so cancellation while a
+        // scheduled download holds the gate still leaves this item untouched.
+        let _subtitle_guard = if let Some(downloader) = subtitle_downloader {
+            let Some(guard) = downloader.lock(cancel).await else {
+                return Ok(ItemSaved::Cancelled);
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let ((artwork, cut_short), failed) = count_request_failures(Box::pin(
             self.collect_artwork(item.id, art, state.art_cache),
         ))
@@ -4672,7 +4886,23 @@ impl LibraryScanner {
             // union (upstream `LockedFields.Concat(…).Distinct()`).
             self.persistence.add_locked_fields(item.id, &ids).await?;
         }
-        self.persist_probe_rows(item.id, &rows).await?;
+        self.persist_probe_rows(item.id, &rows, subtitle_downloader.map(AsRef::as_ref))
+            .await?;
+        // Like FFProbeVideoInfo.AddExternalSubtitlesAsync, only a successful
+        // video probe in Default/FullRefresh downloads. Save first: attachment
+        // reads the item and appends streams, so it must follow the probe's
+        // full stream replacement. Failed probes cannot establish absence.
+        if probe_ran
+            && matches!(
+                options.metadata_refresh_mode,
+                MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+            )
+            && let (Some(downloader), Some(options)) = (subtitle_downloader, policy.options)
+        {
+            downloader
+                .download_missing_locked(&entity, options, cancel)
+                .await;
+        }
         // TODO(parity, open work item — NOT an accepted divergence): upstream's
         // `TrickplayProvider` (`MediaBrowser.Providers/Trickplay/
         // TrickplayProvider.cs:95-118`, a forced custom provider) runs here
@@ -4933,9 +5163,16 @@ impl LibraryScanner {
         &self,
         item_id: Uuid,
         probe: &ProbeRows,
+        subtitles: Option<&crate::subtitle_downloader::SubtitleDownloader>,
     ) -> Result<(), ServiceError> {
         if let (false, Some(repo)) = (probe.streams.is_empty(), &self.media_streams) {
-            repo.save_media_streams(item_id, &probe.streams).await?;
+            if let Some(subtitles) = subtitles {
+                subtitles
+                    .save_probed_streams(item_id, &probe.streams)
+                    .await?;
+            } else {
+                repo.save_media_streams(item_id, &probe.streams).await?;
+            }
         }
         // Attachments are replaced whenever a video probe ran (an empty set clears
         // the rows of a re-muxed file); without a probe the stored rows stay.
@@ -5600,23 +5837,6 @@ impl LibraryScanner {
         Ok(folders)
     }
 
-    /// Publishes one library's refresh percentage as a `RefreshProgress` event
-    /// (the C# `RefreshProgressMessage` dictionary shape: string values).
-    /// No-op without an event seam.
-    async fn publish_refresh_progress(&self, library: Uuid, pct: f64) {
-        let Some(events) = &self.events else {
-            return;
-        };
-        // `LibraryChangedNotifier`: the id in Jellyfin's guid spelling (N form) —
-        // jellyfin-web compares it with the card's `data-id` as a plain string.
-        let payload = serde_json::json!({
-            "ItemId": library.simple().to_string(),
-            "Progress": format!("{pct:.2}"),
-        })
-        .to_string();
-        let _ = events.publish("RefreshProgress", &payload).await;
-    }
-
     /// Publishes the scan's net changes as a `LibraryChanged` event carrying a
     /// [`LibraryUpdateInfo`] — the payload Jellyfin's `LibraryChangedNotifier`
     /// pushes so clients refresh home rows and library views. No-op when no
@@ -5718,6 +5938,7 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
+        excluded: &[String],
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
@@ -5726,12 +5947,17 @@ impl LibraryScanner {
         // Nothing at or under a directory that failed to list is known to be
         // gone (`Folder.ValidateChildrenInternal2` returns on an
         // `IOException` before it removes a child).
-        let unlisted = Unlisted::of(unlisted);
+        let unlisted = PathRoots::of(unlisted);
+        let excluded = PathRoots::of(excluded);
         let listed = |row_path: Option<&str>| row_path.is_none_or(|rp| !unlisted.covers(rp));
         let planned_paths: std::collections::HashSet<&str> = planned
             .iter()
             .filter_map(|p| p.entity.path.as_deref())
             .collect();
+        let keep_on_disk = |path: Option<&str>| {
+            !path.is_some_and(|path| excluded.covers(path))
+                && self.still_on_disk(path, &planned_paths)
+        };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -5781,7 +6007,7 @@ impl LibraryScanner {
             };
             let own = LibraryFolders::of(&top_parents, &folder.locations);
             let Some((ids, paths)) = self
-                .stale_rows(cf, &existing, &live, &planned_paths, &listed, &own)
+                .stale_rows(cf, &existing, &live, &keep_on_disk, &listed, &own)
                 .await
             else {
                 continue;
@@ -5800,7 +6026,7 @@ impl LibraryScanner {
                             .collect();
                         log_pruned(&gone);
                     }
-                    tracing::info!(library = %cf, removed = deleted.len(), "pruned items deleted from disk");
+                    tracing::info!(library = %cf, removed = deleted.len(), "pruned missing or excluded items");
                     removed.push((cf, deleted));
                 }
                 Err(err) => {
@@ -5848,7 +6074,7 @@ impl LibraryScanner {
         cf: Uuid,
         existing: &[ItemPathRow],
         live: &std::collections::HashSet<Uuid>,
-        planned_paths: &std::collections::HashSet<&str>,
+        keep_on_disk: &(dyn Fn(Option<&str>) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
     ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
@@ -5878,7 +6104,7 @@ impl LibraryScanner {
             .iter()
             .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = self.still_on_disk(row.path.as_deref(), planned_paths);
+                let keep = keep_on_disk(row.path.as_deref());
                 if keep {
                     if planner_resolves(&row.item_type) {
                         kept_on_disk += 1;
@@ -6995,6 +7221,18 @@ impl LibraryScanner {
         if let Some(imdb) = details.imdb_id.as_deref().filter(|s| !s.is_empty()) {
             provider_ids.push(("Imdb".to_owned(), imdb.to_owned()));
         }
+        for (key, value) in [
+            ("Tvdb", details.tvdb_id),
+            ("TvRage", details.tvrage_id),
+            (
+                "TmdbCollection",
+                details.collection_id.map(|id| id.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                provider_ids.push((key.to_owned(), value));
+            }
+        }
         // `Some(..)` because this fn returns Option: None is a TMDB miss the
         // fetcher-order gate falls back from (G1.3); main's tmdb_people helper
         // replaces the inline people mapping this branch used to carry.
@@ -7083,20 +7321,40 @@ impl LibraryScanner {
             .and_then(|d| episode_in_season(d, number))?
             .clone();
         apply_tmdb_episode(entity, &ep);
-        let people = self
-            .tmdb_episode_people(series_tmdb_id_of(cache, &series_id), season, number)
-            .await;
-        // The season listed the episode, so TMDB answered. Its credits are
-        // `TmdbEpisodeProvider`'s `AddPerson`s: null when it credits nobody,
-        // and null when the credits request missed or failed (a failure is
-        // counted, so the refresh is not stamped).
+        let extras = match (&self.tmdb, series_tmdb_id_of(cache, &series_id)) {
+            (Some(tmdb), Some(id)) => tmdb.episode_extras(id, season, number).await,
+            _ => None,
+        };
+        let people = extras
+            .as_ref()
+            .and_then(|e| e.people.as_ref())
+            .map(|p| tmdb_people(p));
+        let trailers = extras
+            .as_ref()
+            .map(|e| {
+                e.trailers
+                    .iter()
+                    .map(|t| (Some(t.name.clone()), t.url.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(data) =
+            crate::item_data::merge_remote_trailers(entity.data.as_deref(), &trailers)
+        {
+            entity.data = Some(data);
+        }
+        // Credits retain main's AddPerson semantics: an empty answer does
+        // not clear stored people; request failures remain counted.
         // Upstream `TmdbEpisodeProvider` sets the episode's own Tmdb id; the
         // client's Identify and external-links surface on an episode page reads
         // it.
-        let provider_ids = ep
+        let mut provider_ids = ep
             .tmdb_id
             .map(|id| vec![("Tmdb".to_owned(), id.to_string())])
             .unwrap_or_default();
+        if let Some(extras) = extras {
+            provider_ids.extend(extras.provider_ids);
+        }
         Some(RemoteMetadata {
             credits: vec![people.and_then(added)],
             provider_ids,
@@ -7167,7 +7425,8 @@ impl LibraryScanner {
         answers
     }
 
-    /// The TheTVDB metadata pass. For a **series** it searches by name/year,
+    /// The TheTVDB metadata pass. A **series** resolves by native/external ids,
+    /// or by name/year when unpinned,
     /// applies the matched series' fields, and caches the details (its
     /// `tvdb_id` lets episodes resolve, its artwork feeds the image pass).
     /// For an **episode** it resolves the episode by (season, number) against
@@ -7193,6 +7452,8 @@ impl LibraryScanner {
     /// `TvdbEpisodeProvider.cs:195`, jellyfin-plugin-tvdb `5c4592f`), which
     /// defeats that guard: an outage during "Replace all metadata" wipes the
     /// item there.
+    // Keep the series/episode dispatch and each answer's cache updates together.
+    #[allow(clippy::too_many_lines)]
     async fn fetch_tvdb_metadata(
         &self,
         entity: &mut BaseItemEntity,
@@ -7214,9 +7475,27 @@ impl LibraryScanner {
                     .find(|(key, _)| key.eq_ignore_ascii_case("Tvdb"))
                     .and_then(|(_, value)| value.trim().parse::<i64>().ok())
                     .filter(|id| *id > 0);
+                let mut pinned = pinned;
+                let mut has_remote_id = false;
+                for source in ["Imdb", "Zap2It", "Tmdb"] {
+                    if pinned.is_some() {
+                        break;
+                    }
+                    if let Some((_, id)) = known_ids.iter().find(|(key, value)| {
+                        key.eq_ignore_ascii_case(source) && !value.trim().is_empty()
+                    }) {
+                        has_remote_id = true;
+                        pinned = tvdb.series_by_remote_id(id).await;
+                    }
+                }
                 let tvdb_id = if let Some(id) = pinned {
                     id
                 } else {
+                    // A supplied remote id pins the identity. A miss must not
+                    // silently replace it with a similarly named series.
+                    if has_remote_id {
+                        return None;
+                    }
                     let name = lookup.name(entity)?;
                     let year = lookup.year(entity);
                     pick_series_hit(tvdb.search(&name, year).await, year)?.tvdb_id
@@ -7232,6 +7511,15 @@ impl LibraryScanner {
                 }
                 if let Some(tmdb) = details.tmdb_id.as_deref().filter(|s| !s.is_empty()) {
                     provider_ids.push(("Tmdb".to_owned(), tmdb.to_owned()));
+                }
+                for (key, value) in [
+                    ("TvdbSlug", details.slug.clone()),
+                    ("Zap2It", details.zap2it_id.clone()),
+                    ("TvdbCollection", details.collection_ids.clone()),
+                ] {
+                    if let Some(value) = value {
+                        provider_ids.push((key.to_owned(), value));
+                    }
                 }
                 cache.series_tvdb.insert(entity.id.clone(), details);
                 // `TvdbSeriesProvider` `ResetPeople`s before mapping the
@@ -7276,6 +7564,10 @@ impl LibraryScanner {
                 // the series': TVDB's episode record, then TMDB's per-episode
                 // credits when the library runs TheMovieDb after TheTVDB
                 // (`episode_people`).
+                let mut provider_ids = vec![("Tvdb".to_owned(), ep.tvdb_id.to_string())];
+                if let Some(id) = &ep.imdb_id {
+                    provider_ids.push(("Imdb".to_owned(), id.clone()));
+                }
                 Some(RemoteMetadata {
                     credits: self
                         .episode_people(
@@ -7286,7 +7578,7 @@ impl LibraryScanner {
                             tmdb_after,
                         )
                         .await,
-                    provider_ids: Vec::new(),
+                    provider_ids,
                     answered: true,
                 })
             }
@@ -8311,6 +8603,8 @@ impl LibraryScanner {
     /// `replace`: `ReplaceAllImages` — every type but the ones in the set is
     /// downloaded afresh over what an earlier download or an upload left in
     /// the item's metadata folder; `None` reuses what is there.
+    // Each item-kind arm gathers and ranks its own provider image sets.
+    #[allow(clippy::too_many_lines)]
     async fn fetch_remote_images(
         &self,
         entity: &BaseItemEntity,
@@ -8342,16 +8636,16 @@ impl LibraryScanner {
                     .item_provider_ids
                     .get(&entity.id)
                     .and_then(|ids| tmdb_id_in(ids));
-                let mut images = if !policy.image_enabled(short, fetcher_names::TMDB) {
+                let images = if !policy.image_enabled(short, fetcher_names::TMDB) {
                     Vec::new()
                 } else if let Some(id) = tmdb_id {
                     tmdb.images_by_id(TmdbKind::Movie, id).await
                 } else {
                     tmdb.images_for(TmdbKind::Movie, name, year).await
                 };
-                // fanart.tv supplements TMDB's poster/backdrop with the types it
-                // lacks (logo/clear-art/disc/banner), keyed off the movie's
-                // Tmdb/Imdb id persisted earlier this scan.
+                let mut sources = vec![(fetcher_names::TMDB, images)];
+                // Rank all artwork before selecting the first of each type.
+                // Fanart leads by default; a saved library order wins.
                 if policy.image_enabled(short, fetcher_names::FANART)
                     && let Some(fanart) = &self.fanart
                     && let Some(id) = cache
@@ -8359,36 +8653,36 @@ impl LibraryScanner {
                         .get(&entity.id)
                         .and_then(|ids| fanart_movie_id(ids))
                 {
+                    let mut images = Vec::new();
                     append_fanart(&mut images, fanart.movie_images(&id).await);
+                    sources.push((fetcher_names::FANART, images));
                 }
-                // OMDb's poster is the last-resort Primary (C# `Order = 90`,
-                // "after other internet providers, because they're better").
-                // Appending it last means the dedup keeps it only when nothing
-                // above supplied a Primary. The URL was captured during the
-                // metadata pass, so this costs no extra request.
+                let mut images = Vec::new();
                 append_omdb_poster(&mut images, entity, cache, policy, short);
-                download_remote_images(
-                    tmdb,
-                    &item_dir,
-                    &entity.id,
-                    dedup_images_by_type(images),
-                    replace,
-                )
-                .await
+                sources.push((fetcher_names::OMDB, images));
+                let images = ordered_remote_images(sources, policy, short);
+                download_remote_images(tmdb, &item_dir, &entity.id, images, replace).await
             }
             "Series" => {
-                // TVDB is the TV authority: when it matched this series during the
-                // metadata pass, reuse its artwork (no second fetch); else fall
-                // back to a TMDB series match. The Tvdb id (when present) also
-                // keys fanart's series artwork.
-                let tvdb_id = cache.series_tvdb.get(&entity.id).map(|d| d.tvdb_id);
+                // Reuse artwork from TVDB's metadata response, then rank it
+                // with TMDB and Fanart using the library's image preferences.
+                // The stored Tvdb id also keys Fanart on an image-only refresh.
+                let tvdb_id = cache
+                    .series_tvdb
+                    .get(&entity.id)
+                    .map(|d| d.tvdb_id)
+                    .or_else(|| recorded_provider_id(cache, &entity.id, "Tvdb"));
                 let tvdb_art = policy
                     .image_enabled(short, fetcher_names::TVDB)
                     .then(|| cache.series_tvdb.get(&entity.id))
                     .flatten();
-                let mut images = if let Some(details) = tvdb_art {
-                    details.download_images()
-                } else if policy.image_enabled(short, fetcher_names::TMDB) {
+                let mut sources = vec![(
+                    fetcher_names::TVDB,
+                    tvdb_art
+                        .map(ferrofin_providers::TvdbSeriesDetails::download_images)
+                        .unwrap_or_default(),
+                )];
+                let images = if policy.image_enabled(short, fetcher_names::TMDB) {
                     // The series' TMDB id as this pass resolved it (the
                     // metadata fetch's, pinned or searched, or the settled
                     // ids) keys its artwork; only a series TMDB never matched
@@ -8402,36 +8696,31 @@ impl LibraryScanner {
                     if let Some(id) = known {
                         cache.series_tmdb.insert(entity.id.clone(), id);
                         tmdb.images_by_id(TmdbKind::Series, id).await
-                    } else {
-                        let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                            return Vec::new();
-                        };
-                        let Some(matched) = tmdb.series_match(name, year).await else {
-                            return Vec::new();
-                        };
+                    } else if let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty())
+                        && let Some(matched) = tmdb.series_match(name, year).await
+                    {
                         // Remember the TMDB id so this series' seasons/episodes resolve.
                         cache.series_tmdb.insert(entity.id.clone(), matched.tmdb_id);
                         matched.images
+                    } else {
+                        Vec::new()
                     }
                 } else {
                     Vec::new()
                 };
+                sources.push((fetcher_names::TMDB, images));
                 if policy.image_enabled(short, fetcher_names::FANART)
                     && let (Some(fanart), Some(tvdb_id)) = (&self.fanart, tvdb_id)
                 {
+                    let mut images = Vec::new();
                     append_fanart(
                         &mut images,
                         fanart.series_images(&tvdb_id.to_string()).await,
                     );
+                    sources.push((fetcher_names::FANART, images));
                 }
-                download_remote_images(
-                    tmdb,
-                    &item_dir,
-                    &entity.id,
-                    dedup_images_by_type(images),
-                    replace,
-                )
-                .await
+                let images = ordered_remote_images(sources, policy, short);
+                download_remote_images(tmdb, &item_dir, &entity.id, images, replace).await
             }
             "Season" | "Episode" => {
                 self.fetch_tv_still_images(entity, short, cache, tmdb, &item_dir, policy, replace)
@@ -8664,7 +8953,13 @@ impl LibraryScanner {
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
                     ) => {
-                        self.plan_movies(location, location, cf, &ctx, &mut out);
+                        let kind =
+                            if folder.collection_type == Some(CollectionTypeOptions::musicvideos) {
+                                BaseItemKind::MusicVideo
+                            } else {
+                                BaseItemKind::Movie
+                            };
+                        self.plan_movies(location, location, cf, kind, &ctx, &mut out);
                         // Upstream folds the separate `photos` collection type
                         // into `homevideos`, where photos are resolved only when
                         // the library enables them (`PhotoResolver.Resolve`).
@@ -8685,6 +8980,8 @@ impl LibraryScanner {
         }
         PlanOutput {
             items: out,
+            excluded: ctx.excluded.into_inner(),
+            owner_paths: ctx.owner_paths.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
             date_added,
@@ -8698,8 +8995,27 @@ impl LibraryScanner {
     fn list(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
         match self.file_system.try_get_file_system_entries(dir) {
             Ok(entries) => {
+                // Availability is measured before exclusions: a mounted
+                // directory containing only ignored files is still reachable.
                 ctx.listed_location(dir, entries.is_empty());
+                ctx.direct_file_counts.borrow_mut().insert(
+                    dir.to_owned(),
+                    entries
+                        .iter()
+                        .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
+                        .count(),
+                );
                 entries
+                    .into_iter()
+                    .filter(|entry| {
+                        if crate::resolvers::should_ignore_path(&entry.path) {
+                            ctx.excluded.borrow_mut().push(entry.path.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
             }
             Err(err) => {
                 ctx.failed_to_list(dir, &err);
@@ -8796,13 +9112,14 @@ impl LibraryScanner {
     /// `theme-music/` / `extras/` directories …), which become owned rows
     /// (`OwnerId` + `ExtraType`) attached to the movie they belong to. Owned
     /// rows are what `/Items/{id}/LocalTrailers`, `/SpecialFeatures`, and the
-    /// hasTrailer/hasThemeSong/… filters read; the browse queries' "unowned"
-    /// predicate keeps them out of the library grid.
+    /// hasTrailer/hasThemeSong/… filters read. They have no physical parent
+    /// or top parent, so library browsing does not return them.
     fn plan_movies(
         &self,
         dir: &str,
         root: &str,
         cf: Uuid,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
@@ -8810,54 +9127,209 @@ impl LibraryScanner {
         // Movies emitted per directory, for extras owner resolution.
         let mut movies_by_dir: std::collections::HashMap<String, Vec<(Uuid, String)>> =
             std::collections::HashMap::new();
-        self.collect_movie_plan(dir, root, cf, ctx, out, &mut extras, &mut movies_by_dir);
+        self.collect_movie_plan(
+            dir,
+            root,
+            cf,
+            kind,
+            ctx,
+            out,
+            &mut extras,
+            &mut movies_by_dir,
+        );
         for (path, extra_type) in extras {
             if !ctx.scope.keeps(&path) {
                 continue;
             }
             let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
-                continue; // an extra with no resolvable movie is skipped
-            };
-            // The extra's item KIND comes from its extra type, per
-            // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
-            // three-way switch, not a two-way one:
-            //   ExtraType.Trailer   => _trailerResolvers  (GenericVideoResolver<Trailer>)
-            //   ExtraType.ThemeSong => null               ("For audio we'll have
-            //                          to rely on the AudioResolver, which is a
-            //                          'built-in'") — so a theme song is an
-            //                          AUDIO item, not a video one
-            //   _                   => _videoResolvers
-            // A `Trailer` is what makes a `-trailer.*` file visible to
-            // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
-            // theme song is what makes `/Items/{id}/ThemeMedia` return it under
-            // `ThemeSongsResult` rather than as a stray Video row.
-            let (kind, media_type) = match extra_type {
-                ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
-                ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
-                _ => (BaseItemKind::Video, "Video"),
-            };
-            let Some((id, mut entity)) =
-                self.base_item(ctx, kind, cf, cf, file_stem(&path), &path, false)
-            else {
+                // This candidate was listed, but no eligible containing movie
+                // searches for it. Reconcile legacy rows at this exact path.
+                ctx.excluded.borrow_mut().push(path);
                 continue;
             };
-            entity.media_type = Some(media_type.to_owned());
-            entity.extra_type = Some(extra_type as i32);
-            entity.owner_id = Some(guid_to_db(owner));
-            // A video extra resolves through `BaseVideoResolver` like any
-            // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
-            // its `VideoType` from the extension.
-            if media_type == "Video" {
-                set_video_type(&mut entity, file_video_type(&path));
+            self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+        }
+    }
+
+    /// Emit the same owned media shape for movies, series and physical seasons.
+    fn emit_extra(
+        &self,
+        path: &str,
+        extra_type: ferrofin_model::entities::ExtraType,
+        owner: Uuid,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        // The extra's item KIND comes from its extra type, per
+        // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
+        // three-way switch, not a two-way one:
+        //   ExtraType.Trailer   => _trailerResolvers  (GenericVideoResolver<Trailer>)
+        //   ExtraType.ThemeSong => null               ("For audio we'll have
+        //                          to rely on the AudioResolver, which is a
+        //                          'built-in'") — so a theme song is an
+        //                          AUDIO item, not a video one
+        //   _                   => _videoResolvers
+        // A `Trailer` is what makes a `-trailer.*` file visible to
+        // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
+        // theme song is what makes `/Items/{id}/ThemeMedia` return it under
+        // `ThemeSongsResult` rather than as a stray Video row.
+        let (kind, media_type) = match extra_type {
+            ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
+            ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
+            _ => (BaseItemKind::Video, "Video"),
+        };
+        let Some((id, mut entity)) =
+            self.base_item(ctx, kind, cf, cf, file_stem(path), path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some(media_type.to_owned());
+        entity.extra_type = Some(extra_type as i32);
+        entity.owner_id = Some(guid_to_db(owner));
+        // BaseItem.RefreshExtras clears the physical parent. An extra's
+        // library is reached through its owner, not GetTopParent's parent
+        // walk. Keep the collection ancestor (GetCollectionFolders follows
+        // OwnerId), also used by scan policy and progress accounting.
+        entity.parent_id = None;
+        entity.top_parent_id = None;
+        // A video extra resolves through `BaseVideoResolver` like any
+        // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
+        // its `VideoType` from the extension.
+        if media_type == "Video" {
+            set_video_type(&mut entity, file_video_type(path));
+        }
+        ctx.emit(
+            out,
+            Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            },
+        );
+    }
+
+    /// Resolve a TV owner's direct extras before its seasons or episodes.
+    /// Sort every candidate before applying scope, so type numbering is stable.
+    fn plan_tv_extras(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        owner_dir: &str,
+        owner: Uuid,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) -> std::collections::HashSet<String> {
+        let mut consumed = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                if ctx
+                    .naming
+                    .all_extras_types_folder_names
+                    .contains_key(&entry.name.to_lowercase())
+                {
+                    consumed.insert(entry.path.clone());
+                    ctx.excluded.borrow_mut().push(entry.path.clone());
+                    let files: Vec<_> = self
+                        .list(&entry.path, ctx)
+                        .into_iter()
+                        .filter(|file| file.type_ != FileSystemEntryType::Directory)
+                        .collect();
+                    let mixed = ctx
+                        .direct_file_counts
+                        .borrow()
+                        .get(&entry.path)
+                        .copied()
+                        .unwrap_or(0)
+                        > 1;
+                    candidates.extend(files.into_iter().map(|file| (file.path, mixed)));
+                }
+            } else {
+                candidates.push((entry.path.clone(), false));
             }
-            ctx.emit(
-                out,
-                Planned {
-                    id,
-                    entity,
-                    ancestors: vec![cf],
-                },
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let Some(owner_info) =
+            video_resolver::resolve_directory(Some(owner_dir), ctx.naming, true, Some(owner_dir))
+        else {
+            return consumed;
+        };
+        let mut counts = HashMap::new();
+        for (path, mixed) in candidates {
+            let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                &path,
+                ctx.naming,
+                Some(owner_dir),
             );
+            let Some(extra_type) = extra.extra_type else {
+                continue;
+            };
+            let Some(rule) = extra.rule.as_ref() else {
+                continue;
+            };
+            if !extra_matches_owner(&path, rule.rule_type, &owner_info, ctx.naming) {
+                continue;
+            }
+            consumed.insert(path.clone());
+            let mut name = video_resolver::resolve_file(Some(&path), ctx.naming, Some(owner_dir))
+                .map_or_else(|| file_stem(&path), |info| info.name);
+            let named_after_owner = extra.rule.is_some_and(|rule| match rule.rule_type {
+                ferrofin_naming::video::ExtraRuleType::Filename => true,
+                ferrofin_naming::video::ExtraRuleType::Suffix => {
+                    name.eq_ignore_ascii_case(&owner_info.name)
+                }
+                _ => false,
+            });
+            if named_after_owner {
+                let count = counts.entry(extra_type as i32).or_insert(0);
+                *count += 1;
+                name = self.extra_type_name(extra_type, *count);
+            }
+            if ctx.scope.keeps(&path) {
+                ctx.excluded.borrow_mut().push(path.clone());
+                let first = out.len();
+                self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+                for item in &mut out[first..] {
+                    item.entity.name = Some(name.clone());
+                    item.entity.is_in_mixed_folder = mixed;
+                }
+            }
+        }
+        consumed
+    }
+
+    fn extra_type_name(&self, extra: ferrofin_model::entities::ExtraType, count: i32) -> String {
+        use ferrofin_model::entities::ExtraType;
+        let key = match extra {
+            ExtraType::Clip => "NameExtraClip",
+            ExtraType::Trailer => "NameExtraTrailer",
+            ExtraType::BehindTheScenes => "NameExtraBehindTheScenes",
+            ExtraType::DeletedScene => "NameExtraDeletedScene",
+            ExtraType::Interview => "NameExtraInterview",
+            ExtraType::Scene => "NameExtraScene",
+            ExtraType::Sample => "NameExtraSample",
+            ExtraType::ThemeSong => "NameExtraThemeSong",
+            ExtraType::ThemeVideo => "NameExtraThemeVideo",
+            ExtraType::Featurette => "NameExtraFeaturette",
+            ExtraType::Short => "NameExtraShort",
+            ExtraType::Unknown => "NameExtraUnknown",
+        };
+        let fallback;
+        let localization = if let Some(localization) = &self.localization {
+            localization.as_ref()
+        } else {
+            fallback = crate::localization_manager::LocalizationManager::new("");
+            &fallback
+        };
+        let name = localization.get_localized_string(key);
+        if count == 1 {
+            name
+        } else {
+            localization
+                .get_localized_string("NameExtraNumbered")
+                .replace("{0}", &name)
+                .replace("{1}", &count.to_string())
         }
     }
 
@@ -8870,6 +9342,7 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
         extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
@@ -8882,10 +9355,39 @@ impl LibraryScanner {
         if dir != root
             && let Some(video_type) = self.disc_video_type(dir, ctx)
         {
-            self.plan_disc_movie(dir, cf, video_type, ctx, out);
+            self.plan_disc_movie(dir, cf, video_type, kind, ctx, out);
             return;
         }
-        for entry in self.list(dir, ctx) {
+        let entries = self.list(dir, ctx);
+        let movie = (dir != root)
+            .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
+            .flatten();
+        let own_folder = movie.is_some();
+        // ResolveMultiple consumes the directory's file list when it finds
+        // any regular movie, and drops sample filenames from that list. If it
+        // finds none, individual-file resolution can still accept a title
+        // whose name contains "sample".
+        let has_movie_files = entries.iter().any(|entry| {
+            entry.type_ != FileSystemEntryType::Directory
+                && !video_resolver::is_sample_filename(&entry.name)
+                && video_resolver::resolve_file(Some(&entry.path), naming, Some(root))
+                    .is_some_and(|video| video.extra_type.is_none())
+        });
+        if let Some(movie) = movie {
+            // Resolve ownership from the same grouped title as FindMovie.
+            // Stacked parts are one owner; alternate versions can own named extras.
+            let owners = movies_by_dir.entry(dir.to_owned()).or_default();
+            for version in std::iter::once(&movie).chain(movie.alternate_versions.iter()) {
+                if let Some(file) = version.files.first()
+                    && let Some(id) =
+                        item_type_lookup::derive_item_id_with(&self.id_derivation, kind, &file.path)
+                {
+                    owners.push((id, file_stem(&file.path)));
+                    ctx.owner_paths.borrow_mut().insert(id, file.path.clone());
+                }
+            }
+        }
+        for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
                 // TODO(parity): a plain subfolder (`Movies/Collection/…`,
                 // not a title's own folder) is flattened: its movies are
@@ -8906,7 +9408,16 @@ impl LibraryScanner {
                 // `TopParentId` stays the library, and prove it with a
                 // `plan_paths` invariant case plus an adopted-library browse.
                 if ctx.scope.visits(&entry.path) {
-                    self.collect_movie_plan(&entry.path, root, cf, ctx, out, extras, movies_by_dir);
+                    self.collect_movie_plan(
+                        &entry.path,
+                        root,
+                        cf,
+                        kind,
+                        ctx,
+                        out,
+                        extras,
+                        movies_by_dir,
+                    );
                 }
                 continue;
             }
@@ -8936,19 +9447,13 @@ impl LibraryScanner {
             if !is_video {
                 continue;
             }
+            // A sample consumed by ResolveMultiple is neither another movie
+            // nor an extra unless an explicit extra rule matched above.
+            if has_movie_files && video_resolver::is_sample_filename(&entry.name) {
+                ctx.excluded.borrow_mut().push(entry.path);
+                continue;
+            }
             if !ctx.scope.keeps(&entry.path) {
-                // Outside a scoped plan's paths: only its id is needed, for
-                // the owner of an extra beside it that is in scope. No stat.
-                if let Some(id) = item_type_lookup::derive_item_id_with(
-                    &self.id_derivation,
-                    BaseItemKind::Movie,
-                    &entry.path,
-                ) {
-                    movies_by_dir
-                        .entry(dir.to_owned())
-                        .or_default()
-                        .push((id, file_stem(&entry.path)));
-                }
                 continue;
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
@@ -8957,24 +9462,23 @@ impl LibraryScanner {
             // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
             // file in the library root keeps its clean_date_time-parsed name (year stripped).
             // ProductionYear is still populated either way.
-            let name = if dir == root {
-                clean_name
-            } else {
+            let name = if kind == BaseItemKind::MusicVideo {
+                file_stem(&entry.path)
+            } else if own_folder {
                 folder_name(dir).unwrap_or(clean_name)
+            } else {
+                clean_name
             };
             let Some((id, mut entity)) =
-                self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, &entry.path, false)
+                self.base_item(ctx, kind, cf, cf, name, &entry.path, false)
             else {
                 continue;
             };
-            entity.is_movie = true;
+            entity.is_movie = kind == BaseItemKind::Movie;
+            entity.is_in_mixed_folder = !own_folder;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
             set_video_type(&mut entity, file_video_type(&entry.path));
-            movies_by_dir
-                .entry(dir.to_owned())
-                .or_default()
-                .push((id, file_stem(&entry.path)));
             ctx.emit(
                 out,
                 Planned {
@@ -9019,16 +9523,15 @@ impl LibraryScanner {
         dir: &str,
         cf: Uuid,
         video_type: VideoType,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-        let Some((id, mut entity)) =
-            self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, dir, true)
-        else {
+        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, cf, name, dir, true) else {
             return;
         };
-        entity.is_movie = true;
+        entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         set_video_type(&mut entity, video_type);
         ctx.emit(
@@ -9204,7 +9707,15 @@ impl LibraryScanner {
         // navigate (Series→Seasons→Episodes) — without seasons, a show renders
         // with no episodes.
         let mut loose: Vec<String> = Vec::new();
-        for entry in self.list(series_dir, ctx) {
+        ctx.owner_paths
+            .borrow_mut()
+            .insert(series_id, series_dir.to_owned());
+        let entries = self.list(series_dir, ctx);
+        let extras = self.plan_tv_extras(&entries, series_dir, series_id, cf, ctx, out);
+        for entry in entries {
+            if extras.contains(&entry.path) {
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
                     continue;
@@ -9224,6 +9735,9 @@ impl LibraryScanner {
                     ) else {
                         continue;
                     };
+                    ctx.owner_paths
+                        .borrow_mut()
+                        .insert(season_id, entry.path.clone());
                     e.index_number = num.map(i64::from);
                     e.sort_name = Some(season_sort_name(e.index_number, &name));
                     e.series_id = Some(guid_to_db(series_id));
@@ -9249,7 +9763,7 @@ impl LibraryScanner {
                         out,
                     );
                 } else {
-                    // A non-season subfolder (extras, etc.): collect its videos as
+                    // A non-season subfolder: collect its videos as
                     // loose episodes (grouped into virtual seasons below).
                     self.collect_videos(&entry.path, ctx, &mut loose);
                 }
@@ -9395,7 +9909,18 @@ impl LibraryScanner {
         out: &mut Vec<Planned>,
     ) {
         let naming = ctx.naming;
-        for entry in self.list(dir, ctx) {
+        let owner = season.map_or(series_id, |(id, _)| id);
+        let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
+        let entries = self.list(dir, ctx);
+        let extras = if owner_dir.as_deref() == Some(dir) {
+            self.plan_tv_extras(&entries, dir, owner, cf, ctx, out)
+        } else {
+            std::collections::HashSet::new()
+        };
+        for entry in entries {
+            if extras.contains(&entry.path) {
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
                     continue;
@@ -10740,12 +11265,12 @@ fn planner_resolves(item_type: &str) -> bool {
     )
 }
 
-/// The directories a plan pass could not list. Looked up by a path's
-/// ancestors, so a mount that dropped thousands of directories costs each
-/// row the prune checks its path depth, not the whole list.
-struct Unlisted<'a>(std::collections::HashSet<&'a str>);
+/// A set of paths and their descendants. Used for unavailable directories
+/// and confirmed discovery exclusions; each membership check costs only the
+/// path depth, even when thousands of entries were excluded or unavailable.
+struct PathRoots<'a>(std::collections::HashSet<&'a str>);
 
-impl<'a> Unlisted<'a> {
+impl<'a> PathRoots<'a> {
     fn of(dirs: &'a [String]) -> Self {
         Self(
             dirs.iter()
@@ -10795,39 +11320,119 @@ fn path_is_under(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Resolves which movie an extra belongs to: a movie in the extra's own
-/// directory whose file stem prefixes the extra's (`Movie-trailer.mkv` beside
-/// `Movie.mkv`), the directory's single movie, or the parent directory's
-/// single movie (`Movie (2020)/trailers/x.mkv`). Mirrors upstream's ownership
-/// (extras attach to the item owning their folder).
+/// MovieResolver.FindMovie accepts one resolved movie (including versions)
+/// and no ordinary subdirectories. Only such a movie searches its containing
+/// folder for extras (BaseItem.SearchesContainingFolderForExtras).
+fn movie_in_own_folder(
+    entries: &[FileSystemEntryInfo],
+    naming: &NamingOptions,
+    root: &str,
+    parse_name: bool,
+) -> Option<ferrofin_naming::video::VideoInfo> {
+    if entries.iter().any(|e| {
+        e.type_ == FileSystemEntryType::Directory
+            && !naming
+                .all_extras_types_folder_names
+                .contains_key(&e.name.to_lowercase())
+    }) {
+        return None;
+    }
+    let videos: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.type_ != FileSystemEntryType::Directory
+                && !video_resolver::is_sample_filename(&e.name)
+        })
+        .filter_map(|e| {
+            video_resolver::resolve(Some(&e.path), false, naming, parse_name, Some(root))
+        })
+        .collect();
+    let movies = ferrofin_naming::video::VideoListResolver::new(naming).resolve(
+        &videos,
+        true,
+        parse_name,
+        Some(root),
+        Some(ferrofin_model::data::CollectionType::movies),
+    );
+    let mut titles = movies
+        .into_iter()
+        .filter(|movie| movie.extra_type.is_none());
+    let movie = titles.next()?;
+    titles.next().is_none().then_some(movie)
+}
+
+/// Video.GetOwnerIdForExtra selects the longest version-name prefix with a
+/// delimiter boundary, otherwise the primary title. Only eligible folders
+/// enter the map; a stack contributes its first part, not each raw file.
 fn owner_for_extra(
     path: &str,
     movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
 ) -> Option<Uuid> {
-    let dir = std::path::Path::new(path)
-        .parent()?
-        .to_string_lossy()
-        .into_owned();
-    let stem = file_stem(path);
-    if let Some(movies) = movies_by_dir.get(&dir) {
-        if let Some((id, _)) = movies
-            .iter()
-            .find(|(_, movie_stem)| stem.to_lowercase().starts_with(&movie_stem.to_lowercase()))
-        {
-            return Some(*id);
+    let dir = Path::new(path).parent()?;
+    if let Some(movies) = dir.to_str().and_then(|dir| movies_by_dir.get(dir)) {
+        let stem = file_stem(path).to_lowercase();
+        let mut owner = movies.first()?.0;
+        let mut matched = 0;
+        for (id, name) in movies {
+            let name = name.to_lowercase();
+            if name.len() > matched
+                && let Some(rest) = stem.strip_prefix(&name)
+                && rest.starts_with([' ', '-', '_', '.'])
+            {
+                owner = *id;
+                matched = name.len();
+            }
         }
-        if let [(id, _)] = movies.as_slice() {
-            return Some(*id);
-        }
+        return Some(owner);
     }
-    let parent = std::path::Path::new(&dir)
-        .parent()?
-        .to_string_lossy()
-        .into_owned();
-    match movies_by_dir.get(&parent).map(Vec::as_slice) {
-        Some([(id, _)]) => Some(*id),
-        _ => None,
+    movies_by_dir
+        .get(dir.parent()?.to_str()?)?
+        .first()
+        .map(|(id, _)| *id)
+}
+
+/// `ExtraResolver.TryGetExtraTypeForOwner`: filename prefix first, then
+/// containing folder (one level higher only for a directory-name rule).
+fn extra_matches_owner(
+    path: &str,
+    rule: ferrofin_naming::video::ExtraRuleType,
+    owner: &ferrofin_naming::video::VideoFileInfo,
+    naming: &NamingOptions,
+) -> bool {
+    fn trimmed(value: &str, delimiters: &[char]) -> String {
+        ferrofin_util::string_extensions::upper_invariant(
+            value.trim_end().trim_end_matches(delimiters).trim_end(),
+        )
     }
+    let extra = video_resolver::clean_date_time(&file_stem(path), naming);
+    let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
+    let owner_file = trimmed(&file_stem(&owner.path), &naming.video_flag_delimiters);
+    let owner_name = trimmed(&owner.name, &naming.video_flag_delimiters);
+    if (!owner_file.is_empty() && extra_name.starts_with(&owner_file))
+        || (!owner_name.is_empty()
+            && extra_name.starts_with(&owner_name)
+            && extra.year == owner.year)
+    {
+        return true;
+    }
+    let parent = Path::new(path)
+        .parent()
+        .and_then(|parent| {
+            if rule == ferrofin_naming::video::ExtraRuleType::DirectoryName {
+                parent.parent()
+            } else {
+                Some(parent)
+            }
+        })
+        .and_then(Path::to_str);
+    let owner_dir = if owner.is_directory {
+        Some(owner.path.as_str())
+    } else {
+        Path::new(&owner.path).parent().and_then(Path::to_str)
+    };
+    parent
+        .zip(owner_dir)
+        .is_some_and(|(parent, owner)| parent.eq_ignore_ascii_case(owner))
 }
 
 /// The three stat timestamps the creation-time rule reads.
@@ -11873,6 +12478,9 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     if !scanned.type_.ends_with(".Book") {
         row.series_name.clone_from(&scanned.series_name);
     }
+    if scanned.owner_id.is_some() {
+        row.series_presentation_unique_key = None;
+    }
     if scanned.series_presentation_unique_key.is_some() {
         row.series_presentation_unique_key
             .clone_from(&scanned.series_presentation_unique_key);
@@ -11914,6 +12522,31 @@ fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> Peopl
 }
 
 fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
+    apply_episode_title(entity, d.name.as_deref());
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&d.original_title);
+    }
+    if entity.original_language.is_none() {
+        entity.original_language.clone_from(&d.original_language);
+    }
+    merge_multi_value(&mut entity.tags, &d.tags);
+    merge_multi_value(&mut entity.production_locations, &d.production_locations);
+    if entity.end_date.is_none() {
+        entity.end_date = d.end_date.as_deref().and_then(parse_ymd);
+    }
+    if entity.type_.ends_with(".Series") {
+        fill_runtime(entity, d.runtime_minutes);
+    }
+    fill_provider_data(
+        entity,
+        "HomePageUrl",
+        d.home_page_url.as_ref().map(|v| serde_json::json!(v)),
+    );
+    fill_provider_data(
+        entity,
+        "CollectionName",
+        d.collection_name.as_ref().map(|v| serde_json::json!(v)),
+    );
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
@@ -12142,6 +12775,17 @@ fn apply_omdb(
     english: bool,
     us: bool,
 ) {
+    if english {
+        apply_episode_title(entity, item.title.as_deref());
+    }
+    if entity.original_language.is_none() {
+        entity.original_language = item.original_language();
+    }
+    fill_provider_data(
+        entity,
+        "HomePageUrl",
+        item.website.as_ref().map(|v| serde_json::json!(v)),
+    );
     if entity.overview.is_none() {
         entity.overview.clone_from(&item.plot);
     }
@@ -12202,9 +12846,39 @@ fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
 // if per-region ratings matter.
 const METADATA_COUNTRY: &str = "usa";
 
+/// Fills a provider-owned serialized property without reserializing a no-op.
+fn fill_provider_data(entity: &mut BaseItemEntity, key: &str, value: Option<serde_json::Value>) {
+    let Some(value) = value.filter(|v| !v.is_null() && v.as_str().is_none_or(|s| !s.is_empty()))
+    else {
+        return;
+    };
+    let mut data = crate::item_data::parse_data(entity.data.as_deref());
+    if data
+        .get(key)
+        .is_none_or(|v| v.is_null() || v.as_str() == Some(""))
+    {
+        data.insert(key.to_owned(), value);
+        entity.data = Some(serde_json::Value::Object(data).to_string());
+    }
+}
+
+/// Series have no playable file from which to probe a duration.
+fn fill_runtime(entity: &mut BaseItemEntity, minutes: Option<i32>) {
+    if entity.run_time_ticks.is_none() {
+        entity.run_time_ticks = minutes
+            .filter(|m| *m > 0)
+            .map(|m| i64::from(m) * 600_000_000);
+    }
+}
+
 /// Applies matched TheTVDB **series** fields to the row, filling only what is
 /// still empty (a local NFO or prior scan wins), mirroring [`apply_details`].
 fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSeriesDetails) {
+    apply_episode_title(entity, d.name.as_deref());
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&d.name);
+    }
+    fill_runtime(entity, d.runtime_minutes);
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
@@ -12290,6 +12964,16 @@ fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
 /// everything except the title, where the provider outranks the resolver's
 /// filename placeholder).
 fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbEpisodeDetails) {
+    if entity.original_title.is_none() {
+        entity.original_title.clone_from(&d.name);
+    }
+    for (key, value) in [
+        ("AirsBeforeEpisodeNumber", d.airs_before_episode),
+        ("AirsAfterSeasonNumber", d.airs_after_season),
+        ("AirsBeforeSeasonNumber", d.airs_before_season),
+    ] {
+        fill_provider_data(entity, key, value.map(|v| serde_json::json!(v)));
+    }
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
     }
@@ -12472,9 +13156,8 @@ fn append_fanart(images: &mut Vec<RemoteImage>, fanart: Vec<ferrofin_providers::
 /// Appends OMDb's poster as a `Primary` candidate, when the library enabled the
 /// OMDb image fetcher and the metadata pass captured a poster URL for the item.
 ///
-/// Always appended **last** so [`dedup_images_by_type`] keeps it only when no
-/// better provider supplied a Primary — C# gives `OmdbImageProvider` `Order = 90`
-/// for the same reason.
+/// OMDb defaults to the last position (`OmdbImageProvider.Order = 90`). The
+/// caller ranks this candidate with the other providers before downloading.
 fn append_omdb_poster(
     images: &mut Vec<RemoteImage>,
     entity: &BaseItemEntity,
@@ -12493,7 +13176,17 @@ fn append_omdb_poster(
     }
 }
 
-/// Keeps the first image of each type (the primary provider's, then fanart's
+/// Orders provider results before choosing an image of each type.
+fn ordered_remote_images(
+    mut sources: Vec<(&str, Vec<RemoteImage>)>,
+    policy: FetcherPolicy<'_>,
+    kind: &str,
+) -> Vec<RemoteImage> {
+    sources.sort_by_key(|(name, _)| policy.image_order(kind, name));
+    sources.into_iter().flat_map(|(_, images)| images).collect()
+}
+
+/// Keeps the first image of each type (the preferred provider's, then others'
 /// best per type after its sort), so the one-file-per-type downloader emits no
 /// duplicate rows.
 fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
@@ -13007,6 +13700,212 @@ mod tests {
     /// `StringComparer.OrdinalIgnoreCase`, which folds one char to one char and
     /// leaves the non-1:1 mappings alone. `str::to_lowercase` (the full Unicode
     /// mapping) is a different comparer, and these are the pairs where they part.
+
+    #[test]
+    fn provider_fields_fill_gaps_and_repeated_answers_do_not_change_data() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let mut row = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            ..Default::default()
+        };
+        let details = ferrofin_providers::TmdbDetails {
+            name: Some("Title".into()),
+            original_title: Some("Original".into()),
+            original_language: Some("ja".into()),
+            tags: vec!["keyword".into()],
+            production_locations: vec!["Japan".into()],
+            home_page_url: Some("https://example.org".into()),
+            end_date: Some("2020-01-02".into()),
+            collection_name: Some("Collection".into()),
+            runtime_minutes: Some(42),
+            ..Default::default()
+        };
+        super::apply_details(&mut row, &details);
+        assert_eq!(row.name.as_deref(), Some("Title"));
+        assert_eq!(row.original_title.as_deref(), Some("Original"));
+        assert_eq!(row.original_language.as_deref(), Some("ja"));
+        assert_eq!(row.tags.as_deref(), Some("keyword"));
+        assert_eq!(row.production_locations.as_deref(), Some("Japan"));
+        assert_eq!(row.run_time_ticks, Some(25_200_000_000));
+        assert!(row.end_date.is_some());
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(data["HomePageUrl"], "https://example.org");
+        assert_eq!(data["CollectionName"], "Collection");
+        let before = row.clone();
+        super::apply_details(&mut row, &details);
+        assert_eq!(row, before);
+        // The next provider may fill gaps, but cannot overwrite these fields.
+        let omdb = serde_json::from_str(
+            r#"{"Title":"Other","Language":"English, French","Website":"https://other.org"}"#,
+        )
+        .unwrap();
+        super::apply_omdb(&mut row, &omdb, true, true);
+        assert_eq!(row, before);
+        let mut empty = BaseItemEntity::default();
+        super::apply_omdb(&mut empty, &omdb, false, false);
+        assert!(empty.name.is_none(), "OMDb titles are English-only");
+        assert_eq!(empty.original_language.as_deref(), Some("English"));
+        assert_eq!(
+            crate::item_data::parse_data(empty.data.as_deref())["HomePageUrl"],
+            "https://other.org"
+        );
+        let tvdb = ferrofin_providers::TvdbSeriesDetails {
+            name: Some("TVDB title".into()),
+            runtime_minutes: Some(60),
+            ..Default::default()
+        };
+        super::apply_tvdb_series(&mut row, &tvdb);
+        assert_eq!(row, before);
+        let mut ep = BaseItemEntity::default();
+        let tvdb = ferrofin_providers::TvdbEpisodeDetails {
+            name: Some("Special".into()),
+            airs_before_episode: Some(2),
+            airs_after_season: Some(0),
+            airs_before_season: Some(1),
+            ..Default::default()
+        };
+        super::apply_tvdb_episode(&mut ep, &tvdb);
+        assert_eq!(ep.original_title.as_deref(), Some("Special"));
+        let data = crate::item_data::parse_data(ep.data.as_deref());
+        assert_eq!(data["AirsBeforeEpisodeNumber"], 2);
+        assert_eq!(data["AirsAfterSeasonNumber"], 0);
+        assert_eq!(data["AirsBeforeSeasonNumber"], 1);
+        let before = ep.clone();
+        super::apply_tvdb_episode(&mut ep, &tvdb);
+        assert_eq!(ep, before);
+    }
+
+    #[test]
+    fn artwork_uses_fanart_first_unless_the_library_overrides_it() {
+        use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_providers::library_options::fetcher_names;
+        let sources = || {
+            vec![
+                (
+                    fetcher_names::TMDB,
+                    vec![super::RemoteImage {
+                        image_type: ImageType::Primary,
+                        url: "tmdb".into(),
+                    }],
+                ),
+                (
+                    fetcher_names::FANART,
+                    vec![super::RemoteImage {
+                        image_type: ImageType::Primary,
+                        url: "fanart".into(),
+                    }],
+                ),
+            ]
+        };
+        let choose = |policy: super::FetcherPolicy<'_>, kind: &str| {
+            super::dedup_images_by_type(super::ordered_remote_images(sources(), policy, kind))[0]
+                .url
+                .clone()
+        };
+        for kind in ["Movie", "Series"] {
+            assert_eq!(choose(super::FetcherPolicy::default(), kind), "fanart");
+            let options = LibraryOptions {
+                type_options: vec![TypeOptions {
+                    type_: Some(kind.into()),
+                    image_fetcher_order: vec![
+                        fetcher_names::TMDB.into(),
+                        fetcher_names::FANART.into(),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert_eq!(
+                choose(
+                    super::FetcherPolicy {
+                        options: Some(&options),
+                        ..Default::default()
+                    },
+                    kind
+                ),
+                "tmdb"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tvdb_resolves_external_ids_before_a_name_search() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let base = spawn_tvdb_server(
+            Some(r#"{"data":[{"series":{"id":81189}}]}"#),
+            Some(
+                r#"{"data":{"name":"Breaking Bad","slug":"breaking-bad","remoteIds":[{"sourceName":"Zap2It","id":"EP123"}],"lists":[{"id":9,"isOfficial":true}]}}"#,
+            ),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _) = tmdb_episode_fixture("http://127.0.0.1:1", tmp.path()).await;
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&base),
+        ));
+        for source in ["Imdb", "Zap2It", "Tmdb"] {
+            let mut row = BaseItemEntity {
+                id: "SERIES".into(),
+                ..Default::default()
+            };
+            let result = scanner
+                .fetch_tvdb_metadata(
+                    &mut row,
+                    "Series",
+                    &mut cache,
+                    &[(source.into(), "123".into())],
+                    &super::ResolverGuesses::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(
+                result
+                    .provider_ids
+                    .contains(&("Tvdb".into(), "81189".into()))
+            );
+            assert!(
+                result
+                    .provider_ids
+                    .contains(&("TvdbSlug".into(), "breaking-bad".into()))
+            );
+            assert!(
+                result
+                    .provider_ids
+                    .contains(&("TvdbCollection".into(), "9;".into()))
+            );
+            assert!(
+                result
+                    .provider_ids
+                    .contains(&("Zap2It".into(), "EP123".into()))
+            );
+        }
+        let base = spawn_tvdb_server(
+            Some(r#"{"data":[{"tvdb_id":"1","name":"Wrong show"}]}"#),
+            None,
+        );
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&base),
+        ));
+        let mut row = BaseItemEntity {
+            name: Some("Wrong show".into()),
+            ..Default::default()
+        };
+        assert!(
+            scanner
+                .fetch_tvdb_metadata(
+                    &mut row,
+                    "Series",
+                    &mut cache,
+                    &[("Imdb".into(), "tt404".into())],
+                    &super::ResolverGuesses::default(),
+                    false,
+                )
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn ordinal_ignore_case_matches_dotnet_not_full_case_mapping() {
         let key = super::ordinal_ignore_case_key;
@@ -14169,6 +15068,49 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn artwork_falls_back_after_a_failed_preferred_download() {
+        use ferrofin_model::entities::ImageType;
+        use std::collections::HashSet;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn_art_server("", b"FALLBACK");
+        let tmdb = ferrofin_providers::TmdbClient::new();
+        let images = || {
+            vec![
+                super::RemoteImage {
+                    image_type: ImageType::Primary,
+                    url: "http://127.0.0.1:9/absent".into(),
+                },
+                super::RemoteImage {
+                    image_type: ImageType::Primary,
+                    url: format!("{base}/fallback"),
+                },
+                super::RemoteImage {
+                    image_type: ImageType::Primary,
+                    url: "http://127.0.0.1:9/unused".into(),
+                },
+            ]
+        };
+        for replace in [None, Some(HashSet::new())] {
+            let infos =
+                super::download_remote_images(&tmdb, tmp.path(), "ID", images(), replace.as_ref())
+                    .await;
+            assert_eq!(infos.len(), 1);
+            assert_eq!(std::fs::read(&infos[0].path).unwrap(), b"FALLBACK");
+        }
+        // When both providers fail, one reference to the stored image survives.
+        let infos = super::download_remote_images(
+            &tmdb,
+            tmp.path(),
+            "ID",
+            vec![images()[0].clone(), images()[2].clone()],
+            Some(&HashSet::new()),
+        )
+        .await;
+        assert_eq!(infos.len(), 1);
+        assert_eq!(std::fs::read(&infos[0].path).unwrap(), b"FALLBACK");
     }
 
     /// `ReplaceAllImages` re-downloads over what an earlier download or an
@@ -16175,6 +17117,7 @@ mod tests {
             production_year: Some(2011),
             image_url: Some("https://artworks.thetvdb.com/s.jpg".into()),
             people: Vec::new(),
+            ..Default::default()
         };
         // Blank name → filled.
         let mut blank = BaseItemEntity::default();
@@ -16357,7 +17300,12 @@ mod tests {
                 // body is a MISS — a real non-2xx, not an empty 200, so the
                 // caller's failure branch is the one under test.
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let (status, payload) = if req.contains("/credits") {
+                let episode_payload = credits.map(|c| format!("{{\"credits\":{c}}}"));
+                let (status, payload) = if req.contains("/episode/") && !req.contains("/credits") {
+                    episode_payload
+                        .as_deref()
+                        .map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/credits") {
                     credits.map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
                 } else if req.contains("/season/") {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -23070,7 +24018,7 @@ mod tests {
 
     // Extras (suffix- and directory-classified) become OWNED rows attached to
     // their movie, never Movie rows — feeding /LocalTrailers and the
-    // hasTrailer/… filters while staying out of the library grid.
+    // hasTrailer/… filters. Parent/top-parent scope keeps them out of browse.
     #[tokio::test]
     async fn scan_attaches_extras_to_their_movie() {
         use ferrofin_model::data::BaseItemKind;

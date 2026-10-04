@@ -10,7 +10,7 @@ Jellyfin's own apt repository.
 | `/usr/bin/ferrofin-server` | the binary (the `.deb` puts it here) |
 | `/etc/ferrofin/config.toml` | configuration ([`docs/CONFIG.md`](CONFIG.md)); a conffile, never overwritten on upgrade |
 | `/lib/systemd/system/ferrofin.service` | the unit ([`contrib/systemd/ferrofin.service`](../contrib/systemd/ferrofin.service)) |
-| `/var/lib/ferrofin/data` | `jellyfin.db`, `cache/` (transcodes), `log/`, `plugins/`, `config/` |
+| `/var/lib/ferrofin` | `jellyfin.db`, `cache/` (transcodes), `log/`, `plugins/`, `config/` |
 | `/usr/lib/jellyfin-ffmpeg/` | jellyfin-ffmpeg (`ffmpeg`, `ffprobe`), from the `jellyfin-ffmpeg8` package |
 | `/usr/share/jellyfin/web/` | jellyfin-web's built client, from the `jellyfin-web` package, served at `/web` |
 
@@ -43,12 +43,17 @@ Download the `.deb` for your architecture from the
 `jellyfin-ffmpeg8` and `jellyfin-web` with it:
 
 ```sh
-V=1.0.1; A=amd64                                  # or arm64
+V=$(curl -fsSL https://api.github.com/repos/mangoleaf/ferrofin/releases/latest \
+  | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')   # latest release, without its v
+A=$(dpkg --print-architecture)                        # amd64 or arm64
 curl -fsSLO "https://github.com/mangoleaf/ferrofin/releases/download/v$V/ferrofin_${V}_$A.deb"
 sudo apt-get install -y "./ferrofin_${V}_$A.deb"
 ```
 
-The package creates the `ferrofin` system user and `/var/lib/ferrofin/data`, installs the
+v1.3.1 is the only release whose packages are named `ferrofin_1.3.1-1_$A.deb`
+([#36](https://github.com/mangoleaf/ferrofin/issues/36)); apt upgrades from it normally.
+
+The package creates the `ferrofin` system user and `/var/lib/ferrofin`, installs the
 unit, and **does not enable or start it**: configure a password or be ready to complete
 the web setup wizard on first boot. Give the `ferrofin` user read access to your
 media, typically by adding it to the group that owns the library. Keep the service stopped
@@ -68,7 +73,7 @@ sha256sum -c "ferrofin-$V-$T.tar.gz.sha256"
 tar xzf "ferrofin-$V-$T.tar.gz"
 sudo install -m 755 "ferrofin-$V-$T/ferrofin-server" /usr/local/bin/ferrofin-server
 sudo useradd --system --user-group --home /var/lib/ferrofin --shell /usr/sbin/nologin ferrofin
-sudo install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
+sudo install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin
 sudo install -d /etc/ferrofin
 sudo install -o root -g ferrofin -m 640 contrib/debian/config.toml /etc/ferrofin/config.toml
 sudo install -m 644 contrib/systemd/ferrofin.service /etc/systemd/system/ferrofin.service
@@ -84,20 +89,10 @@ fresh-install or migration procedure below before starting it.
 
 ## 3. The unit
 
-The unit runs with `ProtectSystem=strict`: the filesystem is read-only except
-`/var/lib/ferrofin/data`. Scans and playback only read media, so that is enough for most
-installs. If you enable deleting items or saving metadata/images into the library from the
-UI, add that library to `ReadWritePaths=` in a drop-in:
-
-```sh
-sudo systemctl edit ferrofin      # opens an override; add:
-# [Service]
-# ReadWritePaths=/srv/media
-```
-
-For VAAPI/QSV hardware transcoding uncomment the `DeviceAllow=` and
-`SupplementaryGroups=` lines the same way. The unit names ffmpeg, ffprobe and the web
-client explicitly through `FERROFIN_FFMPEG_PATH`, `FERROFIN_FFPROBE_PATH` and
+The unit runs as the `ferrofin` user with no extra sandboxing, like Jellyfin's own unit.
+It adds the `render` group (`SupplementaryGroups=render`) so VAAPI/QSV transcoding can open
+`/dev/dri/renderD*` without changing the user's group membership. The unit names ffmpeg, ffprobe
+and the web client explicitly through `FERROFIN_FFMPEG_PATH`, `FERROFIN_FFPROBE_PATH` and
 `FERROFIN_WEB_DIR`, because systemd's `PATH` does not include `/usr/lib/jellyfin-ffmpeg`
 and discovery would otherwise land on Debian's `/usr/bin/ffmpeg`.
 
@@ -136,75 +131,52 @@ identify the seven tested fixture paths and the server image used.
 The gate checks the exact migration history and refuses unknown or incomplete histories;
 support does not extend automatically to other 10.11.x or 12.x releases. Upgrade an older
 installation to a supported version under Jellyfin before copying it; do not edit migration
-history to bypass the check. Adoption is one-way: keep a full backup to return to Jellyfin.
+history to bypass the check. Keep the original Jellyfin installation intact until Ferrofin
+has been verified so you can roll back if needed.
 
-#### Stop both servers and copy the complete state
+#### Stop both servers and copy the Jellyfin state
 
-Keep Jellyfin and Ferrofin stopped throughout the copy. The example below uses the Debian
-package layout: all data in `/var/lib/jellyfin`, with configuration stored separately in
-`/etc/jellyfin`. Change both source paths for your installation. For Docker, stop the
-container and use the host paths of its data/config mounts; layouts vary by image.
+Install `rsync` and stop both services before copying. Run the checked-in script from a
+Ferrofin checkout. It uses the Debian package paths by default and assigns the copied files
+to the `ferrofin` user. Ferrofin's `data_dir` has the same layout as Jellyfin's
+`/var/lib/jellyfin`, so each path keeps its relative position; the `data/` inside each
+holds the database, playlists and collections:
 
-Copy **all files**, including hidden files, from the entire data and configuration
-directories. Preserve the directory structure: `data/jellyfin.db` can stay nested because
-Ferrofin detects that layout. Include the database's `-wal` and `-shm` companions when
-present. Do not copy a database while either server is writing to it.
+| Jellyfin | Ferrofin | Contents |
+|---|---|---|
+| `/var/lib/jellyfin/data/jellyfin.db` (and `-wal`/`-shm`) | `{data_dir}/data/` | the database |
+| `/var/lib/jellyfin/data/playlists/`, `collections/` | `{data_dir}/data/` | playlist and collection folders |
+| `/var/lib/jellyfin/root/default/` | `{data_dir}/root/default/` | library definitions |
+| `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
+| `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
+
+The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
+sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
+`config.toml` and stays read-only to the service.
+
+The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`. `root/default/` holds
+only the library definitions (`.mblink` files naming each media path); media stays where
+it is.
 
 ```sh
-sudo sh <<'SH'
-set -eu
-systemctl stop jellyfin ferrofin
-source_data=/var/lib/jellyfin
-source_config=/etc/jellyfin
-destination=/var/lib/ferrofin/data
-
-test -d "$source_data"
-test -d "$source_config"
-test -f "$source_data/data/jellyfin.db" || test -f "$source_data/jellyfin.db"
-test -f "$source_config/system.xml"
-test -f "$source_config/network.xml"
-
-# An independent backup, readable only by root. Originals are left in place.
-backup=$(mktemp -d /var/lib/ferrofin-migration.XXXXXX)
-printf 'Migration backup: %s\n' "$backup"
-mkdir "$backup/jellyfin-data" "$backup/jellyfin-config"
-cp -a "$source_data/." "$backup/jellyfin-data/"
-cp -a "$source_config/." "$backup/jellyfin-config/"
-
-# Preserve a previous Ferrofin installation, including its DB, WAL and JSON.
-# Mixing it into the copy would cause its database/settings to win on startup.
-if [ -e "$destination" ]; then
-    mv "$destination" "$backup/previous-ferrofin-data"
-fi
-mkdir -p "$destination"
-cp -a "$backup/jellyfin-data/." "$destination/"
-# A copied config symlink must not send writes back into the original install.
-if [ -L "$destination/config" ]; then
-    mv "$destination/config" "$backup/copied-config-symlink"
-fi
-mkdir -p "$destination/config"
-cp -a "$backup/jellyfin-config/." "$destination/config/"
-chown -R ferrofin:ferrofin "$destination"
-SH
+sudo systemctl stop jellyfin ferrofin
+sudo apt-get install -y rsync
+sudo scripts/migrate-jellyfin.sh
 ```
 
-If a preflight check fails, verify the source paths and locate the missing file before
-continuing. If the destination is a mount point, use a separate empty destination and
-update `data_dir` and the unit's writable paths instead of moving the mount point.
+The script must run after installing Ferrofin but before its first start. It refuses to
+copy over an existing Ferrofin database, because `--ignore-existing` would otherwise
+silently keep that database instead of adopting Jellyfin's. It leaves the original
+Jellyfin files untouched. For Docker or other non-Debian layouts, `--help` lists the options
+for the Jellyfin and Ferrofin directories.
 
-This copies library definitions (`root/default/`), metadata and images (`metadata/`),
-playlists, plugin files, and configuration alongside the database. Jellyfin .NET plugins
-are retained in the copy but cannot run in Ferrofin; they require Ferrofin-compatible
-replacements. A copied symbolic link still points at its original target: separately back
-up any external state directories and arrange access to them. Include any separately
-configured cache, metadata, or configuration directories in your backup as well.
-
-The destination's `config/` is Ferrofin's default `config_dir` for this guide. If you set
-`config_dir` explicitly, copy the configuration there instead, using a clean destination.
-`network.xml` is essential: it carries remote-access policy, IP filters, trusted proxies,
-and local-network definitions. Omitting it restores defaults, including remote access
-enabled and an empty IP filter. Existing Ferrofin JSON takes precedence over copied XML,
-which is why the example preserves the previous destination and starts with a clean one.
+Jellyfin .NET plugins cannot run in Ferrofin; they require Ferrofin-compatible
+replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies, and
+local-network definitions. A copied symbolic link still points at its original target, so
+ensure any linked external state remains available to Ferrofin. If Jellyfin uses custom
+cache, metadata, or configuration paths, copy those separately to the configured Ferrofin
+paths.
 
 #### Unicode usernames
 
@@ -246,9 +218,9 @@ The copy includes all source files, but only settings supported by Ferrofin are 
 review warnings about unsupported fields. Keep Jellyfin stopped while Ferrofin uses the
 same media paths, and prevent its service/container from automatically restarting.
 
-Adoption is one-way. To roll back, stop Ferrofin and restart Jellyfin against its untouched
-original state, or restore the full backup while both are stopped. Do not point Jellyfin
-at the adopted database. Changes made in Ferrofin after migration are not copied back.
+Adoption is one-way. To roll back before retiring Jellyfin, stop Ferrofin and restart
+Jellyfin against its untouched original state. Do not point Jellyfin at the adopted
+database. Changes made in Ferrofin after migration are not copied back.
 See [`docs/UPGRADING.md`](UPGRADING.md).
 
 ## Upgrading

@@ -57,7 +57,8 @@ Deep-verified against a real Jellyfin server:
   `boxsets` is the one library type not resolved off disk (its members are curated through
   the collection API). A rescan reprocesses only what changed (an unchanged library is not
   re-probed, re-fetched or re-saved); [`verify/`](../verify/README.md) checks that against
-  any running server.
+  any running server. Movie and episode probes download missing subtitles in the
+  library's configured languages, respecting existing subtitles and provider settings.
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
@@ -115,10 +116,10 @@ Wired and working, with a documented limitation or lighter verification:
   that ticked them under "Similarity providers", and resolve against items already in the
   library. The local scorer is a single query rather than upstream's six per-kind
   providers, which are identical in behaviour.
-- **Remote metadata providers** (TMDB / TVDB / MusicBrainz / AudioDb / fanart / Studio Images)
+- **Remote metadata providers** (TMDB / OMDb / TVDB / MusicBrainz / AudioDb / fanart / Studio Images)
   — compiled in and **on by default** with built-in keys, gated per library by the
-  "Metadata downloaders" / "Image fetchers" checkboxes. **OMDb** is the exception: it stays
-  inert until `FERROFIN_OMDB_KEY` (config `omdb_api_key`) is set.
+  "Metadata downloaders" / "Image fetchers" checkboxes. OMDb uses Jellyfin's shared
+  key unless `FERROFIN_OMDB_KEY` (config `omdb_api_key`) supplies an override.
 - **DLNA** — the profile / `StreamBuilder` logic is ported (used for transcode decisions), but
   there is no DLNA **server** side.
 - **Books / audiobooks** — a `books` library resolves documents (`.azw .azw3 .cb7 .cbr .cbt

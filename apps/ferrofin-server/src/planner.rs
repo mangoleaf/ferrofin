@@ -36,6 +36,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoding_helper::helper::{
+    is_video_encoding_disallowed, shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
+};
 use ferrofin_mediaencoding::encoding_helper::hw;
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
@@ -381,14 +384,23 @@ fn hardware_encodes(
 /// only software libx264 (h264) is realtime-viable — software av1/vp9/hevc
 /// (libaom-av1 etc.) run far below realtime and stall the player — so we fall
 /// back to the broadly-compatible h264. A bare `copy` request is honoured.
+///
+/// Skipping a non-realtime preference must not land on a codec the encoding
+/// options forbid (`vp9,av1,h264` with AV1 disallowed is h264, not av1), so a
+/// disallowed codec is only a candidate when the client lists nothing else,
+/// which is when `ShiftVideoCodecsIfNeeded` also leaves the order alone.
 fn preferred_transcode_video_codec(
     codecs: &[String],
     caps: &FfmpegCapabilities,
     options: &EncodingOptions,
     video_type: Option<VideoType>,
 ) -> String {
+    let any_allowed = codecs
+        .iter()
+        .any(|c| !is_video_encoding_disallowed(c, options));
     codecs
         .iter()
+        .filter(|c| !any_allowed || !is_video_encoding_disallowed(c, options))
         .find(|c| {
             EncodingJobInfo::is_copy_codec(Some(c))
                 || c.eq_ignore_ascii_case("h264")
@@ -633,8 +645,12 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // `-c:a` encoder name, so it must be resolved to a single codec here — a
         // passed-through list makes ffmpeg exit immediately and the whole
         // transcode (hence playback) fails.
-        let video_codecs = split_codecs(request.video_codec.as_deref());
-        let audio_codecs = split_codecs(request.audio_codec.as_deref());
+        let mut video_codecs = split_codecs(request.video_codec.as_deref());
+        let mut audio_codecs = split_codecs(request.audio_codec.as_deref());
+        // `AttachMediaSourceInfo`: codecs the server may not or should not
+        // produce drop to the end, so they are neither the target nor preferred.
+        shift_video_codecs_if_needed(&mut video_codecs, &options);
+        shift_audio_codecs_if_needed(&mut audio_codecs, audio_stream.as_ref());
 
         // The requested/target codecs (defaulting to the broadly-compatible
         // h264/aac). A `copy` request is honoured verbatim. The video target is
@@ -651,7 +667,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             media_source.video_type,
         );
         let requested_audio_codec = audio_codecs
-            .first()
+            .iter()
+            .find(|c| self.encoding_helper.can_encode_to_audio_codec(c))
+            .or_else(|| audio_codecs.first())
             .cloned()
             .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
 
@@ -2257,10 +2275,13 @@ mod tests {
     #[test]
     fn transcode_target_prefers_client_order_with_nvenc() {
         // With NVENC the hardware encodes av1/hevc/h264, so the client's top pick
-        // (av1 — keeping 10-bit HDR) is honoured instead of forcing h264.
+        // (av1 — keeping 10-bit HDR) is honoured instead of forcing h264, once
+        // the options allow AV1 and HEVC encoding.
         let nv = EncodingOptions {
             enable_hardware_encoding: true,
             hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            allow_av1_encoding: true,
+            allow_hevc_encoding: true,
             ..EncodingOptions::default()
         };
         let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
@@ -3627,6 +3648,70 @@ mod tests {
             enable_intel_low_power_h264_hw_encoder: true,
             hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
             ..EncodingOptions::default()
+        }
+    }
+
+    /// The `-c:v` a VAAPI server with `av1_vaapi` in its ffmpeg picks for a
+    /// client's `video_codec` request against an XviD source.
+    async fn vaapi_encoder_for_request(
+        video_codec: &str,
+        allow_av1: bool,
+        allow_hevc: bool,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let caps = FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_vaapi", "hevc_vaapi", "av1_vaapi", "libx264"])
+            .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .os_version(ferrofin_mediaencoding::encoder::FfmpegVersion::new(6, 1))
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("mp3")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            caps,
+            EncodingOptions {
+                allow_av1_encoding: allow_av1,
+                allow_hevc_encoding: allow_hevc,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some(video_codec.to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let pos = plan.arguments.iter().position(|a| a == "-c:v").unwrap();
+        plan.arguments[pos + 1].clone()
+    }
+
+    #[tokio::test]
+    async fn disallowed_encodings_are_not_the_transcode_target() {
+        for (codecs, allow_av1, allow_hevc, expected) in [
+            ("av1,hevc,h264", false, true, "hevc_vaapi"),
+            ("av1,hevc,h264", false, false, "h264_vaapi"),
+            ("av1,hevc,h264", true, true, "av1_vaapi"),
+            ("vp9,av1,h264", false, false, "h264_vaapi"),
+            ("vp9,av1,h264", true, false, "av1_vaapi"),
+            ("vp9,hevc,h264", false, false, "h264_vaapi"),
+            ("vp9,hevc,h264", false, true, "hevc_vaapi"),
+            ("vp9,h265,h264", false, false, "h264_vaapi"),
+            ("av1,hevc", false, false, "av1_vaapi"),
+        ] {
+            assert_eq!(
+                vaapi_encoder_for_request(codecs, allow_av1, allow_hevc).await,
+                expected,
+                "{codecs} with AllowAv1Encoding={allow_av1}, AllowHevcEncoding={allow_hevc}"
+            );
         }
     }
 

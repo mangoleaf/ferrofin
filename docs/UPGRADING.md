@@ -8,6 +8,37 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — extras no longer appear as library children
+
+Run **Scan All Libraries** once after upgrading if extras or samples appeared as
+ordinary library items (#32). The scan repairs valid extras' ownership and library
+relationships while retaining their IDs, metadata, artwork, and watch history,
+including locked items. Special features, local trailers, and theme media remain
+available through their owning movie.
+
+The scan also removes database rows for files excluded by Jellyfin's discovery
+rules, including AppleDouble files, ignored directories (#31), and extras in
+folders without an eligible movie owner. It leaves the files on disk. Supported
+sample extras such as `Movie-sample.mkv` remain; `sample.mkv` and
+`Movie.sample.mkv` are ignored. Only successfully scanned locations are cleaned.
+No database reset or forced metadata replacement is needed.
+
+## Unreleased — subtitles download during library scans
+
+Libraries with subtitle download languages now fetch missing subtitles when a movie
+or episode is probed during a normal scan or full metadata refresh. Configure an
+OpenSubtitles account in its plugin settings. The shared application key is built in.
+
+Existing subtitles are retained, and unchanged scans make no subtitle requests.
+Enabling languages for an already scanned library takes effect on its next video
+probe or full refresh; the daily subtitle task also fills missing languages.
+Provider outages leave the media scan and existing subtitles intact.
+
+Both paths now respect provider disabling/order and perfect-match settings. Text
+subtitles already embedded in a video satisfy their language, even when skipping
+embedded image subtitles is disabled. The audio-language skip checks default audio
+tracks, falling back to the first audio track when none is marked default.
+
 ## Unreleased — a database adopted from Jellyfin shows its libraries and removes deleted media
 
 This applies only to a database adopted from a Jellyfin install (a
@@ -104,7 +135,7 @@ The server-wide options ship with Jellyfin's defaults, which turn off:
 - **TheAudioDB** as a metadata downloader for music albums and music artists (its artwork
   stays on). Earlier versions asked it for every album and artist.
 - **The Open Movie Database** as a metadata downloader and image fetcher for music videos
-  (it only runs with `FERROFIN_OMDB_KEY` set).
+  (the library must enable it for those types).
 
 If you customised the server-wide options — their disabled fetchers or their order, stored
 in the server configuration's `MetadataOptions` — those settings now also apply to movies,
@@ -228,3 +259,16 @@ functions that standalone `sqlite3` and `sqlx migrate` do not register. No
 persistent schema objects depend on these functions, so external database
 inspection remains possible after migration. Follow the backup and rollback
 steps above before upgrading.
+
+## Shared provider keys
+
+OMDb now uses Jellyfin's built-in API key when `FERROFIN_OMDB_KEY` / `omdb_api_key`
+is unset or blank. Existing explicit keys still take precedence. Libraries that
+have OMDb enabled can now fetch its metadata and artwork without extra setup;
+to disable it, uncheck its metadata and image fetchers in the library settings.
+This can add provider requests on installations where the checked provider was
+previously inactive because no key was configured.
+
+OpenSubtitles also defaults to Jellyfin's shared application key. Configure your
+OpenSubtitles username and password in its plugin settings; `ApiKey` is optional.
+The shared key does not replace the account required to download subtitles.

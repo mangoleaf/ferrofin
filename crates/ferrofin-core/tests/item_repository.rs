@@ -1130,6 +1130,7 @@ async fn paged_user_data_sort_with_total_count_works() {
     let mut movie_row = item(movie, BaseItemKind::Movie, "Heat");
     movie_row.id = movie_row.id.to_uppercase();
     movie_row.parent_id = Some(library.to_string().to_uppercase());
+    movie_row.top_parent_id.clone_from(&movie_row.parent_id);
     persist
         .save_items(&[lib_row, movie_row])
         .await

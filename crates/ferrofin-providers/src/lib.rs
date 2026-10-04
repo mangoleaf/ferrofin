@@ -5,8 +5,7 @@
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
 //! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
 //! Studio Images) are compiled in unconditionally and gated at runtime by the
-//! per-library fetcher checkboxes — OMDb additionally needs an API key before
-//! it does anything.
+//! per-library fetcher checkboxes, using shared keys where required.
 
 pub mod audiodb;
 pub mod books;

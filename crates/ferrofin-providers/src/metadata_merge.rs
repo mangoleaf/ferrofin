@@ -22,11 +22,10 @@
 //! upstream rule here too, and every other `Data` key is merged key-wise
 //! (never replaced wholesale).
 //!
-//! The one upstream property Ferrofin has no storage for is not merged:
-//! `HomePageUrl`. A credit's `SortOrder` rides on its [`PeopleEntity`] and is
-//! merged by [`merge_people`] (stored as `PeopleBaseItemMap.SortOrder`).
-//! `LockedFields` lives in its own table (`BaseItemMetadataFields`), so it
-//! rides on [`MetadataResult`].
+//! `HomePageUrl` lives in `Data`. A credit's `SortOrder` rides on its
+//! [`PeopleEntity`] and is merged by [`merge_people`] (stored as
+//! `PeopleBaseItemMap.SortOrder`). `LockedFields` lives in its own table
+//! (`BaseItemMetadataFields`), so it rides on [`MetadataResult`].
 //!
 //! It lives here, beside the providers, as upstream's lives in
 //! `MediaBrowser.Providers`: the library scan (`ferrofin-core`) and the
@@ -636,6 +635,7 @@ enum DataRule {
 /// (see [`merge_data_blob`]).
 const DATA_RULES: &[(&str, DataRule)] = &[
     ("RemoteTrailers", DataRule::Trailers),
+    ("HomePageUrl", DataRule::Plain),
     ("DisplayOrder", DataRule::NonBlankSource),
     ("Video3DFormat", DataRule::PresentSource),
     // `SeriesMetadataService.MergeData`.

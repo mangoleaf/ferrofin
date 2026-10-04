@@ -233,6 +233,20 @@ pub struct TmdbDetails {
     /// The title's original language, TMDB's ISO 639-1 `original_language`
     /// (`ja`, `en`, …) — what `BaseItems.OriginalLanguage` stores.
     pub original_language: Option<String>,
+    /// Keyword tags attached to this movie or series.
+    pub tags: Vec<String>,
+    /// Movie production-country names.
+    pub production_locations: Vec<String>,
+    /// Series home page.
+    pub home_page_url: Option<String>,
+    /// Series last air date.
+    pub end_date: Option<String>,
+    /// The movie collection's TMDB id.
+    pub collection_id: Option<i64>,
+    /// The movie collection's name.
+    pub collection_name: Option<String>,
+    /// The series' TVRage id.
+    pub tvrage_id: Option<String>,
     /// Plot synopsis.
     pub overview: Option<String>,
     /// Marketing tagline.
@@ -357,6 +371,12 @@ fn youtube_trailers(videos: Option<VideosResults>) -> Vec<TmdbTrailer> {
 
 #[derive(Debug, Deserialize)]
 struct DetailsResponse {
+    homepage: Option<String>,
+    last_air_date: Option<String>,
+    episode_run_time: Option<Vec<i32>>,
+    production_countries: Option<Vec<NamedEntry>>,
+    keywords: Option<KeywordsResponse>,
+    belongs_to_collection: Option<CollectionRef>,
     /// Movie title.
     #[serde(default)]
     title: Option<String>,
@@ -412,15 +432,106 @@ struct DetailsResponse {
     external_ids: Option<ExternalIds>,
 }
 
+/// Episode fields only available on its detail endpoint.
+#[derive(Debug)]
+pub struct EpisodeExtras {
+    /// IMDb, TVDB and TVRage identities for this episode.
+    pub provider_ids: Vec<(String, String)>,
+    /// Episode trailers.
+    pub trailers: Vec<TmdbTrailer>,
+    /// Credits, absent when the appended credits payload was unavailable.
+    pub people: Option<Vec<TmdbPerson>>,
+}
+
+fn episode_people_from(
+    credits: CreditsResponse,
+    cfg: &crate::plugin_config::TmdbConfig,
+) -> Vec<TmdbPerson> {
+    let mut people = Vec::new();
+    // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
+    // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
+    // `.Take(config.MaxCastMembers)` loops, `:212-267`), so the cap is
+    // per-list here too.
+    let hide_cast = cfg.hide_missing_cast_members;
+    let max_cast = cfg.max_cast_members;
+    let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
+        for c in billed_cast(entries, hide_cast, max_cast) {
+            if c.name.is_empty() {
+                continue;
+            }
+            people.push(TmdbPerson {
+                tmdb_id: c.id,
+                name: c.name,
+                person_type: person_type.to_owned(),
+                role: c.character.filter(|r| !r.is_empty()),
+                // `SortOrder = actor.Order` / `guest.Order`
+                // (`TmdbEpisodeProvider.cs:233,264`).
+                sort_order: Some(c.order),
+                profile_url: c
+                    .profile_path
+                    .filter(|p| !p.is_empty())
+                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+            });
+        }
+    };
+    push_cast(credits.cast, "Actor");
+    push_cast(credits.guest_stars, "GuestStar");
+    for c in credits
+        .crew
+        .into_iter()
+        .filter(|c| crew_person_type(c.job.as_deref()).is_some())
+        .filter(|c| {
+            !cfg.hide_missing_crew_members
+                || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
+        })
+        .take(cfg.max_crew_members)
+    {
+        let Some(person_type) = crew_person_type(c.job.as_deref()) else {
+            continue;
+        };
+        if c.name.is_empty() {
+            continue;
+        }
+        people.push(TmdbPerson {
+            tmdb_id: c.id,
+            name: c.name,
+            person_type: person_type.to_owned(),
+            role: c.job.filter(|r| !r.is_empty()),
+            sort_order: None,
+            profile_url: c
+                .profile_path
+                .filter(|p| !p.is_empty())
+                .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
+        });
+    }
+    people
+}
+
 /// TMDB `external_ids` — the IMDb id (RT lookup key for series) and the TVDB
 /// id, which `TmdbSeriesProvider.MapTvShowToRemoteSearchResult` stamps onto an
 /// Identify result alongside it.
+// Field names mirror TMDB's external_ids payload.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Default, Deserialize)]
 struct ExternalIds {
+    tvrage_id: Option<i64>,
     #[serde(default)]
     imdb_id: Option<String>,
     #[serde(default)]
     tvdb_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionRef {
+    id: Option<i64>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeywordsResponse {
+    // Movies use `keywords`; series use `results`.
+    #[serde(default, alias = "results")]
+    keywords: Vec<NamedEntry>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1510,64 +1621,65 @@ impl TmdbClient {
             return None;
         }
         let credits = resp.counted_json::<CreditsResponse>().await.ok()?;
-        let mut people = Vec::new();
-        // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
-        // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
-        // `.Take(config.MaxCastMembers)` loops, `:212-267`), so the cap is
-        // per-list here too.
-        let hide_cast = cfg.hide_missing_cast_members;
-        let max_cast = cfg.max_cast_members;
-        let mut push_cast = |entries: Vec<CastEntry>, person_type: &str| {
-            for c in billed_cast(entries, hide_cast, max_cast) {
-                if c.name.is_empty() {
-                    continue;
-                }
-                people.push(TmdbPerson {
-                    tmdb_id: c.id,
-                    name: c.name,
-                    person_type: person_type.to_owned(),
-                    role: c.character.filter(|r| !r.is_empty()),
-                    // `SortOrder = actor.Order` / `guest.Order`
-                    // (`TmdbEpisodeProvider.cs:233,264`).
-                    sort_order: Some(c.order),
-                    profile_url: c
-                        .profile_path
-                        .filter(|p| !p.is_empty())
-                        .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
-                });
-            }
-        };
-        push_cast(credits.cast, "Actor");
-        push_cast(credits.guest_stars, "GuestStar");
-        for c in credits
-            .crew
-            .into_iter()
-            .filter(|c| crew_person_type(c.job.as_deref()).is_some())
-            .filter(|c| {
-                !cfg.hide_missing_crew_members
-                    || c.profile_path.as_deref().is_some_and(|p| !p.is_empty())
-            })
-            .take(cfg.max_crew_members)
-        {
-            let Some(person_type) = crew_person_type(c.job.as_deref()) else {
-                continue;
-            };
-            if c.name.is_empty() {
-                continue;
-            }
-            people.push(TmdbPerson {
-                tmdb_id: c.id,
-                name: c.name,
-                person_type: person_type.to_owned(),
-                role: c.job.filter(|r| !r.is_empty()),
-                sort_order: None,
-                profile_url: c
-                    .profile_path
-                    .filter(|p| !p.is_empty())
-                    .map(|p| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &p)),
-            });
+        Some(episode_people_from(credits, &cfg))
+    }
+
+    /// Retrieves episode external ids, trailers and credits in one request.
+    /// The season response supplies shared text/artwork; this replaces the
+    /// separate credits request while retaining its failure semantics.
+    pub async fn episode_extras(
+        &self,
+        series: i64,
+        season: i32,
+        episode: i32,
+    ) -> Option<EpisodeExtras> {
+        #[derive(Deserialize)]
+        struct Response {
+            external_ids: Option<ExternalIds>,
+            videos: Option<VideosResults>,
+            credits: Option<CreditsResponse>,
         }
-        Some(people)
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
+        let resp = self
+            .http
+            .get(format!(
+                "{}/tv/{series}/season/{season}/episode/{episode}",
+                self.base_url
+            ))
+            .query(&[
+                ("api_key", key),
+                ("append_to_response", "external_ids,videos,credits"),
+            ])
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let response: Response = resp.counted_json().await.ok()?;
+        let ids = response.external_ids.unwrap_or_default();
+        let mut provider_ids = Vec::new();
+        for (key, value) in [
+            ("Imdb", non_empty(ids.imdb_id)),
+            (
+                "Tvdb",
+                ids.tvdb_id.filter(|id| *id > 0).map(|id| id.to_string()),
+            ),
+            (
+                "TvRage",
+                ids.tvrage_id.filter(|id| *id > 0).map(|id| id.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                provider_ids.push((key.to_owned(), value));
+            }
+        }
+        Some(EpisodeExtras {
+            provider_ids,
+            trailers: youtube_trailers(response.videos),
+            people: response.credits.map(|c| episode_people_from(c, &cfg)),
+        })
     }
 
     /// Resolves a TMDB id from an external id (`/find/{id}?external_source=`)
@@ -1652,8 +1764,8 @@ impl TmdbClient {
         let (path, append) = match kind {
             // The movie Identify branch needs `external_ids` too — `/movie/{id}`
             // carries `imdb_id` directly, so only the series arm asks for it.
-            TmdbKind::Movie => ("movie", "credits,release_dates,videos"),
-            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids"),
+            TmdbKind::Movie => ("movie", "credits,release_dates,videos,keywords"),
+            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids,keywords"),
         };
         let req = self
             .http
@@ -1688,7 +1800,36 @@ impl TmdbClient {
                 .filter(|s| !s.is_empty())
                 .or_else(|| original_title.clone()),
             original_title,
-            original_language: d.original_language.filter(|s| !s.is_empty()),
+            original_language: non_empty(d.original_language),
+            tags: d
+                .keywords
+                .into_iter()
+                .flat_map(|k| k.keywords)
+                .filter_map(|k| non_empty(k.name))
+                .collect(),
+            production_locations: d
+                .production_countries
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|c| non_empty(c.name))
+                .collect(),
+            home_page_url: (kind == TmdbKind::Series)
+                .then(|| non_empty(d.homepage))
+                .flatten(),
+            end_date: (kind == TmdbKind::Series)
+                .then(|| non_empty(d.last_air_date))
+                .flatten(),
+            collection_id: d
+                .belongs_to_collection
+                .as_ref()
+                .and_then(|c| c.id)
+                .filter(|id| *id > 0),
+            collection_name: d.belongs_to_collection.and_then(|c| non_empty(c.name)),
+            tvrage_id: external_ids
+                .as_ref()
+                .and_then(|e| e.tvrage_id)
+                .filter(|id| *id > 0)
+                .map(|id| id.to_string()),
             overview: d.overview.filter(|s| !s.is_empty()),
             tagline: d.tagline.filter(|s| !s.is_empty()),
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
@@ -1697,7 +1838,11 @@ impl TmdbClient {
             official_rating: us_certification(kind, d.release_dates, d.content_ratings),
             production_year: year_from(premiere.as_deref()),
             premiere_date: premiere,
-            runtime_minutes: d.runtime.filter(|m| *m > 0),
+            runtime_minutes: match kind {
+                TmdbKind::Movie => d.runtime,
+                TmdbKind::Series => d.episode_run_time.and_then(|r| r.into_iter().next()),
+            }
+            .filter(|m| *m > 0),
             people,
             trailers,
             imdb_id: d
@@ -1963,6 +2108,54 @@ mod tests {
             crate::rate_limit::count_request_failures(client.season_details(1399, 2)).await;
         assert!(details.is_some());
         assert_eq!(failures, 0);
+    }
+
+    #[tokio::test]
+    async fn maps_collection_keywords_countries_and_series_fields() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/movie/1", r#"{"belongs_to_collection":{"id":7,"name":"Collection"},"production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"samurai"}]}}"#.into()),
+            ("/tv/2?", r#"{"episode_run_time":[42,45],"last_air_date":"2020-01-02","homepage":"https://example.org/show","keywords":{"results":[{"name":"drama"}]},"external_ids":{"tvdb_id":3,"tvrage_id":4}}"#.into()),
+            ("/episode/1", r#"{"external_ids":{"imdb_id":"tt123","tvdb_id":5,"tvrage_id":6},"videos":{"results":[{"site":"YouTube","type":"Trailer","key":"abc","name":"Trailer"}]},"credits":{"cast":[{"id":7,"name":"Actor"}]}}"#.into()),
+        ]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let movie = client.details(TmdbKind::Movie, 1, None).await.unwrap();
+        assert_eq!(movie.collection_id, Some(7));
+        assert_eq!(movie.collection_name.as_deref(), Some("Collection"));
+        assert_eq!(movie.tags, ["samurai"]);
+        assert_eq!(movie.production_locations, ["Japan"]);
+        let series = client.details(TmdbKind::Series, 2, None).await.unwrap();
+        assert_eq!(series.runtime_minutes, Some(42));
+        assert_eq!(series.end_date.as_deref(), Some("2020-01-02"));
+        assert_eq!(
+            series.home_page_url.as_deref(),
+            Some("https://example.org/show")
+        );
+        assert_eq!(series.tags, ["drama"]);
+        assert_eq!(series.tvdb_id.as_deref(), Some("3"));
+        assert_eq!(series.tvrage_id.as_deref(), Some("4"));
+        let extras = client.episode_extras(2, 1, 1).await.unwrap();
+        assert_eq!(
+            extras.provider_ids,
+            [
+                ("Imdb".into(), "tt123".into()),
+                ("Tvdb".into(), "5".into()),
+                ("TvRage".into(), "6".into())
+            ]
+        );
+        assert_eq!(
+            extras.trailers[0].url,
+            "https://www.youtube.com/watch?v=abc"
+        );
+        assert_eq!(extras.people.unwrap()[0].name, "Actor");
+        // A successful but incomplete response must not clear stored credits.
+        assert!(
+            client
+                .episode_extras(2, 1, 9)
+                .await
+                .unwrap()
+                .people
+                .is_none()
+        );
     }
 
     #[test]

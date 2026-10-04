@@ -304,7 +304,12 @@ impl RateLimiter {
             tracing::debug!(provider = %self.provider, %context, %status,
                 delay_ms = delay.as_millis(), "Metadata provider request rejected; backing off");
         } else {
-            if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Provider clients and request metrics already classify 404
+                // as an empty result, not an authentication or service failure.
+                tracing::debug!(provider = %self.provider, %context, %status,
+                    "Metadata provider lookup returned no result");
+            } else if !status.is_success() {
                 tracing::warn!(provider = %self.provider, %context, %status,
                     "Metadata provider request rejected");
             } else if rate.succeeded() {
@@ -889,9 +894,56 @@ mod tests {
         }
     }
 
+    fn init_log_capture() {
+        // Cargo runs other provider tests on threads without our scoped
+        // subscriber. If one of those threads first reaches a log callsite,
+        // tracing can cache it as disabled for the capturing test too. Keep
+        // a DEBUG-enabled fallback alive for the entire test process; each
+        // test's scoped subscriber still writes only to its own LogBuffer.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+            .expect("provider tests install their fallback subscriber only once");
+        });
+    }
+
+    #[test]
+    fn log_capture_survives_first_use_on_another_thread() {
+        fn emit() {
+            tracing::warn!("provider log capture regression");
+        }
+
+        init_log_capture();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // The first visit to this shared callsite comes from outside the
+            // scoped capture, as when another provider test runs concurrently.
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("provider log capture regression").count(),
+            1,
+            "capture must retain its own event and exclude the other thread:\n{logs}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn warnings_identify_failures_and_cooldown_summary_counts_skips() {
         use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
         let _clock = TestClock::start();
         let logs = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -901,7 +953,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         async {
-            let (url, server) = scripted_server(vec![(404, ""), (200, ""), (200, "")]).await;
+            let (url, server) = scripted_server(vec![(401, ""), (200, ""), (200, "")]).await;
             let client = RateLimiter::new("omdb");
             let http = reqwest::Client::new();
             let request = || {
@@ -929,13 +981,70 @@ mod tests {
         assert!(
             logs.lines().any(|line| line.contains("WARN")
                 && line.contains("tt123")
-                && line.contains("404"))
+                && line.contains("401")),
+            "missing rejection warning:\n{logs}"
         );
-        assert!(logs.lines().any(|line| line.contains("WARN")
-            && line.contains("tt123")
-            && line.contains("could not be parsed")));
-        assert!(logs.contains("skipped=2"));
+        assert!(
+            logs.lines().any(|line| line.contains("WARN")
+                && line.contains("tt123")
+                && line.contains("could not be parsed")),
+            "missing parse warning:\n{logs}"
+        );
+        assert!(
+            logs.contains("skipped=2"),
+            "missing cooldown summary:\n{logs}"
+        );
         assert!(!logs.contains("private-key"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_provider_entries_are_debug_but_access_rejections_warn() {
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let _clock = TestClock::start();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        async {
+            let (url, server) = scripted_server(vec![(404, ""), (401, ""), (403, "")]).await;
+            let limiter = RateLimiter::new("fanart");
+            let http = reqwest::Client::new();
+            for status in [404, 401, 403] {
+                let response = limiter
+                    .send_request(http.get(&url), Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), status);
+            }
+            server.await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.lines().any(|line| line.contains("DEBUG")
+                && line.contains("404")
+                && line.contains("lookup returned no result")),
+            "missing lookup debug event:\n{logs}"
+        );
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("WARN") && line.contains("404")),
+            "lookup incorrectly warned:\n{logs}"
+        );
+        for status in ["401", "403"] {
+            assert!(
+                logs.lines().any(|line| line.contains("WARN")
+                    && line.contains(status)
+                    && line.contains("request rejected")),
+                "missing {status} rejection warning:\n{logs}"
+            );
+        }
     }
 
     #[test]

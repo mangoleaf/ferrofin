@@ -1,0 +1,13 @@
+# Deliberate departures from lintian's defaults.
+
+# The unit lives in /lib/systemd/system, matching Jellyfin's jellyfin-server
+# package; /lib is an alias of /usr/lib on merged-/usr systems.
+ferrofin: aliased-location
+
+# Kept so `apt show ferrofin` names the license; the copyright file is the
+# authoritative record.
+ferrofin: unknown-field License
+
+# The configuration may hold the bootstrap admin password, so only root and
+# the service group may read it (postinst makes it root:ferrofin).
+ferrofin: non-standard-file-perm 0640 != 0644 [etc/ferrofin/config.toml]

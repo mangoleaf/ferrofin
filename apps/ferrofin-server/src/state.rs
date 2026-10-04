@@ -500,9 +500,13 @@ pub async fn build_app_state(
         None => the_tvdb,
     });
     // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
-    // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
-    // `omdb_api_key`) is set: every call returns nothing without a key.
-    let omdb_client = Arc::new(ferrofin_providers::OmdbClient::new(&config.omdb_api_key));
+    // critic score TMDB has no data for. Uses Jellyfin's built-in key unless
+    // FERROFIN_OMDB_KEY (config `omdb_api_key`) overrides it.
+    let omdb_client = ferrofin_providers::OmdbClient::new(&config.omdb_api_key);
+    let omdb_client = Arc::new(match endpoints.omdb.as_deref() {
+        Some(base) => omdb_client.with_base_url(base),
+        None => omdb_client,
+    });
     // MusicBrainz — the music authority (keyless; a mirror URL lifts the 1
     // req/sec limit). Shared by the scan's enrichment pass and the
     // MusicAlbum/MusicArtist "Identify" providers.
@@ -666,6 +670,7 @@ pub async fn build_app_state(
         Arc::new(FerrofinActivityManager::new(db.clone()));
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
+            .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
                 std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
@@ -774,13 +779,15 @@ pub async fn build_app_state(
         id_derivation.clone(),
         paths.default_user_views_path(),
     );
+    let scan_progress = ferrofin_core::scan_progress::ScanProgressTracker::default();
     let virtual_folders_impl = Arc::new(
         ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service))
             .with_items(Arc::clone(&item_repository))
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
-            .with_user_root(user_root_store.clone()),
+            .with_user_root(user_root_store.clone())
+            .with_scan_progress(scan_progress.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -859,7 +866,7 @@ pub async fn build_app_state(
             .with_studios(Arc::clone(&studios_client))
             // The other "Choose Image" providers: fanart.tv (movies/series/
             // artists/albums), TheAudioDb (artists/albums) and OMDb's poster
-            // (movies/trailers/episodes; inert without an API key).
+            // (movies/trailers/episodes; shared API key by default).
             .with_fanart(Arc::clone(&fanart_client))
             .with_audiodb(Arc::clone(&audiodb_client))
             .with_omdb(Arc::clone(&omdb_client))
@@ -1038,8 +1045,7 @@ pub async fn build_app_state(
     .with_fanart(Arc::clone(&fanart_client))
     // OMDb closes the metadata chain (plot/genres/cast/certificate/ratings and
     // a last-resort poster) and supplements TMDB with the Rotten Tomatoes score.
-    // Enabled only when an OMDb API key is configured (FERROFIN_OMDB_KEY /
-    // config.toml `omdb_api_key`).
+    // Uses the built-in key by default; gated by the library's fetcher settings.
     .with_omdb(Arc::clone(&omdb_client))
     // Persist TMDB cast/crew credits fetched alongside the metadata.
     .with_people(Arc::clone(&people_repository))
@@ -1092,7 +1098,9 @@ pub async fn build_app_state(
     // until the collaborators are armed below and while a plugin is
     // disabled).
     scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
-    scanner = scanner.with_events(Arc::clone(&event_manager));
+    scanner = scanner
+        .with_events(Arc::clone(&event_manager))
+        .with_scan_progress(scan_progress.clone());
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
@@ -1117,7 +1125,9 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
+        .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
+        .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata
         // edit, a delete) announce themselves after `LibraryUpdateDuration`
         // seconds of quiet. Without this only scans pushed `LibraryChanged`,
@@ -1367,10 +1377,12 @@ pub async fn build_app_state(
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
 
+    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins));
+    if let Some(endpoint) = &config.provider_endpoints.opensubtitles {
+        opensubtitles = opensubtitles.with_base_url(endpoint);
+    }
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
-        vec![Arc::new(ferrofin_providers::OpenSubtitlesProvider::new(
-            Arc::clone(&plugins),
-        ))];
+        vec![Arc::new(opensubtitles)];
     let subtitles: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
         Arc::new(FerrofinSubtitleManager::new(
             db.clone(),
@@ -1379,6 +1391,12 @@ pub async fn build_app_state(
             subtitle_providers,
             paths.internal_metadata_path(),
         ));
+    let subtitle_downloader =
+        Arc::new(ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
+            &subtitles,
+            Arc::clone(&media_stream_repository),
+        ));
+    library_scanner.attach_subtitle_downloader(Arc::clone(&subtitle_downloader));
     let media_segments: Arc<dyn ferrofin_traits::media_segments::MediaSegmentManager> = Arc::new(
         FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
     );
@@ -1508,8 +1526,7 @@ pub async fn build_app_state(
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
-            Arc::clone(&subtitles),
-            Arc::clone(&media_stream_repository),
+            Arc::clone(&subtitle_downloader),
         )));
         task_manager.register(Arc::new(lib_tasks::LyricDownloadTask::new(
             Arc::clone(&library),
@@ -1705,11 +1722,24 @@ pub async fn build_app_state(
             false,
         );
         // Scan % + task completion → the admin dashboard's live displays.
-        forward(
-            &event_bus,
+        // The scan reporter already runs independently of item processing.
+        // Await its delivery here to preserve start/tick/end ordering; spawning
+        // each send independently can resurrect a finished indicator.
+        let progress_sessions = Arc::clone(&sessions);
+        event_bus.subscribe(
             "RefreshProgress",
-            SessionMessageType::RefreshProgress,
-            true,
+            Arc::new(move |payload: &str| {
+                let sessions = Arc::clone(&progress_sessions);
+                let payload = payload.to_owned();
+                Box::pin(async move {
+                    sessions
+                        .send_message_to_admin_sessions(
+                            SessionMessageType::RefreshProgress,
+                            &payload,
+                        )
+                        .await
+                })
+            }),
         );
         forward(
             &event_bus,

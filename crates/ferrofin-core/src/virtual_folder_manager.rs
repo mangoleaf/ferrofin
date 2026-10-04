@@ -31,8 +31,7 @@
 //!   add/remove also creates/deletes the library's `CollectionFolder` `BaseItem`,
 //!   and `GetVirtualFolders` projects its deterministic id onto
 //!   [`VirtualFolderInfo::item_id`] (so the library appears in `/UserViews` and is
-//!   editable). `PrimaryImageItemId`/refresh-state still need the image + refresh
-//!   queues and are left unset for now.
+//!   editable). The shared scan tracker supplies live refresh state.
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +76,8 @@ const COLLECTION_EXTENSION: &str = "collection";
 /// over a temp directory.
 #[derive(Clone)]
 pub struct FerrofinVirtualFolderManager {
+    /// Live library counts, shared with dashboard readers.
+    scan_progress: crate::scan_progress::ScanProgressTracker,
     /// The `DefaultUserViewsPath` root under which each virtual folder lives.
     root: PathBuf,
     /// The item store, set by the composition root. When present, adding/removing
@@ -130,6 +131,16 @@ impl std::fmt::Debug for FerrofinVirtualFolderManager {
 }
 
 impl FerrofinVirtualFolderManager {
+    /// Shares scan progress with the library dashboard reader.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        tracker: crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
+        self.scan_progress = tracker;
+        self
+    }
+
     /// Creates a manager rooted at `default_user_views_path`.
     ///
     /// The directory is created lazily on first write; a read of a missing root
@@ -138,6 +149,7 @@ impl FerrofinVirtualFolderManager {
     pub fn new(default_user_views_path: impl Into<PathBuf>) -> Self {
         Self {
             root: default_user_views_path.into(),
+            scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence: None,
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
@@ -704,22 +716,47 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             if let Some(name) = name.as_deref() {
                 self.ensure_collection_folder(&path, name).await?;
             }
+            let library_id = self.collection_folder_id(&path);
+            let locations = Self::resolve_locations(&path).await?;
             folders.push(VirtualFolderInfo {
                 name,
-                locations: Self::resolve_locations(&path).await?,
+                locations,
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
                 // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
                 // dashboard matches it against `RefreshProgress.ItemId` as a string.
-                item_id: self
-                    .collection_folder_id(&path)
-                    .map(|g| g.simple().to_string()),
-                // Jellyfin always reports a non-null refresh status; at rest it is
-                // "Idle" (it becomes "Queued"/"Active" only while a scan is running,
-                // which this manager does not track).
-                refresh_status: Some("Idle".to_string()),
+                item_id: library_id.map(|id| id.simple().to_string()),
                 ..VirtualFolderInfo::default()
             });
+        }
+        // Capture once after all filesystem/DB awaits, so every library uses
+        // the same scan generation and we build the visible map only once.
+        let progress: std::collections::HashMap<_, _> = self
+            .scan_progress
+            .libraries()
+            .into_iter()
+            .map(|p| (p.library_id.simple().to_string(), p))
+            .collect();
+        for folder in &mut folders {
+            let current = folder.item_id.as_ref().and_then(|id| progress.get(id));
+            let status = if let Some(current) = current {
+                if current.phase == crate::scan_progress::ScanPhase::Queued {
+                    "Queued"
+                } else {
+                    "Active"
+                }
+            } else if folder
+                .item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .is_some_and(|id| self.scan_progress.is_queued(id, &folder.locations))
+            {
+                "Queued"
+            } else {
+                "Idle"
+            };
+            folder.refresh_progress = current.map(|p| p.percent());
+            folder.refresh_status = Some(status.to_owned());
         }
         // Directory enumeration order is unspecified; a stable name sort keeps
         // the response deterministic (Jellyfin sorts by directory listing too).
@@ -1036,6 +1073,38 @@ mod tests {
             .with_item_store(persistence)
             .with_items(items);
         (tmp, db, mgr)
+    }
+
+    #[tokio::test]
+    async fn virtual_folders_restore_live_progress_and_clear_it_when_the_scan_stops() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let tracker = crate::scan_progress::ScanProgressTracker::default();
+        let mgr = mgr.with_scan_progress(tracker.clone());
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        let id = uuid::Uuid::parse_str(folder.item_id.as_deref().unwrap()).unwrap();
+        let run = tracker.begin([id]);
+        let active = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(active.refresh_status.as_deref(), Some("Active"));
+        assert_eq!(active.refresh_progress, Some(0.0));
+        run.planned([(id, 4)]);
+        run.advance(id);
+        let active = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(active.refresh_progress, Some(25.0));
+        drop(run);
+        let idle = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(idle.refresh_status.as_deref(), Some("Idle"));
+        assert_eq!(idle.refresh_progress, None);
+        tracker.set_queue_reader(Arc::new(move |library, _| library == id));
+        let queued = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(queued.refresh_status.as_deref(), Some("Queued"));
     }
 
     /// Every `CollectionFolder` row currently parented to the user root, as

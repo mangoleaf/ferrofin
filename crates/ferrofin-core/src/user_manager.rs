@@ -26,11 +26,10 @@
 //!   preserved.
 //! - `get_user_dto` assembles the full [`UserDto`](ferrofin_model::dto::UserDto)
 //!   (policy + configuration) from the `Users` row and its
-//!   `Permissions`/`Preferences`/`AccessSchedules`. The C# profile-image cache
-//!   tag is not yet ported, so `PrimaryImageTag` is left unset.
-//! - `update_policy` persists the flat `Users` columns and reflects the two
-//!   load-bearing permission flags into `Permissions`; the broader
-//!   folder/channel/schedule policy mapping is a flagged follow-up.
+//!   `Permissions`/`Preferences`/`AccessSchedules`, including the profile-image
+//!   cache tag when an image processor is attached.
+//! - `update_policy` persists the flat `Users` columns, permissions, list-valued
+//!   preferences, and access schedules in one transaction.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,9 +103,9 @@ pub struct FerrofinUserManager {
     auth_cache: Arc<crate::auth_cache::AuthCache>,
     /// The directory user profile images are written under
     /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
-    /// leaves [`save_profile_image`](ferrofin_traits::library::UserManager::save_profile_image)
-    /// deferred (tests).
+    /// rejects uploads until a directory is configured.
     profile_image_dir: Option<std::path::PathBuf>,
+    image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
 }
 
 impl std::fmt::Debug for FerrofinUserManager {
@@ -189,8 +188,19 @@ impl FerrofinUserManager {
             activity: None,
             config: None,
             profile_image_dir: None,
+            image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Attaches the image processor used to advertise profile images in user DTOs.
+    #[must_use]
+    pub fn with_image_processor(
+        mut self,
+        processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+    ) -> Self {
+        self.image_processor = Some(processor);
+        self
     }
 
     /// Attaches the server configuration, used to resolve each user's cast
@@ -832,14 +842,9 @@ impl UserManager for FerrofinUserManager {
             ));
         };
 
-        if !success {
-            self.record_login_failure(&user).await?;
-            return Ok(None);
-        }
-
         if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
             tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
-            return Err(ServiceError::unauthorized(format!(
+            return Err(ServiceError::Forbidden(format!(
                 "The {} account is currently disabled. Please consult with your administrator.",
                 user.username
             )));
@@ -847,9 +852,14 @@ impl UserManager for FerrofinUserManager {
 
         if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
             tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
-            return Err(ServiceError::unauthorized(
-                "User is not allowed access at this time.",
+            return Err(ServiceError::Forbidden(
+                "User is not allowed access at this time.".to_owned(),
             ));
+        }
+
+        if !success {
+            self.record_login_failure(&user).await?;
+            return Ok(None);
         }
 
         // Success: reset the failure counter and, for a real user session, stamp
@@ -980,9 +990,17 @@ impl UserManager for FerrofinUserManager {
 
         let policy = build_user_policy(pool, user, user_uuid, &perms, &prefs).await?;
 
+        let primary_image_tag = if let Some(processor) = &self.image_processor
+            && let Some(image) = self.get_profile_image(user_uuid).await?
+        {
+            processor.get_image_cache_tag(user_uuid, &image).await?
+        } else {
+            None
+        };
         let mut dto = UserDto {
             name: Some(user.username.clone()),
             id: user_uuid,
+            primary_image_tag,
             // The manager's own id (set by the composition root) so
             // `UserDto.ServerId` is never null; a caller-supplied id is applied
             // after caching so the cached copy stays caller-independent.
@@ -1194,6 +1212,7 @@ impl UserManager for FerrofinUserManager {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -1203,6 +1222,7 @@ impl UserManager for FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        self.auth_cache.clear();
         Ok(())
     }
 
@@ -1513,6 +1533,63 @@ fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
 mod tests {
     use super::*;
     use crate::test_support::test_db;
+
+    #[tokio::test]
+    async fn profile_image_tags_follow_upload_replacement_and_removal() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let processor = Arc::new(ferrofin_drawing::ImageProcessor::new(
+            Arc::new(ferrofin_drawing::NullImageEncoder),
+            dir.path().join("cache"),
+        ));
+        let mgr = FerrofinUserManager::new(db)
+            .with_profile_image_dir(dir.path().join("users"))
+            .with_image_processor(processor);
+        let user = mgr.create_user("synthetic-avatar").await.unwrap();
+        assert!(
+            mgr.get_user_dto(&user, None)
+                .await
+                .unwrap()
+                .primary_image_tag
+                .is_none()
+        );
+        mgr.save_profile_image(&user, b"first image", "image/png", ".png")
+            .await
+            .unwrap();
+        let first = mgr
+            .get_user_dto(&user, None)
+            .await
+            .unwrap()
+            .primary_image_tag
+            .unwrap();
+        assert_eq!(first.len(), 32);
+        assert_eq!(
+            mgr.get_user_dto(&user, None)
+                .await
+                .unwrap()
+                .primary_image_tag
+                .as_deref(),
+            Some(first.as_str())
+        );
+        mgr.save_profile_image(&user, b"replacement", "image/jpeg", ".jpg")
+            .await
+            .unwrap();
+        let second = mgr
+            .get_user_dto(&user, None)
+            .await
+            .unwrap()
+            .primary_image_tag
+            .unwrap();
+        assert_ne!(first, second);
+        mgr.clear_profile_image(&user).await.unwrap();
+        assert!(
+            mgr.get_user_dto(&user, None)
+                .await
+                .unwrap()
+                .primary_image_tag
+                .is_none()
+        );
+    }
 
     #[test]
     fn valid_username_accepts_and_rejects() {
@@ -2151,11 +2228,23 @@ mod tests {
                 .await
                 .expect("perm")
         );
-        // Now even the correct password is refused (disabled).
-        assert!(matches!(
-            mgr.authenticate_user("dan", "pw", "127.0.0.1", true).await,
-            Err(ServiceError::Unauthorized(_))
-        ));
+        // Once disabled, neither a correct nor incorrect password may log in
+        // or mutate the persisted lockout counter.
+        for password in ["pw", "bad"] {
+            assert!(matches!(
+                mgr.authenticate_user("dan", password, "127.0.0.1", true)
+                    .await,
+                Err(ServiceError::Forbidden(_))
+            ));
+            assert_eq!(
+                mgr.get_user_by_name("dan")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .invalid_login_attempt_count,
+                2
+            );
+        }
     }
 
     #[tokio::test]

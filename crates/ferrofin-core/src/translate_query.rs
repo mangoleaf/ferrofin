@@ -367,15 +367,8 @@ pub(crate) fn build_latest_item_list_query(filter: &InternalItemsQuery) -> Query
 /// .ThenByDescending(Id)` and the limit caps ALBUMS — the caller's `order_by`
 /// and `start_index` are both ignored, as they are in the C#.
 ///
-/// `ApplyParentalRestrictions` (`:172`) is **not** ported, and upstream's
-/// comment above it (`:169-171`) says exactly what that costs: neither arm
-/// reads the album through the user's filters, so "a matching track does not
-/// make an album the user may not see visible" — that call is the only guard,
-/// and here the album comes back unguarded. This is not a gap this arm opened:
-/// Ferrofin's query layer carries no parental predicates anywhere (see
-/// [`ACCESSIBLE_LEAF`], which records the same absence on the leaf-access path,
-/// and the standing work item noted in `ferrofin-api` `handlers/mod.rs`). The
-/// one user scoping Ferrofin *does* have — `top_parent_ids` — is applied.
+/// Maximum parental scores apply to the returned albums as well as the
+/// tracks in the ancestor-scoped arm.
 ///
 /// Upstream's closing `LoadLatestByIds` (`:180`) is folded in: it re-selects the
 /// same ids under the same `DateCreated DESC, Id DESC` purely to attach EF
@@ -409,6 +402,7 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
             &to_guid_strings(&filter.top_parent_ids),
         );
     }
+    append_parental_rating(&mut qb, filter);
     qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
     // `limit.HasValue ? orderedAlbums.Take(limit.Value) : orderedAlbums` — a
     // `limit` of 0 really does mean no albums, as `Take(0)` does.
@@ -427,12 +421,52 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
     qb
 }
 
+/// Jellyfin's maximum parental score, including sub-scores and manual containers.
+fn append_parental_rating(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let limit = filter
+        .max_parental_rating
+        .as_ref()
+        .map(|rating| {
+            (
+                i64::from(rating.score),
+                i64::from(rating.sub_score.unwrap_or(0)),
+            )
+        })
+        .or_else(|| {
+            filter.user.as_ref().and_then(|user| {
+                user.max_parental_rating_score
+                    .map(|score| (score, user.max_parental_rating_sub_score.unwrap_or(0)))
+            })
+        });
+    let Some((score, subscore)) = limit else {
+        return;
+    };
+    qb.push(" AND ");
+    push_rating_limit(qb, "bi", score, subscore);
+    qb.push(r#" AND (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc
+        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0)
+        OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" rated ON rated."Id" = lc."ChildId"
+        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0 AND "#);
+    push_rating_limit(qb, "rated", score, subscore);
+    qb.push("))");
+}
+
+fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, subscore: i64) {
+    qb.push(format!(r#"({alias}."InheritedParentalRatingValue" IS NULL OR {alias}."InheritedParentalRatingValue" < "#))
+        .push_bind(score)
+        .push(format!(r#" OR ({alias}."InheritedParentalRatingValue" = "#))
+        .push_bind(score)
+        .push(format!(r#" AND COALESCE({alias}."InheritedParentalRatingSubValue", 0) <= "#))
+        .push_bind(subscore).push("))");
+}
+
 /// Appends every `AND <predicate>` clause derived from the filter.
 ///
 /// Each block mirrors one C# `if (filter.X …) baseQuery = baseQuery.Where(…)`.
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    append_parental_rating(qb, filter);
     // --- resolution (own-row form; the folder-descendant roll-up is an open
     // work item, see `append_resolution_predicate`) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
@@ -1420,7 +1454,8 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
 }
 
 /// Appends the `ItemValues`-backed predicates: genres, genre ids, studios, studio
-/// ids, artist ids, album-artist ids, tags, and exclude-tags.
+/// ids, artist ids, album-artist ids, contributing-artist ids, tags, and
+/// exclude-tags.
 ///
 /// Each is an `EXISTS`/`NOT EXISTS` over `ItemValuesMap ⨝ ItemValues` filtered by
 /// the value `Type` discriminant (mirrors the C# `e.ItemValues!.Any(…)`).
@@ -1454,6 +1489,23 @@ fn append_item_value_predicates(
             &[ItemValueType::AlbumArtist],
             &filter.album_artist_ids,
             false,
+        );
+    }
+    // A contributing artist is credited on the item (`Artist`) but is not one
+    // of its album artists (TranslateQuery.cs:627-640) — the artist page's
+    // "Appears On" section.
+    if !filter.contributing_artist_ids.is_empty() {
+        push_referenced_item(
+            qb,
+            &[ItemValueType::Artist],
+            &filter.contributing_artist_ids,
+            false,
+        );
+        push_referenced_item(
+            qb,
+            &[ItemValueType::AlbumArtist],
+            &filter.contributing_artist_ids,
+            true,
         );
     }
     if !filter.exclude_artist_ids.is_empty() {

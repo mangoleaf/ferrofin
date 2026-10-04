@@ -51,10 +51,11 @@ const SEASON_JSON: &str = r#"{
     ]
 }"#;
 
-/// `/tv/{id}/season/1/episode/{n}/credits`: requested per episode, and only
+/// `/tv/{id}/season/1/episode/{n}?append_to_response=credits,…`: requested per episode, and only
 /// by the episode provider, so it counts exactly the episodes the gate let
 /// through.
-const CREDITS_JSON: &str = r#"{"cast": [{"id": 1, "name": "Sean Bean", "character": "Ned"}]}"#;
+const CREDITS_JSON: &str =
+    r#"{"credits":{"cast": [{"id": 1, "name": "Sean Bean", "character": "Ned"}]}}"#;
 
 /// `/tv/{id}` for a series that has everything the backfill gates want
 /// (an overview and a trailer), so no heuristic asks for it again.
@@ -83,7 +84,7 @@ fn spawn_tmdb_with(series_details: &'static str) -> (String, Arc<AtomicUsize>, A
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).into_owned();
             // `/credits` first: its path contains `/season/` too.
-            let (status, payload) = if req.contains("/credits") {
+            let (status, payload) = if req.contains("/episode/") {
                 counter.fetch_add(1, Ordering::SeqCst);
                 ("200 OK", CREDITS_JSON)
             } else if req.contains("/season/") {

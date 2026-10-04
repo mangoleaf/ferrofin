@@ -7295,9 +7295,11 @@ mod tests {
             released.is_some(),
             "the capture must be released, not orphaned"
         );
-        // The recording settled rather than being stuck mid-flight.
-        let in_progress = mgr
-            .get_recordings_matching(
+        // `finish_capture` releases the active entry before `settle_timer`
+        // finishes the async database writes. Wait for that second phase too:
+        // seeing no active path does not yet mean the recording row has settled.
+        let settled = wait_for(|| async {
+            mgr.get_recordings_matching(
                 &ferrofin_model::live_tv::RecordingQuery {
                     is_in_progress: Some(true),
                     ..ferrofin_model::live_tv::RecordingQuery::default()
@@ -7306,9 +7308,14 @@ mod tests {
                 &DtoOptions::default(),
             )
             .await
-            .expect("recordings");
+            .expect("recordings")
+            .items
+            .is_empty()
+            .then_some(())
+        })
+        .await;
         assert!(
-            in_progress.items.is_empty(),
+            settled.is_some(),
             "nothing may still report itself as recording"
         );
         let _ = tokio::fs::remove_file(path).await;

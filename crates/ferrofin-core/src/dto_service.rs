@@ -74,7 +74,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager};
 use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
-use ferrofin_traits::persistence::{ItemCountService, NameItemRow};
+use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
@@ -85,6 +85,8 @@ use crate::item_type_lookup::kind_from_type_name;
 /// for that item, not "not prefetched".
 #[derive(Default)]
 struct Prefetched {
+    /// Counts of owned extras, loaded only when either count field is requested.
+    extra_counts: HashMap<Uuid, ExtraCounts>,
     /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
@@ -1487,8 +1489,8 @@ impl FerrofinDtoService {
     ///
     /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
     /// hash-map a clean value to a stable id; here the stored `ItemValues` row
-    /// already carries that id, so a lookup keyed by `(Type, CleanValue)`
-    /// suffices.
+    /// carries the fallback id. Adopted music libraries can have a distinct
+    /// physical artist row, so artist links must prefer that browsable item's id.
     async fn resolve_value_ids(
         &self,
         clean_pairs: &[(i32, String)],
@@ -1510,8 +1512,15 @@ impl FerrofinDtoService {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                r#"SELECT "Type", "CleanValue", "ItemValueId" FROM "ItemValues"
-                   WHERE ("Type", "CleanValue") IN ({ph})"#,
+                r#"SELECT iv."Type", iv."CleanValue",
+                   CASE WHEN iv."Type" IN (0, 1) THEN COALESCE(
+                       (SELECT artist."Id" FROM "BaseItems" artist
+                        WHERE artist."Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
+                          AND artist."CleanName" = iv."CleanValue"
+                        ORDER BY artist."SortName", artist."Id" LIMIT 1), iv."ItemValueId")
+                   ELSE iv."ItemValueId" END
+                   FROM "ItemValues" iv
+                   WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
             );
             let mut query = sqlx::query_as::<_, (i32, String, String)>(sqlx::AssertSqlSafe(sql));
             for (t, clean) in chunk {
@@ -2413,10 +2422,24 @@ impl FerrofinDtoService {
             dto.enable_media_source_display = Some(true);
         }
         if options.contains_field(ItemFields::SpecialFeatureCount) {
-            dto.special_feature_count = Some(0); // no extras subsystem yet
+            dto.special_feature_count = Some(
+                prefetched
+                    .extra_counts
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .special_features,
+            );
         }
         if options.contains_field(ItemFields::LocalTrailerCount) {
-            dto.local_trailer_count = Some(0);
+            dto.local_trailer_count = Some(
+                prefetched
+                    .extra_counts
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .local_trailers,
+            );
         }
 
         // Jellyfin emits an empty [] / {} for these when the field is requested but the item has
@@ -2777,6 +2800,18 @@ impl FerrofinDtoService {
 
         // Episode extras.
         if kind == BaseItemKind::Episode {
+            let data = crate::item_data::parse_data(item.data.as_deref());
+            let number = |key| {
+                data.get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok())
+            };
+            dto.index_number_end = number("IndexNumberEnd");
+            if options.contains_field(ItemFields::SpecialEpisodeNumbers) {
+                dto.airs_after_season_number = number("AirsAfterSeasonNumber");
+                dto.airs_before_episode_number = number("AirsBeforeEpisodeNumber");
+                dto.airs_before_season_number = number("AirsBeforeSeasonNumber");
+            }
             dto.series_name = item.series_name.clone();
             dto.season_name = item.season_name.clone();
             dto.season_id = item
@@ -3539,6 +3574,34 @@ impl FerrofinDtoService {
         retrieved_by_id: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
+        let extra_counts = if options.contains_field(ItemFields::SpecialFeatureCount)
+            || options.contains_field(ItemFields::LocalTrailerCount)
+        {
+            let owners = self.library.get_extra_owner_ids_batch(items).await?;
+            let physical: Vec<Uuid> = owners
+                .values()
+                .flatten()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let counts = self.item_counts.get_extra_counts_batch(&physical).await?;
+            owners
+                .into_iter()
+                .map(|(id, owners)| {
+                    let mut total = ExtraCounts::default();
+                    for owner in owners {
+                        if let Some(count) = counts.get(&owner) {
+                            total.special_features += count.special_features;
+                            total.local_trailers += count.local_trailers;
+                        }
+                    }
+                    (id, total)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let want_images =
             options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
         let want_user_data = user.is_some() && options.enable_user_data;
@@ -4064,6 +4127,7 @@ impl FerrofinDtoService {
             _ => None,
         };
         Ok(Prefetched {
+            extra_counts,
             images,
             user_data,
             media_streams,
@@ -5313,6 +5377,13 @@ mod tests {
 
     #[async_trait]
     impl ItemCountService for FakeCounts {
+        async fn get_extra_counts_batch(
+            &self,
+            _owner_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
+            Ok(HashMap::new())
+        }
+
         async fn get_count(
             &self,
             _filter: &ferrofin_traits::options::InternalItemsQuery,
@@ -5907,6 +5978,143 @@ mod tests {
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
         )
+    }
+
+    #[tokio::test]
+    async fn extra_counts_enable_client_controls_and_honor_field_selection() {
+        let db = test_db().await;
+        let owner = Uuid::new_v4();
+        let empty = Uuid::new_v4();
+        seed_named_item(&db, owner, BaseItemKind::Movie, "With extras").await;
+        seed_named_item(&db, empty, BaseItemKind::Movie, "Without extras").await;
+        // Every known extra type, plus owned non-extras and an invalid type.
+        // Unknown (0) is a special feature; theme media (8/9) are not.
+        for extra_type in (0..=12).map(Some).chain([None]) {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Video, "Extra").await;
+            let mut row = fetch_item(&db, id).await;
+            row.owner_id = Some(guid_to_db(owner));
+            row.extra_type = extra_type;
+            save_item(&db, &row).await;
+        }
+        let movie = fetch_item(&db, owner).await;
+        let empty_movie = fetch_item(&db, empty).await;
+        let mut svc = service(db.clone());
+        svc.item_counts = Arc::new(crate::FerrofinItemCountService::new(db));
+        let both = DtoOptions {
+            fields: vec![
+                ItemFields::SpecialFeatureCount,
+                ItemFields::LocalTrailerCount,
+            ],
+            ..DtoOptions::default()
+        };
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie.clone(), empty_movie, movie.clone()],
+                &both,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].special_feature_count, Some(9));
+        assert_eq!(dtos[0].local_trailer_count, Some(1));
+        assert_eq!(dtos[1].special_feature_count, Some(0));
+        assert_eq!(dtos[1].local_trailer_count, Some(0));
+        assert_eq!(
+            dtos[2].special_feature_count,
+            Some(9),
+            "duplicate owner on a page"
+        );
+        assert_eq!(dtos[2].local_trailer_count, Some(1));
+        for (fields, special, trailers) in [
+            (vec![ItemFields::SpecialFeatureCount], Some(9), None),
+            (vec![ItemFields::LocalTrailerCount], None, Some(1)),
+            (vec![], None, None),
+        ] {
+            let dto = svc
+                .get_base_item_dto(
+                    &movie,
+                    &DtoOptions {
+                        fields,
+                        ..both.clone()
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(dto.special_feature_count, special);
+            assert_eq!(dto.local_trailer_count, trailers);
+            let json = serde_json::to_value(dto).unwrap();
+            assert_eq!(json.get("SpecialFeatureCount").is_some(), special.is_some());
+            assert_eq!(json.get("LocalTrailerCount").is_some(), trailers.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_counts_include_linked_owners_once_for_every_version() {
+        let db = test_db().await;
+        let primary = Uuid::new_v4();
+        let alternate = Uuid::new_v4();
+        let extra = Uuid::new_v4();
+        for (id, kind) in [
+            (primary, BaseItemKind::Movie),
+            (alternate, BaseItemKind::Movie),
+            (extra, BaseItemKind::Trailer),
+        ] {
+            seed_named_item(&db, id, kind, "Item").await;
+        }
+        let mut version = fetch_item(&db, alternate).await;
+        version.primary_version_id = Some(guid_to_db(primary));
+        save_item(&db, &version).await;
+        let mut trailer = fetch_item(&db, extra).await;
+        trailer.owner_id = Some(guid_to_db(alternate));
+        trailer.extra_type = Some(2);
+        save_item(&db, &trailer).await;
+        ferrofin_traits::persistence::LinkedChildrenService::upsert_linked_child(
+            &crate::FerrofinLinkedChildrenService::new(db.clone()),
+            primary,
+            alternate,
+            3,
+        )
+        .await
+        .unwrap();
+        let counts = Arc::new(crate::FerrofinItemCountService::new(db.clone()));
+        let library = Arc::new(crate::FerrofinLibraryManager::new(
+            Arc::new(crate::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            )),
+            counts.clone(),
+            Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+            Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
+        ));
+        let mut svc = service_with(db.clone(), library);
+        svc.item_counts = counts;
+        let primary_row = fetch_item(&db, primary).await;
+        let dtos = svc
+            .get_base_item_dtos(
+                &[primary_row.clone(), version, primary_row],
+                &DtoOptions {
+                    fields: vec![
+                        ItemFields::SpecialFeatureCount,
+                        ItemFields::LocalTrailerCount,
+                    ],
+                    ..Default::default()
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            dtos.iter()
+                .all(|dto| dto.local_trailer_count == Some(1)
+                    && dto.special_feature_count == Some(0))
+        );
     }
 
     // A folder or a by-name item owns no chapter, stream, trickplay or
@@ -7966,6 +8174,34 @@ mod tests {
         assert_eq!(people.len(), 1);
         assert_eq!(people[0].name.as_deref(), Some("Leonardo DiCaprio"));
         assert_eq!(people[0].type_, ferrofin_model::data::PersonKind::Actor);
+    }
+
+    #[tokio::test]
+    async fn adopted_artist_links_use_the_existing_artist_item() {
+        let db = test_db().await;
+        let artist = Uuid::from_u128(0xAB40);
+        crate::test_support::seed_named_item(
+            &db,
+            artist,
+            BaseItemKind::MusicArtist,
+            "Synthetic artist",
+        )
+        .await;
+        crate::test_support::set_clean_name(&db, artist, "Synthetic artist").await;
+        let clean = crate::text_util::get_clean_value("Synthetic artist");
+        for kind in [
+            ferrofin_db::enums::ItemValueType::Artist,
+            ferrofin_db::enums::ItemValueType::AlbumArtist,
+        ] {
+            crate::test_support::seed_item_value(&db, artist, kind, "Synthetic artist").await;
+        }
+        let svc = service(db);
+        let map = svc
+            .resolve_value_ids(&[(0, clean.clone()), (1, clean.clone())])
+            .await
+            .unwrap();
+        assert_eq!(map[&0][&clean], artist);
+        assert_eq!(map[&1][&clean], artist);
     }
 
     #[tokio::test]

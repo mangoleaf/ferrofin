@@ -273,6 +273,53 @@ impl RemoteSearchProvider for TvdbSearchProvider {
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
         let search_info = &request.search_info;
+        let ids = search_info.provider_ids.as_ref();
+        let mut pinned = provider_id_of(ids, "Tvdb")
+            .and_then(parse_numeric_provider_id)
+            .filter(|id| *id > 0);
+        let mut has_remote_id = false;
+        for source in ["Imdb", "Zap2It", "Tmdb"] {
+            if pinned.is_some() {
+                break;
+            }
+            if let Some(id) = provider_id_of(ids, source).filter(|id| !id.trim().is_empty()) {
+                has_remote_id = true;
+                pinned = self.tvdb.series_by_remote_id(id).await;
+            }
+        }
+        if let Some(id) = pinned {
+            let Some(details) = self.tvdb.series_details(id, "usa").await else {
+                return Ok(Vec::new());
+            };
+            let mut provider_ids =
+                std::collections::HashMap::from([("Tvdb".to_owned(), id.to_string())]);
+            for (key, value) in [
+                ("Imdb", details.imdb_id),
+                ("Tmdb", details.tmdb_id),
+                ("Zap2It", details.zap2it_id),
+            ] {
+                if let Some(value) = value {
+                    provider_ids.insert(key.to_owned(), value);
+                }
+            }
+            return Ok(vec![RemoteSearchResult {
+                name: details.name,
+                overview: details.overview,
+                production_year: details.production_year,
+                image_url: details
+                    .images
+                    .iter()
+                    .find(|image| image.image_type == ImageType::Primary)
+                    .map(|image| image.url.clone()),
+                provider_ids: Some(provider_ids),
+                search_provider_name: Some(self.name().to_owned()),
+                ..RemoteSearchResult::default()
+            }]);
+        }
+        if has_remote_id {
+            return Ok(Vec::new());
+        }
+
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
@@ -405,8 +452,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
 }
 
 /// A [`RemoteSearchProvider`] backed by OMDb — the "Identify" flow's IMDb-keyed
-/// candidates. Port of `OmdbItemProvider.GetSearchResults`; inert (no results)
-/// until an OMDb API key is configured.
+/// candidates. Port of `OmdbItemProvider.GetSearchResults`, using the shared
+/// API key unless the operator supplies an override.
 pub struct OmdbSearchProvider {
     omdb: Arc<crate::omdb::OmdbClient>,
     kind: crate::omdb::OmdbKind,
@@ -1259,7 +1306,7 @@ impl LocalProviderManager {
     }
 
     /// Attaches the OMDb client as a remote image provider (the poster of a
-    /// movie/trailer/episode with an IMDb id). Inert without an API key.
+    /// movie/trailer/episode with an IMDb id), using the shared key by default.
     #[must_use]
     pub fn with_omdb(mut self, omdb: Arc<crate::omdb::OmdbClient>) -> Self {
         self.omdb = Some(omdb);
@@ -2284,6 +2331,24 @@ impl LocalProviderManager {
             "Studio" => sources.extend(has(self.studios.is_some(), RemoteImageSource::Studios)),
             _ => {}
         }
+        sources.sort_by_key(|source| crate::library_options::default_image_order(source.name()));
+        sources
+    }
+
+    /// The library's image order overrides the built-in default ordering.
+    async fn ordered_image_sources(&self, entity: &BaseItemEntity) -> Vec<RemoteImageSource> {
+        let library = self.library_options_for(entity).await;
+        let kind = short_kind(entity);
+        let global = self.global_metadata_options_for(kind);
+        let mut sources = self.image_sources_for(entity);
+        sources.sort_by_key(|source| {
+            crate::library_options::image_fetcher_rank(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                source.name(),
+            )
+        });
         sources
     }
 
@@ -2888,7 +2953,8 @@ impl ProviderManager for LocalProviderManager {
         // narrowed to the requested `ImageType`.
         let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
         let sources: Vec<RemoteImageSource> = self
-            .image_sources_for(&entity)
+            .ordered_image_sources(&entity)
+            .await
             .into_iter()
             .filter(|source| name_filter.is_none_or(|n| source.name().eq_ignore_ascii_case(n)))
             .collect();
@@ -2954,7 +3020,8 @@ impl ProviderManager for LocalProviderManager {
         // `GetRemoteImageProviderInfo`: each provider's name + the image types
         // its `GetSupportedImages(item)` reports.
         Ok(self
-            .image_sources_for(&entity)
+            .ordered_image_sources(&entity)
+            .await
             .into_iter()
             .map(|source| ImageProviderInfo {
                 name: Some(source.name().to_owned()),
@@ -4563,6 +4630,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tvdb_identify_resolves_external_ids_without_a_title() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"test"}}"#.into()),
+            (
+                "/search/remoteid/tt123",
+                r#"{"data":[{"series":{"id":42}}]}"#.into(),
+            ),
+            (
+                "/series/42/extended",
+                r#"{"data":{"name":"Matched","remoteIds":[{"sourceName":"IMDB","id":"tt123"}]}}"#
+                    .into(),
+            ),
+        ])
+        .await;
+        let provider = super::TvdbSearchProvider::new(Arc::new(
+            crate::tvdb::TvdbClient::new().with_base_url(&server.base_url),
+        ));
+        let mut req = request(BaseItemKind::Series);
+        req.search_info.provider_ids = Some(HashMap::from([("Imdb".into(), "tt123".into())]));
+        let results = provider.get_search_results(&req).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Matched"));
+        assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tvdb"], "42");
+        req.search_info.provider_ids = Some(HashMap::from([("Tmdb".into(), "404".into())]));
+        assert!(provider.get_search_results(&req).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn tvdb_search_provider_supports_series_and_guards_empty_name() {
         use super::TvdbSearchProvider;
         let p = TvdbSearchProvider::new(Arc::new(crate::tvdb::TvdbClient::new()));
@@ -5863,9 +5958,9 @@ mod tests {
         // Provider info: both providers, each with its C# `GetSupportedImages`.
         let info = mgr.get_remote_image_provider_info(item_id).await.unwrap();
         let names: Vec<&str> = info.iter().filter_map(|i| i.name.as_deref()).collect();
-        assert_eq!(names, ["TheAudioDB", "FanArt"]);
+        assert_eq!(names, ["FanArt", "TheAudioDB"]);
         assert_eq!(
-            info[0].supported_images,
+            info[1].supported_images,
             [
                 ImageType::Primary,
                 ImageType::Logo,
@@ -5874,7 +5969,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            info[1].supported_images,
+            info[0].supported_images,
             [
                 ImageType::Primary,
                 ImageType::Logo,
@@ -5896,11 +5991,11 @@ mod tests {
         assert_eq!(
             by_provider,
             [
+                ("FanArt", ImageType::Primary),
+                ("FanArt", ImageType::Banner),
                 ("TheAudioDB", ImageType::Primary),
                 ("TheAudioDB", ImageType::Logo),
                 ("TheAudioDB", ImageType::Backdrop),
-                ("FanArt", ImageType::Primary),
-                ("FanArt", ImageType::Banner),
             ]
         );
 
@@ -5979,10 +6074,10 @@ mod tests {
         assert_eq!(
             urls,
             [
-                "https://a/cover.jpg",
-                "https://a/cd.png",
                 "https://f/cover.jpg",
-                "https://f/cd.png"
+                "https://f/cd.png",
+                "https://a/cover.jpg",
+                "https://a/cd.png"
             ]
         );
 
@@ -6044,9 +6139,9 @@ mod tests {
 
         let info = mgr.get_remote_image_provider_info(item_id).await.unwrap();
         let names: Vec<&str> = info.iter().filter_map(|i| i.name.as_deref()).collect();
-        assert_eq!(names, ["TheMovieDb", "FanArt", "The Open Movie Database"]);
+        assert_eq!(names, ["FanArt", "TheMovieDb", "The Open Movie Database"]);
         assert_eq!(
-            info[0].supported_images,
+            info[1].supported_images,
             [
                 ImageType::Primary,
                 ImageType::Backdrop,
@@ -6073,6 +6168,8 @@ mod tests {
         assert_eq!(
             shape,
             [
+                ("FanArt", ImageType::Primary, "https://f/poster.jpg"),
+                ("FanArt", ImageType::Logo, "https://f/logo.png"),
                 // Within each provider the block is `OrderByLanguageDescending`,
                 // so the two `en`-tagged images (rank 4) come before the two
                 // untagged ones (rank 3) — NOT the raw poster/backdrop/logo
@@ -6100,8 +6197,6 @@ mod tests {
                     ImageType::Logo,
                     "https://image.tmdb.org/t/p/original/l.png"
                 ),
-                ("FanArt", ImageType::Primary, "https://f/poster.jpg"),
-                ("FanArt", ImageType::Logo, "https://f/logo.png"),
                 (
                     "The Open Movie Database",
                     ImageType::Primary,
@@ -6110,8 +6205,8 @@ mod tests {
             ]
         );
         // TMDB's sizes/ratings/languages ride along.
-        assert_eq!(all[0].width, Some(1000));
-        assert_eq!(all[0].language.as_deref(), Some("en"));
+        assert_eq!(all[2].width, Some(1000));
+        assert_eq!(all[2].language.as_deref(), Some("en"));
     }
 
     #[tokio::test]

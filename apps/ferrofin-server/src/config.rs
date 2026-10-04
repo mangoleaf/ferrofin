@@ -163,7 +163,6 @@ enum DbPoolFileValue {
 /// Not here, and why:
 /// - MusicBrainz and the studio artwork repository: each has a real setting
 ///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
-/// - OMDb: inert without a key ([`Config::omdb_api_key`]).
 /// - LrcLib and ListenBrainz: a scan never calls them (lyrics come from the
 ///   "Download missing lyrics" task, similar artists on request), as upstream.
 /// - OpenSubtitles: a scan does not call it yet. Upstream's probe downloads
@@ -182,6 +181,10 @@ pub struct ProviderEndpoints {
     /// Replaces TMDb's image CDN root, `https://image.tmdb.org/t/p` (the
     /// artwork URLs TMDb's answers are relative to).
     pub tmdb_images: Option<String>,
+    /// Replaces `https://www.omdbapi.com/`.
+    pub omdb: Option<String>,
+    /// OpenSubtitles REST endpoint override for integration tests.
+    pub opensubtitles: Option<String>,
     /// Replaces `https://api4.thetvdb.com/v4`.
     pub tvdb: Option<String>,
     /// Replaces `https://webservice.fanart.tv/v3.2`.
@@ -247,8 +250,8 @@ pub struct Config {
     /// (`HostNetworkInfo.base_url`). Empty string = root.
     pub base_url: String,
 
-    /// OMDb (omdbapi.com) API key, enabling the Rotten Tomatoes critic rating.
-    /// Empty = disabled (RT ratings stay unpopulated). From `FERROFIN_OMDB_KEY` or
+    /// OMDb (omdbapi.com) API key override. Empty uses Jellyfin's built-in key.
+    /// From `FERROFIN_OMDB_KEY` or
     /// `config.toml`.
     pub omdb_api_key: String,
 

@@ -3,11 +3,11 @@
 //!
 //! Faithful to Jellyfin's OpenSubtitles **plugin**: the provider is a
 //! compiled-in Ferrofin plugin ([`PLUGIN_ID`] / [`PLUGIN_NAME`]) whose credentials
-//! ([`OpenSubtitlesConfig`] — API key + account) are set through the dashboard
-//! plugin-configuration page (`POST /Plugins/{id}/Configuration`) and read back
-//! via the [`PluginManager`]. With no key configured the provider is inert
-//! (search returns empty, download rejects) — exactly like the unconfigured
-//! plugin.
+//! ([`OpenSubtitlesConfig`] — account + optional API key override) are set through
+//! the dashboard plugin-configuration page (`POST /Plugins/{id}/Configuration`)
+//! and read back via the [`PluginManager`]. Jellyfin's shared application key is
+//! used by default. Downloads still require an OpenSubtitles account; with no
+//! account or explicit key configured, the provider remains inactive.
 //!
 //! API shape (<https://opensubtitles.stoplight.io>): every call carries the
 //! `Api-Key` header and a descriptive `User-Agent`; `POST /login` exchanges the
@@ -39,6 +39,9 @@ pub const PLUGIN_NAME: &str = "opensubtitles";
 /// The API base URL.
 const API_BASE: &str = "https://api.opensubtitles.com/api/v1";
 
+/// Jellyfin's shared application key (`OpenSubtitlesPlugin.ApiKey`).
+const DEFAULT_API_KEY: &str = "gUCLWGoAg2PmyseoTM0INFFVPcDCeDlT";
+
 /// The `User-Agent` OpenSubtitles requires (they reject generic agents).
 const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
 
@@ -49,7 +52,7 @@ const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct OpenSubtitlesConfig {
-    /// The consumer API key from the caller's opensubtitles.com registration.
+    /// Optional API key override. Empty or whitespace uses Jellyfin's shared key.
     pub api_key: SecretString,
     /// The account username.
     pub username: String,
@@ -58,10 +61,19 @@ pub struct OpenSubtitlesConfig {
 }
 
 impl OpenSubtitlesConfig {
-    /// Whether enough is configured to talk to the API (an API key at minimum).
+    /// Whether an account or explicit API key is configured. An account uses
+    /// the shared application key; an explicit key alone still permits searches.
     #[must_use]
     pub fn is_configured(&self) -> bool {
-        !self.api_key.expose_secret().is_empty()
+        !self.api_key.expose_secret().trim().is_empty()
+            || (!self.username.trim().is_empty()
+                && !self.password.expose_secret().trim().is_empty())
+    }
+
+    /// The operator's override, or Jellyfin's shared application key.
+    fn effective_api_key(&self) -> &str {
+        let key = self.api_key.expose_secret().trim();
+        if key.is_empty() { DEFAULT_API_KEY } else { key }
     }
 }
 
@@ -94,6 +106,8 @@ struct SearchItem {
 struct SearchAttributes {
     #[serde(default)]
     hearing_impaired: Option<bool>,
+    #[serde(default)]
+    moviehash_match: Option<bool>,
     #[serde(default)]
     foreign_parts_only: Option<bool>,
     #[serde(default)]
@@ -202,7 +216,7 @@ fn map_search(response: &SearchResponse, language: &str) -> Vec<RemoteSubtitleIn
                 author: attrs.uploader.as_ref().and_then(|u| u.name.clone()),
                 comment: attrs.release.clone(),
                 download_count: attrs.download_count.and_then(|c| i32::try_from(c).ok()),
-                is_hash_match: None,
+                is_hash_match: attrs.moviehash_match,
                 hearing_impaired: attrs.hearing_impaired,
                 forced: attrs.foreign_parts_only,
                 ..Default::default()
@@ -242,6 +256,7 @@ pub struct OpenSubtitlesProvider {
     http: reqwest::Client,
     limiter: RateLimiter,
     plugins: Arc<dyn PluginManager>,
+    base_url: String,
 }
 
 impl std::fmt::Debug for OpenSubtitlesProvider {
@@ -259,7 +274,17 @@ impl OpenSubtitlesProvider {
             http: reqwest::Client::new(),
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
+            base_url: API_BASE.to_owned(),
         }
+    }
+
+    /// Overrides the REST endpoint for local integration tests.
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        base_url
+            .trim_end_matches('/')
+            .clone_into(&mut self.base_url);
+        self
     }
 
     /// Loads the current dashboard-configured credentials.
@@ -272,8 +297,8 @@ impl OpenSubtitlesProvider {
     async fn login(&self, cfg: &OpenSubtitlesConfig) -> Result<String, ServiceError> {
         let resp = self
             .http
-            .post(format!("{API_BASE}/login"))
-            .header("Api-Key", cfg.api_key.expose_secret())
+            .post(format!("{}/login", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&LoginRequest {
@@ -302,11 +327,32 @@ impl OpenSubtitlesProvider {
     pub async fn validate_config(&self, cfg: &OpenSubtitlesConfig) -> Result<(), ServiceError> {
         if !cfg.is_configured() {
             return Err(ServiceError::invalid_input(
-                "OpenSubtitles API key is not configured",
+                "OpenSubtitles account or API key is not configured",
             ));
         }
         self.login(cfg).await.map(|_| ())
     }
+}
+
+/// OpenSubtitles' hash: file size plus the little-endian 64-bit words in
+/// the first and last 64 KiB, with wrapping addition (including overlap).
+async fn movie_hash(path: &str) -> std::io::Result<Option<String>> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut file = tokio::fs::File::open(path).await?;
+    let size = file.metadata().await?.len();
+    if size < 65_536 {
+        return Ok(None);
+    }
+    let mut hash = size;
+    let mut buffer = vec![0u8; 65_536];
+    for offset in [0, size - 65_536] {
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        file.read_exact(&mut buffer).await?;
+        for word in buffer.as_chunks::<8>().0 {
+            hash = hash.wrapping_add(u64::from_le_bytes(*word));
+        }
+    }
+    Ok(Some(format!("{hash:016x}")))
 }
 
 /// Maps a transport / response-decode error to a backend [`ServiceError`],
@@ -338,8 +384,26 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             return Ok(Vec::new());
         }
 
+        let hash = match request.media_path.as_deref() {
+            Some(path) if !path.to_ascii_lowercase().ends_with(".strm") => {
+                movie_hash(path).await.map_err(|e| {
+                    ServiceError::backend(format!("subtitle movie hash failed: {e}"))
+                })?
+            }
+            _ => None,
+        };
+        // A perfect match requires a file hash, never a title-only guess.
+        if request.is_perfect_match == Some(true) && hash.is_none() {
+            return Ok(Vec::new());
+        }
         // Build the query params from the enriched request.
         let mut query: Vec<(String, String)> = Vec::new();
+        if let Some(hash) = hash {
+            query.push(("moviehash".to_owned(), hash));
+            if request.is_perfect_match == Some(true) {
+                query.push(("moviehash_match".to_owned(), "only".to_owned()));
+            }
+        }
         if !request.language.is_empty() {
             query.push((
                 "languages".to_owned(),
@@ -378,8 +442,8 @@ impl SubtitleProvider for OpenSubtitlesProvider {
 
         let resp = self
             .http
-            .get(format!("{API_BASE}/subtitles"))
-            .header("Api-Key", cfg.api_key.expose_secret())
+            .get(format!("{}/subtitles", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .query(&query)
@@ -393,7 +457,12 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             )));
         }
         let body: SearchResponse = resp.counted_json().await.map_err(net_err)?;
-        Ok(map_search(&body, &request.language))
+        let mut results = map_search(&body, &request.language);
+        if request.is_perfect_match == Some(true) {
+            results.retain(|r| r.is_hash_match == Some(true));
+        }
+        results.sort_by_key(|r| r.is_hash_match != Some(true));
+        Ok(results)
     }
 
     async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
@@ -409,7 +478,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         let cfg = self.config().await?;
         if !cfg.is_configured() {
             return Err(ServiceError::invalid_input(
-                "OpenSubtitles API key is not configured",
+                "OpenSubtitles account or API key is not configured",
             ));
         }
         let parsed = parse_subtitle_id(provider_local_id)
@@ -421,8 +490,8 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         // Turn the file id into a one-time download link.
         let dl: DownloadResponse = self
             .http
-            .post(format!("{API_BASE}/download"))
-            .header("Api-Key", cfg.api_key.expose_secret())
+            .post(format!("{}/download", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
             .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(reqwest::header::ACCEPT, "application/json")
             .bearer_auth(&token)
@@ -487,6 +556,30 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn movie_hash_uses_file_size_and_little_endian_end_blocks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("movie.mkv");
+        let mut bytes = vec![0u8; 131_072];
+        bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        bytes[131_064..].copy_from_slice(&2u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            movie_hash(path.to_str().unwrap()).await.unwrap().as_deref(),
+            Some("0000000000020001")
+        );
+        // Exactly 64 KiB: the two blocks overlap completely.
+        bytes.truncate(65_536);
+        bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            movie_hash(path.to_str().unwrap()).await.unwrap().as_deref(),
+            Some("0000000000010002")
+        );
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(movie_hash(path.to_str().unwrap()).await.unwrap(), None);
+    }
+
     #[test]
     fn config_parses_pascal_case_and_detects_configured() {
         let cfg: OpenSubtitlesConfig =
@@ -494,6 +587,84 @@ mod tests {
         assert_eq!(cfg.api_key.expose_secret(), "k");
         assert!(cfg.is_configured());
         assert!(!OpenSubtitlesConfig::default().is_configured());
+    }
+
+    #[test]
+    fn account_uses_shared_key_unless_overridden() {
+        for key in ["", "  ", " custom-key "] {
+            let cfg: OpenSubtitlesConfig = serde_json::from_value(serde_json::json!({
+                "Username": "user", "Password": "password", "ApiKey": key
+            }))
+            .unwrap();
+            assert!(cfg.is_configured());
+            assert_eq!(
+                cfg.effective_api_key(),
+                if key.trim().is_empty() {
+                    DEFAULT_API_KEY
+                } else {
+                    "custom-key"
+                }
+            );
+        }
+        let cfg: OpenSubtitlesConfig =
+            serde_json::from_str(r#"{"Username":"user","Password":"password"}"#).unwrap();
+        assert!(cfg.is_configured(), "Jellyfin config has no ApiKey field");
+        assert_eq!(cfg.effective_api_key(), DEFAULT_API_KEY);
+        for config in [
+            "{}",
+            r#"{"Username":"user"}"#,
+            r#"{"Password":"password"}"#,
+            r#"{"Username":" ","Password":"password","ApiKey":" "}"#,
+        ] {
+            let cfg: OpenSubtitlesConfig = serde_json::from_str(config).unwrap();
+            assert!(!cfg.is_configured(), "{config}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_sends_shared_key_or_operator_override() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for key in ["", " custom-key "] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let response = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]).into_owned();
+                let body = r#"{"token":"test-token"}"#;
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ).as_bytes()).await.unwrap();
+                request
+            });
+            let plugins =
+                crate::plugin_config::tests_support::manager_with(PLUGIN_ID, b"{}".to_vec());
+            let mut provider = OpenSubtitlesProvider::new(plugins);
+            provider.base_url = base_url;
+            let cfg = OpenSubtitlesConfig {
+                api_key: SecretString::from(key),
+                username: "user".to_owned(),
+                password: SecretString::from("password"),
+            };
+            provider
+                .validate_config(&cfg)
+                .await
+                .expect("account can log in");
+            let request = response.await.unwrap();
+            assert!(request.starts_with("POST /login "));
+            let expected = if key.is_empty() {
+                DEFAULT_API_KEY
+            } else {
+                "custom-key"
+            };
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case(&format!("api-key: {expected}")))
+            );
+        }
     }
 
     #[test]

@@ -509,17 +509,14 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   [[ "$output" == *"summary: 12 PASS, 0 FAIL, 1 SKIP"* ]]
 }
 
-@test "run: OMDb alone is unknown, and every scratch NFO holds what the enriched gates read" {
-  # OMDb ticked alone asks nothing without a key the script cannot see: counting it as "on"
-  # made the rows that run the providers fail against a correct, keyless server. The scratch
-  # NFOs (row 1's, and row 4's rewrite) carry the plot, both ratings and a trailer, so with a
-  # key OMDb's backfill gate has nothing to ask for either.
+@test "run: OMDb alone is on with its shared key, and every scratch NFO holds what the enriched gates read" {
+  # OMDb uses a shared key; ticking it must produce requests on forced passes.
   real_item
-  movies_scenario ".[1].snapshot = \"$TMP/nfo-row1\" | .[6].snapshot = \"$TMP/nfo-row4\""
+  movies_scenario "$WITH_REQUESTS | .[1].snapshot = \"$TMP/nfo-row1\" | .[6].snapshot = \"$TMP/nfo-row4\""
   FAKE_TYPE_OPTIONS='[{"Type":"Movie","MetadataFetchers":["The Open Movie Database"]}]' fake
   whole_run "$BASE" "$LIB_ID" "$TMP/lib/scratch"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"remote metadata fetchers for Movie: unknown"* ]]
+  [[ "$output" == *"remote metadata fetchers for Movie: on"* ]]
   [[ "$output" == *"summary: 12 PASS, 0 FAIL, 1 SKIP"* ]]
   [ "$(find nfo-row1 -name '*.nfo' | wc -l)" -eq 3 ]
   for nfo in nfo-row1/*.nfo nfo-row4/*Gamma*.nfo; do

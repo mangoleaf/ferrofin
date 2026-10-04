@@ -269,7 +269,20 @@ async fn scans_record_trigger_outcomes_passes_and_probes() {
             .await
             .expect("scan")
     );
-    let first = scrape(&router).await;
+    // A scan waiter is released when its pass finishes. The queue worker
+    // drops ScanInProgress only after draining the queue, so its gauge may
+    // still be 1 immediately after run_library_scan returns.
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let metrics = scrape(&router).await;
+            if sample(&metrics, "ferrofin_library_scan_in_progress", &[]) == Some(0.0) {
+                break metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("scan queue worker became idle after the completed pass");
     let schedule = ("trigger", "schedule");
     let items = |text: &str, outcome: &str| {
         sample(

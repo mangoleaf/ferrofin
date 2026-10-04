@@ -113,8 +113,8 @@ Whether the library's remote fetchers are "on" is read from its saved metadata-d
 choices for the scratch items' kinds (a movie; or a series, its seasons and its episodes, as
 the choice is per kind): on when any of them ticks one, off when every one of them saved an
 empty choice. Otherwise it is unknown and the rows do not check provider requests: a kind
-with no saved choice follows the server-wide one, and OMDb ticked alone asks nothing unless
-the server has an OMDb key, which the script cannot see.
+with no saved choice follows the server-wide one. OMDb ticked alone counts as on
+because it now uses a shared API key by default.
 
 In a TV library the rows check for 0 provider requests, whatever the fetchers, on every row
 but the first. An episode's (and a season's) remote lookup starts from its series' provider
@@ -144,7 +144,7 @@ scans do. They cover:
 - a passing run, and one with a failing row (exit 1);
 - a movies library with its fetchers on and one with them off, each with the row that must
   fail when a request is missing or stray;
-- OMDb ticked alone (unknown, not "on"), with every scratch NFO checked for the fields the
+- OMDb ticked alone ("on" with its shared key), with every scratch NFO checked for the fields the
   enriched checks read;
 - a TV library with its fetchers on (every row but the first expects 0), a stray episode
   request, a scratch series that matched a real show (the run stops after row 1), and one
@@ -184,3 +184,22 @@ unchanged, 0 probes).
   re-probed and saved it, and row 6 failed with
   `updated 1 (want <= 0);probes 1 (want = 0)`, exit 1. The cleanup still removed every
   scratch file, and the server pruned the scratch items.
+
+## Dashboard scan progress
+
+`node verify/scan-progress.mjs BINARY [LOG_EVERY]` boots a disposable server and
+checks progress over authenticated HTTP and WebSocket connections. It needs Node
+22 or newer and uses controlled ffprobe stubs; no media or existing server is
+modified. Logs and captured events remain in the printed temporary directory.
+
+Run with logging cadences `0`, `1`, and `100` to check that UI notifications do not
+depend on item-count logging. The fixture holds the first probe, reconnects during
+that stall, and checks intermediate ratios, short unchanged scans, scoped
+refreshes, cancellation, terminal cleanup, and an empty library. Controlled-clock
+Rust tests cover exact timer boundaries, item 100, and overlapping scan ownership.
+
+Add `--measure` to compare binaries on the same generated 200-item fixture. It
+prints initial/unchanged scan wall times and library notification counts without
+requiring the baseline to exhibit the corrected behavior. Use three alternating
+baseline/fixed runs and compare medians; these local debug-build measurements are
+not production throughput estimates.

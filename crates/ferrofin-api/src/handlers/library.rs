@@ -137,10 +137,14 @@ async fn theme_media(
                 "stored item id is not a uuid: {e}"
             )))
         })?;
+        let mut owners = state
+            .library
+            .get_extra_owner_ids_batch(std::slice::from_ref(&owner))
+            .await?;
         let items = state
             .library
             .get_item_list(&InternalItemsQuery {
-                owner_ids: vec![owner_id],
+                owner_ids: owners.remove(&owner_id).unwrap_or_else(|| vec![owner_id]),
                 extra_types: vec![extra_type],
                 order_by: order_by.clone(),
                 ..InternalItemsQuery::default()

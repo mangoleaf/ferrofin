@@ -13,7 +13,7 @@ use thiserror::Error;
 /// The error returned by every `ferrofin-traits` service/manager method.
 ///
 /// A deliberately small, transport-agnostic taxonomy: the HTTP layer maps each
-/// variant to a status code (`NotFound` → 404, `Unauthorized` → 401,
+/// variant to a status code (`NotFound` → 404, `Unauthorized` → 401, `Forbidden` → 403,
 /// `InvalidInput` → 400, `Conflict` → 409, `Db`/`Backend` → 500). Keep it flat —
 /// richer, domain-specific context belongs in the message strings, not new
 /// variants (a variant is only added for a genuinely distinct HTTP semantic).
@@ -24,10 +24,13 @@ pub enum ServiceError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// The caller is not authenticated or lacks permission for the operation
-    /// (C# `AuthenticationException` / `SecurityException`).
+    /// The caller is not authenticated (C# `AuthenticationException`).
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+
+    /// Account policy forbids the operation (C# `SecurityException`).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// A caller-supplied argument was missing, malformed, or contradictory
     /// (C# `ArgumentException` / `ArgumentNullException`).

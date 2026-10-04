@@ -392,8 +392,8 @@ impl FerrofinItemRepository {
     ///
     /// `None` means "leave this to the ancestor closure" — the item is not a view
     /// at all (which is what `SetTopParentIdsOrAncestors` does when the parents are
-    /// not all `ICollectionFolder`/`UserView`), or it is a collection folder with no
-    /// physical folders, which on a Ferrofin-written database is every one of them.
+    /// not all `ICollectionFolder`/`UserView`). Native collection folders use
+    /// their own id as the top-parent scope.
     /// `Some(vec![])` is different and deliberate: a *view* that resolves to
     /// nothing, which upstream turns into a match-nothing scope rather than letting
     /// the query widen to every library.
@@ -455,15 +455,14 @@ impl FerrofinItemRepository {
                 .await?
                 .remove(&id)
                 .unwrap_or_default();
-            // A collection folder with NO physical folders means two different
-            // things, and only one of them is "an empty library". On a
-            // Ferrofin-written database no collection folder has them — items hang
-            // off the folder directly and there is no `Data` blob — so answering
-            // "match nothing" here would empty every native browse. Deliberate
-            // divergence, same as the one `resolve_views` already documents: an
-            // unresolvable collection folder falls through to the ancestor closure,
-            // which is right for both database shapes.
-            return Ok((!folders.is_empty()).then_some(folders));
+            // Native libraries use the collection folder as TopParentId.
+            // Always scope a library by top parent: its ancestor closure also
+            // includes parentless extras attached through OwnerId.
+            return Ok(Some(if folders.is_empty() {
+                vec![id]
+            } else {
+                folders
+            }));
         }
         if kind != Some(BaseItemKind::UserView) {
             // C#'s last arm — `item.GetTopParent()` — but only when we got here by
@@ -2203,6 +2202,15 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(exists.is_some())
     }
 
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+        grouped_series: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        crate::extra_owners_repository::get_extra_owner_ids_batch(&self.db, items, grouped_series)
+            .await
+    }
+
     async fn get_items_by_primary_version(
         &self,
         primary_id: Uuid,
@@ -2723,6 +2731,156 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    /// The artist id filters over one artist's albums (TranslateQuery.cs:
+    /// 617-650): `ArtistIds` is any credit, `AlbumArtistIds` the albums the
+    /// artist leads (the artist page's Albums), `ContributingArtistIds` the
+    /// albums crediting the artist under someone else's name (Appears On) and
+    /// `ExcludeArtistIds` every album not crediting the artist.
+    #[tokio::test]
+    async fn artist_id_filters_split_an_artists_albums() {
+        async fn albums(
+            repository: &FerrofinItemRepository,
+            filter: InternalItemsQuery,
+        ) -> Vec<String> {
+            let rows = repository
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::MusicAlbum],
+                    ..filter
+                })
+                .await
+                .unwrap();
+            let mut names: Vec<String> = rows.into_iter().filter_map(|row| row.name).collect();
+            names.sort();
+            names
+        }
+
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (alpha, beta) = (Uuid::from_u128(0xAA01), Uuid::from_u128(0xAA02));
+        for (id, name) in [(alpha, "Alpha"), (beta, "Beta")] {
+            seed_named_item(&db, id, BaseItemKind::MusicArtist, name).await;
+            set_clean_name(&db, id, &name.to_lowercase()).await;
+        }
+        for (id, name, album_artist, artists) in [
+            (0xAA10, "Own", "Alpha", &["Alpha"][..]),
+            (0xAA11, "Featured", "Beta", &["Beta", "Alpha"][..]),
+            (0xAA12, "Other", "Beta", &["Beta"][..]),
+        ] {
+            let album = Uuid::from_u128(id);
+            seed_named_item(&db, album, BaseItemKind::MusicAlbum, name).await;
+            seed_item_value(&db, album, ItemValueType::AlbumArtist, album_artist).await;
+            for artist in artists {
+                seed_item_value(&db, album, ItemValueType::Artist, artist).await;
+            }
+        }
+
+        let by = |ids: fn(&mut InternalItemsQuery) -> &mut Vec<Uuid>, artist: Uuid| {
+            let mut filter = InternalItemsQuery::default();
+            ids(&mut filter).push(artist);
+            filter
+        };
+        assert_eq!(
+            albums(&repository, InternalItemsQuery::default()).await,
+            ["Featured", "Other", "Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.artist_ids, alpha)).await,
+            ["Featured", "Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.album_artist_ids, alpha)).await,
+            ["Own"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.contributing_artist_ids, alpha)).await,
+            ["Featured"]
+        );
+        assert_eq!(
+            albums(&repository, by(|q| &mut q.exclude_artist_ids, alpha)).await,
+            ["Other"]
+        );
+        // Beta leads every album crediting Beta, so it appears on none.
+        assert!(
+            albums(&repository, by(|q| &mut q.contributing_artist_ids, beta))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn parental_rating_filters_lists_counts_and_linked_containers() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let mut user = seed_user_with_defaults(&db, Uuid::from_u128(0xAB10)).await;
+        user.max_parental_rating_score = Some(10);
+        user.max_parental_rating_sub_score = Some(1);
+        let ids: Vec<_> = (0xAB20..0xAB25).map(Uuid::from_u128).collect();
+        for (id, score, subscore) in [
+            (ids[0], Some(9_i64), Some(9_i64)),
+            (ids[1], Some(10), Some(1)),
+            (ids[2], Some(10), Some(2)),
+            (ids[3], Some(17), None),
+            (ids[4], None, None),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, "Synthetic rating case").await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue"=?,
+                "InheritedParentalRatingSubValue"=? WHERE "Id"=?"#,
+            )
+            .bind(score)
+            .bind(subscore)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        seed_library_over(&db, &ids).await;
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        let rows = repository.get_items(&query).await.unwrap();
+        assert_eq!(rows.total_record_count, 3);
+        for id in [ids[0], ids[1], ids[4]] {
+            assert!(rows.items.iter().any(|row| row.id == guid_to_db(id)));
+        }
+        let collection = Uuid::from_u128(0xAB30);
+        seed_named_item(
+            &db,
+            collection,
+            BaseItemKind::BoxSet,
+            "Synthetic restricted collection",
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "TopParentId" =
+            (SELECT "TopParentId" FROM "BaseItems" WHERE "Id"=?) WHERE "Id"=?"#,
+        )
+        .bind(guid_to_db(ids[0]))
+        .bind(guid_to_db(collection))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        links
+            .upsert_linked_child(collection, ids[3], 0)
+            .await
+            .unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::BoxSet],
+            ..Default::default()
+        };
+        assert!(repository.get_item_list(&query).await.unwrap().is_empty());
+        links
+            .upsert_linked_child(collection, ids[0], 0)
+            .await
+            .unwrap();
+        assert_eq!(repository.get_item_list(&query).await.unwrap().len(), 1);
+    }
 
     #[rstest::rstest]
     #[case("Élodie", "él", true)]
@@ -3519,29 +3677,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_parent_matches_descendants_via_ancestor_closure() {
+    async fn recursive_parent_uses_library_scope_and_folder_ancestors() {
         let db = test_db().await;
         let repository = repo(&db);
         // library ─ series ─ episode. The episode is a direct child of the series,
-        // NOT of the library, but the library is in its ancestor closure.
+        // not of the library. Persist both its library scope and ancestor closure,
+        // as the scanner does; library queries use TopParentId, folder queries
+        // use the ancestor closure.
         let library = Uuid::from_u128(0xB001);
         let series = Uuid::from_u128(0xB002);
         let episode = Uuid::from_u128(0xB003);
         seed_named_item(&db, library, BaseItemKind::CollectionFolder, "TV").await;
         seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
         seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(series))
-            .bind(guid_to_db(library))
-            .execute(db.writer())
-            .await
-            .expect("series parent");
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(episode))
-            .bind(guid_to_db(series))
-            .execute(db.writer())
-            .await
-            .expect("episode parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("series parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("episode parent");
         for ancestor in [series, library] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
                 .bind(guid_to_db(episode))
@@ -3565,19 +3731,21 @@ mod tests {
                 .is_empty()
         );
 
-        // Recursive: the episode is reached through the ancestor closure.
-        let recursive = InternalItemsQuery {
-            parent_id: library,
-            recursive: true,
-            include_item_types: vec![BaseItemKind::Episode],
-            ..InternalItemsQuery::default()
-        };
-        let rows = repository
-            .get_item_list(&recursive)
-            .await
-            .expect("recursive");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, guid_to_db(episode));
+        // The library and its series both reach the episode recursively.
+        for parent_id in [library, series] {
+            let recursive = InternalItemsQuery {
+                parent_id,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Episode],
+                ..InternalItemsQuery::default()
+            };
+            let rows = repository
+                .get_item_list(&recursive)
+                .await
+                .expect("recursive");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, guid_to_db(episode));
+        }
     }
 
     #[tokio::test]

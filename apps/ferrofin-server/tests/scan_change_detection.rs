@@ -24,12 +24,10 @@
 //! - provider requests: every provider a library scan reaches points at an
 //!   in-process mock that logs each request line — TMDb's API and its image
 //!   CDN, TheTVDB, fanart.tv and TheAudioDB through
-//!   [`Config::provider_endpoints`], MusicBrainz and the studio artwork
-//!   repository through their own settings. Not redirected: OMDb (inert
-//!   without a key); LrcLib and ListenBrainz, which a scan never calls; and
-//!   OpenSubtitles, which a scan does not call yet (upstream's probe downloads
-//!   missing subtitles for a library with `SubtitleDownloadLanguages`, which is
-//!   not ported yet — porting it needs an OpenSubtitles endpoint in the seam).
+//!   [`Config::provider_endpoints`] (including OMDb), MusicBrainz and the studio
+//!   artwork repository through their own settings. Not redirected: LrcLib
+//!   and ListenBrainz, which a scan never calls. OpenSubtitles also points at
+//!   the mock to test scan-time downloads for `SubtitleDownloadLanguages`.
 //!   The other image CDNs are reached only through URLs a provider answer
 //!   names, which the mock controls;
 //! - database writes: a trigger on every table counts the rows written, and
@@ -55,6 +53,7 @@
 //! | 12 | locked item saved by a rescan | `Data` (trailers) intact |
 //! | 13 | episode with TMDB date/rating, rescans | fields intact |
 //! | 14 | pending library refresh + webhook path | no full scan queued |
+//! | 15 | movie refresh: TMDB 429 and missing ffprobe | text retained; images follow replacement flags |
 //!
 //! Row 14's queue state has no HTTP surface, so it is asserted through its
 //! observable effect: the scans that ran, by trigger (`/metrics`), their
@@ -79,6 +78,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -145,11 +145,17 @@ const SHOWS: [(&str, u32); 2] = [("Harbor", 201), ("Lantern", 202)];
 struct Providers {
     base: String,
     requests: Arc<Mutex<Vec<String>>>,
+    tmdb_unavailable: Arc<AtomicBool>,
+    subtitles_unavailable: Arc<AtomicBool>,
 }
 
 impl Providers {
     fn spawn() -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let tmdb_unavailable = Arc::new(AtomicBool::new(false));
+        let unavailable = Arc::clone(&tmdb_unavailable);
+        let subtitles_unavailable = Arc::new(AtomicBool::new(false));
+        let subs_unavailable = Arc::clone(&subtitles_unavailable);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider mock");
         let addr = listener.local_addr().expect("mock addr");
         let log = Arc::clone(&requests);
@@ -162,10 +168,37 @@ impl Providers {
                 let line = req.lines().next().unwrap_or_default().to_owned();
                 log.lock().expect("lock").push(line.clone());
                 let target = line.split_whitespace().nth(1).unwrap_or_default();
-                let (status, content_type, body) = if target.starts_with("/image/") {
+                if target.starts_with("/tmdb/") && unavailable.load(Ordering::Relaxed) {
+                    // Longer than the maximum configured provider wait (300 s), so
+                    // the scan skips the shared cooldown without sleeping.
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3600\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    );
+                    continue;
+                }
+                if target.starts_with("/opensubtitles/") && subs_unavailable.load(Ordering::Relaxed)
+                {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    );
+                    continue;
+                }
+                let (status, content_type, body) = if target == "/subtitle-file" {
+                    (
+                        "200 OK",
+                        "text/plain",
+                        b"1\n00:00:00,000 --> 00:00:01,000\nHello\n".to_vec(),
+                    )
+                } else if target.starts_with("/image/") {
                     ("200 OK", "image/png", POSTER_PNG.to_vec())
                 } else {
-                    match answer(target) {
+                    match subtitle_answer(target, addr)
+                        .or_else(|| parity_answer(target, addr))
+                        .or_else(|| omdb_answer(target))
+                        .or_else(|| answer(target))
+                    {
                         Some(body) => ("200 OK", "application/json", body.into_bytes()),
                         None => ("404 Not Found", "application/json", b"{}".to_vec()),
                     }
@@ -181,6 +214,8 @@ impl Providers {
         Self {
             base: format!("http://{addr}"),
             requests,
+            tmdb_unavailable,
+            subtitles_unavailable,
         }
     }
 
@@ -188,6 +223,52 @@ impl Providers {
     fn all(&self) -> Vec<String> {
         self.requests.lock().expect("lock").clone()
     }
+}
+
+fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
+    let path = target.split('?').next()?;
+    Some(match path {
+        "/opensubtitles/login" => json!({"token":"test-token"}).to_string(),
+        "/opensubtitles/download" => {
+            json!({"link":format!("http://{addr}/subtitle-file")}).to_string()
+        }
+        "/opensubtitles/subtitles" => {
+            assert!(target.contains("moviehash="));
+            assert!(target.contains("moviehash_match=only"));
+            // A nonmatching candidate first must never win perfect-match mode.
+            json!({"data":[
+                {"attributes":{"moviehash_match":false,"files":[{"file_id":99}]}},
+                {"attributes":{"moviehash_match":true,"files":[{"file_id":42}]}}
+            ]})
+            .to_string()
+        }
+        _ => return None,
+    })
+}
+
+/// Distinct artwork URLs let the HTTP matrix prove which provider won.
+fn parity_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
+    let path = target.split('?').next()?;
+    let art = |file: &str| format!("http://{addr}/image/{file}.png");
+    Some(match path {
+        "/tmdb/movie/901" => json!({"id":901,"title":"Mapped movie","original_title":"Original movie","original_language":"ja",
+            "overview":"Mapped overview", "videos":{"results":[{"site":"YouTube","type":"Trailer","key":"mapped","name":"Trailer"}]}, "production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"mapped keyword"}]},
+            "belongs_to_collection":{"id":99,"name":"Mapped collection"},"poster_path":"/mapped-tmdb.png","credits":{"cast":[],"crew":[]}}),
+        "/fanart/movies/901" => json!({"movieposter":[{"url":art("mapped-fanart"),"lang":"en"}]}),
+        "/tvdb/login" => json!({"data":{"token":"test"}}),
+        "/tvdb/search/remoteid/tt123456" | "/tvdb/search/remoteid/777" => json!({"data":[{"series":{"id":42}}]}),
+        "/tvdb/series/42/extended" => json!({"data":{"id":42,"name":"Mapped series","overview":"TVDB series overview",
+            "averageRuntime":42,"slug":"mapped-series","lists":[{"id":9,"isOfficial":true}],
+            "remoteIds":[{"sourceName":"IMDB","id":"tt123456"}],
+            "artworks":[{"type":2,"image":art("mapped-tvdb")}]
+        }}),
+        "/tvdb/series/42/episodes/official" => json!({"data":{"episodes":[{"id":43,"seasonNumber":1,"number":1}]}}),
+        "/tvdb/episodes/43/extended" => json!({"data":{"id":43,"name":"Mapped episode","overview":"TVDB episode overview",
+            "airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,
+            "remoteIds":[{"sourceName":"IMDB","id":"tt123457"}],"characters":[]}}),
+        "/fanart/tv/42" => json!({"tvposter":[{"url":art("mapped-series-fanart"),"lang":"en"}]}),
+        _ => return None,
+    }.to_string())
 }
 
 /// The request lines of `provider` (its path prefix) among `lines`.
@@ -202,6 +283,24 @@ fn trailer(title: &str) -> String {
     format!(
         r#"{{"results": [{{"site": "YouTube", "type": "Trailer", "key": "k{title}", "name": "{title} trailer"}}]}}"#
     )
+}
+
+/// OMDb's response also verifies the credential supplied by the real server.
+fn omdb_answer(target: &str) -> Option<String> {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path == "/omdb/" {
+        assert!(
+            query.split('&').any(|p| p == "apikey=2c9d9507"),
+            "default OMDb key"
+        );
+        return Some(
+            r#"{"Response":"True","Title":"Shared Key Movie","Year":"1999",
+            "imdbID":"tt1234567","Plot":"Fetched with the shared key.","imdbRating":"8.0",
+            "Ratings":[{"Source":"Rotten Tomatoes","Value":"87%"}]}"#
+                .to_owned(),
+        );
+    }
+    None
 }
 
 /// The stand-in's answer to `target` (path + query), `None` for a 404.
@@ -259,7 +358,7 @@ fn answer(target: &str) -> Option<String> {
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
-                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5}}"#
+                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5, "credits": {{"cast":[],"crew":[]}}, "external_ids": {{"imdb_id":"tt900{n}","tvdb_id":900{n}}}, "videos": {{"results":[]}}}}"#
             )
         };
         return match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -1027,6 +1126,8 @@ impl Harness {
             provider_endpoints: ProviderEndpoints {
                 tmdb: Some(format!("{}/tmdb", providers.base)),
                 tmdb_images: Some(format!("{}/image", providers.base)),
+                omdb: Some(format!("{}/omdb/", providers.base)),
+                opensubtitles: Some(format!("{}/opensubtitles", providers.base)),
                 tvdb: Some(format!("{}/tvdb", providers.base)),
                 fanart: Some(format!("{}/fanart", providers.base)),
                 audiodb: Some(format!("{}/audiodb", providers.base)),
@@ -1598,6 +1699,11 @@ async fn a_scan_reprocesses_only_what_changed() {
     let h = Harness::boot().await;
     let started = Instant::now();
     rows(&h).await;
+    subtitles_are_downloaded_during_scan(&h).await;
+    provider_identity_fields_and_artwork(&h).await;
+    movie_metadata_survives_provider_outage(&h).await;
+    subtitle_probe_failure_is_quiet(&h).await;
+    omdb_works_without_an_operator_key(&h).await;
     eprintln!("matrix rows took {:?}", started.elapsed());
     h.shutdown().await;
 }
@@ -2245,6 +2351,452 @@ async fn rows(h: &Harness) {
     );
 }
 
+/// Issue #23: a full movie-library refresh must preserve existing metadata
+/// when the provider is throttled, including when ffprobe cannot run. Explicit
+/// image removal still follows Jellyfin. The library was populated above; this
+/// tests the refresh, not database adoption.
+async fn movie_metadata_survives_provider_outage(h: &Harness) {
+    let alpha = h.id(&h.media.alpha).await;
+    // Remove the field lock from row 10 so it cannot conceal data loss.
+    h.edit(&alpha, |dto| {
+        dto["LockedFields"] = json!([]);
+        dto["LockData"] = json!(false);
+    })
+    .await;
+    let before = h.item(&alpha).await;
+    assert!(!before["People"].as_array().expect("cast").is_empty());
+    assert!(before["ImageTags"]["Primary"].is_string());
+    let name = before["Name"].as_str().expect("movie name");
+    let stored = h.writes.row(name).await;
+    assert_ne!(stored["DateLastRefreshed"], "NULL");
+
+    // A fresh movie still gets remote metadata when probing fails.
+    std::fs::remove_file(&h.stubs.ffprobe).expect("make ffprobe unavailable");
+    let mark = h.mark().await;
+    put(&h.media.delta, &[0u8; 1024]);
+    h.webhook(&h.media.delta, "Created").await;
+    let added = h.settle(mark, &[("webhook", 1.0)]).await;
+    eprintln!("{}", added.summary("15a"));
+    assert_eq!(added.outcome("created"), 1.0);
+    assert!(added.probes.get("failed").copied().unwrap_or_default() > 0.0);
+    let delta = h.id(&h.media.delta).await;
+    let populated = h.item(&delta).await;
+    assert_eq!(populated["Overview"], "About Delta.");
+    assert_eq!(populated["ProviderIds"]["Tmdb"], "104");
+
+    h.providers.tmdb_unavailable.store(true, Ordering::Relaxed);
+    let mark = h.mark().await;
+    h.refresh(h.library("Movies"), "FullRefresh", true).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    eprintln!("{}", seen.summary("15"));
+    assert_eq!(of(&seen.requests, "tmdb").len(), 1, "shared cooldown");
+    assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
+    let after = h.item(&alpha).await;
+    for field in [
+        "Name",
+        "Overview",
+        "CommunityRating",
+        "ProductionYear",
+        "PremiereDate",
+        "RemoteTrailers",
+        "ProviderIds",
+        "People",
+        "ImageTags",
+        "RunTimeTicks",
+    ] {
+        assert_eq!(after[field], before[field], "outage must preserve {field}");
+    }
+    assert_eq!(
+        h.writes.row(name).await["DateLastRefreshed"],
+        stored["DateLastRefreshed"],
+        "failed refresh must not be stamped successful"
+    );
+    let tag = after["ImageTags"]["Primary"].as_str().expect("poster tag");
+    let image = h
+        .client
+        .get(format!("{}/Items/{alpha}/Images/Primary?tag={tag}", h.base))
+        .header("X-Emby-Token", &h.token)
+        .send()
+        .await
+        .expect("poster request");
+    assert_eq!(image.status(), reqwest::StatusCode::OK);
+    assert!(!image.bytes().await.expect("poster body").is_empty());
+
+    // Jellyfin's ItemRefreshController sets RemoveOldMetadata when replacing
+    // metadata. Combined with ReplaceAllImages, MetadataService calls
+    // RemoveImages BEFORE fetching, so an outage leaves the cached poster gone.
+    let mark = h.mark().await;
+    h.post(
+        &format!(
+            "/Items/{}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh\
+             &ReplaceAllMetadata=true&ReplaceAllImages=true&RegenerateTrickplay=false",
+            h.library("Movies")
+        ),
+        None,
+    )
+    .await;
+    let removed = h.settle(mark, &[("api", 1.0)]).await;
+    eprintln!("{}", removed.summary("15b"));
+    assert!(
+        of(&removed.requests, "tmdb").is_empty(),
+        "still cooling down"
+    );
+    let after_removal = h.item(&alpha).await;
+    assert!(after_removal["ImageTags"]["Primary"].is_null());
+    assert_eq!(after_removal["Overview"], before["Overview"]);
+    assert_eq!(after_removal["People"], before["People"]);
+}
+
+/// Scan-time subtitle downloads: existing sidecars, quiet rescans, explicit
+/// refreshes, deletion, disabled providers, and provider outages over real HTTP.
+#[allow(clippy::too_many_lines)]
+async fn subtitles_are_downloaded_during_scan(h: &Harness) {
+    assert!(of(&h.providers.all(), "opensubtitles").is_empty());
+    h.post(
+        "/Plugins/4a3f8e216c944d17a2b80f5e9c3d7a10/Configuration",
+        Some(&json!({"Username":"test", "Password":"test"})),
+    )
+    .await;
+    let root = PathBuf::from(h.media.library("subtitles"));
+    let movie = root.join("Subtitle Film (2020).mkv");
+    put(&movie, &vec![0u8; 131_072]);
+    let french = movie.with_extension("fra.srt");
+    put(&french, b"existing French subtitle");
+    let mut options = json!({
+        "PathInfos":[{"Path":root}], "EnableRealtimeMonitor":false,
+        "SubtitleDownloadLanguages":["eng", "fra", "ENG"],
+        "RequirePerfectSubtitleMatch":true,
+        "TypeOptions":[{"Type":"Movie", "MetadataFetchers":[], "ImageFetchers":[]}]
+    });
+    h.post(
+        "/Library/VirtualFolders?name=Subtitles&collectionType=movies&refreshLibrary=false",
+        Some(&json!({"LibraryOptions":options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "Subtitles")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "Default", false).await;
+    let first = h.settle(mark, &[("api", 1.0)]).await;
+    assert_eq!(
+        of(&first.requests, "opensubtitles").len(),
+        3,
+        "search + login + download: {:?}",
+        first.requests
+    );
+    assert!(first.requests.iter().any(|r| r.contains("languages=en")));
+    assert!(!first.requests.iter().any(|r| r.contains("languages=fr")));
+    let english = movie.with_extension("eng.srt");
+    let content = std::fs::read(&english).expect("subtitle downloaded before scan completes");
+    assert_eq!(std::fs::read(&french).unwrap(), b"existing French subtitle");
+    let id = h.id(&movie).await;
+    let streams = h.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+    assert_eq!(
+        streams["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["Type"] == "Subtitle")
+            .count(),
+        2
+    );
+
+    for mode in ["Default", "FullRefresh"] {
+        let mark = h.mark().await;
+        h.refresh(library, mode, mode == "FullRefresh").await;
+        let seen = h.settle(mark, &[("api", 1.0)]).await;
+        assert!(of(&seen.requests, "opensubtitles").is_empty());
+        assert_eq!(std::fs::read(&english).unwrap(), content);
+        if mode == "Default" {
+            assert!(
+                seen.spawns.is_empty(),
+                "unchanged scan must not probe: {seen:?}"
+            );
+            assert!(!seen.writes.contains_key("MediaStreamInfos"));
+        }
+    }
+    // A removed sidecar is a file change: download just that language again.
+    std::fs::remove_file(&english).unwrap();
+    let mark = h.mark().await;
+    h.refresh(library, "Default", false).await;
+    let repaired = h.settle(mark, &[("api", 1.0)]).await;
+    assert_eq!(of(&repaired.requests, "opensubtitles").len(), 3);
+    assert_eq!(std::fs::read(&english).unwrap(), content);
+
+    options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);
+    options["SubtitleDownloadLanguages"] = json!(["spa"]);
+    h.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&json!({"Id":library,"LibraryOptions":options})),
+    )
+    .await;
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let disabled = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(of(&disabled.requests, "opensubtitles").is_empty());
+
+    options["DisabledSubtitleFetchers"] = json!([]);
+    h.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&json!({"Id":library,"LibraryOptions":options})),
+    )
+    .await;
+    h.providers
+        .subtitles_unavailable
+        .store(true, Ordering::Relaxed);
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let outage = h.settle(mark, &[("api", 1.0)]).await;
+    assert_eq!(of(&outage.requests, "opensubtitles").len(), 1);
+    assert!(
+        outage.unfinished.is_empty(),
+        "subtitle failure must not abort scan"
+    );
+    assert_eq!(std::fs::read(&english).unwrap(), content);
+    assert!(!movie.with_extension("spa.srt").exists());
+    h.providers
+        .subtitles_unavailable
+        .store(false, Ordering::Relaxed);
+    // Failure does not cause every unchanged scan to retry the provider.
+    let mark = h.mark().await;
+    h.refresh(library, "Default", false).await;
+    let quiet = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(of(&quiet.requests, "opensubtitles").is_empty());
+    assert!(quiet.spawns.is_empty());
+    for mode in ["ValidationOnly", "None"] {
+        set_mtime(&movie, 5);
+        let mark = h.mark().await;
+        h.refresh(library, mode, false).await;
+        let seen = h.settle(mark, &[("api", 1.0)]).await;
+        assert!(
+            of(&seen.requests, "opensubtitles").is_empty(),
+            "{mode} must not download"
+        );
+    }
+}
+
+/// The outage scenario removed ffprobe. A forced refresh must keep existing
+/// subtitles and avoid downloading when it cannot inspect embedded streams.
+async fn subtitle_probe_failure_is_quiet(h: &Harness) {
+    let movie = PathBuf::from(h.media.library("subtitles")).join("Subtitle Film (2020).mkv");
+    let id = h.id(&movie).await;
+    let before = std::fs::read(movie.with_extension("eng.srt")).unwrap();
+    let mark = h.mark().await;
+    h.refresh(&id, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(of(&seen.requests, "opensubtitles").is_empty());
+    assert_eq!(
+        std::fs::read(movie.with_extension("eng.srt")).unwrap(),
+        before
+    );
+}
+
+/// The real composition root supplies the shared OMDb key with the operator
+/// setting empty. Per-library disabling still prevents requests entirely.
+async fn omdb_works_without_an_operator_key(h: &Harness) {
+    assert!(
+        of(&h.providers.all(), "omdb").is_empty(),
+        "disabled in earlier libraries"
+    );
+    let movie = PathBuf::from(h.media.library("omdb")).join("Shared Key Movie (1999).mkv");
+    put(&movie, &[0u8; 1024]);
+    let mut options = json!({
+        "PathInfos": [{"Path": h.media.library("omdb")}],
+        "EnableRealtimeMonitor": false,
+        "TypeOptions": [{"Type":"Movie", "MetadataFetchers":["The Open Movie Database"],
+                         "ImageFetchers":[]}]
+    });
+    h.post(
+        "/Library/VirtualFolders?name=OMDb&collectionType=movies&refreshLibrary=false",
+        Some(&json!({"LibraryOptions": options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|f| f["Name"] == "OMDb")
+        .expect("OMDb library")["ItemId"]
+        .as_str()
+        .expect("library ID");
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert_eq!(of(&seen.requests, "omdb").len(), 1);
+    assert!(of(&seen.requests, "tmdb").is_empty());
+    let id = h.id(&movie).await;
+    let dto = h.item(&id).await;
+    assert_eq!(dto["Overview"], "Fetched with the shared key.");
+    assert_eq!(dto["CriticRating"], 87.0);
+    assert_eq!(dto["ProviderIds"]["Imdb"], "tt1234567");
+
+    options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
+    h.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&json!({
+            "Id": library, "LibraryOptions": options
+        })),
+    )
+    .await;
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", true).await;
+    let disabled = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(of(&disabled.requests, "omdb").is_empty());
+}
+
+/// External identities, newly mapped fields, artwork order and quiet rescans
+/// through the real server, its persistence layer and SQLite write triggers.
+#[allow(clippy::too_many_lines)]
+async fn provider_identity_fields_and_artwork(h: &Harness) {
+    let movie_root = h.media.library("provider-movies");
+    let movie = PathBuf::from(&movie_root).join("Unmatched filename.mkv");
+    put(&movie, &[0; 1024]);
+    put(
+        &movie.with_extension("nfo"),
+        b"<movie><tmdbid>901</tmdbid></movie>",
+    );
+    let mut options = json!({"PathInfos":[{"Path":movie_root}],"EnableRealtimeMonitor":false,
+        "TypeOptions":[{"Type":"Movie","MetadataFetchers":["TheMovieDb"],"ImageFetchers":["TheMovieDb","FanArt"]}]});
+    h.post(
+        "/Library/VirtualFolders?name=ProviderMovies&collectionType=movies&refreshLibrary=false",
+        Some(&json!({"LibraryOptions":options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "ProviderMovies")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/image/mapped-fanart.png"))
+    );
+    assert!(
+        !seen
+            .requests
+            .iter()
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb"))
+    );
+    let id = h.id(&movie).await;
+    let dto = h.item(&id).await;
+    assert_eq!(dto["Name"], "Mapped movie");
+    assert_eq!(dto["OriginalTitle"], "Original movie");
+    assert_eq!(dto["ProductionLocations"], json!(["Japan"]));
+    assert_eq!(dto["Tags"], json!(["mapped keyword"]));
+    assert_eq!(dto["ProviderIds"]["TmdbCollection"], "99");
+    // A plain rescan neither redownloads artwork nor changes image rows.
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "Default", false).await;
+    let quiet = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(quiet.requests.is_empty(), "{quiet:?}");
+    assert!(
+        !quiet.writes.contains_key("BaseItemImageInfos"),
+        "{quiet:?}"
+    );
+    // An explicit library order overrides the default on image replacement.
+    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["TheMovieDb", "FanArt"]);
+    h.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&json!({"Id":library,"LibraryOptions":options})),
+    )
+    .await;
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.post(&format!("/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllImages=true"),None).await;
+    let reordered = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        reordered
+            .requests
+            .iter()
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+        "{reordered:?}"
+    );
+
+    let series_root = h.media.library("provider-series");
+    let series = PathBuf::from(&series_root).join("Unmatched series");
+    let episode = series.join("Season 1/Unknown.S01E01.mkv");
+    put(&episode, &[0; 1024]);
+    put(
+        &series.join("tvshow.nfo"),
+        b"<tvshow><imdbid>tt123456</imdbid></tvshow>",
+    );
+    let options = json!({"PathInfos":[{"Path":series_root}],"EnableRealtimeMonitor":false,"TypeOptions":[
+        {"Type":"Series","MetadataFetchers":["TheTVDB"],"ImageFetchers":["TheTVDB","FanArt"]},
+        {"Type":"Season","MetadataFetchers":[],"ImageFetchers":[]},
+        {"Type":"Episode","MetadataFetchers":["TheTVDB"],"ImageFetchers":[]}]});
+    h.post(
+        "/Library/VirtualFolders?name=ProviderSeries&collectionType=tvshows&refreshLibrary=false",
+        Some(&json!({"LibraryOptions":options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "ProviderSeries")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/tvdb/search/remoteid/tt123456")),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.requests.iter().any(|r| r.contains("/tvdb/search?")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/image/mapped-series-fanart.png")),
+        "{seen:?}"
+    );
+    let dto = h.item(&h.id(&series).await).await;
+    assert_eq!(dto["Name"], "Mapped series");
+    assert_eq!(dto["OriginalTitle"], "Mapped series");
+    assert_eq!(dto["RunTimeTicks"], 25_200_000_000_i64);
+    assert_eq!(dto["ProviderIds"]["Tvdb"], "42");
+    assert_eq!(dto["ProviderIds"]["TvdbSlug"], "mapped-series");
+    assert_eq!(dto["ProviderIds"]["TvdbCollection"], "9;");
+    let dto = h.item(&h.id(&episode).await).await;
+    assert_eq!(dto["OriginalTitle"], "Mapped episode");
+    assert_eq!(dto["ProviderIds"]["Tvdb"], "43");
+    assert_eq!(dto["ProviderIds"]["Imdb"], "tt123457");
+    assert_eq!(dto["AirsBeforeEpisodeNumber"], 2);
+    assert_eq!(dto["AirsBeforeSeasonNumber"], 1);
+    assert_eq!(dto["AirsAfterSeasonNumber"], 0);
+}
+
 /// Asserts the row wrote rows for every item in `items` and for nothing
 /// outside `items` and `also` (the items it may touch as well).
 fn assert_only_items(seen: &Seen, items: &[&str], also: &[&str], row: &str) {
@@ -2312,6 +2864,13 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
         );
     }
     assert_tables_within(seen, PROVIDER_PASS_TABLES, row);
+    assert!(
+        !seen.item_writes.iter().any(|(table, _, item)| {
+            table == "BaseItemImageInfos" && item.starts_with("Person:")
+        }),
+        "row {row}: identical provider results must not rewrite cast images: {:?}",
+        seen.item_writes
+    );
     let written = seen.written_items();
     assert!(
         keys.iter().all(|k| written.contains(k))

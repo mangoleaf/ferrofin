@@ -64,6 +64,15 @@ pub struct PlayedAndTotal {
     pub total: i32,
 }
 
+/// Counts of an owner's playable special features and local trailers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExtraCounts {
+    /// Extras included in Jellyfin's `BaseItem.DisplayExtraTypes`.
+    pub special_features: i32,
+    /// Extras whose type is `Trailer`.
+    pub local_trailers: i32,
+}
+
 /// A folder's stored value of a children-derived column next to the value
 /// its descendants give it now
 /// ([`ItemPersistenceService::folder_run_time_sums`],
@@ -201,6 +210,22 @@ pub trait ItemRepository: Send + Sync {
     /// # Errors
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Batch extra owners for video versions and the series allowed to group.
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+        grouped_series: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        let _ = grouped_series;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, vec![id]))
+            })
+            .collect())
+    }
 
     /// The library ids `user` is allowed to see — the collection folders and
     /// views left after `BlockedMediaFolders`, `EnableAllFolders` and
@@ -710,8 +735,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `images` — the write path the library scan uses to persist discovered
     /// artwork (posters/backdrops/…) so the image routes can serve it.
     ///
-    /// The default is a no-op (for stub/fake services); the real service deletes
-    /// the item's existing rows and inserts the given set.
+    /// The default is a no-op (for stub/fake services). The real service keeps
+    /// identical rows, updates changed image metadata, inserts new images and
+    /// deletes only images absent from the supplied set.
     ///
     /// # Errors
     ///
@@ -1227,6 +1253,15 @@ pub struct NameItemRow<'a> {
 /// the `User` argument becomes a [`UserEntity`] reference.
 #[async_trait]
 pub trait ItemCountService: Send + Sync {
+    /// Counts owned extras for a page in batches, without loading media rows.
+    ///
+    /// Keys are owner ids; absent keys mean zero. Counts use `ExtraType`, not
+    /// browse ancestry, and exclude theme media and untyped owned items.
+    async fn get_extra_counts_batch(
+        &self,
+        owner_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError>;
+
     /// Counts the items matching the filter.
     async fn get_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError>;
 

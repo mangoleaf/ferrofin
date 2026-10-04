@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteImage, ScanCancel, ScanOutcome, ScanRun,
-    Served, append_fanart, apply_album_child_metadata, dedup_images_by_type, download_images,
-    download_remote_images, images_changed, item_values_of, search_result_ids, split_pipe,
+    Served, append_fanart, apply_album_child_metadata, download_images, download_remote_images,
+    images_changed, item_values_of, search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -1345,6 +1345,8 @@ impl LibraryScanner {
     /// replacing, only the image types the item lacks are downloaded; with
     /// `ReplaceAllImages` every type but the ones stored with the media is
     /// replaced. Returns the item's new image set when it changed.
+    // Fetch and rank the two providers before applying the image refresh mode.
+    #[allow(clippy::too_many_lines)]
     async fn music_images(
         &self,
         work: &MusicRefresh<'_>,
@@ -1359,6 +1361,7 @@ impl LibraryScanner {
             return None;
         };
         let mut found: Vec<ferrofin_providers::TmdbImage> = Vec::new();
+        let mut fanart_found = Vec::new();
         match work.kind {
             MusicKind::Album => {
                 let group = valid_id(ids, "MusicBrainzReleaseGroup");
@@ -1380,7 +1383,7 @@ impl LibraryScanner {
                         valid_id(ids, "MusicBrainzAlbumArtist"),
                     )
                 {
-                    found.extend(fanart.album_images(&artist, group).await);
+                    fanart_found.extend(fanart.album_images(&artist, group).await);
                 }
             }
             MusicKind::Artist | MusicKind::ByNameArtist => {
@@ -1397,11 +1400,11 @@ impl LibraryScanner {
                 if fetch.fanart_images
                     && let (Some(fanart), Some(id)) = (&self.fanart, artist_key.as_deref())
                 {
-                    found.extend(fanart.artist_images(id).await);
+                    fanart_found.extend(fanart.artist_images(id).await);
                 }
             }
         }
-        if found.is_empty() {
+        if found.is_empty() && fanart_found.is_empty() {
             return None;
         }
         let stored = match items.get_image_infos(work.id).await {
@@ -1413,7 +1416,20 @@ impl LibraryScanner {
         };
         let mut remote: Vec<RemoteImage> = Vec::new();
         append_fanart(&mut remote, found);
-        let remote = dedup_images_by_type(remote);
+        let mut fanart_remote = Vec::new();
+        append_fanart(&mut fanart_remote, fanart_found);
+        let remote = super::ordered_remote_images(
+            vec![
+                (fetcher_names::AUDIODB, remote),
+                (fetcher_names::FANART, fanart_remote),
+            ],
+            work.policy,
+            if matches!(work.kind, MusicKind::Album) {
+                "MusicAlbum"
+            } else {
+                "MusicArtist"
+            },
+        );
         let key = work.id.to_string();
         let dir = meta_root.join(&key);
         let mut images = stored.clone();

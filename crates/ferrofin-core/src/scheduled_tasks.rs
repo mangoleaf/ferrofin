@@ -301,6 +301,8 @@ impl Registration {
 /// configured triggers fire on their own.
 #[derive(Clone, Default)]
 pub struct FerrofinTaskManager {
+    /// Captured lifecycle snapshots; bounded so slow clients cannot grow memory.
+    updates: Arc<TaskUpdates>,
     // Keyed by `ScheduledTask::key`, mirroring the C# lookup-by-type. Guarded by
     // a std mutex — critical sections are trivial map edits, never held across an
     // `.await`; task execution happens on a clone taken *outside* the lock.
@@ -335,6 +337,14 @@ pub struct FerrofinTaskManager {
     /// [`Failed`](TaskCompletionStatus::Failed) is recorded as a `TaskFailed`
     /// dashboard Alert (port of upstream's `TaskCompletedLogger`).
     activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
+}
+
+struct TaskUpdates(tokio::sync::broadcast::Sender<Vec<TaskInfo>>);
+
+impl Default for TaskUpdates {
+    fn default() -> Self {
+        Self(tokio::sync::broadcast::channel(64).0)
+    }
 }
 
 impl std::fmt::Debug for FerrofinTaskManager {
@@ -427,6 +437,17 @@ fn read_store<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, 
 }
 
 impl FerrofinTaskManager {
+    /// Captures transitions while holding the registry lock. A short task's
+    /// start must survive even when it finishes before the socket reads it.
+    fn publish_snapshot(&self, tasks: &HashMap<String, Registration>) {
+        if self.updates.0.receiver_count() == 0 {
+            return;
+        }
+        let mut snapshot: Vec<_> = tasks.values().map(Registration::to_info).collect();
+        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
+        let _ = self.updates.0.send(snapshot);
+    }
+
     /// Creates an empty task registry.
     #[must_use]
     pub fn new() -> Self {
@@ -724,6 +745,7 @@ impl FerrofinTaskManager {
             reg.abort = None;
             reg.started_at = None;
         }
+        self.publish_snapshot(&guard);
     }
 
     /// Runs the named task now, to completion, recording the outcome.
@@ -838,7 +860,9 @@ impl FerrofinTaskManager {
         reg.state = TaskState::Running;
         reg.progress = TaskProgress::default();
         reg.started_at = Some(Utc::now());
-        Ok((Arc::clone(&reg.task), reg.progress.clone()))
+        let claimed = (Arc::clone(&reg.task), reg.progress.clone());
+        self.publish_snapshot(&guard);
+        Ok(claimed)
     }
 
     /// Records a finished run's outcome and returns the task to
@@ -910,6 +934,7 @@ impl FerrofinTaskManager {
             long_error_message: None,
         };
         reg.last_result = Some(result.clone());
+        self.publish_snapshot(&guard);
         drop(guard);
         self.publish_task_completed(&result);
         self.persist_result(key, &result);
@@ -1252,6 +1277,14 @@ impl ScheduledTask for RefreshLibraryTask {
 /// `Result` wrappers always yield `Ok`.
 #[async_trait]
 impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
+    fn subscribe_task_updates(&self) -> Option<ferrofin_traits::tasks::TaskSubscription> {
+        let guard = lock(&self.tasks);
+        let updates = self.updates.0.subscribe();
+        let mut snapshot: Vec<_> = guard.values().map(Registration::to_info).collect();
+        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(ferrofin_traits::tasks::TaskSubscription { snapshot, updates })
+    }
+
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
         Ok(self.list())
     }
@@ -1337,6 +1370,38 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_transitions_capture_short_runs_and_failures_before_the_next_tick() {
+        use ferrofin_traits::tasks::TaskManager as _;
+        for fail in [false, true] {
+            let mgr = FerrofinTaskManager::new();
+            mgr.register(Arc::new(CountingTask {
+                runs: Arc::new(AtomicU32::new(0)),
+                fail,
+                hidden: false,
+            }));
+            let mut subscription = mgr.subscribe_task_updates().unwrap();
+            assert_eq!(subscription.snapshot[0].state, TaskState::Idle);
+            let result = mgr.run_now("counting").await;
+            assert_eq!(result.is_err(), fail);
+            // Receive only after the whole run has finished: the start is captured.
+            let started = subscription.updates.try_recv().unwrap();
+            assert_eq!(started[0].state, TaskState::Running);
+            assert_eq!(started[0].current_progress_percentage, Some(0.0));
+            let ended = subscription.updates.try_recv().unwrap();
+            assert_eq!(ended[0].state, TaskState::Idle);
+            assert_eq!(
+                ended[0].last_execution_result.as_ref().unwrap().status,
+                if fail {
+                    TaskCompletionStatus::Failed
+                } else {
+                    TaskCompletionStatus::Completed
+                }
+            );
+            assert!(subscription.updates.try_recv().is_err());
         }
     }
 

@@ -831,7 +831,7 @@ pub struct Verified {
     /// Date of the comparison, `YYYY-MM-DD`.
     pub date: &'static str,
     /// Accepted divergences, one sentence each. Owner-scope items (native .NET
-    /// plugin loading, SSDP, OMDb without a key) and Jellyfin bugs deliberately
+    /// plugin loading, SSDP) and Jellyfin bugs deliberately
     /// not ported belong here; anything else is a gap to fix before the row is
     /// written. An entry with divergences still counts as verified — the text
     /// is the published statement of what is *not* done.

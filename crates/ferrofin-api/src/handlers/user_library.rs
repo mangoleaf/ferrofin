@@ -479,8 +479,17 @@ async fn get_extras(
     let owner = resolve_item_id(state, item_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let owner_item = state
+        .library
+        .get_item_by_id(owner)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {owner}")))?;
+    let mut owner_groups = state
+        .library
+        .get_extra_owner_ids_batch(&[owner_item])
+        .await?;
     let query = InternalItemsQuery {
-        owner_ids: vec![owner],
+        owner_ids: owner_groups.remove(&owner).unwrap_or_else(|| vec![owner]),
         extra_types: extra_types.to_vec(),
         order_by: vec![(
             ferrofin_model::live_tv::ItemSortBy::SortName,

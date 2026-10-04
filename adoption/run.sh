@@ -10,9 +10,11 @@
 #      (server version, task/plugin lists, /Devices, folder order, activity-log count,
 #      image byte size);
 #   3. PRAGMA integrity_check / foreign_key_check are clean on the adopted file;
-#   4. a second boot runs no repair and changes no answer.
-# One PASS/FAIL line per fixture; exit status is non-zero if any failed. Roughly two minutes
-# per fixture. The fixtures are NOT in the repository — see adoption/README.md for what DIR
+#   4. a second boot runs no repair and changes no answer;
+#   5. populated metadata survives both boots and an explicit library scan (DB + HTTP).
+#   6. watch history survives each stage for every user (DB + HTTP).
+# One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
+# includes two boots and a full scan. Fixtures are NOT in the repository — see adoption/README.md for what DIR
 # must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -21,10 +23,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
-  -h|--help) sed -n 2,16p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,18p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
-for t in docker sqlite3 jq curl; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
+WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work}
+for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
+python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-12.1.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
@@ -47,16 +51,51 @@ FIXTURE_TABLE=(
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
 settle() { local port=$1 auth=$2 busy; for _ in $(seq 1 60); do busy=$(curl -sf "http://127.0.0.1:$port/ScheduledTasks" -H "$auth" 2>/dev/null | jq -r '[.[]|select(.State!="Idle")]|length' 2>/dev/null); [ "${busy:-1}" = 0 ] && break; sleep 2; done; sleep 5; }
+# Capture status as well as output: a failed checker must never silently pass.
+metadata_check() {
+  local stage=$1 mode=$2 result log
+  log=$dst.metadata-${stage// /-}.log
+  if ! result=$(python3 "$HERE/metadata.py" "$mode" "$dst/data/jellyfin.db" "$dst.metadata.json" \
+      --base-url "http://127.0.0.1:$port" --timeout "${ADOPTION_SCAN_TIMEOUT:-600}" 2>&1); then
+    printf '%s\n' "${result:-check failed}" > "$log"
+    why+=("metadata $stage: ${result:-check failed}")
+  else
+    printf 'PASS metadata %s\n' "$stage" > "$log"
+  fi
+  log=$dst.watch-history-${stage// /-}.log
+  if ! result=$(python3 "$HERE/watch_history.py" check "$dst/data/jellyfin.db" "$dst.watch-history.json" \
+      --base-url "http://127.0.0.1:$port" 2>&1); then
+    printf '%s\n' "${result:-check failed}" > "$log"
+    why+=("watch history $stage: ${result:-check failed}")
+  else
+    printf 'PASS watch history %s\n' "$stage" > "$log"
+  fi
+}
 failed=0
 for spec in "${FIXTURE_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$src" ] || [ "$ONLY" = "$expected" ] || continue
   [ -d "$FIXTURES/$src" ] || { printf '%-5s %-9s %-28s %s\n' SKIP "$expected" "$src" "fixture missing"; continue; }
-  name=adopt-$src; dst=$FIXTURES/work/$src
-  docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache"; mkdir -p "$FIXTURES/work"
+  name=adopt-$src; dst=$WORK/$src
+  docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache"; mkdir -p "$WORK"
   cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"
+  if ! baseline=$(python3 "$HERE/metadata.py" snapshot "$dst/data/jellyfin.db" "$dst.metadata.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "metadata baseline: $baseline"
+    failed=1
+    continue
+  fi
+  if ! baseline=$(python3 "$HERE/watch_history.py" snapshot "$dst/data/jellyfin.db" "$dst.watch-history.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "watch history baseline: $baseline"
+    failed=1
+    continue
+  fi
+  # Provider failure must not erase adopted metadata. An unreachable local
+  # proxy keeps providers from refilling lost values or depending on live keys.
+  # HTTP probes run from the host; cached artwork and media stay available.
   docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" \
     -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
+    -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
+    -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost \
     -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
   why=()
   wait_ready "$port" || why+=("never became ready")
@@ -68,6 +107,7 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke.txt" 2>&1
   mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$ORACLE" "$dst.smoke.txt")
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
+  metadata_check "after adoption" check
   docker restart "$name" >/dev/null; wait_ready "$port" || why+=("second boot never ready")
   settle "$port" "$AUTH"
   docker logs --since "$(date -u -d '-90 seconds' +%Y-%m-%dT%H:%M:%S)" "$name" > "$dst.boot2.log" 2>&1
@@ -75,6 +115,9 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   [ -z "$second" ] || why+=("second boot repaired again: $second")
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke2.txt" 2>&1
   diff -q <(adoption_normalise "$dst.smoke.txt") <(adoption_normalise "$dst.smoke2.txt") >/dev/null || why+=("second boot answers differ")
+  metadata_check "after restart" check
+  metadata_check "after scan" scan
+  mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL
   docker logs "$name" > "$dst.server.log" 2>&1; docker rm -f "$name" >/dev/null
   printf '%-5s %-9s %-28s %s\n' "$verdict" "$expected" "$src" "$(IFS='; '; echo "${why[*]:-}")"

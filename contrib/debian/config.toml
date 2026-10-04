@@ -5,7 +5,7 @@
 # variables set in the unit (FERROFIN_FFMPEG_PATH, FERROFIN_FFPROBE_PATH,
 # FERROFIN_WEB_DIR) take precedence over values here.
 
-data_dir = "/var/lib/ferrofin/data"
+data_dir = "/var/lib/ferrofin"
 bind_addr = "0.0.0.0"
 port = 8096
 
