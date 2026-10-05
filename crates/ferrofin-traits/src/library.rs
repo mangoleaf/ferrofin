@@ -1088,6 +1088,35 @@ pub struct PlaybackPermissions {
     pub remuxing: bool,
 }
 
+/// The user permissions `BaseItem.CanDelete(user)` and `CanDownload(user)`
+/// read, from [`UserDataManager::get_content_permissions`].
+///
+/// Upstream reads each with `user.HasPermission(PermissionKind.…)` and the
+/// folder list with `user.GetPreferenceValues<Guid>(PreferenceKind.
+/// EnableContentDeletionFromFolders)` (`BaseItem.cs:854-879`,
+/// `BoxSet.cs:107-110`, `Playlist.cs:273-276`, `BaseItem.cs:902-905`).
+// Each flag is one independent `Permissions` row, not a state to model.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentPermissions {
+    /// `PermissionKind.IsAdministrator` — deletes any playlist and any
+    /// collection. It grants nothing for ordinary media: an administrator
+    /// without "Allow media deletion" cannot delete a movie, as upstream.
+    pub is_administrator: bool,
+    /// `PermissionKind.EnableContentDeletion` — the dashboard's "Allow media
+    /// deletion" (any library).
+    pub enable_content_deletion: bool,
+    /// `PermissionKind.EnableContentDownloading`.
+    pub enable_content_downloading: bool,
+    /// `PermissionKind.EnableCollectionManagement` — deletes collections.
+    pub enable_collection_management: bool,
+    /// `PreferenceKind.EnableContentDeletionFromFolders` — the dashboard's
+    /// "Allow media deletion from" list: the libraries (`CollectionFolder`
+    /// ids) the user may delete from without the global permission. Values
+    /// that are not GUIDs are dropped.
+    pub content_deletion_folders: Vec<Uuid>,
+}
+
 impl PlaybackPermissions {
     /// Applies the overwrite to one media source, for an item of `media_type`.
     ///
@@ -1421,17 +1450,20 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// The user's `(EnableContentDeletion, EnableContentDownloading)`
-    /// permissions, for the DTO builder's per-user `CanDelete`/`CanDownload`
-    /// gating (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`).
+    /// The slice of the user's policy that `CanDelete(user)` and
+    /// `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
+    /// `BoxSet`/`Playlist` overrides, and `IsAuthorizedToDownload`), for the
+    /// DTO builder's per-user `CanDelete`/`CanDownload` and the delete
+    /// endpoints' check, which use the same value.
     ///
-    /// `None` means "no policy known" — the caller falls back to the
-    /// file-level fact. The default returns that; the concrete manager reads
-    /// the `Permissions` rows.
+    /// `None` means "no policy known". `CanDownload` then falls back to the
+    /// file-level fact, and `CanDelete` for a user is `false`: a deletion is
+    /// never granted on an unknown policy. The default returns `None`; the
+    /// concrete manager reads the `Permissions` and `Preferences` rows.
     async fn get_content_permissions(
         &self,
         user_id: Uuid,
-    ) -> Result<Option<(bool, bool)>, ServiceError> {
+    ) -> Result<Option<ContentPermissions>, ServiceError> {
         let _ = user_id;
         Ok(None)
     }

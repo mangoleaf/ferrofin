@@ -33,15 +33,18 @@
 //! exactly as the sibling managers read `ferrofin-db` for data with no repository
 //! surface.
 //!
-//! ## Deferred (noted, faithful stubs)
+//! ## Not yet ported
 //!
-//! LiveTV program/channel enrichment (`AddInfoToProgramDto`/`AddChannelInfo`)
-//! and active-recording rewrites depend on the `ILiveTvManager`/
-//! `IRecordingsManager` seams, which are not injected into this unit; those
-//! branches are skipped and flagged. `CanDelete`/`CanDownload` collapse to thin
-//! defaults (the C# logic needs the domain tree). Everything else — the
-//! full field/image/user-data/people/media-source/chapter/trickplay mapping —
-//! is ported.
+//! The active-recording rewrite (`DtoService.cs:443-466`: a library video a
+//! DVR capture is still writing answers `Type: Recording`, `CanDownload:
+//! false` and no run time) is an open work item, not an accepted state: the
+//! files being written are known (`LiveTvManager::active_recording_paths`,
+//! which `CanDelete` already reads), the rewrite is not applied yet. LiveTV
+//! channel/programme enrichment runs through the late-bound Live TV manager,
+//! and `CanDelete` is upstream's `CanDelete(user)` in full
+//! ([`crate::item_deletion::can_delete`]). Everything else — the full
+//! field/image/user-data/people/media-source/chapter/trickplay mapping — is
+//! ported.
 
 // The DTO assembly copies dozens of scalar/collection fields straight from the
 // item row onto a fresh, `Option`-valued DTO field (`dto.name =
@@ -72,7 +75,9 @@ use uuid::Uuid;
 use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager};
+use ferrofin_traits::library::{
+    ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
+};
 use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
 use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
@@ -179,8 +184,11 @@ struct Prefetched {
     has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
     /// `CanDelete`/`CanDownload` fields are requested and a user is present),
-    /// so the whole page gates on one `Permissions` query.
-    content_permissions: Option<UserContentPermissions>,
+    /// so the whole page gates on one permissions query.
+    content_permissions: Option<ContentPermissions>,
+    /// Everything the page's `CanDelete` reads besides the rows (empty unless
+    /// the field is requested) — see [`FerrofinDtoService::delete_facts`].
+    delete_facts: crate::item_deletion::DeleteFacts,
     /// The per-NAME `Person` item id for each credited name on the page, so
     /// `People[].Id` points at the favoritable by-name item. Keyed by the credit
     /// row's name *as stored*: the prefetch resolves names case-insensitively
@@ -199,16 +207,6 @@ struct Prefetched {
     /// item, so it must survive its own item's projection — see
     /// [`FerrofinDtoService::attach_basic_fields`]'s `MediaStreams` read.
     alt_referenced: std::collections::HashSet<Uuid>,
-}
-
-/// The delete/download half of a user's policy (C# `HasPermission` over
-/// `EnableContentDeletion` / `EnableContentDownloading`).
-#[derive(Debug, Clone, Copy)]
-struct UserContentPermissions {
-    /// `PermissionKind::EnableContentDeletion` (10).
-    can_delete: bool,
-    /// `PermissionKind::EnableContentDownloading` (11).
-    can_download: bool,
 }
 
 /// Takes an item's prefetched entry instead of cloning it, when this is the
@@ -753,6 +751,53 @@ impl ImageParent {
     /// The ids `DisplayParent ?? GetOwner() ?? GetParent()` tries, in order.
     fn candidates(&self) -> [Option<Uuid>; 3] {
         [self.display_parent_id(), self.owner_id, self.parent_id]
+    }
+}
+
+/// One row of a `GetCollectionFolders` walk
+/// ([`FerrofinDtoService::libraries_of`]).
+struct LibraryHop {
+    kind: BaseItemKind,
+    parent: Option<Uuid>,
+    owner: Option<Uuid>,
+    path: Option<String>,
+}
+
+impl LibraryHop {
+    fn from_entity(item: &BaseItemEntity) -> Self {
+        Self {
+            kind: row_kind(item),
+            parent: stored_id(item.parent_id.as_deref()),
+            owner: stored_id(item.owner_id.as_deref()),
+            path: item.path.clone(),
+        }
+    }
+
+    fn from_row(row: ferrofin_db::ImageParentRow) -> Self {
+        Self {
+            kind: kind_from_type_name(&row.type_).unwrap_or(BaseItemKind::Folder),
+            parent: stored_id(row.parent_id.as_deref()),
+            owner: stored_id(row.owner_id.as_deref()),
+            path: row.path,
+        }
+    }
+
+    /// The row the walk steps onto next, or `None` where it ends: upstream
+    /// stops when the parent is the `AggregateFolder`, and steps to the
+    /// owner when there is no parent. `GetParent()` is the parent ROW, so a
+    /// dangling `ParentId` reads as no parent.
+    fn next(&self, rows: &HashMap<Uuid, Self>) -> Option<Uuid> {
+        match self.parent.filter(|p| rows.contains_key(p)) {
+            Some(parent)
+                if rows
+                    .get(&parent)
+                    .is_some_and(|p| p.kind == BaseItemKind::AggregateFolder) =>
+            {
+                None
+            }
+            Some(parent) => Some(parent),
+            None => self.owner.filter(|o| rows.contains_key(o)),
+        }
     }
 }
 
@@ -2318,38 +2363,26 @@ impl FerrofinDtoService {
         .await?;
 
         let perms = prefetched.content_permissions.as_ref();
-        // Can-delete / can-download: the file-level fact gated by the user's
-        // policy (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`). The
-        // per-library `EnableContentDeletionFromFolders` refinement needs the
-        // un-ported collection-folder walk and is deferred; admin or the global
-        // permission covers the real cases.
-        // Live TV channels/programmes hard-override both to false upstream
-        // (`LiveTvChannel.CanDelete() => false`, and `LiveTvProgram` keeps the
-        // `BaseItem` defaults — no file to delete or download).
+        // Live TV channels/programmes hard-override CanDownload to false
+        // upstream (`LiveTvProgram` keeps the `BaseItem` default — no file to
+        // download); CanDelete's own overrides live in `item_deletion`.
         let live_tv = is_live_tv_channel(kind) || is_live_tv_program(kind);
         if options.contains_field(ItemFields::CanDelete) {
-            // By-name items (Genre/Studio/Person/…) have no file — C# `CanDelete()`
-            // returns false (default `IsFileProtocol`, plus explicit overrides) —
-            // and so do the library containers: `CollectionFolder.CanDelete()`
-            // (CollectionFolder.cs:107) and `BasePluginFolder.CanDelete()`
-            // hard-return false, and `Folder.CanDelete()` (Folder.cs:187) returns
-            // false for an `IsRoot` folder (`UserRootFolder`/`AggregateFolder`).
-            // `kinds::can_delete` is that override table; `has_parent` carries
-            // `MusicArtist.CanDelete => !IsAccessedByName`.
-            let has_parent = item
-                .parent_id
-                .as_deref()
-                .and_then(|p| Uuid::parse_str(p).ok())
-                .is_some_and(|p| !p.is_nil());
-            let file_deletable =
-                !item.is_virtual_item && kinds::can_delete(kind, has_parent) && !live_tv;
-            dto.can_delete = Some(file_deletable && perms.is_none_or(|p| p.can_delete));
+            // C# `user is null ? item.CanDelete() : item.CanDelete(user)` — the
+            // one implementation the delete endpoints answer `401` by, so the
+            // menu jellyfin-web shows from this field and the endpoint agree.
+            dto.can_delete = Some(crate::item_deletion::can_delete(
+                item,
+                kind,
+                &prefetched.delete_facts,
+            ));
         }
         if options.contains_field(ItemFields::CanDownload) {
             // C# `CanDownload()` is false by default and only true for playable media;
             // a by-name item is not a folder but still isn't downloadable.
             let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv;
-            dto.can_download = Some(file_downloadable && perms.is_none_or(|p| p.can_download));
+            dto.can_download =
+                Some(file_downloadable && perms.is_none_or(|p| p.enable_content_downloading));
         }
 
         Ok(dto)
@@ -3443,7 +3476,14 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
         let mut prefetched = self
-            .prefetch(std::slice::from_ref(item), options, user, None, false)
+            .prefetch(
+                std::slice::from_ref(item),
+                options,
+                user,
+                None,
+                false,
+                false,
+            )
             .await?;
         // Single-item page: the id cannot repeat, so every entry moves.
         let mut dto = self
@@ -3461,6 +3501,28 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
             }
         }
         Ok(dto)
+    }
+
+    async fn can_delete(
+        &self,
+        item: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        // Exactly the projection's path for `ItemFields::CanDelete`
+        // (`prefetch` → `delete_facts`, `build_dto` →
+        // `item_deletion::can_delete`), for this one item.
+        let permissions = self
+            .user_data
+            .get_content_permissions(parse_user_id(&user.id)?)
+            .await?;
+        let facts = self
+            .delete_facts(std::slice::from_ref(item), Some(user), permissions, false)
+            .await?;
+        Ok(crate::item_deletion::can_delete(
+            item,
+            row_kind(item),
+            &facts,
+        ))
     }
 }
 
@@ -3483,7 +3545,16 @@ impl FerrofinDtoService {
         // ported at this layer; the caller is expected to have filtered the set,
         // so every input row is projected.
         let mut prefetched = self
-            .prefetch(items, options, user, owner_id, retrieved_by_id)
+            // `GetBaseItemDto` (by id) vs `GetBaseItemDtos` (a page): only the
+            // page asks the non-virtual `CanDelete(user, allCollectionFolders)`.
+            .prefetch(
+                items,
+                options,
+                user,
+                owner_id,
+                retrieved_by_id,
+                !retrieved_by_id,
+            )
             .await?;
         // Ids the page lists more than once (a playlist may repeat a track).
         // Their prefetched entries are read once per occurrence, so they keep
@@ -3572,6 +3643,7 @@ impl FerrofinDtoService {
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
         retrieved_by_id: bool,
+        list_page: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
         let extra_counts = if options.contains_field(ItemFields::SpecialFeatureCount)
@@ -4109,22 +4181,25 @@ impl FerrofinDtoService {
                 .into_iter()
                 .collect()
         };
-        // One Permissions read gates the whole page's CanDelete/CanDownload
-        // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item).
+        // One permissions read gates the whole page's CanDelete/CanDownload
+        // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item), and
+        // CanDelete's other inputs are read once for the page too.
         let content_permissions = match user {
             Some(user)
                 if options.contains_field(ItemFields::CanDelete)
                     || options.contains_field(ItemFields::CanDownload) =>
             {
-                let user_id = parse_user_id(&user.id)?;
-                self.user_data.get_content_permissions(user_id).await?.map(
-                    |(can_delete, can_download)| UserContentPermissions {
-                        can_delete,
-                        can_download,
-                    },
-                )
+                self.user_data
+                    .get_content_permissions(parse_user_id(&user.id)?)
+                    .await?
             }
             _ => None,
+        };
+        let delete_facts = if options.contains_field(ItemFields::CanDelete) {
+            self.delete_facts(items, user, content_permissions.clone(), list_page)
+                .await?
+        } else {
+            crate::item_deletion::DeleteFacts::default()
         };
         Ok(Prefetched {
             extra_counts,
@@ -4152,11 +4227,192 @@ impl FerrofinDtoService {
             has_subtitles,
             has_lyrics,
             content_permissions,
+            delete_facts,
             person_ids_by_name,
             image_parents,
             parent_images,
             alt_referenced,
         })
+    }
+
+    /// What the page's `CanDelete` reads besides each row
+    /// ([`crate::item_deletion::can_delete`]): the user and their
+    /// permissions, the page's playlists' owners, the files recordings are
+    /// writing, and — only when the user's "Allow media deletion from" list
+    /// decides — each item's libraries.
+    ///
+    /// The same facts answer [`DtoService::can_delete`] for one item, which
+    /// is what makes the delete endpoints agree with a single item's DTO.
+    /// `list_page` marks a page (`GetBaseItemDtos`), where upstream skips the
+    /// playlist override ([`crate::item_deletion::DeleteFacts::list_page`]).
+    async fn delete_facts(
+        &self,
+        items: &[BaseItemEntity],
+        user: Option<&UserEntity>,
+        permissions: Option<ContentPermissions>,
+        list_page: bool,
+    ) -> Result<crate::item_deletion::DeleteFacts, ServiceError> {
+        let mut facts = crate::item_deletion::DeleteFacts {
+            list_page,
+            ..crate::item_deletion::DeleteFacts::default()
+        };
+        // `Video.IsActiveRecording`: an in-memory set, and only when the page
+        // holds a video at all.
+        if let Some(live_tv) = self.live_tv.get()
+            && items.iter().any(|item| kinds::is_video(row_kind(item)))
+        {
+            facts.active_recordings = live_tv
+                .active_recording_paths()
+                .await?
+                .into_iter()
+                .collect();
+        }
+        let Some(user) = user else {
+            return Ok(facts);
+        };
+        facts.user_id = Some(parse_user_id(&user.id)?);
+        facts.permissions = permissions;
+        let playlists: Vec<String> = items
+            .iter()
+            .filter(|item| row_kind(item) == BaseItemKind::Playlist)
+            .map(|item| guid_to_db(row_id(item)))
+            .collect();
+        if !playlists.is_empty() {
+            for (playlist, owner) in self
+                .db
+                .playlist_owners(&playlists)
+                .await
+                .map_err(|e| ServiceError::Backend(e.to_string()))?
+            {
+                if let (Ok(playlist), Ok(owner)) =
+                    (Uuid::parse_str(&playlist), Uuid::parse_str(&owner))
+                {
+                    facts.playlist_owners.insert(playlist, owner);
+                }
+            }
+        }
+        if facts.needs_libraries() {
+            facts.libraries = self.libraries_of(items).await?;
+        }
+        Ok(facts)
+    }
+
+    /// `LibraryManager.GetCollectionFolders(item)` (`LibraryManager.cs:
+    /// 2840-2881`) for every item: the libraries (`CollectionFolder` ids) it
+    /// belongs to, which the "Allow media deletion from" grants name.
+    ///
+    /// Upstream walks `GetParent()` (`GetOwner()` when there is no parent) up
+    /// to the folder under the `AggregateFolder` and matches that folder's
+    /// path against each collection folder's `Path` and
+    /// `PhysicalLocationsList`. That is the shape of a database Jellyfin
+    /// scanned. In one Ferrofin scanned, a library's `CollectionFolder` owns
+    /// its items directly, so a walk that reaches one stops there and
+    /// answers it.
+    ///
+    /// One narrow row read per level of the walk for the whole set, and the
+    /// collection folders once.
+    async fn libraries_of(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        let mut rows: HashMap<Uuid, LibraryHop> = items
+            .iter()
+            .map(|item| (row_id(item), LibraryHop::from_entity(item)))
+            .collect();
+        // Per item, the row its walk stands on; `None` once it has ended.
+        let mut at: HashMap<Uuid, Option<Uuid>> = rows.keys().map(|id| (*id, Some(*id))).collect();
+        let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        let mut tops: HashMap<Uuid, Uuid> = HashMap::new();
+        for _ in 0..MAX_IMAGE_PARENT_DEPTH {
+            self.read_library_hops(&at, &mut rows).await?;
+            let mut moving = false;
+            for (item, current) in &mut at {
+                let Some(id) = *current else { continue };
+                let Some(hop) = rows.get(&id) else {
+                    *current = None;
+                    continue;
+                };
+                // Ferrofin's own tree: the library owns its items directly.
+                if hop.kind == BaseItemKind::CollectionFolder {
+                    out.insert(*item, vec![id]);
+                    *current = None;
+                } else if let Some(next) = hop.next(&rows) {
+                    *current = Some(next);
+                    moving = true;
+                } else {
+                    tops.insert(*item, id);
+                    *current = None;
+                }
+            }
+            if !moving {
+                break;
+            }
+        }
+        // A walk still under way hit the cap (a `ParentId`/`OwnerId` cycle, or
+        // a tree deeper than any real one): no library is known for that item,
+        // so a per-library grant cannot allow deleting it. Said, not silent —
+        // the same warning the inherited-image walk gives.
+        for (item, current) in &at {
+            if current.is_some() {
+                tracing::warn!(
+                    item_id = %item,
+                    depth = MAX_IMAGE_PARENT_DEPTH,
+                    "library walk hit its depth cap; a per-library deletion grant cannot apply"
+                );
+            }
+        }
+        if tops.is_empty() {
+            return Ok(out);
+        }
+        let folders = self.collection_folder_locations().await?;
+        for (item, top) in tops {
+            let Some(path) = rows.get(&top).and_then(|hop| hop.path.as_deref()) else {
+                continue;
+            };
+            let matched: Vec<Uuid> = folders
+                .iter()
+                .filter(|f| f.matches(path))
+                .map(|f| f.id)
+                .collect();
+            if !matched.is_empty() {
+                out.insert(item, matched);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reads, in one query, every row a [`Self::libraries_of`] walk steps
+    /// onto next that is not in `rows` yet.
+    async fn read_library_hops(
+        &self,
+        at: &HashMap<Uuid, Option<Uuid>>,
+        rows: &mut HashMap<Uuid, LibraryHop>,
+    ) -> Result<(), ServiceError> {
+        let wanted: Vec<String> = at
+            .values()
+            .flatten()
+            .filter_map(|id| rows.get(id))
+            .flat_map(|hop| [hop.parent, hop.owner])
+            .flatten()
+            .filter(|id| !rows.contains_key(id))
+            .map(guid_to_db)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        for fetched in self
+            .db
+            .image_parent_rows(&wanted)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        {
+            if let Ok(id) = Uuid::parse_str(&fetched.id) {
+                rows.insert(id, LibraryHop::from_row(fetched));
+            }
+        }
+        Ok(())
     }
 
     /// Counts pre-supplied tagged items by kind onto a by-name DTO (port of the
@@ -4423,10 +4679,13 @@ mod tests {
         async fn get_content_permissions(
             &self,
             _user_id: Uuid,
-        ) -> Result<Option<(bool, bool)>, ServiceError> {
+        ) -> Result<Option<ContentPermissions>, ServiceError> {
             // Deletion granted, downloading denied — asymmetric on purpose so a
             // test can prove each side gates independently.
-            Ok(Some((true, false)))
+            Ok(Some(ContentPermissions {
+                enable_content_deletion: true,
+                ..ContentPermissions::default()
+            }))
         }
         async fn save_user_data(
             &self,
@@ -6979,6 +7238,7 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "Subbed").await;
+        crate::test_support::set_item_path(&db, id, "/media/Subbed.mkv").await;
         let item = fetch_item(&db, id).await;
         let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x99)).await;
         let svc = service(db);
@@ -7235,14 +7495,31 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "M").await;
+        crate::test_support::set_item_path(&db, id, "/media/M.mkv").await;
         let item = fetch_item(&db, id).await;
         assert!(!item.is_virtual_item, "seeded item is a real file item");
-        let svc = service(db);
+        let svc = service(db.clone());
         let dto = svc
             .get_base_item_dto(&item, &DtoOptions::default(), None, None)
             .await
             .unwrap();
         assert_eq!(dto.can_delete, Some(true));
+
+        // `BaseItem.CanDelete() => IsFileProtocol`: a row with no path, or a
+        // streamed one, has nothing to delete.
+        for path in [None, Some("https://cdn.example/m.mkv")] {
+            let other = Uuid::new_v4();
+            seed_named_item(&db, other, BaseItemKind::Movie, "N").await;
+            if let Some(path) = path {
+                crate::test_support::set_item_path(&db, other, path).await;
+            }
+            let item = fetch_item(&db, other).await;
+            let dto = svc
+                .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap();
+            assert_eq!(dto.can_delete, Some(false), "{path:?}");
+        }
     }
 
     #[tokio::test]
@@ -7891,7 +8168,7 @@ mod tests {
     /// been adopted under the legacy type could see it. Both spellings are
     /// seeded here, both with a parent, so neither route can regress.
     ///
-    /// The fake permissions reader grants deletion (`Ok(Some((true, false)))`),
+    /// The fake permissions reader grants deletion (`EnableContentDeletion`),
     /// so a `false` here can only come from the kind table — not from the
     /// user's `EnableContentDeletion` policy, which is the other half of
     /// C# `BaseItem.CanDelete(user)`.
@@ -7942,6 +8219,7 @@ mod tests {
 
         let plain = Uuid::new_v4();
         seed_folder_item(&db, plain, BaseItemKind::Folder, "Some Folder", Some(root)).await;
+        crate::test_support::set_item_path(&db, plain, "/media/Some Folder").await;
         let item = fetch_item(&db, plain).await;
         let dto = svc
             .get_base_item_dto(&item, &options, Some(&user), None)
@@ -9092,5 +9370,190 @@ mod tests {
             item_count: 99,
         };
         assert_eq!(total_item_count(&counts), 11);
+    }
+
+    // ---- CanDelete(user): one answer for the DTO and the delete endpoints ----
+
+    /// A DTO service over the REAL permission reader, so `CanDelete` sees the
+    /// users' stored "Allow media deletion" settings.
+    async fn service_with_real_permissions(
+        db: &Database,
+    ) -> (FerrofinDtoService, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            tmp.path(),
+            tmp.path().join("log"),
+            tmp.path().join("config"),
+            tmp.path().join("cache"),
+            tmp.path().join("web"),
+        ));
+        let config = crate::configuration_manager::FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("config");
+        let user_data =
+            crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), Arc::new(config));
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(user_data),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        (svc, tmp)
+    }
+
+    /// A single item's DTO `CanDelete` and `DtoService::can_delete` — which
+    /// the delete endpoints answer `401` by — give the same answer for every
+    /// user and item, and that answer is upstream's `BaseItem.CanDelete(User)`;
+    /// a page of items agrees too, except for a playlist, which upstream's
+    /// `GetBaseItemDtos` shows deletable to everyone (it calls the
+    /// non-virtual `CanDelete(user, allCollectionFolders)`, which the
+    /// playlist's owner override does not reach — `DtoService.cs:182-186,
+    /// 422-428` at master):
+    ///
+    /// - media needs "Allow media deletion", or "Allow media deletion from"
+    ///   naming the item's library — found through a Ferrofin-scanned tree
+    ///   (the library owns the movie) and a Jellyfin-scanned one (the movie
+    ///   sits in a physical folder the library lists as a location);
+    /// - an administrator without the deletion permission cannot delete
+    ///   media, but deletes collections and any playlist;
+    /// - a collection needs collection management or administrator;
+    /// - a playlist is its owner's (or an administrator's).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn can_delete_agrees_with_the_dto_for_every_user_and_item() {
+        use ferrofin_db::enums::PermissionKind as P;
+        let db = test_db().await;
+        let library_a = Uuid::from_u128(0xA0);
+        let library_b = Uuid::from_u128(0xB0);
+        seed_item_with_data(
+            &db,
+            library_a,
+            BaseItemKind::CollectionFolder,
+            "A",
+            r#"{"PhysicalLocationsList":["/media/a2"]}"#,
+        )
+        .await;
+        seed_named_item(&db, library_b, BaseItemKind::CollectionFolder, "B").await;
+        // Ferrofin's tree: the library owns its items.
+        let movie_a = Uuid::from_u128(0xA1);
+        seed_child_item(&db, movie_a, BaseItemKind::Movie, "In A", library_a).await;
+        crate::test_support::set_item_path(&db, movie_a, "/media/a/In A.mkv").await;
+        let movie_b = Uuid::from_u128(0xB1);
+        seed_child_item(&db, movie_b, BaseItemKind::Movie, "In B", library_b).await;
+        crate::test_support::set_item_path(&db, movie_b, "/media/b/In B.mkv").await;
+        // Jellyfin's tree: aggregate → physical folder → movie, and an extra
+        // owned by that movie (reached through `GetOwner()`).
+        let aggregate = Uuid::from_u128(0xC0);
+        let physical = Uuid::from_u128(0xC1);
+        let adopted = Uuid::from_u128(0xC2);
+        let extra = Uuid::from_u128(0xC3);
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, physical, BaseItemKind::Folder, "a2", Some(aggregate)).await;
+        crate::test_support::set_item_path(&db, physical, "/media/a2").await;
+        seed_child_item(&db, adopted, BaseItemKind::Movie, "Adopted", physical).await;
+        crate::test_support::set_item_path(&db, adopted, "/media/a2/Adopted.mkv").await;
+        seed_named_item(&db, extra, BaseItemKind::Trailer, "Trailer").await;
+        let mut extra_row = fetch_item(&db, extra).await;
+        extra_row.owner_id = Some(guid_to_db(adopted));
+        extra_row.path = Some("/media/a2/Adopted-trailer.mkv".to_owned());
+        save_item(&db, &extra_row).await;
+        let boxset = Uuid::from_u128(0xD0);
+        seed_named_item(&db, boxset, BaseItemKind::BoxSet, "Saga").await;
+        let playlist = Uuid::from_u128(0xE0);
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
+
+        let nobody = Uuid::from_u128(0x101);
+        let deleter = Uuid::from_u128(0x102);
+        let granted = Uuid::from_u128(0x103);
+        let admin = Uuid::from_u128(0x104);
+        let curator = Uuid::from_u128(0x105);
+        let mut users = HashMap::new();
+        for (user, name) in [
+            (nobody, "nobody"),
+            (deleter, "deleter"),
+            (granted, "granted"),
+            (admin, "admin"),
+            (curator, "curator"),
+        ] {
+            users.insert(
+                user,
+                crate::test_support::seed_named_user(&db, user, name).await,
+            );
+        }
+        let grant = crate::user_data_manager::seed_content_permissions;
+        grant(&db, deleter, &[P::EnableContentDeletion], &[]).await;
+        grant(&db, granted, &[], &[library_a]).await;
+        grant(&db, admin, &[P::IsAdministrator], &[]).await;
+        grant(&db, curator, &[P::EnableCollectionManagement], &[]).await;
+        crate::item_data::seed_playlist_owner(&db, playlist, granted).await;
+
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let items = [movie_a, movie_b, adopted, extra, boxset, playlist];
+        //                       movie_a movie_b adopted extra  boxset playlist
+        let expected: [(Uuid, [bool; 6]); 5] = [
+            (nobody, [false, false, false, false, false, false]),
+            (deleter, [true, true, true, true, false, false]),
+            (granted, [true, false, true, true, false, true]),
+            (admin, [false, false, false, false, true, true]),
+            (curator, [false, false, false, false, true, false]),
+        ];
+        let options = DtoOptions {
+            fields: vec![ItemFields::CanDelete],
+            ..DtoOptions::default()
+        };
+        let mut rows = Vec::new();
+        for id in items {
+            rows.push(fetch_item(&db, id).await);
+        }
+        for (user_id, want) in expected {
+            let user = &users[&user_id];
+            let page = svc
+                .get_base_item_dtos(&rows, &options, Some(user), None, true)
+                .await
+                .expect("page");
+            for ((row, dto), want) in rows.iter().zip(&page).zip(want) {
+                let single = svc
+                    .get_base_item_dto(row, &options, Some(user), None)
+                    .await
+                    .expect("dto");
+                let asked = svc.can_delete(row, user).await.expect("can delete");
+                let what = format!("user {}, item {:?}", user.username, row.name);
+                assert_eq!(asked, want, "{what}: DtoService::can_delete");
+                assert_eq!(single.can_delete, Some(want), "{what}: single DTO");
+                let on_a_page = want || row.id == guid_to_db(playlist);
+                assert_eq!(dto.can_delete, Some(on_a_page), "{what}: page DTO");
+            }
+        }
+    }
+
+    /// A `ParentId` cycle ends the library walk at its depth cap: no library
+    /// is found, so a per-library grant does not allow the delete — and the
+    /// walk returns instead of spinning.
+    #[tokio::test]
+    async fn a_parent_cycle_grants_no_library() {
+        let db = test_db().await;
+        let (first, second, movie) = (
+            Uuid::from_u128(0xF1),
+            Uuid::from_u128(0xF2),
+            Uuid::from_u128(0xF3),
+        );
+        seed_folder_item(&db, first, BaseItemKind::Folder, "one", None).await;
+        seed_folder_item(&db, second, BaseItemKind::Folder, "two", Some(first)).await;
+        let mut row = fetch_item(&db, first).await;
+        row.parent_id = Some(guid_to_db(second));
+        save_item(&db, &row).await;
+        seed_child_item(&db, movie, BaseItemKind::Movie, "Loop", first).await;
+        crate::test_support::set_item_path(&db, movie, "/media/loop/Loop.mkv").await;
+        let user = Uuid::from_u128(0x201);
+        let entity = crate::test_support::seed_named_user(&db, user, "granted").await;
+        crate::user_data_manager::seed_content_permissions(&db, user, &[], &[first]).await;
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let item = fetch_item(&db, movie).await;
+        assert!(!svc.can_delete(&item, &entity).await.expect("can delete"));
     }
 }

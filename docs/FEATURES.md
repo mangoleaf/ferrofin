@@ -51,7 +51,9 @@ Deep-verified against a real Jellyfin server:
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
-  path-scoped ingest; virtual folders; item read + write/edit + delete. Deep-verified for
+  path-scoped ingest; virtual folders; item read + write/edit + delete (delete removes the
+  item from the library only — Jellyfin also deletes its files, an open work item).
+  Deep-verified for
   `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
   libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
   `boxsets` is the one library type not resolved off disk (its members are curated through

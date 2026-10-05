@@ -370,13 +370,16 @@ async fn apply_search_criteria(
             // the scan queue's priority lane — inside a running scan, between
             // two of its items — so it never waits for a library scan.
             let library = std::sync::Arc::clone(&state.library);
-            let ran = tokio::spawn(async move { library.run_refresh_scan(target, &options).await })
-                .await
-                .map_err(|err| {
-                    ApiError::Service(ServiceError::backend(format!(
-                        "identify refresh task failed: {err}"
-                    )))
-                })??;
+            // In the request's span: the request awaits it (LOGGING.md §4).
+            let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+                library.run_refresh_scan(target, &options).await
+            }))
+            .await
+            .map_err(|err| {
+                ApiError::Service(ServiceError::backend(format!(
+                    "identify refresh task failed: {err}"
+                )))
+            })??;
             if !ran {
                 // Logged once, by the error boundary (a 5xx).
                 return Err(ApiError::ServiceUnavailable(format!(

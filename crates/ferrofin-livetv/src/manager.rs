@@ -2961,6 +2961,30 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .map(|recording| recording.path.display().to_string()))
     }
 
+    async fn active_recording_paths(&self) -> Result<Vec<String>, ServiceError> {
+        // `RecordingsManager.GetActiveRecordingInfo`: a capture told to stop,
+        // or whose timer is no longer `InProgress`, is not an active recording.
+        let live: Vec<(String, String)> = self
+            .active_recordings_lock()
+            .values()
+            .filter(|recording| !recording.is_cancelled())
+            .map(|recording| {
+                (
+                    recording.timer_id.clone(),
+                    recording.path.display().to_string(),
+                )
+            })
+            .collect();
+        let mut paths = Vec::with_capacity(live.len());
+        for (timer_id, path) in live {
+            let timer = self.get_timer(&timer_id).await?;
+            if timer.is_some_and(|timer| timer.status == RecordingStatus::InProgress) {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
+    }
+
     async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
         // `LiveTvChannel.MediaType => ChannelType == ChannelType.Radio ?
         // MediaType.Audio : MediaType.Video` — the same mapping
@@ -7255,6 +7279,45 @@ mod tests {
         }
     }
 
+    /// Port of `GetActiveRecordingInfo`'s two exclusions: a capture whose
+    /// cancel flag is set, and one whose timer is not `InProgress` (or is
+    /// gone), are not active recordings.
+    #[tokio::test]
+    async fn only_a_live_capture_of_an_in_progress_timer_is_an_active_recording() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        for (id, status) in [
+            ("recording", RecordingStatus::InProgress),
+            ("stopping", RecordingStatus::InProgress),
+            ("finished", RecordingStatus::Completed),
+        ] {
+            let timer = TimerInfoDto {
+                base: BaseTimerInfoDto {
+                    id: Some(id.to_owned()),
+                    start_date: Utc::now() + chrono::Duration::minutes(600),
+                    end_date: Utc::now() + chrono::Duration::minutes(660),
+                    ..BaseTimerInfoDto::default()
+                },
+                status,
+                ..TimerInfoDto::default()
+            };
+            mgr.persist_timer(&timer).await.expect("plant");
+        }
+        for id in ["recording", "stopping", "finished", "no-timer-row"] {
+            let path = dir.path().join(format!("{id}.ts"));
+            mgr.active_recordings_lock().insert(
+                id.to_owned(),
+                crate::dvr::ActiveRecording::new(id.to_owned(), Uuid::new_v4(), path),
+            );
+        }
+        mgr.cancel_recording("stopping");
+
+        let expected = dir.path().join("recording.ts").display().to_string();
+        assert_eq!(
+            mgr.active_recording_paths().await.expect("paths"),
+            vec![expected]
+        );
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
         // On a multi-thread runtime the firing task and the cancel really do
@@ -7281,6 +7344,14 @@ mod tests {
         })
         .await
         .expect("the capture must start");
+        // `Video.IsActiveRecording`'s source: the file being written, once
+        // the timer row says `InProgress`.
+        let active = wait_for(|| async {
+            let paths = mgr.active_recording_paths().await.expect("paths");
+            (!paths.is_empty()).then_some(paths)
+        })
+        .await;
+        assert_eq!(active, Some(vec![path.clone()]));
         mgr.cancel_timer(&timer_id).await.expect("cancel");
 
         let released = wait_for(|| async {
@@ -7294,6 +7365,12 @@ mod tests {
         assert!(
             released.is_some(),
             "the capture must be released, not orphaned"
+        );
+        assert!(
+            mgr.active_recording_paths()
+                .await
+                .expect("paths")
+                .is_empty()
         );
         // `finish_capture` releases the active entry before `settle_timer`
         // finishes the async database writes. Wait for that second phase too:

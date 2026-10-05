@@ -8,6 +8,47 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — who may delete an item follows Jellyfin more closely
+
+This applies to accounts that delete items: the **Delete media**, **Delete Series**,
+**Delete Episode** or **Delete** entry in an item's menu, and `DELETE /Items/{itemId}` /
+`DELETE /Items?ids=`.
+
+Ferrofin 1.3.0–1.3.2 already refused a delete from an account without deletion rights. Three
+things are refined, to match Jellyfin:
+
+- An account allowed to delete in some libraries only is matched to an item's library
+  through the library tree, as Jellyfin does, instead of by comparing folder paths.
+- The server answers a delete exactly as the item's own `CanDelete` says, which is what
+  jellyfin-web shows its delete entry by, so the entry appears only where the delete is
+  allowed. A *list* of playlists reports every playlist deletable, as Jellyfin's does;
+  deleting a playlist still needs its owner or an administrator. A playlist with no owner
+  (made with an API key, or created before Ferrofin stored playlist owners) can now be
+  deleted by an administrator only; in 1.3.x any signed-in account could delete one.
+- Some items cannot be deleted at all, as in Jellyfin: an item with no file of its own (a
+  season Ferrofin groups from a series folder without season folders, a streamed item), a
+  missing (virtual) episode or season, and a video a DVR recording is still writing.
+
+The settings are under **Dashboard → Users → (user) → Profile → Allow media deletion
+from**: **All libraries** lets the account delete in every library, or tick individual
+libraries. New accounts have neither; an administrator needs one of them too (the
+administrator Ferrofin creates on first start has **All libraries**). Deleting a collection
+needs **Allow this user to manage collections** or an administrator. An account that may
+not delete an item gets `401 Unauthorized`, and nothing is deleted.
+
+**Deleting an item still removes it from the library database only: its media files stay
+on disk**, and the next scan finds them again. Jellyfin also deletes the files; a later
+release will too, the way Jellyfin does.
+
+One more difference from Jellyfin remains: an account with **All libraries** deletion that can
+see only some libraries can still delete, by id, an item in a library it cannot see, where
+Jellyfin answers `404`. A later release closes this.
+
+`DELETE /Items?ids=` handles the ids one at a time, in order, as Jellyfin does: if it
+reaches an id the account may not delete, it stops with `401`, and the items before that
+one are already deleted. A delete finishes even if the app that asked for it is closed
+half way.
+
 ## Unreleased — plugin metadata sources run at their rank
 
 This applies only if you run WASM plugins that supply metadata (a plugin listed under

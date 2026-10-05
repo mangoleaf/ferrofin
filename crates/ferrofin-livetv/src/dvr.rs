@@ -196,6 +196,13 @@ impl ActiveRecording {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
+    /// Whether the capture has been told to stop (C#
+    /// `CancellationTokenSource.IsCancellationRequested`).
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
     /// The flag the copy loop polls.
     #[must_use]
     pub fn cancellation(&self) -> Arc<AtomicBool> {

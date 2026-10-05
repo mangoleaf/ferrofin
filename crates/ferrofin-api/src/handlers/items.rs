@@ -573,92 +573,104 @@ async fn get_item(
     Ok(Json(dto))
 }
 
-/// The per-item half of Jellyfin's `CanDelete(user)` authorization.
-/// Collection management and playlist ownership have their own permissions;
-/// ordinary media allows either global deletion or a containing library grant.
-async fn require_delete_permission(
+/// `LibraryController.DeleteItem`'s gate (`LibraryController.cs:386-389` at
+/// master `96bca6f0bd`, and `:432-435` in `DeleteItems`): `if (user is not
+/// null && !item.CanDelete(user)) return Unauthorized("Unauthorized access")`.
+///
+/// `CanDelete(user)` is asked of the DTO service — the very value it puts in
+/// the DTO's `CanDelete`, which is what jellyfin-web shows its "Delete" entry
+/// by — so the menu and the endpoint cannot disagree. Its inputs are the
+/// user's "Allow media deletion" / "Allow media deletion from" settings
+/// (`EnableContentDeletion` / `EnableContentDeletionFromFolders`), collection
+/// management for a collection, and ownership for a playlist. An API key has
+/// no user and is not asked, as upstream.
+async fn require_can_delete(
     state: &AppState,
     auth: &AuthorizationInfo,
     item: &BaseItemEntity,
 ) -> Result<(), ApiError> {
-    if auth.is_api_key {
+    let Some(user) = auth.user.as_ref() else {
         return Ok(());
-    }
-    let denied = || ApiError::Unauthorized("Unauthorized access".to_owned());
-    let user = auth.user.as_ref().ok_or_else(denied)?;
-    let policy = super::users::user_policy(state, user)
-        .await?
-        .ok_or_else(denied)?;
-    let allowed = match item.type_.rsplit('.').next().unwrap_or_default() {
-        "Playlist" => {
-            policy.is_administrator
-                || state
-                    .playlists
-                    .get_playlist_access(
-                        Uuid::parse_str(&item.id).map_err(|_| denied())?,
-                        auth.user_id(),
-                    )
-                    .await?
-                    .level
-                    == ferrofin_traits::collections::PlaylistAccessLevel::Owner
-        }
-        "BoxSet" => policy.is_administrator || policy.enable_collection_management,
-        _ => {
-            if policy.enable_content_deletion {
-                return Ok(());
-            }
-            let grants: Vec<Uuid> = policy
-                .enable_content_deletion_from_folders
-                .iter()
-                .filter_map(|id| Uuid::parse_str(id).ok())
-                .collect();
-            if grants.is_empty() {
-                return Err(denied());
-            }
-            if let Some(channel) = item
-                .channel_id
-                .as_deref()
-                .and_then(|id| Uuid::parse_str(id).ok())
-                .filter(|id| !id.is_nil())
-            {
-                grants.contains(&channel)
-            } else {
-                state
-                    .virtual_folders
-                    .get_virtual_folders()
-                    .await?
-                    .iter()
-                    .any(|folder| {
-                        folder
-                            .item_id
-                            .as_deref()
-                            .and_then(|id| Uuid::parse_str(id).ok())
-                            .is_some_and(|id| grants.contains(&id))
-                            && item.path.as_deref().is_some_and(|path| {
-                                folder
-                                    .locations
-                                    .iter()
-                                    .any(|root| super::path_is_under(path, root))
-                            })
-                    })
-            }
-        }
     };
-    if allowed { Ok(()) } else { Err(denied()) }
+    if state.dto.can_delete(item, user).await? {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized("Unauthorized access".to_owned()))
+    }
+}
+
+/// `LibraryController.DeleteItem`'s body for one id, after the user check:
+/// resolve the item (`404`), ask `CanDelete(user)` (`401`), delete it.
+///
+/// TODO(parity, open work item): upstream deletes the media files
+/// (`new DeleteOptions { DeleteFileLocation = true }`); not ported yet, it
+/// waits on scanner parity, so only the item's rows go and its files stay on
+/// disk. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+///
+/// TODO(parity): upstream resolves the item as the user —
+/// `_libraryManager.GetItemById<BaseItem>(itemId, user)` (`LibraryController.cs:
+/// 380,425`), `null` (so `404`) for an item the user cannot see — and Ferrofin
+/// has no per-user by-id lookup yet, so a user allowed to delete in every
+/// library but kept out of some can delete there by id. The same gap covers
+/// playlists: a private playlist the caller cannot see is a `404` upstream
+/// (and was one through 1.3.x), but a `401` from the `CanDelete` check here.
+/// Un-defer path:
+/// `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md` (a `LibraryManager` by-id
+/// read that applies `IsVisibleStandalone`, used here and by every by-id
+/// route).
+async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
+    let item = state
+        .library
+        .get_item_by_id(id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
+    require_can_delete(state, auth, &item).await?;
+    state
+        .library
+        .delete_item(id, &DeleteOptions::default())
+        .await?;
+    Ok(())
+}
+
+/// Runs a delete request's work to completion even if the client goes away.
+///
+/// axum drops a handler's future when the connection closes. The row delete
+/// itself is one transaction, but what follows its commit — re-syncing the
+/// `Data` of the playlists and collections that lost a member, and the
+/// `LibraryChanged` notice — would be skipped, and a `DELETE /Items?ids=`
+/// would stop between two items. Upstream's controller does not observe
+/// `RequestAborted` here, so its delete finishes; the work runs on its own
+/// task, which the request only awaits.
+async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
+where
+    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
+{
+    // The request awaits the task, so its logs and spans stay under the
+    // request's (LOGGING.md §4: a spawned future carries its span explicitly).
+    tokio::spawn(tracing::Instrument::in_current_span(work))
+        .await
+        .map_err(|e| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::Backend(format!(
+                "delete task failed: {e}"
+            )))
+        })?
 }
 
 /// `DELETE /Items/{itemId}` — deletes one item from the library.
 ///
-/// Port of `LibraryController.DeleteItem`. A missing item is a `404`; on success
-/// the item (and, for a folder, its subtree) is removed and the handler returns
-/// `204`. Physical file deletion is the filesystem layer's job (deferred), so the
-/// portable seam deletes the rows only.
+/// Port of `LibraryController.DeleteItem`. A token whose user no longer
+/// exists, or a missing item, is a `404`; a user who may not delete the item
+/// (`CanDelete(user)`) is a `401`. Otherwise the item and everything under
+/// it are deleted from the library and the handler returns `204`; the media
+/// files stay on disk (see [`delete_one`]). The work finishes even if the
+/// client disconnects.
 #[utoipa::path(
     delete,
     path = "/Items/{itemId}",
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Item deleted"),
+        (status = 401, description = "Unauthorized access"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -668,18 +680,11 @@ async fn delete_item(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Confirm the item exists first so a bogus id is a `404` (C# `GetItemById`
-    // null-check) rather than a silently-idempotent `204`.
-    let item = state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    require_delete_permission(&state, &auth, &item).await?;
-    state
-        .library
-        .delete_item(item_id, &DeleteOptions::default())
-        .await?;
+    // `if (user is null && !isApiKey) return NotFound();`
+    if auth.user.is_none() && !auth.is_api_key {
+        return Err(ApiError::NotFound(format!("user {}", auth.user_id())));
+    }
+    run_to_completion(async move { delete_one(&state, &auth, item_id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -694,13 +699,18 @@ struct DeleteItemsQuery {
 
 /// `DELETE /Items` — deletes several items by id.
 ///
-/// Port of `LibraryController.DeleteItems`. Each id must resolve or the whole
-/// request is a `404` (matching C#'s per-item `NotFound()` short-circuit).
+/// Port of `LibraryController.DeleteItems`, which is **per item, in order**,
+/// not all-or-nothing: each id is resolved (`404` if missing), checked
+/// (`401` if the user may not delete it) and deleted before the next is
+/// looked at, so the ids before the first refused or missing one are
+/// already deleted when the request fails. The loop finishes even if the
+/// client disconnects, as upstream's does.
 #[utoipa::path(
     delete,
     path = "/Items",
     responses(
         (status = 204, description = "Items deleted"),
+        (status = 401, description = "Unauthorized access"),
         (status = 404, description = "An item was not found")
     ),
     tag = "ferrofin"
@@ -710,19 +720,18 @@ async fn delete_items(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<DeleteItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let ids = parse_csv_uuids(query.ids.as_deref())?;
-    for id in ids {
-        let item = state
-            .library
-            .get_item_by_id(id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
-        require_delete_permission(&state, &auth, &item).await?;
-        state
-            .library
-            .delete_item(id, &DeleteOptions::default())
-            .await?;
+    // `if (!isApiKey && user is null) return Unauthorized("Unauthorized access");`
+    if auth.user.is_none() && !auth.is_api_key {
+        return Err(ApiError::Unauthorized("Unauthorized access".to_owned()));
     }
+    let ids = parse_csv_uuids(query.ids.as_deref())?;
+    run_to_completion(async move {
+        for id in ids {
+            delete_one(&state, &auth, id).await?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1593,5 +1602,26 @@ mod tests {
         let resume: ResumeQuery =
             serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
         assert_eq!(resume.exclude_active_sessions, Some(true));
+    }
+
+    /// The delete's task runs inside the request's span, so its logs and
+    /// spans stay under `http_request` (LOGGING.md §4).
+    #[tokio::test]
+    async fn the_delete_task_runs_in_the_requests_span() {
+        use tracing::Instrument as _;
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = tracing::info_span!("http_request");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = std::sync::Arc::clone(&seen);
+        run_to_completion(async move {
+            *record.lock().expect("lock") = tracing::Span::current()
+                .metadata()
+                .map(tracing::Metadata::name);
+            Ok(())
+        })
+        .instrument(span)
+        .await
+        .expect("ran");
+        assert_eq!(*seen.lock().expect("lock"), Some("http_request"));
     }
 }
