@@ -3932,6 +3932,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_lookup_requires_visibility_and_keeps_raw_access() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(71);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Scoped").await;
+        let mgr = manager(&db);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(72)).await;
+        assert!(
+            mgr.get_item_by_id_for_user(id, None)
+                .await
+                .expect("raw")
+                .is_some()
+        );
+        assert!(matches!(
+            mgr.get_item_by_id_for_user(id, Some(&user)).await,
+            Err(ferrofin_traits::error::ServiceError::Backend(_))
+        ));
+        assert!(
+            mgr.get_item_by_id_for_user(Uuid::nil(), Some(&user))
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        assert!(
+            mgr.get_visible_item_ids(&[], &user)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
+    }
+
+    #[tokio::test]
     async fn item_exists_agrees_with_get_item_by_id() {
         // The image routes gate their 404 on `item_exists`, so it must answer
         // exactly what `get_item_by_id(..).is_some()` answers — including for
