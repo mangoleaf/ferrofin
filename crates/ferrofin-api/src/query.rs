@@ -1,8 +1,10 @@
 //! Case-insensitive query binding shared by every typed API handler.
 //!
 //! Discover serde's accepted field names (including aliases) without constructing
-//! a value. Fold only those names; raw queries and dictionary keys retain their
-//! spelling. Values remain percent-encoded until axum performs deserialization.
+//! a value. Fold only those names; raw queries retain their spelling. Scalars
+//! bind the first occurrence, as ASP.NET's `SimpleTypeModelBinder.FirstValue`
+//! does. Only declared collections merge. Values remain percent-encoded until
+//! axum performs deserialization, so a comma in a scalar is never split.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -13,7 +15,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::http::{Uri, request::Parts};
 use serde::de::{self, DeserializeOwned, Visitor};
 
-/// A query extractor accepting any ASCII casing of a struct's field names.
+/// Case-insensitive query binding with first-value scalars and merged collections.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 
@@ -58,7 +60,7 @@ impl<T: QueryParameters> Query<T> {
     /// Returns axum's query rejection when a value cannot bind to `T`.
     pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
         let fields = fields::<T>();
-        let normalized = normalize(uri.query().unwrap_or_default(), fields);
+        let normalized = normalize(uri.query().unwrap_or_default(), fields, T::COLLECTIONS);
         let normalized_uri;
         let uri = if let Some(query) = normalized {
             // Only field names and separators change. Values remain URI-safe.
@@ -145,9 +147,10 @@ impl<'de> de::Deserializer<'de> for Capture {
     }
 }
 
-/// Rewrites recognized keys and merges repetitions in first-occurrence order.
-/// Non-struct queries (e.g. raw pairs) remain untouched.
-fn normalize(query: &str, fields: &[&str]) -> Option<String> {
+/// Rewrites recognized keys, keeping the first scalar and every collection value.
+/// Non-struct queries (e.g. raw pairs) remain untouched. Delimiters describe the
+/// handler's existing string representation; commas inside scalar values are data.
+fn normalize(query: &str, fields: &[&str], collections: &[(&str, char)]) -> Option<String> {
     if fields.is_empty() || query.is_empty() {
         return None;
     }
@@ -168,7 +171,12 @@ fn normalize(query: &str, fields: &[&str]) -> Option<String> {
         };
         changed |= key != raw_key;
         if let Some((_, values)) = groups.iter_mut().find(|(k, v)| *k == key && !v.is_empty()) {
-            values.push(value);
+            if collections
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(key))
+            {
+                values.push(value);
+            }
             changed = true;
         } else {
             groups.push((key, vec![value]));
@@ -181,7 +189,13 @@ fn normalize(query: &str, fields: &[&str]) -> Option<String> {
                 if values.is_empty() {
                     key.to_owned()
                 } else {
-                    format!("{key}={}", values.join(","))
+                    let delimiter = collections.iter().find_map(|(name, delimiter)| {
+                        name.eq_ignore_ascii_case(key).then_some(*delimiter)
+                    });
+                    // Encode the pipe, keeping the rebuilt URI valid and letting
+                    // axum decode it alongside the original encoded values.
+                    let separator = if delimiter == Some('|') { "%7C" } else { "," };
+                    format!("{key}={}", values.join(separator))
                 }
             })
             .collect::<Vec<_>>()
@@ -295,7 +309,7 @@ pub(crate) mod tests {
     fn groups_alias_case_variants_before_binding() {
         let uri = "/?DeviceId=a&deviceid=b&deviceId=c".parse().unwrap();
         let query = Query::<Parameters>::try_from_uri(&uri).unwrap();
-        assert_eq!(query.device_id.as_deref(), Some("a,b,c"));
+        assert_eq!(query.device_id.as_deref(), Some("a"));
     }
 
     #[test]
