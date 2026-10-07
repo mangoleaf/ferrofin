@@ -1027,3 +1027,80 @@ async fn musicvideo_adopted_video_identity_is_reused_in_full_and_scoped_scans() 
         assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&adopted));
     }
 }
+
+/// An extra in an extras-type subfolder is `IsInMixedFolder` when that
+/// folder holds more than one file, whatever the files are, as upstream's
+/// `FindExtras` stores it (`LibraryManager.cs:3459-3475`); beside its owner it
+/// never is (`:3478`). Below the extras folder, and in it besides the extras,
+/// nothing resolves (`CoreResolutionIgnoreRule.cs:56-61`) — not a disc rip,
+/// not a video no extra rule takes — and a row an older scan planned there is
+/// pruned.
+#[tokio::test]
+async fn an_extras_subfolder_holding_several_files_is_a_mixed_folder() {
+    let f = Fixture::new(&[
+        "Heat (1995)/Heat (1995).mkv",
+        "Heat (1995)/trailers/one.mkv",
+        "Heat (1995)/trailers/two.mkv",
+        "Heat (1995)/trailers/nested/three.mkv",
+        "Heat (1995)/extras/BDMV/STREAM/00000.m2ts",
+        "Heat (1995)/theme-music/clip.mkv",
+        "Alien (1979)/Alien (1979).mkv",
+        "Alien (1979)/Alien (1979)-trailer.mkv",
+        "Alien (1979)/featurettes/only.mkv",
+        "Blade (1998)/Blade (1998).mkv",
+        "Blade (1998)/interviews/one.mkv",
+        "Blade (1998)/interviews/one.nfo",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+
+    let heat = f.row("Heat (1995)/Heat (1995).mkv").await;
+    let blade = f.row("Blade (1998)/Blade (1998).mkv").await;
+    for (path, owner) in [
+        ("Heat (1995)/trailers/one.mkv", &heat),
+        ("Heat (1995)/trailers/two.mkv", &heat),
+        ("Blade (1998)/interviews/one.mkv", &blade),
+    ] {
+        let extra = f.row(path).await;
+        assert_eq!(extra.owner_id.as_ref(), Some(&owner.id), "{path}");
+        assert!(extra.is_in_mixed_folder, "{path}");
+    }
+    let alien = f.row("Alien (1979)/Alien (1979).mkv").await;
+    for path in [
+        "Alien (1979)/featurettes/only.mkv",
+        "Alien (1979)/Alien (1979)-trailer.mkv",
+    ] {
+        let extra = f.row(path).await;
+        assert_eq!(extra.owner_id.as_ref(), Some(&alien.id), "{path}");
+        assert!(!extra.is_in_mixed_folder, "{path}");
+    }
+    let unresolved = || async {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '%three.mkv' \
+             OR Path LIKE '%clip.mkv' OR Path LIKE '%/extras' OR Path LIKE '%.m2ts'",
+        )
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        count
+    };
+    assert_eq!(
+        unresolved().await,
+        0,
+        "nothing else in an extras folder resolves"
+    );
+
+    // What an older scan planned below the extras folder goes.
+    let mut stale = heat.clone();
+    stale.id = guid_to_db(Uuid::from_u128(0x3EE));
+    stale.path = Some(
+        f.media
+            .join("Heat (1995)/trailers/nested/three.mkv")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    f.store.save_items(&[stale]).await.unwrap();
+    assert_eq!(unresolved().await, 1);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(unresolved().await, 0, "the older row is pruned");
+}

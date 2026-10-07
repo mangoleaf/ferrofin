@@ -9551,7 +9551,7 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let mut extras: Vec<(String, ferrofin_model::entities::ExtraType)> = Vec::new();
+        let mut extras: Vec<MovieExtra> = Vec::new();
         // Movies emitted per directory, for extras owner resolution.
         let mut movies_by_dir: std::collections::HashMap<String, Vec<(Uuid, String)>> =
             std::collections::HashMap::new();
@@ -9565,7 +9565,12 @@ impl LibraryScanner {
             &mut extras,
             &mut movies_by_dir,
         );
-        for (path, extra_type) in extras {
+        for MovieExtra {
+            path,
+            extra_type,
+            in_mixed_folder,
+        } in extras
+        {
             if !ctx.scope.keeps(&path) {
                 continue;
             }
@@ -9575,7 +9580,11 @@ impl LibraryScanner {
                 ctx.excluded.borrow_mut().push(path);
                 continue;
             };
+            let first = out.len();
             self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+            for item in &mut out[first..] {
+                item.entity.is_in_mixed_folder = in_mixed_folder;
+            }
         }
     }
 
@@ -9772,21 +9781,30 @@ impl LibraryScanner {
         kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
-        extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
+        extras: &mut Vec<MovieExtra>,
         movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) {
         let naming = ctx.naming;
+        let extras_folder = is_extras_folder_below_top(dir, root, naming);
         // A disc rip (`…/Movie (2009)/BDMV/` or `VIDEO_TS/`) is ONE item for the
         // containing folder, not one per .vob/.m2ts inside — port of
         // `BaseVideoResolver.ResolveVideo`'s directory arm.
         if dir != root
+            && !extras_folder
             && let Some(video_type) = self.disc_video_type(dir, ctx)
         {
             self.plan_disc_movie(dir, cf, video_type, kind, ctx, out);
             return;
         }
         let entries = self.list(dir, ctx);
-        let movie = (dir != root)
+        // `FindExtras` counts every file of an extras folder (listed above).
+        let extras_folder_mixed = extras_folder
+            && ctx
+                .direct_file_counts
+                .borrow()
+                .get(dir)
+                .is_some_and(|&files| files > 1);
+        let movie = (dir != root && !extras_folder)
             .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
             .flatten();
         let own_folder = movie.is_some();
@@ -9801,20 +9819,15 @@ impl LibraryScanner {
                     .is_some_and(|video| video.extra_type.is_none())
         });
         if let Some(movie) = movie {
-            // Resolve ownership from the same grouped title as FindMovie.
-            // Stacked parts are one owner; alternate versions can own named extras.
-            let owners = movies_by_dir.entry(dir.to_owned()).or_default();
-            for version in std::iter::once(&movie).chain(movie.alternate_versions.iter()) {
-                if let Some(file) = version.files.first()
-                    && let Some(id) =
-                        item_type_lookup::derive_item_id_with(&self.id_derivation, kind, &file.path)
-                {
-                    owners.push((id, file_stem(&file.path)));
-                    ctx.owner_paths.borrow_mut().insert(id, file.path.clone());
-                }
-            }
+            self.register_extras_owner(dir, &movie, kind, ctx, movies_by_dir);
         }
         for entry in entries {
+            if entry.type_ == FileSystemEntryType::Directory && extras_folder {
+                // Below an extras folder nothing resolves; rows an older
+                // scan planned there are reconciled away.
+                ctx.excluded.borrow_mut().push(entry.path);
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 // TODO(parity): a plain subfolder (`Movies/Collection/…`,
                 // not a title's own folder) is flattened: its movies are
@@ -9866,7 +9879,19 @@ impl LibraryScanner {
                 Some(root),
             );
             if let Some(extra_type) = extra.extra_type {
-                extras.push((entry.path.clone(), extra_type));
+                extras.push(MovieExtra {
+                    path: entry.path.clone(),
+                    extra_type,
+                    // False beside its owner (`LibraryManager.cs:3478`);
+                    // more than one file in its extras folder (`:3464`).
+                    in_mixed_folder: extras_folder_mixed,
+                });
+                continue;
+            }
+            // In an extras folder a file no extra rule takes is nothing
+            // (`FindExtras` drops it; the folder itself is never resolved).
+            if extras_folder {
+                ctx.excluded.borrow_mut().push(entry.path);
                 continue;
             }
             // An audio file that matched no extra rule is not a movie: a
@@ -9883,37 +9908,68 @@ impl LibraryScanner {
             if !ctx.scope.keeps(&entry.path) {
                 continue;
             }
-            let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
-                .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
-            // Port of MovieResolver: a movie in its OWN folder is named from that folder
-            // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
-            // file in the library root keeps its clean_date_time-parsed name (year stripped).
-            // ProductionYear is still populated either way.
-            let name = if kind == BaseItemKind::MusicVideo {
-                file_stem(&entry.path)
-            } else if own_folder {
-                folder_name(dir).unwrap_or(clean_name)
-            } else {
-                clean_name
-            };
-            let Some((id, mut entity)) =
-                self.base_item(ctx, kind, cf, cf, name, &entry.path, false)
-            else {
-                continue;
-            };
-            entity.is_movie = kind == BaseItemKind::Movie;
-            entity.is_in_mixed_folder = !own_folder;
-            entity.media_type = Some("Video".to_owned());
-            entity.production_year = year.map(i64::from);
-            set_video_type(&mut entity, file_video_type(&entry.path));
-            ctx.emit(
-                out,
-                Planned {
-                    id,
-                    entity,
-                    ancestors: vec![cf],
-                },
-            );
+            if let Some(planned) = self.movie_file(&entry, dir, own_folder, kind, cf, ctx) {
+                ctx.emit(out, planned);
+            }
+        }
+    }
+
+    /// The row for the video `entry` in `dir`, resolved as `kind`.
+    fn movie_file(
+        &self,
+        entry: &FileSystemEntryInfo,
+        dir: &str,
+        own_folder: bool,
+        kind: BaseItemKind,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+    ) -> Option<Planned> {
+        let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), ctx.naming, None)
+            .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
+        // Port of MovieResolver: a movie in its OWN folder is named from that folder
+        // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
+        // file in the library root keeps its clean_date_time-parsed name (year stripped).
+        // ProductionYear is still populated either way.
+        let name = if kind == BaseItemKind::MusicVideo {
+            file_stem(&entry.path)
+        } else if own_folder {
+            folder_name(dir).unwrap_or(clean_name)
+        } else {
+            clean_name
+        };
+        let (id, mut entity) = self.base_item(ctx, kind, cf, cf, name, &entry.path, false)?;
+        entity.is_movie = kind == BaseItemKind::Movie;
+        entity.is_in_mixed_folder = !own_folder;
+        entity.media_type = Some("Video".to_owned());
+        entity.production_year = year.map(i64::from);
+        set_video_type(&mut entity, file_video_type(&entry.path));
+        Some(Planned {
+            id,
+            entity,
+            ancestors: vec![cf],
+        })
+    }
+
+    /// Registers `movie`, resolved in `dir`, as the owner of the extras its
+    /// folder holds. Ownership follows the same grouped title as `FindMovie`:
+    /// stacked parts are one owner; alternate versions can own named extras.
+    fn register_extras_owner(
+        &self,
+        dir: &str,
+        movie: &ferrofin_naming::video::VideoInfo,
+        kind: BaseItemKind,
+        ctx: &PlanCtx<'_>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) {
+        let owners = movies_by_dir.entry(dir.to_owned()).or_default();
+        for version in std::iter::once(movie).chain(movie.alternate_versions.iter()) {
+            if let Some(file) = version.files.first()
+                && let Some(id) =
+                    item_type_lookup::derive_item_id_with(&self.id_derivation, kind, &file.path)
+            {
+                owners.push((id, file_stem(&file.path)));
+                ctx.owner_paths.borrow_mut().insert(id, file.path.clone());
+            }
         }
     }
 
@@ -11733,6 +11789,32 @@ fn affected_libraries(
         })
         .cloned()
         .collect()
+}
+
+/// Whether `dir` is an extras-type subfolder below the library's top level
+/// (`Movie/trailers/`, `Movie/extras/`, …), which holds only its owner's
+/// extras: `FindExtras` takes its files, one level deep, each
+/// `IsInMixedFolder` when the folder holds more than one file
+/// (`LibraryManager.cs:3459-3475`), and the resolver chain never resolves the
+/// folder or anything in it (`CoreResolutionIgnoreRule.cs:56-61`).
+fn is_extras_folder_below_top(dir: &str, root: &str, naming: &NamingOptions) -> bool {
+    dir != root
+        && Path::new(dir)
+            .parent()
+            .is_some_and(|parent| trimmed_dir(&parent.to_string_lossy()) != trimmed_dir(root))
+        && naming
+            .all_extras_types_folder_names
+            .contains_key(&entry_name(dir).to_lowercase())
+}
+
+/// An extra the movie walk found, before its owner is known.
+struct MovieExtra {
+    /// The extra's file.
+    path: String,
+    /// What kind of extra the naming rules make it.
+    extra_type: ferrofin_model::entities::ExtraType,
+    /// Its stored `IsInMixedFolder`.
+    in_mixed_folder: bool,
 }
 
 /// A library's own folders, which the pruning never deletes: its
