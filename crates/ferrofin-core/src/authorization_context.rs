@@ -445,17 +445,23 @@ fn fill_blank_client_fields(
     }
 }
 
-/// Reads the first value of a query-string parameter, case-insensitively on the
-/// key. The `RequestContext` carries the raw query string (no leading `?`).
+/// Reads a query-string parameter, case-insensitively on the decoded key.
+/// `AuthorizationContext.cs` assigns `IQueryCollection`'s `StringValues` to a
+/// string, joining nonempty values instead of taking `FirstValue`. Preserve
+/// that behavior now that the router leaves raw URIs intact.
 fn query_value<'r>(request: &'r RequestContext, key: &str) -> Option<Cow<'r, str>> {
     let query = request.query_string.as_deref()?;
-    for pair in query.split('&') {
+    let mut values = query.split('&').filter_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k.eq_ignore_ascii_case(key) {
-            return Some(url_decode(v));
-        }
+        (url_decode(k).eq_ignore_ascii_case(key) && !v.is_empty()).then(|| url_decode(v))
+    });
+    let mut value = values.next()?;
+    for next in values {
+        let joined = value.to_mut();
+        joined.push(',');
+        joined.push_str(&next);
     }
-    None
+    Some(value)
 }
 
 /// The five authorization-header fields Ferrofin consumes (C# reads exactly
@@ -1276,6 +1282,59 @@ mod tests {
             assert!(info.is_authenticated);
             assert_eq!(info.user_id(), uid);
         }
+    }
+
+    #[tokio::test]
+    async fn query_credentials_use_string_values_semantics_not_scalar_binding() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x22);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+        let ctx = context(db);
+
+        for (query, token, authenticated) in [
+            ("ApiKey=dev-tok&ApiKey=bad", Some("dev-tok,bad"), false),
+            ("apikey=bad&APIKEY=dev-tok", Some("bad,dev-tok"), false),
+            ("%41piKey=dev%2Dtok&ApiKey=bad", Some("dev-tok,bad"), false),
+            (
+                "ApiKey=dev-tok&ApiKey=dev-tok",
+                Some("dev-tok,dev-tok"),
+                false,
+            ),
+            ("ApiKey=&APIKEY=dev-tok", Some("dev-tok"), true),
+            ("ApiKey&APIKEY=dev-tok&ApiKey=", Some("dev-tok"), true),
+            ("%41piKey=dev%2Dtok", Some("dev-tok"), true),
+            ("%2541piKey=ignored&ApiKey=dev-tok", Some("dev-tok"), true),
+            ("ApiKey=&APIKEY", None, false),
+        ] {
+            let info = ctx
+                .get_authorization_info(&query_request(query))
+                .await
+                .unwrap();
+            assert_eq!(
+                info.token
+                    .as_ref()
+                    .map(ferrofin_model::secret::Secret::expose),
+                token,
+                "{query}"
+            );
+            assert_eq!(info.is_authenticated, authenticated, "{query}");
+        }
+
+        let legacy = query_request("API_KEY=first&%61pi_key=second");
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, None, false),
+            None
+        );
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, None, true).as_deref(),
+            Some("first,second")
+        );
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, Some("header".to_owned()), true)
+                .as_deref(),
+            Some("header")
+        );
     }
 
     #[tokio::test]

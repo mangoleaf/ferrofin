@@ -19,7 +19,8 @@
 //! the C# `LinkedAlternateVersions` array and linked-child reroute are not modeled
 //! at that seam (see the manager docs).
 
-use axum::extract::{Path, Query, Request, State};
+use crate::extract::Query;
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -301,6 +302,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(delete_alternate_sources),
         )
         .route("/Items/{itemId}/Download", get(get_download))
+}
+
+crate::query::query_parameters! {
+    AdditionalPartsQuery {} => [("get", "/Videos/{itemId}/AdditionalParts")];
+    MergeVersionsQuery {
+        "ids" => ',',
+    } => [("post", "/Videos/MergeVersions")];
 }
 
 #[cfg(test)]

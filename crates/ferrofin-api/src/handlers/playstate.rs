@@ -21,7 +21,8 @@
 //!   manager, which is deferred; the reporting call to [`SessionManager`] still
 //!   runs, so the session/play-state bookkeeping is faithful.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -764,6 +765,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/PlayingItems/{itemId}/Progress",
             post(on_playback_progress_for_user),
         )
+}
+
+crate::query::query_parameters! {
+    MarkPlayedQuery {} => [("post", "/UserPlayedItems/{itemId}")];
+    UserIdQuery {} => [("delete", "/UserPlayedItems/{itemId}")];
+    PingQuery {} => [("post", "/Sessions/Playing/Ping")];
+    LegacyStartQuery {} => [("post", "/PlayingItems/{itemId}")];
+    LegacyProgressQuery {} => [("post", "/PlayingItems/{itemId}/Progress")];
+    LegacyStopQuery {} => [("delete", "/PlayingItems/{itemId}")];
 }
 
 #[cfg(test)]

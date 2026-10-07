@@ -13,8 +13,9 @@
 //! "Generate Trickplay Images" task, so an item whose metadata exists but
 //! whose tiles are absent yields `404` — matching the C# `File.Exists` gate.
 
+use crate::extract::Query;
 use axum::Router;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -164,4 +165,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Videos/{itemId}/Trickplay/{width}/{index}",
             get(get_trickplay_tile_image),
         )
+}
+crate::query::query_parameters! {
+    TrickplayQuery {} => [("get", "/Videos/{itemId}/Trickplay/{width}/tiles.m3u8"), ("get", "/Videos/{itemId}/Trickplay/{width}/{index}.jpg")];
 }

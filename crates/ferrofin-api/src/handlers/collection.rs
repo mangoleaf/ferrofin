@@ -16,7 +16,8 @@
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -178,4 +179,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         "/Collections/{collectionId}/Items",
         post(add_to_collection).delete(remove_from_collection),
     )
+}
+crate::query::query_parameters! {
+    CreateCollectionQuery {
+        "ids" => ',',
+    } => [("post", "/Collections")];
+    CollectionItemsQuery {
+        "ids" => ',',
+    } => [("post", "/Collections/{collectionId}/Items"), ("delete", "/Collections/{collectionId}/Items")];
 }

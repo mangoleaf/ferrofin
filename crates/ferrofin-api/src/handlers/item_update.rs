@@ -25,7 +25,8 @@
 //! `FullRefresh`/`ReplaceAllMetadata` refresh queued when a series'
 //! `DisplayOrder` changes (`ItemUpdateController.cs:83-86,120-132`).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::routing::post;
@@ -1063,6 +1064,11 @@ async fn get_metadata_editor(
         content_type_options: Vec::new(),
     };
     Ok(Json(info))
+}
+
+crate::query::query_parameters! {
+    ContentTypeQuery {} => [("post", "/Items/{itemId}/ContentType")];
+    RefreshQuery {} => [("post", "/Items/{itemId}/Refresh")];
 }
 
 #[cfg(test)]

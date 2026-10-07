@@ -217,13 +217,18 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Extracts a query-string parameter case-insensitively, as Jellyfin does.
-/// The host normalizes the SDK's `ApiKey` to `apiKey` before this handler.
-/// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
+/// Raw authentication reads join nonempty StringValues; scalar model binding's
+/// first-value rule does not apply. Decode each key and value exactly once.
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_owned())
-    })
+    let mut values = form_urlencoded::parse(query?.as_bytes())
+        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
+        .map(|(_, value)| value);
+    let mut value = values.next()?.into_owned();
+    for next in values {
+        value.push(',');
+        value.push_str(&next);
+    }
+    Some(value)
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -1077,6 +1082,31 @@ mod tests {
         assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
+        assert_eq!(
+            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
+            Some("first,second")
+        );
+        assert_eq!(
+            query_param(Some("api_key=&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            query_param(Some("api_key&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(query_param(Some("api_key=&api_key"), "api_key"), None);
+        assert_eq!(
+            query_param(
+                Some("%61pi_key=first%2526&API_KEY=second%2Bvalue"),
+                "api_key"
+            )
+            .as_deref(),
+            Some("first%26,second+value")
+        );
+        assert_eq!(
+            query_param(Some("%2561pi_key=ignored&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
     }
 
     #[test]

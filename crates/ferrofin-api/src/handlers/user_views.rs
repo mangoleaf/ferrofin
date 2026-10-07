@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::CollectionType;
@@ -228,6 +229,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/GroupingOptions",
             get(get_grouping_options_for_user),
         )
+}
+
+crate::query::query_parameters! {
+    UserViewsQuery {} => [("get", "/UserViews"), ("get", "/UserViews/GroupingOptions")];
 }
 
 #[cfg(test)]

@@ -26,7 +26,8 @@
 
 use std::fmt::Write as _;
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -708,6 +709,12 @@ async fn validate_open_subtitles_login(
         .validate_provider_login("opensubtitles", &body)
         .await?;
     Ok(StatusCode::OK)
+}
+
+crate::query::query_parameters! {
+    RemoteSearchQuery {} => [("get", "/Items/{itemId}/RemoteSearch/Subtitles/{language}")];
+    SubtitleStreamQuery {} => [("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}"), ("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}")];
+    SubtitlePlaylistQuery {} => [("get", "/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8")];
 }
 
 #[cfg(test)]

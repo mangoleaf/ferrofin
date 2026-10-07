@@ -1283,8 +1283,7 @@ async fn get_items_with_filters_returns_query_result() {
 /// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
 /// This), through both the query- and the path-scoped route. Each id set
 /// must reach the repository query: a dropped one answers the Albums section
-/// with every album in the library. (The keys are camelCase here because the
-/// server's outer layer folds the client's PascalCase before routing.)
+/// with every album in the library.
 #[tokio::test]
 async fn get_items_forwards_the_artist_id_filters() {
     let (album_artist, featured, excluded) = (
@@ -1324,6 +1323,49 @@ async fn get_items_forwards_the_artist_id_filters() {
         assert_eq!(query.contributing_artist_ids, [featured, excluded], "{uri}");
         assert_eq!(query.exclude_artist_ids, [excluded], "{uri}");
         assert!(query.artist_ids.is_empty(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes() {
+    use ferrofin_model::data::BaseItemKind;
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{path}?includeItemTypes=Movie&INCLUDEITEMTYPES=Series\
+                &genres=News%2CSport&GENRES=Drama&tags=one&TAGS=two\
+                &limit=7&LIMIT=bad&recursive=true&Recursive=false\
+                &searchTerm=a%2Cb&SEARCHTERM=ignored&userId={USER_ID}&USERID=bad\
+                &genreIds={USER_ID}&GENREIDS={USER_ID}"
+                    ))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let query = seen.lock().unwrap().take().expect("query_items ran");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Movie, BaseItemKind::Series]
+        );
+        assert_eq!(query.genres, ["News,Sport", "Drama"]);
+        assert_eq!(query.tags, ["one", "two"]);
+        assert_eq!(query.genre_ids, [USER_ID, USER_ID]);
+        assert_eq!(query.limit, Some(7));
+        assert!(query.recursive);
+        assert_eq!(query.search_term.as_deref(), Some("a,b"));
     }
 }
 

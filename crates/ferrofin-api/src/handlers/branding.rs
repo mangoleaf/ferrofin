@@ -21,8 +21,9 @@
 
 use std::path::Path;
 
+use crate::extract::Query;
 use axum::body::Body;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -240,4 +241,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(upload_splashscreen)
                 .delete(delete_splashscreen),
         )
+}
+crate::query::query_parameters! {
+    SplashscreenQuery {} => [("get", "/Branding/Css")];
 }

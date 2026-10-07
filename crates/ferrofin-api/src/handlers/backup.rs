@@ -18,7 +18,8 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -594,6 +595,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Backup/Manifest", get(get_backup_manifest))
         .route("/Backup/Create", post(create_backup))
         .route("/Backup/Restore", post(restore_backup))
+}
+
+crate::query::query_parameters! {
+    ManifestQuery {} => [("get", "/Backup/Manifest")];
 }
 
 #[cfg(test)]

@@ -14,7 +14,8 @@
 //! lists; it is an open work item on `GET /Genres`, tracked in
 //! `suite/parity/classifications.json`, not something this file silently drops.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;

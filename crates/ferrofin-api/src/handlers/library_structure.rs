@@ -23,8 +23,9 @@
 //! toggles) and honors the `refreshLibrary` query flag by queueing a scan —
 //! mirroring the `finally` block of each C# controller action.
 
+use crate::extract::Query;
 use axum::Router;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -579,4 +580,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Library/VirtualFolders/Paths/Update",
             post(update_media_path),
         )
+}
+crate::query::query_parameters! {
+    AddVirtualFolderQuery {
+        "paths" => ',',
+    } => [("post", "/Library/VirtualFolders")];
+    RemoveVirtualFolderQuery {} => [("delete", "/Library/VirtualFolders")];
+    RenameVirtualFolderQuery {} => [("post", "/Library/VirtualFolders/Name")];
+    MediaPathQuery {} => [("post", "/Library/VirtualFolders/Paths"), ("delete", "/Library/VirtualFolders/Paths")];
 }

@@ -30,9 +30,10 @@
 //! (`videos`/`audio`), which fall back to [`HlsStreamManager::transcode_stream`]
 //! only when the item has no direct-playable file.
 
+use crate::extract::Query;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get};
@@ -665,6 +666,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Videos/{itemId}/{container}/Attachments/{index}",
             get(get_video_attachment),
         )
+}
+
+crate::query::query_parameters! {
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/universal")];
+    StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
+    HlsQueryPub {} => [("get", "/Audio/{itemId}/universal")];
 }
 
 #[cfg(test)]

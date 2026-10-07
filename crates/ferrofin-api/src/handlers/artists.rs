@@ -11,7 +11,8 @@
 //! instant-mix / similar / per-name image routes stay on the `501` stub (later
 //! batches).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;

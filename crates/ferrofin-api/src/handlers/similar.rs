@@ -15,7 +15,8 @@
 //! to the number of rows. The transform is identical for every alias — only the
 //! route path differs — so one handler backs all five.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;
@@ -178,4 +179,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/Similar", get(get_similar_generic_items))
         .route("/Movies/{itemId}/Similar", get(get_similar_movies))
         .route("/Trailers/{itemId}/Similar", get(get_similar_trailers))
+}
+crate::query::query_parameters! {
+    SimilarParams {
+        "excludeArtistIds" => ',',
+        "fields" => ',',
+    } => [("get", "/Items/{itemId}/Similar"), ("get", "/Artists/{itemId}/Similar"), ("get", "/Albums/{itemId}/Similar"), ("get", "/Movies/{itemId}/Similar"), ("get", "/Trailers/{itemId}/Similar")];
 }

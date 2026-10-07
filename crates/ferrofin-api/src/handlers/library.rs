@@ -34,7 +34,8 @@
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
-use axum::extract::{Path, Query, Request, State};
+use crate::extract::Query;
+use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -765,4 +766,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Library/Movies/Added", post(post_updated_movies))
         .route("/Library/Movies/Updated", post(post_updated_movies))
         .route("/Library/Media/Updated", post(post_updated_media))
+}
+crate::query::query_parameters! {
+    ThemeMediaQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+    } => [("get", "/Items/{itemId}/ThemeSongs"), ("get", "/Items/{itemId}/ThemeVideos"), ("get", "/Items/{itemId}/ThemeMedia")];
+    MediaFoldersQuery {} => [("get", "/Library/MediaFolders")];
+    AvailableOptionsQuery {} => [("get", "/Libraries/AvailableOptions")];
+    SeriesUpdatedQuery {} => [("post", "/Library/Series/Updated")];
+    MoviesUpdatedQuery {} => [("post", "/Library/Movies/Updated")];
 }
