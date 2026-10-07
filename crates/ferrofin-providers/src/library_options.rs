@@ -1770,4 +1770,23 @@ mod tests {
             "not advertised until its season fetch is ported"
         );
     }
+    #[test]
+    fn current_web_receives_available_similarity_provider_choices() {
+        let dto = library_options_info(&["Movie".into()], true, &[], &[]);
+        let body = serde_json::to_value(dto).unwrap();
+        let choices = body["TypeOptions"][0]["SimilarItemProviders"]
+            .as_array()
+            .expect("the current Web library editor needs these choices");
+        assert!(
+            choices
+                .iter()
+                .any(|p| p["Name"] == "Local Genre/Tag" && p["DefaultEnabled"] == true)
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|p| p["Name"] == "TheMovieDb" && p["DefaultEnabled"] == false)
+        );
+        assert!(!choices.iter().any(|p| p["Name"] == "ListenBrainz"));
+    }
 }

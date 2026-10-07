@@ -119,6 +119,7 @@ impl AuthorizationContext for OkAuth {
 struct StubConfig {
     updates: Mutex<Vec<(String, Arc<str>)>>,
     branding: Mutex<BrandingOptions>,
+    configuration: Mutex<Option<Arc<ServerConfiguration>>>,
     paths: StubPaths,
 }
 
@@ -195,15 +196,23 @@ impl ServerConfigurationManager for StubConfig {
         Arc::new(self.paths.clone())
     }
     async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
-        Ok(Arc::new(ServerConfiguration {
-            server_name: "Ferrofin".to_owned(),
-            ..Default::default()
-        }))
+        Ok(self
+            .configuration
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| {
+                Arc::new(ServerConfiguration {
+                    server_name: "Ferrofin".to_owned(),
+                    ..Default::default()
+                })
+            }))
     }
     async fn update_configuration(
         &self,
-        _configuration: &ServerConfiguration,
+        configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
+        *self.configuration.lock().unwrap() = Some(Arc::new(configuration.clone()));
         Ok(())
     }
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -1449,4 +1458,45 @@ async fn only_successful_named_saves_notify_configuration_observers() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(manager.updates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn current_web_configuration_payloads_survive_save_and_readback() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dashboard-settings.json")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    for key in [
+        "server",
+        "branding",
+        "encoding",
+        "network",
+        "metadata",
+        "xbmcmetadata",
+        "livetv",
+    ] {
+        let uri = if key == "server" {
+            "/System/Configuration".into()
+        } else {
+            format!("/System/Configuration/{key}")
+        };
+        let payload = &fixture[key];
+        assert_eq!(
+            post(app.clone(), &uri, payload).await,
+            StatusCode::NO_CONTENT,
+            "{key}"
+        );
+        let (status, bytes) = get(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        let returned = json(&bytes);
+        for (field, expected) in payload.as_object().unwrap() {
+            assert_eq!(
+                &returned[field], expected,
+                "{key}.{field} must survive the Web save action"
+            );
+        }
+    }
 }

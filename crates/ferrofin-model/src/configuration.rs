@@ -362,15 +362,8 @@ pub struct LibraryTypeOptionsDto {
     /// Gets or sets the available similarity providers. Local ones are
     /// default-enabled; remote ones must be ticked.
     ///
-    /// NEVER put on the wire. `SimilarItemProviders` is a post-10.11.8 addition
-    /// (it appears on upstream master's `TypeOptions`/`LibraryTypeOptionsDto`
-    /// but not on `v10.11.8`), and `LibraryTypeOptionsDto` in
-    /// `contracts/jellyfin-openapi-10.11.8.json` sets `additionalProperties:
-    /// false` — so emitting it made every `GET /Libraries/AvailableOptions`
-    /// body schema-invalid. It stays computed because Ferrofin's similarity
-    /// registry is real; only the wire projection is withheld until the
-    /// vendored contract is bumped.
-    #[serde(default, skip_serializing)]
+    /// Present in Jellyfin v12 and consumed by the current Web library editor.
+    #[serde(default)]
     pub similar_item_providers: Vec<LibraryOptionInfoDto>,
 
     /// Gets or sets the supported image types.
