@@ -8,19 +8,22 @@
 //! The composition root can supply an operator key to override it; per-library
 //! metadata and image fetcher settings control whether the provider runs.
 //!
+//! Title records (`&i=`) and season listings (`&season=`) are cached on disk
+//! as C# `EnsureItemInfo`/`EnsureSeasonInfo` cache them: under
+//! `{cache}/omdb/{imdbId}.json` and `{imdbId}_season_{n}.json`, reused while
+//! the file was written within the last day ([`OmdbClient::with_cache_dir`]).
+//! A title a scan keeps asking about (a D2 backfill whose trigger OMDb cannot
+//! clear) costs one request a day, as upstream.
+//!
 //! # Accepted divergences
 //!
-//! - **No on-disk response cache.** C# writes each response under
-//!   `{cache}/omdb/{imdbId}.json` and reuses it for a day. Ferrofin's scan
-//!   already skips a row that has the fields OMDb would fill, so the same title
-//!   is not re-fetched on a re-scan; a title OMDb has nothing for is the only
-//!   repeat request.
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use crate::rate_limit::CountedBody as _;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use secrecy::{ExposeSecret, SecretString};
@@ -45,15 +48,10 @@ pub struct OmdbClient {
     limiter: crate::rate_limit::RateLimiter,
     api_key: SecretString,
     base_url: String,
-    /// Season listings already fetched, keyed by `(series id, season)`.
-    ///
-    /// C# `EnsureSeasonInfo` caches the same JSON on disk under
-    /// `{cache}/omdb/{id}_season_{n}.json` for a day. Ferrofin keeps it in
-    /// memory instead — the cache directory is not wired into this client, and
-    /// the request that matters is the one repeated once per EPISODE of the
-    /// same season within a single scan. Same TTL, same effect on a scan; a
-    /// restart re-fetches where Jellyfin would not.
-    seasons: SeasonCache,
+    /// Where responses are cached (`{cache}/omdb`), when the composition
+    /// root wired one ([`Self::with_cache_dir`]); without it every lookup is
+    /// a request.
+    cache_dir: Option<PathBuf>,
     /// The OMDb plugin's dashboard settings (`CastAndCrew`).
     plugin: crate::plugin_config::ConfigSource,
 }
@@ -95,7 +93,7 @@ impl OmdbClient {
             limiter: crate::rate_limit::RateLimiter::new("omdb"),
             api_key: SecretString::from(api_key),
             base_url: API_BASE.to_owned(),
-            seasons: Arc::default(),
+            cache_dir: None,
             plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
@@ -104,6 +102,15 @@ impl OmdbClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         base_url.clone_into(&mut self.base_url);
+        self
+    }
+
+    /// Caches title records and season listings under `dir` — the server's
+    /// `{cache}/omdb`, where C# `GetDataFilePath`/`GetSeasonFilePath` keep
+    /// them.
+    #[must_use]
+    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.cache_dir = Some(dir);
         self
     }
 
@@ -216,7 +223,8 @@ impl OmdbClient {
             ("tomatoes", "true"),
             ("r", "json"),
         ];
-        let item: OmdbItem = self.get(&imdb_id, &params).await?;
+        let path = self.cache_path(&imdb_id, "");
+        let item: OmdbItem = self.cached_get(path, &imdb_id, &params).await?;
         item.is_found().then_some(item)
     }
 
@@ -239,22 +247,9 @@ impl OmdbClient {
             ("season", season_str.as_str()),
             ("detail", "full"),
         ];
-        let key = (series_id.clone(), season);
-        let cached = self.seasons.lock().ok().and_then(|seasons| {
-            seasons
-                .get(&key)
-                .filter(|(at, _)| at.elapsed() < SEASON_CACHE_TTL)
-                .map(|(_, listing)| listing.clone())
-        });
-        let listing: OmdbSeason = if let Some(listing) = cached {
-            listing
-        } else {
-            let fetched: OmdbSeason = self.get(&series_id, &params).await?;
-            if let Ok(mut seasons) = self.seasons.lock() {
-                seasons.insert(key, (Instant::now(), fetched.clone()));
-            }
-            fetched
-        };
+        // One listing serves every episode of the season.
+        let path = self.cache_path(&series_id, &format!("_season_{season}"));
+        let listing: OmdbSeason = self.cached_get(path, &series_id, &params).await?;
         let by_id = episode_imdb_id
             .and_then(normalize_imdb_id)
             .and_then(|wanted| {
@@ -269,12 +264,51 @@ impl OmdbClient {
             .cloned()
     }
 
-    /// The Rotten Tomatoes critic rating (`0.0`–`100.0`) for an IMDb id.
-    ///
-    /// A thin wrapper over [`item`](Self::item) kept because the scan's
-    /// rating-only backfill path reads nothing else.
-    pub async fn critic_rating(&self, imdb_id: &str) -> Option<f32> {
-        self.item(imdb_id).await?.rotten_tomatoes()
+    /// The cache file for `imdb_id` (`{dir}/{imdbId}{suffix}.json`), when a
+    /// cache directory is wired and the id is `tt` + ASCII alphanumerics
+    /// only, so a stored id can never name a path outside the directory.
+    fn cache_path(&self, imdb_id: &str, suffix: &str) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        imdb_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric())
+            .then(|| dir.join(format!("{imdb_id}{suffix}.json")))
+    }
+
+    /// The response cached at `path` while it was written within
+    /// [`RESPONSE_CACHE_TTL`], else a fresh GET whose body is written there
+    /// — C# `EnsureItemInfo`/`EnsureSeasonInfo`, which cache every answer
+    /// OMDb gives, a "not found" one included.
+    async fn cached_get<T: serde::de::DeserializeOwned>(
+        &self,
+        path: Option<PathBuf>,
+        imdb_id: &str,
+        params: &[(&str, &str)],
+    ) -> Option<T> {
+        if let Some(path) = &path
+            && let Some(body) = fresh_cache_file(path).await
+            && let Ok(value) = serde_json::from_slice(&body)
+        {
+            return Some(value);
+        }
+        let body = self
+            .limiter
+            .send_get(self.request(imdb_id, params)?, Duration::ZERO)
+            .await?
+            .counted_bytes()
+            .await
+            .ok()?;
+        let value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(provider = "omdb", imdb_id, %error, "Metadata provider response could not be parsed");
+                return None;
+            }
+        };
+        if let Some(path) = path {
+            write_cache_file(&path, &body).await;
+        }
+        Some(value)
     }
 
     /// Issues one OMDb GET and deserializes the body, logging (never returning)
@@ -284,6 +318,15 @@ impl OmdbClient {
         imdb_id: &str,
         params: &[(&str, &str)],
     ) -> Option<T> {
+        // OMDb has no configured fixed request interval. Server quota headers
+        // and transient failures still apply a shared cooldown across lookups.
+        self.limiter
+            .get_json(self.request(imdb_id, params)?, Duration::ZERO)
+            .await
+    }
+
+    /// One OMDb GET with the key and `params`; `None` without a key.
+    fn request(&self, imdb_id: &str, params: &[(&str, &str)]) -> Option<reqwest::RequestBuilder> {
         if !self.is_enabled() {
             return None;
         }
@@ -295,9 +338,37 @@ impl OmdbClient {
         for (key, value) in params {
             request = request.query(&[(key, value)]);
         }
-        // OMDb has no configured fixed request interval. Server quota headers
-        // and transient failures still apply a shared cooldown across lookups.
-        self.limiter.get_json(request, Duration::ZERO).await
+        Some(request)
+    }
+}
+
+/// How long a cached OMDb response is reused: C# `EnsureItemInfo`/
+/// `EnsureSeasonInfo` keep a file while `(UtcNow - LastWriteTimeUtc).
+/// TotalDays <= 1` (`OmdbProvider.cs:319,361`).
+const RESPONSE_CACHE_TTL: Duration = Duration::from_hours(24);
+
+/// The cache file at `path` while it was written within
+/// [`RESPONSE_CACHE_TTL`] (a write time in the future counts as fresh, as
+/// C#'s negative age does).
+async fn fresh_cache_file(path: &Path) -> Option<Vec<u8>> {
+    let written = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    let age = SystemTime::now()
+        .duration_since(written)
+        .unwrap_or_default();
+    if age > RESPONSE_CACHE_TTL {
+        return None;
+    }
+    tokio::fs::read(path).await.ok()
+}
+
+/// Writes a response to its cache file. Best-effort: a failed write only
+/// means the next lookup asks OMDb again.
+async fn write_cache_file(path: &Path, body: &[u8]) {
+    if let Some(dir) = path.parent() {
+        let _ = tokio::fs::create_dir_all(dir).await;
+    }
+    if let Err(error) = tokio::fs::write(path, body).await {
+        tracing::debug!(provider = "omdb", %error, path = %path.display(), "OMDb response not cached");
     }
 }
 
@@ -388,19 +459,8 @@ pub struct OmdbSearchKey<'a> {
     pub episode: Option<i32>,
 }
 
-/// The season listings a client has already fetched, keyed by
-/// `(series id, season)` and stamped with when they were read.
-///
-/// Shared across clones of the client, so the composition root handing the same
-/// client to several subsystems does not multiply the requests.
-type SeasonCache = Arc<std::sync::Mutex<HashMap<(String, i32), (Instant, OmdbSeason)>>>;
-
-/// How long a cached season listing stays fresh — C# `EnsureSeasonInfo`'s
-/// `TotalDays <= 1`.
-const SEASON_CACHE_TTL: Duration = Duration::from_hours(24);
-
 /// One season listing (`&season=N`) — port of `OmdbProvider.SeasonRootObject`.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OmdbSeason {
     #[serde(rename = "Episodes", default)]
     episodes: Vec<OmdbItem>,
@@ -753,7 +813,7 @@ mod tests {
         let client = OmdbClient::new("key").with_base_url(&server.base_url);
         let item = client.item("tt1375666").await.expect("a title");
         assert_eq!(item.title.as_deref(), Some("Inception"));
-        assert_eq!(client.critic_rating("tt1375666").await, Some(87.0));
+        assert_eq!(item.rotten_tomatoes(), Some(87.0));
     }
 
     #[tokio::test]
@@ -809,22 +869,62 @@ mod tests {
     #[tokio::test]
     async fn a_season_listing_is_fetched_once_for_the_whole_season() {
         // C# `EnsureSeasonInfo` caches the listing for a day. Without a cache
-        // a scan issues one full season request PER EPISODE — the skip gate
-        // upstream of it cannot help, because `episode()` sends no
-        // `tomatoes=true` and so never fills the critic rating the gate wants.
+        // a scan issues one full season request PER EPISODE.
+        let cache = tempfile::tempdir().unwrap();
         let client = {
             let server = MockServer::start(vec![("/", season_body())]).await;
-            let client = OmdbClient::new("key").with_base_url(&server.base_url);
+            let client = OmdbClient::new("key")
+                .with_base_url(&server.base_url)
+                .with_cache_dir(cache.path().to_path_buf());
             let first = client.episode("tt0903747", 1, 1, None).await.expect("ep");
             assert_eq!(first.title.as_deref(), Some("Pilot"));
             client
             // …and the server goes away here.
         };
+        assert!(cache.path().join("tt0903747_season_1.json").exists());
         // A second episode of the same season must resolve without a request.
         let second = client.episode("tt0903747", 1, 2, None).await.expect("ep");
         assert_eq!(second.title.as_deref(), Some("Cat's in the Bag..."));
         // A DIFFERENT season is a different key, so it has nothing to serve.
         assert!(client.episode("tt0903747", 2, 1, None).await.is_none());
+    }
+
+    /// A title record is reused while its file was written within a day
+    /// (`OmdbProvider.cs:319`), asked again once it is older, and never
+    /// cached under an id that is not `tt` + alphanumerics.
+    #[tokio::test]
+    async fn a_title_record_is_cached_on_disk_for_a_day() {
+        let cache = tempfile::tempdir().unwrap();
+        let server = MockServer::start(vec![("/", movie_body())]).await;
+        let client = OmdbClient::new("key")
+            .with_base_url(&server.base_url)
+            .with_cache_dir(cache.path().to_path_buf());
+        let file = cache.path().join("tt1375666.json");
+        assert!(client.item("1375666").await.is_some());
+        assert!(file.exists(), "cached under the `tt` id");
+        drop(server);
+
+        assert!(
+            client.item("tt1375666").await.is_some(),
+            "served from the cache"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_hours(25))
+            .unwrap();
+        assert!(
+            client.item("tt1375666").await.is_none(),
+            "a day-old file is asked again, and the server is gone"
+        );
+
+        assert_eq!(client.cache_path("tt../../x", ""), None);
+        assert_eq!(
+            OmdbClient::new("key").cache_path("tt1375666", ""),
+            None,
+            "no directory wired"
+        );
     }
 
     #[tokio::test]

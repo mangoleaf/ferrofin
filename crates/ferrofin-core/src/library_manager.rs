@@ -15,10 +15,10 @@
 //!   service (the row upsert is idempotent); the `parent_id` argument is accepted
 //!   for API parity but the parent linkage is already carried on each row's
 //!   `ParentId` column.
-//! - `delete_item` honors [`DeleteOptions`] by deleting the single row (and, when
-//!   requested, its children) through the persistence service; the physical
-//!   file deletion the C# path performs is out of scope for this seam and is
-//!   noted deferred.
+//! - `delete_item` deletes the item's row and its children's through the
+//!   persistence service. TODO(parity, open work item): upstream deletes the
+//!   media files (`DeleteFileLocation = true`); not ported yet, it waits on
+//!   scanner parity. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -1580,10 +1580,12 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(());
         };
         // C# `LibraryController.DeleteItem`: `!item.CanDelete(user)` is a 401
-        // "Unauthorized access". The kind half of that rule lives here, on the
-        // one path every delete takes: the user root, the aggregate root, a
-        // library's collection folder, the views, and the by-name items are
-        // never deletable — and with `ParentId` a cascading foreign key,
+        // "Unauthorized access". `item_deletion::can_delete` is the single
+        // implementation of that rule, and the handler asks it; this kind
+        // check is a backstop that only changes the outcome for an API key,
+        // where upstream would ask nothing. It keeps the user root, the
+        // aggregate root, a library's collection folder, the views and the
+        // by-name items undeletable — with `ParentId` a cascading foreign key,
         // deleting the root would delete every library and all of its items.
         let kind = crate::item_type_lookup::kind_from_type_name(&row.type_)
             .unwrap_or(BaseItemKind::Folder);
@@ -1597,9 +1599,12 @@ impl LibraryManager for FerrofinLibraryManager {
         }
         let mut ids = vec![id];
         // C# `DeleteItem` cascades to a folder's children; gather the direct-child
-        // ids so the row deletion removes the subtree too. Physical file deletion
-        // (honoring `delete_file_location`) is the filesystem layer's job, not this
-        // persistence seam, and is deferred.
+        // ids so the row deletion removes the subtree too.
+        //
+        // TODO(parity, open work item): upstream deletes the media files
+        // (`DeleteFileLocation = true`); not ported yet, it waits on scanner
+        // parity, so `options.delete_file_location` is not honoured and only
+        // rows go. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
         if row.is_folder {
             // Cascade to PHYSICAL children only. A box-set/playlist is a folder whose
             // members are LinkedChildren (references), not owned children — deleting the

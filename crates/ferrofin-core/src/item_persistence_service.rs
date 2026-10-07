@@ -7870,6 +7870,53 @@ mod tests {
         );
     }
 
+    /// Upstream's `ItemPersistenceDeleteItemTests`
+    /// (`tests/Jellyfin.Server.Implementations.Tests/Item/
+    /// ItemPersistenceDeleteItemTests.cs`), transliterated: each seeds
+    /// `(Id, OwnerId, ParentId)` rows, deletes the first, and expects every
+    /// seeded row gone.
+    ///
+    /// - `DeleteItem_OwnerIdChain_DeletesWholeChain`: an extra that owns an
+    ///   extra of its own;
+    /// - `DeleteItem_ExtraOwnedByCascadedChild_DeletesExtraToo`: a child
+    ///   reached by `ParentId` owns an extra;
+    /// - `DeleteItem_OwnershipCycle_Terminates`: two rows that own each
+    ///   other.
+    #[rstest::rstest]
+    #[case::owner_id_chain(&[(0, None, None), (1, Some(0), None), (2, Some(1), None)], None)]
+    #[case::extra_owned_by_cascaded_child(&[(0, None, None), (1, None, Some(0)), (2, Some(1), None)], None)]
+    #[case::ownership_cycle(&[(0, None, None), (1, Some(0), None)], Some(1))]
+    #[tokio::test]
+    async fn upstream_delete_item_closure(
+        #[case] rows: &[(usize, Option<usize>, Option<usize>)],
+        #[case] owner_of_first: Option<usize>,
+    ) {
+        let db = test_db().await;
+        let ids: Vec<Uuid> = (0..rows.len()).map(|_| Uuid::new_v4()).collect();
+        for (index, _, _) in rows {
+            seed_item(&db, ids[*index], BaseItemKind::Movie).await;
+        }
+        for (index, owner, parent) in rows {
+            let mut row = crate::test_support::fetch_item(&db, ids[*index]).await;
+            row.owner_id = owner.map(|o| guid_to_db(ids[o]));
+            row.parent_id = parent.map(|p| guid_to_db(ids[p]));
+            crate::test_support::save_item(&db, &row).await;
+        }
+        if let Some(owner) = owner_of_first {
+            let mut row = crate::test_support::fetch_item(&db, ids[0]).await;
+            row.owner_id = Some(guid_to_db(ids[owner]));
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.delete_items(&ids[..1]).await.expect("delete");
+        for id in ids {
+            assert!(
+                crate::test_support::fetch_item_opt(&db, id).await.is_none(),
+                "{id} deleted"
+            );
+        }
+    }
+
     /// A failure part-way through the delete leaves everything as it was: no
     /// row and no playlist or collection link half-deleted.
     #[tokio::test]

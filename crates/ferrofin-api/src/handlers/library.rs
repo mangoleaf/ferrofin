@@ -415,8 +415,12 @@ struct AvailableOptionsQuery {
     /// Optional. The library content (collection) type to scope the options to.
     #[serde(default)]
     library_content_type: Option<ferrofin_model::data::CollectionType>,
-    /// Optional. Whether this is a new library (accepted for parity; it only
-    /// affects `DefaultEnabled` flags, which are all empty at this seam).
+    /// Optional. Whether this is a new library (jellyfin-web's add-library
+    /// dialog sends `true`): it decides which fetchers and savers report
+    /// `DefaultEnabled` — the dialog's initial checkboxes — as upstream's
+    /// `IsSaverEnabledByDefault` / `IsMetadataFetcherEnabledByDefault` /
+    /// `IsImageFetcherEnabledByDefault` do (a plugin's fetcher starts
+    /// unticked in a new library).
     #[serde(default)]
     is_new_library: bool,
 }

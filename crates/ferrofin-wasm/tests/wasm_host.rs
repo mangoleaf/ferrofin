@@ -212,12 +212,20 @@ fn colliding_provider_names_are_refused_at_load() {
         "e-empty",
         &named_provider_fixture("55555555-5555-5555-5555-555555555555", ""),
     );
+    // Skipped: a name on a new-library allowlist that Ferrofin registers no
+    // provider for (upstream's "Screen Grabber" image fetcher) — it would
+    // start ticked in a new library, unlike every other plugin.
+    write_fixture(
+        dir.path(),
+        "f-screen-grabber",
+        &named_provider_fixture("77777777-7777-7777-7777-777777777777", "screen grabber"),
+    );
 
     let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(
         host.plugins().len(),
         1,
-        "reserved/taken/empty/padded provider names must be skipped"
+        "reserved/taken/empty/padded/allowlisted provider names must be skipped"
     );
     let info = host.plugins()[0]
         .provider_info

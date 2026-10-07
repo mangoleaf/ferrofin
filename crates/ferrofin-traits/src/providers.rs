@@ -382,9 +382,10 @@ pub trait ProviderManager: Send + Sync {
 
 fn _assert_object_safe_provider_manager(_: &dyn ProviderManager) {}
 
-/// What a [`DynamicMetadataProvider`] is asked about: the item as scanned so
-/// far. Plain data (no entity/DTO) so the seam stays stable for out-of-tree
-/// implementations (the Tier-1b WASM plugin host).
+/// What a [`DynamicMetadataProvider`] is asked about: the item's lookup
+/// info, as every remote provider of the pass is asked by it
+/// (`ItemLookupInfo`). Plain data (no entity/DTO) so the seam stays stable
+/// for out-of-tree implementations (the Tier-1b WASM plugin host).
 #[derive(Debug, Clone, Default)]
 pub struct DynamicMetadataLookup {
     /// The item's id.
@@ -397,14 +398,20 @@ pub struct DynamicMetadataLookup {
     pub production_year: Option<i32>,
     /// Filesystem path, when the item has one.
     pub path: Option<String>,
-    /// External ids known so far, as (provider name, id) pairs.
+    /// External ids known so far, as (provider name, id) pairs: the item's
+    /// own, then every id a provider that ran before this one in the same
+    /// pass answered with (`MergeNewData`).
     pub provider_ids: Vec<(String, String)>,
 }
 
-/// Metadata a dynamic provider contributes. **Supplement-only**: the scanner
-/// applies each field only where the item still lacks a value — dynamic
-/// providers fill gaps, they never overwrite built-in providers or user
-/// edits.
+/// Metadata a dynamic provider contributes: one remote provider's answer
+/// (upstream's `MetadataResult` with `HasMetadata`). The scanner folds it
+/// into the pass's result at the provider's rank, exactly like a built-in
+/// provider's answer (`ExecuteRemoteProviders`' `MergeData(result, temp, [],
+/// false, false)`): a field an answer from a provider ranked above it
+/// already filled stands, an empty one takes this answer's value, and the
+/// list fields that union (studios, tags) union. The pass's result is then
+/// merged onto the stored item by the refresh mode, as every provider's is.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicMetadataResult {
     /// Plot/description text.
@@ -413,39 +420,72 @@ pub struct DynamicMetadataResult {
     pub production_year: Option<i32>,
     /// Community rating on the 0–10 scale.
     pub community_rating: Option<f64>,
-    /// Genre names (applied only when the item has none).
+    /// Genre names (taken only where no provider ranked above supplied any).
     pub genres: Vec<String>,
-    /// External ids to record, as (provider name, id) pairs.
+    /// External ids to record, as (provider name, id) pairs. An id of a name
+    /// a provider ranked above already answered with stands.
     pub provider_ids: Vec<(String, String)>,
-    /// Tagline (supplement-only).
+    /// Tagline.
     pub tagline: Option<String>,
-    /// Studio names (supplement-only).
+    /// Studio names (unioned with the other answers').
     pub studios: Vec<String>,
-    /// Tag names (supplement-only).
+    /// Tag names (unioned with the other answers').
     pub tags: Vec<String>,
-    /// Parental rating (supplement-only).
+    /// Parental rating.
     pub official_rating: Option<String>,
-    /// End date, ISO-8601 (supplement-only).
+    /// End date, ISO-8601 (RFC 3339; another shape is ignored).
     pub end_date: Option<String>,
 }
 
-/// A dynamically-registered scan metadata source — the seam Tier-1b WASM
+/// A dynamically-registered remote metadata provider — the seam Tier-1b WASM
 /// plugins implement (`metadata-lookup` in the `ferrofin:plugin` world).
-/// Called per item AFTER the built-in provider chain (TVDB/TMDB/OMDb/NFO),
-/// so built-ins stay authoritative and dynamic sources supplement.
+///
+/// The scanner runs it as one of the item kind's remote providers
+/// (`IRemoteMetadataProvider`), in the same fold as the built-in ones
+/// (`MetadataService.ExecuteRemoteProviders`), at its rank in upstream's
+/// order (`ProviderManager.GetMetadataProvidersInternal`):
+///
+/// 1. the position of its [`name`](Self::name) in the library's
+///    `MetadataFetcherOrder` for the kind (else the server-wide one; a
+///    provider the order leaves out ranks last);
+/// 2. its default order: upstream's `GetDefaultOrder` 50 for a provider that
+///    declares no `IHasOrder`, as a plugin cannot declare one — after
+///    TheMovieDb's movie, series and episode providers (1), OMDb (2, its
+///    episode provider 1), MusicBrainz (0) and TheAudioDB (1). The scanner
+///    and the library-options lists read it from one table
+///    (`ferrofin_providers::library_options::DEFAULT_ORDER`);
+/// 3. registration, Ferrofin's tie rule: these sources first (in
+///    registration order), compiled-in extensions second, the built-in
+///    providers last — as Jellyfin registers its plugins' providers before
+///    the server's — so a plugin precedes TheTVDB and TheMovieDb's season
+///    provider (also 50) where the order ranks them alike.
+///
+/// Ranked first, its answer wins every field it fills among the remote
+/// providers (what the item's local readers found still comes first);
+/// ranked after another provider, it fills only what that one left empty.
+/// It reports no answer
+/// language, so the fold counts its answer as one in the preferred language
+/// (`MatchesPreferredLanguage`): its overview or tagline replaces one an
+/// earlier provider supplied only as another-language fallback (OMDb's and
+/// TheAudioDB's English in a library of another language).
 ///
 /// Implementations must be cheap to call with `None`-meaning results: most
 /// items are none of a given provider's business.
 #[async_trait]
 pub trait DynamicMetadataProvider: Send + Sync {
-    /// A stable display name for logs (typically the plugin name).
+    /// A stable display name for logs (typically the plugin name). For a
+    /// [`library_gated`](Self::library_gated) provider, the name the
+    /// library-options fetcher lists advertise and `MetadataFetcherOrder`
+    /// stores.
     fn name(&self) -> &str;
 
     /// Whether this source is a NAMED provider the admin manages per
     /// library (its [`name`](Self::name) appears in the library-options
-    /// fetcher lists). Gated sources are skipped/ordered by the library's
-    /// `TypeOptions`; ungated sources always run, as before. Default:
-    /// ungated.
+    /// fetcher lists). A gated source runs only where the library's
+    /// `TypeOptions` (or the server-wide options) enable it, at its rank in
+    /// the saved order. An ungated source appears in no list, so the admin
+    /// can neither turn it off nor rank it: it always runs, ranked as a
+    /// provider the order leaves out. Default: ungated.
     fn library_gated(&self) -> bool {
         false
     }
@@ -454,8 +494,10 @@ pub trait DynamicMetadataProvider: Send + Sync {
     /// nothing to contribute.
     ///
     /// # Errors
-    /// Provider-internal failure; the scanner logs it once and continues
-    /// (one bad source never fails a scan).
+    /// Provider-internal failure. The scanner counts it as a provider failure
+    /// (the refresh is not recorded as complete, so the next scan asks
+    /// again), logs it and runs the remaining providers (one bad source
+    /// never fails a scan).
     async fn lookup(
         &self,
         item: &DynamicMetadataLookup,

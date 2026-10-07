@@ -710,6 +710,34 @@ impl Database {
         Ok(out)
     }
 
+    /// `Playlist.OwnerUserId` of each of the playlists among `ids` (stored
+    /// GUID form) that has an owner: `(PlaylistId, OwnerUserId)` from
+    /// `FerrofinPlaylists`. A playlist with no owner (made through an API key)
+    /// and an id that is no playlist are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
+                   WHERE "PlaylistId" IN ({placeholders}) AND "OwnerUserId" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]
     /// when the key is unset.
     ///

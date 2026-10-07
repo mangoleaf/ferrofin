@@ -59,7 +59,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
 | `FERROFIN_PLAYBACK_METRICS_QUEUE` | `1024` | Depth of the playback-metrics write queue, in events. Each PlaybackInfo decision and playstate start/stop is handed to this queue and written by one background task, so a SQLite WAL checkpoint can never stall a playback request. A full queue drops the event with a warning rather than blocking — raise it if `playback-metrics queue full` appears in the log under a load spike. |
-| `FERROFIN_SCAN_PROBE_CONCURRENCY` | `4` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
+| `FERROFIN_SCAN_PROBE_CONCURRENCY` | `8` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
 
 ## Observability
 
@@ -91,6 +91,7 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 |---|---|
 | `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. |
 | `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | Optional TheTVDB API key override and subscriber PIN. |
+| `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
 | `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. |
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |

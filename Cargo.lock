@@ -1644,6 +1644,7 @@ dependencies = [
  "ferrofin-providers",
  "ferrofin-traits",
  "reqwest",
+ "rstest",
  "serde_json",
  "tempfile",
  "tokio",

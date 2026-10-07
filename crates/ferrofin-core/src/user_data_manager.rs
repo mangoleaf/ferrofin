@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::UserDataManager;
+use ferrofin_traits::library::{ContentPermissions, UserDataManager};
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
@@ -940,18 +940,45 @@ impl UserDataManager for FerrofinUserDataManager {
     async fn get_content_permissions(
         &self,
         user_id: Uuid,
-    ) -> Result<Option<(bool, bool)>, ServiceError> {
-        // Kind 10 = EnableContentDeletion, 11 = EnableContentDownloading.
-        let rows: Vec<(i32, bool)> = sqlx::query_as(
-            r#"SELECT "Kind", "Value" FROM "Permissions"
-               WHERE "UserId" = ?1 AND "Kind" IN (10, 11)"#,
+    ) -> Result<Option<ContentPermissions>, ServiceError> {
+        use ferrofin_db::enums::{PermissionKind, PreferenceKind};
+        // One indexed read over both `(UserId, Kind)` tables, the shape
+        // `user_manager::load_permission_and_preference_maps` uses: the four
+        // permissions and the "Allow media deletion from" list (stored
+        // `,`-delimited, as C# writes it).
+        let rows: Vec<(i64, i32, String)> = sqlx::query_as(
+            r#"SELECT 0, "Kind", CAST("Value" AS TEXT) FROM "Permissions"
+               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5)
+               UNION ALL
+               SELECT 1, "Kind", "Value" FROM "Preferences"
+               WHERE "UserId" = ?1 AND "Kind" = ?6"#,
         )
         .bind(guid_to_db(user_id))
+        .bind(i32::from(PermissionKind::IsAdministrator))
+        .bind(i32::from(PermissionKind::EnableContentDeletion))
+        .bind(i32::from(PermissionKind::EnableContentDownloading))
+        .bind(i32::from(PermissionKind::EnableCollectionManagement))
+        .bind(i32::from(PreferenceKind::EnableContentDeletionFromFolders))
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        let has = |kind: i32| rows.iter().any(|(k, v)| *k == kind && *v);
-        Ok(Some((has(10), has(11))))
+        let has = |kind: PermissionKind| {
+            rows.iter()
+                .any(|(src, k, v)| *src == 0 && *k == i32::from(kind) && v == "1")
+        };
+        let content_deletion_folders = rows
+            .iter()
+            .filter(|(src, ..)| *src == 1)
+            .flat_map(|(_, _, value)| value.split(','))
+            .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+            .collect();
+        Ok(Some(ContentPermissions {
+            is_administrator: has(PermissionKind::IsAdministrator),
+            enable_content_deletion: has(PermissionKind::EnableContentDeletion),
+            enable_content_downloading: has(PermissionKind::EnableContentDownloading),
+            enable_collection_management: has(PermissionKind::EnableCollectionManagement),
+            content_deletion_folders,
+        }))
     }
 
     async fn get_playback_permissions(
@@ -1084,6 +1111,49 @@ impl FerrofinUserDataManager {
             }
         }
         Ok(map.into_iter().map(|(id, (dto, _))| (id, dto)).collect())
+    }
+}
+
+/// Test-only: grants `user` the given permission rows and, when `folders` is
+/// not empty, the "Allow media deletion from" list — the rows
+/// [`UserDataManager::get_content_permissions`] reads — keeping the raw SQL
+/// inside the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_content_permissions(
+    db: &Database,
+    user: Uuid,
+    permissions: &[ferrofin_db::enums::PermissionKind],
+    folders: &[Uuid],
+) {
+    for kind in permissions {
+        sqlx::query(
+            r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
+               VALUES (?1, 1, ?2, 0)"#,
+        )
+        .bind(i32::from(*kind))
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("seed permission");
+    }
+    if !folders.is_empty() {
+        let value = folders
+            .iter()
+            .map(|f| f.simple().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        sqlx::query(
+            r#"INSERT INTO "Preferences" ("Kind", "Value", "UserId", "RowVersion")
+               VALUES (?1, ?2, ?3, 0)"#,
+        )
+        .bind(i32::from(
+            ferrofin_db::enums::PreferenceKind::EnableContentDeletionFromFolders,
+        ))
+        .bind(value)
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("seed deletion folders");
     }
 }
 
@@ -1837,29 +1907,58 @@ mod tests {
         seed_user(&db, user).await;
         let mgr = FerrofinUserDataManager::new(db.clone(), config());
 
-        // No rows: permissions known, both denied (falsy rows == absent rows).
+        // No rows: permissions known, all denied (falsy rows == absent rows).
         let perms = mgr
             .get_content_permissions(user)
             .await
             .expect("read")
             .expect("policy known");
-        assert_eq!(perms, (false, false));
+        assert_eq!(perms, ContentPermissions::default());
 
-        // Kind 10 = EnableContentDeletion granted, 11 = downloading denied.
+        // Kind 10 = EnableContentDeletion granted, 11 = downloading denied,
+        // 0 = IsAdministrator and 21 = EnableCollectionManagement granted, and
+        // another user's rows ignored.
+        let other = Uuid::from_u128(0x78);
+        crate::test_support::seed_named_user(&db, other, "other").await;
         sqlx::query(
             r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
-               VALUES (10, 1, ?1, 0), (11, 0, ?1, 0)"#,
+               VALUES (10, 1, ?1, 0), (11, 0, ?1, 0), (0, 1, ?1, 0), (21, 1, ?1, 0),
+                      (11, 1, ?2, 0)"#,
         )
         .bind(ferrofin_db::store::guid_to_db(user))
+        .bind(ferrofin_db::store::guid_to_db(other))
         .execute(db.writer())
         .await
         .expect("seed permissions");
+        // The "Allow media deletion from" list, `,`-delimited as C# writes it;
+        // a value that is not a GUID is dropped.
+        let library_a = Uuid::from_u128(0xA);
+        let library_b = Uuid::from_u128(0xB);
+        sqlx::query(
+            r#"INSERT INTO "Preferences" ("Kind", "Value", "UserId", "RowVersion")
+               VALUES (6, ?2, ?1, 0), (5, ?3, ?1, 0)"#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(user))
+        .bind(format!("{},junk,{}", library_a.simple(), library_b))
+        .bind(Uuid::from_u128(0xC).to_string())
+        .execute(db.writer())
+        .await
+        .expect("seed preferences");
         let perms = mgr
             .get_content_permissions(user)
             .await
             .expect("read")
             .expect("policy known");
-        assert_eq!(perms, (true, false));
+        assert_eq!(
+            perms,
+            ContentPermissions {
+                is_administrator: true,
+                enable_content_deletion: true,
+                enable_content_downloading: false,
+                enable_collection_management: true,
+                content_deletion_folders: vec![library_a, library_b],
+            }
+        );
     }
 
     #[tokio::test]

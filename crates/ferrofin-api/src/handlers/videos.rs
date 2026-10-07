@@ -133,8 +133,8 @@ struct MergeVersionsQuery {
 /// Port of `VideosController.MergeVersions`. Requires at least two ids (else
 /// `400`); delegates the primary-selection and `PrimaryVersionId` linkage to
 /// [`LibraryManager::merge_versions`](ferrofin_traits::library::LibraryManager::merge_versions).
-/// Returns `204 No Content` on success. Elevation policy enforcement is deferred
-/// to the auth layer.
+/// Returns `204 No Content` on success. Administrators and API keys only
+/// (`Policies.RequiresElevation`, enforced by [`RequireAdmin`]).
 #[utoipa::path(
     post,
     path = "/Videos/MergeVersions",
@@ -165,8 +165,10 @@ async fn merge_versions(
 /// Port of `VideosController.DeleteAlternateSources`: clears the group's
 /// `PrimaryVersionId` links via
 /// [`LibraryManager::remove_alternate_sources`](ferrofin_traits::library::LibraryManager::remove_alternate_sources).
-/// Returns `204 No Content`, or `404` when the item does not exist. Elevation
-/// policy enforcement is deferred to the auth layer.
+/// Returns `204 No Content`, or `404` when the item does not exist.
+/// Administrators and API keys only (`Policies.RequiresElevation`, enforced by
+/// [`RequireAdmin`]); upstream asks no `CanDelete(user)` here, and no item or
+/// file is deleted — only the version links are cleared.
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/AlternateSources",

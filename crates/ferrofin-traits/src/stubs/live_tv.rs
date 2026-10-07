@@ -683,6 +683,19 @@ pub trait LiveTvManager: Send + Sync {
         Ok(None)
     }
 
+    /// The files live captures are writing right now, whatever timer fired
+    /// them.
+    ///
+    /// Backs `Video.IsActiveRecording` (`RecordingsManager.
+    /// GetActiveRecordingInfo(Path) is not null`), which makes
+    /// `Video.CanDelete()` false while a recording is still being written to
+    /// the item's file. Like upstream, a capture that has been told to stop,
+    /// or whose timer is no longer `InProgress`, is left out. The default
+    /// reports nothing recording.
+    async fn active_recording_paths(&self) -> Result<Vec<String>, ServiceError> {
+        Ok(Vec::new())
+    }
+
     /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
     /// `"Audio"`, or `None` when `id` is neither.
     ///

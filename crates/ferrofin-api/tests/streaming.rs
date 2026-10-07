@@ -640,7 +640,9 @@ async fn deletion_requires_permission_for_single_and_batch_routes() {
             },
         )
         .app;
-        // The stub's delete method panics, proving rejection happens first.
+        // `FakeDto`'s `CanDelete(user)` refuses, as the DTO service does for a
+        // user without "Allow media deletion"; the stub's delete method
+        // panics, proving the rejection happens first.
         let response = create_router(app)
             .oneshot(authed("DELETE", &uri))
             .await

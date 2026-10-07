@@ -452,8 +452,9 @@ impl WasmPluginHost {
     }
 
     /// Builds the [`DynamicMetadataProvider`] adapters for every loaded
-    /// plugin — the scanner's dynamic metadata pass (`metadata-lookup` in
-    /// the world). Each adapter self-gates on the plugin's enabled flag via
+    /// plugin, in load order — remote metadata providers the scanner folds
+    /// with the built-in ones at their configured rank (`metadata-lookup`
+    /// in the world). Each adapter self-gates on the plugin's enabled flag via
     /// the collaborators cell, so it is inert until
     /// [`set_runtime_collaborators`](Self::set_runtime_collaborators) and
     /// while the plugin is disabled.
@@ -1166,7 +1167,8 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
 
     fn library_gated(&self) -> bool {
         // Declaring provider-info opts the plugin into per-library admin
-        // control; a plugin without one supplements ungated, as before.
+        // control (its checkbox and its rank in the fetcher order); a
+        // plugin without one runs ungated and unranked.
         self.plugin.provider_info.is_some()
     }
 

@@ -91,8 +91,12 @@
 //!   resolves images through an injected `Arc<dyn ImageProcessor>`, honors the
 //!   [`DtoOptions`](ferrofin_traits::options::DtoOptions) field/image toggles, and
 //!   reuses the [`kinds`] helpers to branch on an item's kind (the C#
-//!   subclass type-tests). LiveTV program/channel enrichment and active-recording
-//!   rewrites are deferred (their sibling seams are not injected into this unit).
+//!   subclass type-tests). LiveTV channel/programme enrichment runs through the
+//!   late-bound Live TV manager, and `CanDelete` is upstream's `CanDelete(user)`
+//!   in full (`item_deletion::can_delete`). The active-recording rewrite
+//!   (`DtoService.cs:443-466`) is an open work item: the files being written
+//!   are known (`LiveTvManager::active_recording_paths`), the rewrite is not
+//!   applied yet.
 //!
 //! ## Unit 7 — session manager + WebSocket wiring
 //!
@@ -179,6 +183,7 @@ mod extra_owners_repository;
 pub mod file_system;
 pub mod item_count_service;
 pub mod item_data;
+mod item_deletion;
 pub mod item_persistence_service;
 pub mod item_repository;
 pub mod item_type_lookup;

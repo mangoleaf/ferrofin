@@ -1,6 +1,7 @@
 //! The music pass: the remote providers of music albums and artists
-//! (MusicBrainz, TheAudioDB, fanart) and the album metadata derived from its
-//! tracks, run after the item walk under each item's own refresh decision.
+//! (MusicBrainz, TheAudioDB, the plugins' metadata sources, fanart) and the
+//! album metadata derived from its tracks, run after the item walk under
+//! each item's own refresh decision.
 //!
 //! Upstream refreshes a `MusicAlbum` — an `IMetadataContainer` — after its
 //! tracks (`MusicAlbum.RefreshAllMetadata`), so `AlbumMetadataService` reads
@@ -31,7 +32,7 @@ use ferrofin_model::providers::RemoteSearchResult;
 use ferrofin_providers::library_options::fetcher_names;
 use ferrofin_providers::metadata_merge::{
     ALL_LOCKABLE_FIELDS, MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id,
-    merge_data, merge_provider_ids, merge_refresh, settle_sort_name,
+    merge_provider_ids, merge_refresh, settle_sort_name,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
@@ -39,9 +40,10 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 use super::{
-    FetcherPolicy, LibraryScanner, RefreshReach, RemoteImage, ScanCancel, ScanOutcome, ScanRun,
-    Served, append_fanart, apply_album_child_metadata, download_images, download_remote_images,
-    images_changed, item_values_of, search_result_ids, split_pipe,
+    FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
+    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, download_images,
+    download_remote_images, images_changed, item_values_of, preferred_language, provider_order,
+    search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -80,6 +82,13 @@ impl MusicKind {
             Self::Artist | Self::ByNameArtist => "MusicArtist",
         }
     }
+}
+
+/// Whether an item of kind `short` runs its remote metadata providers in
+/// this pass rather than in the walk's: an album or an artist, which upstream
+/// refreshes after the tracks below it (see the module docs).
+pub(super) fn owns_providers(short: &str) -> bool {
+    matches!(short, "MusicAlbum" | "MusicArtist")
 }
 
 /// One album or artist this scan owes a music refresh, with the decision
@@ -142,6 +151,8 @@ pub(super) struct MusicFetch {
     musicbrainz: bool,
     /// `AudioDbAlbumProvider` / `AudioDbArtistProvider`.
     audiodb: bool,
+    /// A plugin's (Tier-1b WASM) metadata source enabled for the kind.
+    dynamic: bool,
     /// `AudioDbAlbumImageProvider` / `AudioDbArtistImageProvider`.
     audiodb_images: bool,
     /// fanart.tv's album/artist images.
@@ -153,7 +164,7 @@ pub(super) struct MusicFetch {
 impl MusicFetch {
     /// A remote metadata provider runs.
     fn metadata(self) -> bool {
-        self.musicbrainz || self.audiodb
+        self.musicbrainz || self.audiodb || self.dynamic
     }
 
     /// A remote image provider runs.
@@ -207,7 +218,7 @@ fn first_song_id(
 /// (`MetadataService.cs:1307-1328`) — how `ExecuteRemoteProviders` gathers
 /// its providers' answers in `temp` — and `MergeNewData`'s (`:1079-1100`),
 /// how it hands them to the next provider's lookup info.
-fn fill_ids(target: &mut Vec<(String, String)>, ids: &[(String, String)]) {
+pub(super) fn fill_ids(target: &mut Vec<(String, String)>, ids: &[(String, String)]) {
     for (key, value) in ids {
         if is_valid_provider_id(key, value) && valid_id(target, key).is_none() {
             target.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
@@ -216,33 +227,44 @@ fn fill_ids(target: &mut Vec<(String, String)>, ids: &[(String, String)]) {
     }
 }
 
-/// An empty provider result for `item`'s kind: the type is what the kind's
-/// merge rules key on (`MergeAlbumArtist` and the album's `Artists`).
-fn provider_result(item: &BaseItemEntity) -> MetadataResult {
-    MetadataResult::of(BaseItemEntity {
+/// The lookup info a plugin's (Tier-1b WASM) metadata source is asked by
+/// for `work`'s item, as the built-in providers of its kind are: the name
+/// they look up (`name`), the item's year and path, and the ids the lookup
+/// holds by its turn (`ids`: the item's own, then each earlier answer's).
+fn dynamic_lookup(
+    work: &MusicRefresh<'_>,
+    item: &BaseItemEntity,
+    name: &str,
+    ids: &[(String, String)],
+) -> ferrofin_traits::providers::DynamicMetadataLookup {
+    ferrofin_traits::providers::DynamicMetadataLookup {
+        item_id: work.id,
+        kind: work.kind.type_name().to_owned(),
+        name: name.to_owned(),
+        production_year: item.production_year.and_then(|y| i32::try_from(y).ok()),
+        path: item.path.clone(),
+        provider_ids: ids.to_vec(),
+    }
+}
+
+/// An empty `temp` row for `item`'s kind: the type is what the kind's merge
+/// rules key on (`MergeAlbumArtist` and the album's `Artists`).
+fn provider_row(item: &BaseItemEntity) -> BaseItemEntity {
+    BaseItemEntity {
         type_: item.type_.clone(),
         ..BaseItemEntity::default()
-    })
+    }
 }
+
+/// The `ResultLanguage` of a TheAudioDB answer: Ferrofin maps its English
+/// description (`strDescriptionEN`), which `AudioDbAlbumProvider`/
+/// `AudioDbArtistProvider` mark `"en"` so it does not block a provider that
+/// can serve the requested language (`AudioDbAlbumProvider.cs:122-131`).
+const AUDIODB_LANGUAGE: &str = "en";
 
 /// `values` as a `|`-joined list column; `None` when empty.
 fn joined(values: &[String]) -> Option<String> {
     (!values.is_empty()).then(|| values.join("|"))
-}
-
-/// One provider's answer taken in, as `ExecuteRemoteProviders` does
-/// (`MetadataService.cs:1001-1004`): merged into `temp` with `replaceData =
-/// false` — each field filled only where an earlier provider left it empty,
-/// the lists that union (`Studios`, `Tags`, `ProductionLocations`, the
-/// album artists) unioned ignoring case — and its ids handed to the next
-/// provider's lookup info (`MergeNewData`).
-fn take_answer(
-    temp: &mut MetadataResult,
-    lookup: &mut Vec<(String, String)>,
-    result: &MetadataResult,
-) {
-    merge_data(result, temp, &[], false, false);
-    fill_ids(lookup, &result.provider_ids);
 }
 
 /// A remote metadata provider of music.
@@ -253,20 +275,53 @@ enum MusicSource {
     MusicBrainz,
     /// `AudioDbAlbumProvider` / `AudioDbArtistProvider` (`Order` 1).
     AudioDb,
+    /// A plugin's (Tier-1b WASM) metadata source: its index in the scanner's
+    /// registration order.
+    Dynamic(usize),
 }
 
 /// The order the remote providers of a `kind` item run in
 /// (`GetMetadataProvidersInternal`, `ProviderManager.cs:523-540`): the
 /// admin's `MetadataFetcherOrder` for the kind — the library's, else the
-/// server-wide one — then each provider's own `Order`.
-fn music_sources(policy: FetcherPolicy<'_>, kind: MusicKind) -> [MusicSource; 2] {
-    let name = kind.type_name();
-    let mut sources = [MusicSource::MusicBrainz, MusicSource::AudioDb];
-    sources.sort_by_key(|source| match source {
-        MusicSource::MusicBrainz => (policy.metadata_rank(name, fetcher_names::MUSICBRAINZ), 0),
-        MusicSource::AudioDb => (policy.metadata_rank(name, fetcher_names::AUDIODB), 1),
-    });
-    sources
+/// server-wide one — then each provider's own `Order` (MusicBrainz 0,
+/// TheAudioDB 1, a WASM plugin 50), then registration: the plugins'
+/// `dynamic` sources first, as [`LibraryScanner::dynamic_sources`] lists
+/// them, then the built-in providers ([`BUILT_IN_METADATA_FETCHERS`], where
+/// the three-category tie rule is spelled out). Identifying moves the
+/// provider the chosen result came from to the front ("When identifying, run
+/// the provider the user picked first so the correct IDs are used",
+/// `MetadataService.cs:876-882`, a stable `OrderBy`).
+///
+/// [`BUILT_IN_METADATA_FETCHERS`]: ferrofin_providers::library_options::BUILT_IN_METADATA_FETCHERS
+fn music_sources(
+    policy: FetcherPolicy<'_>,
+    kind: MusicKind,
+    identified: Option<&RemoteSearchResult>,
+    dynamic: &[(usize, Option<&str>, i32)],
+) -> Vec<MusicSource> {
+    use ferrofin_providers::library_options::{BUILT_IN_METADATA_FETCHERS, default_metadata_order};
+    let mut candidates: Vec<(MusicSource, Option<&str>, i32)> = dynamic
+        .iter()
+        .map(|&(index, name, order)| (MusicSource::Dynamic(index), name, order))
+        .collect();
+    candidates.extend(BUILT_IN_METADATA_FETCHERS.iter().filter_map(|&name| {
+        let source = match name {
+            fetcher_names::MUSICBRAINZ => MusicSource::MusicBrainz,
+            fetcher_names::AUDIODB => MusicSource::AudioDb,
+            _ => return None,
+        };
+        Some((
+            source,
+            Some(name),
+            default_metadata_order(name, kind.type_name()),
+        ))
+    }));
+    provider_order(
+        policy,
+        kind.type_name(),
+        &candidates,
+        identified.and_then(|r| r.search_provider_name.as_deref()),
+    )
 }
 
 /// `AlbumMetadataService.SetProviderIdFromSongs` (`:158-178`) for the three
@@ -422,7 +477,9 @@ impl LibraryScanner {
     /// provider only when the plan's `GetNonLocalImageProviders` does, and
     /// each only when its client is wired and its library's "Metadata
     /// downloaders" / "Image fetchers" checkbox for the kind is ticked
-    /// (`ProviderManager.CanRefreshMetadata`/`CanRefreshImages`).
+    /// (`ProviderManager.CanRefreshMetadata`/`CanRefreshImages`) — the
+    /// plugins' metadata sources by the same rule
+    /// ([`dynamic_sources`](LibraryScanner::dynamic_sources)).
     pub(super) fn music_fetch(
         &self,
         kind: MusicKind,
@@ -442,6 +499,7 @@ impl LibraryScanner {
             audiodb: metadata
                 && self.audiodb.is_some()
                 && policy.metadata_enabled(name, fetcher_names::AUDIODB),
+            dynamic: metadata && !self.dynamic_sources(policy, name).is_empty(),
             audiodb_images: images
                 && self.audiodb.is_some()
                 && policy.image_enabled(name, fetcher_names::AUDIODB),
@@ -897,6 +955,7 @@ impl LibraryScanner {
             aggregate = work.aggregate,
             musicbrainz = fetch.musicbrainz,
             audiodb = fetch.audiodb,
+            dynamic = fetch.dynamic,
             images = fetch.any_images(),
             answered,
             failures = failures + image_failures,
@@ -1025,6 +1084,72 @@ impl LibraryScanner {
         }
     }
 
+    /// The plugins' (Tier-1b WASM) metadata sources `work`'s refresh runs
+    /// ([`LibraryScanner::dynamic_sources`]): none unless `fetch` runs them.
+    fn music_dynamic_sources(
+        &self,
+        work: &MusicRefresh<'_>,
+        fetch: MusicFetch,
+    ) -> Vec<(usize, Option<&str>, i32)> {
+        if fetch.dynamic {
+            self.dynamic_sources(work.policy, work.kind.type_name())
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `RefreshWithProviders`' state when its remote providers start, for
+    /// `work`'s item: the lookup info holding the item's ids (`id`), and
+    /// `temp` holding what the item's local reader found — its `album.nfo`
+    /// or `artist.nfo` (`AlbumNfoProvider`/`ArtistNfoProvider`), merged in
+    /// first (`MergeData(localItem, temp, [], false, true)`,
+    /// `MetadataService.cs:803-850`), its ids with it — so every remote
+    /// provider, built-in or plugin, only fills what the NFO left
+    /// (`MergeData(result, temp, [], false, false)`, `:1003`) and the NFO's
+    /// values replace the stored ones as the pass merges `temp` back.
+    ///
+    /// The local reader runs where the item's decision runs the local
+    /// readers, and never under an Identify: upstream tests the refresh's
+    /// own options (`options.SearchResult is null`, `:803`), and those carry
+    /// the chosen result to every child of the identified folder as well
+    /// (`ProviderManager.RefreshItem` → `ValidateChildren(options)`, the
+    /// options copy keeping `SearchResult`) — an album under an identified
+    /// artist reads no `album.nfo` either, as the walk's `run_local` already
+    /// has it (`search.is_none()`). `work.identified` is set for the
+    /// identified item alone, so the scan's options decide here. Upstream
+    /// also skips it under "Replace all metadata" when the
+    /// item has a metadata saver (`isSavingMetadata`, the
+    /// `ProviderManager.GetMetadataSavers(...).Any()` of `:184`): Ferrofin
+    /// runs no saver yet (the open "NFO metadata saver is never run" item),
+    /// so under "Replace all metadata" the NFO seeds `temp` as it does in the
+    /// walk, which is upstream's behaviour for a library without a saver.
+    async fn music_fold_start<'p>(
+        &self,
+        work: &MusicRefresh<'_>,
+        current: &MetadataResult,
+        preferred: &'p str,
+    ) -> (RemoteFold<'p>, BaseItemEntity) {
+        let mut fold = RemoteFold::new(&current.provider_ids, preferred);
+        let mut temp = provider_row(&current.item);
+        if work.request.options.search_result.is_some() || !work.plan.local_metadata {
+            return (fold, temp);
+        }
+        let mut local = BaseItemEntity {
+            id: current.item.id.clone(),
+            type_: current.item.type_.clone(),
+            path: current.item.path.clone(),
+            is_folder: current.item.is_folder,
+            ..BaseItemEntity::default()
+        };
+        let nfo = self.fetch_local_nfo(&mut local, work.policy).await;
+        if nfo.found {
+            temp = local;
+            fill_ids(&mut fold.lookup, &nfo.ids);
+            fold.result.provider_ids = nfo.ids;
+        }
+        (fold, temp)
+    }
+
     /// The remote metadata providers of one item, in the admin's order
     /// ([`music_sources`]), each filling only what an earlier one left
     /// empty (`ExecuteRemoteProviders` merges with `replaceData = false`) and
@@ -1050,7 +1175,8 @@ impl LibraryScanner {
         }
     }
 
-    /// `MusicBrainzAlbumProvider` + `AudioDbAlbumProvider`.
+    /// `MusicBrainzAlbumProvider` + `AudioDbAlbumProvider`, and the plugins'
+    /// metadata sources at their rank among them.
     ///
     /// The lookup name is the Identify's choice, else the first non-empty
     /// `Album` tag of the tracks, else the album's name (`MusicAlbum.
@@ -1075,9 +1201,10 @@ impl LibraryScanner {
         child_ids: &HashMap<Uuid, Vec<(String, String)>>,
         parent_ids: &[(String, String)],
     ) -> MusicAnswer {
-        // `AlbumInfo`: the album's ids, extended by each provider's answer.
-        let mut lookup = current.provider_ids.clone();
-        let mut temp = provider_result(&current.item);
+        // `AlbumInfo`: the album's ids, extended by each provider's answer
+        // (`RemoteFold::lookup`); `temp` starts from its `album.nfo`.
+        let preferred = preferred_language(&current.item, work.policy);
+        let (mut fold, mut temp) = self.music_fold_start(work, current, &preferred).await;
         let mut answered = false;
         let name = work
             .identified
@@ -1102,19 +1229,20 @@ impl LibraryScanner {
                     .next()
             });
         let mut audiodb_images = None;
-        for source in music_sources(work.policy, work.kind) {
+        let dynamic = self.music_dynamic_sources(work, fetch);
+        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {
                         continue;
                     };
-                    let release = valid_id(&lookup, "MusicBrainzAlbum")
+                    let release = valid_id(&fold.lookup, "MusicBrainzAlbum")
                         .or_else(|| first_song_id(children, child_ids, "MusicBrainzAlbum"));
-                    let group = valid_id(&lookup, "MusicBrainzReleaseGroup")
+                    let group = valid_id(&fold.lookup, "MusicBrainzReleaseGroup")
                         .or_else(|| first_song_id(children, child_ids, "MusicBrainzReleaseGroup"));
                     // `GetMusicBrainzArtistId`: the album's album-artist id,
                     // its artist's id, its tracks' album-artist id.
-                    let artist_id = valid_id(&lookup, "MusicBrainzAlbumArtist")
+                    let artist_id = valid_id(&fold.lookup, "MusicBrainzAlbumArtist")
                         .or_else(|| valid_id(parent_ids, "MusicBrainzArtist"))
                         .or_else(|| first_song_id(children, child_ids, "MusicBrainzAlbumArtist"));
                     let resolved = mb
@@ -1136,7 +1264,8 @@ impl LibraryScanner {
                         continue;
                     };
                     answered = true;
-                    let mut result = provider_result(&current.item);
+                    // MusicBrainz names no `ResultLanguage`.
+                    let mut result = RemoteAnswer::for_row(&current.item, None);
                     let item = &mut result.item;
                     item.premiere_date = details
                         .premiere_date
@@ -1154,11 +1283,11 @@ impl LibraryScanner {
                             result.provider_ids.push((key.to_owned(), id));
                         }
                     }
-                    take_answer(&mut temp, &mut lookup, &result);
+                    fold.take(&mut temp, result);
                 }
                 MusicSource::AudioDb => {
                     // `AudioDbAlbumProvider.GetMetadata`: `info.GetReleaseGroupId()`.
-                    let group = valid_id(&lookup, "MusicBrainzReleaseGroup")
+                    let group = valid_id(&fold.lookup, "MusicBrainzReleaseGroup")
                         .or_else(|| first_song_id(children, child_ids, "MusicBrainzReleaseGroup"));
                     let (true, Some(adb), Some(group)) = (
                         fetch.audiodb || fetch.audiodb_images,
@@ -1172,7 +1301,8 @@ impl LibraryScanner {
                         && let Some(album) = &album
                     {
                         answered = true;
-                        let mut result = provider_result(&current.item);
+                        let mut result =
+                            RemoteAnswer::for_row(&current.item, Some(AUDIODB_LANGUAGE));
                         let item = &mut result.item;
                         // `ProcessResult`: with `ReplaceAlbumName` (off by
                         // default) the album's name. ACCEPTED DIVERGENCE
@@ -1196,20 +1326,38 @@ impl LibraryScanner {
                         .into_iter()
                         .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
                         .collect();
-                        take_answer(&mut temp, &mut lookup, &result);
+                        fold.take(&mut temp, result);
                     }
                     audiodb_images = Some(album.map(|a| a.images).unwrap_or_default());
+                }
+                MusicSource::Dynamic(index) => {
+                    let Some(result) = self
+                        .ask_dynamic(
+                            index,
+                            &dynamic_lookup(work, &current.item, &name, &fold.lookup),
+                            &current.item,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    answered = true;
+                    fold.take(&mut temp, result);
                 }
             }
         }
         MusicAnswer {
-            temp: answered.then_some(temp),
+            temp: answered.then(|| MetadataResult {
+                provider_ids: fold.result.provider_ids,
+                ..MetadataResult::of(temp)
+            }),
             audiodb_images,
             artist_id: None,
         }
     }
 
-    /// `MusicBrainzArtistProvider` + `AudioDbArtistProvider`.
+    /// `MusicBrainzArtistProvider` + `AudioDbArtistProvider`, and the
+    /// plugins' metadata sources at their rank among them.
     ///
     /// The artist is looked up by its own `MusicBrainzArtist` id — a folder
     /// artist's else by the first valid `MusicBrainzAlbumArtist` id among
@@ -1234,9 +1382,10 @@ impl LibraryScanner {
         children: &[BaseItemEntity],
         child_ids: &HashMap<Uuid, Vec<(String, String)>>,
     ) -> MusicAnswer {
-        // `ArtistInfo`: the artist's ids, extended by each provider's answer.
-        let mut lookup = current.provider_ids.clone();
-        let mut temp = provider_result(&current.item);
+        // `ArtistInfo`: the artist's ids, extended by each provider's answer
+        // (`RemoteFold::lookup`); `temp` starts from its `artist.nfo`.
+        let preferred = preferred_language(&current.item, work.policy);
+        let (mut fold, mut temp) = self.music_fold_start(work, current, &preferred).await;
         let mut answered = false;
         let name = work
             .identified
@@ -1253,13 +1402,14 @@ impl LibraryScanner {
                 .or_else(|| first_song_id(songs, child_ids, "MusicBrainzAlbumArtist"))
         };
         let mut audiodb_images = None;
-        for source in music_sources(work.policy, work.kind) {
+        let dynamic = self.music_dynamic_sources(work, fetch);
+        for source in music_sources(work.policy, work.kind, work.identified, &dynamic) {
             match source {
                 MusicSource::MusicBrainz => {
                     let (true, Some(mb)) = (fetch.musicbrainz, &self.musicbrainz) else {
                         continue;
                     };
-                    let mut id = artist_id(&lookup);
+                    let mut id = artist_id(&fold.lookup);
                     let mut searched_name = None;
                     if id.is_none()
                         && !name.is_empty()
@@ -1277,7 +1427,8 @@ impl LibraryScanner {
                         continue;
                     };
                     answered = true;
-                    let mut result = provider_result(&current.item);
+                    // MusicBrainz names no `ResultLanguage`.
+                    let mut result = RemoteAnswer::for_row(&current.item, None);
                     let item = &mut result.item;
                     if mb.replace_artist_name().await {
                         item.name = details.name.or(searched_name);
@@ -1293,10 +1444,10 @@ impl LibraryScanner {
                     item.genres = joined(&details.genres);
                     item.tags = joined(&details.tags);
                     result.provider_ids = vec![("MusicBrainzArtist".to_owned(), id)];
-                    take_answer(&mut temp, &mut lookup, &result);
+                    fold.take(&mut temp, result);
                 }
                 MusicSource::AudioDb => {
-                    let id = artist_id(&lookup);
+                    let id = artist_id(&fold.lookup);
                     let (true, Some(adb), Some(id)) = (
                         fetch.audiodb || fetch.audiodb_images,
                         &self.audiodb,
@@ -1309,7 +1460,8 @@ impl LibraryScanner {
                         && let Some(artist) = &artist
                     {
                         answered = true;
-                        let mut result = provider_result(&current.item);
+                        let mut result =
+                            RemoteAnswer::for_row(&current.item, Some(AUDIODB_LANGUAGE));
                         let item = &mut result.item;
                         item.overview.clone_from(&artist.biography);
                         // `ProcessResult`: the genre and the sub-genre.
@@ -1327,16 +1479,34 @@ impl LibraryScanner {
                         .into_iter()
                         .filter_map(|(key, value)| Some((key.to_owned(), value.clone()?)))
                         .collect();
-                        take_answer(&mut temp, &mut lookup, &result);
+                        fold.take(&mut temp, result);
                     }
                     audiodb_images = Some(artist.map(|a| a.images).unwrap_or_default());
                 }
+                MusicSource::Dynamic(index) => {
+                    let Some(result) = self
+                        .ask_dynamic(
+                            index,
+                            &dynamic_lookup(work, &current.item, &name, &fold.lookup),
+                            &current.item,
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    answered = true;
+                    fold.take(&mut temp, result);
+                }
             }
         }
+        let artist_id = artist_id(&fold.lookup);
         MusicAnswer {
-            temp: answered.then_some(temp),
+            temp: answered.then(|| MetadataResult {
+                provider_ids: fold.result.provider_ids,
+                ..MetadataResult::of(temp)
+            }),
             audiodb_images,
-            artist_id: artist_id(&lookup),
+            artist_id,
         }
     }
 
@@ -1520,10 +1690,7 @@ impl LibraryScanner {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MetadataResult, MusicKind, heals_from_children, ids_from_songs, restore_from_children,
-        same_ids, take_answer,
-    };
+    use super::{MusicKind, heals_from_children, ids_from_songs, restore_from_children, same_ids};
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::entities::MetadataField;
     use std::collections::HashMap;
@@ -1628,29 +1795,161 @@ mod tests {
 
     /// `MetadataServiceRefreshTests.RefreshWithProviders_ForeignProviderId_
     /// ReplacedInLookupInfo`, over the scan's port of
-    /// `ExecuteRemoteProviders`' per-answer step ([`take_answer`], whose
-    /// lookup half is `MergeNewData`): the stored id cannot be a TMDB one, so
-    /// the provider that runs next is handed the id the one before it just
-    /// found instead of failing on the same bad one. A usable id already in
-    /// the lookup stays ("Don't replace existing Id's").
+    /// `ExecuteRemoteProviders`' per-answer step ([`RemoteFold::take`], whose
+    /// lookup half is `MergeNewData`), which music shares: the stored id
+    /// cannot be a TMDB one, so the provider that runs next is handed the id
+    /// the one before it just found instead of failing on the same bad one.
+    /// A usable id already in the lookup stays ("Don't replace existing
+    /// Id's").
+    ///
+    /// [`RemoteFold::take`]: super::RemoteFold::take
     #[test]
     fn refresh_with_providers_foreign_provider_id_replaced_in_lookup_info() {
-        let answering = MetadataResult {
-            provider_ids: pairs(&[("Tmdb", "12345")]),
-            ..MetadataResult::of(BaseItemEntity {
+        let answering = || super::RemoteAnswer {
+            item: BaseItemEntity {
                 name: Some("Test Movie".into()),
                 ..BaseItemEntity::default()
-            })
+            },
+            people: None,
+            provider_ids: pairs(&[("Tmdb", "12345")]),
+            language: None,
         };
-        let mut temp = MetadataResult::of(BaseItemEntity::default());
+        let mut temp = BaseItemEntity::default();
 
-        let mut lookup = pairs(&[("Tmdb", "nm0000123")]);
-        take_answer(&mut temp, &mut lookup, &answering);
+        let mut fold = super::RemoteFold::new(&pairs(&[("Tmdb", "nm0000123")]), "en");
+        fold.take(&mut temp, answering());
         // What the following provider reads: `info.GetProviderId(Tmdb)`.
-        assert_eq!(lookup, pairs(&[("Tmdb", "12345")]));
+        assert_eq!(fold.lookup, pairs(&[("Tmdb", "12345")]));
 
-        let mut usable = pairs(&[("Tmdb", "11")]);
-        take_answer(&mut temp, &mut usable, &answering);
-        assert_eq!(usable, pairs(&[("Tmdb", "11")]));
+        let mut fold = super::RemoteFold::new(&pairs(&[("Tmdb", "11")]), "en");
+        fold.take(&mut temp, answering());
+        assert_eq!(fold.lookup, pairs(&[("Tmdb", "11")]));
+    }
+
+    /// The music providers run by the saved `MetadataFetcherOrder`, then
+    /// `IHasOrder` (MusicBrainz 0, TheAudioDB 1); identifying moves the
+    /// chosen result's provider to the front whatever the saved order
+    /// ("When identifying, run the provider the user picked first",
+    /// `MetadataService.cs:876-882`).
+    #[test]
+    fn identify_runs_the_chosen_music_provider_first() {
+        use super::{FetcherPolicy, MusicSource, music_sources};
+        use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+        use ferrofin_model::providers::RemoteSearchResult;
+        use ferrofin_providers::library_options::fetcher_names::{AUDIODB, MUSICBRAINZ};
+        let saved = |order: [&str; 2]| LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicAlbum".to_owned()),
+                metadata_fetchers: order.iter().map(|n| (*n).to_owned()).collect(),
+                metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+                ..TypeOptions::default()
+            }],
+            ..LibraryOptions::default()
+        };
+        let chosen = |provider: &str| RemoteSearchResult {
+            search_provider_name: Some(provider.to_owned()),
+            ..RemoteSearchResult::default()
+        };
+        let audiodb_first = saved([AUDIODB, MUSICBRAINZ]);
+        let policy = FetcherPolicy {
+            options: Some(&audiodb_first),
+            global: None,
+        };
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, None, &[]),
+            [MusicSource::AudioDb, MusicSource::MusicBrainz]
+        );
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, Some(&chosen("musicbrainz")), &[]),
+            [MusicSource::MusicBrainz, MusicSource::AudioDb]
+        );
+        let musicbrainz_first = saved([MUSICBRAINZ, AUDIODB]);
+        let policy = FetcherPolicy {
+            options: Some(&musicbrainz_first),
+            global: None,
+        };
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, Some(&chosen(AUDIODB)), &[]),
+            [MusicSource::AudioDb, MusicSource::MusicBrainz]
+        );
+        assert_eq!(
+            music_sources(FetcherPolicy::default(), MusicKind::Artist, None, &[]),
+            [MusicSource::MusicBrainz, MusicSource::AudioDb],
+            "no saved order: MusicBrainz's IHasOrder 0 leads"
+        );
+    }
+
+    /// A plugin's (Tier-1b WASM) metadata source takes its place among the
+    /// music providers like any provider: its rank in the saved order, then
+    /// its `IHasOrder` (a WASM plugin's is upstream's 50, after MusicBrainz's
+    /// 0 and TheAudioDB's 1), then registration (plugins first, which only a
+    /// full tie reaches); one the fetcher lists do not name is never ranked.
+    #[test]
+    fn a_plugin_source_runs_at_its_rank_among_the_music_providers() {
+        use super::{FetcherPolicy, MusicSource, music_sources};
+        use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+        use ferrofin_providers::library_options::fetcher_names::{AUDIODB, MUSICBRAINZ};
+        let saved = |order: &[&str]| LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("MusicAlbum".to_owned()),
+                metadata_fetchers: order.iter().map(|n| (*n).to_owned()).collect(),
+                metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+                ..TypeOptions::default()
+            }],
+            ..LibraryOptions::default()
+        };
+        let named = [(0, Some("AlbumDb"), 50)];
+        let plugin_first = saved(&["AlbumDb", MUSICBRAINZ, AUDIODB]);
+        let policy = FetcherPolicy {
+            options: Some(&plugin_first),
+            global: None,
+        };
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, None, &named),
+            [
+                MusicSource::Dynamic(0),
+                MusicSource::MusicBrainz,
+                MusicSource::AudioDb
+            ]
+        );
+        let between = saved(&[MUSICBRAINZ, "albumdb", AUDIODB]);
+        let policy = FetcherPolicy {
+            options: Some(&between),
+            global: None,
+        };
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, None, &named),
+            [
+                MusicSource::MusicBrainz,
+                MusicSource::Dynamic(0),
+                MusicSource::AudioDb
+            ],
+            "the saved order names fetchers case-insensitively"
+        );
+        // No saved order: MusicBrainz (0) and TheAudioDB (1) declare an
+        // `IHasOrder` below the plugin's 50.
+        assert_eq!(
+            music_sources(FetcherPolicy::default(), MusicKind::Album, None, &named),
+            [
+                MusicSource::MusicBrainz,
+                MusicSource::AudioDb,
+                MusicSource::Dynamic(0)
+            ]
+        );
+        // A source that declares no `provider-info` has no name to rank.
+        let unnamed = [(0, None, 50)];
+        let names_it = saved(&["AlbumDb", MUSICBRAINZ, AUDIODB]);
+        let policy = FetcherPolicy {
+            options: Some(&names_it),
+            global: None,
+        };
+        assert_eq!(
+            music_sources(policy, MusicKind::Album, None, &unnamed),
+            [
+                MusicSource::MusicBrainz,
+                MusicSource::AudioDb,
+                MusicSource::Dynamic(0)
+            ]
+        );
     }
 }

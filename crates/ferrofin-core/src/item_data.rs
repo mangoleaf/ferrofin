@@ -682,6 +682,21 @@ pub(crate) async fn import_playlist_meta(
     Ok(())
 }
 
+/// Test-only: records `owner` as the owner of `playlist` in
+/// `FerrofinPlaylists`, keeping the raw SQL inside the persistence boundary.
+#[cfg(test)]
+pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
+           VALUES (?1, ?2, 0)"#,
+    )
+    .bind(guid_to_db(playlist))
+    .bind(guid_to_db(owner))
+    .execute(db.writer())
+    .await
+    .expect("seed playlist owner");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

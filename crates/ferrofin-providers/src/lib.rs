@@ -35,6 +35,7 @@ pub mod plugin_config;
 pub mod provider_manager;
 pub mod rate_limit;
 pub mod refresh_plan;
+pub mod season;
 pub mod similarity;
 pub mod studios;
 pub mod tmdb;
@@ -69,13 +70,12 @@ pub use similarity::{
 };
 pub use studios::StudiosClient;
 pub use tmdb::{
-    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbCollection,
-    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbPersonHit, TmdbSearchHit,
-    TmdbTrailer,
+    EpisodeDetails, RemoteImage, SeasonDetails, TmdbClient, TmdbCollection, TmdbCollectionHit,
+    TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbPersonHit, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
-    TvdbSeasonDetails, TvdbSeriesDetails,
+    TvdbSeasonDetails, TvdbSeriesDetails, TvdbTranslation,
 };
 
 pub use container_types::{
