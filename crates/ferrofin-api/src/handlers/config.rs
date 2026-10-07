@@ -7,10 +7,10 @@
 //! - `GET`/`POST /System/Configuration/{key}` — a *named* configuration.
 //!
 //! Named configurations are Jellyfin's pluggable per-key config store. `branding`
-//! has a dedicated typed store; every other key (`encoding`/`network`/`metadata`/
-//! `xbmcmetadata` and any plugin key) round-trips through a generic per-key store
-//! at `{config}/named/{key}.json`. Known sections bind through typed JsonDefaults
-//! converters before persistence; plugin-owned documents keep their raw shape.
+//! has a dedicated typed store; other keys use per-key files at
+//! `{config}/users/named/{key}.json`. Core sections bind through typed
+//! JsonDefaults converters before persistence and return typed documents on
+//! reads. Plugin-owned documents keep their raw shape.
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -166,14 +166,37 @@ async fn read_named_config(path: &std::path::Path) -> Option<Value> {
     }
 }
 
+/// Loads a core section through its configuration DTO. Older
+/// documents may omit members; deserialization supplies their defaults. Like
+/// `BaseConfigurationManager.LoadConfiguration`, an invalid stored document
+/// yields defaults and a diagnostic, without overwriting the damaged file.
+fn load_named_configuration<T: serde::de::DeserializeOwned + Default>(
+    key: &str,
+    saved: Option<Value>,
+) -> T {
+    let Some(saved) = saved else {
+        return T::default();
+    };
+    match serde_json::from_value(saved) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                configuration_key = key,
+                error = %error,
+                "saved named configuration could not be read; falling back to defaults"
+            );
+            T::default()
+        }
+    }
+}
+
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
 /// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
-/// dedicated typed store; every other key round-trips through the generic
-/// per-key store (`{config}/named/{key}.json`), falling back to a typed default
-/// object for the known core sections (`encoding`/`network`/`metadata`/
-/// `xbmcmetadata`) when nothing has been saved. An unknown, never-saved key is
-/// still `501`.
+/// dedicated typed store; other core keys load their DTO from the per-key
+/// store (`{config}/users/named/{key}.json`). Omitted members receive defaults,
+/// and invalid documents fall back with a warning. Plugin-owned keys retain
+/// their raw shape; an unknown, never-saved key is still `501`.
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -186,7 +209,10 @@ async fn get_named_configuration(
     _auth: RequireAuth,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    use ferrofin_model::configuration::{MetadataConfiguration, XbmcMetadataOptions};
+    use ferrofin_model::configuration::{
+        EncodingOptions, MetadataConfiguration, XbmcMetadataOptions,
+    };
+    use ferrofin_model::live_tv::LiveTvOptions;
     let to_value = |r: Result<Value, serde_json::Error>| {
         r.map_err(|e| {
             ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
@@ -199,18 +225,14 @@ async fn get_named_configuration(
             state.config.get_branding().await?,
         ))?));
     }
-    // A previously-saved value wins over the default object.
+    // Load once: retrying through a manager after a failed file read would
+    // turn the logged fallback into another parse error on the same file.
     let saved = match named_config_file(&state, &key) {
         Some(path) => read_named_config(&path).await,
         None => None,
     };
     if key.eq_ignore_ascii_case("encoding") {
-        let options = match saved {
-            Some(value) => {
-                serde_json::from_value(value).map_err(|error| configuration_error(&error))?
-            }
-            None => state.config.get_encoding_options().await?,
-        };
+        let options = load_named_configuration::<EncodingOptions>(&key, saved);
         return encoding_response(&options).map(Json);
     }
     // `livetv` merges the persisted scalars (recording paths, padding) with the
@@ -218,12 +240,8 @@ async fn get_named_configuration(
     // dashboard's Live TV page renders its tuner and guide-provider lists from
     // this config object, so they must reflect the manager's state.
     if key.eq_ignore_ascii_case("livetv") {
-        let mut value = match saved {
-            Some(v) => v,
-            None => to_value(serde_json::to_value(
-                ferrofin_model::live_tv::LiveTvOptions::default(),
-            ))?,
-        };
+        let options = load_named_configuration::<LiveTvOptions>(&key, saved);
+        let mut value = to_value(serde_json::to_value(options))?;
         if let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value) {
             // A backend failure must not read as "no tuners configured": the
             // rows still render empty (Jellyfin's corrupt-store fallback also
@@ -260,33 +278,19 @@ async fn get_named_configuration(
         }
         return Ok(Json(value));
     }
-    if let Some(value) = saved {
-        // A `network.json` written by an older Ferrofin spells four keys the
-        // way `PascalCase` derived them (`EnableIpv4`, `RemoteIpFilter`, …),
-        // not the way the contract does. Served verbatim, jellyfin-web would
-        // not recognise them: the network page would render an empty remote-IP
-        // filter, and the operator's next Save would write that emptiness back.
-        // Round-tripping through the typed struct — whose serde aliases read
-        // the old names — hands the page the contract's spelling instead.
-        if key.eq_ignore_ascii_case("network") {
-            match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(value.clone())
-            {
-                Ok(config) => return Ok(Json(to_value(serde_json::to_value(config))?)),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "the saved network configuration could not be read; serving it unchanged"
-                ),
-            }
-        }
-        return Ok(Json(value));
-    }
     let value = match key.to_ascii_lowercase().as_str() {
-        "network" => to_value(serde_json::to_value(
-            ferrofin_networking::NetworkConfiguration::default(),
-        ))?,
-        "metadata" => to_value(serde_json::to_value(MetadataConfiguration::default()))?,
-        "xbmcmetadata" => to_value(serde_json::to_value(XbmcMetadataOptions::default()))?,
-        _ => return Err(ApiError::NotImplemented),
+        // The DTO's aliases also read the old EnableIpv4/RemoteIpFilter names;
+        // serialization always returns the names understood by jellyfin-web.
+        "network" => to_value(serde_json::to_value(load_named_configuration::<
+            ferrofin_networking::NetworkConfiguration,
+        >(&key, saved)))?,
+        "metadata" => to_value(serde_json::to_value(load_named_configuration::<
+            MetadataConfiguration,
+        >(&key, saved)))?,
+        "xbmcmetadata" => to_value(serde_json::to_value(load_named_configuration::<
+            XbmcMetadataOptions,
+        >(&key, saved)))?,
+        _ => saved.ok_or(ApiError::NotImplemented)?,
     };
     Ok(Json(value))
 }

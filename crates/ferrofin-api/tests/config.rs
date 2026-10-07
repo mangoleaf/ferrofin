@@ -805,9 +805,10 @@ async fn a_saved_network_configuration_is_served_under_the_contract_names() {
 }
 
 #[tokio::test]
-async fn a_network_configuration_that_cannot_be_read_is_served_unchanged_and_warned() {
-    // Normalization must not become a way to lose a document: if it will not
-    // parse, hand the client exactly what is on disk and say so.
+async fn a_network_configuration_that_cannot_be_read_returns_defaults_without_overwriting() {
+    // Match BaseConfigurationManager.LoadConfiguration: a malformed stored
+    // section returns a typed default and a warning. Reading must not replace
+    // the original document, which the operator may still be able to repair.
     let dir = tempfile::tempdir().unwrap();
     write_named_config(
         dir.path(),
@@ -823,16 +824,133 @@ async fn a_network_configuration_that_cannot_be_read_is_served_unchanged_and_war
         with_captured_logs(get(state, "/System/Configuration/network")).await;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["InternalHttpPort"], serde_json::json!(8096));
     assert_eq!(
-        json(&body)["InternalHttpPort"],
-        serde_json::json!("not a port")
-    );
-    assert_eq!(
-        logs.warnings_matching("network configuration").len(),
+        logs.warnings_matching("named configuration").len(),
         1,
         "the unreadable configuration must be reported: {:?}",
         logs.0.lock().unwrap()
     );
+    assert_eq!(
+        std::fs::read(dir.path().join("named/network.json")).unwrap(),
+        br#"{"InternalHttpPort":"not a port"}"#
+    );
+}
+
+/// These partial documents predate typed named-config writes. The dashboard
+/// must see constructor defaults for omitted members, just as it does when
+/// Jellyfin loads a partial XML configuration. Unknown members are not typed
+/// settings and must not leak back into a core configuration response.
+#[tokio::test]
+async fn saved_core_configurations_return_typed_defaults() {
+    for (key, mut saved, default_field, default_value) in [
+        (
+            "metadata",
+            serde_json::json!({}),
+            "UseFileCreationTimeForDateAdded",
+            serde_json::json!(true),
+        ),
+        (
+            "xbmcmetadata",
+            serde_json::json!({"UserId":"user-1"}),
+            "SaveImagePathsInNfo",
+            serde_json::json!(true),
+        ),
+        (
+            "livetv",
+            serde_json::json!({"PrePaddingSeconds":120}),
+            "SaveRecordingNFO",
+            serde_json::json!(true),
+        ),
+        (
+            "network",
+            serde_json::json!({"EnableIpv4":false}),
+            "InternalHttpPort",
+            serde_json::json!(8096),
+        ),
+        (
+            "encoding",
+            serde_json::json!({"EncodingThreadCount":3}),
+            "DownMixAudioBoost",
+            serde_json::json!(2.0),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        saved["UnrecognizedSetting"] = serde_json::json!("old client value");
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        write_named_config(dir.path(), key, &bytes);
+        let app = state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        });
+        // The key is case-insensitive even though JSON members bind exactly.
+        let uri = format!("/System/Configuration/{}", key.to_ascii_uppercase());
+        let ((status, body), logs) = with_captured_logs(get(app, &uri)).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        let response = json(&body);
+        assert_eq!(response[default_field], default_value, "{key}");
+        assert!(response.get("UnrecognizedSetting").is_none(), "{key}");
+        for (field, value) in saved.as_object().unwrap() {
+            match field.as_str() {
+                "UnrecognizedSetting" => {}
+                "EnableIpv4" => assert_eq!(&response["EnableIPv4"], value),
+                _ => assert_eq!(&response[field], value),
+            }
+        }
+        assert!(logs.warnings_matching("named configuration").is_empty());
+        assert_eq!(
+            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
+            bytes,
+            "a GET must not rewrite the stored document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_core_configurations_return_defaults_and_report_the_section() {
+    for (key, field, default_value) in [
+        ("metadata", "UseFileCreationTimeForDateAdded", true),
+        ("xbmcmetadata", "SaveImagePathsInNfo", true),
+        ("livetv", "SaveRecordingNFO", true),
+        ("encoding", "EnableThrottling", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({field: "invalid boolean"})).unwrap();
+        write_named_config(dir.path(), key, &bytes);
+        let app = state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        });
+        let ((status, body), logs) =
+            with_captured_logs(get(app, &format!("/System/Configuration/{key}"))).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        assert_eq!(json(&body)[field], default_value, "{key}");
+        let warnings = logs.warnings_matching("named configuration");
+        assert_eq!(warnings.len(), 1, "{key}");
+        assert!(warnings[0].contains(key));
+        assert_eq!(
+            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn plugin_named_configuration_keeps_its_own_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    let uri = "/System/Configuration/plugin-owned";
+    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    assert_eq!(
+        post(app.clone(), uri, &document).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = get(app, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body), document);
 }
 
 /// A Live TV manager whose two configuration reads fail (backend down).
