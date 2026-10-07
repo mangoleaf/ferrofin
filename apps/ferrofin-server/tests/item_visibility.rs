@@ -660,3 +660,164 @@ async fn hidden_images_and_indirect_media_are_checked_before_cached_responses() 
         StatusCode::OK
     );
 }
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn deletion_checks_visibility_before_permission_and_stops_in_input_order() {
+    let f = fixture().await;
+    let id = &f.hidden;
+    for uri in [format!("/Items/{id}"), format!("/Items?ids={id}")] {
+        assert_eq!(
+            call(&f.router, "DELETE", &uri, Some(&f.viewer), None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{id}"),
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let items = items_by_path(&f.router, &f.admin).await;
+    let later = &items[&f
+        .h
+        .path("movies/Epsilon (2003)/Epsilon (2003).mkv")
+        .to_string_lossy()
+        .into_owned()];
+    let uri = format!("/Items?ids={},{id},{later}", f.allowed);
+    assert_eq!(
+        call(&f.router, "DELETE", &uri, Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{}", f.allowed),
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for retained in [id, later] {
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Items/{retained}"),
+                Some(&f.admin),
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    // Deletion in this baseline removes database rows only.
+    assert!(f.h.path("movies/Alpha (1999)/Alpha (1999).mkv").exists());
+    assert!(f.h.path("more/Gamma (2001)/Gamma (2001).mkv").exists());
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnableContentDeletion"] = json!(false);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(policy)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &format!("/Items/{later}"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &format!("/Items/{id}"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, playlist) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(&f.admin),
+        Some(json!({"Name":"Private", "Ids":[later], "IsPublic":false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{playlist}");
+    let playlist_id = playlist["Id"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{playlist_id}"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "DELETE",
+            &format!("/Items/{playlist_id}"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{playlist_id}"),
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}

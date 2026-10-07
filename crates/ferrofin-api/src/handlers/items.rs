@@ -625,21 +625,12 @@ async fn require_can_delete(
 /// waits on scanner parity, so only the item's rows go and its files stay on
 /// disk. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
 ///
-/// TODO(parity): upstream resolves the item as the user —
-/// `_libraryManager.GetItemById<BaseItem>(itemId, user)` (`LibraryController.cs:
-/// 380,425`), `null` (so `404`) for an item the user cannot see — and Ferrofin
-/// has no per-user by-id lookup yet, so a user allowed to delete in every
-/// library but kept out of some can delete there by id. The same gap covers
-/// playlists: a private playlist the caller cannot see is a `404` upstream
-/// (and was one through 1.3.x), but a `401` from the `CanDelete` check here.
-/// Un-defer path:
-/// `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md` (a `LibraryManager` by-id
-/// read that applies `IsVisibleStandalone`, used here and by every by-id
-/// route).
+/// Resolve visibility before CanDelete: a hidden item is indistinguishable
+/// from a missing one, even when the caller may delete from every library.
 async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
     let item = state
         .library
-        .get_item_by_id(id)
+        .get_item_by_id_for_user(id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
     require_can_delete(state, auth, &item).await?;
