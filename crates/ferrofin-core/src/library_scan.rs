@@ -28568,6 +28568,112 @@ mod tests {
         );
     }
 
+    /// Upstream `AudioResolverTests.Resolve_AudiobookDirectory_SingleResult`
+    /// and `_NoResult` against `FindAudioBook`'s port: whether a folder of
+    /// `children` is one audiobook — which is then not in a mixed folder
+    /// (`AudioResolver.cs:153`); without one each file is its own audiobook in
+    /// a mixed folder.
+    #[rstest::rstest]
+    #[case::single_untagged(&["words.mp3"], true)]
+    #[case::chapter(&["chapter 01.mp3"], true)]
+    #[case::part(&["part 1.mp3"], true)]
+    #[case::with_non_media(&["chapter 01.mp3", "non-media.txt"], true)]
+    #[case::with_epub(&["title.mp3", "title.epub"], true)]
+    #[case::with_subdirectory(&["01.mp3", "subdirectory/"], true)]
+    #[case::empty(&[], false)]
+    #[case::only_subdirectory(&["subdirectory/"], false)]
+    #[case::only_non_media(&["non-media.txt"], false)]
+    #[case::two_names(&["Name.mp3", "Another Name.mp3"], false)]
+    #[case::two_numbers(&["01.mp3", "02.mp3"], false)]
+    #[case::two_chapters(&["chapter 01.mp3", "chapter 02.mp3"], false)]
+    #[case::two_parts(&["part 1.mp3", "part 2.mp3"], false)]
+    #[case::chapter_parts(&["chapter 01 part 01.mp3", "chapter 01 part 02.mp3"], false)]
+    #[case::chapter_and_part(&["chapter 01.mp3", "part 2.mp3"], false)]
+    #[case::title_and_chapter(&["book title.mp3", "chapter name.mp3"], false)]
+    #[case::content_and_credits(&["01 Content.mp3", "01 Credits.mp3"], false)]
+    #[case::chapter_name_and_part(&["Chapter Name.mp3", "Part 1.mp3"], false)]
+    fn a_folder_is_one_audiobook_as_upstream_resolves_it(
+        #[case] children: &[&str],
+        #[case] single: bool,
+    ) {
+        use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
+        let parent = if single {
+            "/parent/title"
+        } else {
+            "/parent/book title"
+        };
+        let entries: Vec<FileSystemEntryInfo> = children
+            .iter()
+            .map(|child| {
+                let name = child.trim_end_matches('/');
+                FileSystemEntryInfo {
+                    name: name.to_owned(),
+                    path: format!("{parent}/{name}"),
+                    type_: if child.ends_with('/') {
+                        FileSystemEntryType::Directory
+                    } else {
+                        FileSystemEntryType::File
+                    },
+                }
+            })
+            .collect();
+        let naming = super::NamingOptions::new();
+        assert_eq!(
+            super::single_audio_book(&entries, &naming).is_some(),
+            single
+        );
+    }
+
+    /// The episode count behind `IsInMixedFolder` is `ResolveVideos`'s, not
+    /// the file count: an extra beside a lone episode counts (`VideoListResolver`
+    /// appends it), two versions of one episode are one item
+    /// (`MovieResolverTests.ResolveMultiple_GivenTvShowsCollection_CreatesEpisodeItems`:
+    /// three files, two items), and a folder nested in a season is its own
+    /// count.
+    #[tokio::test]
+    async fn an_episode_folder_counts_resolved_items_not_files() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let extra = media.join("Extra/Season 1");
+        touch(&extra, "Extra S01E01.mkv");
+        touch(&extra, "Extra S01E01-trailer.mkv");
+        let versions = media.join("Show/Season 1");
+        touch(&versions, "Show - S01E01 - 1080p.mkv");
+        touch(&versions, "Show - S01E01 - 720p.mkv");
+        let alone = media.join("Alone/Season 1");
+        touch(&alone, "Alone - S01E01 - 1080p.mkv");
+        touch(&alone, "Alone - S01E01 - 720p.mkv");
+        touch(&alone, "Alone - S01E02.mkv");
+        touch(&alone.join("Disc 2"), "Alone S01E03.mkv");
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+        let mixed: std::collections::BTreeMap<String, bool> =
+            scanned_by_kind(&db, BaseItemKind::Episode)
+                .await
+                .into_iter()
+                .map(|e| {
+                    (
+                        super::file_stem(e.path.as_deref().unwrap_or_default()),
+                        e.is_in_mixed_folder,
+                    )
+                })
+                .collect();
+        assert_eq!(mixed.get("Extra S01E01"), Some(&true), "the extra counts");
+        assert_eq!(
+            mixed.get("Show - S01E01 - 1080p"),
+            Some(&false),
+            "two versions are one item"
+        );
+        assert_eq!(mixed.get("Alone - S01E02"), Some(&true), "two items");
+        assert_eq!(
+            mixed.get("Alone S01E03"),
+            Some(&false),
+            "a nested folder counts on its own"
+        );
+    }
+
     // Audio in a books library resolves to `AudioBook`: a folder holding one
     // audio file IS that audiobook, while the shapes upstream refuses to stack
     // fall back to a row per file.

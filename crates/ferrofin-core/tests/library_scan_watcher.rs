@@ -1473,3 +1473,35 @@ async fn a_missing_episode_without_a_path_survives_every_scan() {
     assert_eq!(full.removed, 0, "{full:?}");
     assert_eq!(present().await, 1, "a library scan keeps it");
 }
+
+/// A second episode beside a lone one puts both in a mixed folder, and
+/// removing it takes the survivor out again: the watcher's scan, rooted at
+/// the season, saves the sibling's flipped `IsInMixedFolder`, as upstream's
+/// `UpdateFromResolvedItem` does (`BaseItem.cs:1749-1757`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sibling_follows_its_season_in_and_out_of_a_mixed_folder() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = tv(tmp.path()).await;
+    let season = fx.media.join("Other").join("Season 1");
+    let sibling = season.join("Other S01E01.mkv");
+    let mixed = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT "IsInMixedFolder" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(id(BaseItemKind::Episode, &sibling))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("row")
+    };
+    assert!(!mixed().await, "alone in its season");
+
+    touch(&season, "Other S01E02.mkv");
+    move_mtime(&season);
+    fx.report(&[&season.join("Other S01E02.mkv")]).await;
+    assert!(mixed().await, "beside a second episode");
+
+    std::fs::remove_file(season.join("Other S01E02.mkv")).expect("rm");
+    move_mtime(&season);
+    fx.report(&[&season.join("Other S01E02.mkv")]).await;
+    assert!(!mixed().await, "alone again");
+}
