@@ -588,6 +588,65 @@ mod tests {
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
     }
 
+    #[tokio::test]
+    #[allow(deprecated)] // Both dashboard API generations must report the same roots.
+    async fn dashboard_info_and_storage_follow_effective_directory_changes() {
+        let (mgr, _) = build().await;
+        let original = mgr.configuration_manager.configuration().await.unwrap();
+        let before = mgr.get_system_storage_info().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let metadata = root.path().join("metadata");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::create_dir(&metadata).unwrap();
+        let mut changed = (*original).clone();
+        changed.cache_path = Some(cache.to_string_lossy().into_owned());
+        changed.metadata_path = metadata.to_string_lossy().into_owned();
+        mgr.configuration_manager
+            .update_configuration(&changed)
+            .await
+            .unwrap();
+        let info = mgr
+            .get_system_info(&RequestContext::default())
+            .await
+            .unwrap();
+        let storage = mgr.get_system_storage_info().await.unwrap();
+        assert_eq!(
+            info.cache_path.as_deref(),
+            Some(storage.cache_folder.path.as_str())
+        );
+        assert_eq!(
+            info.internal_metadata_path.as_deref(),
+            Some(storage.internal_metadata_folder.path.as_str())
+        );
+        assert_eq!(storage.cache_folder.path, cache.to_string_lossy());
+        assert_eq!(
+            storage.image_cache_folder.path,
+            cache.join("images").to_string_lossy()
+        );
+        assert_eq!(
+            storage.internal_metadata_folder.path,
+            metadata.to_string_lossy()
+        );
+        assert_eq!(
+            storage.transcoding_temp_folder.path,
+            cache.join("transcodes").to_string_lossy()
+        );
+        mgr.configuration_manager
+            .update_configuration(&original)
+            .await
+            .unwrap();
+        let cleared = mgr.get_system_storage_info().await.unwrap();
+        assert_eq!(
+            cleared.cache_folder.path, storage.cache_folder.path,
+            "cache reset needs restart"
+        );
+        assert_eq!(
+            cleared.internal_metadata_folder.path,
+            before.internal_metadata_folder.path
+        );
+    }
+
     // The real filesystem probe reports the live free/used bytes of the disk the
     // path is on — a booted server no longer shows every folder as 0 bytes.
     #[cfg(unix)]
