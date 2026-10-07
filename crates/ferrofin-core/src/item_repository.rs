@@ -1725,21 +1725,7 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 /// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
 /// [`ImageType::Primary`] (the C# default when parsing a legacy row).
 pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
-    match disc {
-        1 => ImageType::Art,
-        2 => ImageType::Backdrop,
-        3 => ImageType::Banner,
-        4 => ImageType::Logo,
-        5 => ImageType::Thumb,
-        6 => ImageType::Disc,
-        7 => ImageType::Box,
-        8 => ImageType::Screenshot,
-        9 => ImageType::Menu,
-        10 => ImageType::Chapter,
-        11 => ImageType::BoxRear,
-        12 => ImageType::Profile,
-        _ => ImageType::Primary,
-    }
+    ImageType::from_json_value(disc)
 }
 
 /// Maps a wire [`ImageType`] back to its `BaseItemImageInfos.ImageType` integer
@@ -1747,21 +1733,7 @@ pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
 ///
 /// The discriminants line up 1:1 with the C# `ImageType` declaration order.
 pub(crate) fn image_type_to_disc(image_type: ImageType) -> i32 {
-    match image_type {
-        ImageType::Primary => 0,
-        ImageType::Art => 1,
-        ImageType::Backdrop => 2,
-        ImageType::Banner => 3,
-        ImageType::Logo => 4,
-        ImageType::Thumb => 5,
-        ImageType::Disc => 6,
-        ImageType::Box => 7,
-        ImageType::Screenshot => 8,
-        ImageType::Menu => 9,
-        ImageType::Chapter => 10,
-        ImageType::BoxRear => 11,
-        ImageType::Profile => 12,
-    }
+    image_type.json_value()
 }
 
 /// Projects a persisted [`BaseItemImageInfoEntity`] row into an
@@ -5176,7 +5148,7 @@ mod tests {
             )
             .bind(guid_to_db(id))
             .bind(guid_to_db(owner))
-            .bind(extra as i32)
+            .bind(extra.json_value())
             .execute(db.writer())
             .await
             .expect("set extra");

@@ -22,8 +22,9 @@ use crate::dto::{BaseItemPerson, MediaSourceInfo};
 use crate::entities_media::{ChapterInfo, MediaStream};
 
 /// Enum `MediaProtocol` — how a media source is delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaProtocol {
     /// Local file.
     #[default]
@@ -40,11 +41,27 @@ pub enum MediaProtocol {
     Rtp = 5,
     /// FTP.
     Ftp = 6,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaProtocol, None, {
+        File => ("File", 0),
+        Http => ("Http", 1),
+        Rtmp => ("Rtmp", 2),
+        Rtsp => ("Rtsp", 3),
+        Udp => ("Udp", 4),
+        Rtp => ("Rtp", 5),
+        Ftp => ("Ftp", 6),
+    }
 }
 
 /// The type of timestamps used in a transport stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TransportStreamTimestamp {
     /// The stream contains no timestamps.
     None,
@@ -52,6 +69,17 @@ pub enum TransportStreamTimestamp {
     Zero,
     /// The stream contains valid timestamps.
     Valid,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TransportStreamTimestamp, None, {
+        None => ("None", 0),
+        Zero => ("Zero", 1),
+        Valid => ("Valid", 2),
+    }
 }
 
 /// Subtitle format string constants (C# `SubtitleFormat` static class).

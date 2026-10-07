@@ -953,6 +953,17 @@ impl FerrofinTaskManager {
         key: &str,
         triggers: &[TaskTriggerInfo],
     ) -> Result<(), ServiceError> {
+        // C# GetTrigger throws for unnamed trigger types; a weekly trigger
+        // with an impossible weekday also fails while computing its next date.
+        if triggers.iter().any(|trigger| {
+            matches!(trigger.type_, TaskTriggerInfoType::Unrecognized(_))
+                || (trigger.type_ == TaskTriggerInfoType::WeeklyTrigger
+                    && matches!(trigger.day_of_week, Some(DayOfWeek::Unrecognized(_))))
+        }) {
+            return Err(ServiceError::backend(
+                "unrecognized task trigger type or weekday",
+            ));
+        }
         {
             let mut guard = lock(&self.tasks);
             let reg = guard
@@ -1075,8 +1086,8 @@ fn ticks_to_chrono(ticks: i64) -> chrono::Duration {
 }
 
 /// Maps the wire [`DayOfWeek`] onto chrono's weekday.
-fn weekday_of(day: DayOfWeek) -> chrono::Weekday {
-    match day {
+fn weekday_of(day: DayOfWeek) -> Option<chrono::Weekday> {
+    Some(match day {
         DayOfWeek::Sunday => chrono::Weekday::Sun,
         DayOfWeek::Monday => chrono::Weekday::Mon,
         DayOfWeek::Tuesday => chrono::Weekday::Tue,
@@ -1084,7 +1095,8 @@ fn weekday_of(day: DayOfWeek) -> chrono::Weekday {
         DayOfWeek::Thursday => chrono::Weekday::Thu,
         DayOfWeek::Friday => chrono::Weekday::Fri,
         DayOfWeek::Saturday => chrono::Weekday::Sat,
-    }
+        DayOfWeek::Unrecognized(_) => return None,
+    })
 }
 
 /// Whether `trigger` is due at `now`.
@@ -1116,7 +1128,7 @@ fn trigger_due(
     triggers_since: Option<DateTime<Utc>>,
 ) -> bool {
     match trigger.type_ {
-        TaskTriggerInfoType::StartupTrigger => false,
+        TaskTriggerInfoType::StartupTrigger | TaskTriggerInfoType::Unrecognized(_) => false,
         TaskTriggerInfoType::IntervalTrigger => {
             let Some(interval) = trigger.interval_ticks.filter(|t| *t > 0) else {
                 return false;
@@ -1168,7 +1180,7 @@ fn trigger_due(
                 let Some(day) = trigger.day_of_week else {
                     return false;
                 };
-                if local_now.weekday() != weekday_of(day) {
+                if Some(local_now.weekday()) != weekday_of(day) {
                     return false;
                 }
             }
@@ -1951,6 +1963,26 @@ mod tests {
         let info = mgr2.get("counting").expect("info");
         assert_eq!(info.triggers.len(), 1);
         assert_eq!(info.triggers[0].interval_ticks, Some(42));
+
+        // Invalid unnamed enums are bound successfully, then rejected before
+        // replacing the working schedule or writing its persisted copy.
+        for trigger in [
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::Unrecognized(99),
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::WeeklyTrigger,
+                day_of_week: Some(DayOfWeek::Unrecognized(99)),
+                ..TaskTriggerInfo::default()
+            },
+        ] {
+            assert!(mgr2.set_triggers("counting", &[trigger]).is_err());
+            assert_eq!(
+                mgr2.get("counting").expect("info").triggers[0].interval_ticks,
+                Some(42)
+            );
+        }
 
         // A missing task is NotFound.
         assert!(matches!(

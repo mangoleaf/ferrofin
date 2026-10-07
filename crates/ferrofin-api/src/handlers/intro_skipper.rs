@@ -91,7 +91,7 @@ fn segment_type_mode_name(type_: MediaSegmentType) -> Option<&'static str> {
         MediaSegmentType::Preview => Some("Preview"),
         MediaSegmentType::Recap => Some("Recap"),
         MediaSegmentType::Commercial => Some("Commercial"),
-        MediaSegmentType::Unknown => None,
+        MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => None,
     }
 }
 
@@ -277,7 +277,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
             MediaSegmentType::Recap => ts.recap = Some(seg),
             MediaSegmentType::Preview => ts.preview = Some(seg),
             MediaSegmentType::Commercial => ts.commercial = Some(seg),
-            MediaSegmentType::Unknown => {}
+            MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => {}
         }
     }
     Ok(ts)

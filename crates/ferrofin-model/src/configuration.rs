@@ -20,19 +20,31 @@ use crate::system::CastReceiverApplication;
 use crate::updates::RepositoryInfo;
 
 /// The convention used for naming saved images.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ImageSavingConvention {
     /// The legacy naming convention.
     #[default]
     Legacy,
     /// A convention compatible with other media servers and metadata managers.
     Compatible,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ImageSavingConvention, None, {
+        Legacy => ("Legacy", 0),
+        Compatible => ("Compatible", 1),
+    }
 }
 
 /// Options for seeking the input audio stream when transcoding HLS segments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum HlsAudioSeekStrategy {
     /// Trim copied audio packets before the seek point.
     #[default]
@@ -40,23 +52,45 @@ pub enum HlsAudioSeekStrategy {
     /// Prevent audio streams from being copied if the video stream is
     /// transcoded.
     TranscodeAudio = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    HlsAudioSeekStrategy, None, {
+        TrimCopiedAudio => ("TrimCopiedAudio", 0),
+        TranscodeAudio => ("TranscodeAudio", 1),
+    }
 }
 
 /// The behavior used by the trickplay provider on library scan/update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TrickplayScanBehavior {
     /// Start generation, only return once complete.
     Blocking,
     /// Start generation, return immediately.
     #[default]
     NonBlocking,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TrickplayScanBehavior, None, {
+        Blocking => ("Blocking", 0),
+        NonBlocking => ("NonBlocking", 1),
+    }
 }
 
 /// The process priority for a spawned ffmpeg process (mirrors
 /// `System.Diagnostics.ProcessPriorityClass`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProcessPriorityClass {
     /// Normal priority.
     Normal,
@@ -71,6 +105,20 @@ pub enum ProcessPriorityClass {
     BelowNormal,
     /// Above-normal priority.
     AboveNormal,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProcessPriorityClass, None, {
+        Normal => ("Normal", 32),
+        Idle => ("Idle", 64),
+        High => ("High", 128),
+        RealTime => ("RealTime", 256),
+        BelowNormal => ("BelowNormal", 16384),
+        AboveNormal => ("AboveNormal", 32768),
+    }
 }
 
 /// The type of a metadata plugin.
@@ -105,8 +153,9 @@ pub enum MetadataPluginType {
 }
 
 /// Options for disabling embedded subtitles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum EmbeddedSubtitleOptions {
     /// Allow all embedded subs.
     #[default]
@@ -117,6 +166,18 @@ pub enum EmbeddedSubtitleOptions {
     AllowImage = 2,
     /// Disable all embedded subs.
     AllowNone = 3,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    EmbeddedSubtitleOptions, None, {
+        AllowAll => ("AllowAll", 0),
+        AllowText => ("AllowText", 1),
+        AllowImage => ("AllowImage", 2),
+        AllowNone => ("AllowNone", 3),
+    }
 }
 
 /// The subtitle playback mode (mirrors
@@ -124,8 +185,9 @@ pub enum EmbeddedSubtitleOptions {
 ///
 /// Forward reference: referenced by [`UserConfiguration`] and defined here as it
 /// has no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SubtitlePlaybackMode {
     /// The default mode.
     #[default]
@@ -138,6 +200,19 @@ pub enum SubtitlePlaybackMode {
     None,
     /// Smart subtitle display.
     Smart,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SubtitlePlaybackMode, None, {
+        Default => ("Default", 0),
+        Always => ("Always", 1),
+        OnlyForced => ("OnlyForced", 2),
+        None => ("None", 3),
+        Smart => ("Smart", 4),
+    }
 }
 
 /// A single image download option for a metadata type.

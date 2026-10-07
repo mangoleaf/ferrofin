@@ -23,18 +23,30 @@ use crate::querying::ItemFields;
 use crate::secret::Secret;
 
 /// The type of a live TV channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum ChannelType {
     /// The TV.
     #[serde(rename = "TV")]
     Tv,
     /// The radio.
     Radio,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ChannelType, None, {
+        Tv => ("TV", 0),
+        Radio => ("Radio", 1),
+    }
 }
 
 /// The audio format of a live TV program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProgramAudio {
     /// Mono audio.
     Mono,
@@ -48,11 +60,26 @@ pub enum ProgramAudio {
     Thx,
     /// Dolby Atmos audio.
     Atmos,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProgramAudio, None, {
+        Mono => ("Mono", 0),
+        Stereo => ("Stereo", 1),
+        Dolby => ("Dolby", 2),
+        DolbyDigital => ("DolbyDigital", 3),
+        Thx => ("Thx", 4),
+        Atmos => ("Atmos", 5),
+    }
 }
 
 /// The day pattern of a recurring timer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DayPattern {
     /// Every day.
     #[default]
@@ -61,11 +88,23 @@ pub enum DayPattern {
     Weekdays,
     /// Saturday and Sunday.
     Weekends,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DayPattern, None, {
+        Daily => ("Daily", 0),
+        Weekdays => ("Weekdays", 1),
+        Weekends => ("Weekends", 2),
+    }
 }
 
 /// The status of a recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum RecordingStatus {
     /// A new recording.
     #[default]
@@ -82,6 +121,21 @@ pub enum RecordingStatus {
     ConflictedNotOk,
     /// The recording errored.
     Error,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    RecordingStatus, None, {
+        New => ("New", 0),
+        InProgress => ("InProgress", 1),
+        Completed => ("Completed", 2),
+        Cancelled => ("Cancelled", 3),
+        ConflictedOk => ("ConflictedOk", 4),
+        ConflictedNotOk => ("ConflictedNotOk", 5),
+        Error => ("Error", 6),
+    }
 }
 
 /// The status of a live TV service.
@@ -96,8 +150,9 @@ pub enum LiveTvServiceStatus {
 }
 
 /// How long a recording should be kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum KeepUntil {
     /// Keep until deleted.
     #[default]
@@ -108,15 +163,28 @@ pub enum KeepUntil {
     UntilWatched,
     /// Keep until a date.
     UntilDate,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    KeepUntil, None, {
+        UntilDeleted => ("UntilDeleted", 0),
+        UntilSpaceNeeded => ("UntilSpaceNeeded", 1),
+        UntilWatched => ("UntilWatched", 2),
+        UntilDate => ("UntilDate", 3),
+    }
 }
 
 /// The sort field for items (mirrors `Jellyfin.Data.Enums.ItemSortBy`).
 ///
 /// Forward reference: defined here because [`LiveTvChannelQuery`] uses it and it
 /// has no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 #[allow(missing_docs)]
+#[repr(i32)]
 pub enum ItemSortBy {
     /// The default sort order.
     #[default]
@@ -151,6 +219,44 @@ pub enum ItemSortBy {
     SeriesDatePlayed,
     ParentIndexNumber,
     IndexNumber,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ItemSortBy, None, {
+        Default => ("Default", 0),
+        AiredEpisodeOrder => ("AiredEpisodeOrder", 1),
+        Album => ("Album", 2),
+        AlbumArtist => ("AlbumArtist", 3),
+        Artist => ("Artist", 4),
+        DateCreated => ("DateCreated", 5),
+        OfficialRating => ("OfficialRating", 6),
+        DatePlayed => ("DatePlayed", 7),
+        PremiereDate => ("PremiereDate", 8),
+        StartDate => ("StartDate", 9),
+        SortName => ("SortName", 10),
+        Name => ("Name", 11),
+        Random => ("Random", 12),
+        Runtime => ("Runtime", 13),
+        CommunityRating => ("CommunityRating", 14),
+        ProductionYear => ("ProductionYear", 15),
+        PlayCount => ("PlayCount", 16),
+        CriticRating => ("CriticRating", 17),
+        IsFolder => ("IsFolder", 18),
+        IsUnplayed => ("IsUnplayed", 19),
+        IsPlayed => ("IsPlayed", 20),
+        SeriesSortName => ("SeriesSortName", 21),
+        VideoBitRate => ("VideoBitRate", 22),
+        AirTime => ("AirTime", 23),
+        Studio => ("Studio", 24),
+        IsFavoriteOrLiked => ("IsFavoriteOrLiked", 25),
+        DateLastContentAdded => ("DateLastContentAdded", 26),
+        SeriesDatePlayed => ("SeriesDatePlayed", 27),
+        ParentIndexNumber => ("ParentIndexNumber", 28),
+        IndexNumber => ("IndexNumber", 29),
+    }
 }
 
 /// Guide date range info.

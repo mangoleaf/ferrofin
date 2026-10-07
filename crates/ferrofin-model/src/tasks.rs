@@ -41,8 +41,9 @@ pub enum TaskCompletionStatus {
 }
 
 /// The type of a task trigger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TaskTriggerInfoType {
     /// A daily trigger.
     #[default]
@@ -53,6 +54,18 @@ pub enum TaskTriggerInfoType {
     IntervalTrigger,
     /// A startup trigger.
     StartupTrigger,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TaskTriggerInfoType, None, {
+        DailyTrigger => ("DailyTrigger", 0),
+        WeeklyTrigger => ("WeeklyTrigger", 1),
+        IntervalTrigger => ("IntervalTrigger", 2),
+        StartupTrigger => ("StartupTrigger", 3),
+    }
 }
 
 /// Options for tasks.

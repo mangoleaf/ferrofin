@@ -1465,7 +1465,9 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
     }
 
     let range_name = video_range_type_name(range);
-    let directly_supported = requested.iter().any(|r| r.eq_ignore_ascii_case(range_name));
+    let directly_supported = requested
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&range_name));
 
     // Copying a Dolby Vision stream to a client that only supports the fallback
     // range (e.g. a browser that lists HDR10 but not DOVI) requires stripping the
@@ -1481,22 +1483,8 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
 
 /// The PascalCase wire name of a video range type. Port of
 /// `VideoRangeType.ToString()`.
-fn video_range_type_name(range: VideoRangeType) -> &'static str {
-    match range {
-        VideoRangeType::Unknown => "Unknown",
-        VideoRangeType::Sdr => "SDR",
-        VideoRangeType::Hdr10 => "HDR10",
-        VideoRangeType::Hlg => "HLG",
-        VideoRangeType::Dovi => "DOVI",
-        VideoRangeType::DoviWithHdr10 => "DOVIWithHDR10",
-        VideoRangeType::DoviWithHlg => "DOVIWithHLG",
-        VideoRangeType::DoviWithSdr => "DOVIWithSDR",
-        VideoRangeType::DoviWithEl => "DOVIWithEL",
-        VideoRangeType::DoviWithHdr10Plus => "DOVIWithHDR10Plus",
-        VideoRangeType::DoviWithElhdr10Plus => "DOVIWithELHDR10Plus",
-        VideoRangeType::DoviInvalid => "DOVIInvalid",
-        VideoRangeType::Hdr10Plus => "HDR10Plus",
-    }
+fn video_range_type_name(range_type: VideoRangeType) -> String {
+    range_type.json_name().into_owned()
 }
 
 /// The codec/parameter incompatibilities that prevent an audio copy. Port of

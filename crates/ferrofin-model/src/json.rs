@@ -17,6 +17,7 @@
 //!   fraction digits are written, otherwise trailing zeros are trimmed (that is
 //!   `Utf8JsonWriter.WriteStringValue(DateTime)`).
 
+pub mod enums;
 pub mod number;
 
 /// `JsonGuidConverter` — `Uuid` fields.

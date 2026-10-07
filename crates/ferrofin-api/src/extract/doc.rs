@@ -780,4 +780,32 @@ mod tests {
         assert!(bind::<Vec<String>>("[{}]").is_err());
         assert!(bind::<Vec<String>>("[[]]").is_err());
     }
+    #[test]
+    fn numeric_enums_keep_their_value_and_integer_lexical_rules() {
+        use ferrofin_model::configuration::SubtitlePlaybackMode as Mode;
+        use ferrofin_model::data::MediaStreamProtocol;
+        for input in ["3", r#""3""#, r#"" 3 ""#, r#""onlyforced,Always""#] {
+            assert_eq!(bind::<Mode>(input).unwrap(), Mode::None);
+        }
+        assert_eq!(bind::<Mode>("-0").unwrap(), Mode::Default);
+        assert_eq!(bind::<Mode>("999").unwrap(), Mode::Unrecognized(999));
+        assert_eq!(bind::<Mode>(r#""-1""#).unwrap(), Mode::Unrecognized(-1));
+        for bad in [
+            "3.0",
+            "3e0",
+            "-0.0",
+            "true",
+            "null",
+            r#""""#,
+            r#""no-such-mode""#,
+        ] {
+            assert!(bind::<Mode>(bad).is_err(), "{bad}");
+        }
+        for default in ["null", r#""""#] {
+            assert_eq!(
+                bind::<MediaStreamProtocol>(default).unwrap(),
+                MediaStreamProtocol::http
+            );
+        }
+    }
 }

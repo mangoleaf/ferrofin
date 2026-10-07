@@ -23,8 +23,9 @@ use crate::media_info::audio_codec;
 ///
 /// Upstream this lives in `Jellyfin.Data.Enums`, but it is pulled in here
 /// because [`MediaStream`] derives it from the codec profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum AudioSpatialFormat {
     /// None audio spatial format.
     #[default]
@@ -34,6 +35,17 @@ pub enum AudioSpatialFormat {
     /// DTS:X audio spatial format.
     #[serde(rename = "DTSX")]
     Dtsx,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    AudioSpatialFormat, None, {
+        None => ("None", 0),
+        DolbyAtmos => ("DolbyAtmos", 1),
+        Dtsx => ("DTSX", 2),
+    }
 }
 
 /// Enum `MetadataProvider` — well-known external metadata sources.
@@ -1016,12 +1028,8 @@ fn it(interlaced: bool, base: &str) -> String {
 }
 
 /// The `ToString()` of a [`VideoRange`], matching the C# enum member names.
-fn video_range_to_string(range: VideoRange) -> &'static str {
-    match range {
-        VideoRange::Unknown => "Unknown",
-        VideoRange::Sdr => "SDR",
-        VideoRange::Hdr => "HDR",
-    }
+fn video_range_to_string(range: VideoRange) -> String {
+    range.json_name().into_owned()
 }
 
 /// Joins `attributes` with `separator`; if a `title` is present, appends only

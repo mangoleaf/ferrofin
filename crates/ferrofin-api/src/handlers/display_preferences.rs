@@ -74,40 +74,24 @@ fn resolve_item_id(raw: &str) -> Uuid {
     Uuid::parse_str(raw).unwrap_or_else(|_| get_md5(raw))
 }
 
-/// Maps a stored `ScrollDirection` discriminant to the DTO enum
-/// (`0` → Horizontal, else Vertical).
+/// Reads a C# enum without discarding unnamed integer values.
 fn scroll_direction_from_i32(value: i32) -> ScrollDirection {
-    if value == 1 {
-        ScrollDirection::Vertical
-    } else {
-        ScrollDirection::Horizontal
-    }
+    ScrollDirection::from_json_value(value)
 }
 
-/// Maps a DTO `ScrollDirection` to its stored discriminant.
+/// The exact C# enum value to persist.
 fn scroll_direction_to_i32(dir: ScrollDirection) -> i32 {
-    match dir {
-        ScrollDirection::Horizontal => 0,
-        ScrollDirection::Vertical => 1,
-    }
+    dir.json_value()
 }
 
-/// Maps a stored `SortOrder` discriminant to the DTO enum
-/// (`0` → Ascending, else Descending).
+/// Reads a C# enum without discarding unnamed integer values.
 fn sort_order_from_i32(value: i32) -> SortOrder {
-    if value == 1 {
-        SortOrder::Descending
-    } else {
-        SortOrder::Ascending
-    }
+    SortOrder::from_json_value(value)
 }
 
-/// Maps a DTO `SortOrder` to its stored discriminant.
+/// The exact C# enum value to persist.
 fn sort_order_to_i32(order: SortOrder) -> i32 {
-    match order {
-        SortOrder::Ascending => 0,
-        SortOrder::Descending => 1,
-    }
+    order.json_value()
 }
 
 /// The `IndexingKind` display name for a stored discriminant (C# `IndexBy?.ToString()`).

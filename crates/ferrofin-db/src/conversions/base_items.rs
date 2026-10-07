@@ -65,11 +65,10 @@ impl TryFrom<BaseItemImageInfoEntity> for ImageInfo {
     /// [`i64`]; real image dimensions never overflow `i32`).
     ///
     /// # Errors
-    /// Returns [`DbError::InvalidEnumValue`] if the stored `ImageType`
-    /// discriminant is out of range.
+    /// This conversion is infallible; unnamed image types retain their integer.
     fn try_from(entity: BaseItemImageInfoEntity) -> Result<Self, Self::Error> {
         Ok(Self {
-            image_type: image_type_from_i32(entity.image_type)?,
+            image_type: ImageType::from_json_value(entity.image_type),
             image_index: None,
             image_tag: None,
             path: Some(entity.path),
@@ -117,34 +116,4 @@ fn person_kind_from_str(value: &str) -> PersonKind {
         "Narrator" => PersonKind::Narrator,
         _ => PersonKind::Unknown,
     }
-}
-
-/// Reads an [`ImageType`] from its stored `INTEGER` discriminant (0-based,
-/// matching the C# `ImageType` declaration order mirrored by the target enum).
-///
-/// # Errors
-/// Returns [`DbError::InvalidEnumValue`] for a discriminant outside `0..=12`.
-fn image_type_from_i32(value: i32) -> Result<ImageType, DbError> {
-    let kind = match value {
-        0 => ImageType::Primary,
-        1 => ImageType::Art,
-        2 => ImageType::Backdrop,
-        3 => ImageType::Banner,
-        4 => ImageType::Logo,
-        5 => ImageType::Thumb,
-        6 => ImageType::Disc,
-        7 => ImageType::Box,
-        8 => ImageType::Screenshot,
-        9 => ImageType::Menu,
-        10 => ImageType::Chapter,
-        11 => ImageType::BoxRear,
-        12 => ImageType::Profile,
-        other => {
-            return Err(DbError::InvalidEnumValue {
-                enum_name: "ImageType",
-                value: other,
-            });
-        }
-    };
-    Ok(kind)
 }

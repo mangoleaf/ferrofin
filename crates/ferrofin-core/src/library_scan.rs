@@ -9574,7 +9574,7 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some(media_type.to_owned());
-        entity.extra_type = Some(extra_type as i32);
+        entity.extra_type = Some(extra_type.json_value());
         entity.owner_id = Some(guid_to_db(owner));
         // BaseItem.RefreshExtras clears the physical parent. An extra's
         // library is reached through its owner, not GetTopParent's parent
@@ -9671,7 +9671,7 @@ impl LibraryScanner {
                 _ => false,
             });
             if named_after_owner {
-                let count = counts.entry(extra_type as i32).or_insert(0);
+                let count = counts.entry(extra_type.json_value()).or_insert(0);
                 *count += 1;
                 name = self.extra_type_name(extra_type, *count);
             }
@@ -9689,21 +9689,7 @@ impl LibraryScanner {
     }
 
     fn extra_type_name(&self, extra: ferrofin_model::entities::ExtraType, count: i32) -> String {
-        use ferrofin_model::entities::ExtraType;
-        let key = match extra {
-            ExtraType::Clip => "NameExtraClip",
-            ExtraType::Trailer => "NameExtraTrailer",
-            ExtraType::BehindTheScenes => "NameExtraBehindTheScenes",
-            ExtraType::DeletedScene => "NameExtraDeletedScene",
-            ExtraType::Interview => "NameExtraInterview",
-            ExtraType::Scene => "NameExtraScene",
-            ExtraType::Sample => "NameExtraSample",
-            ExtraType::ThemeSong => "NameExtraThemeSong",
-            ExtraType::ThemeVideo => "NameExtraThemeVideo",
-            ExtraType::Featurette => "NameExtraFeaturette",
-            ExtraType::Short => "NameExtraShort",
-            ExtraType::Unknown => "NameExtraUnknown",
-        };
+        let key = format!("NameExtra{}", extra.json_name());
         let fallback;
         let localization = if let Some(localization) = &self.localization {
             localization.as_ref()
@@ -9711,7 +9697,7 @@ impl LibraryScanner {
             fallback = crate::localization_manager::LocalizationManager::new("");
             &fallback
         };
-        let name = localization.get_localized_string(key);
+        let name = localization.get_localized_string(&key);
         if count == 1 {
             name
         } else {
@@ -11549,13 +11535,8 @@ fn file_video_type(path: &str) -> VideoType {
 /// blob — where Jellyfin keeps them, and what the `videoTypes` browse filter
 /// matches on. `IsoType` follows upstream's path-substring heuristic.
 fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
-    let name = match video_type {
-        VideoType::VideoFile => "VideoFile",
-        VideoType::Iso => "Iso",
-        VideoType::Dvd => "Dvd",
-        VideoType::BluRay => "BluRay",
-    };
-    if let Some(data) = crate::item_data::set_data_field(entity.data.as_deref(), "VideoType", name)
+    let name = video_type.json_name();
+    if let Some(data) = crate::item_data::set_data_field(entity.data.as_deref(), "VideoType", &name)
     {
         entity.data = Some(data);
     }
@@ -26416,7 +26397,7 @@ mod tests {
         assert_eq!(audio[0].media_type.as_deref(), Some("Audio"));
         assert_eq!(
             audio[0].extra_type,
-            Some(ferrofin_model::entities::ExtraType::ThemeSong as i32)
+            Some(ferrofin_model::entities::ExtraType::ThemeSong.json_value())
         );
     }
 

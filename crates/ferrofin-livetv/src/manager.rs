@@ -4620,16 +4620,8 @@ fn push_program_paging(qb: &mut QueryBuilder<Sqlite>, limit: Option<i32>, start_
 }
 
 /// The stored `Status` string for a [`RecordingStatus`].
-fn recording_status_name(status: RecordingStatus) -> &'static str {
-    match status {
-        RecordingStatus::New => "New",
-        RecordingStatus::InProgress => "InProgress",
-        RecordingStatus::Completed => "Completed",
-        RecordingStatus::Cancelled => "Cancelled",
-        RecordingStatus::ConflictedOk => "ConflictedOk",
-        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
-        RecordingStatus::Error => "Error",
-    }
+fn recording_status_name(status: RecordingStatus) -> String {
+    status.json_name().into_owned()
 }
 
 /// Parses a timestamp stored in the guide cache: the canonical storage format

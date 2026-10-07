@@ -24,8 +24,7 @@ impl TryFrom<DisplayPreferencesEntity> for DisplayPreferencesDto {
     /// owning user's `Guid` (kept as its stored string form).
     ///
     /// # Errors
-    /// Returns [`DbError::InvalidEnumValue`] if the stored `IndexBy` or
-    /// `ScrollDirection` discriminant is out of range.
+    /// Returns [`DbError::InvalidEnumValue`] if the stored `IndexBy` is out of range.
     fn try_from(entity: DisplayPreferencesEntity) -> Result<Self, Self::Error> {
         let index_by = entity
             .index_by
@@ -42,7 +41,7 @@ impl TryFrom<DisplayPreferencesEntity> for DisplayPreferencesDto {
             primary_image_height: DisplayPreferencesDto::default().primary_image_height,
             primary_image_width: DisplayPreferencesDto::default().primary_image_width,
             custom_prefs: HashMap::new(),
-            scroll_direction: scroll_direction_from_i32(entity.scroll_direction)?,
+            scroll_direction: ScrollDirection::from_json_value(entity.scroll_direction),
             show_backdrop: entity.show_backdrop,
             remember_sorting: false,
             sort_order: SortOrder::default(),
@@ -60,23 +59,4 @@ fn indexing_kind_name(kind: IndexingKind) -> &'static str {
         IndexingKind::ProductionYear => "ProductionYear",
         IndexingKind::CommunityRating => "CommunityRating",
     }
-}
-
-/// Reads a [`ScrollDirection`] from its stored `INTEGER` discriminant
-/// (Horizontal = 0, Vertical = 1).
-///
-/// # Errors
-/// Returns [`DbError::InvalidEnumValue`] for a discriminant outside `0..=1`.
-fn scroll_direction_from_i32(value: i32) -> Result<ScrollDirection, DbError> {
-    let direction = match value {
-        0 => ScrollDirection::Horizontal,
-        1 => ScrollDirection::Vertical,
-        other => {
-            return Err(DbError::InvalidEnumValue {
-                enum_name: "ScrollDirection",
-                value: other,
-            });
-        }
-    };
-    Ok(direction)
 }
