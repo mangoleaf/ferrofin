@@ -24,7 +24,7 @@
 //! mirroring the `finally` block of each C# controller action.
 
 use axum::Router;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// Restarts the library monitor so its watch set matches the just-mutated

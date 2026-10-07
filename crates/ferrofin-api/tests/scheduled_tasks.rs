@@ -355,6 +355,28 @@ async fn get_tasks_filters_never_reject_a_non_configurable_task() {
     );
 }
 
+/// ASP.NET binds query keys ignoring case; the shared `Query` extractor folds
+/// them to the handler's member names (this goes through the router alone, with
+/// no server-level key rewriting in front of it).
+#[tokio::test]
+async fn get_tasks_query_keys_bind_ignoring_case() {
+    let tasks = Arc::new(
+        StubTasks::new(vec![task_info("cleanup", "Cleanup", true)]).configurable(&["cleanup"]),
+    );
+    let (status, _) = send(
+        Arc::clone(&tasks),
+        true,
+        "GET",
+        "/ScheduledTasks?ishidden=true&ISENABLED=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *tasks.filters.lock().expect("lock"),
+        vec![(Some(true), Some(false))]
+    );
+}
+
 #[tokio::test]
 async fn get_tasks_is_enabled_false_returns_none() {
     let tasks =

@@ -21,7 +21,7 @@
 //!   manager, which is deferred; the reporting call to [`SessionManager`] still
 //!   runs, so the session/play-state bookkeeping is faithful.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::{current_session, current_session_id, notify_user_data_changed};
 use crate::state::AppState;

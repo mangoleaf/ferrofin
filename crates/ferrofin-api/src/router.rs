@@ -226,7 +226,7 @@ async fn merge_repeated_query_params(mut request: Request, next: Next) -> Respon
 /// Merges repeated query keys into single comma-joined values, preserving
 /// first-occurrence order and percent-encoding. Returns `None` when no key
 /// repeats (the common case — the URI is left untouched).
-fn merged_query(query: &str) -> Option<String> {
+pub(crate) fn merged_query(query: &str) -> Option<String> {
     // (key, values, saw_equals) per distinct key, in first-seen order. A pair
     // without `=` (a bare flag) keeps its bare form on rebuild.
     let mut groups: Vec<(&str, Vec<&str>, bool)> = Vec::new();

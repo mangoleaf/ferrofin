@@ -20,7 +20,7 @@
 //! resolve, upload / download also queue a metadata refresh, matching the C#
 //! flow.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::queue_high_priority_refresh;
 use crate::state::AppState;
 

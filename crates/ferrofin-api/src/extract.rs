@@ -55,8 +55,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use self::doc::Doc;
+pub use self::query::Query;
 
 mod doc;
+mod query;
 
 /// The `type` URI ASP.NET stamps on a validation failure.
 const VALIDATION_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.1";

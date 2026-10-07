@@ -25,7 +25,7 @@
 //! `FullRefresh`/`ReplaceAllMetadata` refresh queued when a series'
 //! `DisplayOrder` changes (`ItemUpdateController.cs:83-86,120-132`).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::routing::post;
@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
