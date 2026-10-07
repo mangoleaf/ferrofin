@@ -4,20 +4,31 @@
 //! a value. Fold only those names; raw queries retain their spelling. Scalars
 //! bind the first occurrence, as ASP.NET's `SimpleTypeModelBinder.FirstValue`
 //! does. Only declared collections merge. Values remain percent-encoded until
-//! axum performs deserialization, so a comma in a scalar is never split.
+//! deserialization, so a comma in a scalar is never split.
 
 use std::borrow::Cow;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use axum::extract::FromRequestParts;
-use axum::extract::rejection::QueryRejection;
-use axum::http::{Uri, request::Parts};
+use axum::http::{StatusCode, Uri, request::Parts};
+use axum::response::{IntoResponse, Response};
 use serde::de::{self, DeserializeOwned, Visitor};
 
 /// Case-insensitive query binding with first-value scalars and merged collections.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
+
+/// A query binding failure with axum's HTTP 400 status and diagnostic format.
+#[derive(Debug, thiserror::Error)]
+#[error("Failed to deserialize query string: {0}")]
+pub struct QueryRejection(#[source] serde_path_to_error::Error<serde_urlencoded::de::Error>);
+
+impl IntoResponse for QueryRejection {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+    }
+}
 
 /// Collection fields carried as delimited strings by a typed query DTO.
 ///
@@ -57,23 +68,20 @@ impl<T: QueryParameters> Query<T> {
     /// Binds query parameters using the same rules as the HTTP extractor.
     ///
     /// # Errors
-    /// Returns axum's query rejection when a value cannot bind to `T`.
-    ///
-    /// # Panics
-    /// Panics if a DTO declares a field name that is invalid in a query URI.
-    /// API contract field names are ASCII identifiers.
+    /// Returns an HTTP 400 query rejection when a value cannot bind to `T`.
     pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
         let fields = fields::<T>();
-        let normalized = normalize(uri.query().unwrap_or_default(), fields, T::COLLECTIONS);
-        let normalized_uri;
-        let uri = if let Some(query) = normalized {
-            // Only field names and separators change. Values remain URI-safe.
-            normalized_uri = format!("/?{query}").parse::<Uri>().expect("encoded query");
-            &normalized_uri
-        } else {
-            uri
-        };
-        axum::extract::Query::<T>::try_from_uri(uri).map(|query| Self(query.0))
+        let query = uri.query().unwrap_or_default();
+        let normalized = normalize(query, fields, T::COLLECTIONS);
+        // Bind directly: adding '=' to bare parameters can grow an otherwise
+        // valid request beyond http::Uri's size limit. Use the same deserializer
+        // and error paths as axum without constructing another URI.
+        let deserializer = serde_urlencoded::Deserializer::new(form_urlencoded::parse(
+            normalized.as_deref().unwrap_or(query).as_bytes(),
+        ));
+        serde_path_to_error::deserialize(deserializer)
+            .map(Self)
+            .map_err(QueryRejection)
     }
 }
 
@@ -199,9 +207,9 @@ fn normalize(query: &str, fields: &[&str], collections: &[(&str, char)]) -> Opti
                     let delimiter = collections.iter().find_map(|(name, delimiter)| {
                         name.eq_ignore_ascii_case(key).then_some(*delimiter)
                     });
-                    // Encode the pipe, keeping the rebuilt URI valid and letting
-                    // axum decode it alongside the original encoded values.
+                    // Keep inserted separators encoded alongside original values.
                     let separator = if delimiter == Some('|') { "%7C" } else { "," };
+                    let key: String = form_urlencoded::byte_serialize(key.as_bytes()).collect();
                     format!("{key}={}", values.join(separator))
                 }
             })
@@ -215,13 +223,9 @@ fn decoded_key(key: &str) -> Cow<'_, str> {
     if !key.contains(['%', '+']) {
         return Cow::Borrowed(key);
     }
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_str(key).expect("string pairs");
-    Cow::Owned(
-        pairs
-            .into_iter()
-            .next()
-            .map_or_else(String::new, |(key, _)| key),
-    )
+    form_urlencoded::parse(key.as_bytes())
+        .next()
+        .map_or(Cow::Borrowed(""), |(key, _)| key)
 }
 
 #[cfg(test)]
@@ -352,7 +356,7 @@ pub(crate) mod tests {
         const COLLECTIONS: &'static [(&'static str, char)] = &[("fields", ','), ("genres", '|')];
     }
 
-    fn mixed(query: &str) -> Result<Query<Mixed>, axum::extract::rejection::QueryRejection> {
+    fn mixed(query: &str) -> Result<Query<Mixed>, super::QueryRejection> {
         Query::try_from_uri(&format!("/?{query}").parse().unwrap())
     }
 
@@ -432,6 +436,73 @@ pub(crate) mod tests {
         let query = mixed("").unwrap();
         assert_eq!(query.name, None);
         assert_eq!(query.fields, None);
+    }
+
+    #[test]
+    fn normalization_handles_queries_at_the_uri_size_limit() {
+        let prefix = "/?NAME&fields&genres&unknown=";
+        let uri = format!("{prefix}{}", "x".repeat(65_534 - prefix.len()))
+            .parse()
+            .unwrap();
+        let query = Query::<Mixed>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.name.as_deref(), Some(""));
+        assert_eq!(query.fields.as_deref(), Some(""));
+        assert_eq!(query.genres.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn encoded_names_and_values_are_decoded_exactly_once() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Encoded {
+            #[serde(rename = "a+b&c=d %")]
+            value: String,
+        }
+        impl QueryParameters for Encoded {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[];
+        }
+        let uri = "/?a%2Bb%26c%3Dd+%25=first%2526&a%2Bb%26c%3Dd%20%25=second"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            Query::<Encoded>::try_from_uri(&uri).unwrap().value,
+            "first%26"
+        );
+        for (query, expected) in [
+            ("na%256De=ignored&name=first&NAME=second", "first"),
+            ("name%=ignored&NAME=first&name=second", "first"),
+            ("name=bad%ZZ%4&name=second", "bad%ZZ%4"),
+            ("name=%FF&name=second", "\u{fffd}"),
+        ] {
+            assert_eq!(mixed(query).unwrap().name.as_deref(), Some(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_queries_preserve_axums_rejection_response() {
+        use axum::response::IntoResponse;
+
+        for (input, first_only) in [
+            ("LIMIT=bad&limit=7", "limit=bad"),
+            ("RECURSIVE=&recursive=true", "recursive="),
+            ("USERID=invalid&userId=", "userId=invalid"),
+        ] {
+            let actual = mixed(input).unwrap_err().into_response();
+            let expected = axum::extract::Query::<Mixed>::try_from_uri(
+                &format!("/?{first_only}").parse().unwrap(),
+            )
+            .unwrap_err()
+            .into_response();
+            assert_eq!(actual.status(), expected.status());
+            assert_eq!(actual.headers(), expected.headers());
+            assert_eq!(
+                axum::body::to_bytes(actual.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+                axum::body::to_bytes(expected.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     #[tokio::test]

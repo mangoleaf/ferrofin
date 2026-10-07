@@ -38,7 +38,7 @@
 //! content type and the document's shape are the contract; the diagnostic text
 //! is Ferrofin's own, and no parity probe compares it.
 
-pub use crate::query::{Query, QueryParameters};
+pub use crate::query::{Query, QueryParameters, QueryRejection};
 
 use std::collections::BTreeMap;
 
