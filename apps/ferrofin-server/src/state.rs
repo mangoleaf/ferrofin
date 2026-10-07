@@ -1955,6 +1955,7 @@ pub async fn build_app_state(
         )
         .with_network(Arc::clone(&network), config.bind_addr),
     );
+    config_mgr.add_configuration_listener(app_host.configuration_listener());
     app_host
         .refresh_server_name()
         .await
