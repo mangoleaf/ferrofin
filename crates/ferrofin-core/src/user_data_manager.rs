@@ -1082,6 +1082,74 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::source_first(false)]
+    #[case::destination_first(true)]
+    #[tokio::test]
+    async fn retention_round_trip_does_not_revive_old_guid_state(#[case] destination_first: bool) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for item in [a, b] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            seed_provider_id(&db, item, "Tmdb", "round-trip").await;
+        }
+        manager
+            .save_user_data(
+                user,
+                a,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[a]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        assert!(
+            manager
+                .get_user_data_dto(b, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .played
+        );
+        manager.mark_unplayed(user, b).await.unwrap();
+
+        if !destination_first {
+            persistence.delete_items(&[b]).await.unwrap();
+        }
+        seed_item(&db, a, BaseItemKind::Movie).await;
+        seed_provider_id(&db, a, "Tmdb", "round-trip").await;
+        persistence
+            .reattach_user_data(&fetch_item(&db, a).await)
+            .await
+            .unwrap();
+        if destination_first {
+            persistence.delete_items(&[b]).await.unwrap();
+        }
+        persistence.reattach_all_user_data().await.unwrap();
+        let restored = manager.get_user_data_dto(a, user).await.unwrap().unwrap();
+        assert!(
+            !restored.played,
+            "the later explicit unplayed state survives"
+        );
+        assert!(restored.is_favorite);
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0, "consume the complete source snapshot");
+    }
+
     /// Seeds a movie with a runtime, for the play-state heuristics.
     async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
         seed_item(db, id, BaseItemKind::Movie).await;

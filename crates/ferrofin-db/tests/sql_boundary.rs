@@ -48,7 +48,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/next_up_service.rs", 5),
     ("crates/ferrofin-core/src/playback_metrics.rs", 4),
     ("crates/ferrofin-core/src/scheduled_tasks/library.rs", 15),
-    ("crates/ferrofin-core/src/scheduled_tasks/maintenance.rs", 7),
+    ("crates/ferrofin-core/src/scheduled_tasks/maintenance.rs", 6),
     ("crates/ferrofin-core/src/session_manager.rs", 1),
     ("crates/ferrofin-core/src/session_manager/tests.rs", 5),
     ("crates/ferrofin-core/src/subtitle_manager.rs", 3),

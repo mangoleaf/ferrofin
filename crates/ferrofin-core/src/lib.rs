@@ -234,6 +234,7 @@ pub mod tv_series_manager;
 mod user_data_key_repository;
 pub mod user_data_keys;
 pub mod user_data_manager;
+mod user_data_retention_repository;
 pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_root_folder;

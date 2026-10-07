@@ -1490,6 +1490,8 @@ pub(crate) async fn detach_user_data(
     if ids.is_empty() {
         return Ok(());
     }
+    let retained_at = datetime_to_db(chrono::Utc::now());
+    crate::user_data_retention_repository::capture(tx, ids, &retained_at).await?;
     // Bind the entire deletion set as one JSON array, so ranking is global
     // even when the BaseItems deletion itself crosses SQL bind chunks.
     let ids = serde_json::to_string(ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
@@ -1524,7 +1526,7 @@ pub(crate) async fn detach_user_data(
     )
     .bind(&ids)
     .bind(PLACEHOLDER_ID)
-    .bind(datetime_to_db(chrono::Utc::now()))
+    .bind(retained_at)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -1549,6 +1551,7 @@ async fn reattach_user_data_keys(
     item_id: &str,
     keys: &[String],
 ) -> Result<(), ServiceError> {
+    crate::user_data_retention_repository::recover(tx, item_id, keys).await?;
     let keys = serde_json::to_string(keys).map_err(|e| ServiceError::Backend(e.to_string()))?;
     sqlx::query(
         r#"WITH keys AS (SELECT key, value FROM json_each(?1)),
@@ -1560,6 +1563,10 @@ async fn reattach_user_data_keys(
             ) AS priority
             FROM "UserData" ud JOIN keys ON keys.value = ud."CustomDataKey"
             WHERE ud."ItemId" = ?3 AND NOT EXISTS (
+                SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
+                JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
+                WHERE s."UserId" = ud."UserId" AND k."Kind" = 'mirror'
+                AND k."Key" = ud."CustomDataKey") AND NOT EXISTS (
                 SELECT 1 FROM "UserData" current
                 WHERE current."ItemId" = ?2 AND current."UserId" = ud."UserId")
         )
@@ -1583,8 +1590,12 @@ async fn reattach_user_data_keys(
     // an explicit destination state. Unmatched keys remain available until
     // their retention period expires.
     sqlx::query(
-        r#"DELETE FROM "UserData" WHERE "ItemId" = ?1
-           AND "CustomDataKey" IN (SELECT value FROM json_each(?2))"#,
+        r#"DELETE FROM "UserData" AS ud WHERE "ItemId" = ?1
+           AND "CustomDataKey" IN (SELECT value FROM json_each(?2))
+           AND NOT EXISTS (SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
+               JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
+               WHERE s."UserId" = ud."UserId" AND k."Kind" = 'mirror'
+               AND k."Key" = ud."CustomDataKey")"#,
     )
     .bind(PLACEHOLDER_ID)
     .bind(&keys)
@@ -2990,12 +3001,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(());
         }
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        let detached: bool =
-            sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM "UserData" WHERE "ItemId" = ?1)"#)
-                .bind(PLACEHOLDER_ID)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        let detached: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS(SELECT 1 FROM "UserData" WHERE "ItemId" = ?1)
+                OR EXISTS(SELECT 1 FROM "FerrofinUserDataRetentionSnapshots")"#,
+        )
+        .bind(PLACEHOLDER_ID)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
         if detached
             && let Some(keys) = crate::user_data_key_repository::load_keys(&mut tx, id).await?
         {
@@ -3011,7 +3024,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // transaction below. History detached concurrently after this snapshot
         // is picked up by the next scan or its destination's refresh.
         let mut retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
-            r#"SELECT DISTINCT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#,
+            r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1
+               UNION SELECT "Key" FROM "FerrofinUserDataRetentionKeys" WHERE "Kind" = 'identity'"#,
         )
         .bind(PLACEHOLDER_ID)
         .fetch_all(self.db.pool())
