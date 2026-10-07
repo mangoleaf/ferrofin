@@ -59,13 +59,14 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
-/// TODO(PLAN_JSON_BODY_CASE_INSENSITIVE F11): port the remaining typed
-/// `DynamicHlsController` members — `audioChannels`, `maxAudioChannels`,
-/// `maxRefFrames`, `maxVideoBitDepth`, `maxAudioBitDepth`, `audioSampleRate`,
-/// `deInterlace`, `audioStreamIndex` — through `HlsStreamRequest` into the
-/// planner's `BaseEncodingJobOptions` (whose fields already exist). Until then
-/// only their camelCase spelling reaches the encoder, via the stream-option
-/// fallback; PascalCase is dropped.
+/// TODO(PLAN_JSON_BODY_CASE_INSENSITIVE F11): two `DynamicHlsController`
+/// members are still unported. `audioStreamIndex` (emitted by
+/// `StreamInfo::to_url`) never reaches stream selection, so a non-default audio
+/// track transcodes the default one; port it into the planner's stream pick.
+/// `audioSampleRate` needs `EncodingJobInfo.OutputAudioSampleRate` and the
+/// `-ar` argument (`DynamicHlsController.GetAudioArguments`, the ac-4 → 48 kHz
+/// branch, progressive opus snapping) before it may reach
+/// `BaseEncodingJobOptions`: wired alone it only vetoes audio copy.
 ///
 /// Keys bind ignoring case ([`crate::extract::Query`]): the PlaybackInfo-
 /// negotiated `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase
@@ -107,6 +108,27 @@ struct HlsQuery {
     /// The transcoding profile's max audio channels (drives the `-ac` downmix).
     #[serde(default)]
     transcoding_max_audio_channels: Option<i32>,
+    /// The requested output audio channels (`audioChannels`).
+    #[serde(default)]
+    audio_channels: Option<i32>,
+    /// The maximum output audio channels (`maxAudioChannels`).
+    #[serde(default)]
+    max_audio_channels: Option<i32>,
+    /// The maximum output audio bit depth (`maxAudioBitDepth`).
+    #[serde(default)]
+    max_audio_bit_depth: Option<i32>,
+    /// The maximum reference-frame count (`maxRefFrames`).
+    #[serde(default)]
+    max_ref_frames: Option<i32>,
+    /// The maximum output video bit depth (`maxVideoBitDepth`).
+    #[serde(default)]
+    max_video_bit_depth: Option<i32>,
+    /// Whether the input is force-deinterlaced (`deInterlace`).
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
+    de_interlace: Option<bool>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
     /// The contract (and every Jellyfin client) spells this `videoBitRate`
@@ -132,13 +154,23 @@ struct HlsQuery {
     max_framerate: Option<f32>,
     /// Whether `-c:v copy` is permitted (PlaybackInfo appends `false` when the
     /// client forbade it).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     allow_audio_stream_copy: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
-    #[serde(default, rename = "static")]
+    #[serde(
+        default,
+        rename = "static",
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     is_static: Option<bool>,
     /// The requested video profile (the `CODECS` profile byte of a re-encode).
     #[serde(default)]
@@ -169,13 +201,22 @@ struct HlsQuery {
     transcode_reasons: Option<String>,
     /// Whether text subtitles are listed as a group in the master playlist
     /// (route-specific default: `false` for `master.m3u8`, `true` for `live.m3u8`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     enable_subtitles_in_manifest: Option<bool>,
     /// Whether the master playlist adds two lower-bitrate variants (default `false`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     enable_adaptive_bitrate_streaming: Option<bool>,
     /// Whether the master playlist lists trickplay image playlists (default `true`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
+    )]
     enable_trickplay: Option<bool>,
 }
 
@@ -248,6 +289,12 @@ fn build_request(
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
+        audio_channels: query.audio_channels,
+        max_audio_channels: query.max_audio_channels,
+        max_audio_bit_depth: query.max_audio_bit_depth,
+        max_ref_frames: query.max_ref_frames,
+        max_video_bit_depth: query.max_video_bit_depth,
+        deinterlace: query.de_interlace.unwrap_or(false),
         video_bitrate: query.video_bitrate,
         audio_bitrate: query.audio_bitrate,
         max_width: query.max_width,
@@ -724,6 +771,54 @@ mod tests {
         assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
         let lower: HlsQuery = parse("audioBitrate=96000").expect("parses");
         assert_eq!(lower.audio_bitrate, Some(96_000));
+    }
+
+    /// `DynamicHlsController`'s typed members bind in any casing and reach the
+    /// stream request (upstream reads them before any per-codec stream option).
+    #[test]
+    fn typed_encoding_members_reach_the_request_in_any_casing() {
+        for query in [
+            "AudioChannels=6&MaxAudioChannels=8&MaxAudioBitDepth=24&\
+             MaxRefFrames=4&MaxVideoBitDepth=10&DeInterlace=True",
+            "audioChannels=6&maxAudioChannels=8&maxAudioBitDepth=24&\
+             maxRefFrames=4&maxVideoBitDepth=10&deInterlace=true",
+        ] {
+            let req = build_request(
+                uuid::Uuid::from_u128(7),
+                parse(query).expect(query),
+                None,
+                HlsRequestContext::default(),
+            );
+            assert_eq!(req.audio_channels, Some(6), "{query}");
+            assert_eq!(req.max_audio_channels, Some(8), "{query}");
+            assert_eq!(req.max_audio_bit_depth, Some(24), "{query}");
+            assert_eq!(req.max_ref_frames, Some(4), "{query}");
+            assert_eq!(req.max_video_bit_depth, Some(10), "{query}");
+            assert!(req.deinterlace, "{query}");
+        }
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            parse("").expect("empty"),
+            None,
+            HlsRequestContext::default(),
+        );
+        assert!(!req.deinterlace);
+        assert_eq!(req.audio_channels, None);
+    }
+
+    /// ASP.NET's `bool.TryParse`: any case, surrounding whitespace, and an
+    /// empty value as unset. `StreamInfo::to_url` emits `True`/`False`.
+    #[test]
+    fn hls_bools_bind_like_bool_try_parse() {
+        let query =
+            parse("EnableSubtitlesInManifest=True&Static=FALSE&AllowVideoStreamCopy=%20true%20")
+                .expect("binds");
+        assert_eq!(query.enable_subtitles_in_manifest, Some(true));
+        assert_eq!(query.is_static, Some(false));
+        assert_eq!(query.allow_video_stream_copy, Some(true));
+        let query = parse("deInterlace=").expect("empty binds");
+        assert_eq!(query.de_interlace, None);
+        assert!(parse("deInterlace=yes").is_err());
     }
 
     #[test]

@@ -681,6 +681,14 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let base_request = BaseEncodingJobOptions {
             audio_codec: Some(requested_audio_codec.clone()),
             transcoding_max_audio_channels: request.transcoding_max_audio_channels,
+            // The typed `DynamicHlsController` members `GetRequested*` read
+            // before falling back to a per-codec stream option.
+            audio_channels: request.audio_channels,
+            max_audio_channels: request.max_audio_channels,
+            max_audio_bit_depth: request.max_audio_bit_depth,
+            max_ref_frames: request.max_ref_frames,
+            max_video_bit_depth: request.max_video_bit_depth,
+            deinterlace: request.deinterlace,
             is_static: request.is_static,
             subtitle_stream_index: subtitle_index,
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
@@ -2337,6 +2345,42 @@ mod tests {
             pos.map(|i| plan.arguments[i + 1].as_str()),
             Some("2"),
             "expected `-ac 2`, got: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_honours_the_typed_audio_channels_member() {
+        // `audioChannels` is a typed `DynamicHlsController` member: it reaches
+        // `GetRequestedAudioChannels` through the base request, not only as a
+        // lower-case per-codec stream option (casing: hls.rs binding tests).
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_channels = Some(2);
+        req.max_audio_channels = Some(6);
+        req.max_audio_bit_depth = Some(24);
+        req.max_ref_frames = Some(4);
+        req.max_video_bit_depth = Some(10);
+        req.deinterlace = true;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        // Every typed member lands on the base request…
+        let base = &plan.state.base_request;
+        assert_eq!(base.audio_channels, Some(2));
+        assert_eq!(base.max_audio_channels, Some(6));
+        assert_eq!(base.max_audio_bit_depth, Some(24));
+        assert_eq!(base.max_ref_frames, Some(4));
+        assert_eq!(base.max_video_bit_depth, Some(10));
+        assert!(base.deinterlace);
+        // …and `GetRequestedAudioChannels` takes MaxAudioChannels first.
+        let pos = plan.arguments.iter().position(|a| a == "-ac");
+        assert_eq!(
+            pos.map(|i| plan.arguments[i + 1].as_str()),
+            Some("6"),
+            "expected `-ac 6`, got: {:?}",
             plan.arguments
         );
     }

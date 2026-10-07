@@ -124,6 +124,27 @@ where
     }
 }
 
+/// Binds a query `bool?` the way ASP.NET's `SimpleTypeModelBinder` does:
+/// `bool.TryParse`, which ignores case and surrounding whitespace (`True`,
+/// `FALSE`), and an empty value as `null`. serde's own `bool` accepts only
+/// `true`/`false`, so `?EnableSubtitlesInManifest=True` — the spelling
+/// Ferrofin's own `StreamInfo::to_url` emits — was a `400`.
+pub(crate) fn opt_bool_ci<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
+        Some(value) => Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Str(value),
+            &"true or false",
+        )),
+    }
+}
+
 /// Splits a pipe-delimited value into owned strings, trimming and dropping empty
 /// tokens. Mirrors Jellyfin's `PipeDelimitedCollectionModelBinder`.
 pub(crate) fn parse_pipe_strings(raw: Option<&str>) -> Vec<String> {
