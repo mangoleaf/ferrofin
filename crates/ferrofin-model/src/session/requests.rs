@@ -35,6 +35,7 @@ pub struct PlayRequest {
 
     /// Gets or sets the start position ticks the first item should play at.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_position_ticks: Option<i64>,
 
     /// Gets or sets the play command.
@@ -47,10 +48,12 @@ pub struct PlayRequest {
 
     /// Gets or sets the subtitle stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
 
     /// Gets or sets the audio stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
 
     /// Gets or sets the media source id.
@@ -59,6 +62,7 @@ pub struct PlayRequest {
 
     /// Gets or sets the start index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 }
 
@@ -71,6 +75,7 @@ pub struct PlaystateRequest {
 
     /// Gets or sets the seek position in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub seek_position_ticks: Option<i64>,
 
     /// Gets or sets the controlling user identifier.

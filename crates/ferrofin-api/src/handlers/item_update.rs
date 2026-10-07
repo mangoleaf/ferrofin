@@ -181,6 +181,7 @@ pub(crate) struct UpdateItemRequest {
     #[serde(default)]
     preferred_metadata_language: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     lock_data: Option<bool>,
     /// The fields locked against provider updates. An absent key leaves the
     /// stored set alone (`if (request.LockedFields is not null)`).

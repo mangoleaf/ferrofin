@@ -22,6 +22,7 @@ pub struct PlaylistCreationRequest {
 
     /// Gets or sets the media type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub media_type: Option<MediaType>,
 
     /// Gets or sets the user id.
@@ -34,6 +35,7 @@ pub struct PlaylistCreationRequest {
 
     /// Gets or sets a value indicating whether the playlist is public.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub public: Option<bool>,
 }
 
@@ -75,6 +77,7 @@ pub struct PlaylistUpdateRequest {
 
     /// Gets or sets a value indicating whether the playlist is public.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub public: Option<bool>,
 }
 
@@ -103,6 +106,7 @@ pub struct CreatePlaylistDto {
 
     /// Gets or sets the media type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub media_type: Option<MediaType>,
 
     /// Gets or sets the playlist users.
@@ -111,6 +115,7 @@ pub struct CreatePlaylistDto {
 
     /// Gets or sets a value indicating whether the playlist is public.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub is_public: Option<bool>,
 }
 
@@ -138,6 +143,7 @@ pub struct UpdatePlaylistDto {
 
     /// Gets or sets a value indicating whether the playlist is public.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub is_public: Option<bool>,
 }
 
@@ -151,6 +157,7 @@ pub struct UpdatePlaylistDto {
 pub struct UpdatePlaylistUserDto {
     /// Gets or sets a value indicating whether the user can edit the playlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub can_edit: Option<bool>,
 }
 
@@ -170,5 +177,6 @@ pub struct PlaylistUserUpdateRequest {
 
     /// Gets or sets a value indicating whether the user can edit the playlist.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub can_edit: Option<bool>,
 }

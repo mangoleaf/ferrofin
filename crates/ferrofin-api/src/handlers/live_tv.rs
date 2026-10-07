@@ -48,8 +48,8 @@ use crate::error::ApiError;
 use crate::extract::JsonBody;
 use crate::handlers::items::{effective_user_id, resolve_user_opt};
 use crate::handlers::query_parse::{
-    de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
-    parse_pipe_strings,
+    de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
+    parse_csv_uuids, parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -362,40 +362,50 @@ impl ProgramsQuery {
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
 struct GetProgramsDto {
     /// The channels to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "de_comma_delimited_guids")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
+    #[serde(with = "ferrofin_model::json::guid::option")]
     user_id: Option<Uuid>,
     /// The minimum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     min_start_date: Option<DateTime<Utc>>,
     /// Filter by programmes that have finished airing.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     has_aired: Option<bool>,
     /// Filter by programmes airing right now.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_airing: Option<bool>,
     /// The maximum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     max_start_date: Option<DateTime<Utc>>,
     /// The minimum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     min_end_date: Option<DateTime<Utc>>,
     /// The maximum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     max_end_date: Option<DateTime<Utc>>,
     /// Filter for movies.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_movie: Option<bool>,
     /// Filter for series.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_series: Option<bool>,
     /// Filter for news.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_news: Option<bool>,
     /// Filter for kids' programmes.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_kids: Option<bool>,
     /// Filter for sports.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_sports: Option<bool>,
     /// The index of the first record to return.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     start_index: Option<i32>,
     /// The maximum number of records to return.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     limit: Option<i32>,
     /// The sort columns.
     #[serde(deserialize_with = "de_comma_delimited")]
@@ -408,25 +418,30 @@ struct GetProgramsDto {
     #[serde(deserialize_with = "de_pipe_delimited")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "de_comma_delimited_guids")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_images: Option<bool>,
     /// The maximum number of images returned per image type.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     image_type_limit: Option<i32>,
     /// The image types to include.
     #[serde(deserialize_with = "de_comma_delimited")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_user_data: Option<bool>,
     /// Filter to the programmes a series timer records.
     series_timer_id: Option<String>,
     /// Filter to the programmes of one library series.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
     #[serde(deserialize_with = "de_comma_delimited")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_total_record_count: Option<bool>,
 }
 

@@ -68,6 +68,19 @@ var inputs = new[] { "null", "true", "false", "{}", "[]", "[1]", "{\"x\":1}" }
     .Concat(numbers.Where(n => { try { using var d = JsonDocument.Parse(n); return true; } catch { return false; } }))
     .Concat(numbers.Concat(strings).Select(s => JsonSerializer.Serialize(s)))
     .Distinct();
+if (args is ["--date-edges"])
+{
+    types = types.Where(pair => pair.Key is "date" or "date?").ToDictionary();
+    string[] dates = ["2022-01-01T00:00", "2022-01-01T00:00Z", "2022-01-01T00:00+02:00",
+        "2022-01-01T00:00:00+02", "2022-01-01T00:00:00+14:00", "2022-01-01T00:00:00+14:01",
+        "2022-01-01T00:00:00+15:00", "2022-01-01T24:00:00Z", "2022-01-01T23:59:60Z",
+        "2022-01-01T00:00:00.Z", "2022-01-01T00:00:00.1Z", "2022-01-01T00:00:00.123456789Z",
+        "2022-01-01T00:00:00.1234567890123456Z", "2022-01-01T00:00:00.12345678901234567Z",
+        "2022-1-1", "0001-01-01", "0000-01-01", "9999-12-31T23:59:59Z", "10000-01-01",
+        "2022-01-01Z", "2022-01-01T00:00:00\t", "2022-01-01t00:00:00Z", "2022-01-01T00:00:00z",
+        "2022-01-01 00:00:00Z", "2022-01-01T00:00:00,1Z", "2022-01-01T00:00:00+00:60"];
+    inputs = dates.Select(date => JsonSerializer.Serialize(date));
+}
 foreach (var (name, type) in types)
 {
     foreach (var input in inputs)

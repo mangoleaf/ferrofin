@@ -1331,6 +1331,7 @@ pub struct ServerConfiguration {
 
     /// Gets or sets the number of days activity logs should be retained.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub activity_log_retention_days: Option<i32>,
 
     /// Gets or sets the library scan fanout concurrency.

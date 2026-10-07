@@ -152,6 +152,7 @@ pub struct BlurayDiscInfo {
     pub media_streams: Vec<MediaStream>,
     /// The run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
     /// The files.
     pub files: Vec<String>,
@@ -216,18 +217,23 @@ pub struct LiveStreamRequest {
     pub play_session_id: Option<String>,
     /// The maximum streaming bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_streaming_bitrate: Option<i32>,
     /// The start time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_time_ticks: Option<i64>,
     /// The audio stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
     /// The subtitle stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
     /// The maximum audio channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_audio_channels: Option<i32>,
     /// The item id.
     #[schema(value_type = String, format = "uuid")]
@@ -334,14 +340,17 @@ pub struct MediaInfo {
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
 
     /// Gets or sets the premiere date.

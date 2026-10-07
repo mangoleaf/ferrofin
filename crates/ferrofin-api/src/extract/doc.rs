@@ -384,10 +384,19 @@ impl<'de> de::Deserializer<'de> for Doc {
 
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_newtype_struct(self)
+        use ferrofin_model::json::value::{NULLABLE_VALUE, STRING_TOKEN};
+        match (name, self) {
+            (NULLABLE_VALUE, Self::String(text)) if text.is_empty() => {
+                visitor.visit_newtype_struct(Self::Null)
+            }
+            (STRING_TOKEN, value) if !matches!(value, Self::String(_)) => Err(
+                de::Error::invalid_type(value.unexpected(), &"a JSON string token"),
+            ),
+            (_, value) => visitor.visit_newtype_struct(value),
+        }
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -807,5 +816,121 @@ mod tests {
                 MediaStreamProtocol::http
             );
         }
+    }
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct Guid(#[serde(with = "ferrofin_model::json::guid")] uuid::Uuid);
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct OptionalGuid(#[serde(with = "ferrofin_model::json::guid::option")] Option<uuid::Uuid>);
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct Date(#[serde(with = "ferrofin_model::json::datetime")] chrono::DateTime<chrono::Utc>);
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct OptionalDate(
+        #[serde(with = "ferrofin_model::json::datetime::option")]
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct Nullable<T>(
+        #[serde(
+            deserialize_with = "ferrofin_model::json::value::nullable",
+            bound(deserialize = "T: Deserialize<'de>")
+        )]
+        Option<T>,
+    );
+
+    #[derive(Debug, PartialEq)]
+    struct OracleEnum(i32);
+    impl ferrofin_model::json::enums::JsonEnum for OracleEnum {
+        fn from_discriminant(value: i32) -> Self {
+            Self(value)
+        }
+        fn members() -> &'static [(&'static str, i32)] {
+            &[("First", 1), ("Second", 4)]
+        }
+        fn json_default() -> Option<i32> {
+            None
+        }
+    }
+    impl<'de> Deserialize<'de> for OracleEnum {
+        fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            ferrofin_model::json::enums::deserialize(d)
+        }
+    }
+
+    #[test]
+    fn nullable_guid_and_date_binding_match_jellyfin_oracle() {
+        let fixture = include_str!("../../tests/data/json-binding/jellyfin-12.2.jsonl");
+        let edges = include_str!("../../tests/data/json-binding/jellyfin-12.2-dates.jsonl");
+        let mut checked = 0;
+        for line in fixture.lines().chain(edges.lines()) {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let input = row["input"].as_str().unwrap();
+            let kind = row["type"].as_str().unwrap();
+            let actual: Result<Option<String>, Error> = match kind {
+                "i32?" => bind::<Nullable<i32>>(input).map(|n| n.0.map(|v| v.to_string())),
+                "bool?" => bind::<Nullable<bool>>(input)
+                    .map(|n| n.0.map(|v| if v { "True" } else { "False" }.to_owned())),
+                "enum?" => bind::<Nullable<OracleEnum>>(input).map(|n| {
+                    n.0.map(|v| match v.0 {
+                        1 => "First".into(),
+                        4 => "Second".into(),
+                        n => n.to_string(),
+                    })
+                }),
+                "guid" => bind::<Guid>(input).map(|g| Some(g.0.to_string())),
+                "guid?" => bind::<OptionalGuid>(input).map(|g| g.0.map(|v| v.to_string())),
+                "date" => bind::<Date>(input).map(|d| Some(d.0.to_rfc3339())),
+                "date?" => bind::<OptionalDate>(input).map(|d| d.0.map(|v| v.to_rfc3339())),
+                _ => continue,
+            };
+            assert_eq!(
+                actual.is_ok(),
+                row["accepted"].as_bool().unwrap(),
+                "{kind} from {input}: {actual:?}"
+            );
+            if let Ok(value) = actual {
+                let expected = row["value"].as_str().map(|text| {
+                    if kind.starts_with("date") {
+                        ferrofin_model::json::datetime::parse(text)
+                            .unwrap()
+                            .to_rfc3339()
+                    } else {
+                        text.to_owned()
+                    }
+                });
+                assert_eq!(value, expected, "{kind} from {input}");
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 815);
+    }
+
+    #[test]
+    fn nullable_markers_apply_to_value_fields_only() {
+        use ferrofin_model::tasks::TaskTriggerInfo;
+        let task: TaskTriggerInfo =
+            bind(r#"{"Type":0,"IntervalTicks":"","DayOfWeek":""}"#).unwrap();
+        assert_eq!(task.interval_ticks, None);
+        assert_eq!(task.day_of_week, None);
+        assert!(bind::<TaskTriggerInfo>(r#"{"Type":0,"IntervalTicks":" "}"#).is_err());
+        assert_eq!(
+            bind::<Option<String>>(r#""""#).unwrap().as_deref(),
+            Some("")
+        );
+        assert!(bind::<Option<Vec<i32>>>(r#""""#).is_err());
+        assert!(bind::<Guid>("12345678901234567890123456789012").is_err());
+        assert!(bind::<Guid>(r#""urn:uuid:00000000-0000-0000-0000-000000000001""#).is_err());
+        #[derive(Deserialize)]
+        struct Ids {
+            #[serde(with = "ferrofin_model::json::guid::vec")]
+            ids: Vec<uuid::Uuid>,
+        }
+        let ids: Ids = bind(r#"{"ids":[null,"(00000000-0000-0000-0000-000000000001)"]}"#).unwrap();
+        assert_eq!(ids.ids, [uuid::Uuid::nil(), uuid::Uuid::from_u128(1)]);
+        assert!(bind::<Ids>(r#"{"ids":[""]}"#).is_err());
     }
 }

@@ -490,6 +490,7 @@ struct UpdateLibraryOptionsBody {
     /// The library item id.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
+    #[serde(with = "ferrofin_model::json::guid::option")]
     id: Option<Uuid>,
     /// The library name (Ferrofin's filesystem seam resolves by name; see below).
     #[serde(default)]

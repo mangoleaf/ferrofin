@@ -268,6 +268,7 @@ pub struct SendCommand {
 
     /// Gets the position ticks, for commands that require it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub position_ticks: Option<i64>,
 
     /// Gets the command.

@@ -483,6 +483,7 @@ pub struct TimerInfoDto {
 
     /// Gets or sets the run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
 
     /// Gets or sets the program information.
@@ -519,6 +520,7 @@ pub struct SeriesTimerInfoDto {
 
     /// Gets or sets the day pattern.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub day_pattern: Option<DayPattern>,
 
     /// Gets or sets the image tags.
@@ -559,10 +561,12 @@ pub struct TimerQuery {
 
     /// Gets or sets a value indicating whether the timer is active.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_active: Option<bool>,
 
     /// Gets or sets a value indicating whether the timer is scheduled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_scheduled: Option<bool>,
 }
 
@@ -598,18 +602,22 @@ pub struct RecordingQuery {
 
     /// Gets or sets the start index. Use for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets the status.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub status: Option<RecordingStatus>,
 
     /// Gets or sets a value indicating whether the recording is in progress.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_in_progress: Option<bool>,
 
     /// Gets or sets the series timer identifier.
@@ -622,34 +630,42 @@ pub struct RecordingQuery {
 
     /// Gets or sets a value indicating whether images are enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_images: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a library item.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_library_item: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a movie.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is for kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets the image type limit.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_type_limit: Option<i32>,
 
     /// Gets or sets the enabled image types.
@@ -668,18 +684,22 @@ pub struct RecordingQuery {
 pub struct LiveTvChannelQuery {
     /// Gets or sets the type of the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channel_type: Option<ChannelType>,
 
     /// Gets or sets a value indicating whether this instance is favorite.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_favorite: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is liked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_liked: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is disliked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_disliked: Option<bool>,
 
     /// Gets or sets a value indicating whether to enable favorite sorting.
@@ -692,10 +712,12 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the start index. Used for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets a value indicating whether to add the current program.
@@ -706,22 +728,27 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets a value indicating whether to return news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether to return movies.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets the sort fields.
@@ -729,6 +756,7 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the sort order to return results with.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sort_order: Option<SortOrder>,
 }
 
@@ -944,6 +972,7 @@ impl Default for TunerHostInfo {
 pub struct LiveTvOptions {
     /// Gets or sets the number of guide days.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub guide_days: Option<i32>,
 
     /// Gets or sets the recording path.

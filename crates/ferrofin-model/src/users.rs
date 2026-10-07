@@ -206,10 +206,12 @@ pub struct UserPolicy {
 
     /// Gets or sets the max parental rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_parental_rating: Option<i32>,
 
     /// Gets or sets the max parental sub rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_parental_sub_rating: Option<i32>,
 
     /// Gets or sets the blocked tags.

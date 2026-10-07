@@ -803,6 +803,7 @@ async fn scan_season(
 #[serde(rename_all = "camelCase", default)]
 struct TransformationRegistration {
     /// The registering plugin's id.
+    #[serde(with = "ferrofin_model::json::guid")]
     id: Uuid,
     /// The exact web-root-relative path or regex to transform.
     file_name_pattern: String,

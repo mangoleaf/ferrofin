@@ -571,14 +571,19 @@ struct PlaybackInfoBody {
     #[serde(default, deserialize_with = "opt_i32")]
     subtitle_stream_index: Option<i32>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_play: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_stream: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_transcoding: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     allow_video_stream_copy: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     allow_audio_stream_copy: Option<bool>,
 }
 
@@ -743,6 +748,7 @@ struct OpenLiveStreamDto {
     /// The open token identifying the source to open.
     open_token: Option<String>,
     /// The target user.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     user_id: Option<Uuid>,
     /// The play session id.
     play_session_id: Option<String>,
@@ -762,12 +768,16 @@ struct OpenLiveStreamDto {
     #[serde(deserialize_with = "opt_i32")]
     max_audio_channels: Option<i32>,
     /// The item id whose source is opened.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     item_id: Option<Uuid>,
     /// Whether direct play is enabled.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_play: Option<bool>,
     /// Whether direct stream is enabled.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_stream: Option<bool>,
     /// Whether subtitles are always burned in when transcoding.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The protocols the client will direct-play.
     direct_play_protocols: Option<Vec<ferrofin_model::media_info::MediaProtocol>>,
