@@ -1233,6 +1233,113 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::different_kind(BaseItemKind::Series, "Tvdb")]
+    #[case::different_provider(BaseItemKind::Movie, "Imdb")]
+    #[tokio::test]
+    async fn retention_equal_provider_values_keep_distinct_snapshots(
+        #[case] other_kind: BaseItemKind,
+        #[case] other_provider: &str,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let [other_new, movie_new, movie_old, other_old] =
+            [100, 900, 1000, 1100].map(Uuid::from_u128);
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for (item, kind, provider) in [
+            (movie_old, BaseItemKind::Movie, "Tmdb"),
+            (movie_new, BaseItemKind::Movie, "Tmdb"),
+            (other_old, other_kind, other_provider),
+            (other_new, other_kind, other_provider),
+        ] {
+            seed_item(&db, item, kind).await;
+            seed_provider_id(&db, item, provider, "949").await;
+        }
+        manager
+            .save_user_data(
+                user,
+                movie_old,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .save_user_data(
+                user,
+                other_old,
+                &UpdateUserItemDataDto {
+                    played: Some(false),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[movie_old]).await.unwrap();
+        persistence
+            .reattach_user_data(&fetch_item(&db, other_new).await)
+            .await
+            .unwrap();
+        assert!(
+            manager.read_row(other_new, user).await.unwrap().is_none(),
+            "equal provider values must not cross media or provider namespaces"
+        );
+        // Both detached snapshots now have the same compatible bare key.
+        persistence.delete_items(&[other_old]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let movie = manager.read_row(movie_new, user).await.unwrap().unwrap();
+        let other = manager.read_row(other_new, user).await.unwrap().unwrap();
+        assert!(movie.played && !movie.is_favorite);
+        assert!(!other.played && other.is_favorite);
+        assert!(movie.retention_date.is_none() && other.retention_date.is_none());
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_legacy_provider_only_rows_are_not_guessed() {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let movie = Uuid::new_v4();
+        let series = Uuid::new_v4();
+        for (item, kind, provider) in [
+            (movie, BaseItemKind::Movie, "Tmdb"),
+            (series, BaseItemKind::Series, "Tvdb"),
+        ] {
+            seed_item(&db, item, kind).await;
+            seed_provider_id(&db, item, provider, "949").await;
+        }
+        crate::test_support::seed_user_data(&db, user, Uuid::from_u128(1), true, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = '949'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .reattach_user_data(&fetch_item(&db, series).await)
+            .await
+            .unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let owners: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![guid_to_db(Uuid::from_u128(1))]);
+    }
+
     /// Seeds a movie with a runtime, for the play-state heuristics.
     async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
         seed_item(db, id, BaseItemKind::Movie).await;

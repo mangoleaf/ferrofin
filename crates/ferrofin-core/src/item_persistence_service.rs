@@ -1550,14 +1550,15 @@ async fn reattach_user_data_keys(
     tx: &mut sqlx::SqliteConnection,
     item_id: &str,
     keys: &[String],
+    retention_keys: &[String],
 ) -> Result<(), ServiceError> {
-    crate::user_data_retention_repository::recover(tx, item_id, keys).await?;
+    crate::user_data_retention_repository::recover(tx, item_id, keys, retention_keys).await?;
     let keys = serde_json::to_string(keys).map_err(|e| ServiceError::Backend(e.to_string()))?;
-    // Only users who receive legacy data may consume it. Another copy with
-    // explicit state must not discard history needed by a later destination.
+    // Legacy rows lack source/provider provenance. Only an exact GUID is a
+    // safe automatic match. Never guess the type behind a bare provider key.
     let users: Vec<String> = sqlx::query_scalar(
         r#"SELECT DISTINCT "UserId" FROM "UserData" ud WHERE "ItemId" = ?1
-        AND "CustomDataKey" IN (SELECT value FROM json_each(?2))
+        AND "CustomDataKey" = lower(?2)
         AND NOT EXISTS (SELECT 1 FROM "UserData" current
             WHERE current."ItemId" = ?3 AND current."UserId" = ud."UserId")
         AND NOT EXISTS (SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
@@ -1566,7 +1567,7 @@ async fn reattach_user_data_keys(
             AND k."Key" = ud."CustomDataKey")"#,
     )
     .bind(PLACEHOLDER_ID)
-    .bind(&keys)
+    .bind(item_id)
     .bind(item_id)
     .fetch_all(&mut *tx)
     .await
@@ -1574,22 +1575,12 @@ async fn reattach_user_data_keys(
     if users.is_empty() {
         return Ok(());
     }
+    let users = serde_json::to_string(&users).map_err(|e| ServiceError::Backend(e.to_string()))?;
     sqlx::query(
-        r#"WITH keys AS (SELECT key, value FROM json_each(?1)),
-        retained AS MATERIALIZED (
-            SELECT ud.*, ROW_NUMBER() OVER (
-                PARTITION BY ud."UserId"
-                ORDER BY CASE WHEN ud."CustomDataKey" = lower(?2) THEN -1
-                              ELSE CAST(keys.key AS INTEGER) END
-            ) AS priority
-            FROM "UserData" ud JOIN keys ON keys.value = ud."CustomDataKey"
-            WHERE ud."ItemId" = ?3 AND NOT EXISTS (
-                SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
-                JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
-                WHERE s."UserId" = ud."UserId" AND k."Kind" = 'mirror'
-                AND k."Key" = ud."CustomDataKey") AND NOT EXISTS (
-                SELECT 1 FROM "UserData" current
-                WHERE current."ItemId" = ?2 AND current."UserId" = ud."UserId")
+        r#"WITH retained AS MATERIALIZED (
+            SELECT * FROM "UserData" WHERE "ItemId" = ?3
+            AND "CustomDataKey" = lower(?2)
+            AND "UserId" IN (SELECT value FROM json_each(?4))
         )
         INSERT INTO "UserData" (
             "ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
@@ -1598,12 +1589,13 @@ async fn reattach_user_data_keys(
         SELECT ?2, retained."UserId", keys.value, "AudioStreamIndex", "IsFavorite",
             "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
             "Played", "Rating", NULL, "SubtitleStreamIndex"
-        FROM retained CROSS JOIN keys WHERE priority = 1
+        FROM retained CROSS JOIN json_each(?1) keys WHERE true
         ON CONFLICT("ItemId", "UserId", "CustomDataKey") DO NOTHING"#,
     )
     .bind(&keys)
     .bind(item_id)
     .bind(PLACEHOLDER_ID)
+    .bind(&users)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -1611,7 +1603,7 @@ async fn reattach_user_data_keys(
     // available for another matching destination until retention expires.
     sqlx::query(
         r#"DELETE FROM "UserData" AS ud WHERE "ItemId" = ?1
-           AND "CustomDataKey" IN (SELECT value FROM json_each(?2))
+           AND "CustomDataKey" = lower(?2)
            AND "UserId" IN (SELECT value FROM json_each(?3))
            AND NOT EXISTS (SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
                JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
@@ -1619,8 +1611,8 @@ async fn reattach_user_data_keys(
                AND k."Key" = ud."CustomDataKey")"#,
     )
     .bind(PLACEHOLDER_ID)
-    .bind(&keys)
-    .bind(serde_json::to_string(&users).map_err(|e| ServiceError::Backend(e.to_string()))?)
+    .bind(item_id)
+    .bind(&users)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -3031,10 +3023,18 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        if detached
-            && let Some(keys) = crate::user_data_key_repository::load_keys(&mut tx, id).await?
-        {
-            reattach_user_data_keys(&mut tx, &guid_to_db(id), &keys).await?;
+        if detached {
+            for identity in
+                crate::user_data_key_repository::load_identities(&mut tx, &[guid_to_db(id)]).await?
+            {
+                reattach_user_data_keys(
+                    &mut tx,
+                    &identity.id,
+                    &identity.keys,
+                    &identity.retention_keys,
+                )
+                .await?;
+            }
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -3077,11 +3077,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 break;
             };
             after.clone_from(last);
-            for (id, keys) in
-                crate::user_data_key_repository::load_keys_for_items(&mut tx, &ids).await?
-            {
-                if keys.iter().any(|key| retained.contains(key)) {
-                    reattach_user_data_keys(&mut tx, &id, &keys).await?;
+            for identity in crate::user_data_key_repository::load_identities(&mut tx, &ids).await? {
+                if retained.contains(&identity.id.to_lowercase())
+                    || identity
+                        .retention_keys
+                        .iter()
+                        .any(|key| retained.contains(key))
+                {
+                    reattach_user_data_keys(
+                        &mut tx,
+                        &identity.id,
+                        &identity.keys,
+                        &identity.retention_keys,
+                    )
+                    .await?;
                     // Keep candidates for later items/pages: this destination
                     // may already have state for some or all retained users.
                 }
@@ -4172,12 +4181,16 @@ mod tests {
         let db = test_db().await;
         let user = Uuid::new_v4();
         crate::test_support::seed_user(&db, user).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
         let ids = [Uuid::from_u128(100), Uuid::from_u128(101)];
         for (index, (date, count)) in [(first_date, first_count), (second_date, second_count)]
             .into_iter()
             .enumerate()
         {
             seed_item(&db, ids[index], BaseItemKind::Movie).await;
+            svc.save_provider_id(ids[index], "Tmdb", "shared")
+                .await
+                .unwrap();
             crate::test_support::seed_user_data(&db, user, ids[index], true, None).await;
             sqlx::query(
                 r#"UPDATE "UserData" SET "CustomDataKey" = 'shared',
@@ -4201,6 +4214,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept, expected);
+        let destination = Uuid::new_v4();
+        seed_item(&db, destination, BaseItemKind::Movie).await;
+        svc.save_provider_id(destination, "Tmdb", "shared")
+            .await
+            .unwrap();
+        svc.reattach_all_user_data().await.unwrap();
+        let recovered: i64 = sqlx::query_scalar(
+            r#"SELECT "PlaybackPositionTicks" FROM "UserData" WHERE "ItemId" = ?1 LIMIT 1"#,
+        )
+        .bind(guid_to_db(destination))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered, expected,
+            "source snapshots keep the same batch tie-breaks"
+        );
     }
 
     #[tokio::test]

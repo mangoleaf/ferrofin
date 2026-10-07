@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
-use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
+use crate::user_data_keys::{KeySource, retention_keys, user_data_keys, uses_provider_ids};
 
 /// One item's identity fields, read once and reused for the item and (for a
 /// `Season`/`Episode`) its series.
@@ -101,6 +101,23 @@ pub(crate) async fn load_keys_for_items(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<Vec<(String, Vec<String>)>, ServiceError> {
+    Ok(load_identities(conn, ids)
+        .await?
+        .into_iter()
+        .map(|identity| (identity.id, identity.keys))
+        .collect())
+}
+
+pub(crate) struct StoredIdentity {
+    pub id: String,
+    pub keys: Vec<String>,
+    pub retention_keys: Vec<String>,
+}
+
+pub(crate) async fn load_identities(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<Vec<StoredIdentity>, ServiceError> {
     let mut rows = key_rows(conn, ids).await?;
     let mut series: Vec<String> = rows
         .values()
@@ -121,10 +138,11 @@ pub(crate) async fn load_keys_for_items(
             let row = rows.get(id)?;
             let series = row.series_id.and_then(|id| rows.get(&guid_to_db(id)));
             let series_source = series.map(KeyRow::as_source);
-            Some((
-                id.clone(),
-                user_data_keys(&row.as_source(), series_source.as_ref()),
-            ))
+            Some(StoredIdentity {
+                id: id.clone(),
+                keys: user_data_keys(&row.as_source(), series_source.as_ref()),
+                retention_keys: retention_keys(&row.as_source(), series_source.as_ref()),
+            })
         })
         .collect())
 }

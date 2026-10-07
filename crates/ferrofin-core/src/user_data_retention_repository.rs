@@ -47,9 +47,10 @@ pub(crate) async fn capture(
     sources.sort_unstable();
     sources.dedup();
     let identities: std::collections::HashMap<_, _> =
-        crate::user_data_key_repository::load_keys_for_items(tx, &sources)
+        crate::user_data_key_repository::load_identities(tx, &sources)
             .await?
             .into_iter()
+            .map(|identity| (identity.id, identity.retention_keys))
             .collect();
     for (snapshot, item, user) in snapshots {
         sqlx::query(
@@ -82,6 +83,7 @@ pub(crate) async fn recover(
     tx: &mut SqliteConnection,
     item: &str,
     keys: &[String],
+    retention_keys: &[String],
 ) -> Result<(), ServiceError> {
     let keys = json(keys)?;
     let candidates: Vec<i64> = sqlx::query_scalar(
@@ -91,7 +93,7 @@ pub(crate) async fn recover(
         AND NOT EXISTS (SELECT 1 FROM "UserData" current
             WHERE current."ItemId" = ?2 AND current."UserId" = s."UserId")"#,
     )
-    .bind(&keys)
+    .bind(json(retention_keys)?)
     .bind(item)
     .fetch_all(&mut *tx)
     .await
@@ -102,7 +104,8 @@ pub(crate) async fn recover(
     sqlx::query(
         r#"WITH ranked AS MATERIALIZED (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY "UserId"
-                ORDER BY "RetentionDate" DESC, "SnapshotId" DESC) AS priority
+                ORDER BY "RetentionDate" DESC, "LastPlayedDate" DESC, "PlayCount" DESC,
+                    "ItemId" ASC, "SnapshotId" DESC) AS priority
             FROM "FerrofinUserDataRetentionSnapshots" s
             WHERE "SnapshotId" IN (SELECT value FROM json_each(?1))
         )
