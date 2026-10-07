@@ -88,6 +88,13 @@ fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
+    /// Serializes named saves through validation, persistence and live updates.
+    pub configuration_write_lock: tokio::sync::Mutex<()>,
+    /// Store validators registered by the composition root, keyed case-insensitively.
+    pub configuration_validators: std::collections::HashMap<
+        String,
+        Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
+    >,
     /// The network policy — which peers count as local, and which remote ones
     /// may reach the server at all (`RemoteIPFilter`).
     ///
@@ -301,6 +308,8 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
+            configuration_write_lock: tokio::sync::Mutex::new(()),
+            configuration_validators: std::collections::HashMap::new(),
             // Wired by the composition root via `with_network`.
             network: None,
             library,
@@ -515,6 +524,24 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_live_tv must be called before the state is shared");
         inner.live_tv = Some(live_tv);
+        self
+    }
+
+    /// Registers a named store's validation before the state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been cloned.
+    #[must_use]
+    pub fn with_configuration_validator(
+        mut self,
+        key: &str,
+        validator: Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_configuration_validator must precede sharing")
+            .configuration_validators
+            .insert(key.to_ascii_lowercase(), validator);
         self
     }
 

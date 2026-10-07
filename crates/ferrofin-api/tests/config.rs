@@ -1271,3 +1271,122 @@ async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization()
     );
     assert_eq!(get(app, uri).await.0, StatusCode::OK);
 }
+
+/// The store is supplied by the host; these tests exercise its API boundary.
+struct RejectEncoderChange;
+
+impl ferrofin_common::configuration::ValidatingConfiguration for RejectEncoderChange {
+    fn validate(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> Result<(), ferrofin_common::configuration::ConfigurationValidationError> {
+        use ferrofin_common::configuration::ConfigurationValidationError;
+        let old: ferrofin_model::configuration::EncodingOptions =
+            serde_json::from_str(old).unwrap();
+        let new: ferrofin_model::configuration::EncodingOptions =
+            serde_json::from_str(new).unwrap();
+        assert_eq!(old.encoding_thread_count, 7);
+        if new.transcoding_temp_path.as_deref() == Some("missing") {
+            return Err(ConfigurationValidationError::DirectoryNotFound(
+                "missing directory".into(),
+            ));
+        }
+        Err(ConfigurationValidationError::InvalidOperation(
+            "rejected update".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn registered_store_validates_before_replacing_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = br#"{"EncodingThreadCount":7}"#;
+    write_named_config(dir.path(), "encoding", original);
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_configuration_validator("ENCODING", Arc::new(RejectEncoderChange));
+    for (body, status) in [
+        (
+            serde_json::json!({"TranscodingTempPath":"missing"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            serde_json::json!({"EncoderAppPath":"changed"}),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        assert_eq!(
+            post(app.clone(), "/System/Configuration/Encoding", &body).await,
+            status
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("named/encoding.json")).unwrap(),
+            original
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+    let dir = tempfile::tempdir().unwrap();
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), ""),
+    )));
+    let remote = "203.0.113.9".parse().unwrap();
+    let uri = "/System/Configuration/network";
+    let body = serde_json::json!({"LocalNetworkSubnets":["203.0.113.0/24"]});
+    // A destination directory makes rename fail after the temporary file is written.
+    std::fs::create_dir_all(dir.path().join("named/network.json")).unwrap();
+    assert!(!state.is_in_local_network(remote));
+    assert_eq!(
+        post(state.clone(), uri, &body).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!state.is_in_local_network(remote));
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+    std::fs::remove_dir(dir.path().join("named/network.json")).unwrap();
+    let mut workers = tokio::task::JoinSet::new();
+    for index in 0..20 {
+        let app = state.clone();
+        workers.spawn(async move {
+            let subnets = if index % 2 == 0 {
+                vec!["203.0.113.0/24"]
+            } else {
+                vec!["192.168.0.0/16"]
+            };
+            post(
+                app,
+                uri,
+                &serde_json::json!({"LocalNetworkSubnets": subnets}),
+            )
+            .await
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+    }
+    let saved: NetworkConfiguration =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    let expected = NetworkManager::with_defaults(saved, "").is_in_local_network(remote);
+    assert_eq!(state.is_in_local_network(remote), expected);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+}

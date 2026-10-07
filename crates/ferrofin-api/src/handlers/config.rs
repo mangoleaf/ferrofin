@@ -377,40 +377,72 @@ async fn update_named_configuration(
         state.config.update_branding(&branding).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
+    // Once accepted, finish persistence and the live update even if the HTTP
+    // client disconnects. The worker owns the save lock until both are done.
+    tokio::spawn(save_named_configuration(state, key, body))
+        .await
+        .map_err(|error| {
+            ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
+        })??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn save_named_configuration(
+    state: AppState,
+    key: String,
+    body: Value,
+) -> Result<(), ApiError> {
+    use ferrofin_common::configuration::ConfigurationValidationError;
+    use ferrofin_traits::error::ServiceError;
     let path = named_config_file(&state, &key)
         .ok_or_else(|| ApiError::BadRequest("invalid configuration key".to_owned()))?;
-    let io_err = |e: &std::io::Error| {
-        ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
-            "persist configuration `{key}`: {e}"
-        )))
+    let _save = state.configuration_write_lock.lock().await;
+    // Parse everything needed by the live consumer before replacing the file.
+    let network = if key.eq_ignore_ascii_case("network") {
+        Some(
+            serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(body.clone())
+                .map_err(|error| configuration_error(&error))?,
+        )
+    } else {
+        None
     };
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| io_err(&e))?;
-    }
-    let bytes = serde_json::to_vec_pretty(&body).map_err(|e| {
-        ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
-            "serialize configuration `{key}`: {e}"
-        )))
-    })?;
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|e| io_err(&e))?;
-    // The network policy caches its parsed subnets, so a saved
-    // `LocalNetworkSubnets` / `RemoteIPFilter` has to be pushed into it or it
-    // would keep enforcing the configuration the server booted with until a
-    // restart. C# `NetworkManager` subscribes to the same configuration event.
-    if key.eq_ignore_ascii_case("network") {
-        match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(body) {
-            Ok(config) => state.update_network_settings(&config),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "the saved network configuration could not be read back; the running policy is unchanged"
-            ),
+    let json = serde_json::to_string_pretty(&body).map_err(|error| configuration_error(&error))?;
+    if let Some(validator) = state
+        .configuration_validators
+        .get(&key.to_ascii_lowercase())
+    {
+        let saved = read_named_config(&path).await;
+        // Validate against the same typed/default value exposed by GET. In
+        // particular, a malformed old encoding file must remain repairable.
+        let old = if key.eq_ignore_ascii_case("encoding") {
+            serde_json::to_string(&load_named_configuration::<
+                ferrofin_model::configuration::EncodingOptions,
+            >(&key, saved))
+        } else {
+            serde_json::to_string(&saved.unwrap_or_else(|| serde_json::json!({})))
         }
+        .map_err(|error| configuration_error(&error))?;
+        validator
+            .validate(&old, &json)
+            .map_err(|error| match error {
+                ConfigurationValidationError::DirectoryNotFound(message) => {
+                    ServiceError::not_found(message)
+                }
+                ConfigurationValidationError::InvalidOperation(message) => {
+                    ServiceError::backend(message)
+                }
+            })?;
     }
-    Ok(StatusCode::NO_CONTENT)
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+    })
+    .await
+    .map_err(|error| ServiceError::backend(format!("configuration writer: {error}")))?
+    .map_err(|error| ServiceError::backend(format!("persist configuration `{key}`: {error}")))?;
+    if let Some(config) = network {
+        state.update_network_settings(&config);
+    }
+    Ok(())
 }
 
 /// `GET /System/Configuration/Branding` — the branding configuration.

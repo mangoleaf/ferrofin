@@ -2113,7 +2113,12 @@ pub async fn build_app_state(
     }
 
     // The host and HTTP policy share one network manager, constructed above.
-    let state = state.with_network(network);
+    let state = state.with_network(network).with_configuration_validator(
+        "encoding",
+        Arc::new(
+            ferrofin_mediaencoding::configuration::store::EncodingConfigurationStore::default(),
+        ),
+    );
 
     // ---- virtual-folder (library-structure) store -------------------------
     // The `/Library/VirtualFolders*` + `/Library/PhysicalPaths` admin surface is

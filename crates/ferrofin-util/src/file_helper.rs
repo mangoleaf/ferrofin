@@ -4,6 +4,50 @@
 use std::io;
 use std::path::Path;
 
+/// Replaces a file only after its complete new contents have reached disk.
+///
+/// The temporary file is private and lives beside the destination so rename
+/// is atomic. A failed write or rename leaves the previous file intact.
+/// Call from a blocking worker when used by an async service.
+///
+/// # Errors
+///
+/// Returns a filesystem error without truncating the destination.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    atomic_replace_with(path, |file| file.write_all(contents))
+}
+
+fn atomic_replace_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".ferrofin-config-{}", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Creates, or truncates, a file at the specified path.
 ///
 /// # Errors
@@ -46,6 +90,27 @@ pub fn ensure_writable_dir<P: AsRef<Path>>(dir: P) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+
+    #[test]
+    fn atomic_write_preserves_previous_file_when_a_write_fails() {
+        use std::io::Write as _;
+        let dir = temp_dir().join(format!("ferrofin-atomic-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("settings.json");
+        atomic_write(&path, b"original").unwrap();
+        let result = atomic_replace_with(&path, |file| {
+            file.write_all(b"incomplete")?;
+            Err(io::Error::other("disk full"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        atomic_write(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        // A rename failure also cleans up its temporary file.
+        assert!(atomic_write(&dir, b"cannot replace a directory").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn ensure_writable_dir_creates_and_probes() {
