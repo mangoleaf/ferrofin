@@ -231,6 +231,7 @@ pub mod text_util;
 pub mod translate_query;
 pub mod trickplay_manager;
 pub mod tv_series_manager;
+mod user_data_key_repository;
 pub mod user_data_keys;
 pub mod user_data_manager;
 pub mod user_entity_ext;
