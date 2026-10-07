@@ -698,16 +698,40 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// the provider. `200` means the credentials work; a rejected login is `401`, a
 /// missing account and API key override `400`. The API key is optional when
 /// account credentials are provided (Jellyfin's shared key is used).
+///
+/// The body binds like every MVC body (member names ignoring case), then
+/// reaches the provider in its canonical PascalCase.
 async fn validate_open_subtitles_login(
     RequireAuth(_auth): RequireAuth,
     State(state): State<AppState>,
-    body: axum::body::Bytes,
+    JsonBody(body): JsonBody<LoginInfoBody>,
 ) -> Result<StatusCode, ApiError> {
+    let canonical =
+        serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
     state
         .subtitles
-        .validate_provider_login("opensubtitles", &body)
+        .validate_provider_login("opensubtitles", &canonical)
         .await?;
     Ok(StatusCode::OK)
+}
+
+/// The `ValidateLoginInfo` body: upstream's `LoginInfoInput`
+/// (`Username`/`Password`, bound by the MVC binder) plus Ferrofin's optional
+/// `ApiKey` override.
+///
+/// No `Debug`: it carries a plaintext password.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LoginInfoBody {
+    /// The optional API key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    /// The account username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    /// The account password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
 }
 
 #[cfg(test)]
