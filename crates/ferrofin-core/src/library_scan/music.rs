@@ -1601,6 +1601,7 @@ impl LibraryScanner {
             },
         );
         let key = work.id.to_string();
+        let meta_root = meta_root.resolve();
         let dir = meta_root.join(&key);
         let mut images = stored.clone();
         match fetch.images {
@@ -1623,7 +1624,7 @@ impl LibraryScanner {
                 // later" (`MergeImages` → `UpdateReplaceImages`).
                 let with_media: HashSet<ImageType> = stored
                     .iter()
-                    .filter(|i| !std::path::Path::new(&i.path).starts_with(meta_root))
+                    .filter(|i| !std::path::Path::new(&i.path).starts_with(&meta_root))
                     .map(|i| i.image_type)
                     .collect();
                 let mut downloaded =

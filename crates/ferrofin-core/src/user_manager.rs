@@ -31,6 +31,7 @@
 //! - `update_policy` persists the flat `Users` columns, permissions, list-valued
 //!   preferences, and access schedules in one transaction.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -104,7 +105,7 @@ pub struct FerrofinUserManager {
     /// The directory user profile images are written under
     /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
     /// rejects uploads until a directory is configured.
-    profile_image_dir: Option<std::path::PathBuf>,
+    profile_image_dir: Option<DirectoryPath>,
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
 }
 
@@ -259,8 +260,8 @@ impl FerrofinUserManager {
     /// Sets the directory user profile images are stored under, enabling
     /// [`save_profile_image`](ferrofin_traits::library::UserManager::save_profile_image).
     #[must_use]
-    pub fn with_profile_image_dir(mut self, dir: std::path::PathBuf) -> Self {
-        self.profile_image_dir = Some(dir);
+    pub fn with_profile_image_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.profile_image_dir = Some(dir.into());
         self
     }
 
@@ -1535,8 +1536,10 @@ mod tests {
             Arc::new(ferrofin_drawing::NullImageEncoder),
             dir.path().join("cache"),
         ));
+        let current = Arc::new(std::sync::RwLock::new(dir.path().join("users")));
+        let source = Arc::clone(&current);
         let mgr = FerrofinUserManager::new(db)
-            .with_profile_image_dir(dir.path().join("users"))
+            .with_profile_image_dir(DirectoryPath::live(move || source.read().unwrap().clone()))
             .with_image_processor(processor);
         let user = mgr.create_user("synthetic-avatar").await.unwrap();
         assert!(
@@ -1564,6 +1567,8 @@ mod tests {
                 .as_deref(),
             Some(first.as_str())
         );
+        let replacement = dir.path().join("new-root/users");
+        *current.write().unwrap() = replacement.clone();
         mgr.save_profile_image(&user, b"replacement", "image/jpeg", ".jpg")
             .await
             .unwrap();
@@ -1574,6 +1579,20 @@ mod tests {
             .primary_image_tag
             .unwrap();
         assert_ne!(first, second);
+        let info = mgr
+            .get_profile_image(Uuid::parse_str(&user.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::path::Path::new(&info.path).starts_with(&replacement));
+        assert!(std::path::Path::new(&info.path).is_file());
+        assert!(
+            dir.path()
+                .join("users")
+                .join(&user.id)
+                .join("profile.png")
+                .is_file()
+        );
         mgr.clear_profile_image(&user).await.unwrap();
         assert!(
             mgr.get_user_dto(&user, None)

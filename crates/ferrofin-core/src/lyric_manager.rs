@@ -45,6 +45,7 @@
 //! registered the manager behaves like a server without a lyric plugin: search
 //! is empty, download misses.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -88,7 +89,7 @@ pub struct FerrofinLyricManager {
     /// downloaded lyrics always land under `{metadata}/library/{id2}/{idN}`,
     /// which is what makes an upload work over a read-only media mount. Absent
     /// → only the media folder can be written (unit-test default).
-    metadata_path: Option<PathBuf>,
+    metadata_path: Option<DirectoryPath>,
     /// The virtual-folder seam used to resolve the item's library options, i.e.
     /// `LibraryOptions.SaveLyricsWithMedia`. Absent → treated as `false`, the
     /// upstream default: never write into the media folder unasked.
@@ -137,7 +138,7 @@ impl FerrofinLyricManager {
     /// uploaded/downloaded lyrics are always written under — Jellyfin's
     /// `Audio.GetInternalMetadataPath()` target.
     #[must_use]
-    pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
+    pub fn with_metadata_path(mut self, metadata_path: impl Into<DirectoryPath>) -> Self {
         self.metadata_path = Some(metadata_path.into());
         self
     }
@@ -1244,8 +1245,12 @@ mod tests {
             text: "[00:17.12]I want to live".to_owned(),
         });
         let fake = Arc::new(fake);
+        let current = Arc::new(std::sync::RwLock::new(meta.path().to_path_buf()));
+        let source = Arc::clone(&current);
         let mgr = manager_over(&db, vec![Arc::clone(&fake) as Arc<dyn LyricProvider>])
-            .with_metadata_path(meta.path());
+            .with_metadata_path(ferrofin_util::directory_path::DirectoryPath::live(
+                move || source.read().unwrap().clone(),
+            ));
 
         let lyric_id = format!("{}_42_synced", provider_id("Fake"));
         let dto = mgr
@@ -1278,6 +1283,14 @@ mod tests {
         mgr.delete_lyrics(item_id).await.expect("delete");
         assert!(!saved.exists());
         assert!(mgr.get_lyrics(item_id).await.expect("get").is_none());
+        let replacement = tempfile::tempdir().expect("new metadata");
+        *current.write().unwrap() = replacement.path().to_path_buf();
+        mgr.download_lyrics(item_id, &lyric_id)
+            .await
+            .expect("download after change");
+        assert!(metadata_sidecar(replacement.path(), item_id, "song", "lrc").is_file());
+        assert!(!saved.exists());
+        assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
     }
 
     #[tokio::test]

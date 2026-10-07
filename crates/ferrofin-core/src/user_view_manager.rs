@@ -18,6 +18,7 @@
 //! channel views, and per-user view ordering from display preferences. Hidden
 //! views (`MyMediaExcludes`) are filtered from the row set returned here.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -149,7 +150,7 @@ pub struct FerrofinUserViewManager {
     /// `{InternalMetadataPath}`, under which the Live TV `UserView` row lives at
     /// `views/livetv`. Set by the composition root; `None` in unit tests keeps
     /// the manager from provisioning the view.
-    metadata_path: Option<PathBuf>,
+    metadata_path: Option<DirectoryPath>,
     /// The user manager — needed to load the [`UserEntity`] whose visibility
     /// rules decide whether a playlists/boxsets library has a visible child
     /// (12.1 `UserViewManager.HasVisibleChild`). Without it (unit tests) the
@@ -189,7 +190,7 @@ impl FerrofinUserViewManager {
     /// Attaches `{InternalMetadataPath}` so the Live TV `UserView` row can be
     /// provisioned at `views/livetv`. Called once by the composition root.
     #[must_use]
-    pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
+    pub fn with_metadata_path(mut self, metadata_path: impl Into<DirectoryPath>) -> Self {
         self.metadata_path = Some(metadata_path.into());
         self
     }
@@ -716,7 +717,7 @@ impl FerrofinUserViewManager {
         crate::user_view_repository::consolidate_localized_user_views(
             db,
             &self.id_derivation,
-            metadata_path,
+            &metadata_path.resolve(),
         )
         .await
     }

@@ -17,6 +17,7 @@
 //! - [`Self::delete_subtitles`] removes the external stream row + sidecar file.
 //! - [`Self::get_supported_providers`] lists the registered providers for an item.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -46,7 +47,7 @@ pub struct FerrofinSubtitleManager {
     /// Internal-metadata base (`{program-data}/metadata`). Uploaded subtitles fall
     /// back here (`.../library/{id2}/{idN}/`) when the media folder is not writable
     /// (e.g. a read-only library mount), mirroring Jellyfin's non-media-folder save.
-    metadata_path: PathBuf,
+    metadata_path: DirectoryPath,
 }
 
 impl std::fmt::Debug for FerrofinSubtitleManager {
@@ -66,7 +67,7 @@ impl FerrofinSubtitleManager {
         library_manager: Arc<dyn LibraryManager>,
         media_streams: Arc<dyn MediaStreamRepository>,
         providers: Vec<Arc<dyn SubtitleProvider>>,
-        metadata_path: impl Into<PathBuf>,
+        metadata_path: impl Into<DirectoryPath>,
     ) -> Self {
         Self {
             db,
@@ -612,12 +613,14 @@ mod tests {
         set_item_path(&db, item, &media).await;
 
         let meta = tempfile::tempdir().expect("meta tempdir");
+        let current = Arc::new(std::sync::RwLock::new(meta.path().to_path_buf()));
+        let source = Arc::clone(&current);
         let mgr = FerrofinSubtitleManager::new(
             db.clone(),
             library_manager_over(db.clone()),
             Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
             vec![],
-            meta.path().to_path_buf(),
+            DirectoryPath::live(move || source.read().unwrap().clone()),
         );
 
         let resp = SubtitleResponse {
@@ -652,6 +655,19 @@ mod tests {
         assert_eq!(streams.len(), 1);
         assert!(streams[0].is_external);
         assert_eq!(streams[0].path.as_deref(), expected.to_str());
+        let replacement = tempfile::tempdir().expect("new metadata");
+        *current.write().unwrap() = replacement.path().to_path_buf();
+        mgr.upload_subtitle(item, &resp)
+            .await
+            .expect("upload after change");
+        let changed = replacement
+            .path()
+            .join("library")
+            .join(&dashless[..2])
+            .join(&dashless)
+            .join("Movie.eng.srt");
+        assert_eq!(std::fs::read(&changed).unwrap(), resp.content);
+        assert!(expected.is_file(), "previous metadata is not relocated");
     }
 
     #[tokio::test]

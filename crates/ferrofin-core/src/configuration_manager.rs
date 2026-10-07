@@ -14,7 +14,7 @@
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
 //!   the metadata path against the filesystem. Successful saves notify registered
 //!   observers; the metadata-path validation is preserved
-//!   ([`validate_metadata_path`](Self::validate_metadata_path)): a new, non-empty
+//!   ([`prepare_metadata_path`]): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
 //!   reproduced by pushing the new `MetadataPath` into the shared
@@ -412,6 +412,7 @@ impl FerrofinServerConfigurationManager {
         }
 
         initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
+        prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
 
         Ok(Self {
@@ -572,29 +573,6 @@ impl FerrofinServerConfigurationManager {
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)
     }
-
-    /// Validates a proposed metadata path, mirroring C# `ValidateMetadataPath`.
-    ///
-    /// A new, non-empty path that differs from the current one must already
-    /// exist as a directory; otherwise the update is rejected. An unchanged or
-    /// blank path is always accepted.
-    fn validate_metadata_path(&self, new_path: &str) -> Result<(), ServiceError> {
-        if new_path.trim().is_empty() {
-            return Ok(());
-        }
-        // Read through the shared handle: this only needs one field, so a deep
-        // clone of the whole document would be pure waste.
-        let current = self.snapshot_shared();
-        if new_path == current.metadata_path {
-            return Ok(());
-        }
-        if !PathBuf::from(new_path).is_dir() {
-            return Err(ServiceError::InvalidInput(format!(
-                "metadata path does not exist: {new_path}"
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -624,7 +602,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         // Hold the writer through validation, persistence, publication and
         // notification. A cancelled caller must not leave disk ahead of memory.
         let save = Arc::clone(&self.write_lock).lock_owned().await;
-        self.validate_metadata_path(&configuration.metadata_path)?;
+        let old_metadata = self.snapshot_shared().metadata_path.clone();
         let old_cache = self.snapshot_shared().cache_path.clone();
         let replacement = Arc::new(configuration.clone());
         let json = serde_json::to_vec_pretty(configuration)
@@ -635,6 +613,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         let listeners = Arc::clone(&self.listeners);
         tokio::task::spawn_blocking(move || {
             let _save = save;
+            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
             if let Some(cache) = replacement
                 .cache_path
                 .as_deref()
@@ -712,6 +691,33 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
     }
+}
+
+/// A changed dashboard directory must already exist and accept a write.
+/// Startup and unchanged paths are created if absent, as in UpdateMetadataPath.
+fn prepare_metadata_path(
+    paths: &FerrofinServerApplicationPaths,
+    proposed: &str,
+    previous: Option<&str>,
+) -> Result<(), ServiceError> {
+    let metadata = if proposed.trim().is_empty() {
+        PathBuf::from(paths.default_internal_metadata_path())
+    } else {
+        PathBuf::from(proposed)
+    };
+    if !proposed.trim().is_empty() && previous.is_some_and(|old| old != proposed) {
+        if !metadata.is_dir() {
+            return Err(ServiceError::not_found(format!(
+                "metadata path does not exist: {proposed}"
+            )));
+        }
+        let probe = metadata.join(uuid::Uuid::new_v4().to_string());
+        std::fs::File::create_new(&probe)
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| io_err("validate metadata directory", &metadata, &e))?;
+    }
+    std::fs::create_dir_all(&metadata)
+        .map_err(|e| io_err("prepare metadata directory", &metadata, &e))
 }
 
 fn initialize_cache_path(
@@ -1155,7 +1161,7 @@ mod tests {
         ));
     }
 
-    /// `validate_metadata_path` reads the live document, so an unchanged path is
+    /// Metadata-path validation reads the live document, so an unchanged path is
     /// accepted even after the configuration has been replaced.
     #[tokio::test]
     async fn metadata_path_validation_reads_the_current_document() {
@@ -1279,6 +1285,46 @@ mod tests {
         assert!(mgr.get_encoding_options().await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_directory_write_failure_preserves_config_and_clearing_resets_live_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let original = paths.internal_metadata_path();
+        let valid = tmp.path().join("custom-metadata");
+        std::fs::create_dir(&valid).expect("mkdir");
+        let mut config = mgr.snapshot();
+        config.metadata_path = valid.to_string_lossy().into_owned();
+        mgr.update_configuration(&config).await.expect("save valid");
+        assert_eq!(paths.internal_metadata_path(), config.metadata_path);
+        let previous = std::fs::read(&mgr.config_file).expect("read config");
+        let blocked = tmp.path().join("readonly");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555))
+            .expect("readonly");
+        config.metadata_path = blocked.to_string_lossy().into_owned();
+        let cannot_write = std::fs::File::create(blocked.join("probe")).is_err();
+        let result = mgr.update_configuration(&config).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        if cannot_write {
+            assert!(matches!(result, Err(ServiceError::Backend(_))));
+            assert_eq!(
+                std::fs::read(&mgr.config_file).expect("read config"),
+                previous
+            );
+            assert_eq!(paths.internal_metadata_path(), valid.to_string_lossy());
+        }
+        config.metadata_path = String::new();
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_eq!(paths.internal_metadata_path(), original);
+        assert!(std::path::Path::new(&original).is_dir());
+    }
+
     #[tokio::test]
     async fn update_rejects_missing_metadata_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1293,7 +1339,7 @@ mod tests {
             .update_configuration(&cfg)
             .await
             .expect_err("should reject");
-        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
     /// A fresh install is 12.0's `false`; an adopted `system.xml` carries its

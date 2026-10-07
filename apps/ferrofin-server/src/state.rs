@@ -302,6 +302,12 @@ pub async fn build_app_state(
             .context("failed to load server configuration")?,
     );
     let server_config = config_mgr.snapshot();
+    let metadata_root = {
+        let paths = Arc::clone(&paths);
+        ferrofin_util::directory_path::DirectoryPath::live(move || {
+            paths.internal_metadata_path().into()
+        })
+    };
     let cache_root = {
         let paths = Arc::clone(&paths);
         ferrofin_util::directory_path::DirectoryPath::live(move || paths.cache_path().into())
@@ -494,7 +500,7 @@ pub async fn build_app_state(
         tmdb_client = tmdb_client.with_image_root(root);
     }
     let tmdb_client = Arc::new(tmdb_client);
-    let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
+    let metadata_library = metadata_root.child("library");
     // TheTVDB — a remote provider of series, seasons and episodes. Ships on
     // with the built-in project key (like TMDB); a user key/PIN override
     // enables their subscription tier. The plugin's `CacheDurationInHours`
@@ -684,9 +690,7 @@ pub async fn build_app_state(
         FerrofinUserManager::new(db.clone())
             .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
-            .with_profile_image_dir(
-                std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),
-            )
+            .with_profile_image_dir(metadata_root.child("users"))
             .with_auth_cache(Arc::clone(&auth_cache))
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
@@ -855,7 +859,7 @@ pub async fn build_app_state(
         FerrofinLyricManager::new()
             .with_items(Arc::clone(&item_repository))
             .with_providers(lyric_providers)
-            .with_metadata_path(paths.internal_metadata_path())
+            .with_metadata_path(metadata_root.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders)),
     );
     // Built after the virtual-folder manager: the refresh path reads the
@@ -941,7 +945,7 @@ pub async fn build_app_state(
             // Settles the `UserRootFolder` row on the first
             // `GET /Library/MediaFolders`, memoized by the store.
             .with_user_root(user_root_store.clone())
-            .with_metadata_path(paths.internal_metadata_path())
+            .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
             // 12.1 lists a playlists/boxsets view only when the user can see
@@ -1426,7 +1430,7 @@ pub async fn build_app_state(
             Arc::clone(&library),
             Arc::clone(&media_stream_repository),
             subtitle_providers,
-            paths.internal_metadata_path(),
+            metadata_root.clone(),
         ));
     let subtitle_downloader =
         Arc::new(ferrofin_core::subtitle_downloader::SubtitleDownloader::new(

@@ -13,8 +13,8 @@
 /// lose a file while adopting it. Per-item uploads live outside this directory.
 pub const SHARED_ALBUM_ARTWORK_DIR: &str = "album-covers";
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -1094,7 +1094,7 @@ pub struct LocalProviderManager {
     /// The item-image store (rows) + the directory uploaded images are written
     /// to. Present enables the `save_image`/`delete_image` write paths.
     image_store: Option<Arc<dyn ItemPersistenceService>>,
-    metadata_dir: Option<PathBuf>,
+    metadata_dir: Option<DirectoryPath>,
     /// The TMDB client + item store used by the remote-image ("Choose Image")
     /// methods to resolve an item and list/download its TMDB artwork.
     tmdb: Option<Arc<TmdbClient>>,
@@ -1431,10 +1431,10 @@ impl LocalProviderManager {
     pub fn with_image_store(
         mut self,
         image_store: Arc<dyn ItemPersistenceService>,
-        metadata_dir: PathBuf,
+        metadata_dir: impl Into<DirectoryPath>,
     ) -> Self {
         self.image_store = Some(image_store);
-        self.metadata_dir = Some(metadata_dir);
+        self.metadata_dir = Some(metadata_dir.into());
         self
     }
 
@@ -3195,9 +3195,14 @@ impl ProviderManager for LocalProviderManager {
             .delete_item_image(item_id, image_type, image_index)
             .await?;
         for path in paths {
-            if self.metadata_dir.as_ref().is_some_and(|root| {
-                std::path::Path::new(&path).starts_with(root.join(SHARED_ALBUM_ARTWORK_DIR))
-            }) {
+            // Shared files can belong to a previous metadata root. Their
+            // persisted layout, not today's root, identifies shared ownership.
+            if std::path::Path::new(&path)
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|name| name == SHARED_ALBUM_ARTWORK_DIR)
+            {
                 continue;
             }
             let _ = std::fs::remove_file(&path);

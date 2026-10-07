@@ -18,6 +18,7 @@
 //! `.await`), then an **async persist**. The filesystem seam is synchronous, so
 //! the whole walk fits the sync pass.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1005,7 +1006,7 @@ struct ExternalProbe {
 /// resolver pair and the metadata root the per-item folder derives from.
 struct ExternalProbeSeam {
     resolvers: Arc<ExternalStreamResolvers>,
-    metadata_dir: Option<PathBuf>,
+    metadata_dir: Option<DirectoryPath>,
 }
 
 impl ExternalProbeSeam {
@@ -2786,7 +2787,7 @@ pub struct LibraryScanner {
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
     /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
-    metadata_dir: Option<PathBuf>,
+    metadata_dir: Option<DirectoryPath>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
     /// movie/series with no overview gets its TMDB cast during the scan).
     people: Option<Arc<dyn ferrofin_traits::persistence::PeopleRepository>>,
@@ -3227,17 +3228,21 @@ impl LibraryScanner {
     /// during the scan (Jellyfin's automatic-artwork behaviour). Omitted in unit
     /// tests, which don't hit the network.
     #[must_use]
-    pub fn with_metadata(mut self, tmdb: Arc<TmdbClient>, metadata_dir: PathBuf) -> Self {
+    pub fn with_metadata(
+        mut self,
+        tmdb: Arc<TmdbClient>,
+        metadata_dir: impl Into<DirectoryPath>,
+    ) -> Self {
         self.tmdb = Some(tmdb);
-        self.metadata_dir = Some(metadata_dir);
+        self.metadata_dir = Some(metadata_dir.into());
         self
     }
 
     /// Sets only the metadata art directory (no TMDB client) — the uploaded-art
     /// preservation and library-tile passes work without remote providers.
     #[must_use]
-    pub fn with_metadata_dir(mut self, metadata_dir: PathBuf) -> Self {
-        self.metadata_dir = Some(metadata_dir);
+    pub fn with_metadata_dir(mut self, metadata_dir: impl Into<DirectoryPath>) -> Self {
+        self.metadata_dir = Some(metadata_dir.into());
         self
     }
 
@@ -23616,8 +23621,15 @@ mod tests {
             1,
             "rescan must not extract again"
         );
-        let manager = ferrofin_providers::LocalProviderManager::default()
-            .with_image_store(persistence.clone(), meta);
+        let current = Arc::new(std::sync::RwLock::new(meta.clone()));
+        let source = Arc::clone(&current);
+        let manager = ferrofin_providers::LocalProviderManager::default().with_image_store(
+            persistence.clone(),
+            ferrofin_util::directory_path::DirectoryPath::live(move || {
+                source.read().unwrap().clone()
+            }),
+        );
+        *current.write().unwrap() = tmp.path().join("replacement-metadata");
         let first = Uuid::parse_str(&tracks[0].id).unwrap();
         manager
             .delete_image(first, ImageType::Primary, None)
@@ -23627,6 +23639,7 @@ mod tests {
             Path::new(&cover.path).is_file(),
             "deleting one reference must not delete shared art"
         );
+        *current.write().unwrap() = meta;
         let bytes = std::fs::read(&cover.path).unwrap();
         manager
             .save_image(first, &bytes, "image/png", ImageType::Primary, None)
