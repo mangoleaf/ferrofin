@@ -1225,7 +1225,8 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// Restores retained history using the item's persisted user-data keys.
-    /// Existing destination state wins for each user; restored rows have no
+    /// Existing destination state wins for each user and leaves that user's
+    /// snapshot available for other destinations. Restored rows have no
     /// retention timestamp. Safe to repeat after an id or metadata change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 

@@ -1553,6 +1553,27 @@ async fn reattach_user_data_keys(
 ) -> Result<(), ServiceError> {
     crate::user_data_retention_repository::recover(tx, item_id, keys).await?;
     let keys = serde_json::to_string(keys).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    // Only users who receive legacy data may consume it. Another copy with
+    // explicit state must not discard history needed by a later destination.
+    let users: Vec<String> = sqlx::query_scalar(
+        r#"SELECT DISTINCT "UserId" FROM "UserData" ud WHERE "ItemId" = ?1
+        AND "CustomDataKey" IN (SELECT value FROM json_each(?2))
+        AND NOT EXISTS (SELECT 1 FROM "UserData" current
+            WHERE current."ItemId" = ?3 AND current."UserId" = ud."UserId")
+        AND NOT EXISTS (SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
+            JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
+            WHERE s."UserId" = ud."UserId" AND k."Kind" = 'mirror'
+            AND k."Key" = ud."CustomDataKey")"#,
+    )
+    .bind(PLACEHOLDER_ID)
+    .bind(&keys)
+    .bind(item_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if users.is_empty() {
+        return Ok(());
+    }
     sqlx::query(
         r#"WITH keys AS (SELECT key, value FROM json_each(?1)),
         retained AS MATERIALIZED (
@@ -1586,12 +1607,12 @@ async fn reattach_user_data_keys(
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
-    // Consume the matching retained snapshots, including those superseded by
-    // an explicit destination state. Unmatched keys remain available until
-    // their retention period expires.
+    // Consume only recovered users; skipped users and unmatched keys remain
+    // available for another matching destination until retention expires.
     sqlx::query(
         r#"DELETE FROM "UserData" AS ud WHERE "ItemId" = ?1
            AND "CustomDataKey" IN (SELECT value FROM json_each(?2))
+           AND "UserId" IN (SELECT value FROM json_each(?3))
            AND NOT EXISTS (SELECT 1 FROM "FerrofinUserDataRetentionSnapshots" s
                JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
                WHERE s."UserId" = ud."UserId" AND k."Kind" = 'mirror'
@@ -1599,6 +1620,7 @@ async fn reattach_user_data_keys(
     )
     .bind(PLACEHOLDER_ID)
     .bind(&keys)
+    .bind(serde_json::to_string(&users).map_err(|e| ServiceError::Backend(e.to_string()))?)
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -3023,7 +3045,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // history again for each page. Actual state is read under the writer
         // transaction below. History detached concurrently after this snapshot
         // is picked up by the next scan or its destination's refresh.
-        let mut retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        let retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
             r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1
                UNION SELECT "Key" FROM "FerrofinUserDataRetentionKeys" WHERE "Kind" = 'identity'"#,
         )
@@ -3033,8 +3055,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .map_err(db_err)?
         .into_iter()
         .collect();
+        if retained.is_empty() {
+            return Ok(());
+        }
         let mut after = String::new();
-        while !retained.is_empty() {
+        loop {
             // Release the single writer between pages. No metadata read here
             // can become stale before its recovery write in this transaction.
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
@@ -3057,9 +3082,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             {
                 if keys.iter().any(|key| retained.contains(key)) {
                     reattach_user_data_keys(&mut tx, &id, &keys).await?;
-                    for key in &keys {
-                        retained.remove(key);
-                    }
+                    // Keep candidates for later items/pages: this destination
+                    // may already have state for some or all retained users.
                 }
             }
             tx.commit().await.map_err(db_err)?;
@@ -4359,7 +4383,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(retained, 0, "matching snapshots are consumed");
+        assert_eq!(retained, 1, "the skipped user's snapshot remains available");
     }
 
     #[tokio::test]

@@ -87,9 +87,12 @@ pub(crate) async fn recover(
     let candidates: Vec<i64> = sqlx::query_scalar(
         r#"SELECT DISTINCT s."SnapshotId" FROM "FerrofinUserDataRetentionSnapshots" s
         JOIN "FerrofinUserDataRetentionKeys" k USING ("SnapshotId")
-        WHERE k."Kind" = 'identity' AND k."Key" IN (SELECT value FROM json_each(?1))"#,
+        WHERE k."Kind" = 'identity' AND k."Key" IN (SELECT value FROM json_each(?1))
+        AND NOT EXISTS (SELECT 1 FROM "UserData" current
+            WHERE current."ItemId" = ?2 AND current."UserId" = s."UserId")"#,
     )
     .bind(&keys)
+    .bind(item)
     .fetch_all(&mut *tx)
     .await
     .map_err(db_err)?;
@@ -102,8 +105,6 @@ pub(crate) async fn recover(
                 ORDER BY "RetentionDate" DESC, "SnapshotId" DESC) AS priority
             FROM "FerrofinUserDataRetentionSnapshots" s
             WHERE "SnapshotId" IN (SELECT value FROM json_each(?1))
-            AND NOT EXISTS (SELECT 1 FROM "UserData" current
-                WHERE current."ItemId" = ?2 AND current."UserId" = s."UserId")
         )
         INSERT INTO "UserData" (
             "ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
