@@ -904,6 +904,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
+    /// Moves each stored item of `moves` to its new id and type — the row
+    /// and every row that references it (user data, links, streams, images,
+    /// …) — so what is keyed to the old id follows the item: what a scan asks
+    /// when a file's item kind changed and its id with it (owner decision D4).
+    /// A move whose old id is not stored, or whose new one already is, is
+    /// skipped. Returns the moves made.
+    ///
+    /// The default (a stub/fake service) moves nothing; the scan then plans
+    /// the item anew and the old row is pruned.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is moved then.
+    async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
+        let _ = moves;
+        Ok(Vec::new())
+    }
+
     /// Writes only the file facts of a scanned item whose stored row could
     /// not be read — its `Path`, `ParentId`, `TopParentId` and, when the
     /// stat has them, `DateModified` and `Size` — and only when one of them
@@ -1582,6 +1600,22 @@ pub struct ItemPathRow {
     pub path: Option<String>,
     /// Its `ParentId`: where a path-less item sits.
     pub parent_id: Option<Uuid>,
+}
+
+/// One stored item to move to a new identity
+/// ([`ItemPersistenceService::rekey_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRekey {
+    /// The stored id.
+    pub from: Uuid,
+    /// The id the item's new kind derives.
+    pub to: Uuid,
+    /// The new kind's stored type name.
+    pub type_name: String,
+    /// The folders named after the item that were moved from the old id's
+    /// name to the new one's, `(old, new)`: stored paths under the old folder
+    /// (images, external streams, chapter images) follow.
+    pub dirs: Vec<(String, String)>,
 }
 
 /// One stored row under another, as

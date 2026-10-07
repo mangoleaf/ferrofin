@@ -59,7 +59,7 @@ use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
-    ItemPathRow, ItemPersistenceService, ItemRepository, MediaStreamRepository,
+    ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, MediaStreamRepository,
     StoredImageMetadata, StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
@@ -2870,6 +2870,10 @@ pub struct LibraryScanner {
     /// image rows store, for the local image validation's existence check.
     /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// Where an item's derived data lives on disk, for moving the folders
+    /// named after an item whose kind (and so id) changed. `None` until
+    /// [`with_path_manager`](Self::with_path_manager): those folders stay.
+    path_manager: Option<Arc<dyn ferrofin_traits::system::PathManager>>,
     /// Reads the server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), live: the fetcher gate for a
     /// kind a library saved no `TypeOptions` entry for, and for an item in no
@@ -2972,6 +2976,7 @@ impl LibraryScanner {
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            path_manager: None,
             metadata_options: None,
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
@@ -3102,6 +3107,18 @@ impl LibraryScanner {
         virtual_paths: crate::virtual_paths::VirtualPathExpander,
     ) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// The server's path manager, which names the folders an item's derived
+    /// data lives in (its internal metadata, trickplay tiles, extracted
+    /// subtitles and attachments): an item moved to a new id takes them along.
+    #[must_use]
+    pub fn with_path_manager(
+        mut self,
+        path_manager: Arc<dyn ferrofin_traits::system::PathManager>,
+    ) -> Self {
+        self.path_manager = Some(path_manager);
         self
     }
 
@@ -3892,6 +3909,195 @@ impl LibraryScanner {
         result
     }
 
+    /// Moves a stored item the scan now resolves as another kind to the id
+    /// that kind derives (owner decision D4): an older Ferrofin scan's
+    /// `Movie` for a file a home-video library resolves as a `Video`, or an
+    /// untyped library as an `Episode` or a plain `Video`. The row keeps its
+    /// user data, links and metadata and the scan updates it in place,
+    /// where it would otherwise prune it and insert a stranger.
+    ///
+    /// Only a row this scan would otherwise prune moves: never one at a path
+    /// a library this scan does not plan also holds (that library may own
+    /// the `Movie`), and never where two planned items share the path.
+    /// Returns the moves made.
+    async fn rekey_changed_kinds(
+        &self,
+        planned: &[Planned],
+        folders: &[VirtualFolderInfo],
+        key_folders: &[VirtualFolderInfo],
+    ) -> Result<(Vec<ItemRekey>, Vec<ItemRekey>), ServiceError> {
+        // Only a home-video or untyped library resolves as another kind what
+        // an older scan stored as a `Movie`.
+        let changed_libraries: std::collections::HashSet<Uuid> = folders
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.collection_type,
+                    None | Some(CollectionTypeOptions::homevideos | CollectionTypeOptions::mixed)
+                )
+            })
+            .filter_map(collection_folder_id)
+            .collect();
+        let mut candidates: HashMap<&str, Option<&Planned>> = HashMap::new();
+        for p in planned.iter().filter(|p| {
+            p.entity.owner_id.is_none()
+                && p.ancestors
+                    .first()
+                    .is_some_and(|cf| changed_libraries.contains(cf))
+                && (p.entity.type_.ends_with("Entities.Video")
+                    || p.entity.type_.ends_with(".Episode"))
+        }) {
+            if let Some(path) = p.entity.path.as_deref() {
+                // A second item at the path makes the target ambiguous.
+                candidates
+                    .entry(path)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(p));
+            }
+        }
+        candidates
+            .retain(|path, item| item.is_some() && !held_by_unscanned(path, folders, key_folders));
+        if candidates.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let paths: Vec<String> = candidates.keys().map(|&path| path.to_owned()).collect();
+        let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let planned_ids: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        let stored: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let mut moves: Vec<ItemRekey> = Vec::new();
+        let mut folders_of: Vec<MovedFolders> = Vec::new();
+        for row in rows
+            .iter()
+            .filter(|row| row.item_type.ends_with(".Movie") && !planned_ids.contains(&row.id))
+        {
+            let Some(path) = row.path.as_deref() else {
+                continue;
+            };
+            let Some(Some(item)) = candidates.get(path) else {
+                continue;
+            };
+            // One move per target: a second row for it waits for its own scan.
+            if stored.contains(&item.id) || moves.iter().any(|m| m.to == item.id) {
+                continue;
+            }
+            let (folders, prefixes) = self.move_item_folders(row.id, item.id, path);
+            moves.push(ItemRekey {
+                from: row.id,
+                to: item.id,
+                type_name: item.entity.type_.clone(),
+                dirs: prefixes,
+            });
+            folders_of.push(folders);
+        }
+        if moves.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        // A move that fails, alone or with the rest, leaves the item as it
+        // was: its row (kept out of the prune) and its folders.
+        let done = self.persistence.rekey_items(&moves).await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "could not move items whose kind changed; they keep their ids");
+            Vec::new()
+        });
+        for (m, folders) in moves.iter().zip(folders_of) {
+            if done.contains(m) {
+                folders.commit();
+            } else {
+                folders.undo();
+            }
+        }
+        moves.retain(|m| !done.contains(m));
+        if !done.is_empty() {
+            tracing::info!(
+                moved = done.len(),
+                "moved items whose kind changed to the ids of their new kind"
+            );
+        }
+        Ok((done, moves))
+    }
+
+    /// Renames the folders named after item `from` — its art directory, its
+    /// internal metadata, trickplay, extracted subtitle and attachment
+    /// folders — to `to`'s names ([`move_folders`]). Also returns the path
+    /// prefixes stored paths under them take: each renamed folder, resolved
+    /// and in the `%MetadataPath%` form adopted Jellyfin rows store.
+    fn move_item_folders(
+        &self,
+        from: Uuid,
+        to: Uuid,
+        media_path: &str,
+    ) -> (MovedFolders, Vec<(String, String)>) {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        if let Some(art) = &self.metadata_dir {
+            for (old, new) in [
+                (guid_to_db(from), guid_to_db(to)),
+                (from.simple().to_string(), to.simple().to_string()),
+            ] {
+                let old = if old.len() == 32 {
+                    art.join(&old[..2]).join(&old)
+                } else {
+                    art.join(&old)
+                };
+                let new = if new.len() == 32 {
+                    art.join(&new[..2]).join(&new)
+                } else {
+                    art.join(&new)
+                };
+                pairs.push((
+                    old.to_string_lossy().into_owned(),
+                    new.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        if let Some(paths) = &self.path_manager {
+            if let (Some(old), Some(new)) = (
+                paths.item_metadata_folder(from),
+                paths.item_metadata_folder(to),
+            ) {
+                pairs.push((old, new));
+            }
+            pairs.push((
+                paths.trickplay_directory(from, media_path, false),
+                paths.trickplay_directory(to, media_path, false),
+            ));
+            let (from_source, to_source) = (from.to_string(), to.to_string());
+            for folder in [
+                |p: &dyn ferrofin_traits::system::PathManager, id: &str| p.subtitle_folder_path(id),
+                |p: &dyn ferrofin_traits::system::PathManager, id: &str| {
+                    p.attachment_folder_path(id)
+                },
+            ] {
+                if let (Some(old), Some(new)) = (
+                    folder(paths.as_ref(), &from_source),
+                    folder(paths.as_ref(), &to_source),
+                ) {
+                    pairs.push((old, new));
+                }
+            }
+        }
+        let folders = move_folders(pairs);
+        // `%MetadataPath%` stands for the metadata root, the art root's parent.
+        let root = self
+            .metadata_dir
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|root| root.to_string_lossy().into_owned());
+        let mut prefixes = folders.renamed.clone();
+        if let Some(root) = root {
+            let virtual_form = |path: &str| {
+                path.strip_prefix(root.as_str())
+                    .map(|rest| format!("%MetadataPath%{rest}"))
+            };
+            for (old, new) in &folders.renamed {
+                if let (Some(old), Some(new)) = (virtual_form(old), virtual_form(new)) {
+                    prefixes.push((old, new));
+                }
+            }
+        }
+        (folders, prefixes)
+    }
+
     /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
     /// those rows by path before refreshing them, so the movie resolver cannot
     /// create another item for a file that is already a linked version.
@@ -4066,6 +4272,16 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
+        // First, so the version and owner reuse below sees the moved rows.
+        let (moved, unmade) = self
+            .rekey_changed_kinds(&planned, folders, key_folders)
+            .await?;
+        // An item whose move was not made is not planned anew this scan: its
+        // old row stays as it was (out of the prune), and the next scan tries
+        // the move again.
+        planned
+            .retain(|p| !unmade.iter().any(|m| m.to == p.id) || moved.iter().any(|m| m.to == p.id));
+        let unmoved: Vec<Uuid> = unmade.iter().map(|m| m.from).collect();
         self.reuse_adopted_video_versions(&mut planned, &owner_paths)
             .await?;
         let options = run.options;
@@ -4092,6 +4308,19 @@ impl LibraryScanner {
         // Item ids that did not exist before this scan (→ `ItemsAdded` in the
         // scan-end `LibraryChanged` push). Only tracked when events are wired.
         let mut items_added: Vec<&Planned> = Vec::new();
+        // A moved item is new to a client under its new id, and its old id
+        // is gone.
+        let mut moved_away: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+        if self.events.is_some() {
+            for m in &moved {
+                if let Some(item) = planned.iter().find(|p| p.id == m.to) {
+                    items_added.push(item);
+                    if let Some(&library) = item.ancestors.first() {
+                        moved_away.push((library, vec![m.from]));
+                    }
+                }
+            }
+        }
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
         let (mut art_cache, locked_items, touched) = self.scan_prereads(&planned, run).await;
@@ -4172,7 +4401,12 @@ impl LibraryScanner {
             // after the window read, whose planning stops at a cancel: a
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
-                let stop = self.stop_early(&mut probes, &items_added, outcome, "between items");
+                let stop = self.stop_early(
+                    &mut probes,
+                    (&items_added, &moved_away),
+                    outcome,
+                    "between items",
+                );
                 return Ok(stop.await);
             }
             // An earlier copy of a repeated id: its last copy is the one
@@ -4313,7 +4547,7 @@ impl LibraryScanner {
                     }
                     let at = "inside an item, before any write";
                     return Ok(self
-                        .stop_early(&mut probes, &items_added, outcome, at)
+                        .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
                         .await);
                 }
             }
@@ -4331,7 +4565,12 @@ impl LibraryScanner {
         // A cancellation that landed during the last item skips the pruning
         // and the closing passes, as one between items does.
         if run.cancel.is_cancelled() {
-            let stop = self.stop_early(&mut probes, &items_added, outcome, "after the last item");
+            let stop = self.stop_early(
+                &mut probes,
+                (&items_added, &moved_away),
+                outcome,
+                "after the last item",
+            );
             return Ok(stop.await);
         }
         probes.abort();
@@ -4342,12 +4581,14 @@ impl LibraryScanner {
             &planned,
             scope,
             &unlisted,
-            (&excluded, &superseded),
+            (&excluded, &superseded, &unmoved),
         ))
         .await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
-        self.publish_library_changed(&items_added, &removed).await;
+        moved_away.extend(removed.iter().cloned());
+        self.publish_library_changed(&items_added, &moved_away)
+            .await;
         // Boxed: the post-scan passes (music, years, studio/library/dynamic
         // images) run once per scan, and inlining their state kept the scan
         // future at clippy's `large_futures` ceiling.
@@ -4378,7 +4619,7 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
-        reconciled: (&[String], &[String]),
+        reconciled: (&[String], &[String], &[Uuid]),
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         if scope.is_some_and(|scope| !scope.prune) {
             return Vec::new();
@@ -4580,7 +4821,7 @@ impl LibraryScanner {
     async fn stop_early(
         &self,
         probes: &mut ProbePipeline<'_>,
-        items_added: &[&Planned],
+        (items_added, removed): (&[&Planned], &[(Uuid, Vec<Uuid>)]),
         mut outcome: ScanOutcome,
         at: &'static str,
     ) -> ScanOutcome {
@@ -4592,7 +4833,7 @@ impl LibraryScanner {
             "library scan cancelled"
         );
         probes.abort();
-        self.publish_library_changed(items_added, &[]).await;
+        self.publish_library_changed(items_added, removed).await;
         outcome.stopped = true;
         outcome
     }
@@ -6276,7 +6517,7 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
-        (excluded, superseded): (&[String], &[String]),
+        (excluded, superseded, unmoved): (&[String], &[String], &[Uuid]),
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
@@ -6301,7 +6542,13 @@ impl LibraryScanner {
                     || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type))
             }) && self.still_on_disk(path, &planned_paths)
         };
-        let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        // A row whose move to its new kind's id failed keeps the old one:
+        // live, though nothing planned it.
+        let live: std::collections::HashSet<Uuid> = planned
+            .iter()
+            .map(|p| p.id)
+            .chain(unmoved.iter().copied())
+            .collect();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
                 continue;
@@ -12106,6 +12353,129 @@ fn affected_libraries(
         })
         .cloned()
         .collect()
+}
+
+/// What [`move_folders`] did, to be confirmed or undone once the database
+/// move is known.
+#[derive(Debug, Default)]
+struct MovedFolders {
+    /// The `(old, new)` folders renamed — or found already renamed by an
+    /// earlier attempt cut short between its rename and its commit.
+    renamed: Vec<(String, String)>,
+    /// The `(aside, new)` folders found at a new name (an item no longer
+    /// stored left them), moved aside until the move commits.
+    aside: Vec<(String, String)>,
+}
+
+impl MovedFolders {
+    /// The move committed: what was set aside goes.
+    fn commit(self) {
+        for (aside, _) in self.aside {
+            if let Err(err) = std::fs::remove_dir_all(&aside) {
+                tracing::warn!(%err, path = %aside, "could not remove a folder set aside");
+            }
+        }
+    }
+
+    /// The move was not made: every folder goes back.
+    fn undo(self) {
+        for (old, new) in self.renamed {
+            if let Err(err) = std::fs::rename(&new, &old) {
+                tracing::warn!(%err, from = %new, to = %old, "could not return an item's folder");
+            }
+        }
+        for (aside, new) in self.aside {
+            if let Err(err) = std::fs::rename(&aside, &new) {
+                tracing::warn!(%err, from = %aside, to = %new, "could not restore a folder set aside");
+            }
+        }
+    }
+}
+
+/// Renames each `(old, new)` folder that exists, a folder already at `new`
+/// moved aside first; a pair whose `old` is gone and whose `new` is there was
+/// renamed by an earlier attempt and counts as renamed. A failure is logged
+/// and leaves that folder where it was.
+///
+/// The recovery reads the folders alone, so it cannot tell an earlier
+/// attempt's work from a folder a pruned item with the same id left at `new`,
+/// nor `old` recreated (by an image or trickplay pass on the still-unmoved
+/// row) after a crash from the item's first `old`: in that window the
+/// recreated content wins and the moved one is set aside. The window is one
+/// scan's renames and transaction; the content in it is the item's own.
+fn move_folders(mut pairs: Vec<(String, String)>) -> MovedFolders {
+    pairs.sort();
+    pairs.dedup();
+    let mut moved = MovedFolders::default();
+    for (old, new) in pairs {
+        if old.is_empty() || old == new {
+            continue;
+        }
+        let (old_path, new_path) = (Path::new(&old), Path::new(&new));
+        let aside = format!("{new}.rekey-aside");
+        if !old_path.is_dir() {
+            if new_path.is_dir() {
+                // A folder set aside by that attempt goes, or comes back, with it.
+                if Path::new(&aside).is_dir() {
+                    moved.aside.push((aside, new.clone()));
+                }
+                moved.renamed.push((old, new));
+            }
+            continue;
+        }
+        let result = (|| {
+            if new_path.exists() {
+                if Path::new(&aside).exists() {
+                    std::fs::remove_dir_all(&aside)?;
+                }
+                std::fs::rename(new_path, &aside)?;
+            }
+            if let Some(parent) = new_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(old_path, new_path)
+        })();
+        match result {
+            Ok(()) => {
+                if Path::new(&aside).exists() {
+                    moved.aside.push((aside, new.clone()));
+                }
+                moved.renamed.push((old, new));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    from = %old,
+                    to = %new,
+                    "could not move an item's folder to its new id; it stays"
+                );
+                if Path::new(&aside).exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&aside, new_path);
+                }
+            }
+        }
+    }
+    moved
+}
+
+/// Whether `path` lies under a location of a library in `key_folders` that
+/// the scan of `folders` does not plan: that library may own a row there.
+fn held_by_unscanned(
+    path: &str,
+    folders: &[VirtualFolderInfo],
+    key_folders: &[VirtualFolderInfo],
+) -> bool {
+    key_folders
+        .iter()
+        // A library with no id cannot be told scanned: it counts as not.
+        .filter(|f| {
+            f.item_id.is_none()
+                || !folders
+                    .iter()
+                    .any(|scanned| scanned.item_id.is_some() && scanned.item_id == f.item_id)
+        })
+        .flat_map(|f| &f.locations)
+        .any(|location| path_is_under(path, location.trim_end_matches('/')))
 }
 
 /// Whether `dir` (listed this pass) holds more than one file, every kind
@@ -28573,6 +28943,87 @@ mod tests {
         let audio = rows_of_kind(&db, BaseItemKind::Audio).await;
         assert_eq!(audio.len(), 1, "its track stays, the cue and theme rows go");
         assert_eq!(audio[0].parent_id.as_deref(), Some(cf.as_str()));
+    }
+
+    /// An item's folders move to its new id's names: an existing one is
+    /// renamed (one already at the new name set aside until the move
+    /// commits), a missing one skipped, one an earlier attempt already
+    /// renamed counted; a move not made is undone, the set-aside folder back.
+    #[test]
+    fn an_items_folders_move_to_its_new_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = |rel: &str| tmp.path().join(rel).to_string_lossy().into_owned();
+        let mk = |rel: &str| std::fs::create_dir_all(tmp.path().join(rel)).unwrap();
+        mk("art/OLD");
+        std::fs::write(tmp.path().join("art/OLD/poster.jpg"), b"x").unwrap();
+        mk("tp/NEW/kept");
+        mk("tp/OLD");
+        mk("done/NEW");
+        let pairs = || {
+            vec![
+                (at("art/OLD"), at("art/NEW")),
+                (at("tp/OLD"), at("tp/NEW")),
+                (at("missing/OLD"), at("missing/NEW")),
+                (at("done/OLD"), at("done/NEW")),
+            ]
+        };
+        let moved = super::move_folders(pairs());
+        assert_eq!(
+            moved.renamed,
+            vec![
+                (at("art/OLD"), at("art/NEW")),
+                (at("done/OLD"), at("done/NEW")),
+                (at("tp/OLD"), at("tp/NEW")),
+            ]
+        );
+        assert!(tmp.path().join("art/NEW/poster.jpg").is_file());
+        assert!(!tmp.path().join("tp/NEW/kept").exists(), "set aside");
+        moved.undo();
+        assert!(tmp.path().join("art/OLD/poster.jpg").is_file(), "undone");
+        assert!(
+            tmp.path().join("tp/NEW/kept").is_dir(),
+            "the set-aside folder back"
+        );
+        assert!(tmp.path().join("done/OLD").is_dir());
+
+        mk("done/NEW");
+        std::fs::remove_dir_all(tmp.path().join("done/OLD")).unwrap();
+        super::move_folders(pairs()).commit();
+        assert!(tmp.path().join("tp/NEW").is_dir());
+        assert!(
+            !tmp.path().join("tp/NEW/kept").exists(),
+            "gone once committed"
+        );
+        assert!(!std::path::Path::new(&format!("{}.rekey-aside", at("tp/NEW"))).exists());
+    }
+
+    /// A row at a path another, unscanned library also holds is that
+    /// library's to keep: a single-library scan moves none there.
+    #[test]
+    fn a_path_an_unscanned_library_holds_is_not_this_scans() {
+        let library = |id: &str, location: &str| super::VirtualFolderInfo {
+            item_id: Some(id.to_owned()),
+            locations: vec![location.to_owned()],
+            ..super::VirtualFolderInfo::default()
+        };
+        let movies = library("m", "/media/films/");
+        let home = library("h", "/media");
+        let all = [movies.clone(), home.clone()];
+        let clip = "/media/films/Day 1.mp4";
+        assert!(super::held_by_unscanned(
+            clip,
+            std::slice::from_ref(&home),
+            &all
+        ));
+        assert!(
+            !super::held_by_unscanned(clip, &all, &all),
+            "a full scan plans both"
+        );
+        assert!(!super::held_by_unscanned(
+            "/media/home/Day 1.mp4",
+            std::slice::from_ref(&home),
+            &all
+        ));
     }
 
     // The art-dir helpers behind uploaded-image survival: stem parsing is the

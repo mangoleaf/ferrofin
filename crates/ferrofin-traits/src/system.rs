@@ -257,6 +257,15 @@ pub trait PathManager: Send + Sync {
     /// The folder holding an item's chapter images.
     fn chapter_image_folder_path(&self, item_id: Uuid, media_path: &str) -> String;
 
+    /// An item's own internal metadata folder
+    /// (`{internal metadata}/library/{xx}/{id}`, `BaseItem.GetInternalMetadataPath`),
+    /// where its chapter images and the subtitles saved for it live. `None`
+    /// (the default) from a manager that keeps no such folder.
+    fn item_metadata_folder(&self, item_id: Uuid) -> Option<String> {
+        let _ = item_id;
+        None
+    }
+
     /// The path to a chapter image at a given position (in ticks).
     fn chapter_image_path(
         &self,

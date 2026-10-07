@@ -25,8 +25,8 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
-    FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, StoredImageMetadata,
-    StoredItemLinks,
+    FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey,
+    StoredImageMetadata, StoredItemLinks,
 };
 use std::collections::HashMap;
 
@@ -2454,6 +2454,72 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(Some(out))
     }
 
+    async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
+        if moves.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Every reference moves inside the one transaction; the foreign
+        // keys are checked once, at its end, against the moved rows.
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        // Read off the schema, so a table added later moves too.
+        let mut references: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT m."name", p."from" FROM "sqlite_master" m
+               JOIN pragma_foreign_key_list(m."name") p
+               WHERE m."type" = 'table' AND p."table" = 'BaseItems' COLLATE NOCASE
+                 AND (p."to" IS NULL OR p."to" = 'Id' COLLATE NOCASE)"#,
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        references.extend(
+            REKEY_LOOSE_REFERENCES
+                .iter()
+                .map(|(table, column)| ((*table).to_owned(), (*column).to_owned())),
+        );
+        let mut done = Vec::new();
+        for m in moves {
+            // One savepoint per move: a move that fails is undone alone and
+            // reported unmade, and the rest go ahead.
+            sqlx::query("SAVEPOINT rekey_move")
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            match rekey_one(&mut tx, m, &references).await {
+                Ok(made) => {
+                    sqlx::query("RELEASE rekey_move")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    if made {
+                        done.push(m.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        item_id = %m.from,
+                        to = %m.to,
+                        "could not move an item to its new kind's id; it keeps the old one"
+                    );
+                    sqlx::query("ROLLBACK TO rekey_move")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    sqlx::query("RELEASE rekey_move")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                }
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(done)
+    }
+
     async fn update_file_facts(
         &self,
         item: &BaseItemEntity,
@@ -2835,6 +2901,120 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // deferred to that unit. No-op here so callers can invoke it safely.
         Ok(())
     }
+}
+
+/// Columns that hold an item id without a foreign key on it. History
+/// (`ActivityLogs`, playback sessions) and display preferences stay on the
+/// old id: they record what was, and a leaf item has none worth carrying.
+const REKEY_LOOSE_REFERENCES: [(&str, &str); 5] = [
+    ("BaseItems", "PrimaryVersionId"),
+    ("BaseItems", "SeriesId"),
+    ("BaseItems", "SeasonId"),
+    ("MediaSegments", "ItemId"),
+    ("TrickplayInfos", "ItemId"),
+];
+
+/// The stored paths that may lie in a folder named after an item.
+const REKEY_PATH_COLUMNS: [(&str, &str); 3] = [
+    ("BaseItemImageInfos", "Path"),
+    ("MediaStreamInfos", "Path"),
+    ("Chapters", "ImagePath"),
+];
+
+/// One [`ItemPersistenceService::rekey_items`] move, inside the caller's
+/// transaction: `false` when the old id is not stored or the new one is.
+async fn rekey_one(
+    conn: &mut sqlx::SqliteConnection,
+    m: &ItemRekey,
+    references: &[(String, String)],
+) -> Result<bool, sqlx::Error> {
+    let (from, to) = (guid_to_db(m.from), guid_to_db(m.to));
+    let stored: Vec<(String, bool)> =
+        sqlx::query_as(r#"SELECT "Id", "IsLocked" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
+            .bind(&from)
+            .bind(&to)
+            .fetch_all(&mut *conn)
+            .await?;
+    let Some(&(_, locked)) = stored.iter().find(|(id, _)| *id == from) else {
+        return Ok(false);
+    };
+    if stored.iter().any(|(id, _)| *id == to) {
+        return Ok(false);
+    }
+    // Rows without a foreign key can outlive an item an older scan pruned:
+    // whatever is still keyed by the unstored new id is stale.
+    for sql in [
+        r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1"#,
+        r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" = ?1"#,
+    ] {
+        sqlx::query(sql).bind(&to).execute(&mut *conn).await?;
+    }
+    for (table, column) in references {
+        let sql = format!(r#"UPDATE "{table}" SET "{column}" = ?1 WHERE "{column}" = ?2"#);
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&to)
+            .bind(&from)
+            .execute(&mut *conn)
+            .await?;
+    }
+    // Paths stored under a folder named after the item follow its rename.
+    for (old, new) in &m.dirs {
+        for (table, column) in REKEY_PATH_COLUMNS {
+            let sql = format!(
+                r#"UPDATE "{table}" SET "{column}" = ?2 || substr("{column}", length(?1) + 1)
+                   WHERE "ItemId" = ?3 AND substr("{column}", 1, length(?1) + 1) = ?1 || ?4"#
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(old)
+                .bind(new)
+                .bind(&to)
+                .bind(std::path::MAIN_SEPARATOR_STR)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    // The item's own user-data row is keyed by its id as well
+    // (`UserDataManager`'s guid row, lowercase hyphenated).
+    sqlx::query(
+        r#"UPDATE "UserData" SET "CustomDataKey" = ?1
+           WHERE "ItemId" = ?2 AND "CustomDataKey" = ?3"#,
+    )
+    .bind(m.to.to_string())
+    .bind(&to)
+    .bind(m.from.to_string())
+    .execute(&mut *conn)
+    .await?;
+    // The row takes its new kind and is refreshed as one on the next pass
+    // (`DateLastRefreshed` cleared): no longer a movie.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Id" = ?1, "Type" = ?2, "IsMovie" = 0,
+           "DateLastRefreshed" = NULL WHERE "Id" = ?3"#,
+    )
+    .bind(&to)
+    .bind(&m.type_name)
+    .bind(&from)
+    .execute(&mut *conn)
+    .await?;
+    // A merged version keyed by the old id's presentation key follows it;
+    // the item's own key is derived anew when the scan saves it.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1
+           WHERE "PresentationUniqueKey" = ?2"#,
+    )
+    .bind(m.to.simple().to_string())
+    .bind(m.from.simple().to_string())
+    .execute(&mut *conn)
+    .await?;
+    // Provider ids name a match for the old kind (a movie's TMDB id is no
+    // episode's): the new kind's first refresh matches it afresh. A locked
+    // item refreshes nothing, so it keeps what the user set.
+    if !locked {
+        sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
+            .bind(&to)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(true)
 }
 
 /// Which `LinkedChildren.ChildType` a version link gets: `LocalAlternateVersion`
@@ -7829,6 +8009,201 @@ mod tests {
             .await
             .expect("links");
         (rows, links)
+    }
+
+    /// `rekey_items` moves an item to a new id and type with everything that
+    /// names it — its owned extra, the playlist and collection that link it,
+    /// its user data (the guid-keyed row renamed too) — leaves the foreign
+    /// keys whole, and skips a move whose source is gone or whose target is
+    /// already stored.
+    #[tokio::test]
+    async fn rekey_items_moves_an_item_with_everything_that_names_it() {
+        use ferrofin_traits::persistence::ItemRekey;
+        let db = test_db().await;
+        let (series, _season, episode, extra, _, playlist, boxset) = season_with_links(&db).await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, episode, true, None).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let to = Uuid::new_v4();
+        let video = crate::item_type_lookup::stored_type_name(BaseItemKind::Video)
+            .expect("type")
+            .to_owned();
+        let moves = [
+            ItemRekey {
+                from: episode,
+                to,
+                type_name: video.clone(),
+                dirs: Vec::new(),
+            },
+            // The target already stored: skipped.
+            ItemRekey {
+                from: extra,
+                to: series,
+                type_name: video.clone(),
+                dirs: Vec::new(),
+            },
+        ];
+        let done = svc.rekey_items(&moves).await.expect("rekey");
+        assert_eq!(done, vec![moves[0].clone()]);
+
+        assert!(
+            crate::test_support::fetch_item_opt(&db, episode)
+                .await
+                .is_none()
+        );
+        let rekeyed = crate::test_support::fetch_item(&db, to).await;
+        assert_eq!(rekeyed.type_, video);
+        let extra_row = crate::test_support::fetch_item(&db, extra).await;
+        assert_eq!(extra_row.owner_id, Some(guid_to_db(to)));
+        for container in [playlist, boxset] {
+            let linked: i64 = sqlx::query_scalar(
+                r#"SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
+            )
+            .bind(guid_to_db(container))
+            .bind(guid_to_db(to))
+            .fetch_one(db.pool())
+            .await
+            .expect("links");
+            assert_eq!(linked, 1);
+        }
+        let user_data: Vec<(String, String)> =
+            sqlx::query_as(r#"SELECT "ItemId", "CustomDataKey" FROM "UserData""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("user data");
+        assert_eq!(user_data, vec![(guid_to_db(to), to.to_string())]);
+        let broken: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .expect("check");
+        assert!(broken.is_empty(), "{broken:?}");
+        assert!(
+            svc.rekey_items(&moves[..1])
+                .await
+                .expect("again")
+                .is_empty(),
+            "the source is gone"
+        );
+    }
+
+    /// A move clears what a pruned item left keyed by the new id (media
+    /// segments, trickplay rows — no foreign key removes them), moves the
+    /// item's own segments, trickplay and ancestors, rewrites stored paths
+    /// under a moved folder, drops its provider ids (a match for the old
+    /// kind), and carries a merged version's presentation key with it.
+    // Seeds and reads back one row in each of six tables: one straight line.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn rekey_items_clears_stale_rows_and_carries_versions() {
+        use ferrofin_traits::persistence::ItemRekey;
+        let db = test_db().await;
+        let (movie, alternate, folder, to) = (
+            Uuid::from_u128(0xA1),
+            Uuid::from_u128(0xA2),
+            Uuid::from_u128(0xA3),
+            Uuid::from_u128(0xA4),
+        );
+        seed_item(&db, folder, BaseItemKind::Folder).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, alternate, BaseItemKind::Video).await;
+        crate::test_support::seed_provider_id(&db, movie, "Tmdb", "603").await;
+        let exec = |sql: &'static str, binds: Vec<String>| {
+            let db = db.clone();
+            async move {
+                let mut query = sqlx::query(sql);
+                for bind in binds {
+                    query = query.bind(bind);
+                }
+                query.execute(db.writer()).await.expect("seed");
+            }
+        };
+        exec(
+            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1 WHERE "Id" = ?2"#,
+            vec![movie.simple().to_string(), guid_to_db(alternate)],
+        )
+        .await;
+        exec(
+            r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
+            vec![guid_to_db(movie), guid_to_db(folder)],
+        )
+        .await;
+        for (id, item) in [("S1", movie), ("S2", to)] {
+            exec(
+                r#"INSERT INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId",
+                   "StartTicks", "Type") VALUES (?1, 10, ?2, 'p', 0, 1)"#,
+                vec![id.to_owned(), guid_to_db(item)],
+            )
+            .await;
+        }
+        for item in [movie, to] {
+            exec(
+                r#"INSERT INTO "TrickplayInfos" ("ItemId", "Width", "Height", "TileWidth",
+                   "TileHeight", "ThumbnailCount", "Interval", "Bandwidth")
+                   VALUES (?1, 320, 180, 10, 10, 1, 10000, 1)"#,
+                vec![guid_to_db(item)],
+            )
+            .await;
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let video = crate::item_type_lookup::stored_type_name(BaseItemKind::Video)
+            .expect("type")
+            .to_owned();
+        exec(
+            r#"INSERT INTO "BaseItemImageInfos" ("Id", "ItemId", "Path", "DateModified",
+               "ImageType", "Width", "Height") VALUES ('I1', ?1, ?2, '2026-01-01 00:00:00', 0, 0, 0)"#,
+            vec![guid_to_db(movie), "/meta/OLD/poster.jpg".to_owned()],
+        )
+        .await;
+        let moves = [ItemRekey {
+            from: movie,
+            to,
+            type_name: video,
+            dirs: vec![("/meta/OLD".to_owned(), "/meta/NEW".to_owned())],
+        }];
+        assert_eq!(svc.rekey_items(&moves).await.expect("rekey").len(), 1);
+
+        let segments: Vec<(String, String)> =
+            sqlx::query_as(r#"SELECT "Id", "ItemId" FROM "MediaSegments""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("segments");
+        assert_eq!(segments, vec![("S1".to_owned(), guid_to_db(to))]);
+        let trickplay: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "TrickplayInfos""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("trickplay");
+        assert_eq!(
+            trickplay,
+            vec![guid_to_db(to)],
+            "its own moved, the stale one gone"
+        );
+        let image: String = sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("image");
+        assert_eq!(
+            image, "/meta/NEW/poster.jpg",
+            "a path in a moved folder follows"
+        );
+        let providers: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItemProviders""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("providers");
+        assert_eq!(providers, 0);
+        let ancestors: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(to))
+                .fetch_all(db.pool())
+                .await
+                .expect("ancestors");
+        assert_eq!(ancestors, vec![guid_to_db(folder)]);
+        assert_eq!(
+            crate::test_support::fetch_item(&db, alternate)
+                .await
+                .presentation_unique_key,
+            Some(to.simple().to_string())
+        );
     }
 
     /// Upstream's `DeleteItem` (`ItemPersistenceService.cs:51-157`): the

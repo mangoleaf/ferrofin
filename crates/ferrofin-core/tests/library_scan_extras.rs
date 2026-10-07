@@ -1596,3 +1596,130 @@ async fn assert_untyped_library(f: &Fixture) {
         .unwrap();
     assert_eq!(themes, 0);
 }
+
+/// Seeds a user and returns its id.
+async fn seed_user(db: &Database) -> Uuid {
+    let user = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'u', 'U')"#,
+    )
+    .bind(guid_to_db(user))
+    .execute(db.writer())
+    .await
+    .unwrap();
+    user
+}
+
+/// Turns the item at `relative` into the `Movie` row an older Ferrofin scan
+/// stored for it — its own id, type, `IsMovie` and presentation key —
+/// favourited by a user and in a playlist; returns (movie id, user, playlist).
+async fn as_an_older_scans_movie(f: &Fixture, relative: &str) -> (Uuid, Uuid, Uuid) {
+    use ferrofin_core::FerrofinLinkedChildrenService;
+    use ferrofin_core::item_type_lookup::{derive_item_id, stored_type_name};
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+
+    let mut row = f.row(relative).await;
+    let mut list = row.clone();
+    let path = row.path.clone().unwrap();
+    let movie = derive_item_id(BaseItemKind::Movie, &path).unwrap();
+    f.store
+        .delete_items(&[Uuid::parse_str(&row.id).unwrap()])
+        .await
+        .unwrap();
+    row.id = guid_to_db(movie);
+    stored_type_name(BaseItemKind::Movie)
+        .unwrap()
+        .clone_into(&mut row.type_);
+    row.is_movie = true;
+    row.series_id = None;
+    row.season_id = None;
+    f.store.save_items(&[row]).await.unwrap();
+    let user = seed_user(&f.db).await;
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+           "PlayCount", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, 1, 1, 0, 1)"#,
+    )
+    .bind(guid_to_db(movie))
+    .bind(guid_to_db(user))
+    .bind(movie.to_string())
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    let playlist = Uuid::new_v4();
+    list.id = guid_to_db(playlist);
+    stored_type_name(BaseItemKind::Playlist)
+        .unwrap()
+        .clone_into(&mut list.type_);
+    list.is_folder = true;
+    list.series_id = None;
+    list.season_id = None;
+    list.path = None;
+    list.parent_id = None;
+    f.store.save_items(&[list]).await.unwrap();
+    FerrofinLinkedChildrenService::new(f.db.clone())
+        .upsert_linked_child(playlist, movie, 0)
+        .await
+        .unwrap();
+    (movie, user, playlist)
+}
+
+/// After a rescan, the item at `relative` is `kind` under the id that kind
+/// derives, and still the user's favourite and in the playlist.
+async fn assert_moved(f: &Fixture, relative: &str, kind: &str, user: Uuid, playlist: Uuid) {
+    let row = f.row(relative).await;
+    assert!(row.type_.ends_with(kind), "{}", row.type_);
+    assert!(!row.is_movie);
+    let kept: Vec<(String, String, bool)> = sqlx::query_as(
+        r#"SELECT "ItemId", "CustomDataKey", "IsFavorite" FROM "UserData" WHERE "UserId" = ?1"#,
+    )
+    .bind(guid_to_db(user))
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    let id = Uuid::parse_str(&row.id).unwrap();
+    assert_eq!(kept, vec![(row.id.clone(), id.to_string(), true)]);
+    let linked: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(linked, vec![row.id]);
+}
+
+/// A clip an older Ferrofin scan stored as a `Movie` — and an episode of an
+/// untyped library's series it stored as one — moves to the id its new kind
+/// derives (owner decision D4), its watch state and playlist entry with it,
+/// instead of being pruned and planned anew.
+#[tokio::test]
+async fn an_older_scans_movie_keeps_its_user_data_under_its_new_kind() {
+    let f = Fixture::with_type(&["Trip/Day 1.mp4"], CollectionTypeOptions::homevideos).await;
+    f.scanner.scan_all().await.unwrap();
+    let (movie, user, playlist) = as_an_older_scans_movie(&f, "Trip/Day 1.mp4").await;
+    f.scanner.scan_all().await.unwrap();
+    assert_moved(&f, "Trip/Day 1.mp4", "Entities.Video", user, playlist).await;
+    assert_ne!(f.row("Trip/Day 1.mp4").await.id, guid_to_db(movie));
+
+    let f = Fixture::untyped(&["Show/Season 1/Show S01E01.mkv"]).await;
+    f.scanner.scan_all().await.unwrap();
+    let (_, user, playlist) = as_an_older_scans_movie(&f, "Show/Season 1/Show S01E01.mkv").await;
+    f.scanner.scan_all().await.unwrap();
+    assert_moved(
+        &f,
+        "Show/Season 1/Show S01E01.mkv",
+        ".Episode",
+        user,
+        playlist,
+    )
+    .await;
+}

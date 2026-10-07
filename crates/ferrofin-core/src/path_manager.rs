@@ -82,6 +82,14 @@ impl FerrofinPathManager {
 }
 
 impl PathManager for FerrofinPathManager {
+    fn item_metadata_folder(&self, item_id: Uuid) -> Option<String> {
+        Some(
+            self.internal_metadata_path(item_id)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     fn trickplay_directory(
         &self,
         item_id: Uuid,

@@ -1024,6 +1024,8 @@ pub async fn build_app_state(
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).
     .with_virtual_paths(virtual_paths.clone())
+    // An item moved to a new id (its kind changed) takes its folders along.
+    .with_path_manager(Arc::clone(&path_manager))
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
