@@ -2320,6 +2320,10 @@ struct PlanCtx<'a> {
     /// and files the resolver chain never resolves (a cue sheet, a theme
     /// song) — a stored row at one is reconciled away.
     excluded: std::cell::RefCell<Vec<String>>,
+    /// Folders a resolved item takes in whole (an album's disc folders): a
+    /// media row an older scan planned at one is stale though the folder is
+    /// on disk, while a plain `Folder` row there (Jellyfin's) stays.
+    superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
     /// Raw direct file counts before discovery ignores, for extras folder context.
@@ -2333,6 +2337,18 @@ struct PlanCtx<'a> {
 }
 
 impl<'a> PlanCtx<'a> {
+    /// Whether resolving the folder `dir` sees its children through the
+    /// ignore rules' extras-folder arm — `ItemResolveArgs`'s children are
+    /// filtered against the folder's parent (`IgnoreFile(child, Parent)`),
+    /// which spares an extras-named directory only when that parent is the
+    /// library's top folder (`CoreResolutionIgnoreRule.cs:46-50`).
+    fn filters_children_of(&self, dir: &str) -> bool {
+        Path::new(dir)
+            .parent()
+            .and_then(Path::to_str)
+            .is_none_or(|parent| !self.locations.contains(trimmed_dir(parent)))
+    }
+
     /// A pass over `scope` with `naming`, dating by the default rule.
     fn new(naming: &'a NamingOptions, scope: PlanScope<'a>) -> Self {
         Self {
@@ -2340,6 +2356,7 @@ impl<'a> PlanCtx<'a> {
             scope,
             unlisted: std::cell::RefCell::new(Vec::new()),
             excluded: std::cell::RefCell::new(Vec::new()),
+            superseded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
@@ -2355,7 +2372,9 @@ impl<'a> PlanCtx<'a> {
     }
 
     /// This pass over the libraries `folders`, whose locations it watches
-    /// for an empty or unlistable one ([`PlanOutput::inaccessible`]).
+    /// for an empty or unlistable one ([`PlanOutput::inaccessible`]) and
+    /// which are its top folders ([`Self::filters_children_of`]: a pass
+    /// without them treats every folder as below the top).
     fn with_locations(mut self, folders: &[VirtualFolderInfo]) -> Self {
         self.locations = folders
             .iter()
@@ -2393,6 +2412,8 @@ struct PlanOutput {
     items: Vec<Planned>,
     /// Successfully observed paths the discovery rules exclude.
     excluded: Vec<String>,
+    /// Folders a resolved item takes in whole ([`PlanCtx::superseded`]).
+    superseded: Vec<String>,
     /// Paths needed to reuse adopted alternate-version owner identities.
     owner_paths: HashMap<Uuid, String>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
@@ -3508,6 +3529,7 @@ impl LibraryScanner {
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
             plan.excluded.extend(part.excluded);
+            plan.superseded.extend(part.superseded);
             plan.unlisted.extend(part.unlisted);
             plan.inaccessible.extend(part.inaccessible);
         }
@@ -3996,6 +4018,7 @@ impl LibraryScanner {
         let PlanOutput {
             items: mut planned,
             excluded,
+            superseded,
             owner_paths,
             mut unlisted,
             inaccessible,
@@ -4291,8 +4314,14 @@ impl LibraryScanner {
         probes.abort();
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
-        let removed =
-            Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted, &excluded)).await;
+        let removed = Box::pin(self.prune_after_scan(
+            folders,
+            &planned,
+            scope,
+            &unlisted,
+            (&excluded, &superseded),
+        ))
+        .await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
@@ -4326,12 +4355,12 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
-        excluded: &[String],
+        reconciled: (&[String], &[String]),
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         if scope.is_some_and(|scope| !scope.prune) {
             return Vec::new();
         }
-        self.prune_deleted(folders, planned, scope, unlisted, excluded)
+        self.prune_deleted(folders, planned, scope, unlisted, reconciled)
             .await
     }
 
@@ -6224,7 +6253,7 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
-        excluded: &[String],
+        (excluded, superseded): (&[String], &[String]),
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
@@ -6240,9 +6269,14 @@ impl LibraryScanner {
             .iter()
             .filter_map(|p| p.entity.path.as_deref())
             .collect();
-        let keep_on_disk = |path: Option<&str>| {
-            !path.is_some_and(|path| excluded.covers(path))
-                && self.still_on_disk(path, &planned_paths)
+        let superseded: std::collections::HashSet<&str> =
+            superseded.iter().map(|dir| trimmed_dir(dir)).collect();
+        let keep_on_disk = |row: &ItemPathRow| {
+            let path = row.path.as_deref();
+            !path.is_some_and(|path| {
+                excluded.covers(path)
+                    || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type))
+            }) && self.still_on_disk(path, &planned_paths)
         };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
@@ -6361,7 +6395,7 @@ impl LibraryScanner {
         cf: Uuid,
         existing: &[ItemPathRow],
         live: &std::collections::HashSet<Uuid>,
-        keep_on_disk: &(dyn Fn(Option<&str>) -> bool + Sync),
+        keep_on_disk: &(dyn Fn(&ItemPathRow) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
     ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
@@ -6391,7 +6425,7 @@ impl LibraryScanner {
             .iter()
             .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = !own.invented(row) && keep_on_disk(row.path.as_deref());
+                let keep = !own.invented(row) && keep_on_disk(row);
                 if keep {
                     if planner_resolves(&row.item_type) {
                         kept_on_disk += 1;
@@ -9374,6 +9408,7 @@ impl LibraryScanner {
         PlanOutput {
             items: out,
             excluded: ctx.excluded.into_inner(),
+            superseded: ctx.superseded.into_inner(),
             owner_paths: ctx.owner_paths.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
@@ -9544,7 +9579,8 @@ impl LibraryScanner {
         }
     }
 
-    /// Emit the same owned media shape for movies, series and physical seasons.
+    /// Emit the same owned media shape for movies, series, physical seasons,
+    /// music artists and music albums.
     fn emit_extra(
         &self,
         path: &str,
@@ -9602,9 +9638,11 @@ impl LibraryScanner {
         );
     }
 
-    /// Resolve a TV owner's direct extras before its seasons or episodes.
-    /// Sort every candidate before applying scope, so type numbering is stable.
-    fn plan_tv_extras(
+    /// Resolve a folder owner's direct extras — `LibraryManager.FindExtras`
+    /// for a series, a season, a music artist or a music album — before what
+    /// else is in it. Sort every candidate before applying scope, so type
+    /// numbering is stable. Returns the entries it took.
+    fn plan_folder_extras(
         &self,
         entries: &[FileSystemEntryInfo],
         owner_dir: &str,
@@ -9617,11 +9655,7 @@ impl LibraryScanner {
         let mut candidates = Vec::new();
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
-                if ctx
-                    .naming
-                    .all_extras_types_folder_names
-                    .contains_key(&entry.name.to_lowercase())
-                {
+                if is_extras_dir(entry, ctx.naming) {
                     consumed.insert(entry.path.clone());
                     ctx.excluded.borrow_mut().push(entry.path.clone());
                     let files: Vec<_> = self
@@ -10104,7 +10138,7 @@ impl LibraryScanner {
             .borrow_mut()
             .insert(series_id, series_dir.to_owned());
         let entries = self.list(series_dir, ctx);
-        let extras = self.plan_tv_extras(&entries, series_dir, series_id, cf, ctx, out);
+        let extras = self.plan_folder_extras(&entries, series_dir, series_id, cf, ctx, out);
         for entry in entries {
             if extras.contains(&entry.path) {
                 continue;
@@ -10306,7 +10340,7 @@ impl LibraryScanner {
         let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
         let entries = self.list(dir, ctx);
         let extras = if owner_dir.as_deref() == Some(dir) {
-            self.plan_tv_extras(&entries, dir, owner, cf, ctx, out)
+            self.plan_folder_extras(&entries, dir, owner, cf, ctx, out)
         } else {
             std::collections::HashSet::new()
         };
@@ -10689,8 +10723,15 @@ impl LibraryScanner {
                     ancestors: vec![cf],
                 },
             );
-            for entry in self.list(dir, ctx) {
-                if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
+            // A music folder searches itself for extras, a theme song above
+            // all (`BaseItem.SearchesContainingFolderForExtras`, `BaseItem.cs:782`).
+            let entries = self.list(dir, ctx);
+            let extras = self.plan_folder_extras(&entries, dir, artist_id, cf, ctx, out);
+            for entry in entries {
+                if entry.type_ == FileSystemEntryType::Directory
+                    && !extras.contains(&entry.path)
+                    && ctx.scope.visits(&entry.path)
+                {
                     self.plan_music_node(&entry.path, cf, artist_id, true, ctx, out);
                 }
             }
@@ -10712,7 +10753,17 @@ impl LibraryScanner {
             return;
         }
         for entry in self.list(dir, ctx) {
-            if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
+            if entry.type_ != FileSystemEntryType::Directory {
+                continue;
+            }
+            // Below the library's top folder an extras-named folder is never
+            // resolved (`CoreResolutionIgnoreRule.cs:46-61`); rows older scans
+            // planned in one are reconciled away.
+            if is_extras_dir(&entry, ctx.naming) {
+                ctx.excluded.borrow_mut().push(entry.path);
+                continue;
+            }
+            if ctx.scope.visits(&entry.path) {
                 self.plan_music_node(&entry.path, cf, parent, in_artist, ctx, out);
             }
         }
@@ -10742,9 +10793,12 @@ impl LibraryScanner {
             return true;
         }
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
+        let filtered = ctx.filters_children_of(dir);
         // Upstream's `Parallel.ForEach` + `state.Stop()` is an early-exit `any`.
         for entry in &entries {
-            if entry.type_ != FileSystemEntryType::Directory {
+            if entry.type_ != FileSystemEntryType::Directory
+                || (filtered && is_extras_dir(entry, naming))
+            {
                 continue;
             }
             // A named artist subfolder ("albums", "live", …) says artist.
@@ -10783,7 +10837,8 @@ impl LibraryScanner {
         // Every track, whatever the scope. The caller decided the folder is
         // an album (`ContainsMusic`), which a cue sheet alone makes it: such
         // an album has no tracks, as upstream's has none.
-        let tracks = self.collect_album_tracks(dir, ctx);
+        let entries = self.list(dir, ctx);
+        let tracks = self.collect_album_tracks(&entries, ctx);
         // A directory name is not a filename (`EnsureName` keeps it whole):
         // `file_stem` would cut "Greatest Hits Vol. 2" at the dot.
         let album_name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
@@ -10820,6 +10875,8 @@ impl LibraryScanner {
                 ancestors: album_ancestors.clone(),
             },
         );
+        // Its extras (a theme song); its tracks are none of them.
+        self.plan_folder_extras(&entries, dir, album_id, cf, ctx, out);
         let mut ancestors = album_ancestors;
         ancestors.push(album_id);
         for track in tracks {
@@ -10919,9 +10976,12 @@ impl LibraryScanner {
 
     /// The audio files belonging to the album at `dir`: those directly inside,
     /// plus those in each multi-disc subfolder.
-    fn collect_album_tracks(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<String> {
+    fn collect_album_tracks(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        ctx: &PlanCtx<'_>,
+    ) -> Vec<String> {
         let naming = ctx.naming;
-        let entries = self.list(dir, ctx);
         // A cue sheet makes a folder an album (`ContainsMusic` counts it) but
         // is no track (`AudioResolver.Resolve` returns null for it); a theme
         // song is never resolved at all.
@@ -10944,8 +11004,13 @@ impl LibraryScanner {
             .map(|e| e.path.clone())
             .collect();
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
-        for entry in &entries {
+        for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && parser.is_multi_part(&entry.path) {
+                // The album takes the disc folder in whole: an album an older
+                // scan made of it is reconciled away.
+                if ctx.scope.keeps(&entry.path) {
+                    ctx.superseded.borrow_mut().push(entry.path.clone());
+                }
                 tracks.extend(
                     self.list(&entry.path, ctx)
                         .into_iter()
@@ -10965,7 +11030,8 @@ impl LibraryScanner {
     /// `resolving` is `MusicAlbumResolver.Resolve`'s own call, over
     /// `args.FileSystemChildren` — the folder's entries less the ignored ones
     /// (`ItemResolveArgs.GetActualFileSystemChildren`), so a theme song does
-    /// not count. The artist probe and the disc-subfolder probe list the
+    /// not count, nor (below the top level) an extras-named subfolder. The
+    /// artist probe's per-folder check and the disc-subfolder probe list the
     /// folder unfiltered (`IDirectoryService.GetFileSystemEntries`).
     fn is_music_album(
         &self,
@@ -10987,9 +11053,12 @@ impl LibraryScanner {
             return false;
         }
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
+        let filtered = resolving && ctx.filters_children_of(dir);
         let mut disc_subfolders = 0;
         for entry in &entries {
-            if entry.type_ != FileSystemEntryType::Directory {
+            if entry.type_ != FileSystemEntryType::Directory
+                || (filtered && is_extras_dir(entry, naming))
+            {
                 continue;
             }
             if !self.is_music_album(&entry.path, ctx, false, false) {
@@ -11199,12 +11268,22 @@ fn is_cue_sheet(path: &str) -> bool {
 /// Whether `path` is a theme song: an audio file whose name, without its
 /// extension, is exactly `theme` (`BaseItem.ThemeSongFileName`, compared
 /// ordinally). `CoreResolutionIgnoreRule.cs:64-66` keeps the resolver chain
-/// from ever resolving one; it reaches the library only as an extra.
+/// from ever resolving one; it reaches the library only as an extra of the
+/// folder it sits in ([`LibraryScanner::plan_folder_extras`]).
 fn is_theme_song(path: &str, naming: &NamingOptions) -> bool {
     std::path::Path::new(path)
         .file_stem()
         .is_some_and(|stem| stem == "theme")
         && is_audio_file(path, naming)
+}
+
+/// Whether `entry` is a directory named like an extras folder (`trailers`,
+/// `extras`, `other`, …: `NamingOptions.AllExtrasTypesFolderNames`).
+fn is_extras_dir(entry: &FileSystemEntryInfo, naming: &NamingOptions) -> bool {
+    entry.type_ == FileSystemEntryType::Directory
+        && naming
+            .all_extras_types_folder_names
+            .contains_key(&entry.name.to_lowercase())
 }
 
 /// Whether `path` is one of the [`BOOK_EXTENSIONS`] documents.
@@ -11817,12 +11896,10 @@ fn movie_in_own_folder(
     root: &str,
     parse_name: bool,
 ) -> Option<ferrofin_naming::video::VideoInfo> {
-    if entries.iter().any(|e| {
-        e.type_ == FileSystemEntryType::Directory
-            && !naming
-                .all_extras_types_folder_names
-                .contains_key(&e.name.to_lowercase())
-    }) {
+    if entries
+        .iter()
+        .any(|e| e.type_ == FileSystemEntryType::Directory && !is_extras_dir(e, naming))
+    {
         return None;
     }
     let videos: Vec<_> = entries
@@ -25960,6 +26037,41 @@ mod tests {
             .unwrap()
     }
 
+    /// A music library over `media` (state under `root`), unscanned, with
+    /// the scanner that scans it.
+    async fn music_scanner(
+        root: &std::path::Path,
+        media: &std::path::Path,
+    ) -> (Database, LibraryScanner) {
+        use ferrofin_traits::persistence::ItemRepository;
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(root.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Music",
+            Some(CollectionTypeOptions::music),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        ));
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items);
+        (db, scanner)
+    }
+
     /// The rows of `kind`, read through the item repository.
     async fn rows_of_kind(db: &Database, kind: BaseItemKind) -> Vec<BaseItemEntity> {
         use ferrofin_traits::persistence::ItemRepository as _;
@@ -27396,7 +27508,7 @@ mod tests {
             "Cue Only",
             "Theme Only",
             "Burial/Box/Live",
-            "Burial/Other",
+            "Burial/Kindred",
         ] {
             std::fs::create_dir_all(media.join(dir)).unwrap();
         }
@@ -27412,7 +27524,7 @@ mod tests {
             "Theme Only/theme.mp3",
             "Burial/Box/theme.mp3",
             "Burial/Box/Live/01 Live.flac",
-            "Burial/Other/01 Other.flac",
+            "Burial/Kindred/01 Kindred.flac",
         ] {
             std::fs::write(media.join(file), b"").unwrap();
         }
@@ -27426,14 +27538,19 @@ mod tests {
             vec![
                 Some("CD1".to_owned()),
                 Some("Cue Only".to_owned()),
+                Some("Kindred".to_owned()),
                 Some("Live".to_owned()),
-                Some("Other".to_owned()),
                 Some("Untrue".to_owned())
             ],
             "no album at the library root; a theme song makes no album \
              (`Theme Only`, `Box`), so `Box/Live` is one"
         );
-        let audio = rows_of_kind(&db, BaseItemKind::Audio).await;
+        // The album's theme song is its extra (`music_folders_own_their_extras`).
+        let audio: Vec<_> = rows_of_kind(&db, BaseItemKind::Audio)
+            .await
+            .into_iter()
+            .filter(|row| row.owner_id.is_none())
+            .collect();
         assert_eq!(
             audio.len(),
             5,
@@ -27449,48 +27566,242 @@ mod tests {
         assert_eq!(stray.album, None);
     }
 
+    /// A music artist or album folder owns its extras — a theme song above
+    /// all (`BaseItem.SearchesContainingFolderForExtras`; `LibraryManager.FindExtras`); a theme
+    /// song at the library root has no owner and is no item. Below the top
+    /// level an extras-named folder is never resolved
+    /// (`CoreResolutionIgnoreRule.cs:46-61`): `Rival/Extras` neither keeps
+    /// `Rival` from being one two-disc album nor is an album itself.
+    #[tokio::test]
+    async fn music_folders_own_their_extras() {
+        use ferrofin_model::entities::ExtraType;
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        let files = [
+            "theme.mp3",
+            "Burial/theme.mp3",
+            "Burial/theme-music/Night Bus.mp3",
+            "Burial/extras/bonus.flac",
+            "Burial/Untrue/01 Archangel.flac",
+            "Burial/Untrue/theme.mp3",
+            "Burial/Untrue/backdrops/Loop.mkv",
+            "Burial/Rival/CD1/01 Rival Dealer.flac",
+            "Burial/Rival/CD2/01 Hiders.flac",
+            "Burial/Rival/Extras/bonus.flac",
+            // At the top level an extras-named folder counts: `Box` is an
+            // artist (its `Extras` holds music), `Extras` an album.
+            "Box/CD1/01 One.flac",
+            "Box/CD2/01 Two.flac",
+            "Box/Extras/bonus.flac",
+            "Extras/01 Root.flac",
+            // A plain grouping folder's extras-named child is never walked.
+            "Compilations/Extras/Live/01 Live.flac",
+        ];
+        for file in files {
+            let path = media.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        let (db, _cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        let mut artists = rows_of_kind(&db, BaseItemKind::MusicArtist).await;
+        artists.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = artists.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![Some("Box".to_owned()), Some("Burial".to_owned())]
+        );
+        let artist = &artists[1];
+        let mut albums = rows_of_kind(&db, BaseItemKind::MusicAlbum).await;
+        albums.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<_> = albums.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(
+            names,
+            ["CD1", "CD2", "Extras", "Rival", "Untrue"]
+                .map(|n| Some(n.to_owned()))
+                .to_vec()
+        );
+        let untrue = &albums[4];
+        let root = media.to_string_lossy().into_owned();
+        assert_eq!(
+            owned_extras(&db, &artist.id, &root).await,
+            vec![
+                (
+                    "/Burial/theme-music/Night Bus.mp3".to_owned(),
+                    Some("Night Bus".to_owned()),
+                    Some(ExtraType::ThemeSong as i32),
+                    None
+                ),
+                (
+                    "/Burial/theme.mp3".to_owned(),
+                    Some("Theme Song".to_owned()),
+                    Some(ExtraType::ThemeSong as i32),
+                    None
+                ),
+            ]
+        );
+        assert_eq!(
+            owned_extras(&db, &untrue.id, &root).await,
+            vec![
+                (
+                    "/Burial/Untrue/backdrops/Loop.mkv".to_owned(),
+                    Some("Loop".to_owned()),
+                    Some(ExtraType::ThemeVideo as i32),
+                    None
+                ),
+                (
+                    "/Burial/Untrue/theme.mp3".to_owned(),
+                    Some("Theme Song".to_owned()),
+                    Some(ExtraType::ThemeSong as i32),
+                    None
+                ),
+            ]
+        );
+        for file in [
+            "theme.mp3",
+            "Burial/extras/bonus.flac",
+            "Burial/Rival/Extras/bonus.flac",
+            "Box/Extras/bonus.flac",
+            "Compilations/Extras/Live/01 Live.flac",
+        ] {
+            let path = media.join(file).to_string_lossy().into_owned();
+            assert_eq!(
+                crate::test_support::items_at_path(&db, &path).await,
+                0,
+                "{file} is no item"
+            );
+        }
+        let tracks = rows_of_kind(&db, BaseItemKind::Audio)
+            .await
+            .into_iter()
+            .filter(|row| row.owner_id.is_none())
+            .count();
+        assert_eq!(tracks, 6);
+    }
+
+    /// The extras `owner` owns, as (path below `root`, name, extra type,
+    /// parent), by path.
+    async fn owned_extras(
+        db: &Database,
+        owner: &str,
+        root: &str,
+    ) -> Vec<(String, Option<String>, Option<i32>, Option<String>)> {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let mut rows = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )
+        .get_item_list(&InternalItemsQuery {
+            owner_ids: vec![Uuid::parse_str(owner).unwrap()],
+            ..Default::default()
+        })
+        .await
+        .expect("extras");
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
+        rows.into_iter()
+            .map(|row| {
+                let path = row.path.unwrap_or_default();
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_owned();
+                (rel, row.name, row.extra_type, row.parent_id)
+            })
+            .collect()
+    }
+
+    /// An album an older scan made of an extras-named folder below the top
+    /// level (`Burial/extras`), with its tracks, is pruned: upstream never
+    /// resolves such a folder. So is one it made of a disc folder an album
+    /// now takes in whole (`Rival/CD1`) — but not a plain `Folder` row there
+    /// (`Rival/CD2`, as Jellyfin stores a disc folder).
+    #[tokio::test]
+    async fn albums_older_scans_made_of_ignored_or_folded_folders_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        for file in [
+            "Burial/Untrue/01 Archangel.flac",
+            "Burial/extras/bonus.flac",
+            "Burial/Rival/CD1/01 Rival Dealer.flac",
+            "Burial/Rival/CD2/01 Hiders.flac",
+        ] {
+            let path = media.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        let (db, scanner) = music_scanner(tmp.path(), &media).await;
+        scanner.scan_all().await.unwrap();
+        // What an older scan stored: an album at `extras` with its track.
+        let mut album = rows_of_kind(&db, BaseItemKind::MusicAlbum).await.remove(0);
+        let mut track = rows_of_kind(&db, BaseItemKind::Audio).await.remove(0);
+        album.id = ferrofin_db::store::guid_to_db(Uuid::from_u128(0xE1));
+        album.path = Some(media.join("Burial/extras").to_string_lossy().into_owned());
+        album.name = Some("extras".to_owned());
+        crate::test_support::save_item(&db, &album).await;
+        track.id = ferrofin_db::store::guid_to_db(Uuid::from_u128(0xE2));
+        track.path = Some(
+            media
+                .join("Burial/extras/bonus.flac")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        track.parent_id = Some(album.id.clone());
+        crate::test_support::save_item(&db, &track).await;
+        let mut disc = album.clone();
+        disc.id = ferrofin_db::store::guid_to_db(Uuid::from_u128(0xE3));
+        disc.path = Some(
+            media
+                .join("Burial/Rival/CD1")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        disc.name = Some("CD1".to_owned());
+        crate::test_support::save_item(&db, &disc).await;
+        let mut folder = disc.clone();
+        folder.id = ferrofin_db::store::guid_to_db(Uuid::from_u128(0xE4));
+        folder.type_ = crate::item_type_lookup::stored_type_name(BaseItemKind::Folder)
+            .expect("a stored type")
+            .to_owned();
+        folder.path = Some(
+            media
+                .join("Burial/Rival/CD2")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        folder.name = Some("CD2".to_owned());
+        crate::test_support::save_item(&db, &folder).await;
+        assert_eq!(rows_of_kind(&db, BaseItemKind::MusicAlbum).await.len(), 4);
+
+        scanner.scan_all().await.unwrap();
+        let mut albums: Vec<_> = rows_of_kind(&db, BaseItemKind::MusicAlbum)
+            .await
+            .into_iter()
+            .map(|album| album.name)
+            .collect();
+        albums.sort();
+        assert_eq!(
+            albums,
+            vec![Some("Rival".to_owned()), Some("Untrue".to_owned())],
+            "the extras and disc albums are pruned"
+        );
+        assert_eq!(rows_of_kind(&db, BaseItemKind::Audio).await.len(), 3);
+        assert!(
+            crate::test_support::fetch_item_opt(&db, Uuid::from_u128(0xE4))
+                .await
+                .is_some(),
+            "a plain Folder row at a disc folder stays"
+        );
+    }
+
     /// An album an older scan made of a music library's root tracks — a
     /// `MusicAlbum` whose path is the library location — is pruned by the
     /// next scan, its folder still on disk notwithstanding, and its tracks
     /// stay, under the library.
     #[tokio::test]
     async fn a_root_album_from_an_older_scan_is_pruned() {
-        use crate::item_repository::FerrofinItemRepository;
-        use crate::item_type_lookup::ItemTypeLookup;
-        use ferrofin_traits::persistence::ItemRepository;
-
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("music");
         std::fs::create_dir_all(&media).unwrap();
         for file in ["Stray.flac", "Stray.cue", "theme.mp3"] {
             std::fs::write(media.join(file), b"").unwrap();
         }
-        let db = Database::connect_in_memory().await.unwrap();
-        db.run_migrations().await.unwrap();
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
-        );
-        vf.add_virtual_folder(
-            "Music",
-            Some(CollectionTypeOptions::music),
-            &LibraryOptions {
-                path_infos: vec![MediaPathInfo {
-                    path: media.to_string_lossy().into_owned(),
-                }],
-                ..LibraryOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
-            db.clone(),
-            Arc::new(ItemTypeLookup::new()),
-        ));
-        let scanner =
-            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
-                .with_items(items);
+        let (db, scanner) = music_scanner(tmp.path(), &media).await;
         scanner.scan_all().await.unwrap();
 
         // What the older scan stored: the album at the location, the track
