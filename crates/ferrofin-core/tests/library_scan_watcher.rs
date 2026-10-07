@@ -491,6 +491,13 @@ async fn a_removed_episode_prunes_exactly_its_rows() {
     let season = fx.media.join("Show").join("Season 1");
     let gone = season.join("Show S01E02.mkv");
     let sibling = season.join("Show S01E01.mkv");
+    // A third episode first, so removing one leaves the season's folder
+    // mixed: going down to one would flip the sibling's `IsInMixedFolder`,
+    // which upstream's `UpdateFromResolvedItem` saves.
+    let third = season.join("Show S01E03.mkv");
+    std::fs::write(&third, b"").expect("third");
+    move_mtime(&season);
+    fx.report(&[&third]).await;
     let before = fx.rows().await;
 
     std::fs::remove_file(&gone).expect("rm");

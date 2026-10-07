@@ -2326,6 +2326,9 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Per folder holding episodes, whether they are in a mixed folder
+    /// ([`note_episode_folder`]).
+    episode_folders_mixed: std::cell::RefCell<HashMap<String, bool>>,
     /// Raw direct file counts before discovery ignores, for extras folder context.
     direct_file_counts: std::cell::RefCell<HashMap<String, usize>>,
     /// The library locations of the pass (without a trailing slash).
@@ -2359,6 +2362,7 @@ impl<'a> PlanCtx<'a> {
             superseded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
+            episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -10219,6 +10223,7 @@ impl LibraryScanner {
             .borrow_mut()
             .insert(series_id, series_dir.to_owned());
         let entries = self.list(series_dir, ctx);
+        note_episode_folder(series_dir, &entries, ctx);
         let extras = self.plan_folder_extras(&entries, series_dir, series_id, cf, ctx, out);
         for entry in entries {
             if extras.contains(&entry.path) {
@@ -10300,7 +10305,9 @@ impl LibraryScanner {
     /// Collects every video file under `dir` (recursively) into `out_paths` —
     /// the ones `ctx`'s scope keeps.
     fn collect_videos(&self, dir: &str, ctx: &PlanCtx<'_>, out_paths: &mut Vec<String>) {
-        for entry in self.list(dir, ctx) {
+        let entries = self.list(dir, ctx);
+        note_episode_folder(dir, &entries, ctx);
+        for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
                 if ctx.scope.visits(&entry.path) {
                     self.collect_videos(&entry.path, ctx, out_paths);
@@ -10420,6 +10427,7 @@ impl LibraryScanner {
         let owner = season.map_or(series_id, |(id, _)| id);
         let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
         let entries = self.list(dir, ctx);
+        note_episode_folder(dir, &entries, ctx);
         let extras = if owner_dir.as_deref() == Some(dir) {
             self.plan_folder_extras(&entries, dir, owner, cf, ctx, out)
         } else {
@@ -10495,6 +10503,11 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some("Video".to_owned());
+        entity.is_in_mixed_folder = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .and_then(|dir| ctx.episode_folders_mixed.borrow().get(dir).copied())
+            .unwrap_or(false);
         // `EpisodeResolver` is a `BaseVideoResolver`: the file's
         // `VideoType` (and an image's `IsoType`) as for a movie.
         set_video_type(&mut entity, file_video_type(path));
@@ -10976,6 +10989,8 @@ impl LibraryScanner {
                 continue;
             };
             entity.media_type = Some("Audio".to_owned());
+            // `AudioResolver.Resolve` sets it for every track (`:133`).
+            entity.is_in_mixed_folder = true;
             // The album folder's name, for the scan's legacy carve-out only
             // (`ResolverGuesses::folder_album`): it is taken off before any
             // provider runs and never saved — a tagless track's `Album`
@@ -11252,6 +11267,9 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // A loose file is a book in a mixed folder (`BookResolver.cs:51`); a
+        // folder that is the book is not (`GetBook`).
+        let in_mixed_folder = folder.is_none();
         let (parsed_from, series_fallback) = match folder {
             Some(name) => (name, Some(String::new())),
             None => (file_stem(path), parent_folder_name(path)),
@@ -11269,6 +11287,7 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some("Book".to_owned());
+        entity.is_in_mixed_folder = in_mixed_folder;
         entity.run_time_ticks = Some(BOOK_RUN_TIME_TICKS);
         entity.index_number = parsed.index.map(i64::from);
         entity.parent_index_number = parsed.parent_index.map(i64::from);
@@ -11300,6 +11319,10 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // The audiobook a folder is has its folder to itself (`FindAudioBook`,
+        // `AudioResolver.cs:153`); any other is in a mixed folder (the
+        // per-file arm, `:133`, and `ResolveMultipleAudio` past one item).
+        let in_mixed_folder = folder.is_none();
         let name = folder.unwrap_or_else(|| file_stem(path));
         let Some((id, mut entity)) =
             self.base_item(ctx, BaseItemKind::AudioBook, cf, cf, name, path, false)
@@ -11307,6 +11330,7 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some("Audio".to_owned());
+        entity.is_in_mixed_folder = in_mixed_folder;
         entity.production_year = year.map(i64::from);
         out.push(Planned {
             id,
@@ -11892,6 +11916,27 @@ fn lone_video(
         collection_type,
     );
     (resolved.len() == 1 && resolved[0].extra_type.is_none()).then(|| resolved.remove(0))
+}
+
+/// Records whether the episodes in `dir` (listed as `entries`) are in a
+/// mixed folder: a tvshows library resolves a folder's files through
+/// `ResolveVideos<Episode>` (`MovieResolver.cs:231-234`), which sets
+/// `IsInMixedFolder = Count > 1` — a series or season folder is never a
+/// top parent.
+fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx<'_>) {
+    let mixed = resolved_videos(
+        entries,
+        dir,
+        ctx.naming,
+        true,
+        true,
+        Some(ferrofin_model::data::CollectionType::tvshows),
+    )
+    .len()
+        > 1;
+    ctx.episode_folders_mixed
+        .borrow_mut()
+        .insert(dir.to_owned(), mixed);
 }
 
 /// The items upstream's `ResolveVideos` resolves from `entries`, the
@@ -27765,8 +27810,10 @@ mod tests {
             .find(|a| a.name.as_deref() == Some("Stray"))
             .expect("the root track");
         assert_eq!(stray.parent_id.as_deref(), Some(cf.as_str()));
-        assert!(stray.is_in_mixed_folder);
         assert_eq!(stray.album, None);
+        // `AudioResolver.Resolve` puts every music track in a mixed folder,
+        // an album's as much as a loose one (`AudioResolver.cs:133`).
+        assert!(audio.iter().all(|track| track.is_in_mixed_folder));
     }
 
     /// A music artist or album folder owns its extras — a theme song above
@@ -28208,6 +28255,67 @@ mod tests {
                 .iter()
                 .all(|i| i.top_parent_id.as_deref() == Some(cf.as_str()))
         );
+        // A loose document is a book in a mixed folder (`BookResolver.cs:51`);
+        // the folder that is a book is not (`GetBook`).
+        assert_eq!(
+            books
+                .iter()
+                .map(|b| b.is_in_mixed_folder)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, true, true]
+        );
+    }
+
+    /// A tvshows library resolves a folder's files through
+    /// `ResolveVideos<Episode>` (`MovieResolver.cs:231-234`, cf.
+    /// `MovieResolverTests.ResolveMultiple_GivenTvShowsCollection_CreatesEpisodeItems`),
+    /// so an episode is in a mixed folder exactly when its folder resolves to
+    /// more than one item — a season folder of several, a series folder of
+    /// several loose episodes — and alone it is not, as a real 10.11.8
+    /// database stores it (every directory of one episode `IsInMixedFolder=0`).
+    #[tokio::test]
+    async fn an_episode_is_in_a_mixed_folder_when_its_folder_holds_several() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        touch(&media.join("Firefly/Season 01"), "Firefly S01E01.mkv");
+        touch(&media.join("Firefly/Season 01"), "Firefly S01E02.mkv");
+        touch(&media.join("Firefly/Season 02"), "Firefly S02E01.mkv");
+        touch(&media.join("Serenity"), "Serenity S01E01.mkv");
+        touch(&media.join("Dollhouse"), "Dollhouse S01E01.mkv");
+        touch(&media.join("Dollhouse"), "Dollhouse S01E02.mkv");
+        touch(
+            &media.join("Dollhouse/Specials Pack"),
+            "Dollhouse S00E01.mkv",
+        );
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+        let mut episodes: Vec<(String, bool)> = scanned_by_kind(&db, BaseItemKind::Episode)
+            .await
+            .into_iter()
+            .map(|e| {
+                (
+                    super::file_stem(e.path.as_deref().unwrap_or_default()),
+                    e.is_in_mixed_folder,
+                )
+            })
+            .collect();
+        episodes.sort();
+        assert_eq!(
+            episodes,
+            [
+                ("Dollhouse S00E01", false),
+                ("Dollhouse S01E01", true),
+                ("Dollhouse S01E02", true),
+                ("Firefly S01E01", true),
+                ("Firefly S01E02", true),
+                ("Firefly S02E01", false),
+                ("Serenity S01E01", false),
+            ]
+            .map(|(name, mixed)| (name.to_owned(), mixed))
+            .to_vec()
+        );
     }
 
     // Audio in a books library resolves to `AudioBook`: a folder holding one
@@ -28293,6 +28401,15 @@ mod tests {
                 .filter(|a| a.name.as_deref() != Some("The Hobbit (1937)"))
                 .all(|a| a.production_year.is_none()),
             "per-file fallback rows are undated"
+        );
+        // The audiobook a folder is has the folder to itself
+        // (`FindAudioBook`); every per-file row is in a mixed folder.
+        assert!(!hobbit.is_in_mixed_folder);
+        assert!(
+            audiobooks
+                .iter()
+                .filter(|a| a.name.as_deref() != Some("The Hobbit (1937)"))
+                .all(|a| a.is_in_mixed_folder)
         );
         assert!(
             audiobooks

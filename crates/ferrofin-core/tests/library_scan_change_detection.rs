@@ -1082,8 +1082,12 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
     let season = tv.join("Show").join("Season 1");
     std::fs::create_dir_all(&season).expect("mkdir");
     std::fs::write(season.join("Show S01E01.mkv"), b"0123").expect("write");
+    // Two episodes already, so the new one leaves their mixed folder as it
+    // is (a second episode would flip the first's `IsInMixedFolder`, which
+    // upstream's `UpdateFromResolvedItem` saves).
+    std::fs::write(season.join("Show S01E03.mkv"), b"0123").expect("write");
     let (db, scanner) = library(tmp.path(), &tv, CollectionTypeOptions::tvshows, None).await;
-    assert_eq!(scanner.scan_all().await.expect("scan").created, 3);
+    assert_eq!(scanner.scan_all().await.expect("scan").created, 4);
     let saved = |path: PathBuf, kind: BaseItemKind| {
         let db = db.clone();
         async move {
@@ -1118,7 +1122,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         ScanOutcome {
             created: 1,
             updated: 1,
-            unchanged: 2,
+            unchanged: 3,
             ..ScanOutcome::default()
         }
     );
