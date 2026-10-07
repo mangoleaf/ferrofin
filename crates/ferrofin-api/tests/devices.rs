@@ -603,3 +603,31 @@ async fn delete_devices_success_and_unknown_is_bad_request() {
     let (status, _) = call(app, "DELETE", "/Devices?id=dev-1,ghost").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn repeated_id_is_scalar_for_info_and_a_collection_for_delete() {
+    let app = state(
+        ok_auth(),
+        Arc::new(StubDevices {
+            known: vec![device("dev-1"), device("dev-2")],
+            ..Default::default()
+        }),
+        Arc::new(ferrofin_api::test_support::FakeApiKeys),
+        Arc::new(FakeClientEventLogger),
+        Arc::new(FakeConfig),
+    );
+    let (status, body) = call(app.clone(), "GET", "/Devices/Info?ID=dev-1&id=ghost").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["Id"],
+        "dev-1"
+    );
+    let (status, _) = call(app.clone(), "DELETE", "/Devices?ID=dev-1&id=ghost").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the second collection member must be validated"
+    );
+    let (status, _) = call(app, "DELETE", "/Devices?id=dev-1&ID=dev-2").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

@@ -630,6 +630,33 @@ async fn body_string(resp: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn hls_binds_first_scalars_and_forwards_the_original_query() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let raw = "DEVICEID=first&deviceId=second&MaxWidth=1280&maxwidth=bad&VideoBitRate=1000000&videobitrate=bad";
+    let response = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?{raw}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = rec.last.lock().unwrap().clone().unwrap();
+    assert_eq!(request.device_id.as_deref(), Some("first"));
+    assert_eq!(request.max_width, Some(1280));
+    assert_eq!(request.video_bitrate, Some(1_000_000));
+    assert_eq!(request.query_string, format!("?{raw}"));
+}
+
+#[tokio::test]
 async fn video_master_playlist_returns_m3u8() {
     let rec = Arc::new(Recorded::default());
     let router = router_with(
