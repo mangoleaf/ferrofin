@@ -433,6 +433,7 @@ async fn save_named_configuration(
                 }
             })?;
     }
+    let committed: std::sync::Arc<str> = json.clone().into();
     tokio::task::spawn_blocking(move || {
         ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
     })
@@ -442,6 +443,7 @@ async fn save_named_configuration(
     if let Some(config) = network {
         state.update_network_settings(&config);
     }
+    state.config.named_configuration_updated(&key, committed);
     Ok(())
 }
 

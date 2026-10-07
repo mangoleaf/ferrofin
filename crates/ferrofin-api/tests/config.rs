@@ -117,6 +117,7 @@ impl AuthorizationContext for OkAuth {
 /// A configuration manager returning canned config + branding, capturing writes.
 #[derive(Default)]
 struct StubConfig {
+    updates: Mutex<Vec<(String, Arc<str>)>>,
     branding: Mutex<BrandingOptions>,
     paths: StubPaths,
 }
@@ -181,6 +182,15 @@ impl ServerApplicationPaths for StubPaths {
 
 #[async_trait]
 impl ServerConfigurationManager for StubConfig {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        let saved = std::fs::read(
+            self.paths.config_dir.clone() + "/named/" + &key.to_ascii_lowercase() + ".json",
+        )
+        .unwrap();
+        assert_eq!(json.as_bytes(), saved);
+        self.updates.lock().unwrap().push((key.to_owned(), json));
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(self.paths.clone())
     }
@@ -394,6 +404,19 @@ fn admin_state_with_paths(paths: StubPaths) -> AppState {
 
 /// [`state_with_paths`] with the caller's role decided by `users`.
 fn state_with(paths: StubPaths, users: Arc<dyn UserManager>) -> AppState {
+    state_with_config(
+        users,
+        Arc::new(StubConfig {
+            paths,
+            ..Default::default()
+        }),
+    )
+}
+
+fn state_with_config(
+    users: Arc<dyn UserManager>,
+    config: Arc<dyn ServerConfigurationManager>,
+) -> AppState {
     let auth = Arc::new(OkAuth);
     AppState::new(
         Arc::new(FakeLibrary),
@@ -404,10 +427,7 @@ fn state_with(paths: StubPaths, users: Arc<dyn UserManager>) -> AppState {
         Arc::new(FakeSessions),
         Arc::new(StubSystem),
         Arc::new(FakeAppHost),
-        Arc::new(StubConfig {
-            paths,
-            ..StubConfig::default()
-        }),
+        config,
         Arc::new(FakeProviders),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -1389,4 +1409,44 @@ async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() 
         std::fs::read_dir(dir.path().join("named")).unwrap().count(),
         1
     );
+}
+
+#[tokio::test]
+async fn only_successful_named_saves_notify_configuration_observers() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(StubConfig {
+        paths: StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        },
+        ..Default::default()
+    });
+    let app = state_with_config(Arc::new(FakeAdminUsers), manager.clone());
+    let uri = "/System/Configuration/metadata";
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"UseFileCreationTimeForDateAdded": false})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(manager.updates.lock().unwrap().len(), 1);
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"UseFileCreationTimeForDateAdded": "bad"})
+        )
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    std::fs::remove_file(dir.path().join("named/metadata.json")).unwrap();
+    std::fs::create_dir(dir.path().join("named/metadata.json")).unwrap();
+    assert_eq!(
+        post(app, uri, &serde_json::json!({})).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(manager.updates.lock().unwrap().len(), 1);
 }

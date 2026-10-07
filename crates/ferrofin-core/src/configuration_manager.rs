@@ -12,8 +12,8 @@
 //!   the configuration directory. The wire shape is unchanged — it is the same
 //!   [`ServerConfiguration`] the API returns.
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
-//!   the metadata path against the filesystem. The event bus is out of scope for
-//!   this unit; the metadata-path validation is preserved
+//!   the metadata path against the filesystem. Successful saves notify registered
+//!   observers; the metadata-path validation is preserved
 //!   ([`validate_metadata_path`](Self::validate_metadata_path)): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
@@ -58,7 +58,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, ServerConfiguration};
-use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::configuration::{
+    ConfigurationListener, ConfigurationUpdate, ServerConfigurationManager,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -215,7 +217,9 @@ pub struct FerrofinServerConfigurationManager {
     /// The `metadata.json` the last "unusable" warning was logged for, so a
     /// broken document warns once per change, not on every read.
     metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
-    configuration: RwLock<Arc<ServerConfiguration>>,
+    configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
 }
 
 /// A file a warning was logged for, by its modification time (`None` when
@@ -416,8 +420,26 @@ impl FerrofinServerConfigurationManager {
             encoding_file,
             metadata_file,
             metadata_warned: std::sync::Mutex::new(None),
-            configuration: RwLock::new(Arc::new(configuration)),
+            configuration: Arc::new(RwLock::new(Arc::new(configuration))),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Subscribes to successful main, branding, and named-store saves.
+    ///
+    /// The host registers listeners while constructing its services. A
+    /// listener receives the exact committed snapshot; failed saves emit none.
+    /// Keep captured service references weak if they own this manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener registry's lock is poisoned.
+    pub fn add_configuration_listener(&self, listener: Arc<ConfigurationListener>) {
+        self.listeners
+            .write()
+            .expect("configuration listener lock poisoned")
+            .push(listener);
     }
 
     /// The metadata configuration as saved now — C#
@@ -576,6 +598,16 @@ impl FerrofinServerConfigurationManager {
 
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        notify_listeners(
+            &self.listeners,
+            &ConfigurationUpdate::Named {
+                key: key.to_ascii_lowercase(),
+                json,
+            },
+        );
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
     }
@@ -588,26 +620,28 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         &self,
         configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
-        // ReplaceConfiguration: validate, persist, then apply side effects.
+        // Hold the writer through validation, persistence, publication and
+        // notification. A cancelled caller must not leave disk ahead of memory.
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
         self.validate_metadata_path(&configuration.metadata_path)?;
-        write_config(&self.config_file, configuration).await?;
-
-        // Build the replacement outside the lock, then swap the pointer: the
-        // write section is a single pointer store, and readers holding an older
-        // handle keep a consistent view of the document they took.
         let replacement = Arc::new(configuration.clone());
-        {
-            let mut guard = self
-                .configuration
-                .write()
-                .expect("configuration lock poisoned");
-            *guard = replacement;
-        }
-
-        // OnConfigurationUpdated → UpdateMetadataPath.
-        self.paths
-            .set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
-        Ok(())
+        let json = serde_json::to_vec_pretty(configuration)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
+        let path = self.config_file.clone();
+        let current = Arc::clone(&self.configuration);
+        let paths = Arc::clone(&self.paths);
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            ferrofin_util::file_helper::atomic_write(&path, &json)
+                .map_err(|e| io_err("write configuration", &path, &e))?;
+            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
+            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -622,16 +656,27 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
-        if let Some(parent) = self.branding_file.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io_err("create configuration directory", parent, &e))?;
-        }
-        let json = serde_json::to_vec_pretty(branding)
-            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?;
-        tokio::fs::write(&self.branding_file, json)
-            .await
-            .map_err(|e| io_err("write branding", &self.branding_file, &e))
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let json: Arc<str> = serde_json::to_string_pretty(branding)
+            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?
+            .into();
+        let path = self.branding_file.clone();
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+                .map_err(|e| io_err("write branding", &path, &e))?;
+            notify_listeners(
+                &listeners,
+                &ConfigurationUpdate::Named {
+                    key: "branding".into(),
+                    json,
+                },
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
@@ -643,6 +688,21 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+    }
+}
+
+fn notify_listeners(
+    listeners: &RwLock<Vec<Arc<ConfigurationListener>>>,
+    update: &ConfigurationUpdate,
+) {
+    // Release the registry lock before invoking listeners so a callback can
+    // inspect configuration or register another observer without deadlocking.
+    let callbacks = listeners
+        .read()
+        .expect("configuration listener lock poisoned")
+        .clone();
+    for callback in callbacks {
+        callback(update);
     }
 }
 
@@ -1652,5 +1712,99 @@ mod tests {
                 .use_file_creation_time_for_date_added
         );
         assert!(mgr.metadata_file.exists(), "seeded as the named JSON");
+    }
+    #[tokio::test]
+    async fn observers_see_committed_snapshots_and_no_failed_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .unwrap(),
+        );
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        let weak = Arc::downgrade(&manager);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            let manager = weak.upgrade().unwrap();
+            if let ConfigurationUpdate::Server(config) = update {
+                let saved: ServerConfiguration =
+                    serde_json::from_slice(&std::fs::read(&manager.config_file).unwrap()).unwrap();
+                assert_eq!(saved.server_name, config.server_name);
+                assert_eq!(manager.snapshot_shared().server_name, config.server_name);
+                assert_eq!(
+                    manager.paths.internal_metadata_path(),
+                    manager.paths.default_internal_metadata_path()
+                );
+            }
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in 0..20 {
+            let manager = Arc::clone(&manager);
+            jobs.spawn(async move {
+                let mut config = manager.snapshot();
+                config.server_name = format!("server-{index}");
+                manager.update_configuration(&config).await.unwrap();
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(updates.lock().unwrap().len(), 20);
+        let previous = manager.snapshot_shared();
+        let bytes = std::fs::read(&manager.config_file).unwrap();
+        let mut invalid = (*previous).clone();
+        invalid.metadata_path = tmp.path().join("missing").to_string_lossy().into_owned();
+        assert!(manager.update_configuration(&invalid).await.is_err());
+        assert_eq!(std::fs::read(&manager.config_file).unwrap(), bytes);
+        // A persistence failure must not publish an event or swap the live Arc.
+        std::fs::remove_file(&manager.config_file).unwrap();
+        std::fs::create_dir(&manager.config_file).unwrap();
+        let mut rejected = (*previous).clone();
+        rejected.server_name = "must-not-publish".into();
+        assert!(manager.update_configuration(&rejected).await.is_err());
+        assert!(Arc::ptr_eq(&previous, &manager.snapshot_shared()));
+        assert_eq!(updates.lock().unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn branding_and_named_stores_publish_the_committed_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .unwrap();
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let branding = BrandingOptions {
+            custom_css: Some("body { color: red; }".into()),
+            ..Default::default()
+        };
+        manager.update_branding(&branding).await.unwrap();
+        manager
+            .named_configuration_updated("NETWORK", Arc::from(r#"{"EnableRemoteAccess":false}"#));
+        {
+            let events = updates.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            let ConfigurationUpdate::Named { key, json } = &events[0] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "branding");
+            assert_eq!(
+                json.as_bytes(),
+                std::fs::read(&manager.branding_file).unwrap()
+            );
+            let ConfigurationUpdate::Named { key, json } = &events[1] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "network");
+            assert_eq!(&**json, r#"{"EnableRemoteAccess":false}"#);
+        }
+        std::fs::remove_file(&manager.branding_file).unwrap();
+        std::fs::create_dir(&manager.branding_file).unwrap();
+        assert!(manager.update_branding(&branding).await.is_err());
+        assert_eq!(updates.lock().unwrap().len(), 2);
     }
 }
