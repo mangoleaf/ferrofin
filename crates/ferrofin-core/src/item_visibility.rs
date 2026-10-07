@@ -10,7 +10,6 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
-use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::localization::LocalizationManager;
@@ -18,8 +17,8 @@ use ferrofin_traits::persistence::ItemRepository;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db_error::db_err;
-use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
+use crate::item_type_lookup::kind_from_type_name;
+use crate::item_visibility_repository as repository;
 use crate::text_util::get_clean_value;
 
 /// The collaborators needed to evaluate item access. Results are never cached
@@ -108,24 +107,9 @@ impl ItemVisibility {
                 .filter(|id| kind(&rows[id]) == BaseItemKind::BoxSet)
                 .copied()
                 .collect();
-            for chunk in boxsets.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-                let mut query = sqlx::QueryBuilder::new(
-                    r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" WHERE "ParentId" IN ("#,
-                );
-                let mut separated = query.separated(",");
-                for id in chunk {
-                    separated.push_bind(guid_to_db(*id));
-                }
-                separated.push_unseparated(")");
-                let pairs: Vec<(String, String)> = query
-                    .build_query_as()
-                    .fetch_all(self.db.pool())
-                    .await
-                    .map_err(db_err)?;
-                for (parent, child) in pairs {
-                    if let (Some(parent), Some(child)) = (uuid(Some(&parent)), uuid(Some(&child))) {
-                        links.entry(parent).or_default().push(child);
-                    }
+            for (parent, child) in repository::linked_children(&self.db, &boxsets).await? {
+                if let (Some(parent), Some(child)) = (uuid(Some(&parent)), uuid(Some(&child))) {
+                    links.entry(parent).or_default().push(child);
                 }
             }
             let mut wanted = HashSet::new();
@@ -167,24 +151,9 @@ impl ItemVisibility {
         items: &[BaseItemEntity],
         user: &'a UserEntity,
     ) -> Result<Context<'a>, ServiceError> {
-        let permissions: Vec<(i32, bool)> =
-            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?"#)
-                .bind(&user.id)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        let preferences: Vec<(i32, String)> =
-            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?"#)
-                .bind(&user.id)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        let libraries: Vec<BaseItemEntity> =
-            sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Type" = ?"#)
-                .bind(stored_type_name(BaseItemKind::CollectionFolder).unwrap_or_default())
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
+        let permissions = repository::permissions(&self.db, &user.id).await?;
+        let preferences = repository::preferences(&self.db, &user.id).await?;
+        let libraries = repository::libraries(&self.db).await?;
         let library_ids: Vec<Uuid> = libraries.iter().map(row_id).collect();
         let mut rows: HashMap<Uuid, BaseItemEntity> = libraries
             .into_iter()
@@ -215,31 +184,14 @@ impl ItemVisibility {
             .filter(|(_, row)| kind(row) == BaseItemKind::Playlist)
             .map(|(id, _)| *id)
             .collect();
-        for chunk in playlist_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let mut query = sqlx::QueryBuilder::new(
-                r#"SELECT p."PlaylistId", p."OwnerUserId", p."OpenAccess",
-                EXISTS(SELECT 1 FROM "FerrofinPlaylistShares" s WHERE s."PlaylistId" = p."PlaylistId" AND s."UserId" = "#,
-            );
-            query
-                .push_bind(&user.id)
-                .push(r#") FROM "FerrofinPlaylists" p WHERE p."PlaylistId" IN ("#);
-            let mut separated = query.separated(",");
-            for id in chunk {
-                separated.push_bind(guid_to_db(*id));
-            }
-            separated.push_unseparated(")");
-            let access: Vec<(String, Option<String>, bool, bool)> = query
-                .build_query_as()
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-            for (id, owner, open, shared) in access {
-                if let Some(id) = uuid(Some(&id)) {
-                    playlists.insert(
-                        id,
-                        open || shared || uuid(owner.as_deref()) == uuid(Some(&user.id)),
-                    );
-                }
+        for (id, owner, open, shared) in
+            repository::playlist_access(&self.db, &user.id, &playlist_ids).await?
+        {
+            if let Some(id) = uuid(Some(&id)) {
+                playlists.insert(
+                    id,
+                    open || shared || uuid(owner.as_deref()) == uuid(Some(&user.id)),
+                );
             }
         }
         Ok(Context {
@@ -561,7 +513,14 @@ impl Context<'_> {
                 return Ok(false);
             }
         }
-        if let Some(channel_id) = uuid(item.channel_id.as_deref()) {
+        // LiveTvProgram/LiveTvChannel override SourceType to LiveTV. Their
+        // ChannelId is guide metadata, not a plugin-channel access reference.
+        if let Some(channel_id) = uuid(item.channel_id.as_deref())
+            && !matches!(
+                kind(item),
+                BaseItemKind::LiveTvProgram | BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel
+            )
+        {
             let channel = self
                 .rows
                 .get(&channel_id)
@@ -711,7 +670,7 @@ mod tests {
         item_repository_over, seed_named_item, seed_user_with_defaults, test_db,
     };
     use crate::user_entity_ext::{set_permission, set_preference};
-    use ferrofin_traits::persistence::ItemPersistenceService;
+    use ferrofin_traits::persistence::{ItemPersistenceService, LinkedChildrenService};
 
     struct Fixture {
         db: Database,
@@ -1023,6 +982,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_tv_program_channel_id_is_not_a_plugin_channel_reference() {
+        let f = Fixture::new().await;
+        let mut program = f.item(65, BaseItemKind::LiveTvProgram, None, None).await;
+        program.channel_id = Some(Uuid::from_u128(66).to_string());
+        program.tags = Some("safe".into());
+        f.save(&program).await;
+        f.pref(PreferenceKind::AllowedTags, &["safe"]).await;
+        f.pref(
+            PreferenceKind::BlockedChannels,
+            &[program.channel_id.as_deref().unwrap()],
+        )
+        .await;
+        assert!(f.visible(&program).await);
+        f.pref(PreferenceKind::BlockUnratedItems, &["LiveTvProgram"])
+            .await;
+        assert!(!f.visible(&program).await);
+    }
+
+    #[tokio::test]
     async fn disabled_library_and_parent_vs_standalone() {
         let f = Fixture::new().await;
         let library = f
@@ -1071,8 +1049,10 @@ mod tests {
         let boxset = f.item(82, BaseItemKind::BoxSet, None, None).await;
         let nested = f.item(83, BaseItemKind::BoxSet, None, None).await;
         for (parent, child) in [(&boxset, &nested), (&nested, &movie)] {
-            sqlx::query(r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder") VALUES (?, ?, 0, 0)"#)
-                .bind(&parent.id).bind(&child.id).execute(f.db.pool()).await.expect("link");
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(parent), row_id(child), 0)
+                .await
+                .expect("link");
         }
         f.pref(PreferenceKind::BlockedMediaFolders, &[&library.id])
             .await;

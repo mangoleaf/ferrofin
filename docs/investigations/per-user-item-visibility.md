@@ -1,21 +1,23 @@
 # Per-user visibility on item lookups
 
-Investigation completed 2026-10-07 against Ferrofin `60f29281`, on branch
-`investigate/per-user-item-visibility`. Implementation remains open. No server
-code or production data was changed.
+Investigated and implemented on branch `investigate/per-user-item-visibility`,
+starting from Ferrofin `60f29281`. User-scoped by-ID actions now evaluate standalone
+visibility before returning data or changing state. The 33 live HTTP observations
+match Jellyfin 12.1.0, including the intentional exceptions described below.
+All runtime fixtures use disposable databases and synthetic media.
 
 ## Finding
 
-Confirmed over real HTTP: knowing a hidden item's ID lets a restricted user read
+Confirmed over real HTTP on the baseline: knowing a hidden item's ID let a restricted user read
 its full DTO, obtain playback sources, download its media, change favorite and
 played state, and delete its database row. Jellyfin returns **404** for those
 requests. A private playlist returns **200** on detail and **401** on deletion
 in Ferrofin, versus **404** for both in Jellyfin.
 
-The missing operation is Jellyfin's user-aware `GetItemById<T>(id, user)`, which
+The missing operation was Jellyfin's user-aware `GetItemById<T>(id, user)`, which
 calls `IsVisibleStandalone` before returning the item. Ferrofin's
-[`LibraryManager`](../../crates/ferrofin-traits/src/library.rs) exposes only an
-unscoped lookup. Its implementation in
+[`LibraryManager`](../../crates/ferrofin-traits/src/library.rs) previously exposed only an
+unscoped lookup. Its baseline implementation in
 [`library_manager.rs`](../../crates/ferrofin-core/src/library_manager.rs)
 at line 1234 rejects a nil ID, then calls `ItemRepository::retrieve_item`.
 Resolving a user for DTO or playback preferences does not authorize the item.
@@ -30,7 +32,7 @@ identified this gap but needs two corrections:
   passed as `/Items?parentId=...` returns **401**. An explicit `/Items?ids=...`
   query returns the hidden movie on **both servers**. Preserve these distinctions.
 
-## Evidence
+## Baseline evidence
 
 Source oracle: the repository's `UPSTREAM_TAG`, **v12.0-rc7**, commit
 `4910aafa1a8227a65a037d3d2d299a32691e4de3`, inspected in the local Jellyfin checkout.
@@ -143,14 +145,13 @@ The pinned upstream implementation is in
    library and child-rating rules. Do not invent a universal Live TV permission
    check here: controller policies and Live TV view availability are distinct.
 
-The existing browse query is **not a substitute**. `hidden_media_folders` only
+The browse query is **not a substitute**. `hidden_media_folders` only
 filters root media folders; `scope_to_user_libraries` deliberately stops adding
 library scope when `item_ids` or an explicit parent already exists.
-`translate_query::append_parental_rating` now implements rating limits, but user
-`AllowedTags`, `BlockedTags`, and `BlockUnratedItems` are stored/read by the user
-manager without corresponding complete visibility enforcement. Shared policy
-facts can be reused; browse and standalone lookup must retain their different
-upstream semantics.
+`translate_query::append_parental_rating` implements rating limits, but on the
+baseline the user manager stored/read `AllowedTags`, `BlockedTags`, and
+`BlockUnratedItems` without corresponding complete visibility enforcement.
+Browse and standalone lookup retain their different upstream semantics.
 
 ## Call-site inventory and integration points
 
@@ -181,20 +182,20 @@ route catalog and is a separate surface gap; it requires a user (401 if absent).
 | Videos: additional parts, alternate-source removal, merge | `videos.rs` | Target user for parts; caller for mutations. Merge filters unavailable videos and returns 400 if fewer than two remain |
 | LiveTV: channel/recording detail, recording delete | `live_tv.rs` | Optional target user for reads; caller for delete; preserve surrounding TV policies |
 
-Do not implement this as a router middleware keyed on `{itemId}` or solely by
-replacing `get_item_by_id` calls:
+The baseline also had indirect lookups that required explicit gates; router
+middleware keyed on `{itemId}` or replacing `get_item_by_id` alone would miss them:
 
-- PlaybackInfo calls `MediaSourceManager`, which reads the repository directly
+- PlaybackInfo called `MediaSourceManager`, which reads the repository directly
   (`media_info.rs:148`, `media_source_manager.rs:1027`).
-- Images serve matching image rows without fetching an item; the existence probe
-  only runs on a miss (`images.rs:595`). Visibility must precede bytes and cached
-  or conditional responses. Preserve the existing no-user behavior.
-- Ancestors reads a repository chain, and media segments/trickplay use their
-  specialized managers. These paths also need the scoped seed check.
-- `SyncPlay::visible_subset` uses `get_item_ids` with explicit IDs
+- Images served matching image rows without fetching an item; the existence probe
+  only ran on a miss (`images.rs:595`). Visibility now precedes bytes and cached
+  or conditional responses, preserving the existing no-user behavior.
+- Ancestors read a repository chain, and media segments/trickplay use their
+  specialized managers. These paths now have scoped seed checks.
+- `SyncPlay::visible_subset` used `get_item_ids` with explicit IDs
   (`sync_play_manager.rs:1539`), but upstream `Group.HasAccessToQueue` calls
-  `IsVisibleStandalone`. It needs a batched standalone check, not the unchanged
-  browse query. Its comment claiming ratings are wholly absent is stale.
+  `IsVisibleStandalone`. It now uses the batched standalone check. The old
+  comment claiming ratings were wholly absent was also stale.
 
 Exceptions to blanket switching:
 
@@ -215,50 +216,117 @@ Exceptions to blanket switching:
 - Session reporting and internal primary-version lookups are not equivalent to
   user-addressed item lookup. Keep internal raw access available.
 
-## Implementation plan
+## Implementation, in commit order
 
-1. Add an explicit user-aware trait operation, for example
-   `get_item_by_id_for_user(id, Option<&UserEntity>)`, with an implementation
-   shared by API handlers and a batch form for SyncPlay. Keep raw lookup for
-   internal and upstream-unscoped callers. Do not give production implementations
-   a default that silently falls back to the raw lookup.
-2. Implement standalone and per-kind rules in core. Share folder preferences,
-   tag normalization, rating helpers, membership and owner/ancestor facts with
-   browse and deletion policy code, without treating browse result membership
-   as authorization. Keep service/database failures as errors, distinct from an
-   invisible item (`None`). A per-request context can load user preferences and
-   library facts once; do not cache visibility globally by item ID alone.
-3. Wire the scoped action families above, retaining their user selection,
-   API-key/null-user behavior, type checks, nil-ID root handling, and permission
-   order. Gate before DTO generation, media access, state writes and deletion.
-   Batch deletion remains ordered and stops at its first invisible item; earlier
-   successful deletions remain committed. Preserve the existing cancellation
-   handling.
-4. Correct `/Items?parentId=` with its own `IsVisible` → 401 gate. Add the
-   standalone batch check to SyncPlay. Audit delegated playlist/collection and
-   session paths against their manager behavior before changing those actions.
-5. Add tests with real managers/repositories, not only stubs that implement raw
-   lookup. Cover each switched HTTP action and alias with an explicit expected
-   result. An operation matrix should distinguish scoped 404, parent 401,
-   merge filtering/400, user-less access, and intentionally unscoped queries.
+| Item | Work completed | Commit |
+| --- | --- | --- |
+| 1 | Explicit user-scoped lookup, standalone predicate and batch contracts; retain raw lookup and fail closed when visibility is unavailable | `9f027d19` |
+| 2 | Request-local policy evaluation, hierarchy/owner membership, inherited tags and ratings, playlist/BoxSet/channel rules, adopted paths | `6d1a34a2` |
+| 3 | Direct read/write, playback, metadata, TV, lyrics/subtitles and version actions; retain effective-user and type semantics | `2aecb4d6` |
+| 4 | Images before cache/304 responses, ancestors, attachments, media segments and trickplay tiles | `4df593fb` |
+| 5 | Visibility before deletion permission; ordered batch stop and cancellation behavior | `40eeb440` |
+| 6 | Batched standalone SyncPlay queue access, including policy changes | `0c86e327` |
+| 7 | Parent-browse 401, explicit-ID browse and user-less/raw lookup exceptions | `bcdb39f2` |
+| 8 | Final regression checks, SQL repository boundary, Live TV source-type correction, live parity and performance evidence | Final validation commit |
 
-Required rule fixtures: enabled/blocked library precedence; shared physical
-locations; adopted versus newly scanned hierarchy; owned extras; hidden parent;
-normalized/inherited tags and blocked-tag precedence; score/subscore and unrated
-kind overrides; missing/wrong-type/nil IDs; root/name/view items; disabled library;
-channel preferences; public/private/shared/file playlists; legacy/modern BoxSets;
-admin and API-key with/without explicit target user; policy change after cache
-warm-up; batch delete stopping order; image cache hits and conditional requests.
+The evaluator loads policy and reachable hierarchy once per request or batch.
+Database reads live in `item_visibility_repository.rs`; service/database failures
+remain errors rather than being converted to invisible items. There is no global
+item-only visibility cache and no schema migration.
 
-Run the reproduction against the implementation, extend it to images, channels,
-Live TV, BoxSets, inherited rules and SyncPlay, then run normal format, clippy,
-test and coverage gates. The current live matrix establishes the reported gap,
-not complete route coverage or all per-kind rules. No standalone visibility
-unit-test matrix was found in the pinned upstream test tree by the symbol search;
-the C# implementations provide the oracle for new cases.
+The real-manager HTTP tests in
+[`apps/ferrofin-server/tests/item_visibility.rs`](../../apps/ferrofin-server/tests/item_visibility.rs)
+cover direct reads/writes, aliases, cached images, user data, typed seeds,
+restricted administrators, explicit target users, indirect media reads,
+deletion ordering and intentional exceptions. Core fixtures exercise adopted
+physical folders, shared library locations, owner extras, inherited normalized
+tags, custom/official ratings and subscore, unrated kind overrides, disabled
+libraries, playlist sharing, nested BoxSets, channel preferences and corruption.
+Live TV guide `ChannelId` does not imply a plugin-channel access check, matching
+the upstream source-type override. SyncPlay includes a 1,200-ID batch fixture.
 
-Measure detail, PlaybackInfo, image hits, and SyncPlay batch access before/after
-using the same data and warm/cold policy state. Pay particular attention to
-per-parent queries and repeated user-preference reads. No performance comparison
-is claimed for this investigation: production code is unchanged. No schema
-migration is expected, but tests must include adopted physical-folder layouts.
+The retained [fixed HTTP matrix](per-user-item-visibility-fixed-http.csv) records
+33 matching observations, including image GET/HEAD/conditional responses and
+SyncPlay group list/detail. This matrix complements the route and policy tests;
+it does not claim live coverage of every item kind or controller action.
+
+The reproducible harness is now checked in:
+
+```sh
+RUSTC_WRAPPER= cargo build --locked --offline -p ferrofin-server
+python3 bench/per_user_visibility.py jellyfin /path/to/jellyfin.dll \
+  --dotnet /path/to/dotnet
+python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+  --reference /tmp/ferrofin-visibility-jellyfin-EXAMPLE/results.json
+```
+
+Each invocation prints its temporary artifact directory and stops its own server.
+Use a worktree-local Cargo target directory to avoid artifacts from other branches.
+Deletion still removes database rows only; physical-file deletion and the absent
+`/Items/{itemId}/Collections` route remain separate work.
+
+## Validation
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all --check` and `git diff --check` | Passed |
+| `cargo clippy --locked --offline --all-targets --all-features -- -D warnings` | Passed |
+| `cargo nextest run --locked --offline --workspace --no-fail-fast` | 7,575 passed, 5 skipped |
+| `cargo test --locked --offline --workspace --doc` | 3 passed |
+| Final binary against the saved Jellyfin 12.1 observations | All 33 matched |
+
+Cargo commands used `RUSTC_WRAPPER=` and an isolated worktree target directory.
+The workspace run includes the SQL-boundary, schema, API-contract and real HTTP
+integration tests. Its first run caught SQL in the visibility evaluator; moving
+the reads into the repository module resolved the failure without raising the
+architecture test's ceilings.
+
+| Per-crate line coverage | Covered / total lines | Result |
+| --- | --- | --- |
+| `ferrofin-core` | 84,482 / 89,512 | 94.38% |
+| `ferrofin-api` | 16,384 / 19,007 | 86.20% |
+| `ferrofin-livetv` | 10,118 / 10,793 | 93.75% |
+
+Each changed, non-exempt crate clears the 80% gate. These figures exclude other
+workspace crates and apps using the filename filter specified in
+`CONTRIBUTING.md`. The initial unfiltered API/Live TV aggregate included uncovered
+dependencies and was unsuitable for the per-crate gate; the filtered reports
+above are the final results. Core and API each passed a fresh instrumented
+nextest run with the filter; Live TV's report uses its completed 296-test run.
+
+## Before/after timing
+
+Measured the saved `60f29281` server executable and the final implementation with
+the same harness and unoptimized debug profile. Each invocation created a fresh
+database with 64 movies in two libraries; the allowed SyncPlay queue contained
+63 movies. All four probes used GET. After functional probes, each route received
+10 warm-up requests and 100 sequential timed requests. Trial order was before,
+after, after, before, before, after; our compilation and coverage jobs had finished.
+
+```sh
+python3 bench/per_user_visibility.py ferrofin /path/to/before/ferrofin-server \
+  --benchmark 100 --library-size 64
+python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+  --benchmark 100 --library-size 64
+```
+
+The table takes the median of each build's three trial percentiles, in milliseconds.
+The [measurement artifact](per-user-item-visibility-performance.json) retains
+all six trial summaries, sample counts, first samples and host load observations.
+
+| Route | Before p50 | After p50 | Change in p50 | Before p95 | After p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Item detail | 2.85 | 3.63 | +0.79 | 5.50 | 6.28 |
+| PlaybackInfo | 1.26 | 2.67 | +1.40 | 1.90 | 4.42 |
+| Cached image | 0.84 | 1.94 | +1.10 | 1.13 | 3.22 |
+| SyncPlay list, 63 queue items | 1.47 | 7.56 | +6.09 | 2.21 | 10.78 |
+
+The new checks add measurable work. SyncPlay has the largest observed increase
+(about 5.1× p50), because its previous explicit-ID browse shortcut did not evaluate
+standalone visibility. It now loads the queue entities and policy/hierarchy facts
+in batches and evaluates every item. The other observed p50 increases are below
+1.5 ms. These are limited warm-loopback measurements on a shared host: one-minute
+load averages ranged from 35.9 to 91.1 at trial starts. They are not production,
+cold-cache, concurrency, or throughput results, and no latency SLO is claimed.
+The artifact's first sample follows the functional probes and is not a cold-cache
+measurement. Immediate policy changes are covered by correctness tests.
