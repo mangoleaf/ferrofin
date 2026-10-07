@@ -360,6 +360,7 @@ impl ProgramsQuery {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
+#[cfg_attr(test, derive(serde::Serialize))]
 struct GetProgramsDto {
     /// The channels to return guide information for.
     #[serde(deserialize_with = "de_comma_delimited_guids")]
@@ -3265,5 +3266,19 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    #[test]
+    fn all_contract_numbers_accept_quoted_values() {
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "GetProgramsDto",
+                super::GetProgramsDto::default()
+            ),
+            3
+        );
     }
 }

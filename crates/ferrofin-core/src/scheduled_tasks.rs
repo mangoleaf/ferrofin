@@ -1973,7 +1973,7 @@ mod tests {
             },
             TaskTriggerInfo {
                 type_: TaskTriggerInfoType::WeeklyTrigger,
-                day_of_week: Some(DayOfWeek::Unrecognized(99)),
+                day_of_week: Some(ferrofin_model::dto::DayOfWeek::Unrecognized(99)),
                 ..TaskTriggerInfo::default()
             },
         ] {

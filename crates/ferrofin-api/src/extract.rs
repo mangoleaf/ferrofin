@@ -57,6 +57,8 @@ use serde::de::DeserializeOwned;
 use self::doc::Doc;
 pub use self::query::Query;
 
+#[cfg(test)]
+pub(crate) mod contract_numbers;
 mod doc;
 mod query;
 

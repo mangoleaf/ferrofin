@@ -784,7 +784,7 @@ impl MediaStream {
                 } else {
                     let video_range = self.video_range();
                     if video_range != VideoRange::Unknown {
-                        attributes.push(video_range_to_string(video_range).to_owned());
+                        attributes.push(video_range_to_string(video_range));
                     }
                 }
 

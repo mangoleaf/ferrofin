@@ -250,5 +250,6 @@ fn play_method_label(method: PlayMethod) -> &'static str {
         PlayMethod::Transcode => "Transcode",
         PlayMethod::DirectStream => "DirectStream",
         PlayMethod::DirectPlay => "DirectPlay",
+        PlayMethod::Unrecognized(_) => "Unknown",
     }
 }

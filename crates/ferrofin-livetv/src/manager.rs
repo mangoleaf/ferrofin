@@ -3284,7 +3284,7 @@ impl FerrofinLiveTvManager {
             RecordingStatus::Cancelled | RecordingStatus::Error
         ) {
             dto.timer_id.clone_from(&timer.base.id);
-            dto.status = Some(recording_status_name(timer.status).to_owned());
+            dto.status = Some(recording_status_name(timer.status));
         }
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());

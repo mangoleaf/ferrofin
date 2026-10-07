@@ -554,6 +554,7 @@ async fn get_playback_info(
 /// `?? playbackInfoDto?.Field` pattern).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct PlaybackInfoBody {
     #[serde(default)]
     device_profile: Option<DeviceProfile>,
@@ -710,6 +711,7 @@ struct OpenLiveStreamQuery {
 /// profile it may also carry is not yet honoured.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct OpenLiveStreamDto {
     /// The open token identifying the source to open.
     open_token: Option<String>,
@@ -1208,5 +1210,26 @@ mod tests {
         // Image subtitles can't be extracted to text; text subs can.
         assert!(s.can_extract_subtitles("subrip"));
         assert!(!s.can_extract_subtitles("hdmv_pgs_subtitle"));
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    #[test]
+    fn all_contract_numbers_accept_quoted_values() {
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "OpenLiveStreamDto",
+                super::OpenLiveStreamDto::default()
+            ),
+            5
+        );
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "PlaybackInfoDto",
+                super::PlaybackInfoBody::default()
+            ),
+            5
+        );
     }
 }

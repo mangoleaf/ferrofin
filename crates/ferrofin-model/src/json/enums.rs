@@ -30,7 +30,7 @@ pub fn deserialize<'de, D: Deserializer<'de>, T: JsonEnum>(d: D) -> Result<T, D:
 
 struct EnumVisitor<T>(PhantomData<T>);
 
-impl<'de, T: JsonEnum> Visitor<'de> for EnumVisitor<T> {
+impl<T: JsonEnum> Visitor<'_> for EnumVisitor<T> {
     type Value = T;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -56,10 +56,10 @@ impl<'de, T: JsonEnum> Visitor<'de> for EnumVisitor<T> {
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<T, E> {
-        if text.is_empty() {
-            if let Some(default) = T::json_default() {
-                return Ok(T::from_discriminant(default));
-            }
+        if text.is_empty()
+            && let Some(default) = T::json_default()
+        {
+            return Ok(T::from_discriminant(default));
         }
         let trimmed = text.trim();
         if let Ok(number) = trimmed.parse::<i32>() {

@@ -586,7 +586,11 @@ async fn a_hung_image_provider_cannot_keep_a_cancelled_scan_alive() {
     assert_eq!(saved[0].2, 1, "the item is whole: {saved:?}");
     let images = image_rows(&db).await;
     assert_eq!(images.len(), 1, "the quick Primary only: {images:?}");
-    assert_eq!(images[0].0, ImageType::Primary as i64, "{images:?}");
+    assert_eq!(
+        images[0].0,
+        i64::from(ImageType::Primary.json_value()),
+        "{images:?}"
+    );
     assert!(Path::new(&images[0].1).exists(), "{images:?}");
 
     // The next scan finishes it, and the rest; the source answers now.
