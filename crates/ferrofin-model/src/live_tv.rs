@@ -6,9 +6,10 @@
 //! reference: upstream it lives in the out-of-tree `Jellyfin.Data.Enums`, it is
 //! referenced by [`LiveTvChannelQuery`], and it has no dedicated port unit.
 //!
-//! C# class inheritance (`TimerInfoDto : BaseTimerInfoDto`) is flattened: the
-//! base fields are duplicated into each derived struct, since Rust has no struct
-//! inheritance.
+//! C# class inheritance (`TimerInfoDto : BaseTimerInfoDto`) is flattened: each
+//! derived struct holds a `#[serde(flatten)]` `base`, since Rust has no struct
+//! inheritance. Deserializing goes through a private flat wire struct instead
+//! (see `timer_info!`), which is the only place the base fields are copied.
 
 use std::collections::HashMap;
 
@@ -23,18 +24,30 @@ use crate::querying::ItemFields;
 use crate::secret::Secret;
 
 /// The type of a live TV channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum ChannelType {
     /// The TV.
     #[serde(rename = "TV")]
     Tv,
     /// The radio.
     Radio,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ChannelType, None, {
+        Tv => ("TV", 0),
+        Radio => ("Radio", 1),
+    }
 }
 
 /// The audio format of a live TV program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProgramAudio {
     /// Mono audio.
     Mono,
@@ -48,11 +61,26 @@ pub enum ProgramAudio {
     Thx,
     /// Dolby Atmos audio.
     Atmos,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProgramAudio, None, {
+        Mono => ("Mono", 0),
+        Stereo => ("Stereo", 1),
+        Dolby => ("Dolby", 2),
+        DolbyDigital => ("DolbyDigital", 3),
+        Thx => ("Thx", 4),
+        Atmos => ("Atmos", 5),
+    }
 }
 
 /// The day pattern of a recurring timer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DayPattern {
     /// Every day.
     #[default]
@@ -61,11 +89,23 @@ pub enum DayPattern {
     Weekdays,
     /// Saturday and Sunday.
     Weekends,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DayPattern, None, {
+        Daily => ("Daily", 0),
+        Weekdays => ("Weekdays", 1),
+        Weekends => ("Weekends", 2),
+    }
 }
 
 /// The status of a recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum RecordingStatus {
     /// A new recording.
     #[default]
@@ -82,6 +122,21 @@ pub enum RecordingStatus {
     ConflictedNotOk,
     /// The recording errored.
     Error,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    RecordingStatus, None, {
+        New => ("New", 0),
+        InProgress => ("InProgress", 1),
+        Completed => ("Completed", 2),
+        Cancelled => ("Cancelled", 3),
+        ConflictedOk => ("ConflictedOk", 4),
+        ConflictedNotOk => ("ConflictedNotOk", 5),
+        Error => ("Error", 6),
+    }
 }
 
 /// The status of a live TV service.
@@ -96,8 +151,9 @@ pub enum LiveTvServiceStatus {
 }
 
 /// How long a recording should be kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum KeepUntil {
     /// Keep until deleted.
     #[default]
@@ -108,15 +164,28 @@ pub enum KeepUntil {
     UntilWatched,
     /// Keep until a date.
     UntilDate,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    KeepUntil, None, {
+        UntilDeleted => ("UntilDeleted", 0),
+        UntilSpaceNeeded => ("UntilSpaceNeeded", 1),
+        UntilWatched => ("UntilWatched", 2),
+        UntilDate => ("UntilDate", 3),
+    }
 }
 
 /// The sort field for items (mirrors `Jellyfin.Data.Enums.ItemSortBy`).
 ///
 /// Forward reference: defined here because [`LiveTvChannelQuery`] uses it and it
 /// has no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 #[allow(missing_docs)]
+#[repr(i32)]
 pub enum ItemSortBy {
     /// The default sort order.
     #[default]
@@ -151,6 +220,44 @@ pub enum ItemSortBy {
     SeriesDatePlayed,
     ParentIndexNumber,
     IndexNumber,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ItemSortBy, None, {
+        Default => ("Default", 0),
+        AiredEpisodeOrder => ("AiredEpisodeOrder", 1),
+        Album => ("Album", 2),
+        AlbumArtist => ("AlbumArtist", 3),
+        Artist => ("Artist", 4),
+        DateCreated => ("DateCreated", 5),
+        OfficialRating => ("OfficialRating", 6),
+        DatePlayed => ("DatePlayed", 7),
+        PremiereDate => ("PremiereDate", 8),
+        StartDate => ("StartDate", 9),
+        SortName => ("SortName", 10),
+        Name => ("Name", 11),
+        Random => ("Random", 12),
+        Runtime => ("Runtime", 13),
+        CommunityRating => ("CommunityRating", 14),
+        ProductionYear => ("ProductionYear", 15),
+        PlayCount => ("PlayCount", 16),
+        CriticRating => ("CriticRating", 17),
+        IsFolder => ("IsFolder", 18),
+        IsUnplayed => ("IsUnplayed", 19),
+        IsPlayed => ("IsPlayed", 20),
+        SeriesSortName => ("SeriesSortName", 21),
+        VideoBitRate => ("VideoBitRate", 22),
+        AirTime => ("AirTime", 23),
+        Studio => ("Studio", 24),
+        IsFavoriteOrLiked => ("IsFavoriteOrLiked", 25),
+        DateLastContentAdded => ("DateLastContentAdded", 26),
+        SeriesDatePlayed => ("SeriesDatePlayed", 27),
+        ParentIndexNumber => ("ParentIndexNumber", 28),
+        IndexNumber => ("IndexNumber", 29),
+    }
 }
 
 /// Guide date range info.
@@ -355,84 +462,180 @@ pub struct BaseTimerInfoDto {
     pub keep_until: KeepUntil,
 }
 
-/// Timer info DTO. Flattens [`BaseTimerInfoDto`].
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase", default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct TimerInfoDto {
-    /// Flattened base timer info.
-    #[serde(flatten)]
-    pub base: BaseTimerInfoDto,
+/// Generates a timer DTO that extends [`BaseTimerInfoDto`] (C# inheritance).
+///
+/// It serializes with `flatten` but deserializes through a private flat wire
+/// struct carrying the base fields inline: serde binds a flattened struct
+/// through its private `FlatMapDeserializer`, which the API's request-body
+/// binder cannot reach, so a flattened timer would bind its member names
+/// case-sensitively where Jellyfin's MVC binder ignores case
+/// (`POST /LiveTv/Timers*`, `POST /LiveTv/SeriesTimers*`). The copy of the
+/// base fields below must track [`BaseTimerInfoDto`]; the
+/// `timers_deserialize_every_base_field` test fails if it drifts.
+macro_rules! timer_info {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident {
+            $( $(#[$fmeta:meta])* pub $field:ident : $ty:ty, )*
+        }
+    ) => {
+        $(#[$meta])*
+        pub struct $name {
+            /// Flattened base timer info.
+            #[serde(flatten)]
+            pub base: BaseTimerInfoDto,
+            $( $(#[$fmeta])* pub $field: $ty, )*
+        }
 
-    /// Gets or sets the status.
-    pub status: RecordingStatus,
+        const _: () = {
+            /// The flat wire shape of the timer (base fields inline).
+            #[derive(Default, Deserialize)]
+            #[serde(rename_all = "PascalCase", default)]
+            #[allow(clippy::struct_excessive_bools)]
+            struct Wire {
+                id: Option<String>,
+                #[serde(rename = "Type")]
+                type_: Option<String>,
+                server_id: Option<String>,
+                external_id: Option<String>,
+                #[serde(with = "crate::json::guid")]
+                channel_id: Uuid,
+                external_channel_id: Option<String>,
+                channel_name: Option<String>,
+                channel_primary_image_tag: Option<String>,
+                program_id: Option<String>,
+                external_program_id: Option<String>,
+                name: Option<String>,
+                overview: Option<String>,
+                #[serde(with = "crate::json::datetime")]
+                start_date: DateTime<Utc>,
+                #[serde(with = "crate::json::datetime")]
+                end_date: DateTime<Utc>,
+                service_name: Option<String>,
+                priority: i32,
+                pre_padding_seconds: i32,
+                post_padding_seconds: i32,
+                is_pre_padding_required: bool,
+                parent_backdrop_item_id: Option<String>,
+                parent_backdrop_image_tags: Option<Vec<String>>,
+                is_post_padding_required: bool,
+                keep_until: KeepUntil,
+                $( $(#[$fmeta])* $field: $ty, )*
+            }
 
-    /// Gets or sets the series timer identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub series_timer_id: Option<String>,
-
-    /// Gets or sets the external series timer identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub external_series_timer_id: Option<String>,
-
-    /// Gets or sets the run time ticks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_time_ticks: Option<i64>,
-
-    /// Gets or sets the program information.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub program_info: Option<Box<BaseItemDto>>,
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    let wire = Wire::deserialize(deserializer)?;
+                    Ok(Self {
+                        base: BaseTimerInfoDto {
+                            id: wire.id,
+                            type_: wire.type_,
+                            server_id: wire.server_id,
+                            external_id: wire.external_id,
+                            channel_id: wire.channel_id,
+                            external_channel_id: wire.external_channel_id,
+                            channel_name: wire.channel_name,
+                            channel_primary_image_tag: wire.channel_primary_image_tag,
+                            program_id: wire.program_id,
+                            external_program_id: wire.external_program_id,
+                            name: wire.name,
+                            overview: wire.overview,
+                            start_date: wire.start_date,
+                            end_date: wire.end_date,
+                            service_name: wire.service_name,
+                            priority: wire.priority,
+                            pre_padding_seconds: wire.pre_padding_seconds,
+                            post_padding_seconds: wire.post_padding_seconds,
+                            is_pre_padding_required: wire.is_pre_padding_required,
+                            parent_backdrop_item_id: wire.parent_backdrop_item_id,
+                            parent_backdrop_image_tags: wire.parent_backdrop_image_tags,
+                            is_post_padding_required: wire.is_post_padding_required,
+                            keep_until: wire.keep_until,
+                        },
+                        $( $field: wire.$field, )*
+                    })
+                }
+            }
+        };
+    };
 }
 
-/// Series timer info DTO. Flattens [`BaseTimerInfoDto`].
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase", default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct SeriesTimerInfoDto {
-    /// Flattened base timer info.
-    #[serde(flatten)]
-    pub base: BaseTimerInfoDto,
+timer_info! {
+    /// Timer info DTO. Flattens [`BaseTimerInfoDto`].
+    #[derive(Debug, Clone, PartialEq, Default, Serialize, ToSchema)]
+    #[serde(rename_all = "PascalCase", default)]
+    #[allow(clippy::struct_excessive_bools)]
+    pub struct TimerInfoDto {
+        /// Gets or sets the status.
+        pub status: RecordingStatus,
 
-    /// Gets or sets a value indicating whether to record at any time.
-    pub record_any_time: bool,
+        /// Gets or sets the series timer identifier.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub series_timer_id: Option<String>,
 
-    /// Gets or sets a value indicating whether to skip episodes in the library.
-    pub skip_episodes_in_library: bool,
+        /// Gets or sets the external series timer identifier.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub external_series_timer_id: Option<String>,
 
-    /// Gets or sets a value indicating whether to record on any channel.
-    pub record_any_channel: bool,
+        /// Gets or sets the run time ticks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "crate::json::value::nullable")]
+        pub run_time_ticks: Option<i64>,
 
-    /// Gets or sets how many recordings to keep.
-    pub keep_up_to: i32,
+        /// Gets or sets the program information.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub program_info: Option<Box<BaseItemDto>>,
+    }
+}
 
-    /// Gets or sets a value indicating whether to record new episodes only.
-    pub record_new_only: bool,
+timer_info! {
+    /// Series timer info DTO. Flattens [`BaseTimerInfoDto`].
+    #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, ToSchema)]
+    #[serde(rename_all = "PascalCase", default)]
+    #[allow(clippy::struct_excessive_bools)]
+    pub struct SeriesTimerInfoDto {
+        /// Gets or sets a value indicating whether to record at any time.
+        pub record_any_time: bool,
 
-    /// Gets or sets the days.
-    pub days: Vec<DayOfWeek>,
+        /// Gets or sets a value indicating whether to skip episodes in the library.
+        pub skip_episodes_in_library: bool,
 
-    /// Gets or sets the day pattern.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub day_pattern: Option<DayPattern>,
+        /// Gets or sets a value indicating whether to record on any channel.
+        pub record_any_channel: bool,
 
-    /// Gets or sets the image tags.
-    pub image_tags: HashMap<ImageType, String>,
+        /// Gets or sets how many recordings to keep.
+        pub keep_up_to: i32,
 
-    /// Gets or sets the parent thumb item id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_thumb_item_id: Option<String>,
+        /// Gets or sets a value indicating whether to record new episodes only.
+        pub record_new_only: bool,
 
-    /// Gets or sets the parent thumb image tag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_thumb_image_tag: Option<String>,
+        /// Gets or sets the days.
+        pub days: Vec<DayOfWeek>,
 
-    /// Gets or sets the parent primary image item identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_primary_image_item_id: Option<String>,
+        /// Gets or sets the day pattern.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "crate::json::value::nullable")]
+        pub day_pattern: Option<DayPattern>,
 
-    /// Gets or sets the parent primary image tag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_primary_image_tag: Option<String>,
+        /// Gets or sets the image tags.
+        pub image_tags: HashMap<ImageType, String>,
+
+        /// Gets or sets the parent thumb item id.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub parent_thumb_item_id: Option<String>,
+
+        /// Gets or sets the parent thumb image tag.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub parent_thumb_image_tag: Option<String>,
+
+        /// Gets or sets the parent primary image item identifier.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub parent_primary_image_item_id: Option<String>,
+
+        /// Gets or sets the parent primary image tag.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub parent_primary_image_tag: Option<String>,
+    }
 }
 
 /// A query for timers.
@@ -453,10 +656,12 @@ pub struct TimerQuery {
 
     /// Gets or sets a value indicating whether the timer is active.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_active: Option<bool>,
 
     /// Gets or sets a value indicating whether the timer is scheduled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_scheduled: Option<bool>,
 }
 
@@ -492,18 +697,22 @@ pub struct RecordingQuery {
 
     /// Gets or sets the start index. Use for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets the status.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub status: Option<RecordingStatus>,
 
     /// Gets or sets a value indicating whether the recording is in progress.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_in_progress: Option<bool>,
 
     /// Gets or sets the series timer identifier.
@@ -516,34 +725,42 @@ pub struct RecordingQuery {
 
     /// Gets or sets a value indicating whether images are enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_images: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a library item.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_library_item: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a movie.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is for kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets the image type limit.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_type_limit: Option<i32>,
 
     /// Gets or sets the enabled image types.
@@ -562,18 +779,22 @@ pub struct RecordingQuery {
 pub struct LiveTvChannelQuery {
     /// Gets or sets the type of the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channel_type: Option<ChannelType>,
 
     /// Gets or sets a value indicating whether this instance is favorite.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_favorite: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is liked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_liked: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is disliked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_disliked: Option<bool>,
 
     /// Gets or sets a value indicating whether to enable favorite sorting.
@@ -586,10 +807,12 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the start index. Used for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets a value indicating whether to add the current program.
@@ -600,22 +823,27 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets a value indicating whether to return news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether to return movies.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets the sort fields.
@@ -623,6 +851,7 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the sort order to return results with.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sort_order: Option<SortOrder>,
 }
 
@@ -833,11 +1062,12 @@ impl Default for TunerHostInfo {
 
 /// Live TV options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LiveTvOptions {
     /// Gets or sets the number of guide days.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub guide_days: Option<i32>,
 
     /// Gets or sets the recording path.
@@ -1041,6 +1271,72 @@ mod tests {
         let back: LiveTvInfo =
             serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
         assert_eq!(value, back);
+    }
+
+    /// Every [`BaseTimerInfoDto`] field set to a non-default value (a struct
+    /// literal, so a new base field must be set here too). What forces the wire
+    /// copy to keep up is `timer_info!`'s own exhaustive `BaseTimerInfoDto {..}`
+    /// mapping; this round trip then catches a wire field that reads differently.
+    fn full_base() -> BaseTimerInfoDto {
+        BaseTimerInfoDto {
+            id: Some("timer1".to_owned()),
+            type_: Some("Timer".to_owned()),
+            server_id: Some("server".to_owned()),
+            external_id: Some("ext".to_owned()),
+            channel_id: Uuid::from_u128(3),
+            external_channel_id: Some("ext-channel".to_owned()),
+            channel_name: Some("Channel".to_owned()),
+            channel_primary_image_tag: Some("tag".to_owned()),
+            program_id: Some("program".to_owned()),
+            external_program_id: Some("ext-program".to_owned()),
+            name: Some("Name".to_owned()),
+            overview: Some("Overview".to_owned()),
+            start_date: DateTime::parse_from_rfc3339("2026-10-07T20:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            end_date: DateTime::parse_from_rfc3339("2026-10-07T21:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            service_name: Some("Service".to_owned()),
+            priority: 1,
+            pre_padding_seconds: 60,
+            post_padding_seconds: 120,
+            is_pre_padding_required: true,
+            parent_backdrop_item_id: Some("backdrop".to_owned()),
+            parent_backdrop_image_tags: Some(vec!["b".to_owned()]),
+            is_post_padding_required: true,
+            keep_until: KeepUntil::UntilWatched,
+        }
+    }
+
+    #[test]
+    fn timers_deserialize_every_base_field() {
+        let timer = TimerInfoDto {
+            base: full_base(),
+            status: RecordingStatus::InProgress,
+            series_timer_id: Some("series".to_owned()),
+            ..TimerInfoDto::default()
+        };
+        let json = serde_json::to_value(&timer).unwrap();
+        assert_eq!(serde_json::from_value::<TimerInfoDto>(json).unwrap(), timer);
+        let series = SeriesTimerInfoDto {
+            base: full_base(),
+            record_any_time: true,
+            keep_up_to: 3,
+            ..SeriesTimerInfoDto::default()
+        };
+        let json = serde_json::to_value(&series).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SeriesTimerInfoDto>(json).unwrap(),
+            series
+        );
+        // Absent members: the wire copy defaults every base field exactly as
+        // `BaseTimerInfoDto` does (`default = …`, a hand-written `Default`).
+        let base: BaseTimerInfoDto = serde_json::from_str("{}").unwrap();
+        let timer: TimerInfoDto = serde_json::from_str("{}").unwrap();
+        let series: SeriesTimerInfoDto = serde_json::from_str("{}").unwrap();
+        assert_eq!(timer.base, base);
+        assert_eq!(series.base, base);
     }
 
     #[test]

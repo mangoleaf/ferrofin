@@ -30,7 +30,6 @@
 //! (`videos`/`audio`), which fall back to [`HlsStreamManager::transcode_stream`]
 //! only when the item has no direct-playable file.
 
-use crate::extract::Query;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, Request, State};
@@ -42,6 +41,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
@@ -59,124 +59,123 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
-/// Every field carries a PascalCase `alias`: the PlaybackInfo-negotiated
-/// `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase parameters,
-/// while the regenerated playlist's segment URLs lowercase the first character
-/// — both spellings must parse or the master-playlist request silently drops
-/// the negotiated limits.
+/// TODO(PLAN_JSON_BODY_CASE_INSENSITIVE F11): port the remaining typed
+/// `DynamicHlsController` members — `audioChannels`, `maxAudioChannels`,
+/// `maxRefFrames`, `maxVideoBitDepth`, `maxAudioBitDepth`, `audioSampleRate`,
+/// `deInterlace`, `audioStreamIndex` — through `HlsStreamRequest` into the
+/// planner's `BaseEncodingJobOptions` (whose fields already exist). Until then
+/// only their camelCase spelling reaches the encoder, via the stream-option
+/// fallback; PascalCase is dropped.
+///
+/// Keys bind ignoring case ([`crate::extract::Query`]): the PlaybackInfo-
+/// negotiated `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase
+/// parameters and the contract spells the caps `videoBitRate`/`audioBitRate`,
+/// and every spelling must reach its field or the master-playlist request
+/// silently drops the negotiated limits.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HlsQuery {
     /// The pinned media source id, if any.
-    #[serde(default, alias = "MediaSourceId")]
+    #[serde(default)]
     media_source_id: Option<String>,
     /// The open live stream to transcode, when the client opened one.
-    #[serde(default, alias = "LiveStreamId")]
+    #[serde(default)]
     live_stream_id: Option<String>,
     /// The playback-session id this stream belongs to.
-    #[serde(default, alias = "PlaySessionId")]
+    #[serde(default)]
     play_session_id: Option<String>,
     /// The requesting device id (kill/keep-alive scope).
-    #[serde(default, alias = "DeviceId")]
+    #[serde(default)]
     device_id: Option<String>,
     /// The desired segment container (`ts`/`mp4`).
-    #[serde(default, alias = "SegmentContainer")]
+    #[serde(default)]
     segment_container: Option<String>,
     /// The desired segment length in seconds.
-    #[serde(default, alias = "SegmentLength")]
+    #[serde(default)]
     segment_length: Option<i32>,
     /// The resume offset in ticks; starts the fMP4 init transcode at the resume
     /// segment so the cached init matches the seek-offset segments (avoids the
     /// resume spinner). Baked into playlist init/segment URLs on a resume.
-    #[serde(default, alias = "StartTimeTicks")]
+    #[serde(default)]
     start_time_ticks: Option<i64>,
     /// The desired output audio codec.
-    #[serde(default, alias = "AudioCodec")]
+    #[serde(default)]
     audio_codec: Option<String>,
     /// The desired output video codec.
-    #[serde(default, alias = "VideoCodec")]
+    #[serde(default)]
     video_codec: Option<String>,
     /// The transcoding profile's max audio channels (drives the `-ac` downmix).
-    #[serde(default, alias = "TranscodingMaxAudioChannels")]
+    #[serde(default)]
     transcoding_max_audio_channels: Option<i32>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
     /// The contract (and every Jellyfin client) spells this `videoBitRate`
     /// (capital `R`, `DynamicHlsController`'s `int? videoBitRate`), while the
-    /// PlaybackInfo `TranscodingUrl` emits `VideoBitrate`. All four spellings
-    /// must parse: dropping the contract form silently lost the negotiated cap
-    /// (no `-maxrate`/`-bufsize`, and a source-bitrate BANDWIDTH in the master).
-    #[serde(
-        default,
-        alias = "VideoBitrate",
-        alias = "VideoBitRate",
-        alias = "videoBitRate"
-    )]
+    /// PlaybackInfo `TranscodingUrl` emits `VideoBitrate`; both reach this field
+    /// because keys bind ignoring case. Dropping the contract form once lost the
+    /// negotiated cap (no `-maxrate`/`-bufsize`, and a source-bitrate BANDWIDTH
+    /// in the master).
+    #[serde(default)]
     video_bitrate: Option<i32>,
     /// The negotiated audio bitrate cap in bit/s (`audioBitRate` in the
     /// contract; see [`Self::video_bitrate`] for the spellings).
-    #[serde(
-        default,
-        alias = "AudioBitrate",
-        alias = "AudioBitRate",
-        alias = "audioBitRate"
-    )]
+    #[serde(default)]
     audio_bitrate: Option<i32>,
     /// The maximum output width in pixels (bounds the scale filter).
-    #[serde(default, alias = "MaxWidth")]
+    #[serde(default)]
     max_width: Option<i32>,
     /// The maximum output height in pixels.
-    #[serde(default, alias = "MaxHeight")]
+    #[serde(default)]
     max_height: Option<i32>,
     /// The maximum output framerate.
-    #[serde(default, alias = "MaxFramerate")]
+    #[serde(default)]
     max_framerate: Option<f32>,
     /// Whether `-c:v copy` is permitted (PlaybackInfo appends `false` when the
     /// client forbade it).
-    #[serde(default, alias = "AllowVideoStreamCopy")]
+    #[serde(default)]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted.
-    #[serde(default, alias = "AllowAudioStreamCopy")]
+    #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
-    #[serde(default, rename = "static", alias = "Static")]
+    #[serde(default, rename = "static")]
     is_static: Option<bool>,
     /// The requested video profile (the `CODECS` profile byte of a re-encode).
-    #[serde(default, alias = "Profile")]
+    #[serde(default)]
     profile: Option<String>,
     /// The requested video level (the `CODECS` level of a re-encode).
-    #[serde(default, alias = "Level")]
+    #[serde(default)]
     level: Option<String>,
     /// The requested output framerate.
-    #[serde(default, alias = "Framerate")]
+    #[serde(default)]
     framerate: Option<f32>,
     /// The requested fixed output width.
-    #[serde(default, alias = "Width")]
+    #[serde(default)]
     width: Option<i32>,
     /// The requested fixed output height.
-    #[serde(default, alias = "Height")]
+    #[serde(default)]
     height: Option<i32>,
     /// The minimum segment count a live playlist waits for before serving.
-    #[serde(default, alias = "MinSegments")]
+    #[serde(default)]
     min_segments: Option<i32>,
     /// The subtitle stream to deliver or burn in.
-    #[serde(default, alias = "SubtitleStreamIndex")]
+    #[serde(default)]
     subtitle_stream_index: Option<i32>,
     /// The negotiated subtitle delivery method name.
-    #[serde(default, alias = "SubtitleMethod")]
+    #[serde(default)]
     subtitle_method: Option<String>,
     /// The client's transcode reasons (forwarded into the master's variant URL).
-    #[serde(default, alias = "TranscodeReasons")]
+    #[serde(default)]
     transcode_reasons: Option<String>,
     /// Whether text subtitles are listed as a group in the master playlist
     /// (route-specific default: `false` for `master.m3u8`, `true` for `live.m3u8`).
-    #[serde(default, alias = "EnableSubtitlesInManifest")]
+    #[serde(default)]
     enable_subtitles_in_manifest: Option<bool>,
     /// Whether the master playlist adds two lower-bitrate variants (default `false`).
-    #[serde(default, alias = "EnableAdaptiveBitrateStreaming")]
+    #[serde(default)]
     enable_adaptive_bitrate_streaming: Option<bool>,
     /// Whether the master playlist lists trickplay image playlists (default `true`).
-    #[serde(default, alias = "EnableTrickplay")]
+    #[serde(default)]
     enable_trickplay: Option<bool>,
 }
 
@@ -678,14 +677,23 @@ crate::query::query_parameters! {
 mod tests {
     use super::*;
 
+    /// Binds `query` the way the routes do, through the shared [`Query`]
+    /// extractor (keys matched ignoring case).
+    fn parse(query: &str) -> Result<HlsQuery, crate::extract::QueryRejection> {
+        let uri = format!("/Videos/x/master.m3u8?{query}")
+            .parse()
+            .expect("uri");
+        Query::try_from_uri(&uri).map(|Query(query)| query)
+    }
+
     /// The PlaybackInfo-negotiated `TranscodingUrl` uses PascalCase parameters
-    /// (`StreamInfo::to_url`); regenerated playlist URLs lowercase the first
-    /// character. Both spellings must reach the same request — dropping the
+    /// (`StreamInfo::to_url`), and clients may send camelCase. Every spelling
+    /// must reach the same request — dropping the
     /// PascalCase form silently loses the negotiated caps (the 2026-07-30
     /// benchmark's full-4K re-encode) and the psid (psid-scoped kills).
     #[test]
     fn hls_query_parses_pascal_and_camel_case() {
-        let pascal: HlsQuery = serde_urlencoded::from_str(
+        let pascal: HlsQuery = parse(
             "DeviceId=d1&PlaySessionId=p1&MediaSourceId=m1&VideoCodec=h264&\
              VideoBitrate=8000000&AudioBitrate=192000&MaxWidth=1920&MaxFramerate=30&\
              TranscodingMaxAudioChannels=2&SegmentContainer=mp4&Static=false",
@@ -699,7 +707,7 @@ mod tests {
         assert_eq!(pascal.max_framerate, Some(30.0));
         assert_eq!(pascal.transcoding_max_audio_channels, Some(2));
 
-        let camel: HlsQuery = serde_urlencoded::from_str(
+        let camel: HlsQuery = parse(
             "deviceId=d1&playSessionId=p1&videoBitrate=8000000&maxWidth=1920&\
              allowVideoStreamCopy=false",
         )
@@ -713,16 +721,14 @@ mod tests {
         // used to parse as `None`: no `-maxrate`, no `-b:a`, and the master
         // playlist fell back to the source bitrate.
         let contract: HlsQuery =
-            serde_urlencoded::from_str("videoBitRate=1000000&audioBitRate=128000")
-                .expect("contract query parses");
+            parse("videoBitRate=1000000&audioBitRate=128000").expect("contract query parses");
         assert_eq!(contract.video_bitrate, Some(1_000_000));
         assert_eq!(contract.audio_bitrate, Some(128_000));
-        let contract_pascal: HlsQuery =
-            serde_urlencoded::from_str("VideoBitRate=1000000&AudioBitRate=128000")
-                .expect("pascal contract query parses");
+        let contract_pascal: HlsQuery = parse("VideoBitRate=1000000&AudioBitRate=128000")
+            .expect("pascal contract query parses");
         assert_eq!(contract_pascal.video_bitrate, Some(1_000_000));
         assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
-        let lower: HlsQuery = serde_urlencoded::from_str("audioBitrate=96000").expect("parses");
+        let lower: HlsQuery = parse("audioBitrate=96000").expect("parses");
         assert_eq!(lower.audio_bitrate, Some(96_000));
     }
 
@@ -732,8 +738,7 @@ mod tests {
         // stream it opened. Without this the planner would resolve the channel's
         // static source and dial the tuner a second time.
         let query: HlsQuery =
-            serde_urlencoded::from_str("LiveStreamId=prov_service_source&MediaSourceId=source")
-                .expect("parses");
+            parse("LiveStreamId=prov_service_source&MediaSourceId=source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -746,8 +751,7 @@ mod tests {
         // The camelCase spelling parses too. It also looks like a
         // `ParseStreamOptions` key (lower-case initial), so assert it still
         // reaches the field rather than being swallowed as a stream option.
-        let query: HlsQuery =
-            serde_urlencoded::from_str("liveStreamId=prov_service_source").expect("parses");
+        let query: HlsQuery = parse("liveStreamId=prov_service_source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -757,7 +761,7 @@ mod tests {
         assert_eq!(req.live_stream_id.as_deref(), Some("prov_service_source"));
 
         // An ordinary transcode names no live stream.
-        let query: HlsQuery = serde_urlencoded::from_str("MediaSourceId=source").expect("parses");
+        let query: HlsQuery = parse("MediaSourceId=source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -769,8 +773,7 @@ mod tests {
 
     #[test]
     fn build_request_maps_caps_and_defaults_allow_copy() {
-        let query: HlsQuery =
-            serde_urlencoded::from_str("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
+        let query: HlsQuery = parse("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -789,8 +792,7 @@ mod tests {
         assert_eq!(req.api_key, None);
         assert!(!req.is_in_local_network, "unknown peer is not local");
 
-        let query: HlsQuery =
-            serde_urlencoded::from_str("AllowVideoStreamCopy=false").expect("parses");
+        let query: HlsQuery = parse("AllowVideoStreamCopy=false").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -805,7 +807,7 @@ mod tests {
     /// the manifest flags, the session token and the peer's locality.
     #[test]
     fn build_request_carries_master_playlist_inputs() {
-        let query: HlsQuery = serde_urlencoded::from_str(
+        let query: HlsQuery = parse(
             "Profile=high&Level=41&Framerate=30&Width=1280&Height=720&MinSegments=2&\
              SubtitleStreamIndex=3&SubtitleMethod=Hls&TranscodeReasons=ContainerNotSupported&\
              EnableSubtitlesInManifest=true&EnableAdaptiveBitrateStreaming=true&\
@@ -839,7 +841,7 @@ mod tests {
 
         // The route default fills an omitted `EnableSubtitlesInManifest`
         // (`live.m3u8` defaults it to true); a public peer is not local.
-        let query: HlsQuery = serde_urlencoded::from_str("").expect("parses");
+        let query: HlsQuery = parse("").expect("parses");
         let ctx = HlsRequestContext {
             api_key: None,
             remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))),

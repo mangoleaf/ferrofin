@@ -19,7 +19,6 @@
 //! the C# `LinkedAlternateVersions` array and linked-child reroute are not modeled
 //! at that seam (see the manager docs).
 
-use crate::extract::Query;
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
@@ -31,6 +30,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{serve_static_file, stream_path};

@@ -21,7 +21,6 @@
 //! path through the library scan (its own path, or a folder's subtree), any
 //! other through the provider manager.
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,7 +40,7 @@ use ferrofin_traits::error::ServiceError;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// `GET /Items/{itemId}/ExternalIdInfos` — the item's external-id descriptors.

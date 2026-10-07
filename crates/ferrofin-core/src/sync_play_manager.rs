@@ -271,7 +271,7 @@ impl PlayQueue {
             playlist_item_id: Uuid::new_v4(),
         });
         match mode {
-            GroupQueueMode::Queue => self.items.extend(new_items),
+            GroupQueueMode::Queue | GroupQueueMode::Unrecognized(_) => self.items.extend(new_items),
             GroupQueueMode::QueueNext => {
                 let at = usize::try_from(self.playing_index + 1)
                     .unwrap_or(self.items.len())
@@ -771,7 +771,9 @@ impl Group {
                 }
                 self.queue.enqueue(item_ids, *mode);
                 let reason = match mode {
-                    GroupQueueMode::Queue => PlayQueueUpdateReason::Queue,
+                    GroupQueueMode::Queue | GroupQueueMode::Unrecognized(_) => {
+                        PlayQueueUpdateReason::Queue
+                    }
                     GroupQueueMode::QueueNext => PlayQueueUpdateReason::QueueNext,
                 };
                 vec![Outbound::all(self.play_queue_env(reason, now))]

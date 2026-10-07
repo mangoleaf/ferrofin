@@ -64,14 +64,7 @@ impl FerrofinMediaSegmentManager {
     /// The stored `INTEGER` discriminant for a [`MediaSegmentType`], matching the
     /// C# declaration order mirrored by the `ferrofin-db` → DTO conversion.
     fn type_discriminant(kind: MediaSegmentType) -> i32 {
-        match kind {
-            MediaSegmentType::Unknown => 0,
-            MediaSegmentType::Commercial => 1,
-            MediaSegmentType::Preview => 2,
-            MediaSegmentType::Recap => 3,
-            MediaSegmentType::Outro => 4,
-            MediaSegmentType::Intro => 5,
-        }
+        kind.json_value()
     }
 
     /// Maps a stored row onto the wire DTO, surfacing a malformed row as a

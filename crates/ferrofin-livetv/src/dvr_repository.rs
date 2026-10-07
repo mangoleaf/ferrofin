@@ -399,16 +399,8 @@ pub async fn recording_rows(
 /// Port of `RecordingStatus.ToString()`, which is what the wire and the column
 /// both carry.
 #[must_use]
-pub fn status_name(status: RecordingStatus) -> &'static str {
-    match status {
-        RecordingStatus::New => "New",
-        RecordingStatus::InProgress => "InProgress",
-        RecordingStatus::Completed => "Completed",
-        RecordingStatus::Cancelled => "Cancelled",
-        RecordingStatus::ConflictedOk => "ConflictedOk",
-        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
-        RecordingStatus::Error => "Error",
-    }
+pub fn status_name(status: RecordingStatus) -> String {
+    status.json_name().into_owned()
 }
 
 /// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.

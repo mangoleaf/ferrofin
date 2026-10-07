@@ -34,7 +34,6 @@
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
-use crate::extract::Query;
 use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -52,7 +51,7 @@ use uuid::Uuid;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;

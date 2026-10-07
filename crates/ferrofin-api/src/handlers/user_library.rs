@@ -29,7 +29,6 @@
 //! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
 //! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,7 +40,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;

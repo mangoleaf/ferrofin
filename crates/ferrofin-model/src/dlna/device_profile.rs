@@ -37,17 +37,21 @@ pub struct DeviceProfile {
     pub id: Option<Uuid>,
     /// The maximum allowed bitrate for all streamed content.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_streaming_bitrate: Option<i32>,
     /// The maximum allowed bitrate for statically streamed (direct-played)
     /// content.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_static_bitrate: Option<i32>,
     /// The maximum allowed bitrate for transcoded music streams.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub music_streaming_transcoding_bitrate: Option<i32>,
     /// The maximum allowed bitrate for statically streamed (direct-played)
     /// music files.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_static_music_bitrate: Option<i32>,
     /// The direct-play profiles.
     pub direct_play_profiles: Vec<DirectPlayProfile>,

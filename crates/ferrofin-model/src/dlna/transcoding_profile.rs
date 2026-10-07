@@ -29,7 +29,6 @@ pub struct TranscodingProfile {
     /// The audio codec.
     pub audio_codec: String,
     /// The delivery protocol.
-    #[serde(default, deserialize_with = "deserialize_protocol")]
     pub protocol: MediaStreamProtocol,
     /// Whether the content length should be estimated.
     pub estimate_content_length: bool,
@@ -48,10 +47,10 @@ pub struct TranscodingProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_audio_channels: Option<String>,
     /// The minimum amount of segments.
-    #[serde(default, deserialize_with = "deserialize_int_or_string")]
+    #[serde(default, deserialize_with = "crate::json::number::profile_i32")]
     pub min_segments: i32,
     /// The segment length.
-    #[serde(default, deserialize_with = "deserialize_int_or_string")]
+    #[serde(default, deserialize_with = "crate::json::number::profile_i32")]
     pub segment_length: i32,
     /// Whether breaking the video stream on non-keyframes is supported.
     ///
@@ -89,41 +88,26 @@ impl Default for TranscodingProfile {
     }
 }
 
-/// Deserializes a [`MediaStreamProtocol`], treating an empty string (or a
-/// missing value) as the default `http` — as Jellyfin's device profiles encode
-/// an unspecified transcoding protocol.
-fn deserialize_protocol<'de, D>(deserializer: D) -> Result<MediaStreamProtocol, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    match raw.as_deref() {
-        None | Some("" | "http") => Ok(MediaStreamProtocol::http),
-        Some("hls") => Ok(MediaStreamProtocol::hls),
-        Some(other) => Err(serde::de::Error::custom(format!(
-            "invalid MediaStreamProtocol: {other}"
-        ))),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Deserializes an `i32` from either a JSON number or a JSON string.
-///
-/// Jellyfin device profiles encode `MinSegments` / `SegmentLength` as strings
-/// in some profiles and as numbers in others.
-fn deserialize_int_or_string<'de, D>(deserializer: D) -> Result<i32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrString {
-        Int(i32),
-        Str(String),
+    fn protocol(json: &str) -> Result<MediaStreamProtocol, serde_json::Error> {
+        serde_json::from_str::<TranscodingProfile>(json).map(|p| p.protocol)
     }
 
-    match IntOrString::deserialize(deserializer)? {
-        IntOrString::Int(n) => Ok(n),
-        IntOrString::Str(s) if s.is_empty() => Ok(0),
-        IntOrString::Str(s) => s.parse().map_err(serde::de::Error::custom),
+    #[test]
+    fn protocol_defaults_to_http_and_matches_ignoring_case() {
+        for (json, want) in [
+            ("{}", MediaStreamProtocol::http),
+            (r#"{"Protocol":null}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":""}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":"HTTP"}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":"hls"}"#, MediaStreamProtocol::hls),
+            (r#"{"Protocol":"HLS"}"#, MediaStreamProtocol::hls),
+        ] {
+            assert_eq!(protocol(json).expect(json), want, "{json}");
+        }
+        assert!(protocol(r#"{"Protocol":"rtsp"}"#).is_err());
     }
 }

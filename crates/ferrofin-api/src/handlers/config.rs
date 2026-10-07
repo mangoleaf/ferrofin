@@ -9,8 +9,8 @@
 //! Named configurations are Jellyfin's pluggable per-key config store. `branding`
 //! has a dedicated typed store; every other key (`encoding`/`network`/`metadata`/
 //! `xbmcmetadata` and any plugin key) round-trips through a generic per-key store
-//! at `{config}/named/{key}.json` — `POST` persists the JSON verbatim, `GET`
-//! returns it (or a typed default object for the known core keys until saved).
+//! at `{config}/named/{key}.json`. Known sections bind through typed JsonDefaults
+//! converters before persistence; plugin-owned documents keep their raw shape.
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -204,6 +204,15 @@ async fn get_named_configuration(
         Some(path) => read_named_config(&path).await,
         None => None,
     };
+    if key.eq_ignore_ascii_case("encoding") {
+        let options = match saved {
+            Some(value) => {
+                serde_json::from_value(value).map_err(|error| configuration_error(&error))?
+            }
+            None => state.config.get_encoding_options().await?,
+        };
+        return encoding_response(&options).map(Json);
+    }
     // `livetv` merges the persisted scalars (recording paths, padding) with the
     // canonical tuner/provider rows the Live TV manager keeps in SQLite — the
     // dashboard's Live TV page renders its tuner and guide-provider lists from
@@ -272,9 +281,6 @@ async fn get_named_configuration(
         return Ok(Json(value));
     }
     let value = match key.to_ascii_lowercase().as_str() {
-        "encoding" => to_value(serde_json::to_value(
-            state.config.get_encoding_options().await?,
-        ))?,
         "network" => to_value(serde_json::to_value(
             ferrofin_networking::NetworkConfiguration::default(),
         ))?,
@@ -285,12 +291,67 @@ async fn get_named_configuration(
     Ok(Json(value))
 }
 
+/// A JsonException thrown inside UpdateNamedConfiguration reaches Jellyfin's
+/// exception middleware as 500; MVC syntax errors are still rejected as 400
+/// before the controller runs.
+fn configuration_error(error: &serde_json::Error) -> ApiError {
+    ferrofin_traits::error::ServiceError::backend(format!("invalid named configuration: {error}"))
+        .into()
+}
+
+// JsonDefaults reads named floating-point literals but cannot write them.
+// Jellyfin persists these in XML; its response serialization throws an
+// ArgumentException, which the exception middleware maps to HTTP 400.
+fn encoding_response(
+    options: &ferrofin_model::configuration::EncodingOptions,
+) -> Result<Value, ApiError> {
+    if [
+        options.down_mix_audio_boost,
+        options.tonemapping_desat,
+        options.tonemapping_peak,
+        options.tonemapping_param,
+        options.vpp_tonemapping_brightness,
+        options.vpp_tonemapping_contrast,
+    ]
+    .iter()
+    .any(|value| !value.is_finite())
+    {
+        return Err(ApiError::BadRequest(
+            "Non-finite numbers cannot be written as JSON.".into(),
+        ));
+    }
+    serde_json::to_value(options).map_err(|error| configuration_error(&error))
+}
+
+fn normalize_named_configuration(key: &str, raw: &str) -> Result<Value, ApiError> {
+    fn typed<T: serde::de::DeserializeOwned + serde::Serialize>(
+        raw: &str,
+    ) -> Result<Value, ApiError> {
+        let config: T = crate::extract::deserialize_defaults(raw)
+            .map_err(|error| configuration_error(&error))?;
+        serde_json::to_value(config).map_err(|error| configuration_error(&error))
+    }
+    use ferrofin_model::configuration::{
+        EncodingOptions, MetadataConfiguration, XbmcMetadataOptions,
+    };
+    match key.to_ascii_lowercase().as_str() {
+        "branding" => typed::<BrandingOptions>(raw),
+        "encoding" => typed::<EncodingOptions>(raw),
+        "network" => typed::<ferrofin_networking::NetworkConfiguration>(raw),
+        "metadata" => typed::<MetadataConfiguration>(raw),
+        "xbmcmetadata" => typed::<XbmcMetadataOptions>(raw),
+        "livetv" => typed::<ferrofin_model::live_tv::LiveTvOptions>(raw),
+        // Plugin-owned documents have no core DTO: retain their existing store.
+        _ => serde_json::from_str(raw).map_err(|error| configuration_error(&error)),
+    }
+}
+
 /// `POST /System/Configuration/{key}` — update a named configuration.
 ///
 /// Port of `ConfigurationController.UpdateNamedConfiguration` (elevation-gated).
-/// `branding` updates its dedicated typed store; every other key is persisted
-/// verbatim to the generic per-key store (`{config}/named/{key}.json`), so the
-/// dashboard's config pages round-trip.
+/// Known keys bind through their configuration DTO with exact member names
+/// and JsonDefaults value conversion before being saved. Plugin-owned keys
+/// retain their generic JSON store.
 #[utoipa::path(
     post,
     path = "/System/Configuration/{key}",
@@ -303,12 +364,12 @@ async fn update_named_configuration(
     State(state): State<AppState>,
     _auth: RequireAdmin,
     Path(key): Path<String>,
-    JsonValueBody(body): JsonValueBody<Value>,
+    JsonValueBody(raw): JsonValueBody<Box<serde_json::value::RawValue>>,
 ) -> Result<StatusCode, ApiError> {
+    let body = normalize_named_configuration(&key, raw.get())?;
     if key.eq_ignore_ascii_case("branding") {
-        let branding: BrandingOptions = serde_json::from_value(body).map_err(|_| {
-            ApiError::BadRequest("Body doesn't contain a valid configuration".to_owned())
-        })?;
+        let branding: BrandingOptions =
+            serde_json::from_value(body).map_err(|error| configuration_error(&error))?;
         state.config.update_branding(&branding).await?;
         return Ok(StatusCode::NO_CONTENT);
     }

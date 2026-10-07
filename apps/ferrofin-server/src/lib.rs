@@ -782,7 +782,8 @@ fn enable_metrics_endpoint(
     ))
 }
 
-/// Rewrites a request's path to its canonical Jellyfin case before routing.
+/// Rewrites a request's path to its canonical Jellyfin case before routing
+/// (the query string is passed through unchanged).
 ///
 /// Jellyfin's API is case-insensitive (ASP.NET); axum's router is case-sensitive,
 /// and clients call some paths in non-canonical case (e.g. `/Localization/countries`).
@@ -795,19 +796,23 @@ async fn canonicalize_path_case(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     // Path: re-case to the registered route where recognized (asset/unknown paths
-    // return `None` and keep their significant case).
-    let path = request.uri().path().to_owned();
-    let new_path = ferrofin_api::routes::canonicalize_path(&path).unwrap_or_else(|| path.clone());
-    // Typed API extractors match query names case-insensitively. Preserve the
-    // original query for authentication, streaming URLs and plugin forwarding.
-    let target = match request.uri().query() {
-        Some(q) => format!("{new_path}?{q}"),
-        None => new_path,
-    };
-    // Origin-form request URI (path + query, no scheme/authority) → rebuilding from
-    // the parts is lossless; the rewrite is idempotent when nothing changed.
-    if let Ok(uri) = target.parse() {
-        *request.uri_mut() = uri;
+    // return `None` and keep their significant case). Query keys are left as
+    // sent: `ferrofin_api::extract::Query` binds them to each handler's members
+    // ignoring case, as ASP.NET does. Preserve the original query for
+    // authentication, streaming URLs and plugin forwarding.
+    let path = request.uri().path();
+    if let Some(new_path) = ferrofin_api::routes::canonicalize_path(path)
+        && new_path != path
+    {
+        let target = match request.uri().query() {
+            Some(q) => format!("{new_path}?{q}"),
+            None => new_path,
+        };
+        // Origin-form request URI (path + query, no scheme/authority), so
+        // rebuilding it from the parts is lossless.
+        if let Ok(uri) = target.parse() {
+            *request.uri_mut() = uri;
+        }
     }
     next.run(request).await
 }

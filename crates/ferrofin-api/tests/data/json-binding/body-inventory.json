@@ -1,0 +1,1804 @@
+{
+  "contracts": [
+    {
+      "file": "jellyfin-openapi-10.11.8.json",
+      "version": "10.11.8"
+    },
+    {
+      "file": "jellyfin-openapi-12.1.0.json",
+      "version": "12.1.0"
+    }
+  ],
+  "body_schemas": [
+    "AccessSchedule",
+    "AddVirtualFolderDto",
+    "AlbumInfo",
+    "AlbumInfoRemoteSearchQuery",
+    "AnalyzerAction",
+    "ArtistInfo",
+    "ArtistInfoRemoteSearchQuery",
+    "AudioSpatialFormat",
+    "AuthenticateUserByName",
+    "BackupOptionsDto",
+    "BackupRestoreRequestDto",
+    "BaseItemDto",
+    "BaseItemKind",
+    "BaseItemPerson",
+    "BookInfo",
+    "BookInfoRemoteSearchQuery",
+    "BoxSetInfo",
+    "BoxSetInfoRemoteSearchQuery",
+    "BrandingOptionsDto",
+    "BufferRequestDto",
+    "CastReceiverApplication",
+    "ChannelType",
+    "ChapterInfo",
+    "ClientCapabilitiesDto",
+    "CodecProfile",
+    "CodecType",
+    "CollectionType",
+    "ContainerProfile",
+    "CreatePlaylistDto",
+    "CreateUserByName",
+    "DayOfWeek",
+    "DayPattern",
+    "DeviceOptionsDto",
+    "DeviceProfile",
+    "DirectPlayProfile",
+    "DisplayPreferencesDto",
+    "DlnaProfileType",
+    "DynamicDayOfWeek",
+    "EmbeddedSubtitleOptions",
+    "EncodingContext",
+    "ExternalUrl",
+    "ExtraType",
+    "ForgotPasswordDto",
+    "ForgotPasswordPinDto",
+    "GeneralCommand",
+    "GeneralCommandType",
+    "GetProgramsDto",
+    "GroupQueueMode",
+    "GroupRepeatMode",
+    "GroupShuffleMode",
+    "IgnoreWaitRequestDto",
+    "ImageOption",
+    "ImageOrientation",
+    "ImageResolution",
+    "ImageSavingConvention",
+    "ImageType",
+    "IsoType",
+    "ItemFields",
+    "ItemSortBy",
+    "JoinGroupRequestDto",
+    "KeepUntil",
+    "LibraryOptions",
+    "ListingsProviderInfo",
+    "LocationType",
+    "LoginInfoInput",
+    "MediaAttachment",
+    "MediaPathDto",
+    "MediaPathInfo",
+    "MediaProtocol",
+    "MediaSegmentDto",
+    "MediaSegmentType",
+    "MediaSourceInfo",
+    "MediaSourceType",
+    "MediaStream",
+    "MediaStreamProtocol",
+    "MediaStreamType",
+    "MediaType",
+    "MediaUpdateInfoDto",
+    "MediaUpdateInfoPathDto",
+    "MediaUrl",
+    "MessageCommand",
+    "MetadataField",
+    "MetadataOptions",
+    "MovePlaylistItemRequestDto",
+    "MovieInfo",
+    "MovieInfoRemoteSearchQuery",
+    "MusicVideoInfo",
+    "MusicVideoInfoRemoteSearchQuery",
+    "NameGuidPair",
+    "NameValuePair",
+    "NewGroupRequestDto",
+    "NextItemRequestDto",
+    "OpenLiveStreamDto",
+    "PathSubstitution",
+    "PersonKind",
+    "PersonLookupInfo",
+    "PersonLookupInfoRemoteSearchQuery",
+    "PingRequestDto",
+    "PlayAccess",
+    "PlayMethod",
+    "PlayRequestDto",
+    "PlaybackInfoDto",
+    "PlaybackOrder",
+    "PlaybackProgressInfo",
+    "PlaybackStartInfo",
+    "PlaybackStopInfo",
+    "PlaylistUserPermissions",
+    "PreviousItemRequestDto",
+    "ProcessPriorityClass",
+    "ProfileCondition",
+    "ProfileConditionType",
+    "ProfileConditionValue",
+    "ProgramAudio",
+    "QueueItem",
+    "QueueRequestDto",
+    "QuickConnectDto",
+    "ReadyRequestDto",
+    "RecordingStatus",
+    "RemoteSearchResult",
+    "RemoveFromPlaylistRequestDto",
+    "RepeatMode",
+    "RepositoryInfo",
+    "ScrollDirection",
+    "SeekRequestDto",
+    "Segment",
+    "SeriesInfo",
+    "SeriesInfoRemoteSearchQuery",
+    "SeriesTimerInfoDto",
+    "ServerConfiguration",
+    "SetChannelMappingDto",
+    "SetPlaylistItemRequestDto",
+    "SetRepeatModeRequestDto",
+    "SetShuffleModeRequestDto",
+    "SongInfo",
+    "SortOrder",
+    "StartupConfigurationDto",
+    "StartupRemoteAccessDto",
+    "StartupUserDto",
+    "SubtitleDeliveryMethod",
+    "SubtitlePlaybackMode",
+    "SubtitleProfile",
+    "SyncPlayUserAccessType",
+    "TaskTriggerInfo",
+    "TaskTriggerInfoType",
+    "TimeStamps",
+    "TimerInfoDto",
+    "TrailerInfo",
+    "TrailerInfoRemoteSearchQuery",
+    "TranscodeSeekInfo",
+    "TranscodingProfile",
+    "TransformationRegistrationPayload",
+    "TransportStreamTimestamp",
+    "TrickplayInfoDto",
+    "TrickplayOptions",
+    "TrickplayScanBehavior",
+    "TunerHostInfo",
+    "TypeOptions",
+    "UnratedItem",
+    "UpdateAnalyzerActionsRequest",
+    "UpdateLibraryOptionsDto",
+    "UpdateMediaPathRequestDto",
+    "UpdatePlaylistDto",
+    "UpdatePlaylistUserDto",
+    "UpdateUserItemDataDto",
+    "UpdateUserPassword",
+    "UploadSubtitleDto",
+    "UserConfiguration",
+    "UserDto",
+    "UserItemDataDto",
+    "UserPolicy",
+    "ValidatePathDto",
+    "Video3DFormat",
+    "VideoRange",
+    "VideoRangeType",
+    "VideoType"
+  ],
+  "enums": [
+    "AnalyzerAction",
+    "AudioSpatialFormat",
+    "BaseItemKind",
+    "ChannelType",
+    "CodecType",
+    "CollectionType",
+    "DayOfWeek",
+    "DayPattern",
+    "DlnaProfileType",
+    "DynamicDayOfWeek",
+    "EmbeddedSubtitleOptions",
+    "EncodingContext",
+    "ExtraType",
+    "GeneralCommandType",
+    "GroupQueueMode",
+    "GroupRepeatMode",
+    "GroupShuffleMode",
+    "ImageOrientation",
+    "ImageResolution",
+    "ImageSavingConvention",
+    "ImageType",
+    "IsoType",
+    "ItemFields",
+    "ItemSortBy",
+    "KeepUntil",
+    "LocationType",
+    "MediaProtocol",
+    "MediaSegmentType",
+    "MediaSourceType",
+    "MediaStreamProtocol",
+    "MediaStreamType",
+    "MediaType",
+    "MetadataField",
+    "PersonKind",
+    "PlayAccess",
+    "PlayMethod",
+    "PlaybackOrder",
+    "ProcessPriorityClass",
+    "ProfileConditionType",
+    "ProfileConditionValue",
+    "ProgramAudio",
+    "RecordingStatus",
+    "RepeatMode",
+    "ScrollDirection",
+    "SortOrder",
+    "SubtitleDeliveryMethod",
+    "SubtitlePlaybackMode",
+    "SyncPlayUserAccessType",
+    "TaskTriggerInfoType",
+    "TranscodeSeekInfo",
+    "TransportStreamTimestamp",
+    "TrickplayScanBehavior",
+    "UnratedItem",
+    "Video3DFormat",
+    "VideoRange",
+    "VideoRangeType",
+    "VideoType"
+  ],
+  "numeric_fields": [
+    {
+      "schema": "AccessSchedule",
+      "field": "EndHour",
+      "type": "number",
+      "format": "double",
+      "nullable": false
+    },
+    {
+      "schema": "AccessSchedule",
+      "field": "Id",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "AccessSchedule",
+      "field": "StartHour",
+      "type": "number",
+      "format": "double",
+      "nullable": false
+    },
+    {
+      "schema": "AlbumInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "AlbumInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "AlbumInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "ArtistInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "ArtistInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "ArtistInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "AirsAfterSeasonNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "AirsBeforeEpisodeNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "AirsBeforeSeasonNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "AlbumCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "AlbumNormalizationGain",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Altitude",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Aperture",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ArtistCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ChildCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "CommunityRating",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "CompletionPercentage",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "CriticRating",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "CumulativeRunTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "EpisodeCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ExposureTime",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "FocalLength",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Height",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "IndexNumberEnd",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "IsoSpeedRating",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Latitude",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "LocalTrailerCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Longitude",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "MediaSourceCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "MovieCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "MusicVideoCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "NormalizationGain",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "PartCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "PrimaryImageAspectRatio",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ProductionYear",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ProgramCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "RecursiveItemCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "RunTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "SeriesCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "ShutterSpeed",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "SongCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "SpecialFeatureCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "TrailerCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BaseItemDto",
+      "field": "Width",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BookInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BookInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BookInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BoxSetInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BoxSetInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BoxSetInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "BufferRequestDto",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "ChapterInfo",
+      "field": "StartPositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "DeviceOptionsDto",
+      "field": "Id",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "DeviceProfile",
+      "field": "MaxStaticBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "DeviceProfile",
+      "field": "MaxStaticMusicBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "DeviceProfile",
+      "field": "MaxStreamingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "DeviceProfile",
+      "field": "MusicStreamingTranscodingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "DisplayPreferencesDto",
+      "field": "PrimaryImageHeight",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "DisplayPreferencesDto",
+      "field": "PrimaryImageWidth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "GetProgramsDto",
+      "field": "ImageTypeLimit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "GetProgramsDto",
+      "field": "Limit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "GetProgramsDto",
+      "field": "StartIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "ImageOption",
+      "field": "Limit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ImageOption",
+      "field": "MinWidth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "LibraryOptions",
+      "field": "AutomaticRefreshIntervalDays",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "MediaAttachment",
+      "field": "Index",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "MediaSegmentDto",
+      "field": "EndTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "MediaSegmentDto",
+      "field": "StartTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "AnalyzeDurationMs",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "Bitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "BufferMs",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "DefaultAudioStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "DefaultSubtitleStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "FallbackMaxStreamingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "RunTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "MediaSourceInfo",
+      "field": "Size",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "AverageFrameRate",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "BitDepth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "BitRate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "BlPresentFlag",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Channels",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "DvBlSignalCompatibilityId",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "DvLevel",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "DvProfile",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "DvVersionMajor",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "DvVersionMinor",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "ElPresentFlag",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Height",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Index",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Level",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "PacketLength",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "RealFrameRate",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "RefFrames",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "ReferenceFrameRate",
+      "type": "number",
+      "format": "float",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Rotation",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "RpuPresentFlag",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "SampleRate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Score",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MediaStream",
+      "field": "Width",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MessageCommand",
+      "field": "TimeoutMs",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "MovePlaylistItemRequestDto",
+      "field": "NewIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "MovieInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MovieInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MovieInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MusicVideoInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MusicVideoInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "MusicVideoInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "OpenLiveStreamDto",
+      "field": "AudioStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "OpenLiveStreamDto",
+      "field": "MaxAudioChannels",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "OpenLiveStreamDto",
+      "field": "MaxStreamingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "OpenLiveStreamDto",
+      "field": "StartTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "OpenLiveStreamDto",
+      "field": "SubtitleStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PersonLookupInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PersonLookupInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PersonLookupInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PingRequestDto",
+      "field": "Ping",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "PlayRequestDto",
+      "field": "PlayingItemPosition",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "PlayRequestDto",
+      "field": "StartPositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "PlaybackInfoDto",
+      "field": "AudioStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackInfoDto",
+      "field": "MaxAudioChannels",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackInfoDto",
+      "field": "MaxStreamingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackInfoDto",
+      "field": "StartTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackInfoDto",
+      "field": "SubtitleStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "AudioStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "Brightness",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "PlaybackStartTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "SubtitleStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackProgressInfo",
+      "field": "VolumeLevel",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "AudioStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "Brightness",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "PlaybackStartTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "SubtitleStreamIndex",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStartInfo",
+      "field": "VolumeLevel",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "PlaybackStopInfo",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "ReadyRequestDto",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "RemoteSearchResult",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "RemoteSearchResult",
+      "field": "IndexNumberEnd",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "RemoteSearchResult",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "RemoteSearchResult",
+      "field": "ProductionYear",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SeekRequestDto",
+      "field": "PositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "Segment",
+      "field": "End",
+      "type": "number",
+      "format": "double",
+      "nullable": false
+    },
+    {
+      "schema": "Segment",
+      "field": "Start",
+      "type": "number",
+      "format": "double",
+      "nullable": false
+    },
+    {
+      "schema": "SeriesInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SeriesInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SeriesInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SeriesTimerInfoDto",
+      "field": "KeepUpTo",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "SeriesTimerInfoDto",
+      "field": "PostPaddingSeconds",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "SeriesTimerInfoDto",
+      "field": "PrePaddingSeconds",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "SeriesTimerInfoDto",
+      "field": "Priority",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "ActivityLogRetentionDays",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "CacheSize",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "DummyChapterDuration",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "ImageExtractionTimeoutMs",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "InactiveSessionThreshold",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "LibraryMetadataRefreshConcurrency",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "LibraryMonitorDelay",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "LibraryScanFanoutConcurrency",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "LibraryUpdateDuration",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "LogFileRetentionDays",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "MaxAudiobookResume",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "MaxResumePct",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "MinAudiobookResume",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "MinResumeDurationSeconds",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "MinResumePct",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "ParallelImageEncodingLimit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "RemoteClientBitrateLimit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "ServerConfiguration",
+      "field": "SlowResponseThresholdMs",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "SongInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SongInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "SongInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "TaskTriggerInfo",
+      "field": "IntervalTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "TaskTriggerInfo",
+      "field": "MaxRuntimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "TaskTriggerInfo",
+      "field": "TimeOfDayTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "TimerInfoDto",
+      "field": "PostPaddingSeconds",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TimerInfoDto",
+      "field": "PrePaddingSeconds",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TimerInfoDto",
+      "field": "Priority",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TimerInfoDto",
+      "field": "RunTimeTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "TrailerInfo",
+      "field": "IndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "TrailerInfo",
+      "field": "ParentIndexNumber",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "TrailerInfo",
+      "field": "Year",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "TranscodingProfile",
+      "field": "MinSegments",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TranscodingProfile",
+      "field": "SegmentLength",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "Bandwidth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "Height",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "Interval",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "ThumbnailCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "TileHeight",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "TileWidth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayInfoDto",
+      "field": "Width",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "Interval",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "JpegQuality",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "ProcessThreads",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "Qscale",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "TileHeight",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "TileWidth",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TrickplayOptions",
+      "field": "WidthResolutions[]",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TunerHostInfo",
+      "field": "FallbackMaxStreamingBitrate",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "TunerHostInfo",
+      "field": "TunerCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "UpdateUserItemDataDto",
+      "field": "PlayCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "UpdateUserItemDataDto",
+      "field": "PlaybackPositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    {
+      "schema": "UpdateUserItemDataDto",
+      "field": "PlayedPercentage",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "UpdateUserItemDataDto",
+      "field": "Rating",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "UpdateUserItemDataDto",
+      "field": "UnplayedItemCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "UserDto",
+      "field": "PrimaryImageAspectRatio",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "UserItemDataDto",
+      "field": "PlayCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "UserItemDataDto",
+      "field": "PlaybackPositionTicks",
+      "type": "integer",
+      "format": "int64",
+      "nullable": false
+    },
+    {
+      "schema": "UserItemDataDto",
+      "field": "PlayedPercentage",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "UserItemDataDto",
+      "field": "Rating",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    {
+      "schema": "UserItemDataDto",
+      "field": "UnplayedItemCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "InvalidLoginAttemptCount",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "LoginAttemptsBeforeLockout",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "MaxActiveSessions",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "MaxParentalRating",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "MaxParentalSubRating",
+      "type": "integer",
+      "format": "int32",
+      "nullable": true
+    },
+    {
+      "schema": "UserPolicy",
+      "field": "RemoteClientBitrateLimit",
+      "type": "integer",
+      "format": "int32",
+      "nullable": false
+    }
+  ]
+}

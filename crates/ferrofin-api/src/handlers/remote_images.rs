@@ -12,7 +12,6 @@
 //!
 //! [`ProviderManager`]: ferrofin_traits::providers::ProviderManager
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -26,6 +25,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Query parameters for `GET /Items/{itemId}/RemoteImages`.

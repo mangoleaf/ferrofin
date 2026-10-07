@@ -15,7 +15,6 @@
 //! as Jellyfin does). The genre facet dispatches to the music-genre aggregate for
 //! a music-only type set and to the plain-genre aggregate otherwise.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -27,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;

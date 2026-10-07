@@ -7,7 +7,6 @@
 //! `IImageProcessor` are left unset here (the image processor is a later wave);
 //! the search manager already fills the textual hint fields.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -17,6 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;

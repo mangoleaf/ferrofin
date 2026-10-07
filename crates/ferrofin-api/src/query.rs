@@ -155,10 +155,23 @@ impl<'de> de::Deserializer<'de> for Capture {
         Err(Captured(fields))
     }
 
+    // Wrappers bind the inner struct's members as well.
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map enum identifier ignored_any
+        bytes byte_buf unit unit_struct seq tuple tuple_struct map enum
+        identifier ignored_any
     }
 }
 
@@ -304,6 +317,18 @@ pub(crate) mod tests {
 
     impl super::QueryParameters for Parameters {
         const COLLECTIONS: &'static [(&'static str, char)] = &[];
+    }
+
+    #[test]
+    fn wrappers_capture_the_inner_fields() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper(#[allow(dead_code)] Parameters);
+        assert_eq!(
+            super::fields::<Option<Parameters>>(),
+            super::fields::<Parameters>()
+        );
+        assert_eq!(super::fields::<Wrapper>(), super::fields::<Parameters>());
+        assert!(super::fields::<crate::handlers::hls::HlsQueryPub>().contains(&"videoCodec"));
     }
 
     #[test]

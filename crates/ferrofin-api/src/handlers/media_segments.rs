@@ -8,7 +8,6 @@
 //! `SegmentEditor` in the contract) belong to a dynamic plugin host and stay on
 //! the `501` stub.
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
@@ -19,6 +18,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 

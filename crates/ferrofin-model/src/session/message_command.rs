@@ -17,5 +17,6 @@ pub struct MessageCommand {
     /// Gets or sets the timeout in milliseconds after which the message should
     /// be dismissed.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub timeout_ms: Option<i64>,
 }

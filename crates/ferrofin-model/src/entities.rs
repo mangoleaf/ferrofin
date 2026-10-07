@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Enum `ImageType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ImageType {
     /// The primary.
     #[default]
@@ -41,11 +42,33 @@ pub enum ImageType {
     BoxRear = 11,
     /// The user profile image.
     Profile = 12,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ImageType, None, {
+        Primary => ("Primary", 0),
+        Art => ("Art", 1),
+        Backdrop => ("Backdrop", 2),
+        Banner => ("Banner", 3),
+        Logo => ("Logo", 4),
+        Thumb => ("Thumb", 5),
+        Disc => ("Disc", 6),
+        Box => ("Box", 7),
+        Screenshot => ("Screenshot", 8),
+        Menu => ("Menu", 9),
+        Chapter => ("Chapter", 10),
+        BoxRear => ("BoxRear", 11),
+        Profile => ("Profile", 12),
+    }
 }
 
 /// Enum `MediaStreamType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaStreamType {
     /// The audio.
     #[default]
@@ -60,11 +83,26 @@ pub enum MediaStreamType {
     Data,
     /// The lyric.
     Lyric,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaStreamType, None, {
+        Audio => ("Audio", 0),
+        Video => ("Video", 1),
+        Subtitle => ("Subtitle", 2),
+        EmbeddedImage => ("EmbeddedImage", 3),
+        Data => ("Data", 4),
+        Lyric => ("Lyric", 5),
+    }
 }
 
 /// Enum `VideoType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum VideoType {
     /// The video file.
     VideoFile,
@@ -74,11 +112,24 @@ pub enum VideoType {
     Dvd,
     /// The blu ray.
     BluRay,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    VideoType, None, {
+        VideoFile => ("VideoFile", 0),
+        Iso => ("Iso", 1),
+        Dvd => ("Dvd", 2),
+        BluRay => ("BluRay", 3),
+    }
 }
 
 /// Enum `Video3DFormat`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum Video3DFormat {
     /// Half side-by-side.
     HalfSideBySide,
@@ -91,21 +142,46 @@ pub enum Video3DFormat {
     /// Multiview Video Coding.
     #[serde(rename = "MVC")]
     Mvc,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    Video3DFormat, None, {
+        HalfSideBySide => ("HalfSideBySide", 0),
+        FullSideBySide => ("FullSideBySide", 1),
+        FullTopAndBottom => ("FullTopAndBottom", 2),
+        HalfTopAndBottom => ("HalfTopAndBottom", 3),
+        Mvc => ("MVC", 4),
+    }
 }
 
 /// Enum `IsoType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum IsoType {
     /// The DVD.
     Dvd,
     /// The blu ray.
     BluRay,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    IsoType, None, {
+        Dvd => ("Dvd", 0),
+        BluRay => ("BluRay", 1),
+    }
 }
 
 /// Enum `LocationType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum LocationType {
     /// The file system.
     FileSystem = 0,
@@ -115,11 +191,24 @@ pub enum LocationType {
     Virtual = 2,
     /// The offline.
     Offline = 3,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    LocationType, None, {
+        FileSystem => ("FileSystem", 0),
+        Remote => ("Remote", 1),
+        Virtual => ("Virtual", 2),
+        Offline => ("Offline", 3),
+    }
 }
 
 /// Enum `ExtraType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ExtraType {
     /// Unknown extra type.
     Unknown = 0,
@@ -145,6 +234,26 @@ pub enum ExtraType {
     Featurette = 10,
     /// Short.
     Short = 11,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ExtraType, None, {
+        Unknown => ("Unknown", 0),
+        Clip => ("Clip", 1),
+        Trailer => ("Trailer", 2),
+        BehindTheScenes => ("BehindTheScenes", 3),
+        DeletedScene => ("DeletedScene", 4),
+        Interview => ("Interview", 5),
+        Scene => ("Scene", 6),
+        Sample => ("Sample", 7),
+        ThemeSong => ("ThemeSong", 8),
+        ThemeVideo => ("ThemeVideo", 9),
+        Featurette => ("Featurette", 10),
+        Short => ("Short", 11),
+    }
 }
 
 /// Enum `TrailerType`.
@@ -176,8 +285,9 @@ pub enum SeriesStatus {
 }
 
 /// Enum `MetadataField` — fields that can be locked against automatic edits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MetadataField {
     /// The cast.
     Cast,
@@ -197,6 +307,23 @@ pub enum MetadataField {
     Runtime,
     /// The official rating.
     OfficialRating,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MetadataField, None, {
+        Cast => ("Cast", 0),
+        Genres => ("Genres", 1),
+        ProductionLocations => ("ProductionLocations", 2),
+        Studios => ("Studios", 3),
+        Tags => ("Tags", 4),
+        Name => ("Name", 5),
+        Overview => ("Overview", 6),
+        Runtime => ("Runtime", 7),
+        OfficialRating => ("OfficialRating", 8),
+    }
 }
 
 impl MetadataField {
@@ -240,19 +367,31 @@ pub enum CollectionTypeOptions {
 }
 
 /// Enum containing deinterlace methods. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum DeinterlaceMethod {
     /// YADIF.
     yadif = 0,
     /// BWDIF.
     bwdif = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DeinterlaceMethod, None, {
+        yadif => ("yadif", 0),
+        bwdif => ("bwdif", 1),
+    }
 }
 
 /// An algorithm to downmix surround sound to stereo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DownMixStereoAlgorithms {
     /// No special algorithm.
     None = 0,
@@ -264,12 +403,26 @@ pub enum DownMixStereoAlgorithms {
     Rfc7845 = 3,
     /// AC-4 standard algorithm with its default gain values (ETSI TS 103 190 6.2.17).
     Ac4 = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DownMixStereoAlgorithms, None, {
+        None => ("None", 0),
+        Dave750 => ("Dave750", 1),
+        NightmodeDialogue => ("NightmodeDialogue", 2),
+        Rfc7845 => ("Rfc7845", 3),
+        Ac4 => ("Ac4", 4),
+    }
 }
 
 /// Enum containing encoder presets. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum EncoderPreset {
     /// Auto preset.
     auto = 0,
@@ -293,12 +446,32 @@ pub enum EncoderPreset {
     superfast = 9,
     /// Ultrafast preset.
     ultrafast = 10,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    EncoderPreset, None, {
+        auto => ("auto", 0),
+        placebo => ("placebo", 1),
+        veryslow => ("veryslow", 2),
+        slower => ("slower", 3),
+        slow => ("slow", 4),
+        medium => ("medium", 5),
+        fast => ("fast", 6),
+        faster => ("faster", 7),
+        veryfast => ("veryfast", 8),
+        superfast => ("superfast", 9),
+        ultrafast => ("ultrafast", 10),
+    }
 }
 
 /// Enum containing hardware acceleration types. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum HardwareAccelerationType {
     /// Software acceleration.
     none = 0,
@@ -316,12 +489,29 @@ pub enum HardwareAccelerationType {
     videotoolbox = 6,
     /// Rockchip Media Process Platform (RKMPP).
     rkmpp = 7,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    HardwareAccelerationType, None, {
+        none => ("none", 0),
+        amf => ("amf", 1),
+        qsv => ("qsv", 2),
+        nvenc => ("nvenc", 3),
+        v4l2m2m => ("v4l2m2m", 4),
+        vaapi => ("vaapi", 5),
+        videotoolbox => ("videotoolbox", 6),
+        rkmpp => ("rkmpp", 7),
+    }
 }
 
 /// Enum containing tonemapping algorithms. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingAlgorithm {
     /// None.
     none = 0,
@@ -339,12 +529,29 @@ pub enum TonemappingAlgorithm {
     mobius = 6,
     /// BT2390.
     bt2390 = 7,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingAlgorithm, None, {
+        none => ("none", 0),
+        clip => ("clip", 1),
+        linear => ("linear", 2),
+        gamma => ("gamma", 3),
+        reinhard => ("reinhard", 4),
+        hable => ("hable", 5),
+        mobius => ("mobius", 6),
+        bt2390 => ("bt2390", 7),
+    }
 }
 
 /// Enum containing tonemapping modes. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingMode {
     /// Auto.
     auto = 0,
@@ -356,12 +563,26 @@ pub enum TonemappingMode {
     lum = 3,
     /// ITP.
     itp = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingMode, None, {
+        auto => ("auto", 0),
+        max => ("max", 1),
+        rgb => ("rgb", 2),
+        lum => ("lum", 3),
+        itp => ("itp", 4),
+    }
 }
 
 /// Enum containing tonemapping ranges. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingRange {
     /// Auto.
     auto = 0,
@@ -369,6 +590,17 @@ pub enum TonemappingRange {
     tv = 1,
     /// PC.
     pc = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingRange, None, {
+        auto => ("auto", 0),
+        tv => ("tv", 1),
+        pc => ("pc", 2),
+    }
 }
 
 /// Enum `UserDataSaveReason`.

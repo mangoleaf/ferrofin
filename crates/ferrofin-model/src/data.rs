@@ -4,11 +4,12 @@
 //! crate here because the DTOs reference them. Video-range, media-type,
 //! item-kind, collection-type, unrated-item and person-kind taxonomies.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use utoipa::ToSchema;
 
 /// An enum representing video ranges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum VideoRange {
     /// Unknown video range.
     Unknown,
@@ -18,13 +19,25 @@ pub enum VideoRange {
     /// HDR video range.
     #[serde(rename = "HDR")]
     Hdr,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    VideoRange, None, {
+        Unknown => ("Unknown", 0),
+        Sdr => ("SDR", 1),
+        Hdr => ("HDR", 2),
+    }
 }
 
 /// An enum representing types of video ranges.
 ///
 /// This is a `[Flags]`-adjacent taxonomy in name only upstream; on the wire it
 /// is a plain string enum (see the OpenAPI contract), so it is modeled as one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum VideoRangeType {
     /// Unknown video range type.
     Unknown,
@@ -64,11 +77,33 @@ pub enum VideoRangeType {
     /// HDR10+ video range type (10-bit to 16-bit).
     #[serde(rename = "HDR10Plus")]
     Hdr10Plus,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    VideoRangeType, None, {
+        Unknown => ("Unknown", 0),
+        Sdr => ("SDR", 1),
+        Hdr10 => ("HDR10", 2),
+        Hlg => ("HLG", 3),
+        Dovi => ("DOVI", 4),
+        DoviWithHdr10 => ("DOVIWithHDR10", 5),
+        DoviWithHlg => ("DOVIWithHLG", 6),
+        DoviWithSdr => ("DOVIWithSDR", 7),
+        DoviWithEl => ("DOVIWithEL", 8),
+        DoviWithHdr10Plus => ("DOVIWithHDR10Plus", 9),
+        DoviWithElhdr10Plus => ("DOVIWithELHDR10Plus", 10),
+        DoviInvalid => ("DOVIInvalid", 11),
+        Hdr10Plus => ("HDR10Plus", 12),
+    }
 }
 
 /// Media types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaType {
     /// Unknown media type.
     #[default]
@@ -81,6 +116,19 @@ pub enum MediaType {
     Photo = 3,
     /// Book media.
     Book = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaType, None, {
+        Unknown => ("Unknown", 0),
+        Video => ("Video", 1),
+        Audio => ("Audio", 2),
+        Photo => ("Photo", 3),
+        Book => ("Book", 4),
+    }
 }
 
 /// Collection type.
@@ -89,9 +137,10 @@ pub enum MediaType {
 /// The server-internal virtual-folder variants (`tvshowseries`, `moviegenre`,
 /// …, discriminants 101–115, marked `[OpenApiIgnoreEnum]` upstream) are not on
 /// the wire and are intentionally omitted to keep the generated schema honest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum CollectionType {
     /// Unknown collection.
     unknown = 0,
@@ -119,11 +168,108 @@ pub enum CollectionType {
     playlists = 11,
     /// Folders collection.
     folders = 12,
+    /// Upstream `tvshowseries` value.
+    #[serde(rename = "tvshowseries")]
+    Tvshowseries,
+
+    /// Upstream `tvgenres` value.
+    #[serde(rename = "tvgenres")]
+    Tvgenres,
+
+    /// Upstream `tvgenre` value.
+    #[serde(rename = "tvgenre")]
+    Tvgenre,
+
+    /// Upstream `tvlatest` value.
+    #[serde(rename = "tvlatest")]
+    Tvlatest,
+
+    /// Upstream `tvnextup` value.
+    #[serde(rename = "tvnextup")]
+    Tvnextup,
+
+    /// Upstream `tvresume` value.
+    #[serde(rename = "tvresume")]
+    Tvresume,
+
+    /// Upstream `tvfavoriteseries` value.
+    #[serde(rename = "tvfavoriteseries")]
+    Tvfavoriteseries,
+
+    /// Upstream `tvfavoriteepisodes` value.
+    #[serde(rename = "tvfavoriteepisodes")]
+    Tvfavoriteepisodes,
+
+    /// Upstream `movielatest` value.
+    #[serde(rename = "movielatest")]
+    Movielatest,
+
+    /// Upstream `movieresume` value.
+    #[serde(rename = "movieresume")]
+    Movieresume,
+
+    /// Upstream `moviemovies` value.
+    #[serde(rename = "moviemovies")]
+    Moviemovies,
+
+    /// Upstream `moviecollection` value.
+    #[serde(rename = "moviecollection")]
+    Moviecollection,
+
+    /// Upstream `moviefavorites` value.
+    #[serde(rename = "moviefavorites")]
+    Moviefavorites,
+
+    /// Upstream `moviegenres` value.
+    #[serde(rename = "moviegenres")]
+    Moviegenres,
+
+    /// Upstream `moviegenre` value.
+    #[serde(rename = "moviegenre")]
+    Moviegenre,
+
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    CollectionType, None, {
+        unknown => ("unknown", 0),
+        movies => ("movies", 1),
+        tvshows => ("tvshows", 2),
+        music => ("music", 3),
+        musicvideos => ("musicvideos", 4),
+        trailers => ("trailers", 5),
+        homevideos => ("homevideos", 6),
+        boxsets => ("boxsets", 7),
+        books => ("books", 8),
+        photos => ("photos", 9),
+        livetv => ("livetv", 10),
+        playlists => ("playlists", 11),
+        folders => ("folders", 12),
+        Tvshowseries => ("tvshowseries", 101),
+        Tvgenres => ("tvgenres", 102),
+        Tvgenre => ("tvgenre", 103),
+        Tvlatest => ("tvlatest", 104),
+        Tvnextup => ("tvnextup", 105),
+        Tvresume => ("tvresume", 106),
+        Tvfavoriteseries => ("tvfavoriteseries", 107),
+        Tvfavoriteepisodes => ("tvfavoriteepisodes", 108),
+        Movielatest => ("movielatest", 109),
+        Movieresume => ("movieresume", 110),
+        Moviemovies => ("moviemovies", 111),
+        Moviecollection => ("moviecollection", 112),
+        Moviefavorites => ("moviefavorites", 113),
+        Moviegenres => ("moviegenres", 114),
+        Moviegenre => ("moviegenre", 115),
+    }
 }
 
 /// An enum representing an unrated item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum UnratedItem {
     /// A movie.
     Movie = 0,
@@ -143,11 +289,29 @@ pub enum UnratedItem {
     ChannelContent = 7,
     /// Another type, not covered by the other fields.
     Other = 8,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    UnratedItem, None, {
+        Movie => ("Movie", 0),
+        Trailer => ("Trailer", 1),
+        Series => ("Series", 2),
+        Music => ("Music", 3),
+        Book => ("Book", 4),
+        LiveTvChannel => ("LiveTvChannel", 5),
+        LiveTvProgram => ("LiveTvProgram", 6),
+        ChannelContent => ("ChannelContent", 7),
+        Other => ("Other", 8),
+    }
 }
 
 /// The person kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum PersonKind {
     /// An unknown person kind.
     Unknown,
@@ -201,11 +365,46 @@ pub enum PersonKind {
     Translator,
     /// A person who narrates a book or other work.
     Narrator,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    PersonKind, None, {
+        Unknown => ("Unknown", 0),
+        Actor => ("Actor", 1),
+        Director => ("Director", 2),
+        Composer => ("Composer", 3),
+        Writer => ("Writer", 4),
+        GuestStar => ("GuestStar", 5),
+        Producer => ("Producer", 6),
+        Conductor => ("Conductor", 7),
+        Lyricist => ("Lyricist", 8),
+        Arranger => ("Arranger", 9),
+        Engineer => ("Engineer", 10),
+        Mixer => ("Mixer", 11),
+        Remixer => ("Remixer", 12),
+        Creator => ("Creator", 13),
+        Artist => ("Artist", 14),
+        AlbumArtist => ("AlbumArtist", 15),
+        Author => ("Author", 16),
+        Illustrator => ("Illustrator", 17),
+        Penciller => ("Penciller", 18),
+        Inker => ("Inker", 19),
+        Colorist => ("Colorist", 20),
+        Letterer => ("Letterer", 21),
+        CoverArtist => ("CoverArtist", 22),
+        Editor => ("Editor", 23),
+        Translator => ("Translator", 24),
+        Narrator => ("Narrator", 25),
+    }
 }
 
 /// The base item kind (generated upstream from all `BaseItem` subclasses).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum BaseItemKind {
     /// Item is an aggregate folder.
     #[default]
@@ -282,6 +481,51 @@ pub enum BaseItemKind {
     Video,
     /// Item is a year.
     Year,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    BaseItemKind, None, {
+        AggregateFolder => ("AggregateFolder", 0),
+        Audio => ("Audio", 1),
+        AudioBook => ("AudioBook", 2),
+        BasePluginFolder => ("BasePluginFolder", 3),
+        Book => ("Book", 4),
+        BoxSet => ("BoxSet", 5),
+        Channel => ("Channel", 6),
+        ChannelFolderItem => ("ChannelFolderItem", 7),
+        CollectionFolder => ("CollectionFolder", 8),
+        Episode => ("Episode", 9),
+        Folder => ("Folder", 10),
+        Genre => ("Genre", 11),
+        ManualPlaylistsFolder => ("ManualPlaylistsFolder", 12),
+        Movie => ("Movie", 13),
+        LiveTvChannel => ("LiveTvChannel", 14),
+        LiveTvProgram => ("LiveTvProgram", 15),
+        MusicAlbum => ("MusicAlbum", 16),
+        MusicArtist => ("MusicArtist", 17),
+        MusicGenre => ("MusicGenre", 18),
+        MusicVideo => ("MusicVideo", 19),
+        Person => ("Person", 20),
+        Photo => ("Photo", 21),
+        PhotoAlbum => ("PhotoAlbum", 22),
+        Playlist => ("Playlist", 23),
+        PlaylistsFolder => ("PlaylistsFolder", 24),
+        Program => ("Program", 25),
+        Recording => ("Recording", 26),
+        Season => ("Season", 27),
+        Series => ("Series", 28),
+        Studio => ("Studio", 29),
+        Trailer => ("Trailer", 30),
+        TvChannel => ("TvChannel", 31),
+        TvProgram => ("TvProgram", 32),
+        UserRootFolder => ("UserRootFolder", 33),
+        UserView => ("UserView", 34),
+        Video => ("Video", 35),
+        Year => ("Year", 36),
+    }
 }
 
 /// The `(kind, stored-type-name)` pairs, copied from the C#
@@ -447,15 +691,26 @@ impl BaseItemKind {
 /// Media streaming protocol.
 ///
 /// Members are lowercase for backwards compatibility with the wire contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum MediaStreamProtocol {
     /// HTTP.
     #[default]
     http = 0,
     /// HTTP Live Streaming.
     hls = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaStreamProtocol, Some(0), {
+        http => ("http", 0),
+        hls => ("hls", 1),
+    }
 }
 
 #[cfg(test)]

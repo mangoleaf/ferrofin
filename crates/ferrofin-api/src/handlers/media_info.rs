@@ -7,7 +7,6 @@
 //! profile + stream selections) is accepted and ignored for now; both verbs
 //! share one handler, matching Jellyfin's two actions.
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -25,8 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
-use crate::handlers::item_update::opt_i32;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
 use crate::state::AppState;
 
@@ -77,39 +75,37 @@ impl TranscoderSupport for FerrofinTranscoderSupport {
 
 /// Query parameters for the playback-info endpoints.
 ///
-/// Jellyfin clients send these PascalCase (the C# model binder is
-/// case-insensitive; axum's `Query` is not), so each field carries a PascalCase
-/// alias alongside the camelCase rename.
+/// Jellyfin clients send these PascalCase; keys bind ignoring case, as the C#
+/// model binder's do ([`crate::extract::Query`]).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaybackInfoQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
-        alias = "UserId",
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
     /// The requested audio stream index override.
-    #[serde(default, alias = "AudioStreamIndex")]
+    #[serde(default)]
     audio_stream_index: Option<i32>,
     /// The requested subtitle stream index override (`-1` = none).
-    #[serde(default, alias = "SubtitleStreamIndex")]
+    #[serde(default)]
     subtitle_stream_index: Option<i32>,
     /// Whether direct play is permitted (default true).
-    #[serde(default, alias = "EnableDirectPlay")]
+    #[serde(default)]
     enable_direct_play: Option<bool>,
     /// Whether direct stream is permitted (default true).
-    #[serde(default, alias = "EnableDirectStream")]
+    #[serde(default)]
     enable_direct_stream: Option<bool>,
     /// Whether transcoding is permitted (default true).
-    #[serde(default, alias = "EnableTranscoding")]
+    #[serde(default)]
     enable_transcoding: Option<bool>,
     /// Whether `-c:v copy` is permitted in a transcode (default true).
-    #[serde(default, alias = "AllowVideoStreamCopy")]
+    #[serde(default)]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted in a transcode (default true).
-    #[serde(default, alias = "AllowAudioStreamCopy")]
+    #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
 }
 
@@ -558,28 +554,32 @@ async fn get_playback_info(
 /// `?? playbackInfoDto?.Field` pattern).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct PlaybackInfoBody {
     #[serde(default)]
     device_profile: Option<DeviceProfile>,
-    // The numeric fields use the lenient number-or-string deserializer: the C#
-    // binder runs with `JsonNumberHandling.AllowReadingFromString`, and clients
-    // (jellyfin-web track pickers) really do post `"AudioStreamIndex": "1"` — a
-    // strict i32 turns the whole request into a 422.
-    #[serde(default, deserialize_with = "opt_i32")]
+    // Track pickers post quoted indexes; the shared body binder reads them.
+    // The marker additionally recognizes an exact empty nullable value.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     max_streaming_bitrate: Option<i32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     audio_stream_index: Option<i32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     subtitle_stream_index: Option<i32>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_play: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_stream: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_transcoding: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     allow_video_stream_copy: Option<bool>,
     #[serde(default)]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     allow_audio_stream_copy: Option<bool>,
 }
 
@@ -703,35 +703,6 @@ struct OpenLiveStreamQuery {
     item_id: Option<Uuid>,
 }
 
-/// Reads an optional `i64` that a client may have posted as a JSON string.
-///
-/// The `i64` twin of [`opt_i32`]: the C# binder runs with
-/// `JsonNumberHandling.AllowReadingFromString`, and a client that quotes
-/// `StartTimeTicks` must not turn the whole request into a `422`.
-///
-/// # Errors
-///
-/// Fails when the value is neither a number, a numeric string, nor `null`.
-fn opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Lenient {
-        Number(i64),
-        Text(String),
-        Null,
-    }
-    match <Lenient as serde::Deserialize>::deserialize(d)? {
-        Lenient::Number(n) => Ok(Some(n)),
-        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
-        Lenient::Text(s) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| serde::de::Error::custom(format!("expected an integer, got {s:?}"))),
-        Lenient::Null => Ok(None),
-    }
-}
-
 /// The posted `OpenLiveStreamDto` body.
 ///
 /// Every scalar the query carries may instead arrive here — jellyfin-web and the
@@ -740,35 +711,41 @@ fn opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Err
 /// profile it may also carry is not yet honoured.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 struct OpenLiveStreamDto {
     /// The open token identifying the source to open.
     open_token: Option<String>,
     /// The target user.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     user_id: Option<Uuid>,
     /// The play session id.
     play_session_id: Option<String>,
     /// The maximum streaming bitrate.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     max_streaming_bitrate: Option<i32>,
     /// The start time in ticks.
-    #[serde(deserialize_with = "opt_i64")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     start_time_ticks: Option<i64>,
     /// The audio stream index.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     audio_stream_index: Option<i32>,
     /// The subtitle stream index.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     subtitle_stream_index: Option<i32>,
     /// The maximum number of audio channels.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     max_audio_channels: Option<i32>,
     /// The item id whose source is opened.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     item_id: Option<Uuid>,
     /// Whether direct play is enabled.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_play: Option<bool>,
     /// Whether direct stream is enabled.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_direct_stream: Option<bool>,
     /// Whether subtitles are always burned in when transcoding.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The protocols the client will direct-play.
     direct_play_protocols: Option<Vec<ferrofin_model::media_info::MediaProtocol>>,
@@ -964,7 +941,7 @@ mod tests {
         // The shape jellyfin-web (and the parity harness) POSTs: everything in
         // the body, nothing in the query. Before this was bound, the open token
         // never reached the manager and a Live TV channel could not be opened.
-        let dto: super::OpenLiveStreamDto = serde_json::from_str(
+        let dto: super::OpenLiveStreamDto = crate::extract::deserialize_mvc(
             r#"{"OpenToken":"prov_LiveTvChannel_abc_src","UserId":"85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d",
                 "ItemId":"11111111222233334444555566667777","PlaySessionId":"parity-livetv",
                 "EnableDirectPlay":true,"EnableDirectStream":false,
@@ -1020,7 +997,7 @@ mod tests {
         // jellyfin-web posts stream indexes as strings ("1", "-1"); the C# binder
         // accepts them (AllowReadingFromString) — a strict i32 made the whole
         // PlaybackInfo request a 422.
-        let body: super::PlaybackInfoBody = serde_json::from_str(
+        let body: super::PlaybackInfoBody = crate::extract::deserialize_mvc(
             r#"{"AudioStreamIndex":"1","SubtitleStreamIndex":"-1","MaxStreamingBitrate":"140000000"}"#,
         )
         .expect("lenient parse");
@@ -1240,5 +1217,26 @@ mod tests {
         // Image subtitles can't be extracted to text; text subs can.
         assert!(s.can_extract_subtitles("subrip"));
         assert!(!s.can_extract_subtitles("hdmv_pgs_subtitle"));
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    #[test]
+    fn all_contract_numbers_accept_quoted_values() {
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "OpenLiveStreamDto",
+                super::OpenLiveStreamDto::default()
+            ),
+            5
+        );
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "PlaybackInfoDto",
+                super::PlaybackInfoBody::default()
+            ),
+            5
+        );
     }
 }

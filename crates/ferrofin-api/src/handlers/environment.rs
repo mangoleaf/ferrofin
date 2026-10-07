@@ -15,7 +15,6 @@
 
 use std::path::Path as StdPath;
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -25,7 +24,7 @@ use ferrofin_model::io::FileSystemEntryInfo;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// The leading marker of a UNC path (`\\server\share`).

@@ -5,7 +5,6 @@
 //! through the
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -15,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
 
