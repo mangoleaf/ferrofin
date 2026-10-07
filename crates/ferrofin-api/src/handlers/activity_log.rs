@@ -9,7 +9,8 @@
 //! for this route; the handler still accepts the full C# filter/sort set (the
 //! richer manager query is honoured when a client sends them).
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -152,4 +153,10 @@ async fn get_log_entries(
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/System/ActivityLog/Entries", get(get_log_entries))
+}
+crate::query::query_parameters! {
+    GetLogEntriesQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+    } => [("get", "/System/ActivityLog/Entries")];
 }

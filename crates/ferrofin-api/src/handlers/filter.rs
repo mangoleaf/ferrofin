@@ -15,7 +15,8 @@
 //! as Jellyfin does). The genre facet dispatches to the music-genre aggregate for
 //! a music-only type set and to the plain-genre aggregate otherwise.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};
@@ -263,4 +264,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Items/Filters", get(get_query_filters_legacy))
         .route("/Items/Filters2", get(get_query_filters))
+}
+crate::query::query_parameters! {
+    FiltersLegacyQuery {
+        "includeItemTypes" => ',',
+        "mediaTypes" => ',',
+    } => [("get", "/Items/Filters")];
+    FiltersQuery {
+        "includeItemTypes" => ',',
+    } => [("get", "/Items/Filters2")];
 }

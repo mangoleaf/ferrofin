@@ -8,7 +8,8 @@
 //! The per-name image routes (`/Studios/{name}/Images/{imageType}`) are
 //! registered by the image controller and probed by `suite/parity/assets.py`.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;

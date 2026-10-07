@@ -20,7 +20,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -651,4 +652,18 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Auth/PasswordResetProviders",
             get(get_password_reset_providers),
         )
+}
+crate::query::query_parameters! {
+    GetSessionsQuery {} => [("get", "/Sessions")];
+    DisplayContentQuery {} => [("post", "/Sessions/{sessionId}/Viewing")];
+    PlayQuery {
+        "itemIds" => ',',
+    } => [("post", "/Sessions/{sessionId}/Playing")];
+    PlaystateQuery {} => [("post", "/Sessions/{sessionId}/Playing/{command}")];
+    CapabilitiesQuery {
+        "playableMediaTypes" => ',',
+        "supportedCommands" => ',',
+    } => [("post", "/Sessions/Capabilities")];
+    FullCapabilitiesQuery {} => [("post", "/Sessions/Capabilities/Full")];
+    ReportViewingQuery {} => [("post", "/Sessions/Viewing")];
 }

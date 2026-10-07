@@ -12,7 +12,8 @@
 //!
 //! [`ProviderManager`]: ferrofin_traits::providers::ProviderManager
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -232,4 +233,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Items/{itemId}/RemoteImages/Download",
             post(download_remote_image),
         )
+}
+crate::query::query_parameters! {
+    RemoteImagesQuery {} => [("get", "/Items/{itemId}/RemoteImages")];
+    DownloadQuery {} => [("post", "/Items/{itemId}/RemoteImages/Download")];
 }

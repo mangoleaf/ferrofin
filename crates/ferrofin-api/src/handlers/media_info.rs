@@ -7,7 +7,8 @@
 //! profile + stream selections) is accepted and ignored for now; both verbs
 //! share one handler, matching Jellyfin's two actions.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -943,6 +944,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/LiveStreams/Open", post(open_live_stream))
         .route("/LiveStreams/Close", post(close_live_stream))
         .route("/Playback/BitrateTest", get(get_bitrate_test))
+}
+
+crate::query::query_parameters! {
+    PlaybackInfoQuery {} => [("get", "/Items/{itemId}/PlaybackInfo"), ("post", "/Items/{itemId}/PlaybackInfo")];
+    OpenLiveStreamQuery {} => [("post", "/LiveStreams/Open")];
+    CloseLiveStreamQuery {} => [("post", "/LiveStreams/Close")];
+    BitrateTestQuery {} => [("get", "/Playback/BitrateTest")];
 }
 
 #[cfg(test)]

@@ -23,8 +23,9 @@
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
 //! not expose).
 
+use crate::extract::Query;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1899,6 +1900,41 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/LiveTv/Tuners/Discover", get(discover_tuners))
         .route("/LiveTv/Tuners/Discvover", get(discover_tuners))
         .route("/LiveTv/Tuners/{tunerId}/Reset", post(reset_tuner))
+}
+
+crate::query::query_parameters! {
+    ChannelsQuery {
+        "enableImageTypes" => ',',
+        "fields" => ',',
+        "sortBy" => ',',
+    } => [("get", "/LiveTv/Channels")];
+    UserIdQuery {} => [("get", "/LiveTv/Channels/{channelId}"), ("get", "/LiveTv/Programs/{programId}")];
+    ProgramsQuery {
+        "channelIds" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "enableImageTypes" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs")];
+    RecommendedProgramsQuery {
+        "enableImageTypes" => ',',
+        "genreIds" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs/Recommended")];
+    IdQuery {} => [("delete", "/LiveTv/TunerHosts"), ("delete", "/LiveTv/ListingProviders")];
+    RecordingsQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/LiveTv/Recordings")];
+    LiveTvUserQuery {} => [("get", "/LiveTv/Recordings/{recordingId}"), ("get", "/LiveTv/Recordings/Folders")];
+    TimersQuery {} => [("get", "/LiveTv/Timers")];
+    TimerDefaultsQuery {} => [("get", "/LiveTv/Timers/Defaults")];
+    SeriesTimersQuery {} => [("get", "/LiveTv/SeriesTimers")];
+    ChannelMappingOptionsQuery {} => [("get", "/LiveTv/ChannelMappingOptions")];
+    LineupsQuery {} => [("get", "/LiveTv/ListingProviders/Lineups")];
+    DiscoverTunersQuery {} => [("get", "/LiveTv/Tuners/Discover")];
 }
 
 #[cfg(test)]

@@ -477,6 +477,7 @@ fn item_entity(id: Uuid) -> BaseItemEntity {
 /// What the [`RecordingSessions`] fake last observed.
 #[derive(Default)]
 struct SessionCalls {
+    listed: Option<(Option<String>, Option<i32>)>,
     played_starts: usize,
     progress: usize,
     stops: usize,
@@ -602,11 +603,13 @@ impl SessionManager for RecordingSessions {
     async fn get_sessions(
         &self,
         _user_id: Uuid,
-        _device_id: Option<&str>,
-        _active_within_seconds: Option<i32>,
+        device_id: Option<&str>,
+        active_within_seconds: Option<i32>,
         _controllable_user_to_check: Option<Uuid>,
         _is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError> {
+        self.calls.lock().unwrap().listed =
+            Some((device_id.map(ToOwned::to_owned), active_within_seconds));
         Ok(vec![current_session_dto(false)])
     }
     async fn logout(&self, access_token: &str) -> Result<(), ServiceError> {
@@ -1492,6 +1495,42 @@ async fn get_sessions_returns_list() {
     let list: Vec<SessionInfoDto> = serde_json::from_slice(&body).expect("list");
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id.as_deref(), Some(SESSION_ID));
+}
+
+#[tokio::test]
+async fn repeated_session_scalars_forward_only_the_first_value() {
+    for (query, expected) in [
+        ("deviceId=probe1&deviceId=nope", "probe1"),
+        ("DeviceId=nope&deviceid=probe1", "nope"),
+        ("DEVICEID=probe1&deviceId=nope&deviceid=third", "probe1"),
+        ("deviceId=a%2Cb&deviceId=c", "a,b"),
+        ("deviceId=&deviceId=probe1", ""),
+    ] {
+        let (sessions, user_data) = recording();
+        let (status, _) = send(
+            state(sessions.clone(), user_data),
+            "GET",
+            &format!("/Sessions?{query}&activeWithinSeconds=7&ACTIVEWITHINSECONDS=invalid"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(
+            sessions.calls.lock().unwrap().listed,
+            Some((Some(expected.to_owned()), Some(7))),
+            "{query}"
+        );
+    }
+    let (sessions, user_data) = recording();
+    let (status, _) = send(
+        state(sessions.clone(), user_data),
+        "GET",
+        "/Sessions?activeWithinSeconds=invalid&activeWithinSeconds=7",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(sessions.calls.lock().unwrap().listed.is_none());
 }
 
 #[tokio::test]

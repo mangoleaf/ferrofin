@@ -21,7 +21,8 @@
 //! list — not [`DtoOptions::default`], which is Jellyfin's *parameterless*
 //! constructor with all 47 fields on.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -365,4 +366,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/MusicGenres/{genreName}/InstantMix",
             get(from_music_genre_name),
         )
+}
+crate::query::query_parameters! {
+    InstantMixQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Songs/{itemId}/InstantMix"), ("get", "/Albums/{itemId}/InstantMix"), ("get", "/Playlists/{itemId}/InstantMix"), ("get", "/Artists/{itemId}/InstantMix"), ("get", "/Items/{itemId}/InstantMix"), ("get", "/MusicGenres/{name}/InstantMix"), ("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
+    InstantMixIdQuery {} => [("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
 }

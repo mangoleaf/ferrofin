@@ -10,7 +10,8 @@
 //! other by-name browses; the year rows come from
 //! [`LibraryManager::get_years`](ferrofin_traits::library::LibraryManager::get_years).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -213,4 +214,16 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Years", get(get_years))
         .route("/Years/{year}", get(get_year))
+}
+crate::query::query_parameters! {
+    YearsQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Years")];
+    YearQuery {} => [("get", "/Years/{year}")];
 }

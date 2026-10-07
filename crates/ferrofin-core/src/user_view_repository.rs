@@ -292,6 +292,9 @@ async fn consolidate(
     move_user_settings(tx, canonical, source_id.as_deref(), &stale_ids).await?;
     move_remaining_references(tx, &canonical_db, &stale_ids).await?;
 
+    for id in &stale_ids {
+        crate::item_persistence_service::move_user_data(tx, id, &canonical_db).await?;
+    }
     // Nothing points at them any more, and BaseItems cascades on ParentId, so
     // this has to come last.
     let delete_sql = format!(r#"DELETE FROM "BaseItems" WHERE "Id" IN ({marks})"#);
@@ -802,6 +805,7 @@ mod tests {
         seed_child(&db, channel_b, BaseItemKind::LiveTvChannel, stale_id).await;
         seed_child(&db, program, BaseItemKind::LiveTvProgram, stale_id).await;
         seed_display_settings(&db, user, stale_id, "emby").await;
+        crate::test_support::seed_user_data(&db, user, stale_id, true, None).await;
         let movies = Uuid::from_u128(0x1111);
         let music = Uuid::from_u128(0x2222);
         seed_preference(
@@ -828,6 +832,18 @@ mod tests {
             .await
             .expect("consolidate");
         assert_eq!(dropped, 1);
+
+        let (history_item, history_key): (String, String) = sqlx::query_as(
+            r#"SELECT "ItemId", "CustomDataKey" FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (history_item, history_key),
+            (guid_to_db(canonical), canonical.to_string())
+        );
 
         // The canonical view is a copy of the promoted source.
         let view = fetch_item_opt(&db, canonical)

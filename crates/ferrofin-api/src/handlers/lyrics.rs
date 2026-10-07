@@ -20,7 +20,8 @@
 //! resolve, upload / download also queue a metadata refresh, matching the C#
 //! flow.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -266,4 +267,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(download_remote_lyrics),
         )
         .route("/Providers/Lyrics/{lyricId}", get(get_remote_lyrics))
+}
+crate::query::query_parameters! {
+    UploadLyricsQuery {} => [("post", "/Audio/{itemId}/Lyrics")];
 }

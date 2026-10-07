@@ -25,7 +25,8 @@
 //! alternate-version primary-episode remap, neither of which is persistable
 //! without the reconstructed domain tree.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -681,4 +682,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Shows/{itemId}/Episodes", get(get_episodes))
         .route("/Shows/{itemId}/Seasons", get(get_seasons))
         .route("/Shows/{itemId}/Similar", get(get_similar_shows))
+}
+crate::query::query_parameters! {
+    NextUpParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/NextUp")];
+    UpcomingParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/Upcoming")];
+    EpisodesParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Episodes")];
+    SeasonsParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Seasons")];
+    SimilarParams {
+        "excludeArtistIds" => ',',
+        "fields" => ',',
+    } => [("get", "/Shows/{itemId}/Similar")];
 }

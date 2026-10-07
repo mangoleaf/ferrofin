@@ -9,7 +9,8 @@
 //! The instant-mix and per-name image routes for music genres live in their own
 //! controllers (`instant_mix.rs`, `image.rs`) and are registered there.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;

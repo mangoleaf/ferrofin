@@ -40,9 +40,10 @@
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
 //! final while the on-disk pipeline is a later wave.
 
+use crate::extract::Query;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -1525,6 +1526,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
             get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
         )
+}
+
+crate::query::query_parameters! {
+    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("get", "/UserImage"), ("post", "/UserImage"), ("delete", "/UserImage"), ("delete", "/Items/{itemId}/Images/{imageType}")];
+    UpdateImageIndexQuery {} => [("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index")];
 }
 
 #[cfg(test)]

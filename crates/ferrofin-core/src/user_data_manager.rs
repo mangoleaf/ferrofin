@@ -5,10 +5,8 @@
 //! `(ItemId, UserId, CustomDataKey)` triple.
 //!
 //! Port simplifications, all faithful to the trait's `Uuid`-identity surface:
-//! - The C# path derives multiple `CustomDataKey`s from an item's metadata
-//!   (`GetUserDataKeys`); the trait works purely with item ids, so this port
-//!   uses the item id as the single `CustomDataKey` (matching how the landed
-//!   `test_support::seed_user_data` and the next-up service already key rows).
+//! - `GetUserDataKeys` derives keys from stored metadata through the shared
+//!   user-data key repository, also used by retention recovery.
 //! - The C# in-memory `FastConcurrentLru` cache and the `UserDataSaved` event
 //!   are dropped; every read hits the table.
 //! - `UpdatePlayState` needs the item's runtime + kind (for the resume-point
@@ -38,81 +36,8 @@ use ferrofin_traits::library::{ContentPermissions, UserDataManager};
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{supports_played_status, supports_position_ticks_resume};
+use crate::user_data_key_repository::extra_type_name;
 use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
-
-/// One item's identity fields, read once and reused for the item and (for a
-/// `Season`/`Episode`) its series.
-///
-/// Owns its strings because it outlives the query; [`Self::as_source`] hands
-/// the derivation the borrowed view it wants.
-#[derive(Debug, Clone)]
-struct KeyRow {
-    item_id: Uuid,
-    kind: BaseItemKind,
-    tmdb: Option<String>,
-    imdb: Option<String>,
-    tvdb: Option<String>,
-    custom: Option<String>,
-    musicbrainz_album: Option<String>,
-    musicbrainz_release_group: Option<String>,
-    musicbrainz_artist: Option<String>,
-    episode_title: Option<String>,
-    is_series: bool,
-    index_number: Option<i64>,
-    parent_index_number: Option<i64>,
-    name: Option<String>,
-    album: Option<String>,
-    album_artist: Option<String>,
-    extra_type: Option<String>,
-    run_time_ticks: Option<i64>,
-    series_id: Option<Uuid>,
-}
-
-impl KeyRow {
-    fn as_source(&self) -> KeySource<'_> {
-        KeySource {
-            item_id: self.item_id,
-            kind: self.kind,
-            tmdb: self.tmdb.as_deref(),
-            imdb: self.imdb.as_deref(),
-            tvdb: self.tvdb.as_deref(),
-            custom: self.custom.as_deref(),
-            musicbrainz_album: self.musicbrainz_album.as_deref(),
-            musicbrainz_release_group: self.musicbrainz_release_group.as_deref(),
-            musicbrainz_artist: self.musicbrainz_artist.as_deref(),
-            episode_title: self.episode_title.as_deref(),
-            is_series: self.is_series,
-            index_number: self.index_number,
-            parent_index_number: self.parent_index_number,
-            name: self.name.as_deref(),
-            album: self.album.as_deref(),
-            album_artist: self.album_artist.as_deref(),
-            extra_type: self.extra_type.as_deref(),
-            run_time_ticks: self.run_time_ticks,
-        }
-    }
-}
-
-/// The lowercase `ExtraType` name the C# key builder appends
-/// (`ExtraType.ToString().ToLowerInvariant()`), for a stored discriminant.
-fn extra_type_name(disc: i32) -> Option<&'static str> {
-    Some(match disc {
-        1 => "clip",
-        2 => "trailer",
-        3 => "behindthescenes",
-        4 => "deletedscene",
-        5 => "interview",
-        6 => "scene",
-        7 => "sample",
-        8 => "themesong",
-        9 => "themevideo",
-        10 => "featurette",
-        11 => "short",
-        // 0 is `Unknown`, which the C# never reaches: `ExtraType.HasValue` is
-        // false for a non-extra, so no key is built at all.
-        _ => return None,
-    })
-}
 
 /// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
@@ -225,134 +150,12 @@ impl FerrofinUserDataManager {
     /// exists to prevent. A failed save the caller can retry beats a save that
     /// half-succeeded silently.
     async fn keys_for(&self, item_id: Uuid) -> Result<Vec<String>, ServiceError> {
-        Ok(self
-            .load_keys(item_id)
-            .await?
-            .unwrap_or_else(|| vec![item_id.to_string()]))
-    }
-
-    /// Reads the rows behind [`Self::keys_for`] — the item, and for a
-    /// `Season`/`Episode` its series — and derives the keys.
-    async fn load_keys(&self, item_id: Uuid) -> Result<Option<Vec<String>>, ServiceError> {
-        let Some(item) = self.key_row(item_id).await? else {
-            return Ok(None);
-        };
-        // Only a Season or an Episode consults its series, so only then is the
-        // second query worth making.
-        let series = match (item.kind, item.series_id) {
-            (BaseItemKind::Season | BaseItemKind::Episode, Some(series_id)) => {
-                self.key_row(series_id).await?
-            }
-            _ => None,
-        };
-        let series_source = series.as_ref().map(KeyRow::as_source);
-        Ok(Some(user_data_keys(
-            &item.as_source(),
-            series_source.as_ref(),
-        )))
-    }
-
-    /// One item's identity fields plus its provider ids.
-    #[allow(
-        clippy::type_complexity,
-        reason = "one row read positionally; naming a struct for it would not \
-                  be read anywhere else"
-    )]
-    async fn key_row(&self, item_id: Uuid) -> Result<Option<KeyRow>, ServiceError> {
-        let row: Option<(
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<i64>,
-            Option<String>,
-            Option<bool>,
-        )> = sqlx::query_as(
-            r#"SELECT "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
-                      "AlbumArtists", "SeriesId", "ExtraType", "RunTimeTicks",
-                      "EpisodeTitle", "IsSeries"
-               FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        Ok(
+            crate::user_data_key_repository::load_keys(&mut conn, item_id)
+                .await?
+                .unwrap_or_else(|| vec![item_id.to_string()]),
         )
-        .bind(guid_to_db(item_id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
-
-        let Some((
-            type_name,
-            index_number,
-            parent_index_number,
-            name,
-            album,
-            album_artists,
-            series_id,
-            extra_type,
-            run_time_ticks,
-            episode_title,
-            is_series,
-        )) = row
-        else {
-            return Ok(None);
-        };
-
-        let kind = kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder);
-        // Most kinds never look at a provider id, and this runs on the busiest
-        // write path, so do not pay for the second query unless the derivation
-        // will read it. An Episode is deliberately in the "no" list: it takes
-        // its keys from the series and ignores its own providers entirely
-        // (`EnableDefaultVideoUserDataKeys => false`), and episodes are the
-        // bulk of a TV library.
-        let providers: Vec<(String, String)> = if uses_provider_ids(kind) {
-            sqlx::query_as(
-                r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
-                   WHERE "ItemId" = ?1"#,
-            )
-            .bind(guid_to_db(item_id))
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?
-        } else {
-            Vec::new()
-        };
-        let provider = |want: &str| {
-            providers
-                .iter()
-                .find(|(id, _)| id.eq_ignore_ascii_case(want))
-                .map(|(_, v)| v.clone())
-        };
-
-        Ok(Some(KeyRow {
-            item_id,
-            kind,
-            tmdb: provider("Tmdb"),
-            imdb: provider("Imdb"),
-            tvdb: provider("Tvdb"),
-            custom: provider("Custom"),
-            musicbrainz_album: provider("MusicBrainzAlbum"),
-            musicbrainz_release_group: provider("MusicBrainzReleaseGroup"),
-            musicbrainz_artist: provider("MusicBrainzArtist"),
-            episode_title,
-            is_series: is_series.unwrap_or(false),
-            index_number,
-            parent_index_number,
-            name,
-            album,
-            // `AlbumArtists` is a delimited list; the C# key uses the first.
-            album_artist: album_artists
-                .as_deref()
-                .and_then(|a| a.split('|').next())
-                .filter(|a| !a.is_empty())
-                .map(str::to_owned),
-            extra_type: extra_type
-                .and_then(extra_type_name)
-                .map(std::borrow::ToOwned::to_owned),
-            run_time_ticks,
-            series_id: series_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
-        }))
     }
 
     /// Reads the item's runtime ticks and [`BaseItemKind`], for the play-state
@@ -1206,6 +1009,335 @@ mod tests {
         Arc::new(FixedConfig {
             config: default_server_configuration(),
         })
+    }
+
+    #[rstest::rstest]
+    #[case::movie(BaseItemKind::Movie)]
+    #[case::episode(BaseItemKind::Episode)]
+    #[case::season(BaseItemKind::Season)]
+    #[case::audio(BaseItemKind::Audio)]
+    #[case::audiobook(BaseItemKind::AudioBook)]
+    #[tokio::test]
+    async fn retention_moves_agree_in_individual_and_batch_dtos(#[case] kind: BaseItemKind) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        for item in [old, new] {
+            seed_item(&db, item, kind).await;
+            let mut row = fetch_item(&db, item).await;
+            row.path = Some(format!("/media/{item}/file"));
+            row.name = Some("Track".to_owned());
+            row.album = Some("Album".to_owned());
+            row.album_artists = Some("Artist|Other".to_owned());
+            row.index_number = Some(2);
+            row.parent_index_number = Some(1);
+            if matches!(kind, BaseItemKind::Episode | BaseItemKind::Season) {
+                let series = Uuid::new_v4();
+                seed_item(&db, series, BaseItemKind::Series).await;
+                seed_provider_id(&db, series, "Tvdb", "retained-series").await;
+                row.series_id = Some(guid_to_db(series));
+            }
+            persistence.save_items(&[row]).await.unwrap();
+            if kind == BaseItemKind::Movie {
+                seed_provider_id(&db, item, "Tmdb", "retained-movie").await;
+            }
+        }
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        manager
+            .save_user_data(
+                user,
+                old,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(true),
+                    play_count: Some(4),
+                    playback_position_ticks: Some(1_234_567),
+                    likes: Some(false),
+                    rating: Some(8.5),
+                    ..UpdateUserItemDataDto::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[old]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let one = manager.get_user_data_dto(new, user).await.unwrap().unwrap();
+        let batch = manager.get_user_data_dtos(&[new], user).await.unwrap();
+        assert_eq!(one, batch[&new]);
+        assert!(one.played && one.is_favorite);
+        assert_eq!(one.play_count, 4);
+        assert_eq!(one.playback_position_ticks, 1_234_567);
+        // A subsequent write keeps every restored alias in sync.
+        manager.mark_unplayed(user, new).await.unwrap();
+        let next = manager.get_user_data_dto(new, user).await.unwrap().unwrap();
+        assert!(!next.played);
+        assert!(next.is_favorite);
+        assert_eq!(
+            next,
+            manager.get_user_data_dtos(&[new], user).await.unwrap()[&new]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::source_first(false)]
+    #[case::destination_first(true)]
+    #[tokio::test]
+    async fn retention_round_trip_does_not_revive_old_guid_state(#[case] destination_first: bool) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for item in [a, b] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            seed_provider_id(&db, item, "Tmdb", "round-trip").await;
+        }
+        manager
+            .save_user_data(
+                user,
+                a,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[a]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        assert!(
+            manager
+                .get_user_data_dto(b, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .played
+        );
+        manager.mark_unplayed(user, b).await.unwrap();
+
+        if !destination_first {
+            persistence.delete_items(&[b]).await.unwrap();
+        }
+        seed_item(&db, a, BaseItemKind::Movie).await;
+        seed_provider_id(&db, a, "Tmdb", "round-trip").await;
+        persistence
+            .reattach_user_data(&fetch_item(&db, a).await)
+            .await
+            .unwrap();
+        if destination_first {
+            persistence.delete_items(&[b]).await.unwrap();
+        }
+        persistence.reattach_all_user_data().await.unwrap();
+        let restored = manager.get_user_data_dto(a, user).await.unwrap().unwrap();
+        assert!(
+            !restored.played,
+            "the later explicit unplayed state survives"
+        );
+        assert!(restored.is_favorite);
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0, "consume the complete source snapshot");
+    }
+
+    #[rstest::rstest]
+    #[case::same_page(false)]
+    #[case::different_page(true)]
+    #[tokio::test]
+    async fn retention_existing_copy_does_not_consume_another_users_recovery(
+        #[case] different_page: bool,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let users = [Uuid::new_v4(), Uuid::new_v4()];
+        for user in users {
+            crate::test_support::seed_named_user(&db, user, &user.to_string()).await;
+        }
+        let existing = Uuid::from_u128(100);
+        let destination = Uuid::from_u128(900);
+        let old = Uuid::from_u128(1000);
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for item in [existing, destination, old] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            seed_provider_id(&db, item, "Tmdb", "multiple-copies").await;
+        }
+        if different_page {
+            for id in 101..=601 {
+                seed_item(&db, Uuid::from_u128(id), BaseItemKind::Movie).await;
+            }
+        }
+        for user in users {
+            manager
+                .save_user_data(
+                    user,
+                    old,
+                    &UpdateUserItemDataDto {
+                        played: Some(true),
+                        is_favorite: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        manager.mark_unplayed(users[0], existing).await.unwrap();
+        persistence.delete_items(&[old]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        assert!(
+            !manager
+                .get_user_data_dto(existing, users[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .played
+        );
+        assert!(
+            manager
+                .get_user_data_dto(existing, users[1])
+                .await
+                .unwrap()
+                .unwrap()
+                .played
+        );
+        let restored = manager
+            .get_user_data_dto(destination, users[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(restored.played && restored.is_favorite);
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0);
+        persistence.reattach_all_user_data().await.unwrap();
+        assert!(
+            !manager
+                .get_user_data_dto(existing, users[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .played
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::different_kind(BaseItemKind::Series, "Tvdb")]
+    #[case::different_provider(BaseItemKind::Movie, "Imdb")]
+    #[tokio::test]
+    async fn retention_equal_provider_values_keep_distinct_snapshots(
+        #[case] other_kind: BaseItemKind,
+        #[case] other_provider: &str,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let [other_new, movie_new, movie_old, other_old] =
+            [100, 900, 1000, 1100].map(Uuid::from_u128);
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for (item, kind, provider) in [
+            (movie_old, BaseItemKind::Movie, "Tmdb"),
+            (movie_new, BaseItemKind::Movie, "Tmdb"),
+            (other_old, other_kind, other_provider),
+            (other_new, other_kind, other_provider),
+        ] {
+            seed_item(&db, item, kind).await;
+            seed_provider_id(&db, item, provider, "949").await;
+        }
+        manager
+            .save_user_data(
+                user,
+                movie_old,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .save_user_data(
+                user,
+                other_old,
+                &UpdateUserItemDataDto {
+                    played: Some(false),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[movie_old]).await.unwrap();
+        persistence
+            .reattach_user_data(&fetch_item(&db, other_new).await)
+            .await
+            .unwrap();
+        assert!(
+            manager.read_row(other_new, user).await.unwrap().is_none(),
+            "equal provider values must not cross media or provider namespaces"
+        );
+        // Both detached snapshots now have the same compatible bare key.
+        persistence.delete_items(&[other_old]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let movie = manager.read_row(movie_new, user).await.unwrap().unwrap();
+        let other = manager.read_row(other_new, user).await.unwrap().unwrap();
+        assert!(movie.played && !movie.is_favorite);
+        assert!(!other.played && other.is_favorite);
+        assert!(movie.retention_date.is_none() && other.retention_date.is_none());
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_legacy_provider_only_rows_are_not_guessed() {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let movie = Uuid::new_v4();
+        let series = Uuid::new_v4();
+        for (item, kind, provider) in [
+            (movie, BaseItemKind::Movie, "Tmdb"),
+            (series, BaseItemKind::Series, "Tvdb"),
+        ] {
+            seed_item(&db, item, kind).await;
+            seed_provider_id(&db, item, provider, "949").await;
+        }
+        crate::test_support::seed_user_data(&db, user, Uuid::from_u128(1), true, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = '949'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .reattach_user_data(&fetch_item(&db, series).await)
+            .await
+            .unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let owners: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![guid_to_db(Uuid::from_u128(1))]);
     }
 
     /// Seeds a movie with a runtime, for the play-state heuristics.

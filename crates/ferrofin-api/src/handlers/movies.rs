@@ -5,7 +5,8 @@
 //! through the
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::RecommendationDto;
@@ -117,4 +118,9 @@ async fn get_movie_recommendations(
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Movies/Recommendations", get(get_movie_recommendations))
+}
+crate::query::query_parameters! {
+    RecommendationsQuery {
+        "fields" => ',',
+    } => [("get", "/Movies/Recommendations")];
 }

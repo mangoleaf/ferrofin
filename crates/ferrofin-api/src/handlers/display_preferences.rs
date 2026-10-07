@@ -23,7 +23,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -510,4 +511,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         "/DisplayPreferences/{displayPreferencesId}",
         get(get_display_preferences).post(update_display_preferences),
     )
+}
+crate::query::query_parameters! {
+    DisplayPreferencesParams {} => [("get", "/DisplayPreferences/{displayPreferencesId}"), ("post", "/DisplayPreferences/{displayPreferencesId}")];
 }
