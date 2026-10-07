@@ -36,6 +36,14 @@ impl Fixture {
     }
 
     async fn with_type(files: &[&str], kind: CollectionTypeOptions) -> Self {
+        Self::with_options(files, kind, LibraryOptions::default()).await
+    }
+
+    async fn with_options(
+        files: &[&str],
+        kind: CollectionTypeOptions,
+        options: LibraryOptions,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         for file in files {
@@ -57,7 +65,7 @@ impl Fixture {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
                 }],
-                ..Default::default()
+                ..options
             },
         )
         .await
@@ -91,6 +99,14 @@ impl Fixture {
         sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Path" = ?"#)
             .bind(self.media.join(relative).to_string_lossy().as_ref())
             .fetch_one(self.db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn ancestors(&self, id: &str) -> Vec<String> {
+        sqlx::query_scalar(r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+            .bind(id)
+            .fetch_all(self.db.pool())
             .await
             .unwrap()
     }
@@ -1214,4 +1230,236 @@ async fn an_extras_named_folder_at_the_top_holds_movies() {
         assert_eq!(row.owner_id, None, "{path}");
         assert_eq!(row.is_in_mixed_folder, mixed, "{path}");
     }
+}
+
+/// A home-video library resolves as upstream's does (`MovieResolver`,
+/// `PhotoAlbumResolver`): a clip is a `Video` named after its file, with no
+/// year, never a movie in its own folder (`isPhotosCollection`), and in a
+/// mixed folder at the library root or beside other clips; a folder holding
+/// photos is a `PhotoAlbum` its clips hang off and that owns the folder's
+/// extras; a disc rip is one `Video` for its folder.
+#[tokio::test]
+async fn a_home_video_library_resolves_clips_albums_and_rips() {
+    let f = Fixture::with_type(
+        &[
+            "Clip.mp4",
+            "Trip (2019)/Day 1 (2019).mp4",
+            "Album/IMG_0001.jpg",
+            "Album/Beach.mp4",
+            "Album/extras/Bloopers.mp4",
+            "Album/extras/Still.jpg",
+            "Album/Inner/IMG_0002.jpg",
+            "Album/Inner/Swim.mp4",
+            "Album/Inner/Deep/IMG_0004.jpg",
+            "Album/Inner/Deep/Dive.mp4",
+            "Album/Plain/Walk.mp4",
+            "Album/Plain/extras/Bloop.mp4",
+            "Album/AlbumRip/VIDEO_TS/VTS_01_1.VOB",
+            "Pair/IMG_0003.jpg",
+            "Pair/One.mp4",
+            "Pair/Two.mp4",
+            "Rip/VIDEO_TS/VTS_01_1.VOB",
+            "Rip/BDMV/META/DL/cover.jpg",
+        ],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let library = guid_to_db(f.library);
+
+    let root = f.row("Clip.mp4").await;
+    assert!(root.type_.ends_with("Entities.Video"), "{}", root.type_);
+    assert!(root.is_in_mixed_folder, "the library root is a top parent");
+    assert!(!root.is_movie);
+    assert_eq!(root.parent_id.as_ref(), Some(&library));
+
+    let day = f.row("Trip (2019)/Day 1 (2019).mp4").await;
+    assert!(day.type_.ends_with("Entities.Video"), "{}", day.type_);
+    assert_eq!(
+        day.name.as_deref(),
+        Some("Day 1 (2019)"),
+        "the raw file name"
+    );
+    assert_eq!(day.production_year, None, "names are not parsed");
+    assert!(!day.is_in_mixed_folder, "the folder's lone clip");
+    assert_eq!(day.parent_id.as_ref(), Some(&library));
+
+    let album = f.row("Album").await;
+    assert!(album.type_.ends_with(".PhotoAlbum"), "{}", album.type_);
+    let beach = f.row("Album/Beach.mp4").await;
+    assert_eq!(beach.parent_id.as_ref(), Some(&album.id));
+    assert!(!beach.is_in_mixed_folder);
+    let bloopers = f.row("Album/extras/Bloopers.mp4").await;
+    assert_eq!(
+        bloopers.owner_id.as_ref(),
+        Some(&album.id),
+        "the album owns the folder's extras"
+    );
+
+    let rip = f.row("Rip").await;
+    assert!(rip.type_.ends_with("Entities.Video"), "{}", rip.type_);
+    assert!(!rip.is_in_mixed_folder);
+    assert!(!rip.is_movie);
+    assert_eq!(rip.name.as_deref(), Some("Rip"));
+    assert!(
+        rip.data
+            .as_deref()
+            .unwrap_or_default()
+            .contains(r#""VideoType":"Dvd""#)
+    );
+
+    // A nested album hangs off its album; its clip off it.
+    let inner = f.row("Album/Inner").await;
+    assert!(inner.type_.ends_with(".PhotoAlbum"), "{}", inner.type_);
+    assert_eq!(inner.parent_id.as_ref(), Some(&album.id));
+    let swim = f.row("Album/Inner/Swim.mp4").await;
+    assert_eq!(swim.parent_id.as_ref(), Some(&inner.id));
+    // Three albums deep, the ancestors are the whole chain.
+    let deep = f.row("Album/Inner/Deep").await;
+    let dive = f.row("Album/Inner/Deep/Dive.mp4").await;
+    assert_eq!(dive.parent_id.as_ref(), Some(&deep.id));
+    let ancestors = f.ancestors(&dive.id).await;
+    for id in [&album.id, &inner.id, &deep.id, &library] {
+        assert!(ancestors.contains(id), "{id} in {ancestors:?}");
+    }
+    // A clip in a plain folder of an album hangs off the album and, alone
+    // in a folder no album is, owns that folder's extras.
+    let walk = f.row("Album/Plain/Walk.mp4").await;
+    assert_eq!(walk.parent_id.as_ref(), Some(&album.id));
+    assert!(!walk.is_in_mixed_folder);
+    assert_eq!(
+        f.row("Album/Plain/extras/Bloop.mp4")
+            .await
+            .owner_id
+            .as_ref(),
+        Some(&walk.id)
+    );
+    // A rip inside an album hangs off it.
+    let album_rip = f.row("Album/AlbumRip").await;
+    assert_eq!(album_rip.parent_id.as_ref(), Some(&album.id));
+    // Two clips in an album are mixed.
+    for path in ["Pair/One.mp4", "Pair/Two.mp4"] {
+        assert!(f.row(path).await.is_in_mixed_folder, "{path}");
+    }
+    // Neither an extras folder nor a rip holds a photo album or photos.
+    let unresolved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '%/extras' \
+         OR Path LIKE '%Still.jpg' OR Path LIKE '%/DL' OR Path LIKE '%cover.jpg'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(unresolved, 0);
+}
+
+/// Without `EnablePhotos` a home-video library has no albums
+/// (`PhotoAlbumResolver.cs:50-51`): a folder's lone clip hangs off the library
+/// and owns the folder's extras.
+#[tokio::test]
+async fn a_home_video_library_without_photos_has_no_albums() {
+    let f = Fixture::with_options(
+        &[
+            "Album/IMG_0001.jpg",
+            "Album/Beach.mp4",
+            "Album/extras/trailer.mp4",
+        ],
+        CollectionTypeOptions::homevideos,
+        LibraryOptions {
+            enable_photos: false,
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let beach = f.row("Album/Beach.mp4").await;
+    assert_eq!(beach.parent_id, Some(guid_to_db(f.library)));
+    assert!(!beach.is_in_mixed_folder);
+    assert_eq!(
+        f.row("Album/extras/trailer.mp4").await.owner_id.as_ref(),
+        Some(&beach.id)
+    );
+    let albums: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Type LIKE '%PhotoAlbum'")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(albums, 0);
+}
+
+/// A music video's name is its file's, but it keeps the year its name gives
+/// (`MusicVideo.BeforeMetadataRefresh`); a home video's carries none.
+#[tokio::test]
+async fn a_music_video_keeps_the_year_its_name_gives() {
+    let f = Fixture::with_type(
+        &["Band - Song (1999).mkv"],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let video = f.row("Band - Song (1999).mkv").await;
+    assert_eq!(video.name.as_deref(), Some("Band - Song (1999)"));
+    assert_eq!(video.production_year, Some(1999));
+}
+
+/// A movie or music video whose name gives no year but that is not in a
+/// mixed folder takes its folder's (`Movie`/`MusicVideo`
+/// `.BeforeMetadataRefresh`), on its first scan as on any later one.
+#[tokio::test]
+async fn an_undated_video_takes_its_folders_year() {
+    let f = Fixture::new(&["Heat (1995)/Heat.mkv", "Ronin (1998)/VIDEO_TS/VTS_01_1.VOB"]).await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Heat (1995)/Heat.mkv").await.production_year,
+        Some(1995)
+    );
+    assert_eq!(
+        f.row("Ronin (1998)").await.production_year,
+        Some(1998),
+        "a disc rip"
+    );
+
+    let f = Fixture::with_type(
+        &["Band (2001)/Clip.mkv"],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Band (2001)/Clip.mkv").await.production_year,
+        Some(2001)
+    );
+}
+
+/// Photos an older scan planned inside a disc rip of a home-video library
+/// are pruned: below a rip nothing resolves.
+#[tokio::test]
+async fn photo_rows_inside_a_disc_rip_are_pruned() {
+    let f = Fixture::with_type(
+        &[
+            "Rip/BDMV/STREAM/00000.m2ts",
+            "Rip/BDMV/META/DL/cover.jpg",
+            "Clip.mp4",
+        ],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    // What an older scan stored: an album at the rip's art folder.
+    let mut album = f.row("Clip.mp4").await;
+    album.id = guid_to_db(Uuid::from_u128(0xDA));
+    album.type_ = "MediaBrowser.Controller.Entities.PhotoAlbum".to_owned();
+    album.path = Some(
+        f.media
+            .join("Rip/BDMV/META/DL")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    album.is_folder = true;
+    f.store.save_items(&[album]).await.unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '%/DL'")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }

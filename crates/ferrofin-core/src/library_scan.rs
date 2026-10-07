@@ -2216,6 +2216,8 @@ fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalM
     }
     let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
         "Movie" => NfoItemKind::Movie,
+        "Video" => NfoItemKind::Video,
+        "MusicVideo" => NfoItemKind::MusicVideo,
         "Series" => NfoItemKind::Series,
         "Season" => NfoItemKind::Season,
         "Episode" => NfoItemKind::Episode,
@@ -2223,8 +2225,7 @@ fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalM
         "MusicArtist" => NfoItemKind::MusicArtist,
         _ => return None,
     };
-    let path = entity.path.as_deref()?;
-    nfo_candidates(path, entity.is_folder, kind)
+    nfo_candidates(entity, kind)
         .into_iter()
         .find_map(|candidate| {
             let meta = std::fs::metadata(candidate).ok()?;
@@ -2326,6 +2327,9 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Each photo album's ancestors as [`LibraryScanner::plan_photos`]
+    /// planned them, which a video in the album extends.
+    album_ancestors: std::cell::RefCell<HashMap<Uuid, Vec<Uuid>>>,
     /// Per folder holding episodes, whether they are in a mixed folder
     /// ([`note_episode_folder`]).
     episode_folders_mixed: std::cell::RefCell<HashMap<String, bool>>,
@@ -2363,6 +2367,7 @@ impl<'a> PlanCtx<'a> {
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
+            album_ancestors: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -6954,6 +6959,8 @@ impl LibraryScanner {
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let kind = match short {
             "Movie" => NfoItemKind::Movie,
+            "Video" => NfoItemKind::Video,
+            "MusicVideo" => NfoItemKind::MusicVideo,
             "Series" => NfoItemKind::Series,
             "Season" => NfoItemKind::Season,
             "Episode" => NfoItemKind::Episode,
@@ -6961,12 +6968,9 @@ impl LibraryScanner {
             "MusicArtist" => NfoItemKind::MusicArtist,
             _ => return LocalNfo::default(),
         };
-        let Some(path) = entity.path.as_deref() else {
-            return LocalNfo::default();
-        };
         let mut xml = None;
         let mut nfo_path = String::new();
-        for cand in nfo_candidates(path, entity.is_folder, kind) {
+        for cand in nfo_candidates(entity, kind) {
             if let Ok(contents) = tokio::fs::read_to_string(&cand).await {
                 nfo_path = cand.to_string_lossy().into_owned();
                 xml = Some(contents);
@@ -6992,7 +6996,9 @@ impl LibraryScanner {
         let ds = NoDirectoryService;
         let mut result = xbmc::new_result(kind);
         let parsed = match kind {
-            NfoItemKind::Movie => {
+            // `BaseVideoNfoProvider.Fetch` reads a movie, a video and a music
+            // video with the one movie parser (`BaseVideoNfoProvider.cs:45-57`).
+            NfoItemKind::Movie | NfoItemKind::Video | NfoItemKind::MusicVideo => {
                 xbmc::fetch_movie(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
             NfoItemKind::Series => {
@@ -7007,7 +7013,6 @@ impl LibraryScanner {
             NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist => {
                 xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
-            _ => return LocalNfo::default(),
         };
         if parsed.is_err() {
             return LocalNfo::default();
@@ -9384,28 +9389,33 @@ impl LibraryScanner {
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
                     ) => {
-                        let kind =
-                            if folder.collection_type == Some(CollectionTypeOptions::musicvideos) {
-                                BaseItemKind::MusicVideo
-                            } else {
-                                BaseItemKind::Movie
-                            };
-                        let walk = MovieWalk {
-                            kind,
-                            collection_type: folder.collection_type,
+                        // A home video is a plain `Video` (`FindMovie<Video>`,
+                        // `ResolveVideos<Video>`, `MovieResolver.cs:111-114,206-209`).
+                        let kind = match folder.collection_type {
+                            Some(CollectionTypeOptions::musicvideos) => BaseItemKind::MusicVideo,
+                            Some(CollectionTypeOptions::homevideos) => BaseItemKind::Video,
+                            _ => BaseItemKind::Movie,
                         };
-                        self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                         // Upstream folds the separate `photos` collection type
                         // into `homevideos`, where photos are resolved only when
                         // the library enables them (`PhotoResolver.Resolve`).
-                        if folder.collection_type == Some(CollectionTypeOptions::homevideos)
+                        let photos = folder.collection_type
+                            == Some(CollectionTypeOptions::homevideos)
                             && folder
                                 .library_options
                                 .as_ref()
-                                .is_none_or(|o| o.enable_photos)
-                        {
-                            self.plan_photos(location, location, cf, cf, &ctx, &mut out);
+                                .is_none_or(|o| o.enable_photos);
+                        let walk = MovieWalk {
+                            kind,
+                            collection_type: folder.collection_type,
+                            photos,
+                            album: None,
+                        };
+                        // Albums first: a clip in one hangs off it.
+                        if photos {
+                            self.plan_photos(location, location, cf, &[cf], &ctx, &mut out);
                         }
+                        self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                     }
                     // `boxsets` is the only type left: a BoxSet's members are
                     // curated through the collection API, not resolved off disk.
@@ -9795,27 +9805,32 @@ impl LibraryScanner {
         let naming = ctx.naming;
         let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
+        let entries = self.list(dir, ctx);
+        let (walk, album) = if walk.photos && dir != root && !extras_folder {
+            self.enter_photo_album(dir, walk, ctx, movies_by_dir)
+        } else {
+            (walk, None)
+        };
         // A disc rip (`…/Movie (2009)/BDMV/` or `VIDEO_TS/`) is ONE item for the
         // containing folder, not one per .vob/.m2ts inside — port of
         // `BaseVideoResolver.ResolveVideo`'s directory arm.
         if dir != root
             && !extras_folder
-            && let Some(video_type) = self.disc_video_type(dir, ctx)
+            && album.is_none()
+            && let Some(video_type) = self.disc_video_type(&entries, ctx)
         {
-            self.plan_disc_movie(dir, cf, video_type, kind, ctx, out);
+            self.plan_disc_movie(dir, cf, video_type, walk, ctx, out);
             return;
         }
-        let entries = self.list(dir, ctx);
         // `FindExtras` counts every file of an extras folder (listed above).
-        let extras_folder_mixed = extras_folder
-            && ctx
-                .direct_file_counts
-                .borrow()
-                .get(dir)
-                .is_some_and(|&files| files > 1);
-        let movie = (dir != root && !extras_folder)
-            .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
-            .flatten();
+        let extras_folder_mixed = extras_folder && holds_several_files(dir, ctx);
+        // A home-video library has no movie in its own folder
+        // (`FindMovie`'s `isPhotosCollection`).
+        let movie = (dir != root
+            && !extras_folder
+            && walk.collection_type != Some(CollectionTypeOptions::homevideos))
+        .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
+        .flatten();
         let own_folder = movie.is_some();
         // ResolveMultiple consumes the directory's file list when it finds
         // any regular movie, and drops sample filenames from that list. If it
@@ -9827,26 +9842,22 @@ impl LibraryScanner {
         // a top-level folder no rule ignores, is a movie upstream.
         let plain_folder = movie.is_none() && !extras_folder && dir != root;
         let extras_root = if plain_folder { dir } else { root };
-        let has_movie_files = entries.iter().any(|entry| {
-            entry.type_ != FileSystemEntryType::Directory
-                && !video_resolver::is_sample_filename(&entry.name)
-                && video_resolver::resolve_file(Some(&entry.path), naming, Some(extras_root))
-                    .is_some_and(|video| video.extra_type.is_none())
-        });
+        let has_movie_files = has_movie_files(&entries, naming, extras_root);
         // A video in its own folder is not in a mixed folder; one at the
         // library root always is (`IsTopParent`); elsewhere `ResolveVideos`
         // decides, and a lone video owns the folder's extras.
+        let lone = plain_folder
+            .then(|| lone_video(&entries, dir, naming, walk))
+            .flatten();
         let mixed = if plain_folder {
-            let lone = lone_video(&entries, dir, naming, walk);
-            if let Some(lone) = &lone {
-                self.register_extras_owner(dir, lone, kind, ctx, movies_by_dir);
-            }
             lone.is_none()
         } else {
             dir == root
         };
-        if let Some(movie) = movie {
-            self.register_extras_owner(dir, &movie, kind, ctx, movies_by_dir);
+        // The movie, or the lone video of a folder that is no photo album,
+        // owns the folder's extras.
+        if let Some(owner) = movie.as_ref().or(lone.as_ref().filter(|_| album.is_none())) {
+            self.register_extras_owner(dir, owner, kind, ctx, movies_by_dir);
         }
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && extras_folder {
@@ -9935,37 +9946,81 @@ impl LibraryScanner {
             if !ctx.scope.keeps(&entry.path) {
                 continue;
             }
-            if let Some(mut planned) = self.movie_file(&entry, dir, own_folder, kind, cf, ctx) {
-                planned.entity.is_in_mixed_folder = mixed;
+            if let Some(mut planned) = self.movie_file(&entry, dir, own_folder, walk, cf, ctx) {
+                settle_mixed_folder(&mut planned.entity, mixed, dir, naming);
                 ctx.emit(out, planned);
             }
         }
     }
 
-    /// The row for the video `entry` in `dir`, resolved as `kind`.
+    /// The walk below `dir` when it is a folder of a home-video library the
+    /// photo walk made a `PhotoAlbum` (`PhotoAlbumResolver`, priority Second, before
+    /// `MovieResolver`; [`Self::plan_photos`] plans the row): what is in it
+    /// hangs off the album, and the album — not a video in it — owns the
+    /// folder's extras (`BaseItem.RefreshedOwnedItems`). Also the album's id.
+    fn enter_photo_album(
+        &self,
+        dir: &str,
+        walk: MovieWalk,
+        ctx: &PlanCtx<'_>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) -> (MovieWalk, Option<Uuid>) {
+        // Only an album the photo walk planned: its own listing decided, and
+        // a folder that changed between the two listings must not point a
+        // clip at a row no plan has.
+        let Some(id) = item_type_lookup::derive_item_id_with(
+            &self.id_derivation,
+            BaseItemKind::PhotoAlbum,
+            dir,
+        )
+        .filter(|id| ctx.album_ancestors.borrow().contains_key(id)) else {
+            return (walk, None);
+        };
+        movies_by_dir
+            .entry(dir.to_owned())
+            .or_default()
+            .push((id, folder_name(dir).unwrap_or_else(|| file_stem(dir))));
+        let walk = MovieWalk {
+            album: Some(id),
+            ..walk
+        };
+        (walk, Some(id))
+    }
+
+    /// The row for the video `entry` in `dir`, resolved in `walk`.
     fn movie_file(
         &self,
         entry: &FileSystemEntryInfo,
         dir: &str,
         own_folder: bool,
-        kind: BaseItemKind,
+        walk: MovieWalk,
         cf: Uuid,
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned> {
+        let kind = walk.kind;
         let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), ctx.naming, None)
             .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
         // Port of MovieResolver: a movie in its OWN folder is named from that folder
         // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
         // file in the library root keeps its clean_date_time-parsed name (year stripped).
-        // ProductionYear is still populated either way.
-        let name = if kind == BaseItemKind::MusicVideo {
-            file_stem(&entry.path)
+        // ProductionYear is still populated either way. Where names are not
+        // parsed (music videos, home videos) the name is the file's and no
+        // year is read (`VideoResolver.Resolve` with `parseName: false`).
+        let (_, parse_name, _) = movie_walk_resolution(walk);
+        let (name, year) = if !parse_name {
+            // A music video still dates itself from its name on its first
+            // refresh (`MusicVideo.BeforeMetadataRefresh`, `MusicVideo.cs:39-72`),
+            // which Ferrofin runs on stored rows only: the new row carries it
+            // (and its folder's, [`settle_mixed_folder`]).
+            let year = year.filter(|_| kind == BaseItemKind::MusicVideo);
+            (file_stem(&entry.path), year)
         } else if own_folder {
-            folder_name(dir).unwrap_or(clean_name)
+            (folder_name(dir).unwrap_or(clean_name), year)
         } else {
-            clean_name
+            (clean_name, year)
         };
-        let (id, mut entity) = self.base_item(ctx, kind, cf, cf, name, &entry.path, false)?;
+        let (parent, ancestors) = walk.parent(cf, ctx);
+        let (id, mut entity) = self.base_item(ctx, kind, cf, parent, name, &entry.path, false)?;
         entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         entity.production_year = year.map(i64::from);
@@ -9973,7 +10028,7 @@ impl LibraryScanner {
         Some(Planned {
             id,
             entity,
-            ancestors: vec![cf],
+            ancestors,
         })
     }
 
@@ -10005,8 +10060,12 @@ impl LibraryScanner {
     /// The disc structure `dir` holds, if any: a `VIDEO_TS` subfolder with
     /// `.vob` files is a DVD rip, a `BDMV` subfolder a Blu-ray rip. Port of
     /// `IsDvdDirectory` / `IsBluRayDirectory`.
-    fn disc_video_type(&self, dir: &str, ctx: &PlanCtx<'_>) -> Option<VideoType> {
-        for entry in self.list(dir, ctx) {
+    fn disc_video_type(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        ctx: &PlanCtx<'_>,
+    ) -> Option<VideoType> {
+        for entry in entries {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue;
             }
@@ -10028,30 +10087,41 @@ impl LibraryScanner {
         None
     }
 
-    /// Emits the single `Movie` row for a disc-rip folder (the folder itself is
+    /// TODO(parity, open work item): the row is stored `IsFolder = 1`, where
+    /// upstream's `Video` never is a folder (`BaseItem.cs:803`); `is_folder`
+    /// also drives the folder-style dates, the probe gate and the
+    /// containing-folder logic, so the fix splits those first. See
+    /// `brain/plans/PLAN_ITEM_FILE_DELETION.md` ("Disc-rip video rows").
+    ///
+    /// Emits the single video row (`walk`'s kind) for a disc-rip folder (the folder itself is
     /// the item, as upstream resolves it).
     fn plan_disc_movie(
         &self,
         dir: &str,
         cf: Uuid,
         video_type: VideoType,
-        kind: BaseItemKind,
+        walk: MovieWalk,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let kind = walk.kind;
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, cf, name, dir, true) else {
+        let (parent, ancestors) = walk.parent(cf, ctx);
+        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, parent, name, dir, true) else {
             return;
         };
         entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         set_video_type(&mut entity, video_type);
+        // A rip is its own folder, never a mixed one: an undated movie or
+        // music video takes the folder name's year ([`settle_mixed_folder`]).
+        settle_mixed_folder(&mut entity, false, dir, ctx.naming);
         ctx.emit(
             out,
             Planned {
                 id,
                 entity,
-                ancestors: vec![cf],
+                ancestors,
             },
         );
     }
@@ -10694,23 +10764,27 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
-        parent: Uuid,
+        chain: &[Uuid],
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        // `chain`: the ancestors of what is planned directly in `dir`, the
+        // library first, its parent (the nearest enclosing album) last.
+        let parent = chain.last().copied().unwrap_or(cf);
         let naming = ctx.naming;
         let entries = self.list(dir, ctx);
-        let files: Vec<&str> = entries
-            .iter()
-            .filter(|e| e.type_ != FileSystemEntryType::Directory)
-            .map(|e| e.path.as_str())
-            .collect();
-        let photos: Vec<&str> = files
-            .iter()
-            .copied()
-            .filter(|path| is_photo_file(path))
-            .filter(|path| !is_owned_by_media(&files, path, naming))
-            .collect();
+        let photos = unowned_photos(&entries, naming);
+        // A folder that is no album but a disc rip is one video
+        // (`FindMovie<Video>`): nothing below it resolves.
+        if dir != root && photos.is_empty() && self.disc_video_type(&entries, ctx).is_some() {
+            // Rows older scans planned below it are reconciled away.
+            for entry in entries {
+                if entry.type_ == FileSystemEntryType::Directory {
+                    ctx.excluded.borrow_mut().push(entry.path);
+                }
+            }
+            return;
+        }
 
         // A sub-directory with photos in it is a PhotoAlbum; the library root
         // is the collection folder itself and never an album, so its loose
@@ -10721,25 +10795,25 @@ impl LibraryScanner {
             let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
             match self.base_item(ctx, BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
                 Some((album_id, album)) => {
-                    let mut ancestors = vec![cf];
-                    if parent != cf {
-                        ancestors.push(parent);
-                    }
+                    ctx.album_ancestors
+                        .borrow_mut()
+                        .insert(album_id, chain.to_vec());
                     ctx.emit(
                         out,
                         Planned {
                             id: album_id,
                             entity: album,
-                            ancestors: ancestors.clone(),
+                            ancestors: chain.to_vec(),
                         },
                     );
+                    let mut ancestors = chain.to_vec();
                     ancestors.push(album_id);
                     (album_id, ancestors)
                 }
-                None => (parent, vec![cf]),
+                None => (parent, chain.to_vec()),
             }
         } else {
-            (parent, vec![cf])
+            (parent, chain.to_vec())
         };
 
         for path in photos {
@@ -10769,8 +10843,18 @@ impl LibraryScanner {
         }
 
         for entry in &entries {
-            if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
-                self.plan_photos(&entry.path, root, cf, photo_parent, ctx, out);
+            if entry.type_ != FileSystemEntryType::Directory {
+                continue;
+            }
+            // Below the top an extras-named folder is never resolved
+            // (`CoreResolutionIgnoreRule.cs:56-61`); rows older scans planned
+            // in one are reconciled away.
+            if is_extras_folder_below_top(&entry.path, root, naming) {
+                ctx.excluded.borrow_mut().push(entry.path.clone());
+                continue;
+            }
+            if ctx.scope.visits(&entry.path) {
+                self.plan_photos(&entry.path, root, cf, &ancestors, ctx, out);
             }
         }
     }
@@ -11761,6 +11845,23 @@ fn is_photo_file(path: &str) -> bool {
         .any(|prefix| stem.starts_with(prefix))
 }
 
+/// The photos in `entries` no video beside them owns — what makes a
+/// folder a `PhotoAlbum` (`PhotoAlbumResolver.HasPhotos`) and what the album
+/// holds.
+fn unowned_photos<'e>(entries: &'e [FileSystemEntryInfo], naming: &NamingOptions) -> Vec<&'e str> {
+    let files: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.type_ != FileSystemEntryType::Directory)
+        .map(|e| e.path.as_str())
+        .collect();
+    files
+        .iter()
+        .copied()
+        .filter(|path| is_photo_file(path))
+        .filter(|path| !is_owned_by_media(&files, path, naming))
+        .collect()
+}
+
 /// Whether `path` is artwork belonging to one of the `siblings` videos — port of
 /// `PhotoResolver.IsOwnedByMedia`: a video file in the same directory whose own
 /// stem is a prefix of the image's stem (so `Movie-thumb.jpg` belongs to
@@ -11840,6 +11941,31 @@ fn affected_libraries(
         .collect()
 }
 
+/// Whether `dir` (listed this pass) holds more than one file, every kind
+/// counted, as `FindExtras` counts an extras folder's (`GetFiles`).
+fn holds_several_files(dir: &str, ctx: &PlanCtx<'_>) -> bool {
+    ctx.direct_file_counts
+        .borrow()
+        .get(dir)
+        .is_some_and(|&files| files > 1)
+}
+
+/// Whether `entries` hold a video `ResolveMultiple` takes as a title (no
+/// sample, no extra under `library_root`): it then consumes the folder's
+/// sample files, which are neither titles nor extras.
+fn has_movie_files(
+    entries: &[FileSystemEntryInfo],
+    naming: &NamingOptions,
+    library_root: &str,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.type_ != FileSystemEntryType::Directory
+            && !video_resolver::is_sample_filename(&entry.name)
+            && video_resolver::resolve_file(Some(&entry.path), naming, Some(library_root))
+                .is_some_and(|video| video.extra_type.is_none())
+    })
+}
+
 /// Whether `dir` is an extras-type subfolder below the library's top level
 /// (`Movie/trailers/`, `Movie/extras/`, …), which holds only its owner's
 /// extras: `FindExtras` takes its files, one level deep, each
@@ -11856,14 +11982,60 @@ fn is_extras_folder_below_top(dir: &str, root: &str, naming: &NamingOptions) -> 
             .contains_key(&entry_name(dir).to_lowercase())
 }
 
+/// Stores a planned video's `IsInMixedFolder`, and — for a movie or music
+/// video still undated — the year of its containing folder's name when it is
+/// not in a mixed folder, the second step of `Movie`/`MusicVideo`
+/// `.BeforeMetadataRefresh` (`Movie.cs:89-123`, `MusicVideo.cs:39-72`) that
+/// [`before_metadata_refresh`] runs for a stored row: a new one takes it here.
+fn settle_mixed_folder(
+    entity: &mut BaseItemEntity,
+    mixed: bool,
+    dir: &str,
+    naming: &NamingOptions,
+) {
+    entity.is_in_mixed_folder = mixed;
+    let dated_by_folder = entity.type_.ends_with(".Movie") || entity.type_.ends_with(".MusicVideo");
+    if dated_by_folder && !mixed && entity.production_year.is_none() {
+        entity.production_year = folder_name(dir)
+            .and_then(|name| video_resolver::clean_date_time(&name, naming).year)
+            .map(i64::from);
+    }
+}
+
 /// What the movie walk resolves in a library: the item kind of a video,
 /// and the library's collection type.
 #[derive(Debug, Clone, Copy)]
 struct MovieWalk {
-    /// `Movie` or `MusicVideo`.
+    /// `Movie`, `MusicVideo` or (home videos) `Video`.
     kind: BaseItemKind,
     /// The library's collection type (`None` for an untyped library).
     collection_type: Option<CollectionTypeOptions>,
+    /// Whether the library resolves photos (a home-video library with
+    /// `EnablePhotos`), which makes a folder holding some a `PhotoAlbum`.
+    photos: bool,
+    /// The nearest enclosing `PhotoAlbum`, which a video below it hangs off,
+    /// as [`LibraryScanner::plan_photos`] parents its photos.
+    album: Option<Uuid>,
+}
+
+impl MovieWalk {
+    /// What a video resolved in this walk hangs off, and its ancestors: the
+    /// album's chain as the photo walk planned it, then the album.
+    fn parent(self, cf: Uuid, ctx: &PlanCtx<'_>) -> (Uuid, Vec<Uuid>) {
+        match self.album {
+            Some(album) => {
+                let mut ancestors = ctx
+                    .album_ancestors
+                    .borrow()
+                    .get(&album)
+                    .cloned()
+                    .unwrap_or_default();
+                ancestors.push(album);
+                (album, ancestors)
+            }
+            None => (cf, vec![cf]),
+        }
+    }
 }
 
 /// How `MovieResolver.ResolveMultipleInternal` resolves a folder's files in
@@ -12331,22 +12503,19 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
     }
 }
 
-/// The display name for a season number — `0` is "Specials" (Jellyfin's
-/// convention for extras/specials), every other number is "Season N".
-/// Applies fetched TMDB [`TmdbDetails`] onto a row, filling only fields the scan
-/// hasn't already set (so a probed runtime, a local NFO, or a prior scan wins).
-/// Genres/studios are stored pipe-delimited, matching the `BaseItems` columns the
-/// DTO service reads.
-/// Resolves the candidate `.nfo` sidecar paths for an item, in Jellyfin's search
-/// order. Movies/episodes (files) look next to the media (`<stem>.nfo`, then
-/// `movie.nfo` in the folder); series/seasons (folders) look for `tvshow.nfo` /
-/// `season.nfo` inside. `is_folder` disambiguates a single-folder movie.
+/// The candidate `.nfo` sidecar paths for `entity`, in Jellyfin's search
+/// order (`BaseNfoProvider.GetXmlFile` per kind): a series, season, album or
+/// artist reads a fixed name inside its folder, an episode its file's own
+/// `.nfo`, and a movie, video or music video what [`video_nfo_candidates`]
+/// lists.
 fn nfo_candidates(
-    path: &str,
-    is_folder: bool,
+    entity: &BaseItemEntity,
     kind: ferrofin_providers::xbmc::item::NfoItemKind,
 ) -> Vec<PathBuf> {
     use ferrofin_providers::xbmc::item::NfoItemKind;
+    let Some(path) = entity.path.as_deref() else {
+        return Vec::new();
+    };
     let p = Path::new(path);
     match kind {
         NfoItemKind::Series => vec![p.join("tvshow.nfo")],
@@ -12355,16 +12524,47 @@ fn nfo_candidates(
         // filename inside the album/artist folder.
         NfoItemKind::MusicAlbum => vec![p.join("album.nfo")],
         NfoItemKind::MusicArtist => vec![p.join("artist.nfo")],
-        NfoItemKind::Movie if is_folder => vec![p.join("movie.nfo")],
-        NfoItemKind::Movie => {
-            let mut c = vec![p.with_extension("nfo")];
-            if let Some(dir) = p.parent() {
-                c.push(dir.join("movie.nfo"));
-            }
-            c
+        NfoItemKind::Movie | NfoItemKind::Video | NfoItemKind::MusicVideo => {
+            video_nfo_candidates(entity, p, kind == NfoItemKind::Movie)
         }
-        _ => vec![p.with_extension("nfo")], // Episode + any leaf kind
+        NfoItemKind::Episode => vec![p.with_extension("nfo")],
     }
+}
+
+/// `MovieNfoSaver.GetMovieSavePaths` (`MovieNfoSaver.cs:47-69`), which
+/// `BaseVideoNfoProvider.GetXmlFile` reads for a movie, a video and a music
+/// video alike, in order: a DVD's `VIDEO_TS/VIDEO_TS.nfo`; `movie.nfo` — a
+/// `Movie` not in a mixed folder only; then a disc rip's
+/// `<folder>/<folder>.nfo`, or the file's own `.nfo`. The folder is the
+/// video's `ContainingFolderPath`: a disc rip's own path, else the file's
+/// directory.
+fn video_nfo_candidates(entity: &BaseItemEntity, path: &Path, is_movie: bool) -> Vec<PathBuf> {
+    let data = crate::item_data::parse_data(entity.data.as_deref());
+    let video_type = data.get("VideoType").and_then(serde_json::Value::as_str);
+    let placeholder = data
+        .get("IsPlaceHolder")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let disc = !placeholder && matches!(video_type, Some("Dvd" | "BluRay"));
+    let containing = if disc || entity.is_folder {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let mut candidates = Vec::new();
+    if video_type == Some("Dvd") && !placeholder {
+        candidates.push(containing.join("VIDEO_TS").join("VIDEO_TS.nfo"));
+    }
+    if is_movie && !entity.is_in_mixed_folder {
+        candidates.push(containing.join("movie.nfo"));
+    }
+    if disc {
+        let name = containing.file_name().unwrap_or_default().to_string_lossy();
+        candidates.push(containing.join(format!("{name}.nfo")));
+    } else {
+        candidates.push(path.with_extension("nfo"));
+    }
+    candidates
 }
 
 /// Merges parsed NFO fields onto `entity`, filling only what the row still lacks
@@ -13379,6 +13579,10 @@ fn person_to_entity(p: ferrofin_providers::container_types::PersonInfo) -> Peopl
     }
 }
 
+/// Applies fetched TMDB [`TmdbDetails`] onto a row, filling only fields the scan
+/// hasn't already set (so a probed runtime, a local NFO, or a prior scan wins).
+/// Genres/studios are stored pipe-delimited, matching the `BaseItems` columns the
+/// DTO service reads.
 fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     apply_episode_title(entity, d.name.as_deref());
     if entity.original_title.is_none() {
@@ -14357,6 +14561,8 @@ fn folder_name(dir: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The display name for a season number — `0` is "Specials" (Jellyfin's
+/// convention for extras/specials), every other number is "Season N".
 fn season_display_name(number: i32) -> String {
     if number == 0 {
         "Specials".to_owned()
@@ -15232,34 +15438,46 @@ mod tests {
         assert_eq!(super::create_sort_name("Se7en"), "se0000000007en");
     }
 
-    // NFO sidecar search order: files look next to the media then for movie.nfo;
-    // folders look inside for tvshow.nfo/season.nfo; a single-folder movie for movie.nfo.
-    #[test]
-    fn nfo_candidates_match_jellyfin_search_order() {
+    /// The NFO sidecar search order, `BaseNfoProvider.GetXmlFile` per kind: a
+    /// video's is `MovieNfoSaver.GetMovieSavePaths` (`movie.nfo` first for a
+    /// `Movie` not in a mixed folder, never for a plain `Video`; a disc rip's
+    /// own-named NFO); a folder kind's is a fixed name inside it.
+    #[rstest::rstest]
+    #[case::own_folder_movie(BaseItemKind::Movie, "/m/Movie (2020)/Movie.mkv", false, None, &["/m/Movie (2020)/movie.nfo", "/m/Movie (2020)/Movie.nfo"])]
+    #[case::mixed_movie(BaseItemKind::Movie, "/m/Movie.mkv", true, None, &["/m/Movie.nfo"])]
+    #[case::dvd_movie(BaseItemKind::Movie, "/m/Rip", false, Some("Dvd"), &["/m/Rip/VIDEO_TS/VIDEO_TS.nfo", "/m/Rip/movie.nfo", "/m/Rip/Rip.nfo"])]
+    #[case::bluray_video(BaseItemKind::Video, "/h/Rip", false, Some("BluRay"), &["/h/Rip/Rip.nfo"])]
+    #[case::home_video(BaseItemKind::Video, "/h/Trip/Day 1.mp4", false, None, &["/h/Trip/Day 1.nfo"])]
+    #[case::music_video(BaseItemKind::MusicVideo, "/v/Clip.mkv", false, None, &["/v/Clip.nfo"])]
+    #[case::series(BaseItemKind::Series, "/tv/Series", false, None, &["/tv/Series/tvshow.nfo"])]
+    #[case::season(BaseItemKind::Season, "/tv/Series/Season 01", false, None, &["/tv/Series/Season 01/season.nfo"])]
+    #[case::episode(BaseItemKind::Episode, "/tv/Series/S01E01.mkv", false, None, &["/tv/Series/S01E01.nfo"])]
+    fn nfo_candidates_match_jellyfin_search_order(
+        #[case] kind: BaseItemKind,
+        #[case] path: &str,
+        #[case] mixed: bool,
+        #[case] video_type: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
         use ferrofin_providers::xbmc::item::NfoItemKind;
-        assert_eq!(
-            super::nfo_candidates("/m/Movie (2020)/Movie.mkv", false, NfoItemKind::Movie),
-            vec![
-                std::path::PathBuf::from("/m/Movie (2020)/Movie.nfo"),
-                std::path::PathBuf::from("/m/Movie (2020)/movie.nfo"),
-            ]
-        );
-        assert_eq!(
-            super::nfo_candidates("/m/Movie (2020)", true, NfoItemKind::Movie),
-            vec![std::path::PathBuf::from("/m/Movie (2020)/movie.nfo")]
-        );
-        assert_eq!(
-            super::nfo_candidates("/tv/Series", true, NfoItemKind::Series),
-            vec![std::path::PathBuf::from("/tv/Series/tvshow.nfo")]
-        );
-        assert_eq!(
-            super::nfo_candidates("/tv/Series/Season 01", true, NfoItemKind::Season),
-            vec![std::path::PathBuf::from("/tv/Series/Season 01/season.nfo")]
-        );
-        assert_eq!(
-            super::nfo_candidates("/tv/Series/S01E01.mkv", false, NfoItemKind::Episode),
-            vec![std::path::PathBuf::from("/tv/Series/S01E01.nfo")]
-        );
+        let nfo_kind = match kind {
+            BaseItemKind::Movie => NfoItemKind::Movie,
+            BaseItemKind::Video => NfoItemKind::Video,
+            BaseItemKind::MusicVideo => NfoItemKind::MusicVideo,
+            BaseItemKind::Series => NfoItemKind::Series,
+            BaseItemKind::Season => NfoItemKind::Season,
+            _ => NfoItemKind::Episode,
+        };
+        let entity = BaseItemEntity {
+            path: Some(path.to_owned()),
+            is_folder: matches!(kind, BaseItemKind::Series | BaseItemKind::Season),
+            is_in_mixed_folder: mixed,
+            data: video_type.map(|t| format!(r#"{{"VideoType":"{t}"}}"#)),
+            ..BaseItemEntity::default()
+        };
+        let expected: Vec<std::path::PathBuf> =
+            expected.iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(super::nfo_candidates(&entity, nfo_kind), expected);
     }
 
     // apply_nfo fills only empty fields (mirrors apply_details) and pipe-joins the sets.
@@ -15551,7 +15769,7 @@ mod tests {
             &root_str,
             &root_str,
             cf,
-            cf,
+            &[cf],
             &super::PlanCtx::new(&naming, super::PlanScope::ALL),
             &mut out,
         );
@@ -26376,6 +26594,38 @@ mod tests {
             .unwrap(),
         );
         (db, cf)
+    }
+
+    /// A home video and a music video read their own `<stem>.nfo` through the
+    /// movie parser, as upstream's `VideoNfoProvider`/`MusicVideoNfoProvider`
+    /// (`BaseVideoNfoProvider`) do.
+    #[tokio::test]
+    async fn home_and_music_videos_read_their_own_nfo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join("Trip")).unwrap();
+        std::fs::write(home.join("Trip/Day 1.mp4"), b"").unwrap();
+        std::fs::write(
+            home.join("Trip/Day 1.nfo"),
+            "<movie><title>Sunset at the pier</title><plot>Waves.</plot></movie>",
+        )
+        .unwrap();
+        let (db, _cf) = scan_one(CollectionTypeOptions::homevideos, "Home", &home).await;
+        let clip = rows_of_kind(&db, BaseItemKind::Video).await.remove(0);
+        assert_eq!(clip.name.as_deref(), Some("Sunset at the pier"));
+        assert_eq!(clip.overview.as_deref(), Some("Waves."));
+
+        let videos = tmp.path().join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        std::fs::write(videos.join("Band - Song.mkv"), b"").unwrap();
+        std::fs::write(
+            videos.join("Band - Song.nfo"),
+            "<musicvideo><title>Song</title><album>Record</album></musicvideo>",
+        )
+        .unwrap();
+        let (db, _cf) = scan_one(CollectionTypeOptions::musicvideos, "Videos", &videos).await;
+        let video = rows_of_kind(&db, BaseItemKind::MusicVideo).await.remove(0);
+        assert_eq!(video.name.as_deref(), Some("Song"));
     }
 
     #[tokio::test]
