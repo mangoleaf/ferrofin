@@ -219,7 +219,7 @@ fn decoded_key(key: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::Query;
+    use super::{Query, QueryParameters};
 
     /// Audit every implemented query field against the newest vendored operation
     /// that declares it. The older contract still covers removed/legacy routes;
@@ -324,5 +324,123 @@ pub(crate) mod tests {
                 ("a".into(), "3".into())
             ]
         );
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Mixed {
+        name: Option<String>,
+        limit: Option<i32>,
+        recursive: Option<bool>,
+        #[serde(
+            default,
+            deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+        )]
+        user_id: Option<uuid::Uuid>,
+        fields: Option<String>,
+        genres: Option<String>,
+    }
+
+    impl super::QueryParameters for Mixed {
+        const COLLECTIONS: &'static [(&'static str, char)] = &[("fields", ','), ("genres", '|')];
+    }
+
+    fn mixed(query: &str) -> Result<Query<Mixed>, axum::extract::rejection::QueryRejection> {
+        Query::try_from_uri(&format!("/?{query}").parse().unwrap())
+    }
+
+    #[test]
+    fn first_scalar_wins_in_wire_order_including_empty_and_encoded_values() {
+        for (query, expected) in [
+            ("name=a&name=b&name=c", "a"),
+            ("NAME=b&name=a", "b"),
+            ("name=&NAME=second", ""),
+            ("name&name=second", ""),
+            ("name=%20&name=second", " "),
+            ("name=a,b&name=c", "a,b"),
+            ("name=a%2Cb&NAME=c", "a,b"),
+            ("na%6De=a%26b%3Dc%2Bd&name=second", "a&b=c+d"),
+            ("name=a+b&name=second", "a b"),
+            ("name=%252C&name=second", "%2C"),
+            ("unknown=x&NAME=%C3%A9&name=second&unknown=y", "é"),
+        ] {
+            assert_eq!(
+                mixed(query).unwrap().name.as_deref(),
+                Some(expected),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_scalars_ignore_invalid_later_values_but_reject_an_invalid_first() {
+        let id = uuid::Uuid::from_u128(19);
+        let query = mixed(&format!(
+            "limit=7&LIMIT=nope&recursive=true&RECURSIVE=nope&userId={id}&USERID=nope"
+        ))
+        .unwrap();
+        assert_eq!(query.limit, Some(7));
+        assert_eq!(query.recursive, Some(true));
+        assert_eq!(query.user_id, Some(id));
+        for bad in [
+            "limit=nope&LIMIT=7",
+            "recursive=nope&recursive=true",
+            "userId=nope&userId=00000000-0000-0000-0000-000000000019",
+        ] {
+            assert!(mixed(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            mixed(&format!("userId=&USERID={id}")).unwrap().user_id,
+            None
+        );
+    }
+
+    #[test]
+    fn comma_and_pipe_collections_keep_all_occurrences_beside_scalars() {
+        let query = mixed("fields=A%2CB&FIELDS=C&fields=D&genres=News%2CSport&GENRES=Drama&name=first&NAME=second").unwrap();
+        assert_eq!(query.fields.as_deref(), Some("A,B,C,D"));
+        assert_eq!(query.genres.as_deref(), Some("News,Sport|Drama"));
+        assert_eq!(query.name.as_deref(), Some("first"));
+        let query = mixed("fields=&fields=A&fields=&genres=&genres=Drama").unwrap();
+        assert_eq!(query.fields.as_deref(), Some(",A,"));
+        assert_eq!(query.genres.as_deref(), Some("|Drama"));
+    }
+
+    #[test]
+    fn unchanged_queries_and_unknown_parameters_keep_the_fast_path() {
+        let fields = super::fields::<Mixed>();
+        for query in [
+            "",
+            "name=a,b",
+            "limit=7&fields=A%2CB",
+            "unknown=a&unknown=b",
+            "flag&&",
+        ] {
+            assert_eq!(
+                super::normalize(query, fields, Mixed::COLLECTIONS),
+                None,
+                "{query}"
+            );
+        }
+        let query = mixed("").unwrap();
+        assert_eq!(query.name, None);
+        assert_eq!(query.fields, None);
+    }
+
+    #[tokio::test]
+    async fn extraction_preserves_the_original_uri_for_raw_consumers() {
+        use axum::extract::FromRequestParts;
+        let uri = "/?NAME=first&name=second&fields=A&FIELDS=B";
+        let (mut parts, ()) = axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let query = Query::<Mixed>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(query.name.as_deref(), Some("first"));
+        assert_eq!(query.fields.as_deref(), Some("A,B"));
+        assert_eq!(parts.uri.to_string(), uri);
     }
 }

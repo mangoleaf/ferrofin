@@ -219,10 +219,15 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
 /// Extracts a query-string parameter case-insensitively, as Jellyfin does.
 /// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_owned())
-    })
+    query?
+        .split('&')
+        .find_map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            k.eq_ignore_ascii_case(key).then_some(v)
+        })
+        // An empty first value stays absent; a later value cannot replace it.
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -1076,6 +1081,15 @@ mod tests {
         assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
+        assert_eq!(
+            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            query_param(Some("api_key=&api_key=second"), "api_key"),
+            None
+        );
+        assert_eq!(query_param(Some("api_key&api_key=second"), "api_key"), None);
     }
 
     #[test]
