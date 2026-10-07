@@ -7,6 +7,12 @@
 //! inheritance where each lookup type derives from `ItemLookupInfo`. The
 //! type-specific fields (album artists, series name, …) are added alongside.
 //!
+//! Each concrete type *deserializes* through a flat wire struct instead of
+//! `flatten`: serde binds a flattened struct through its private
+//! `FlatMapDeserializer`, which the API's request-body binder cannot reach, so
+//! a flattened lookup info would bind its member names case-sensitively where
+//! Jellyfin's MVC binder ignores case (`POST /Items/RemoteSearch/*`).
+//!
 //! Serde casing matches the Jellyfin JSON contract (PascalCase). Because the C#
 //! constructor seeds `IsAutomated = true`, [`ItemLookupInfo`] does **not** derive
 //! `Default` blindly — its [`Default`] impl sets `is_automated` to `true` to stay
@@ -71,8 +77,9 @@ pub struct ItemLookupInfo {
 
     /// Gets or sets a value indicating whether this lookup was automated.
     ///
-    /// The C# constructor seeds this to `true`; [`Default`] does the same.
-    #[serde(default)]
+    /// The C# constructor seeds this to `true`; [`Default`] does the same, and so
+    /// does an absent member (`System.Text.Json` keeps the constructor's value).
+    #[serde(default = "seeded_true")]
     pub is_automated: bool,
 }
 
@@ -109,13 +116,18 @@ impl IHasProviderIds for ItemLookupInfo {
 }
 
 /// Generates a concrete lookup-info newtype flattening [`ItemLookupInfo`].
+///
+/// It serializes with `flatten` but deserializes through a private flat wire
+/// struct carrying [`ItemLookupInfo`]'s fields inline (see the module doc). The
+/// copy of those fields below must track [`ItemLookupInfo`]; the
+/// `lookup_infos_deserialize_every_base_field` test fails if it drifts.
 macro_rules! lookup_info {
     (
         $(#[$meta:meta])*
         $name:ident { $( $(#[$fmeta:meta])* $field:ident : $ty:ty ),* $(,)? }
     ) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+        #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, ToSchema)]
         #[serde(rename_all = "PascalCase")]
         pub struct $name {
             /// The shared [`ItemLookupInfo`] fields (flattened inline on the wire).
@@ -130,7 +142,61 @@ macro_rules! lookup_info {
                 pub $field: $ty,
             )*
         }
+
+        const _: () = {
+            /// The flat wire shape of the lookup info (base fields inline).
+            #[derive(Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Wire {
+                name: Option<String>,
+                original_title: Option<String>,
+                path: Option<String>,
+                metadata_language: Option<String>,
+                metadata_country_code: Option<String>,
+                provider_ids: Option<HashMap<String, String>>,
+                year: Option<i32>,
+                index_number: Option<i32>,
+                parent_index_number: Option<i32>,
+                #[serde(default, with = "crate::json::datetime::option")]
+                premiere_date: Option<DateTime<Utc>>,
+                #[serde(default = "crate::providers::lookup_info::seeded_true")]
+                is_automated: bool,
+                $(
+                    $(#[$fmeta])*
+                    #[serde(default)]
+                    $field: $ty,
+                )*
+            }
+
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    let wire = Wire::deserialize(deserializer)?;
+                    Ok(Self {
+                        base: ItemLookupInfo {
+                            name: wire.name,
+                            original_title: wire.original_title,
+                            path: wire.path,
+                            metadata_language: wire.metadata_language,
+                            metadata_country_code: wire.metadata_country_code,
+                            provider_ids: wire.provider_ids,
+                            year: wire.year,
+                            index_number: wire.index_number,
+                            parent_index_number: wire.parent_index_number,
+                            premiere_date: wire.premiere_date,
+                            is_automated: wire.is_automated,
+                        },
+                        $( $field: wire.$field, )*
+                    })
+                }
+            }
+        };
     };
+}
+
+/// `ItemLookupInfo`'s constructor value for `IsAutomated`, used when a body
+/// omits it.
+const fn seeded_true() -> bool {
+    true
 }
 
 /// True when a flattened optional field should be skipped on serialization.
@@ -250,6 +316,68 @@ pub struct RemoteSearchQuery<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every [`ItemLookupInfo`] field set to a non-default value (a struct
+    /// literal, so a new base field must be set here too). What forces the wire
+    /// copy to keep up is `lookup_info!`'s own exhaustive `ItemLookupInfo {..}`
+    /// mapping; this round trip then catches a wire field that reads differently.
+    fn full_base() -> ItemLookupInfo {
+        ItemLookupInfo {
+            name: Some("Name".into()),
+            original_title: Some("Original".into()),
+            path: Some("/media/x".into()),
+            metadata_language: Some("en".into()),
+            metadata_country_code: Some("US".into()),
+            provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "1".to_owned())])),
+            year: Some(1999),
+            index_number: Some(2),
+            parent_index_number: Some(3),
+            premiere_date: Some(
+                DateTime::parse_from_rfc3339("1999-03-31T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            is_automated: false,
+        }
+    }
+
+    #[test]
+    fn lookup_infos_deserialize_every_base_field() {
+        let album = AlbumInfo {
+            base: full_base(),
+            album_artists: vec!["A".into()],
+            artist_provider_ids: Some(HashMap::from([("Mb".to_owned(), "2".to_owned())])),
+            song_infos: vec![SongInfo {
+                base: full_base(),
+                album_artists: vec!["B".into()],
+                album: Some("Album".into()),
+                artists: vec!["C".into()],
+            }],
+        };
+        let json = serde_json::to_value(&album).unwrap();
+        assert_eq!(serde_json::from_value::<AlbumInfo>(json).unwrap(), album);
+        let movie = MovieInfo { base: full_base() };
+        let json = serde_json::to_value(&movie).unwrap();
+        assert_eq!(serde_json::from_value::<MovieInfo>(json).unwrap(), movie);
+        // Absent members: the wire copy defaults every base field exactly as
+        // `ItemLookupInfo` does (e.g. `IsAutomated` → `true`).
+        let base: ItemLookupInfo = serde_json::from_str("{}").unwrap();
+        let movie: MovieInfo = serde_json::from_str("{}").unwrap();
+        let song: SongInfo = serde_json::from_str("{}").unwrap();
+        assert_eq!(movie.base, base);
+        assert_eq!(song.base, base);
+    }
+
+    #[test]
+    fn a_missing_is_automated_keeps_the_constructor_s_true() {
+        // `ItemLookupInfo()` seeds `IsAutomated = true` and System.Text.Json
+        // leaves an absent member at its constructed value.
+        let movie: MovieInfo = serde_json::from_str(r#"{"Name":"x"}"#).unwrap();
+        assert_eq!(movie.base.name.as_deref(), Some("x"));
+        assert!(movie.base.is_automated);
+        let base: ItemLookupInfo = serde_json::from_str("{}").unwrap();
+        assert!(base.is_automated);
+    }
 
     #[test]
     fn item_lookup_info_defaults_is_automated_true() {

@@ -45,11 +45,11 @@
 //!
 //! Neither their member names nor their enum values fold (serde hands a
 //! buffered string straight to the variant visitor), so a body DTO of either
-//! shape binds through a flat wire struct instead. TODO: `TimerInfoDto`, `SeriesTimerInfoDto` and the
-//! `RemoteSearchQuery` lookup infos still flatten (`POST /LiveTv/Timers*`,
-//! `POST /LiveTv/SeriesTimers*`, `POST /Items/RemoteSearch/*`); their wire
-//! structs are execution step 2 (D3) of `PLAN_JSON_BODY_CASE_INSENSITIVE.md`. Also unsupported,
-//! as no body uses it: a `Box<serde_json::value::RawValue>` member.
+//! shape binds through a flat wire struct instead — as `TimerInfoDto`,
+//! `SeriesTimerInfoDto` (`ferrofin_model::live_tv`, `timer_info!`) and the
+//! `RemoteSearchQuery` lookup infos (`ferrofin_model::providers`, `lookup_info!`)
+//! do. Also unsupported, as no body uses it: a
+//! `Box<serde_json::value::RawValue>` member.
 
 use std::collections::{HashMap, HashSet};
 
@@ -597,6 +597,49 @@ mod tests {
                 .expect("binds");
         assert_eq!(config.subtitle_language_preference.as_deref(), Some("eng"));
         assert_eq!(config.subtitle_mode, SubtitlePlaybackMode::OnlyForced);
+    }
+
+    #[test]
+    fn the_formerly_flattened_bodies_bind_in_any_case() {
+        use ferrofin_model::live_tv::{
+            KeepUntil, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
+        };
+        use ferrofin_model::providers::{AlbumInfo, MovieInfo, RemoteSearchQuery};
+
+        // POST /LiveTv/Timers: base members, own members and enum values.
+        let timer: TimerInfoDto = bind(
+            r#"{"name":"News","prePaddingSeconds":60,"keepUntil":"untilwatched","status":"inprogress","seriesTimerId":"s1"}"#,
+        )
+        .expect("timer");
+        assert_eq!(timer.base.name.as_deref(), Some("News"));
+        assert_eq!(timer.base.pre_padding_seconds, 60);
+        assert_eq!(timer.base.keep_until, KeepUntil::UntilWatched);
+        assert_eq!(timer.status, RecordingStatus::InProgress);
+        assert_eq!(timer.series_timer_id.as_deref(), Some("s1"));
+
+        // POST /LiveTv/SeriesTimers.
+        let series: SeriesTimerInfoDto =
+            bind(r#"{"CHANNELNAME":"BBC","recordanytime":true,"keepUpTo":2}"#).expect("series");
+        assert_eq!(series.base.channel_name.as_deref(), Some("BBC"));
+        assert!(series.record_any_time);
+        assert_eq!(series.keep_up_to, 2);
+
+        // POST /Items/RemoteSearch/Movie and /MusicAlbum (nested lookup infos).
+        let movie: RemoteSearchQuery<MovieInfo> =
+            bind(r#"{"searchInfo":{"name":"Alien","year":1979},"includeDisabledProviders":true}"#)
+                .expect("movie");
+        let info = movie.search_info.expect("search info");
+        assert_eq!(info.base.name.as_deref(), Some("Alien"));
+        assert_eq!(info.base.year, Some(1979));
+        assert!(movie.include_disabled_providers);
+        let album: RemoteSearchQuery<AlbumInfo> = bind(
+            r#"{"searchInfo":{"name":"X","albumArtists":["A"],"songInfos":[{"name":"S","album":"X"}]}}"#,
+        )
+        .expect("album");
+        let info = album.search_info.expect("search info");
+        assert_eq!(info.album_artists, ["A"]);
+        assert_eq!(info.song_infos[0].base.name.as_deref(), Some("S"));
+        assert_eq!(info.song_infos[0].album.as_deref(), Some("X"));
     }
 
     #[test]
