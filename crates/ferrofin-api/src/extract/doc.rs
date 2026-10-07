@@ -401,6 +401,10 @@ impl<'de, const FOLD: bool> de::Deserializer<'de> for Doc<FOLD> {
         visitor: V,
     ) -> Result<V::Value, Error> {
         use ferrofin_model::json::value::{NULLABLE_VALUE, STRING_TOKEN};
+        if name == ferrofin_model::json::number::PROFILE_I32 {
+            let value = i32::deserialize(self)?;
+            return visitor.visit_newtype_struct(value.into_deserializer());
+        }
         match (name, self) {
             (NULLABLE_VALUE, Self::String(text)) if text.is_empty() => {
                 visitor.visit_newtype_struct(Self::Null)
@@ -1014,5 +1018,52 @@ mod tests {
         assert_eq!(duplicate.count, 2);
         assert!(crate::extract::deserialize_defaults::<Config>(r#"{"Child":[]}"#).is_err());
         assert!(crate::extract::deserialize_defaults::<Config>(r#"{"Optional":"true"}"#).is_err());
+    }
+    #[test]
+    fn profile_file_leniency_does_not_override_request_number_rules() {
+        use ferrofin_model::dlna::TranscodingProfile;
+        let file: TranscodingProfile =
+            serde_json::from_str(r#"{"MinSegments":"","SegmentLength":"2"}"#).unwrap();
+        assert_eq!(file.min_segments, 0);
+        assert_eq!(file.segment_length, 2);
+        let body: TranscodingProfile = bind(r#"{"MinSegments":"2","Protocol":"1"}"#).unwrap();
+        assert_eq!(body.min_segments, 2);
+        assert_eq!(
+            body.protocol,
+            ferrofin_model::data::MediaStreamProtocol::hls
+        );
+        for input in [
+            r#"{"MinSegments":""}"#,
+            r#"{"MinSegments":" 2"}"#,
+            r#"{"MinSegments":2.0}"#,
+        ] {
+            assert!(bind::<TranscodingProfile>(input).is_err(), "{input}");
+        }
+        let stream: ferrofin_model::entities_media::MediaStream =
+            bind(r#"{"Type":"999"}"#).unwrap();
+        assert_eq!(
+            stream.stream_type,
+            ferrofin_model::entities::MediaStreamType::Unrecognized(999)
+        );
+    }
+
+    #[test]
+    fn flat_timer_and_lookup_wires_retain_numeric_and_nullable_rules() {
+        use ferrofin_model::{
+            live_tv::{SeriesTimerInfoDto, TimerInfoDto},
+            providers::{MovieInfo, RemoteSearchQuery},
+        };
+        let timer: TimerInfoDto =
+            bind(r#"{"prePaddingSeconds":"60","runTimeTicks":"","keepUntil":1}"#).unwrap();
+        assert_eq!(timer.base.pre_padding_seconds, 60);
+        assert_eq!(timer.run_time_ticks, None);
+        let series: SeriesTimerInfoDto = bind(r#"{"keepUpTo":"2","dayPattern":""}"#).unwrap();
+        assert_eq!(series.keep_up_to, 2);
+        assert_eq!(series.day_pattern, None);
+        let movie: RemoteSearchQuery<MovieInfo> =
+            bind(r#"{"SearchInfo":{"year":"1979","IndexNumber":""}}"#).unwrap();
+        let info = movie.search_info.unwrap();
+        assert_eq!(info.base.year, Some(1979));
+        assert_eq!(info.base.index_number, None);
     }
 }

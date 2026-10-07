@@ -568,7 +568,7 @@ pub struct MediaStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// The type.
-    #[serde(rename = "Type", deserialize_with = "deserialize_media_stream_type")]
+    #[serde(rename = "Type")]
     pub stream_type: MediaStreamType,
     /// The aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1242,49 +1242,6 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     remove_provider_id(instance, provider.as_name());
 }
 
-/// Deserializes a [`MediaStreamType`] from either its PascalCase string name or
-/// its integer discriminant.
-///
-/// Jellyfin's `System.Text.Json` enum converter accepts both forms on read, and
-/// matches a name ignoring case (`"audio"` is `Audio`); the checked-in test
-/// fixtures encode `MediaStream.Type` as an integer.
-fn deserialize_media_stream_type<'de, D>(deserializer: D) -> Result<MediaStreamType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrString {
-        Int(u8),
-        Str(String),
-    }
-
-    match IntOrString::deserialize(deserializer)? {
-        IntOrString::Int(n) => match n {
-            0 => Ok(MediaStreamType::Audio),
-            1 => Ok(MediaStreamType::Video),
-            2 => Ok(MediaStreamType::Subtitle),
-            3 => Ok(MediaStreamType::EmbeddedImage),
-            4 => Ok(MediaStreamType::Data),
-            5 => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType discriminant: {other}"
-            ))),
-        },
-        IntOrString::Str(s) => match s.to_ascii_lowercase().as_str() {
-            "audio" => Ok(MediaStreamType::Audio),
-            "video" => Ok(MediaStreamType::Video),
-            "subtitle" => Ok(MediaStreamType::Subtitle),
-            "embeddedimage" => Ok(MediaStreamType::EmbeddedImage),
-            "data" => Ok(MediaStreamType::Data),
-            "lyric" => Ok(MediaStreamType::Lyric),
-            _ => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType: {s}"
-            ))),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1891,7 +1848,12 @@ mod tests {
             assert_eq!(stream.stream_type, expected, "{wire}");
         }
         // Out-of-range int and unknown string both error.
-        assert!(serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 })).is_err());
+        assert_eq!(
+            serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 }))
+                .unwrap()
+                .stream_type,
+            MediaStreamType::Unrecognized(99)
+        );
         assert!(
             serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": "Nope" })).is_err()
         );

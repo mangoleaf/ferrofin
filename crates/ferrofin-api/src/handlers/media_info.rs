@@ -25,7 +25,6 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::JsonBody;
-use crate::handlers::item_update::opt_i32;
 use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
 use crate::state::AppState;
 
@@ -560,15 +559,13 @@ async fn get_playback_info(
 struct PlaybackInfoBody {
     #[serde(default)]
     device_profile: Option<DeviceProfile>,
-    // The numeric fields use the lenient number-or-string deserializer: the C#
-    // binder runs with `JsonNumberHandling.AllowReadingFromString`, and clients
-    // (jellyfin-web track pickers) really do post `"AudioStreamIndex": "1"` — a
-    // strict i32 turns the whole request into a 422.
-    #[serde(default, deserialize_with = "opt_i32")]
+    // Track pickers post quoted indexes; the shared body binder reads them.
+    // The marker additionally recognizes an exact empty nullable value.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     max_streaming_bitrate: Option<i32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     audio_stream_index: Option<i32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     subtitle_stream_index: Option<i32>,
     #[serde(default)]
     #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -707,35 +704,6 @@ struct OpenLiveStreamQuery {
     item_id: Option<Uuid>,
 }
 
-/// Reads an optional `i64` that a client may have posted as a JSON string.
-///
-/// The `i64` twin of [`opt_i32`]: the C# binder runs with
-/// `JsonNumberHandling.AllowReadingFromString`, and a client that quotes
-/// `StartTimeTicks` must not turn the whole request into a `422`.
-///
-/// # Errors
-///
-/// Fails when the value is neither a number, a numeric string, nor `null`.
-fn opt_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum Lenient {
-        Number(i64),
-        Text(String),
-        Null,
-    }
-    match <Lenient as serde::Deserialize>::deserialize(d)? {
-        Lenient::Number(n) => Ok(Some(n)),
-        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
-        Lenient::Text(s) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| serde::de::Error::custom(format!("expected an integer, got {s:?}"))),
-        Lenient::Null => Ok(None),
-    }
-}
-
 /// The posted `OpenLiveStreamDto` body.
 ///
 /// Every scalar the query carries may instead arrive here — jellyfin-web and the
@@ -753,19 +721,19 @@ struct OpenLiveStreamDto {
     /// The play session id.
     play_session_id: Option<String>,
     /// The maximum streaming bitrate.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     max_streaming_bitrate: Option<i32>,
     /// The start time in ticks.
-    #[serde(deserialize_with = "opt_i64")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     start_time_ticks: Option<i64>,
     /// The audio stream index.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     audio_stream_index: Option<i32>,
     /// The subtitle stream index.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     subtitle_stream_index: Option<i32>,
     /// The maximum number of audio channels.
-    #[serde(deserialize_with = "opt_i32")]
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     max_audio_channels: Option<i32>,
     /// The item id whose source is opened.
     #[serde(with = "ferrofin_model::json::guid::option")]
@@ -966,7 +934,7 @@ mod tests {
         // The shape jellyfin-web (and the parity harness) POSTs: everything in
         // the body, nothing in the query. Before this was bound, the open token
         // never reached the manager and a Live TV channel could not be opened.
-        let dto: super::OpenLiveStreamDto = serde_json::from_str(
+        let dto: super::OpenLiveStreamDto = crate::extract::deserialize_mvc(
             r#"{"OpenToken":"prov_LiveTvChannel_abc_src","UserId":"85c9c1a0f0b74a1b8c4d9e2f3a4b5c6d",
                 "ItemId":"11111111222233334444555566667777","PlaySessionId":"parity-livetv",
                 "EnableDirectPlay":true,"EnableDirectStream":false,
@@ -1022,7 +990,7 @@ mod tests {
         // jellyfin-web posts stream indexes as strings ("1", "-1"); the C# binder
         // accepts them (AllowReadingFromString) — a strict i32 made the whole
         // PlaybackInfo request a 422.
-        let body: super::PlaybackInfoBody = serde_json::from_str(
+        let body: super::PlaybackInfoBody = crate::extract::deserialize_mvc(
             r#"{"AudioStreamIndex":"1","SubtitleStreamIndex":"-1","MaxStreamingBitrate":"140000000"}"#,
         )
         .expect("lenient parse");

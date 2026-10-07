@@ -62,6 +62,43 @@ macro_rules! floats {
 }
 floats!(f32, f64);
 
+/// Identifies legacy device-profile integers to the request binder, which
+/// enforces numeric JSON rules before the file reader sees the value.
+pub const PROFILE_I32: &str = "$ferrofin::profile_i32";
+
+/// Reads integers in device-profile files, including their legacy empty-string
+/// zero. Request deserializers intercept the marker and apply the stricter
+/// non-nullable number rules, so an empty HTTP value is still an error.
+///
+/// # Errors
+/// Rejects non-integer tokens, overflow, whitespace, and invalid number text.
+pub fn profile_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    struct Profile;
+    impl<'de> serde::de::Visitor<'de> for Profile {
+        type Value = i32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a device-profile integer")
+        }
+        fn visit_newtype_struct<D: serde::Deserializer<'de>>(self, d: D) -> Result<i32, D::Error> {
+            d.deserialize_any(self)
+        }
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<i32, E> {
+            i32::try_from(value).map_err(E::custom)
+        }
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<i32, E> {
+            i32::try_from(value).map_err(E::custom)
+        }
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<i32, E> {
+            if text.is_empty() {
+                return Ok(0);
+            }
+            i32::parse_json_number(text, true)
+                .ok_or_else(|| E::custom("invalid device-profile integer"))
+        }
+    }
+    d.deserialize_newtype_struct(PROFILE_I32, Profile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::JsonNumber;

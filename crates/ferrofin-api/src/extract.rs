@@ -255,6 +255,13 @@ fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails>
     serde_path_to_error::deserialize(&mut reader).map_err(member_error)
 }
 
+/// The production MVC document deserializer, exposed to DTO regression tests.
+#[cfg(test)]
+pub(crate) fn deserialize_mvc<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
+    let doc: Doc = serde_json::from_str(json)?;
+    T::deserialize(doc)
+}
+
 /// Uses Jellyfin's JsonDefaults value converters with exact property names.
 pub(crate) fn deserialize_defaults<T: DeserializeOwned>(
     json: &str,

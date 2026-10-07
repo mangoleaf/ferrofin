@@ -131,8 +131,8 @@ pub(crate) async fn update_item(
 /// modelling just them (unknown fields are ignored) keeps the write path focused.
 /// Crucially, its number inputs serialize as **strings** (`"ProductionYear": "2010"`)
 /// and cleared dates as `""`, which Jellyfin's C# binder coerces but strict serde
-/// rejects (a `422`). The numeric/date fields therefore use tolerant deserializers
-/// that accept a string, a number, or an empty value.
+/// rejects. The shared request binder applies Jellyfin's numeric rules; nullable
+/// value markers distinguish cleared values from empty strings.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct UpdateItemRequest {
@@ -142,13 +142,13 @@ pub(crate) struct UpdateItemRequest {
     forced_sort_name: Option<String>,
     #[serde(default)]
     original_title: Option<String>,
-    #[serde(default, deserialize_with = "opt_f32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     critic_rating: Option<f32>,
-    #[serde(default, deserialize_with = "opt_f32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     community_rating: Option<f32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     index_number: Option<i32>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     parent_index_number: Option<i32>,
     #[serde(default)]
     overview: Option<String>,
@@ -158,15 +158,15 @@ pub(crate) struct UpdateItemRequest {
     taglines: Option<Vec<String>>,
     #[serde(default)]
     studios: Option<Vec<NameGuidPair>>,
-    #[serde(default, deserialize_with = "opt_date")]
+    #[serde(default, with = "ferrofin_model::json::datetime::option")]
     date_created: Option<DateTime<Utc>>,
     #[serde(default)]
     series_name: Option<String>,
-    #[serde(default, deserialize_with = "opt_date")]
+    #[serde(default, with = "ferrofin_model::json::datetime::option")]
     end_date: Option<DateTime<Utc>>,
-    #[serde(default, deserialize_with = "opt_date")]
+    #[serde(default, with = "ferrofin_model::json::datetime::option")]
     premiere_date: Option<DateTime<Utc>>,
-    #[serde(default, deserialize_with = "opt_i32")]
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     production_year: Option<i32>,
     #[serde(default)]
     official_rating: Option<String>,
@@ -207,75 +207,6 @@ pub(crate) struct UpdateItemRequest {
     provider_ids: Option<std::collections::HashMap<String, String>>,
 }
 
-/// Deserializes an optional `i32` that may arrive as a number, a numeric string,
-/// or an empty string (`""` → `None`).
-///
-/// The two halves are both ports, not conveniences. Reading a number out of a
-/// string is `JsonNumberHandling.AllowReadingFromString`, which
-/// `JsonDefaults.Options` sets for the whole API (v10.11.8
-/// src/Jellyfin.Extensions/Json/JsonDefaults.cs:33) — jellyfin-web's track
-/// pickers really do post `"AudioStreamIndex": "1"`. Reading `""` as a cleared
-/// field is `JsonNullableStructConverter<TStruct>.Read`, which returns `null`
-/// for an empty string before deserializing (JsonNullableStructConverter.cs:18).
-///
-/// Everything else is an ERROR, exactly as `Deserialize<int>` throws and the
-/// model binder answers `400`. Swallowing a string that is not a number into
-/// `None` was a real divergence: `{"MaxStreamingBitrate":"nope"}` on
-/// `POST /Items/{itemId}/PlaybackInfo` measured Ferrofin `200` against
-/// Jellyfin `400`.
-///
-/// # Errors
-///
-/// Fails when the value is a non-empty string that is not an integer, or a
-/// number that is not a 32-bit integer (`Deserialize<int>` rejects `3.0` too).
-pub(crate) fn opt_i32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i32>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lenient {
-        Number(i32),
-        Text(String),
-        Null,
-    }
-    match Lenient::deserialize(d)? {
-        Lenient::Number(n) => Ok(Some(n)),
-        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
-        Lenient::Text(s) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| serde::de::Error::custom(format!("expected an integer, got {s:?}"))),
-        Lenient::Null => Ok(None),
-    }
-}
-
-/// Deserializes an optional `f32` that may arrive as a number or a numeric string.
-///
-/// The `f32` twin of [`opt_i32`], with the same two ports behind it and the
-/// same refusal to turn an unparseable string into a silent `None`.
-///
-/// # Errors
-///
-/// Fails when the value is a non-empty string that is not a number.
-fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lenient {
-        Number(f32),
-        Text(String),
-        Null,
-    }
-    match Lenient::deserialize(d)? {
-        Lenient::Number(n) => Ok(Some(n)),
-        Lenient::Text(s) if s.trim().is_empty() => Ok(None),
-        Lenient::Text(s) => s
-            .trim()
-            .parse()
-            .map(Some)
-            .map_err(|_| serde::de::Error::custom(format!("expected a number, got {s:?}"))),
-        Lenient::Null => Ok(None),
-    }
-}
-
 /// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
 /// enum, into the stored `MetadataField` values (`MetadataField.cs`: `Cast`
 /// = 0 … `OfficialRating` = 8): a member name (case-insensitively), an
@@ -289,42 +220,9 @@ fn opt_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Err
 fn opt_metadata_fields<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Vec<i32>>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lenient {
-        Number(i32),
-        Name(String),
-    }
-    let Some(values) = Option::<Vec<Lenient>>::deserialize(d)? else {
-        return Ok(None);
-    };
-    values
-        .into_iter()
-        .map(|value| match value {
-            Lenient::Number(n) => Ok(n),
-            Lenient::Name(name) => {
-                let name = name.trim();
-                if let Ok(n) = name.parse::<i32>() {
-                    return Ok(n);
-                }
-                MetadataField::ALL
-                    .iter()
-                    .find(|field| format!("{field:?}").eq_ignore_ascii_case(name))
-                    .map(|field| ferrofin_db::enums::metadata_field::to_i32(*field))
-                    .ok_or_else(|| {
-                        serde::de::Error::custom(format!("not a MetadataField: {name:?}"))
-                    })
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-}
-
-/// Deserializes an optional timestamp the way Jellyfin reads one: a cleared
-/// field (`null` or `""`) is `None`, and a bare date — what jellyfin-web's
-/// metadata editor sends for a date the user changed — is midnight UTC.
-fn opt_date<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
-    ferrofin_model::json::datetime::option::deserialize(d)
+    Option::<Vec<MetadataField>>::deserialize(d).map(|fields| {
+        fields.map(|values| values.into_iter().map(MetadataField::json_value).collect())
+    })
 }
 
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and
@@ -1082,7 +980,7 @@ mod tests {
     #[test]
     fn a_number_that_is_not_a_number_is_refused_not_swallowed() {
         let one = |body: &str| {
-            serde_json::from_str::<UpdateItemRequest>(&format!(
+            crate::extract::deserialize_mvc::<UpdateItemRequest>(&format!(
                 r#"{{"Id":"x","Type":"Movie","Name":"n",{body}}}"#
             ))
         };
@@ -1138,7 +1036,7 @@ mod tests {
             "PremiereDate": "2010-07-16T00:00:00.0000000Z", "EndDate": "",
             "Genres": ["Action"], "Studios": [{"Name": "WB"}], "LockData": false
         }"#;
-        let req: UpdateItemRequest = serde_json::from_str(json).expect("lenient parse");
+        let req: UpdateItemRequest = crate::extract::deserialize_mvc(json).expect("lenient parse");
         assert_eq!(req.production_year, Some(2010));
         assert_eq!(req.community_rating, Some(8.5));
         assert_eq!(req.index_number, Some(1));
@@ -1154,23 +1052,25 @@ mod tests {
     /// its integer value; anything else is refused.
     #[test]
     fn locked_fields_accept_names_and_integer_values() {
-        let req: UpdateItemRequest =
-            serde_json::from_str(r#"{"LockedFields": ["Overview", 8, "cast", "7", 0, 42]}"#)
-                .expect("names and numbers");
+        let req: UpdateItemRequest = crate::extract::deserialize_mvc(
+            r#"{"LockedFields": ["Overview", 8, "cast", "7", 0, 42]}"#,
+        )
+        .expect("names and numbers");
         // Overview 6, OfficialRating 8, Cast 0, Runtime 7; 42 is kept as sent.
         assert_eq!(req.locked_fields, Some(vec![6, 8, 0, 7, 0, 42]));
         let req: UpdateItemRequest =
-            serde_json::from_str(r#"{"LockedFields": null}"#).expect("null");
+            crate::extract::deserialize_mvc(r#"{"LockedFields": null}"#).expect("null");
         assert_eq!(req.locked_fields, None);
         assert!(
-            serde_json::from_str::<UpdateItemRequest>(r#"{"LockedFields": ["Plot"]}"#).is_err()
+            crate::extract::deserialize_mvc::<UpdateItemRequest>(r#"{"LockedFields": ["Plot"]}"#)
+                .is_err()
         );
     }
 
     #[test]
     fn update_request_accepts_native_number_types_too() {
         let req: UpdateItemRequest =
-            serde_json::from_str(r#"{"ProductionYear": 1999, "CommunityRating": 7}"#)
+            crate::extract::deserialize_mvc(r#"{"ProductionYear": 1999, "CommunityRating": 7}"#)
                 .expect("numbers parse");
         assert_eq!(req.production_year, Some(1999));
         assert_eq!(req.community_rating, Some(7.0));
