@@ -1426,21 +1426,57 @@ pub(crate) async fn detach_user_data(
     tx: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    let retained_at = datetime_to_db(chrono::Utc::now());
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let mut query = QueryBuilder::<Sqlite>::new(r#"UPDATE "UserData" SET "ItemId" = "#);
-        query
-            .push_bind(PLACEHOLDER_ID)
-            .push(r#", "RetentionDate" = "#)
-            .push_bind(&retained_at)
-            .push(r#" WHERE "ItemId" IN ("#);
-        let mut values = query.separated(",");
-        for id in chunk {
-            values.push_bind(id);
-        }
-        values.push_unseparated(")");
-        query.build().execute(&mut *tx).await.map_err(db_err)?;
+    if ids.is_empty() {
+        return Ok(());
     }
+    // Bind the entire deletion set as one JSON array, so ranking is global
+    // even when the BaseItems deletion itself crosses SQL bind chunks.
+    let ids = serde_json::to_string(ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    sqlx::query(
+        r#"WITH ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY "UserId", "CustomDataKey"
+                ORDER BY "LastPlayedDate" DESC, "PlayCount" DESC, "ItemId" ASC
+            ) AS priority
+            FROM "UserData"
+            WHERE "ItemId" IN (SELECT value FROM json_each(?1)) AND "ItemId" <> ?2
+        )
+        INSERT INTO "UserData" (
+            "ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+            "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
+            "Played", "Rating", "RetentionDate", "SubtitleStreamIndex")
+        SELECT ?2, "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+            "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
+            "Played", "Rating", ?3, "SubtitleStreamIndex"
+        FROM ranked WHERE priority = 1
+        ON CONFLICT("ItemId", "UserId", "CustomDataKey") DO UPDATE SET
+            "AudioStreamIndex" = excluded."AudioStreamIndex",
+            "IsFavorite" = excluded."IsFavorite",
+            "LastPlayedDate" = excluded."LastPlayedDate",
+            "Likes" = excluded."Likes",
+            "PlayCount" = excluded."PlayCount",
+            "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
+            "Played" = excluded."Played",
+            "Rating" = excluded."Rating",
+            "RetentionDate" = excluded."RetentionDate",
+            "SubtitleStreamIndex" = excluded."SubtitleStreamIndex""#,
+    )
+    .bind(&ids)
+    .bind(PLACEHOLDER_ID)
+    .bind(datetime_to_db(chrono::Utc::now()))
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Incoming history replaces an older detached copy, just as upstream.
+    sqlx::query(
+        r#"DELETE FROM "UserData"
+           WHERE "ItemId" IN (SELECT value FROM json_each(?1)) AND "ItemId" <> ?2"#,
+    )
+    .bind(&ids)
+    .bind(PLACEHOLDER_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -2842,7 +2878,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(());
         };
         sqlx::query(
-            r#"UPDATE "UserData" SET "ItemId" = ?1
+            r#"UPDATE OR IGNORE "UserData" SET "ItemId" = ?1
                WHERE "ItemId" = ?2 AND "CustomDataKey" = ?3"#,
         )
         .bind(&item.id)
@@ -3875,6 +3911,48 @@ mod tests {
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
     };
+
+    #[tokio::test]
+    async fn retention_delete_resolves_keys_across_chunks_and_existing_placeholders() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        let mut ids = Vec::new();
+        // Duplicate keys land in different chunks; all ties resolve by ItemId.
+        for i in 0..=ferrofin_db::BATCH_BIND_CHUNK {
+            let id = Uuid::from_u128(100 + i as u128);
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            ids.push(id);
+        }
+        for (id, count, date) in [
+            (Uuid::from_u128(1), 99, "2026-09-01 00:00:00.0000000"),
+            (ids[0], 50, "2026-09-02 00:00:00.0000000"),
+            (*ids.last().unwrap(), 2, "2026-09-03 00:00:00.0000000"),
+        ] {
+            crate::test_support::seed_user_data(&db, user, id, true, None).await;
+            sqlx::query(
+                r#"UPDATE "UserData" SET "CustomDataKey" = 'shared',
+                   "PlayCount" = ?2, "LastPlayedDate" = ?3 WHERE "ItemId" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(count)
+            .bind(date)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        FerrofinItemPersistenceService::new(db.clone())
+            .delete_items(&ids)
+            .await
+            .unwrap();
+        let rows: Vec<(String, i32)> =
+            sqlx::query_as(r#"SELECT "ItemId", "PlayCount" FROM "UserData" WHERE "UserId" = ?1"#)
+                .bind(guid_to_db(user))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(super::PLACEHOLDER_ID.to_owned(), 2)]);
+    }
 
     // Investigation regressions: run explicitly with
     // cargo test -p ferrofin-core --lib retention_investigation -- --ignored
