@@ -274,17 +274,29 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
 
 /// Parses a text frame as an inbound protocol message, or `None` for anything
 /// unrecognized (matching the C# socket, which ignores unknown message types).
+///
+/// Upstream deserializes the frame with `JsonDefaults.Options`
+/// (`WebSocketConnection.cs:60,262`): member names (`MessageType`, `Data`) match
+/// exactly, as there is no MVC binder to fold them, but `MessageType` is a
+/// `SessionMessageType` read by `JsonStringEnumConverter`, so its VALUE matches
+/// ignoring case (`"keepalive"` is `KeepAlive`). That converter also reads a
+/// numeric value (`28`, `"28"`); that half is `PLAN_JSON_NUMBER_HANDLING.md`.
 fn parse_inbound(text: &str) -> Option<Inbound> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let period = || subscription_period(value.get("Data").and_then(|d| d.as_str()));
-    match value.get("MessageType")?.as_str()? {
-        "KeepAlive" => Some(Inbound::KeepAlive),
-        "SessionsStart" => Some(Inbound::SessionsStart(period())),
-        "SessionsStop" => Some(Inbound::SessionsStop),
-        "ScheduledTasksInfoStart" => Some(Inbound::TasksStart(period())),
-        "ScheduledTasksInfoStop" => Some(Inbound::TasksStop),
-        "ActivityLogEntryStart" => Some(Inbound::ActivityStart(period())),
-        "ActivityLogEntryStop" => Some(Inbound::ActivityStop),
+    match value
+        .get("MessageType")?
+        .as_str()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "keepalive" => Some(Inbound::KeepAlive),
+        "sessionsstart" => Some(Inbound::SessionsStart(period())),
+        "sessionsstop" => Some(Inbound::SessionsStop),
+        "scheduledtasksinfostart" => Some(Inbound::TasksStart(period())),
+        "scheduledtasksinfostop" => Some(Inbound::TasksStop),
+        "activitylogentrystart" => Some(Inbound::ActivityStart(period())),
+        "activitylogentrystop" => Some(Inbound::ActivityStop),
         _ => None,
     }
 }
@@ -1165,6 +1177,21 @@ mod tests {
             Some(Inbound::SessionsStart(Duration::from_millis(
                 DEFAULT_STREAM_MILLIS
             )))
+        );
+    }
+
+    #[test]
+    fn inbound_member_names_are_exact_but_the_message_type_value_is_not() {
+        // `JsonDefaults.Options`: no member-name fold…
+        assert_eq!(parse_inbound(r#"{"messageType":"KeepAlive"}"#), None);
+        // …but `JsonStringEnumConverter` reads the enum value ignoring case.
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"keepalive"}"#),
+            Some(Inbound::KeepAlive)
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SESSIONSSTOP"}"#),
+            Some(Inbound::SessionsStop)
         );
     }
 

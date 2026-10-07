@@ -535,6 +535,37 @@ async fn the_date_added_behavior_round_trips_through_the_metadata_configuration(
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// Named configuration is the one body Jellyfin binds case-SENSITIVELY: the
+/// controller deserializes the `JsonDocument` itself with `JsonDefaults.Options`,
+/// which lacks the MVC binder's `PropertyNameCaseInsensitive`. Measured on a
+/// live Jellyfin 12.2: a camelCase `useFileCreationTimeForDateAdded: false`
+/// is ignored and the setting stays at its default, `true`. End-to-end parity
+/// check; the extractor-level guard is `extract`'s
+/// `a_json_document_body_binds_member_names_exactly`.
+#[tokio::test]
+async fn a_named_configuration_body_binds_member_names_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    };
+    let status = post(
+        admin_state_with_paths(paths),
+        "/System/Configuration/metadata",
+        &serde_json::json!({ "useFileCreationTimeForDateAdded": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved: ferrofin_model::configuration::MetadataConfiguration = serde_json::from_slice(
+        &std::fs::read(dir.path().join("named").join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        saved.use_file_creation_time_for_date_added,
+        "the camelCase member must not bind"
+    );
+}
+
 #[tokio::test]
 async fn configuration_read_returns_server_config() {
     let (status, body) = get(full_state(), "/System/Configuration").await;
