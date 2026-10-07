@@ -1224,6 +1224,13 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Reattaches user-data rows to the correct item after an id change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
+    /// Recovers detached history against persisted identities after pruning.
+    /// Includes destinations outside the current scan scope, for watcher events
+    /// delivered in separate scans. The default is a no-op for fake stores.
+    async fn reattach_all_user_data(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
     /// Recomputes and persists inherited values across the item tree.
     async fn update_inherited_values(&self) -> Result<(), ServiceError>;
 }

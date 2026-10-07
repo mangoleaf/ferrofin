@@ -2929,10 +2929,63 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(());
         }
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        if let Some(keys) = crate::user_data_key_repository::load_keys(&mut tx, id).await? {
+        let detached: bool =
+            sqlx::query_scalar(r#"SELECT EXISTS(SELECT 1 FROM "UserData" WHERE "ItemId" = ?1)"#)
+                .bind(PLACEHOLDER_ID)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        if detached
+            && let Some(keys) = crate::user_data_key_repository::load_keys(&mut tx, id).await?
+        {
             reattach_user_data_keys(&mut tx, &guid_to_db(id), &keys).await?;
         }
         tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn reattach_all_user_data(&self) -> Result<(), ServiceError> {
+        let mut after = String::new();
+        loop {
+            // Release the single writer between pages. No metadata read here
+            // can become stale before its recovery write in this transaction.
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            let retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+                r#"SELECT DISTINCT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#,
+            )
+            .bind(PLACEHOLDER_ID)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .collect();
+            if retained.is_empty() {
+                tx.commit().await.map_err(db_err)?;
+                break;
+            }
+            let ids: Vec<String> = sqlx::query_scalar(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Id" > ?1 AND "Id" <> ?2
+                   ORDER BY "Id" LIMIT 500"#,
+            )
+            .bind(&after)
+            .bind(PLACEHOLDER_ID)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(last) = ids.last() else {
+                tx.commit().await.map_err(db_err)?;
+                break;
+            };
+            after.clone_from(last);
+            for (id, keys) in
+                crate::user_data_key_repository::load_keys_for_items(&mut tx, &ids).await?
+            {
+                if keys.iter().any(|key| retained.contains(key)) {
+                    reattach_user_data_keys(&mut tx, &id, &keys).await?;
+                }
+            }
+            tx.commit().await.map_err(db_err)?;
+        }
         Ok(())
     }
 

@@ -1137,6 +1137,96 @@ async fn user_data(db: &Database) -> i64 {
         .expect("count")
 }
 
+#[rstest::rstest]
+#[case::one_scan(0)]
+#[case::destination_first(1)]
+#[case::source_first(2)]
+#[case::restore_original_path(3)]
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_survives_file_moves_and_restores(#[case] order: u8) {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = tmp.path().join("movies");
+    let original_dir = media.join("Heat (1995)");
+    let destination_dir = if order == 3 {
+        original_dir.clone()
+    } else {
+        media.join("Moved Heat (1995)")
+    };
+    let seed_movie = |dir: &Path| {
+        touch(dir, "Heat (1995).mkv");
+        std::fs::write(dir.join("movie.nfo"),
+            b"<movie><title>Heat</title><uniqueid type=\"tmdb\" default=\"true\">949</uniqueid></movie>").unwrap();
+    };
+    seed_movie(&original_dir);
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+    let original = original_dir.join("Heat (1995).mkv");
+    let destination = destination_dir.join("Heat (1995).mkv");
+    let old_id = id(BaseItemKind::Movie, &original);
+    play(&fx.db, &old_id).await;
+    // Simulate the real provider-keyed snapshot; the original-path case
+    // deliberately has only the GUID key, without a provider fallback.
+    sqlx::query(
+        r#"UPDATE "UserData" SET "CustomDataKey" = ?1, "IsFavorite" = 1,
+           "PlaybackPositionTicks" = 1234567 WHERE "ItemId" = ?2"#,
+    )
+    .bind(if order == 3 {
+        old_id.to_lowercase()
+    } else {
+        "949".to_owned()
+    })
+    .bind(&old_id)
+    .execute(fx.db.writer())
+    .await
+    .unwrap();
+    if order == 1 {
+        seed_movie(&destination_dir);
+        fx.report(&[&destination]).await;
+    }
+    std::fs::remove_file(&original).unwrap();
+    if order >= 2 {
+        fx.report(&[&original]).await;
+        assert!(!fx.rows().await.contains_key(&old_id));
+        assert_eq!(
+            user_data(&fx.db).await,
+            1,
+            "history detached before destination exists"
+        );
+    }
+    if order != 1 {
+        seed_movie(&destination_dir);
+    }
+    if order == 0 {
+        fx.scanner.scan_all().await.unwrap();
+    } else if order == 1 {
+        // Destination was indexed by an earlier scan; this event only
+        // covers the source folder, so recovery must search outside it.
+        fx.report(&[&original]).await;
+    } else {
+        fx.report(&[&destination]).await;
+    }
+    let new_id = id(BaseItemKind::Movie, &destination);
+    let rows: Vec<(bool, bool, i64, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Played", "IsFavorite", "PlaybackPositionTicks", "RetentionDate"
+           FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&new_id)
+    .fetch_all(fx.db.pool())
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "history recovered at {new_id}");
+    assert!(rows.iter().all(|row| *row == (true, true, 1234567, None)));
+    let before = user_data(&fx.db).await;
+    fx.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        user_data(&fx.db).await,
+        before,
+        "unchanged rescan is idempotent"
+    );
+}
+
 /// Restores a folder's permissions when dropped, so the temp dir can go.
 struct Unlistable(PathBuf);
 

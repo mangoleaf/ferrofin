@@ -2245,6 +2245,7 @@ impl LocalProviderManager {
                     .replace_provider_ids(item_id, &merged.provider_ids)
                     .await?;
             }
+            store.reattach_user_data(&row).await?;
             // `SaveItemAsync` writes the people when the result carries a
             // list (`MetadataService.cs:320-324`). A failed write is logged,
             // as the scan logs it: the row is saved.

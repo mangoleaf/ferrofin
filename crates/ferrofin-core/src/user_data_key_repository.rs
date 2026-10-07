@@ -85,64 +85,111 @@ pub(crate) fn extra_type_name(disc: i32) -> Option<&'static str> {
     })
 }
 
-/// Reads the item and, for a
-/// `Season`/`Episode` its series — and derives the keys.
+/// Reads an item's identity through the same batch resolver used by scan recovery.
 pub(crate) async fn load_keys(
     conn: &mut sqlx::SqliteConnection,
     item_id: Uuid,
 ) -> Result<Option<Vec<String>>, ServiceError> {
-    let Some(item) = key_row(conn, item_id).await? else {
-        return Ok(None);
-    };
-    // Only a Season or an Episode consults its series, so only then is the
-    // second query worth making.
-    let series = match (item.kind, item.series_id) {
-        (BaseItemKind::Season | BaseItemKind::Episode, Some(series_id)) => {
-            key_row(conn, series_id).await?
-        }
-        _ => None,
-    };
-    let series_source = series.as_ref().map(KeyRow::as_source);
-    Ok(Some(user_data_keys(
-        &item.as_source(),
-        series_source.as_ref(),
-    )))
+    Ok(load_keys_for_items(conn, &[guid_to_db(item_id)])
+        .await?
+        .pop()
+        .map(|(_, keys)| keys))
 }
 
-/// One item's identity fields plus its provider ids.
-#[allow(
-    clippy::type_complexity,
-    reason = "one row read positionally; naming a struct for it would not \
-              be read anywhere else"
-)]
-async fn key_row(
+/// Resolves one page, including series metadata, without per-item SQL calls.
+pub(crate) async fn load_keys_for_items(
     conn: &mut sqlx::SqliteConnection,
-    item_id: Uuid,
-) -> Result<Option<KeyRow>, ServiceError> {
-    let row: Option<(
-        String,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i32>,
-        Option<i64>,
-        Option<String>,
-        Option<bool>,
-    )> = sqlx::query_as(
-        r#"SELECT "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
+    ids: &[String],
+) -> Result<Vec<(String, Vec<String>)>, ServiceError> {
+    let mut rows = key_rows(conn, ids).await?;
+    let mut series: Vec<String> = rows
+        .values()
+        .filter_map(|row| {
+            matches!(row.kind, BaseItemKind::Season | BaseItemKind::Episode)
+                .then_some(row.series_id)
+                .flatten()
+                .map(guid_to_db)
+        })
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    series.sort_unstable();
+    series.dedup();
+    rows.extend(key_rows(conn, &series).await?);
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            let row = rows.get(id)?;
+            let series = row.series_id.and_then(|id| rows.get(&guid_to_db(id)));
+            let series_source = series.map(KeyRow::as_source);
+            Some((
+                id.clone(),
+                user_data_keys(&row.as_source(), series_source.as_ref()),
+            ))
+        })
+        .collect())
+}
+
+/// Only the identity fields, excluding large Data blobs and artwork metadata.
+type RawKeyRow = (
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<i64>,
+    Option<String>,
+    bool,
+);
+
+async fn key_rows(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, KeyRow>, ServiceError> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let json = serde_json::to_string(ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let raw: Vec<RawKeyRow> = sqlx::query_as(
+        r#"SELECT "Id", "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
                   "AlbumArtists", "SeriesId", "ExtraType", "RunTimeTicks",
                   "EpisodeTitle", "IsSeries"
-           FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
+           FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))"#,
     )
-    .bind(guid_to_db(item_id))
-    .fetch_optional(&mut *conn)
+    .bind(&json)
+    .fetch_all(&mut *conn)
     .await
     .map_err(db_err)?;
-
-    let Some((
+    let provider_ids: Vec<&str> = raw
+        .iter()
+        .filter_map(|row| {
+            let kind = kind_from_type_name(&row.1).unwrap_or(BaseItemKind::Folder);
+            uses_provider_ids(kind).then_some(row.0.as_str())
+        })
+        .collect();
+    let mut providers: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    if !provider_ids.is_empty() {
+        let json = serde_json::to_string(&provider_ids)
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        let values: Vec<(String, String, String)> = sqlx::query_as(
+            r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#,
+        )
+        .bind(json)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+        for (id, provider, value) in values {
+            providers.entry(id).or_default().push((provider, value));
+        }
+    }
+    let mut result = std::collections::HashMap::with_capacity(raw.len());
+    for (
+        id,
         type_name,
         index_number,
         parent_index_number,
@@ -154,63 +201,43 @@ async fn key_row(
         run_time_ticks,
         episode_title,
         is_series,
-    )) = row
-    else {
-        return Ok(None);
-    };
-
-    let kind = kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder);
-    // Most kinds never look at a provider id, and this runs on the busiest
-    // write path, so do not pay for the second query unless the derivation
-    // will read it. An Episode is deliberately in the "no" list: it takes
-    // its keys from the series and ignores its own providers entirely
-    // (`EnableDefaultVideoUserDataKeys => false`), and episodes are the
-    // bulk of a TV library.
-    let providers: Vec<(String, String)> = if uses_provider_ids(kind) {
-        sqlx::query_as(
-            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
-               WHERE "ItemId" = ?1"#,
-        )
-        .bind(guid_to_db(item_id))
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(db_err)?
-    } else {
-        Vec::new()
-    };
-    let provider = |want: &str| {
-        providers
-            .iter()
-            .find(|(id, _)| id.eq_ignore_ascii_case(want))
-            .map(|(_, v)| v.clone())
-    };
-
-    Ok(Some(KeyRow {
-        item_id,
-        kind,
-        tmdb: provider("Tmdb"),
-        imdb: provider("Imdb"),
-        tvdb: provider("Tvdb"),
-        custom: provider("Custom"),
-        musicbrainz_album: provider("MusicBrainzAlbum"),
-        musicbrainz_release_group: provider("MusicBrainzReleaseGroup"),
-        musicbrainz_artist: provider("MusicBrainzArtist"),
-        episode_title,
-        is_series: is_series.unwrap_or(false),
-        index_number,
-        parent_index_number,
-        name,
-        album,
-        // `AlbumArtists` is a delimited list; the C# key uses the first.
-        album_artist: album_artists
-            .as_deref()
-            .and_then(|a| a.split('|').next())
-            .filter(|a| !a.is_empty())
-            .map(str::to_owned),
-        extra_type: extra_type
-            .and_then(extra_type_name)
-            .map(std::borrow::ToOwned::to_owned),
-        run_time_ticks,
-        series_id: series_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
-    }))
+    ) in raw
+    {
+        let item_id = Uuid::parse_str(&id).map_err(|e| ServiceError::Backend(e.to_string()))?;
+        let provider = |want: &str| {
+            providers.get(&id).and_then(|values| {
+                values
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(want))
+                    .map(|(_, value)| value.clone())
+            })
+        };
+        let row = KeyRow {
+            item_id,
+            kind: kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder),
+            tmdb: provider("Tmdb"),
+            imdb: provider("Imdb"),
+            tvdb: provider("Tvdb"),
+            custom: provider("Custom"),
+            musicbrainz_album: provider("MusicBrainzAlbum"),
+            musicbrainz_release_group: provider("MusicBrainzReleaseGroup"),
+            musicbrainz_artist: provider("MusicBrainzArtist"),
+            episode_title,
+            is_series,
+            index_number,
+            parent_index_number,
+            name,
+            album,
+            album_artist: album_artists
+                .as_deref()
+                .and_then(|a| a.split('|').next())
+                .filter(|a| !a.is_empty())
+                .map(str::to_owned),
+            extra_type: extra_type.and_then(extra_type_name).map(str::to_owned),
+            run_time_ticks,
+            series_id: series_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
+        };
+        result.insert(id, row);
+    }
+    Ok(result)
 }
