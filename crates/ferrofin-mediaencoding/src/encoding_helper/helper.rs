@@ -991,38 +991,14 @@ fn is_nvenc_encoder(encoder: &str) -> bool {
 /// [`EncoderPreset`] does not derive `Ord`, so speed comparisons (`preset <
 /// ultrafast`) that the C# does on the backing `int` go through the discriminant
 /// mirrored from `MediaBrowser.Model.Entities.EncoderPreset`.
-fn preset_ordinal(preset: EncoderPreset) -> u8 {
-    match preset {
-        EncoderPreset::auto => 0,
-        EncoderPreset::placebo => 1,
-        EncoderPreset::veryslow => 2,
-        EncoderPreset::slower => 3,
-        EncoderPreset::slow => 4,
-        EncoderPreset::medium => 5,
-        EncoderPreset::fast => 6,
-        EncoderPreset::faster => 7,
-        EncoderPreset::veryfast => 8,
-        EncoderPreset::superfast => 9,
-        EncoderPreset::ultrafast => 10,
-    }
+fn preset_ordinal(preset: EncoderPreset) -> i32 {
+    preset.json_value()
 }
 
 /// The ffmpeg preset token for a preset. Port of
 /// `EncoderPreset.ToString().ToLowerInvariant()`.
-fn preset_name(preset: EncoderPreset) -> &'static str {
-    match preset {
-        EncoderPreset::auto => "auto",
-        EncoderPreset::placebo => "placebo",
-        EncoderPreset::veryslow => "veryslow",
-        EncoderPreset::slower => "slower",
-        EncoderPreset::slow => "slow",
-        EncoderPreset::medium => "medium",
-        EncoderPreset::fast => "fast",
-        EncoderPreset::faster => "faster",
-        EncoderPreset::veryfast => "veryfast",
-        EncoderPreset::superfast => "superfast",
-        EncoderPreset::ultrafast => "ultrafast",
-    }
+fn preset_name(preset: EncoderPreset) -> std::borrow::Cow<'static, str> {
+    preset.json_name()
 }
 
 /// Clamps a requested level to a codec-safe maximum. Port of

@@ -67,7 +67,7 @@ type Error = serde_json::Error;
 /// order (duplicates included), so a struct binding can resolve them the way
 /// `System.Text.Json` does.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Doc {
+pub(crate) enum Doc<const FOLD: bool = true> {
     /// `null`.
     Null,
     /// `true` / `false`.
@@ -77,12 +77,12 @@ pub(crate) enum Doc {
     /// A string.
     String(String),
     /// An array.
-    Array(Vec<Doc>),
+    Array(Vec<Self>),
     /// An object, members in document order.
-    Object(Vec<(String, Doc)>),
+    Object(Vec<(String, Self)>),
 }
 
-impl<'de> Deserialize<'de> for Doc {
+impl<'de, const FOLD: bool> Deserialize<'de> for Doc<FOLD> {
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = <&RawValue>::deserialize(deserializer)?;
         Self::from_raw(raw.get(), 0).map_err(de::Error::custom)
@@ -108,7 +108,7 @@ impl<'de> Visitor<'de> for RawMembers {
     }
 }
 
-impl Doc {
+impl<const FOLD: bool> Doc<FOLD> {
     /// Builds the ordered tree while retaining numeric lexemes. Raw values
     /// borrow the request only during parsing; the completed tree owns its data.
     fn from_raw(raw: &str, depth: usize) -> Result<Self, Error> {
@@ -179,8 +179,11 @@ impl Doc {
 /// ponytail: linear scans over `fields` per member, O(members × fields); fine at
 /// Jellyfin's DTO sizes (`BaseItemDto` ≈ 150). A per-struct name index is the
 /// upgrade if a body ever measures slow.
-fn fold_members(members: Vec<(String, Doc)>, fields: &[&'static str]) -> Vec<(String, Doc)> {
-    let mut out: Vec<(String, Doc)> = Vec::with_capacity(members.len());
+fn fold_members<const FOLD: bool>(
+    members: Vec<(String, Doc<FOLD>)>,
+    fields: &[&'static str],
+) -> Vec<(String, Doc<FOLD>)> {
+    let mut out: Vec<(String, Doc<FOLD>)> = Vec::with_capacity(members.len());
     // `out` position of each field already bound, indexed like `fields`.
     let mut bound: Vec<Option<usize>> = vec![None; fields.len()];
     for (name, value) in members {
@@ -224,7 +227,7 @@ fn fold_name(name: String, names: &[&'static str]) -> String {
 /// sorted `serde_json::Value` map did and as `System.Text.Json`'s dictionary
 /// converter (`dict[key] = value`) does. Names differing only in case stay
 /// apart: on the map path they are distinct dictionary keys.
-fn dedupe_exact(members: Vec<(String, Doc)>) -> Vec<(String, Doc)> {
+fn dedupe_exact<const FOLD: bool>(members: Vec<(String, Doc<FOLD>)>) -> Vec<(String, Doc<FOLD>)> {
     let unique = {
         let mut seen = HashSet::with_capacity(members.len());
         members.iter().all(|(name, _)| seen.insert(name.as_str()))
@@ -232,7 +235,7 @@ fn dedupe_exact(members: Vec<(String, Doc)>) -> Vec<(String, Doc)> {
     if unique {
         return members;
     }
-    let mut out: Vec<(String, Doc)> = Vec::with_capacity(members.len());
+    let mut out: Vec<(String, Doc<FOLD>)> = Vec::with_capacity(members.len());
     let mut at: HashMap<String, usize> = HashMap::with_capacity(members.len());
     for (name, value) in members {
         if let Some(&i) = at.get(&name) {
@@ -247,8 +250,8 @@ fn dedupe_exact(members: Vec<(String, Doc)>) -> Vec<(String, Doc)> {
 
 /// Feeds an object's members to `visitor` as a map, each value still a [`Doc`]
 /// so nested structs fold too. Callers dedupe first.
-fn visit_members<'de, V: Visitor<'de>>(
-    members: Vec<(String, Doc)>,
+fn visit_members<'de, V: Visitor<'de>, const FOLD: bool>(
+    members: Vec<(String, Doc<FOLD>)>,
     visitor: V,
 ) -> Result<V::Value, Error> {
     let mut map = MapDeserializer::new(members.into_iter().map(|(name, value)| (Key(name), value)));
@@ -257,7 +260,7 @@ fn visit_members<'de, V: Visitor<'de>>(
     Ok(value)
 }
 
-impl IntoDeserializer<'_, Error> for Doc {
+impl<const FOLD: bool> IntoDeserializer<'_, Error> for Doc<FOLD> {
     type Deserializer = Self;
 
     fn into_deserializer(self) -> Self {
@@ -282,7 +285,7 @@ macro_rules! read_number {
     )*};
 }
 
-impl<'de> de::Deserializer<'de> for Doc {
+impl<'de, const FOLD: bool> de::Deserializer<'de> for Doc<FOLD> {
     type Error = Error;
 
     read_number! {
@@ -343,8 +346,18 @@ impl<'de> de::Deserializer<'de> for Doc {
         visitor: V,
     ) -> Result<V::Value, Error> {
         match self {
-            Self::Object(members) => visit_members(fold_members(members, fields), visitor),
-            other => other.deserialize_any(visitor),
+            Self::Object(members) => visit_members(
+                if FOLD {
+                    fold_members(members, fields)
+                } else {
+                    dedupe_exact(members)
+                },
+                visitor,
+            ),
+            other => Err(de::Error::invalid_type(
+                other.unexpected(),
+                &"a JSON object",
+            )),
         }
     }
 
@@ -932,5 +945,31 @@ mod tests {
         let ids: Ids = bind(r#"{"ids":[null,"(00000000-0000-0000-0000-000000000001)"]}"#).unwrap();
         assert_eq!(ids.ids, [uuid::Uuid::nil(), uuid::Uuid::from_u128(1)]);
         assert!(bind::<Ids>(r#"{"ids":[""]}"#).is_err());
+    }
+    #[test]
+    fn exact_property_mode_shares_values_and_recurses_without_folding() {
+        #[derive(Debug, Default, Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Config {
+            count: i32,
+            name: String,
+            #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
+            optional: Option<bool>,
+            child: Option<Box<Config>>,
+            values: HashMap<String, String>,
+        }
+        let body = r#"{"Count":"3","count":"999","Name":1.50,"Optional":"","Child":{"Count":"4","count":"bad"},"Values":{"A":1E+02,"a":true}}"#;
+        let result: Config = crate::extract::deserialize_defaults(body).unwrap();
+        assert_eq!(result.count, 3);
+        assert_eq!(result.name, "1.50");
+        assert_eq!(result.optional, None);
+        assert_eq!(result.child.unwrap().count, 4);
+        assert_eq!(result.values["A"], "1E+02");
+        assert_eq!(result.values["a"], "true");
+        let duplicate: Config =
+            crate::extract::deserialize_defaults(r#"{"Count":1,"Count":"2"}"#).unwrap();
+        assert_eq!(duplicate.count, 2);
+        assert!(crate::extract::deserialize_defaults::<Config>(r#"{"Child":[]}"#).is_err());
+        assert!(crate::extract::deserialize_defaults::<Config>(r#"{"Optional":"true"}"#).is_err());
     }
 }

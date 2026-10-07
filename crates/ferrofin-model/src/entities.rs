@@ -367,19 +367,31 @@ pub enum CollectionTypeOptions {
 }
 
 /// Enum containing deinterlace methods. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum DeinterlaceMethod {
     /// YADIF.
     yadif = 0,
     /// BWDIF.
     bwdif = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DeinterlaceMethod, None, {
+        yadif => ("yadif", 0),
+        bwdif => ("bwdif", 1),
+    }
 }
 
 /// An algorithm to downmix surround sound to stereo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DownMixStereoAlgorithms {
     /// No special algorithm.
     None = 0,
@@ -391,12 +403,26 @@ pub enum DownMixStereoAlgorithms {
     Rfc7845 = 3,
     /// AC-4 standard algorithm with its default gain values (ETSI TS 103 190 6.2.17).
     Ac4 = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DownMixStereoAlgorithms, None, {
+        None => ("None", 0),
+        Dave750 => ("Dave750", 1),
+        NightmodeDialogue => ("NightmodeDialogue", 2),
+        Rfc7845 => ("Rfc7845", 3),
+        Ac4 => ("Ac4", 4),
+    }
 }
 
 /// Enum containing encoder presets. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum EncoderPreset {
     /// Auto preset.
     auto = 0,
@@ -420,12 +446,32 @@ pub enum EncoderPreset {
     superfast = 9,
     /// Ultrafast preset.
     ultrafast = 10,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    EncoderPreset, None, {
+        auto => ("auto", 0),
+        placebo => ("placebo", 1),
+        veryslow => ("veryslow", 2),
+        slower => ("slower", 3),
+        slow => ("slow", 4),
+        medium => ("medium", 5),
+        fast => ("fast", 6),
+        faster => ("faster", 7),
+        veryfast => ("veryfast", 8),
+        superfast => ("superfast", 9),
+        ultrafast => ("ultrafast", 10),
+    }
 }
 
 /// Enum containing hardware acceleration types. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum HardwareAccelerationType {
     /// Software acceleration.
     none = 0,
@@ -443,12 +489,29 @@ pub enum HardwareAccelerationType {
     videotoolbox = 6,
     /// Rockchip Media Process Platform (RKMPP).
     rkmpp = 7,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    HardwareAccelerationType, None, {
+        none => ("none", 0),
+        amf => ("amf", 1),
+        qsv => ("qsv", 2),
+        nvenc => ("nvenc", 3),
+        v4l2m2m => ("v4l2m2m", 4),
+        vaapi => ("vaapi", 5),
+        videotoolbox => ("videotoolbox", 6),
+        rkmpp => ("rkmpp", 7),
+    }
 }
 
 /// Enum containing tonemapping algorithms. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingAlgorithm {
     /// None.
     none = 0,
@@ -466,12 +529,29 @@ pub enum TonemappingAlgorithm {
     mobius = 6,
     /// BT2390.
     bt2390 = 7,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingAlgorithm, None, {
+        none => ("none", 0),
+        clip => ("clip", 1),
+        linear => ("linear", 2),
+        gamma => ("gamma", 3),
+        reinhard => ("reinhard", 4),
+        hable => ("hable", 5),
+        mobius => ("mobius", 6),
+        bt2390 => ("bt2390", 7),
+    }
 }
 
 /// Enum containing tonemapping modes. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingMode {
     /// Auto.
     auto = 0,
@@ -483,12 +563,26 @@ pub enum TonemappingMode {
     lum = 3,
     /// ITP.
     itp = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingMode, None, {
+        auto => ("auto", 0),
+        max => ("max", 1),
+        rgb => ("rgb", 2),
+        lum => ("lum", 3),
+        itp => ("itp", 4),
+    }
 }
 
 /// Enum containing tonemapping ranges. Lowercase for wire compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[allow(non_camel_case_types)]
+#[repr(i32)]
 pub enum TonemappingRange {
     /// Auto.
     auto = 0,
@@ -496,6 +590,17 @@ pub enum TonemappingRange {
     tv = 1,
     /// PC.
     pc = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TonemappingRange, None, {
+        auto => ("auto", 0),
+        tv => ("tv", 1),
+        pc => ("pc", 2),
+    }
 }
 
 /// Enum `UserDataSaveReason`.

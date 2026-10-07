@@ -239,34 +239,28 @@ fn bind<T: DeserializeOwned>(bytes: &[u8], want: TopLevel) -> Result<T, ProblemD
     }
 }
 
-/// Binds a REQUIRED `[FromBody] JsonDocument` body into `T`: any JSON kind (an
-/// object, an array or a scalar alike), member names matched **exactly**.
-///
-/// Case-sensitive on purpose. `JsonDocument` has no members for the MVC binder
-/// to fold; the controller deserializes it itself with `JsonDefaults.Options`,
-/// which never sets `PropertyNameCaseInsensitive` (v12.2
-/// `ConfigurationController.UpdateNamedConfiguration`, `.Deserialize(type,
-/// _serializerOptions)`). Measured on a live Jellyfin 12.2.0:
-/// `POST /System/Configuration/metadata` with
-/// `{"useFileCreationTimeForDateAdded":false}` ignores the member and saves the
-/// default (`true`). So this binds through a plain `serde_json::Value`, not a
-/// folding [`Doc`].
-///
-/// This reproduces only the member-name half of `JsonDefaults.Options`. Its
-/// value coercions (`JsonStringEnumConverter` reading enum names in any case,
-/// `AllowReadingFromString` numbers) are the separate
-/// `PLAN_JSON_NUMBER_HANDLING.md` work item, and apply here too: the typed
-/// readers of a stored named configuration still parse its values strictly.
+/// Binds a required JsonDocument without changing its property names or
+/// number spelling. Named-configuration handlers bind its raw text separately
+/// with JsonDefaults options after resolving the configuration's type.
 fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(ProblemDetails::empty_body());
     }
-    let value: serde_json::Value = serde_json::from_slice(bytes)
+    let raw: &serde_json::value::RawValue = serde_json::from_slice(bytes)
         .map_err(|e| ProblemDetails::validation("$", e.to_string()))?;
-    if value.is_null() {
+    if raw.get() == "null" {
         return Err(ProblemDetails::empty_body());
     }
-    serde_path_to_error::deserialize(value).map_err(member_error)
+    let mut reader = serde_json::Deserializer::from_str(raw.get());
+    serde_path_to_error::deserialize(&mut reader).map_err(member_error)
+}
+
+/// Uses Jellyfin's JsonDefaults value converters with exact property names.
+pub(crate) fn deserialize_defaults<T: DeserializeOwned>(
+    json: &str,
+) -> Result<T, serde_json::Error> {
+    let doc: Doc<false> = serde_json::from_str(json)?;
+    T::deserialize(doc)
 }
 
 /// Reads the body of a REQUIRED parameter.

@@ -967,7 +967,7 @@ impl Default for TunerHostInfo {
 
 /// Live TV options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LiveTvOptions {
     /// Gets or sets the number of guide days.

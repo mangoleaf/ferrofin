@@ -1,0 +1,60 @@
+[
+  {
+    "path": "/System/Configuration/encoding",
+    "body": "{\"EncodingThreadCount\":\"3\",\"DownMixAudioBoost\":\"1.5\",\"DownMixStereoAlgorithm\":1}",
+    "status": 204,
+    "expected": 204
+  },
+  {
+    "path": "/System/Configuration/encoding",
+    "body": "{\"EncodingThreadCount\":\" 3\"}",
+    "status": 500,
+    "expected": 500
+  },
+  {
+    "path": "/System/Configuration/encoding",
+    "body": "{\"EnableThrottling\":\"true\"}",
+    "status": 500,
+    "expected": 500
+  },
+  {
+    "path": "/System/Configuration/encoding",
+    "body": "[]",
+    "status": 500,
+    "expected": 500
+  },
+  {
+    "path": "/System/Configuration/metadata",
+    "body": "{\"useFileCreationTimeForDateAdded\":false}",
+    "status": 204,
+    "expected": 204,
+    "observed": {
+      "UseFileCreationTimeForDateAdded": true
+    }
+  },
+  {
+    "path": "/Users/{user_id}/Configuration",
+    "body": "{\"SubtitleMode\":\"3\",\"SubtitleLanguagePreference\":1.50}",
+    "status": 204,
+    "expected": 204,
+    "observed": {
+      "SubtitleMode": "None",
+      "SubtitleLanguagePreference": "1.50"
+    }
+  },
+  {
+    "path": "/Users/{user_id}/Configuration",
+    "body": "{\"PlayDefaultAudioTrack\":\"true\"}",
+    "status": 400,
+    "expected": 400
+  },
+  {
+    "path": "/Users/{user_id}/Configuration",
+    "body": "{\"SubtitleMode\":999}",
+    "status": 204,
+    "expected": 204,
+    "observed": {
+      "SubtitleMode": 999
+    }
+  }
+]

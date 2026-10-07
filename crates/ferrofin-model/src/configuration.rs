@@ -474,7 +474,7 @@ pub struct MetadataPluginSummary {
 
 /// XBMC (Kodi) NFO metadata options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct XbmcMetadataOptions {
     /// Gets or sets the user id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -938,7 +938,7 @@ impl Default for LibraryOptions {
 
 /// FFmpeg encoding options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct EncodingOptions {
     /// Gets or sets the thread count used for encoding.
