@@ -96,6 +96,21 @@ fn library(
     }
 }
 
+/// The untyped library's files: movies, a series by its `tvshow.nfo`, one by
+/// its season folder, a folder of plain videos (`season.nfo`), and audio.
+const MIXED: &[&str] = &[
+    "Film.mkv",
+    "Folder/Other Film (2001).mkv",
+    "Folder/pic.jpg",
+    "Show/tvshow.nfo",
+    "Show/Show S01E01.mkv",
+    "Anthology/Season 1/Anthology S01E01.mkv",
+    "Anthology/Season 1/Anthology S01E02.mkv",
+    "Notes/season.nfo",
+    "Notes/A.mkv",
+    "song.mp3",
+];
+
 /// One fixture tree per library type — each shape a resolver treats
 /// specially: movies with versions, extras (by suffix, folder and theme
 /// song) and disc rips; series with season folders, specials, multi-episode
@@ -188,7 +203,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         touch(&home, rel);
     }
     let mixed = root.join("mixed");
-    for rel in ["Film.mkv", "Folder/Other Film (2001).mkv", "Folder/pic.jpg"] {
+    for rel in MIXED {
         touch(&mixed, rel);
     }
     // A directory that differs from `tv` only in case: a library of its own

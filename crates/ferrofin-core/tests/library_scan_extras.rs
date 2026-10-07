@@ -44,6 +44,19 @@ impl Fixture {
         kind: CollectionTypeOptions,
         options: LibraryOptions,
     ) -> Self {
+        Self::build(files, Some(kind), options).await
+    }
+
+    /// A library with no collection type at all.
+    async fn untyped(files: &[&str]) -> Self {
+        Self::build(files, None, LibraryOptions::default()).await
+    }
+
+    async fn build(
+        files: &[&str],
+        kind: Option<CollectionTypeOptions>,
+        options: LibraryOptions,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         for file in files {
@@ -60,7 +73,7 @@ impl Fixture {
         );
         vf.add_virtual_folder(
             "Movies",
-            Some(kind),
+            kind,
             &LibraryOptions {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
@@ -1462,4 +1475,124 @@ async fn photo_rows_inside_a_disc_rip_are_pruned() {
         .await
         .unwrap();
     assert_eq!(left, 0);
+}
+
+/// A library without a collection type resolves as upstream's does
+/// (`SeriesResolver`, `SeasonResolver`, `MovieResolver`, `AudioResolver` with no
+/// collection type) — `mixed` and no type alike: a folder holding
+/// `tvshow.nfo` (matched exactly) or a season folder is an undated `Series`,
+/// named by the naming rules, whose episodes resolve one by one, so none is in
+/// a mixed folder, and whose audio is `Audio`; a movie in its own folder is a
+/// `Movie` owning its theme song; a folder holding `season.nfo` (or a
+/// differently cased `TVShow.nfo`) resolves its files as plain `Video`s, raw
+/// names, undated, sample names kept; an audio file is `Audio`; a theme song
+/// outside a movie is nothing.
+#[tokio::test]
+async fn an_untyped_library_resolves_series_movies_videos_and_audio() {
+    const FILES: &[&str] = &[
+        "Show/tvshow.nfo",
+        "Show/Show S01E01.mkv",
+        "Show/opening.mp3",
+        "Firefly (2002)/Season 1/Firefly S01E01.mkv",
+        "Firefly (2002)/Season 1/Firefly S01E02.mkv",
+        "Firefly (2002)/Season 1/score.flac",
+        "Heat (1995)/Heat.mkv",
+        "Heat (1995)/theme.mp3",
+        "Notes/season.nfo",
+        "Notes/Other Film (2001).mkv",
+        "Notes/A sample.mkv",
+        "Cased/TVShow.nfo",
+        "Cased/Cased S01E01.mkv",
+        "Root Movie (2001).mkv",
+        "song.mp3",
+        "theme.mp3",
+    ];
+    let typed = Fixture::with_type(FILES, CollectionTypeOptions::mixed).await;
+    let untyped = Fixture::untyped(FILES).await;
+    for f in [typed, untyped] {
+        f.scanner.scan_all().await.unwrap();
+        assert_untyped_library(&f).await;
+    }
+}
+
+async fn assert_untyped_library(f: &Fixture) {
+    let kind = |row: &BaseItemEntity| row.type_.rsplit('.').next().unwrap_or_default().to_owned();
+    let firefly = f.row("Firefly (2002)").await;
+    assert_eq!(kind(&firefly), "Series");
+    assert_eq!(
+        firefly.name.as_deref(),
+        Some("Firefly"),
+        "named by the naming rules"
+    );
+    assert_eq!(
+        firefly.production_year, None,
+        "an untyped series is undated"
+    );
+    let season = f.row("Firefly (2002)/Season 1").await;
+    assert_eq!(kind(&season), "Season");
+    assert_eq!(season.index_number, Some(1));
+    assert_eq!(season.parent_id.as_ref(), Some(&firefly.id));
+    for path in [
+        "Firefly (2002)/Season 1/Firefly S01E01.mkv",
+        "Firefly (2002)/Season 1/Firefly S01E02.mkv",
+    ] {
+        let episode = f.row(path).await;
+        assert_eq!(kind(&episode), "Episode", "{path}");
+        assert!(!episode.is_in_mixed_folder, "{path}");
+        assert_eq!(episode.parent_id.as_ref(), Some(&season.id));
+        assert_eq!(episode.series_id.as_ref(), Some(&firefly.id));
+        assert_eq!(
+            episode.series_presentation_unique_key,
+            firefly.presentation_unique_key
+        );
+        assert_eq!(episode.parent_index_number, Some(1));
+    }
+    let score = f.row("Firefly (2002)/Season 1/score.flac").await;
+    assert_eq!(kind(&score), "Audio");
+    assert_eq!(score.parent_id.as_ref(), Some(&season.id));
+
+    let show = f.row("Show").await;
+    assert_eq!(kind(&show), "Series");
+    let flat = f.row("Show/Show S01E01.mkv").await;
+    assert_eq!(kind(&flat), "Episode");
+    assert!(!flat.is_in_mixed_folder);
+    let opening = f.row("Show/opening.mp3").await;
+    assert_eq!(kind(&opening), "Audio");
+    assert_eq!(opening.parent_id.as_ref(), Some(&show.id));
+
+    let heat = f.row("Heat (1995)/Heat.mkv").await;
+    assert_eq!(kind(&heat), "Movie");
+    assert!(!heat.is_in_mixed_folder);
+    assert_eq!(
+        f.row("Heat (1995)/theme.mp3").await.owner_id.as_ref(),
+        Some(&heat.id)
+    );
+
+    for path in ["Notes/Other Film (2001).mkv", "Notes/A sample.mkv"] {
+        let video = f.row(path).await;
+        assert_eq!(kind(&video), "Video", "{path}");
+        assert!(video.is_in_mixed_folder, "{path}");
+        assert_eq!(video.production_year, None, "{path}");
+    }
+    assert_eq!(
+        f.row("Notes/Other Film (2001).mkv").await.name.as_deref(),
+        Some("Other Film (2001)"),
+        "the raw file name"
+    );
+    let cased = f.row("Cased/Cased S01E01.mkv").await;
+    assert_eq!(kind(&cased), "Video", "TVShow.nfo makes no series");
+
+    let root_movie = f.row("Root Movie (2001).mkv").await;
+    assert_eq!(kind(&root_movie), "Movie");
+    assert!(root_movie.is_in_mixed_folder);
+    let song = f.row("song.mp3").await;
+    assert_eq!(kind(&song), "Audio");
+    assert!(song.is_in_mixed_folder);
+    let at = f.media.join("theme.mp3").to_string_lossy().into_owned();
+    let themes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path = ?1")
+        .bind(at)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(themes, 0);
 }

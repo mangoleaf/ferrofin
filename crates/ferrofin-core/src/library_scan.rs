@@ -2327,6 +2327,12 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Whether the series being planned is in a tvshows library, where a
+    /// folder's episodes resolve together ([`note_episode_folder`]); under a
+    /// series of an untyped library each resolves on its own.
+    tv_library: std::cell::Cell<bool>,
+    /// Every configured library, which a series' presentation key reads.
+    key_folders: &'a [VirtualFolderInfo],
     /// Each photo album's ancestors as [`LibraryScanner::plan_photos`]
     /// planned them, which a video in the album extends.
     album_ancestors: std::cell::RefCell<HashMap<Uuid, Vec<Uuid>>>,
@@ -2368,6 +2374,8 @@ impl<'a> PlanCtx<'a> {
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
             album_ancestors: std::cell::RefCell::new(HashMap::new()),
+            tv_library: std::cell::Cell::new(false),
+            key_folders: &[],
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -2390,6 +2398,12 @@ impl<'a> PlanCtx<'a> {
             .flat_map(|f| f.locations.iter())
             .map(|l| trimmed_dir(l).to_owned())
             .collect();
+        self
+    }
+
+    /// This pass keying series by every library in `folders`.
+    fn with_key_folders(mut self, folders: &'a [VirtualFolderInfo]) -> Self {
+        self.key_folders = folders;
         self
     }
 
@@ -9360,8 +9374,8 @@ impl LibraryScanner {
         let naming = NamingOptions::new();
         let ctx = PlanCtx::new(&naming, scope)
             .with_locations(plan_folders)
+            .with_key_folders(key_folders)
             .with_date_added(date_added);
-        let folders = key_folders;
         let mut out = Vec::new();
         for folder in plan_folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -9374,7 +9388,7 @@ impl LibraryScanner {
                 }
                 match folder.collection_type {
                     Some(CollectionTypeOptions::tvshows) => {
-                        self.plan_tv(folders, location, cf, &ctx, &mut out);
+                        self.plan_tv(location, cf, &ctx, &mut out);
                     }
                     Some(CollectionTypeOptions::music) => {
                         self.plan_music(location, cf, &ctx, &mut out);
@@ -9410,6 +9424,7 @@ impl LibraryScanner {
                             collection_type: folder.collection_type,
                             photos,
                             album: None,
+                            per_file: false,
                         };
                         // Albums first: a clip in one hangs off it.
                         if photos {
@@ -9806,6 +9821,17 @@ impl LibraryScanner {
         let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
         let entries = self.list(dir, ctx);
+        // Without a collection type a folder `SeriesResolver` takes (priority
+        // Second, before `MovieResolver`) is a series, planned as a tvshows
+        // library's is.
+        let untyped = matches!(
+            walk.collection_type,
+            None | Some(CollectionTypeOptions::mixed)
+        );
+        if untyped && dir != root && !extras_folder && is_untyped_series(dir, &entries, naming) {
+            self.plan_untyped_series(dir, cf, ctx, out);
+            return;
+        }
         let (walk, album) = if walk.photos && dir != root && !extras_folder {
             self.enter_photo_album(dir, walk, ctx, movies_by_dir)
         } else {
@@ -9826,8 +9852,13 @@ impl LibraryScanner {
         let extras_folder_mixed = extras_folder && holds_several_files(dir, ctx);
         // A home-video library has no movie in its own folder
         // (`FindMovie`'s `isPhotosCollection`).
+        // Without a collection type a folder holding `tvshow.nfo` or
+        // `season.nfo` resolves its files one by one, as plain videos
+        // (`MovieResolver.cs:167-186,256-263`).
+        let per_file = untyped && holds_tv_nfo(&entries);
         let movie = (dir != root
             && !extras_folder
+            && !per_file
             && walk.collection_type != Some(CollectionTypeOptions::homevideos))
         .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
         .flatten();
@@ -9842,7 +9873,8 @@ impl LibraryScanner {
         // a top-level folder no rule ignores, is a movie upstream.
         let plain_folder = movie.is_none() && !extras_folder && dir != root;
         let extras_root = if plain_folder { dir } else { root };
-        let has_movie_files = has_movie_files(&entries, naming, extras_root);
+        // A per-file folder's `ResolveVideos` stopped before its sample filter.
+        let has_movie_files = !per_file && has_movie_files(&entries, naming, extras_root);
         // A video in its own folder is not in a mixed folder; one at the
         // library root always is (`IsTopParent`); elsewhere `ResolveVideos`
         // decides, and a lone video owns the folder's extras.
@@ -9859,6 +9891,22 @@ impl LibraryScanner {
         if let Some(owner) = movie.as_ref().or(lone.as_ref().filter(|_| album.is_none())) {
             self.register_extras_owner(dir, owner, kind, ctx, movies_by_dir);
         }
+        let folder = MovieFolder {
+            dir,
+            cf,
+            extras_root,
+            extras_folder,
+            extras_folder_mixed,
+            untyped,
+            own_folder,
+            has_movie_files,
+            mixed,
+            walk: MovieWalk {
+                kind: if per_file { BaseItemKind::Video } else { kind },
+                per_file,
+                ..walk
+            },
+        };
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && extras_folder {
                 // Below an extras folder nothing resolves; rows an older
@@ -9899,58 +9947,158 @@ impl LibraryScanner {
                 }
                 continue;
             }
-            // Upstream resolves EXTRAS first, over every file in the folder —
-            // `ExtraRuleResolver` has audio rules as well as video ones
-            // (`theme.mp3` is `ExtraRuleType.Filename` + `MediaType.Audio`), and
-            // `ExtraResolver.GetResolversForExtraType` sends a ThemeSong to the
-            // AudioResolver. Gating on `is_video_file` alone dropped every audio
-            // extra on the floor, so a movie's theme song was never ingested at
-            // all.
-            let is_video = video_resolver::is_video_file(&entry.path, naming);
-            let is_audio = is_audio_file(&entry.path, naming);
-            if !is_video && !is_audio {
-                continue;
-            }
-            let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
-                &entry.path,
-                naming,
-                Some(extras_root),
-            );
-            if let Some(extra_type) = extra.extra_type {
-                extras.push(MovieExtra {
-                    path: entry.path.clone(),
-                    extra_type,
-                    // False beside its owner (`LibraryManager.cs:3478`);
-                    // more than one file in its extras folder (`:3464`).
-                    in_mixed_folder: extras_folder_mixed,
-                });
-                continue;
-            }
-            // In an extras folder a file no extra rule takes is nothing
-            // (`FindExtras` drops it; the folder itself is never resolved).
-            if extras_folder {
-                ctx.excluded.borrow_mut().push(entry.path);
-                continue;
-            }
-            // An audio file that matched no extra rule is not a movie: a
-            // soundtrack sitting beside the film belongs to a music library.
-            if !is_video {
-                continue;
-            }
-            // A sample consumed by ResolveMultiple is neither another movie
-            // nor an extra unless an explicit extra rule matched above.
-            if has_movie_files && video_resolver::is_sample_filename(&entry.name) {
-                ctx.excluded.borrow_mut().push(entry.path);
-                continue;
-            }
-            if !ctx.scope.keeps(&entry.path) {
-                continue;
-            }
-            if let Some(mut planned) = self.movie_file(&entry, dir, own_folder, walk, cf, ctx) {
-                settle_mixed_folder(&mut planned.entity, mixed, dir, naming);
-                ctx.emit(out, planned);
-            }
+            self.plan_movie_walk_file(entry, &folder, ctx, out, extras);
         }
+    }
+
+    /// One file of a folder the movie walk lists: an extra, a movie (or
+    /// other video), an untyped library's audio, or nothing.
+    fn plan_movie_walk_file(
+        &self,
+        entry: FileSystemEntryInfo,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+        extras: &mut Vec<MovieExtra>,
+    ) {
+        let naming = ctx.naming;
+        // Upstream resolves EXTRAS first, over every file in the folder —
+        // `ExtraRuleResolver` has audio rules as well as video ones
+        // (`theme.mp3` is `ExtraRuleType.Filename` + `MediaType.Audio`), and
+        // `ExtraResolver.GetResolversForExtraType` sends a ThemeSong to the
+        // AudioResolver. Gating on `is_video_file` alone dropped every audio
+        // extra on the floor, so a movie's theme song was never ingested at
+        // all.
+        let is_video = video_resolver::is_video_file(&entry.path, naming);
+        let is_audio = is_audio_file(&entry.path, naming);
+        if !is_video && !is_audio {
+            return;
+        }
+        let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+            &entry.path,
+            naming,
+            Some(folder.extras_root),
+        );
+        if let Some(extra_type) = extra.extra_type {
+            extras.push(MovieExtra {
+                path: entry.path.clone(),
+                extra_type,
+                // False beside its owner (`LibraryManager.cs:3478`);
+                // more than one file in its extras folder (`:3464`).
+                in_mixed_folder: folder.extras_folder_mixed,
+            });
+            return;
+        }
+        // In an extras folder a file no extra rule takes is nothing
+        // (`FindExtras` drops it; the folder itself is never resolved).
+        if folder.extras_folder {
+            ctx.excluded.borrow_mut().push(entry.path);
+            return;
+        }
+        // An audio file that matched no extra rule is not a movie: a
+        // soundtrack sitting beside the film belongs to a music library.
+        // Without a collection type it is `Audio` (`AudioResolver.cs:94-134`),
+        // unless it sits in a movie's own folder, which nothing walks.
+        if !is_video {
+            if folder.untyped && !folder.own_folder {
+                let cf = folder.cf;
+                self.plan_untyped_audio(&entry, cf, (cf, vec![cf]), ctx, out);
+            }
+            return;
+        }
+        // A sample consumed by ResolveMultiple is neither another movie
+        // nor an extra unless an explicit extra rule matched above.
+        if folder.has_movie_files && video_resolver::is_sample_filename(&entry.name) {
+            ctx.excluded.borrow_mut().push(entry.path);
+            return;
+        }
+        if !ctx.scope.keeps(&entry.path) {
+            return;
+        }
+        if let Some(mut planned) = self.movie_file(
+            &entry,
+            folder.dir,
+            folder.own_folder,
+            folder.walk,
+            folder.cf,
+            ctx,
+        ) {
+            settle_mixed_folder(&mut planned.entity, folder.mixed, folder.dir, naming);
+            ctx.emit(out, planned);
+        }
+    }
+
+    /// A series in an untyped library: named by the naming rules' series
+    /// resolver, undated (`SeriesResolver.cs:82-110` sets only `Name`), and
+    /// planned below as a tvshows library's series is — except that its
+    /// episodes resolve one by one (`MovieResolver` takes no folder under a
+    /// series, `MovieResolver.cs:219-222`), so none is in a mixed folder.
+    fn plan_untyped_series(&self, dir: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
+        let name = series_resolver::resolve(ctx.naming, dir)
+            .name
+            .unwrap_or_else(|| folder_name(dir).unwrap_or_else(|| file_stem(dir)));
+        let Some((series_id, mut series)) =
+            self.base_item(ctx, BaseItemKind::Series, cf, cf, name.clone(), dir, true)
+        else {
+            return;
+        };
+        let series_key = self.series_key_for(ctx.key_folders, &series, &[], &[]);
+        series.presentation_unique_key = Some(series_key.clone());
+        ctx.emit(
+            out,
+            Planned {
+                id: series_id,
+                entity: series,
+                ancestors: vec![cf],
+            },
+        );
+        self.plan_series(dir, cf, series_id, &name, &series_key, ctx, out);
+    }
+
+    /// An audio file in an untyped library: `Audio`, in a mixed folder
+    /// (`AudioResolver.cs:94-134`) — never a cue sheet or a theme song, nor
+    /// a file whose extension is a video one too. `parent` is what it hangs
+    /// off and the ancestors: the library, or a series or season.
+    fn plan_untyped_audio(
+        &self,
+        entry: &FileSystemEntryInfo,
+        cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        if !is_audio_file(&entry.path, ctx.naming)
+            || video_resolver::is_video_file(&entry.path, ctx.naming)
+        {
+            return;
+        }
+        if is_cue_sheet(&entry.path)
+            || is_theme_song(&entry.path, ctx.naming)
+            || !ctx.scope.keeps(&entry.path)
+        {
+            return;
+        }
+        let Some((id, mut entity)) = self.base_item(
+            ctx,
+            BaseItemKind::Audio,
+            cf,
+            parent,
+            file_stem(&entry.path),
+            &entry.path,
+            false,
+        ) else {
+            return;
+        };
+        entity.media_type = Some("Audio".to_owned());
+        entity.is_in_mixed_folder = true;
+        ctx.emit(
+            out,
+            Planned {
+                id,
+                entity,
+                ancestors,
+            },
+        );
     }
 
     /// The walk below `dir` when it is a folder of a home-video library the
@@ -10129,11 +10277,19 @@ impl LibraryScanner {
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
     /// are `Season`s and the videos beneath them `Episode`s.
     ///
-    /// `folders` is every configured library, not just the one being planned:
-    /// a series' presentation key names EVERY library whose locations hold its
-    /// folder (`LibraryManager.GetCollectionFolders`), which is how one show
-    /// shared by two libraries lists once.
-    fn plan_tv(
+    /// The series keys read `ctx.key_folders`, every configured library, not
+    /// just the one being planned: a series' presentation key names EVERY
+    /// library whose locations hold its folder
+    /// (`LibraryManager.GetCollectionFolders`), which is how one show shared
+    /// by two libraries lists once.
+    fn plan_tv(&self, location: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
+        ctx.tv_library.set(true);
+        self.plan_tv_location(ctx.key_folders, location, cf, ctx, out);
+        ctx.tv_library.set(false);
+    }
+
+    /// [`Self::plan_tv`]'s walk of one location.
+    fn plan_tv_location(
         &self,
         folders: &[VirtualFolderInfo],
         location: &str,
@@ -10354,6 +10510,10 @@ impl LibraryScanner {
                 && ctx.scope.keeps(&entry.path)
             {
                 loose.push(entry.path);
+            } else if !ctx.tv_library.get() {
+                // An untyped library resolves a series' children with no
+                // collection type, so its audio is `Audio` (`Folder.cs:920-925`).
+                self.plan_untyped_audio(&entry, cf, (series_id, vec![cf, series_id]), ctx, out);
             }
         }
         // A scoped plan groups only its own loose episodes: each one's virtual
@@ -10536,6 +10696,13 @@ impl LibraryScanner {
                     ctx,
                     out,
                 );
+            } else if !ctx.tv_library.get() {
+                // As in the series folder: an untyped library's audio.
+                let parent = match season {
+                    Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
+                    None => (series_id, vec![cf, series_id]),
+                };
+                self.plan_untyped_audio(&entry, cf, parent, ctx, out);
             }
         }
     }
@@ -12002,6 +12169,40 @@ fn settle_mixed_folder(
     }
 }
 
+/// `SeriesResolver.Resolve` for a library without a collection type
+/// (`SeriesResolver.cs:82-110`, `IsSeriesFolder` `:117-150`): a folder below
+/// the top is a series when it holds `tvshow.nfo`, or a child folder the
+/// season-path parser numbers (no special aliases, no bare numbers).
+fn is_untyped_series(dir: &str, entries: &[FileSystemEntryInfo], naming: &NamingOptions) -> bool {
+    // `ContainsFileSystemEntryByName` compares ordinally (`ItemResolveArgs.cs:186-211`).
+    if entries.iter().any(|e| e.name == "tvshow.nfo") {
+        return true;
+    }
+    entries.iter().any(|entry| {
+        if entry.type_ == FileSystemEntryType::Directory {
+            season_path_parser::parse(&entry.path, Some(dir), false, false)
+                .season_number
+                .is_some()
+        } else {
+            // Upstream tests the FOLDER's path for a video extension here,
+            // not the child's (`SeriesResolver.cs:136`), so this arm all but
+            // never holds; ported as written (owner decision D3, 2026-10-07).
+            video_resolver::is_video_file(dir, naming)
+                && EpisodeResolver::new(naming)
+                    .resolve(&entry.path, false, Some(true), Some(false), None, false)
+                    .is_some_and(|info| info.episode_number.is_some())
+        }
+    })
+}
+
+/// Whether `entries` hold `tvshow.nfo` or `season.nfo`, which in a library
+/// without a collection type stop `ResolveVideos` (`MovieResolver.cs:256-263`).
+fn holds_tv_nfo(entries: &[FileSystemEntryInfo]) -> bool {
+    entries.iter().any(|e| {
+        e.name.eq_ignore_ascii_case("tvshow.nfo") || e.name.eq_ignore_ascii_case("season.nfo")
+    })
+}
+
 /// What the movie walk resolves in a library: the item kind of a video,
 /// and the library's collection type.
 #[derive(Debug, Clone, Copy)]
@@ -12016,6 +12217,9 @@ struct MovieWalk {
     /// The nearest enclosing `PhotoAlbum`, which a video below it hangs off,
     /// as [`LibraryScanner::plan_photos`] parents its photos.
     album: Option<Uuid>,
+    /// The folder's files resolve one by one as plain videos (an untyped
+    /// library's folder holding `tvshow.nfo` or `season.nfo`).
+    per_file: bool,
 }
 
 impl MovieWalk {
@@ -12045,6 +12249,10 @@ fn movie_walk_resolution(
     walk: MovieWalk,
 ) -> (bool, bool, Option<ferrofin_model::data::CollectionType>) {
     use ferrofin_model::data::CollectionType;
+    if walk.per_file {
+        // `ResolveVideo<Video>(args, false)` (`MovieResolver.cs:167-186`).
+        return (false, false, None);
+    }
     match walk.collection_type {
         Some(CollectionTypeOptions::musicvideos) => {
             (true, false, Some(CollectionType::musicvideos))
@@ -12072,11 +12280,7 @@ fn lone_video(
     walk: MovieWalk,
 ) -> Option<ferrofin_naming::video::VideoInfo> {
     let (multi_editions, parse_name, collection_type) = movie_walk_resolution(walk);
-    if collection_type.is_none()
-        && entries.iter().any(|e| {
-            e.name.eq_ignore_ascii_case("tvshow.nfo") || e.name.eq_ignore_ascii_case("season.nfo")
-        })
-    {
+    if collection_type.is_none() && holds_tv_nfo(entries) {
         return None;
     }
     let mut resolved = resolved_videos(
@@ -12096,6 +12300,9 @@ fn lone_video(
 /// `IsInMixedFolder = Count > 1` — a series or season folder is never a
 /// top parent.
 fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx<'_>) {
+    if !ctx.tv_library.get() {
+        return;
+    }
     let mixed = resolved_videos(
         entries,
         dir,
@@ -12141,6 +12348,34 @@ fn resolved_videos(
         Some(dir),
         collection_type,
     )
+}
+
+/// What the movie walk knows of a folder while it plans the folder's files.
+#[allow(clippy::struct_excessive_bools)] // independent facts of one folder, not a state machine
+struct MovieFolder<'a> {
+    /// The folder.
+    dir: &'a str,
+    /// The library's collection folder.
+    cf: Uuid,
+    /// The library root the folder's files are classified under: the folder
+    /// itself for a plain folder, else the library's.
+    extras_root: &'a str,
+    /// Whether it is an extras folder below the top level.
+    extras_folder: bool,
+    /// Whether it is such a folder holding more than one file.
+    extras_folder_mixed: bool,
+    /// Whether the library has no collection type, or `mixed` (which
+    /// upstream parses to none).
+    untyped: bool,
+    /// Whether it is a movie's own folder.
+    own_folder: bool,
+    /// Whether `ResolveMultiple` finds a title in it (and so consumes its
+    /// sample files).
+    has_movie_files: bool,
+    /// The `IsInMixedFolder` of a video planned in it.
+    mixed: bool,
+    /// The walk its files are resolved in.
+    walk: MovieWalk,
 }
 
 /// An extra the movie walk found, before its owner is known.
