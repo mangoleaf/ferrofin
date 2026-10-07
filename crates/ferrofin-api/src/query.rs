@@ -58,6 +58,10 @@ impl<T: QueryParameters> Query<T> {
     ///
     /// # Errors
     /// Returns axum's query rejection when a value cannot bind to `T`.
+    ///
+    /// # Panics
+    /// Panics if a DTO declares a field name that is invalid in a query URI.
+    /// API contract field names are ASCII identifiers.
     pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
         let fields = fields::<T>();
         let normalized = normalize(uri.query().unwrap_or_default(), fields, T::COLLECTIONS);
@@ -73,11 +77,14 @@ impl<T: QueryParameters> Query<T> {
     }
 }
 
-impl<T: QueryParameters, S: Send + Sync> FromRequestParts<S> for Query<T> {
+impl<T: QueryParameters + Send, S: Send + Sync> FromRequestParts<S> for Query<T> {
     type Rejection = QueryRejection;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Self::try_from_uri(&parts.uri)
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::try_from_uri(&parts.uri))
     }
 }
 
