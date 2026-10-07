@@ -95,10 +95,33 @@ def run(binary, baseline, samples):
                 check("valid first UUID", f"/Items?userId={user_id}&userId=bad", 200)
                 check("invalid first UUID", f"/Items?userId=bad&userId={user_id}", 400)
                 check("empty first nullable UUID", f"/Items?userId=&userId={user_id}", 200)
-                check("query authentication", f"/System/Info?ApiKey={token}&ApiKey=bad", 200,
+                # AuthorizationContext reads StringValues directly, bypassing
+                # scalar model binding: nonempty token values are comma-joined.
+                check("query authentication", f"/System/Info?ApiKey={token}", 200,
                       authenticated=False)
+                for label, query in [
+                    ("duplicate credentials", f"ApiKey={token}&ApiKey=bad"),
+                    ("reversed credentials", f"ApiKey=bad&ApiKey={token}"),
+                    ("case variant credentials", f"apikey={token}&APIKEY=bad"),
+                    ("encoded duplicate credentials", f"%41piKey={token}&ApiKey=bad"),
+                    ("identical duplicate credentials", f"ApiKey={token}&ApiKey={token}"),
+                ]:
+                    check(label, f"/System/Info?{query}", 401, authenticated=False)
+                check("encoded credential", f"/System/Info?%41piKey={token}", 200,
+                      authenticated=False)
+                check("empty credential before valid", f"/System/Info?ApiKey=&APIKEY={token}",
+                      200, authenticated=False)
+                check("bare credential before valid", f"/System/Info?ApiKey&ApiKey={token}",
+                      200, authenticated=False)
+                check("only empty credentials", "/System/Info?ApiKey=&APIKEY", 401,
+                      authenticated=False)
+                check("header token retains precedence", "/System/Info?ApiKey=bad&ApiKey=worse", 200)
                 check("collections", "/Items?includeItemTypes=Movie&INCLUDEITEMTYPES=Series"
                       "&genres=News%2CSport&GENRES=Drama", 200)
+                # Normalization adds '=' to bare fields. At the URI length
+                # limit this must reject the empty bool normally, never panic.
+                prefix = "/Items?RECURSIVE&userId&parentId&searchTerm&nameStartsWith&fields&unknown="
+                check("URI size limit", prefix + "x" * (65_534 - len(prefix)), 400)
 
                 timings = []
                 if samples:

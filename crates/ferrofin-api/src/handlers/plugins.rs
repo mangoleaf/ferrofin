@@ -716,8 +716,11 @@ async fn plugin_web_request(
         .unwrap_or_default()
         .split('&')
         .filter(|pair| {
-            let key = pair.split('=').next().unwrap_or_default();
-            !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
+            form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| {
+                    !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
+                })
         })
         .collect::<Vec<_>>()
         .join("&");
