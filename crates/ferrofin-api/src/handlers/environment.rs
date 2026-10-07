@@ -254,3 +254,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_default_directory_browser),
         )
 }
+crate::query::query_parameters! {
+    DirectoryContentsQuery {} => [("get", "/Environment/DirectoryContents")];
+    ParentPathQuery {} => [("get", "/Environment/NetworkShares")];
+}

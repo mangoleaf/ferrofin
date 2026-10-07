@@ -45,6 +45,8 @@ tokio = { workspace = true }
 futures-core.workspace = true
 async-trait.workspace = true
 serde.workspace = true
+serde_urlencoded.workspace = true
+form_urlencoded.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true
@@ -63,7 +65,6 @@ ferrofin-api = { path = ".", features = ["test-util"] }
 async-trait.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-serde_urlencoded.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The /socket tests drive a real WebSocket against a real listener — the
 # push path cannot be exercised through `tower::oneshot`.

@@ -166,3 +166,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_trickplay_tile_image),
         )
 }
+crate::query::query_parameters! {
+    TrickplayQuery {} => [("get", "/Videos/{itemId}/Trickplay/{width}/tiles.m3u8"), ("get", "/Videos/{itemId}/Trickplay/{width}/{index}.jpg")];
+}

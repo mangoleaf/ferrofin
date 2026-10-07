@@ -715,8 +715,11 @@ async fn plugin_web_request(
         .unwrap_or_default()
         .split('&')
         .filter(|pair| {
-            let key = pair.split('=').next().unwrap_or_default();
-            !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
+            form_urlencoded::parse(pair.as_bytes())
+                .next()
+                .is_none_or(|(key, _)| {
+                    !key.eq_ignore_ascii_case("api_key") && !key.eq_ignore_ascii_case("apikey")
+                })
         })
         .collect::<Vec<_>>()
         .join("&");
@@ -802,6 +805,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Plugins/{pluginId}/web/{*path}",
             axum::routing::any(plugin_web_request),
         )
+}
+
+crate::query::query_parameters! {
+    PackageInfoQuery {} => [("get", "/Packages/{name}")];
+    InstallPackageQuery {} => [("post", "/Packages/Installed/{name}")];
 }
 
 #[cfg(test)]

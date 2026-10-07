@@ -461,3 +461,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(apply_search_criteria),
         )
 }
+crate::query::query_parameters! {
+    ApplyQuery {} => [("post", "/Items/RemoteSearch/Apply/{itemId}")];
+}

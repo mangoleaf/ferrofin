@@ -1383,6 +1383,50 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/Items/{itemId}/Ancestors", get(get_ancestors))
 }
+crate::query::query_parameters! {
+    ItemsQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "imageTypes" => ',',
+        "fields" => ',',
+        "ids" => ',',
+        "excludeItemIds" => ',',
+        "genres" => '|',
+        "tags" => '|',
+        "officialRatings" => '|',
+        "years" => ',',
+        "genreIds" => ',',
+        "studioIds" => ',',
+        "personIds" => ',',
+        "artistIds" => ',',
+        "excludeArtistIds" => ',',
+        "albumArtistIds" => ',',
+        "contributingArtistIds" => ',',
+        "albumIds" => ',',
+        "videoTypes" => ',',
+        "locationTypes" => ',',
+        "excludeLocationTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items")];
+    ItemQuery {} => [("get", "/Items/{itemId}")];
+    DeleteItemsQuery {
+        "ids" => ',',
+    } => [("delete", "/Items")];
+    CountsQuery {} => [("get", "/Items/Counts")];
+    AncestorsQuery {} => [("get", "/Items/{itemId}/Ancestors")];
+    ResumeQuery {
+        "mediaTypes" => ',',
+        "excludeItemTypes" => ',',
+        "includeItemTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/UserItems/Resume")];
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

@@ -798,8 +798,8 @@ async fn canonicalize_path_case(
     // Path: re-case to the registered route where recognized (asset/unknown paths
     // return `None` and keep their significant case). Query keys are left as
     // sent: `ferrofin_api::extract::Query` binds them to each handler's members
-    // ignoring case, as ASP.NET does, and the handlers that read the raw query
-    // match keys ignoring case themselves.
+    // ignoring case, as ASP.NET does. Preserve the original query for
+    // authentication, streaming URLs and plugin forwarding.
     let path = request.uri().path();
     if let Some(new_path) = ferrofin_api::routes::canonicalize_path(path)
         && new_path != path

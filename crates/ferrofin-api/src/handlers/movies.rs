@@ -119,3 +119,8 @@ async fn get_movie_recommendations(
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Movies/Recommendations", get(get_movie_recommendations))
 }
+crate::query::query_parameters! {
+    RecommendationsQuery {
+        "fields" => ',',
+    } => [("get", "/Movies/Recommendations")];
+}

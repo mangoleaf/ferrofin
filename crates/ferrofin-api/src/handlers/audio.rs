@@ -130,3 +130,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_universal_audio_stream).head(get_universal_audio_stream),
         )
 }
+crate::query::query_parameters! {
+    UniversalAudioUserQuery {} => [("get", "/Audio/{itemId}/universal")];
+}

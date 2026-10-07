@@ -304,6 +304,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/Download", get(get_download))
 }
 
+crate::query::query_parameters! {
+    AdditionalPartsQuery {} => [("get", "/Videos/{itemId}/AdditionalParts")];
+    MergeVersionsQuery {
+        "ids" => ',',
+    } => [("post", "/Videos/MergeVersions")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::attachment_disposition;

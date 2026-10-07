@@ -596,6 +596,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Backup/Restore", post(restore_backup))
 }
 
+crate::query::query_parameters! {
+    ManifestQuery {} => [("get", "/Backup/Manifest")];
+}
+
 #[cfg(test)]
 mod tests {
     /// Serializes the backup tests against each other.

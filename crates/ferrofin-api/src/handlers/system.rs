@@ -318,6 +318,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/System/Endpoint", get(get_endpoint_info))
 }
 
+crate::query::query_parameters! {
+    LogFileQuery {} => [("get", "/System/Logs/Log")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_in_local_network;

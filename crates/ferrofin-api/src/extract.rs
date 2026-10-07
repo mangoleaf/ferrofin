@@ -45,6 +45,8 @@
 //! content type and the document's shape are the contract; the diagnostic text
 //! is Ferrofin's own, and no parity probe compares it.
 
+pub use crate::query::{Query, QueryParameters, QueryRejection};
+
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
@@ -55,12 +57,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use self::doc::Doc;
-pub use self::query::Query;
 
 #[cfg(test)]
 pub(crate) mod contract_numbers;
 mod doc;
-mod query;
 
 /// The `type` URI ASP.NET stamps on a validation failure.
 const VALIDATION_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.1";

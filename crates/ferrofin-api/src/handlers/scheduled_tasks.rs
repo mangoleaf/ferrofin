@@ -197,3 +197,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(update_task_triggers),
         )
 }
+crate::query::query_parameters! {
+    GetTasksQuery {} => [("get", "/ScheduledTasks")];
+}

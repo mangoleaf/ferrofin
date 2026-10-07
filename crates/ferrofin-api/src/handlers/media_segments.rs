@@ -127,3 +127,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(erase_provider_segments),
         )
 }
+crate::query::query_parameters! {
+    ProviderEraseQuery {} => [];
+}

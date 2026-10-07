@@ -264,3 +264,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/Providers/Lyrics/{lyricId}", get(get_remote_lyrics))
 }
+crate::query::query_parameters! {
+    UploadLyricsQuery {} => [("post", "/Audio/{itemId}/Lyrics")];
+}

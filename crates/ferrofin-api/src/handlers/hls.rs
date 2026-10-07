@@ -667,13 +667,19 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/universal")];
+    StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
+    HlsQueryPub {} => [("get", "/Audio/{itemId}/universal")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Binds `query` the way the routes do, through the shared [`Query`]
     /// extractor (keys matched ignoring case).
-    fn parse(query: &str) -> Result<HlsQuery, axum::extract::rejection::QueryRejection> {
+    fn parse(query: &str) -> Result<HlsQuery, crate::extract::QueryRejection> {
         let uri = format!("/Videos/x/master.m3u8?{query}")
             .parse()
             .expect("uri");

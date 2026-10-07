@@ -190,3 +190,16 @@ async fn get_trailers(
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Trailers", get(get_trailers))
 }
+crate::query::query_parameters! {
+    TrailersQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "ids" => ',',
+        "excludeItemIds" => ',',
+        "locationTypes" => ',',
+        "excludeLocationTypes" => ',',
+    } => [("get", "/Trailers")];
+}

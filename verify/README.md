@@ -203,3 +203,35 @@ prints initial/unchanged scan wall times and library notification counts without
 requiring the baseline to exhibit the corrected behavior. Use three alternating
 baseline/fixed runs and compare medians; these local debug-build measurements are
 not production throughput estimates.
+
+## Query binding
+
+`python3 verify/query-binding.py BINARY` boots a disposable server and checks
+first-value binding for repeated scalar query parameters over authenticated HTTP.
+The 27 probes cover exact and mixed-case repetitions, encoded names and commas,
+integers, booleans, nullable UUIDs, collection requests, query-token authentication
+and a query at the URI size limit.
+Authentication follows Jellyfin's direct `StringValues` read: repeated nonempty
+tokens are comma-joined, and empty values are skipped. Its behavior is separate
+from scalar controller binding; tests cover encoded keys and header precedence.
+API tests additionally inspect the bound collection values and the raw HLS query.
+The script creates its own administrator, cleans up its data and prints no tokens.
+
+Mixed collection syntax remains an open parity issue: Ferrofin's existing string
+representation flattens `genres=A%7CB&genres=C` into `A`, `B`, `C`. Jellyfin's
+[pipe collection binder](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/ModelBinders/PipeDelimitedCollectionModelBinder.cs)
+keeps `A|B`, `C` when the key is repeated. The comma collection binder has the
+same distinction. The collection probes verify ordinary repetitions and existing
+Ferrofin parsing; they do not establish parity for that mixed syntax.
+
+Add `--baseline` to report the old binary's failures without stopping. Add
+`--samples 1000` to measure warmed, sequential keep-alive `GET /Sessions` requests
+with the same canonical scalar query and response on both versions. Run three
+alternating baseline/fixed pairs on a quiet machine and compare the medians and
+their range. These local HTTP timings include the Python client's overhead and
+are not a replacement for the loaded media-library benchmarks in `bench/`.
+
+```bash
+python3 verify/query-binding.py /path/to/before --baseline --samples 1000
+python3 verify/query-binding.py target/debug/ferrofin-server --samples 1000
+```

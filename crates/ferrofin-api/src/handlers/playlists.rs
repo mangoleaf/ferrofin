@@ -696,3 +696,18 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .delete(remove_user_from_playlist),
         )
 }
+crate::query::query_parameters! {
+    CreatePlaylistQuery {
+        "ids" => ',',
+    } => [("post", "/Playlists")];
+    GetPlaylistItemsQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Playlists/{playlistId}/Items")];
+    AddItemsQuery {
+        "ids" => ',',
+    } => [("post", "/Playlists/{playlistId}/Items")];
+    RemoveItemsQuery {
+        "entryIds" => ',',
+    } => [("delete", "/Playlists/{playlistId}/Items")];
+}

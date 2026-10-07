@@ -230,3 +230,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(download_remote_image),
         )
 }
+crate::query::query_parameters! {
+    RemoteImagesQuery {} => [("get", "/Items/{itemId}/RemoteImages")];
+    DownloadQuery {} => [("post", "/Items/{itemId}/RemoteImages/Download")];
+}

@@ -710,6 +710,12 @@ async fn validate_open_subtitles_login(
     Ok(StatusCode::OK)
 }
 
+crate::query::query_parameters! {
+    RemoteSearchQuery {} => [("get", "/Items/{itemId}/RemoteSearch/Subtitles/{language}")];
+    SubtitleStreamQuery {} => [("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}"), ("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}")];
+    SubtitlePlaylistQuery {} => [("get", "/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8")];
+}
+
 #[cfg(test)]
 mod tests {
     use crate::handlers::image_upload::decode_base64;
