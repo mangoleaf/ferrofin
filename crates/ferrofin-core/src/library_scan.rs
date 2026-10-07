@@ -5906,8 +5906,8 @@ impl LibraryScanner {
     ///
     /// `BaseItems.ParentId` cascades, but a retired row is parentless AND
     /// childless — every album now hangs off the resolved artist — so nothing
-    /// cascades with it. Its user data is lost, which is the honest cost: the
-    /// row it was keyed to no longer exists.
+    /// cascades with it. Its user data is detached and the scan's recovery
+    /// pass can attach it to the surviving artist through the artist keys.
     async fn retire_accessed_by_name_artists(&self) -> Result<(), ServiceError> {
         // A row counts as folder-backed when it carries a TopParentId — that is
         // exactly what `scope_to_user_libraries` (`AddUserToQuery`) requires and
@@ -6185,7 +6185,8 @@ impl LibraryScanner {
     /// exist. The walk is the source of truth: any stored row (movie, series,
     /// season, episode, album, track) keyed to a scanned library that this
     /// scan did not re-plan is gone from disk — deleted, renamed, or moved —
-    /// and is removed. FK cascades clear its streams/chapters/images/user data;
+    /// and is removed. User data is detached for recovery; FK cascades clear
+    /// its streams, chapters, and images;
     /// by-name rows (genres, studios, artists, people) carry no `TopParentId`
     /// and are untouched. No-op without an item repository.
     ///

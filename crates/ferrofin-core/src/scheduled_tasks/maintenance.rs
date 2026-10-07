@@ -1428,8 +1428,8 @@ mod tests {
         let live_item = Uuid::from_u128(0x11);
         seed_item(&db, live_item, BaseItemKind::Movie).await;
 
-        // Three rows: attached (kept), detached-and-expired (removed),
-        // detached-but-recent (kept).
+        // Attached history never expires, even with a legacy timestamp.
+        // Detached rows expire only with an old, non-null retention date.
         let insert = |item_id: String, key: &str, retention: Option<String>| {
             let db = db.clone();
             let user_id = user.id.clone();
@@ -1450,7 +1450,13 @@ mod tests {
                 .expect("insert userdata");
             }
         };
-        insert(guid_to_db(live_item), "live", None).await;
+        insert(
+            guid_to_db(live_item),
+            "live",
+            Some(datetime_to_db(Utc::now() - chrono::Duration::days(120))),
+        )
+        .await;
+        insert(PLACEHOLDER_ID.to_owned(), "undated", None).await;
         insert(
             PLACEHOLDER_ID.to_owned(),
             "expired",
@@ -1474,6 +1480,9 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .expect("query");
-        assert_eq!(remaining, vec!["live".to_owned(), "recent".to_owned()]);
+        assert_eq!(
+            remaining,
+            vec!["live".to_owned(), "recent".to_owned(), "undated".to_owned()]
+        );
     }
 }

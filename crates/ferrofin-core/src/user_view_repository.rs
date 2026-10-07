@@ -805,6 +805,7 @@ mod tests {
         seed_child(&db, channel_b, BaseItemKind::LiveTvChannel, stale_id).await;
         seed_child(&db, program, BaseItemKind::LiveTvProgram, stale_id).await;
         seed_display_settings(&db, user, stale_id, "emby").await;
+        crate::test_support::seed_user_data(&db, user, stale_id, true, None).await;
         let movies = Uuid::from_u128(0x1111);
         let music = Uuid::from_u128(0x2222);
         seed_preference(
@@ -831,6 +832,18 @@ mod tests {
             .await
             .expect("consolidate");
         assert_eq!(dropped, 1);
+
+        let (history_item, history_key): (String, String) = sqlx::query_as(
+            r#"SELECT "ItemId", "CustomDataKey" FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (history_item, history_key),
+            (guid_to_db(canonical), canonical.to_string())
+        );
 
         // The canonical view is a copy of the promoted source.
         let view = fetch_item_opt(&db, canonical)

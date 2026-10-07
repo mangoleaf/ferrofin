@@ -1011,6 +1011,77 @@ mod tests {
         })
     }
 
+    #[rstest::rstest]
+    #[case::movie(BaseItemKind::Movie)]
+    #[case::episode(BaseItemKind::Episode)]
+    #[case::season(BaseItemKind::Season)]
+    #[case::audio(BaseItemKind::Audio)]
+    #[case::audiobook(BaseItemKind::AudioBook)]
+    #[tokio::test]
+    async fn retention_moves_agree_in_individual_and_batch_dtos(#[case] kind: BaseItemKind) {
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        for item in [old, new] {
+            seed_item(&db, item, kind).await;
+            let mut row = fetch_item(&db, item).await;
+            row.path = Some(format!("/media/{item}/file"));
+            row.name = Some("Track".to_owned());
+            row.album = Some("Album".to_owned());
+            row.album_artists = Some("Artist|Other".to_owned());
+            row.index_number = Some(2);
+            row.parent_index_number = Some(1);
+            if matches!(kind, BaseItemKind::Episode | BaseItemKind::Season) {
+                let series = Uuid::new_v4();
+                seed_item(&db, series, BaseItemKind::Series).await;
+                seed_provider_id(&db, series, "Tvdb", "retained-series").await;
+                row.series_id = Some(guid_to_db(series));
+            }
+            persistence.save_items(&[row]).await.unwrap();
+            if kind == BaseItemKind::Movie {
+                seed_provider_id(&db, item, "Tmdb", "retained-movie").await;
+            }
+        }
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        manager
+            .save_user_data(
+                user,
+                old,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    is_favorite: Some(true),
+                    play_count: Some(4),
+                    playback_position_ticks: Some(1_234_567),
+                    likes: Some(false),
+                    rating: Some(8.5),
+                    ..UpdateUserItemDataDto::default()
+                },
+            )
+            .await
+            .unwrap();
+        persistence.delete_items(&[old]).await.unwrap();
+        persistence.reattach_all_user_data().await.unwrap();
+        let one = manager.get_user_data_dto(new, user).await.unwrap().unwrap();
+        let batch = manager.get_user_data_dtos(&[new], user).await.unwrap();
+        assert_eq!(one, batch[&new]);
+        assert!(one.played && one.is_favorite);
+        assert_eq!(one.play_count, 4);
+        assert_eq!(one.playback_position_ticks, 1_234_567);
+        // A subsequent write keeps every restored alias in sync.
+        manager.mark_unplayed(user, new).await.unwrap();
+        let next = manager.get_user_data_dto(new, user).await.unwrap().unwrap();
+        assert!(!next.played);
+        assert!(next.is_favorite);
+        assert_eq!(
+            next,
+            manager.get_user_data_dtos(&[new], user).await.unwrap()[&new]
+        );
+    }
+
     /// Seeds a movie with a runtime, for the play-state heuristics.
     async fn seed_movie_with_runtime(db: &Database, id: Uuid, runtime_ticks: i64) {
         seed_item(db, id, BaseItemKind::Movie).await;

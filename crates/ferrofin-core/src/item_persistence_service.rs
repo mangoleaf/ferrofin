@@ -3006,24 +3006,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn reattach_all_user_data(&self) -> Result<(), ServiceError> {
+        // Snapshot candidate keys once, rather than reading all detached
+        // history again for each page. Actual state is read under the writer
+        // transaction below. History detached concurrently after this snapshot
+        // is picked up by the next scan or its destination's refresh.
+        let mut retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+            r#"SELECT DISTINCT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#,
+        )
+        .bind(PLACEHOLDER_ID)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?
+        .into_iter()
+        .collect();
         let mut after = String::new();
-        loop {
+        while !retained.is_empty() {
             // Release the single writer between pages. No metadata read here
             // can become stale before its recovery write in this transaction.
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-            let retained: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
-                r#"SELECT DISTINCT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#,
-            )
-            .bind(PLACEHOLDER_ID)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(db_err)?
-            .into_iter()
-            .collect();
-            if retained.is_empty() {
-                tx.commit().await.map_err(db_err)?;
-                break;
-            }
             let ids: Vec<String> = sqlx::query_scalar(
                 r#"SELECT "Id" FROM "BaseItems" WHERE "Id" > ?1 AND "Id" <> ?2
                    ORDER BY "Id" LIMIT 500"#,
@@ -3043,6 +3043,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             {
                 if keys.iter().any(|key| retained.contains(key)) {
                     reattach_user_data_keys(&mut tx, &id, &keys).await?;
+                    for key in &keys {
+                        retained.remove(key);
+                    }
                 }
             }
             tx.commit().await.map_err(db_err)?;
@@ -4115,6 +4118,120 @@ mod tests {
     }
 
     // Regressions from the retention investigation, now enabled by default.
+    #[rstest::rstest]
+    #[case::latest_play(Some("2026-09-01"), Some("2026-09-02"), 9, 1, 1)]
+    #[case::play_count(Some("2026-09-01"), Some("2026-09-01"), 1, 9, 1)]
+    #[case::stable_tie(None, None, 1, 1, 0)]
+    #[case::dated_over_undated(None, Some("2026-09-01"), 9, 1, 1)]
+    #[tokio::test]
+    async fn retention_duplicate_priority_is_deterministic(
+        #[case] first_date: Option<&str>,
+        #[case] second_date: Option<&str>,
+        #[case] first_count: i32,
+        #[case] second_count: i32,
+        #[case] expected: i64,
+    ) {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        let ids = [Uuid::from_u128(100), Uuid::from_u128(101)];
+        for (index, (date, count)) in [(first_date, first_count), (second_date, second_count)]
+            .into_iter()
+            .enumerate()
+        {
+            seed_item(&db, ids[index], BaseItemKind::Movie).await;
+            crate::test_support::seed_user_data(&db, user, ids[index], true, None).await;
+            sqlx::query(
+                r#"UPDATE "UserData" SET "CustomDataKey" = 'shared',
+                "LastPlayedDate" = ?2, "PlayCount" = ?3, "PlaybackPositionTicks" = ?4
+                WHERE "ItemId" = ?1"#,
+            )
+            .bind(guid_to_db(ids[index]))
+            .bind(date.map(|date| format!("{date} 00:00:00.0000000")))
+            .bind(count)
+            .bind(i64::try_from(index).unwrap())
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        FerrofinItemPersistenceService::new(db.clone())
+            .delete_items(&[ids[1], ids[0]])
+            .await
+            .unwrap();
+        let kept: i64 = sqlx::query_scalar(r#"SELECT "PlaybackPositionTicks" FROM "UserData""#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(kept, expected);
+    }
+
+    #[tokio::test]
+    async fn retention_reattach_failure_rolls_back_and_can_be_retried() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.delete_items(&[item]).await.unwrap();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        sqlx::query(
+            r#"CREATE TRIGGER FailRetainedDelete BEFORE DELETE ON "UserData"
+            BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let row = crate::test_support::fetch_item(&db, item).await;
+        assert!(svc.reattach_user_data(&row).await.is_err());
+        let owners: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![super::PLACEHOLDER_ID]);
+        sqlx::query("DROP TRIGGER FailRetainedDelete")
+            .execute(db.writer())
+            .await
+            .unwrap();
+        // Simultaneous retries serialize and consume the snapshot only once.
+        let (first, second) =
+            tokio::join!(svc.reattach_user_data(&row), svc.reattach_user_data(&row));
+        first.unwrap();
+        second.unwrap();
+        let owners: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![guid_to_db(item)]);
+    }
+
+    #[tokio::test]
+    async fn retention_recovery_crosses_pages_and_leaves_unknown_keys_detached() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        let restored = Uuid::from_u128(900);
+        for i in 100..=900 {
+            seed_item(&db, Uuid::from_u128(i), BaseItemKind::Movie).await;
+        }
+        crate::test_support::seed_user_data(&db, user, restored, true, None).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.delete_items(&[restored]).await.unwrap();
+        seed_item(&db, restored, BaseItemKind::Movie).await;
+        crate::test_support::seed_user_data(&db, user, Uuid::from_u128(1), false, None).await;
+        svc.reattach_all_user_data().await.unwrap();
+        let owners: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData" ORDER BY "ItemId""#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            owners,
+            vec![super::PLACEHOLDER_ID.to_owned(), guid_to_db(restored)]
+        );
+    }
+
     #[tokio::test]
     async fn retention_container_rekey_moves_history_and_its_guid_key() {
         let db = test_db().await;
@@ -8302,6 +8419,11 @@ mod tests {
         let db = test_db().await;
         let (series, season, episode, extra, season_extra, playlist, boxset) =
             season_with_links(&db).await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        for item in [series, season, episode, extra, season_extra] {
+            crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        }
         let svc = FerrofinItemPersistenceService::new(db.clone());
         let (rows, links) = rows_and_links(&db).await;
         assert_eq!(links, 2);
@@ -8315,6 +8437,14 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(deleted, expected, "the closure, and no id without a row");
         assert_eq!(rows_and_links(&db).await, (rows - 4, 0));
+        let detached: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1"#,
+        )
+        .bind(super::PLACEHOLDER_ID)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(detached, 4, "the entire deletion closure retains history");
         for kept in [series, playlist, boxset] {
             assert!(
                 crate::test_support::fetch_item_opt(&db, kept)
@@ -8381,7 +8511,17 @@ mod tests {
     #[tokio::test]
     async fn a_failure_mid_delete_rolls_the_whole_delete_back() {
         let db = test_db().await;
-        let (_, season, _, extra, _, _, _) = season_with_links(&db).await;
+        let (_, season, episode, extra, _, _, _) = season_with_links(&db).await;
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user(&db, user).await;
+        for item in [season, episode, extra] {
+            crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        }
+        let history_before: Vec<ferrofin_db::entities::playback::UserDataEntity> =
+            sqlx::query_as(r#"SELECT * FROM "UserData" ORDER BY "ItemId""#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
         let before = rows_and_links(&db).await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"CREATE TRIGGER "TestFailDelete" BEFORE DELETE ON "BaseItems"
@@ -8394,5 +8534,11 @@ mod tests {
         let svc = FerrofinItemPersistenceService::new(db.clone());
         assert!(svc.delete_items(&[season]).await.is_err());
         assert_eq!(rows_and_links(&db).await, before, "nothing half-deleted");
+        let history_after: Vec<ferrofin_db::entities::playback::UserDataEntity> =
+            sqlx::query_as(r#"SELECT * FROM "UserData" ORDER BY "ItemId""#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(history_after, history_before, "detachment rolls back too");
     }
 }

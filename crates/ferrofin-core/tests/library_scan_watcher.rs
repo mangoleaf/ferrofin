@@ -1217,7 +1217,7 @@ async fn retention_survives_file_moves_and_restores(#[case] order: u8) {
     .await
     .unwrap();
     assert!(!rows.is_empty(), "history recovered at {new_id}");
-    assert!(rows.iter().all(|row| *row == (true, true, 1234567, None)));
+    assert!(rows.iter().all(|row| *row == (true, true, 1_234_567, None)));
     let before = user_data(&fx.db).await;
     fx.scanner.scan_all().await.unwrap();
     assert_eq!(

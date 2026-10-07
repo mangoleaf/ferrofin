@@ -533,6 +533,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// any of them: upstream's `ItemPersistenceService.DeleteItem`. Either
     /// all of it is deleted or none of it. Returns the ids deleted (ids with
     /// no stored row, and the placeholder row, are not).
+    /// User data is retained on the placeholder, with a retention timestamp,
+    /// before any media row is deleted; duplicate history keys are resolved
+    /// across the whole deletion set.
     ///
     /// # Errors
     ///
@@ -1221,7 +1224,9 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
-    /// Reattaches user-data rows to the correct item after an id change.
+    /// Restores retained history using the item's persisted user-data keys.
+    /// Existing destination state wins for each user; restored rows have no
+    /// retention timestamp. Safe to repeat after an id or metadata change.
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError>;
 
     /// Recovers detached history against persisted identities after pruning.

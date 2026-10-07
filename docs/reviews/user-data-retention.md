@@ -1,162 +1,146 @@
-# User data retention investigation
+# User data retention
 
-Confirmed at Ferrofin `60f29281`: removing a media item destroys its associated
-watch history, resume position, favorites, ratings, and stream preferences.
-Moving a file normally changes its item ID, so pruning the old path loses the
-same data. The database already contains the structures needed for Jellyfin's
-retention model; the missing pieces are in the deletion and recovery lifecycle.
+Ferrofin now retains user data when media is removed and recovers it when a
+matching item is discovered again. This preserves watched state, play count,
+resume position, favorites, likes, ratings, last-played dates, and audio and
+subtitle selections. The change uses the existing Jellyfin-compatible schema.
 
-This investigation is on `investigate/user-data-retention`. Production behavior
-is unchanged. The accompanying ignored regression tests express the required
-behavior and can be run explicitly while implementing the fix.
+Implemented on `investigate/user-data-retention`, starting from `60f29281`, in
+the seven requested work items. The original investigation reproduced three
+failures: deletion erased history, reattachment matched the wrong key, and
+reattachment left the retention timestamp set. Those regressions now run by
+default and pass.
 
-## Where history is lost
+## Deletion and recovery
 
-1. `LibraryScanner::prune_deleted` calls `delete_items` for missing paths,
-   including deleted, renamed, and moved files
-   (`crates/ferrofin-core/src/library_scan.rs:6184–6320`). Unreachable library
-   roots and failed directory listings have separate guards against pruning.
-   The library manager's explicit deletion path also calls this service
-   (`library_manager.rs:1574–1620`).
-2. `FerrofinItemPersistenceService::delete_items` computes the full deletion
-   set, including descendants and owned extras, removes container links, then
-   deletes `BaseItems` in one transaction. It never detaches `UserData`
-   (`item_persistence_service.rs:1425–1530`).
-3. `UserData.ItemId` references `BaseItems.Id` with `ON DELETE CASCADE`
-   (`crates/ferrofin-db/migrations/0001_initial.sql:619–637`). Runtime connections
-   enable foreign keys (`crates/ferrofin-db/src/database.rs:113`). Consequently
-   every user-data key on each deleted item is physically removed. Provider
-   keys do not protect those rows from the cascade.
+`FerrofinItemPersistenceService::delete_items` preserves history for the entire
+removal set, including descendants and owned extras, before deleting media
+rows. History moves to the existing placeholder item
+`00000000-0000-0000-0000-000000000001` with a retention timestamp. Detachment,
+link cleanup, and item deletion share a transaction; a failure rolls back all
+three.
 
-Item IDs derive from the item kind and filesystem path
-(`item_type_lookup.rs:93–118`). Restoring the original path can restore the ID,
-but it cannot restore deleted rows. A new path generally produces a different
-ID; recovery then needs a stable user-data key such as a movie provider ID or
-the series key plus season and episode numbers.
+When several removed items share a `(UserId, CustomDataKey)`, the latest
+`LastPlayedDate` wins, followed by the largest `PlayCount`, then the lowest item
+ID for a deterministic tie. Ranking spans the full deletion set, including
+sets larger than the SQL bind chunk. Incoming history replaces a conflicting
+placeholder snapshot, following Jellyfin's deletion policy.
 
-## Recovery is also incomplete
+Playback writes and recovery share `user_data_key_repository`. Recovery uses
+all current identity keys, including movie provider IDs, series-derived season
+and episode keys, and audio metadata. It restores every affected user's data
+and clears the retention timestamp. The selected snapshot is written under
+all current keys, including the destination GUID, keeping individual and batch
+DTO reads consistent.
 
-`reattach_user_data` exists at `item_persistence_service.rs:2812–2832`, but:
+Existing destination state wins for each user as a whole, including explicit
+unplayed or unfavorite changes. Recovery consumes matching retained snapshots
+without overwriting that state. For a user without destination data, the
+matching destination GUID key takes priority, followed by the normal derived
+key order. Recovery and snapshot consumption are transactional and safe to
+retry.
 
-- It matches only `PresentationUniqueKey`, instead of the complete set returned
-  by the existing `user_data_keys` derivation. A normal movie presentation key
-  is a GUID without hyphens, whereas its GUID user-data key has hyphens. Movie
-  provider IDs and episode keys also need their own derivation.
-- It updates `ItemId` without clearing `RetentionDate`.
-- A repository-wide search finds no production call to it. Apart from its
-  implementation, the existing references are a trait declaration and a mock.
-  Neither scanner saves nor provider refreshes invoke it.
+## Scan and refresh integration
 
-Both individual reads and batch DTO reads restrict history to the current
-`ItemId` (`user_data_manager.rs:167–169,1085–1087`). Therefore even retained rows
-imported from Jellyfin remain invisible until they are properly reattached.
-The current timestamp bug alone does not make attached rows expire: cleanup
-also requires the placeholder item ID. Clearing it still matters for parity
-and a correct lifecycle.
+Recovery runs after scanner and provider refreshes persist item metadata and
+provider IDs. A second recovery pass runs after scan pruning and closing passes,
+before the final library-change notification. It also runs on unchanged scans,
+so a prior interrupted recovery can be retried.
 
-## Jellyfin behavior
+The completion pass considers persisted destinations outside the current scan
+scope. This handles both a new path saved before its old path is pruned and a
+destination indexed by an earlier watcher event. Music's closing pass has
+finished before this recovery, so its final metadata is available for keys.
 
-The local Jellyfin 12.0 checkout at
-`6c073e19ddf604b2369c638716164fdab4c952dc` implements this sequence in
-[ItemPersistenceService.cs](https://github.com/jellyfin/jellyfin/blob/6c073e19ddf604b2369c638716164fdab4c952dc/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs#L50):
+The pass processes 500 items per transaction, releases the writer between
+pages, and loads identity fields, providers, and series context in batches.
+Large item data blobs are not loaded. Only matching candidates perform recovery
+writes. Candidate retained keys are read once per pass and consumed keys are
+removed from that set. With no detached history, the pass exits before reading
+library items. History detached concurrently after the candidate snapshot is
+eligible for recovery on the next scan or destination refresh.
 
-1. Before deletion, move user data onto the placeholder item
-   `00000000-0000-0000-0000-000000000001` and set its retention timestamp.
-2. Resolve collisions on `(UserId, CustomDataKey)` before changing `ItemId`.
-   For duplicate keys within the deletion batch, prefer the latest
-   `LastPlayedDate`, then the largest `PlayCount`. Incoming history replaces
-   conflicting placeholder rows.
-3. Reattach placeholder rows matching any `GetUserDataKeys()` entry and clear
-   their retention timestamps. This operates across users, retaining user
-   identity on each row.
+## Other deletion paths
 
-[MetadataService.SaveItemAsync](https://github.com/jellyfin/jellyfin/blob/6c073e19ddf604b2369c638716164fdab4c952dc/MediaBrowser.Providers/Manager/MetadataService.cs#L308)
-invokes recovery after saving on the first refresh. The local 10.11.8 checkout
-also detaches and reattaches history in `BaseItemRepository.cs:108–139,773–805`.
+| Path | History handling |
+| --- | --- |
+| Library pruning and explicit item deletion | Detach the whole deletion set through the persistence service. |
+| Orphaned extras during adoption | Use the same service, including descendants and owned extras. |
+| Duplicate paths during adoption | Move the duplicate's history to its known survivor; detach history on descendants that will cascade-delete. |
+| Container ID migration and localized view consolidation | Move history directly to the known survivor and translate its GUID key; preserve existing destination state. |
+| Orphaned person cleanup | Use the same retention-aware persistence deletion. |
+| Existing person and artist merges | Already transfer user data before deleting duplicate items; their existing conflict handling is retained. |
+| Schema table rebuilds | Already disable foreign-key cascades during migration and validate integrity afterward. Historical migrations are unchanged. |
+
+User deletion still removes that user's history. The user-data cleanup task
+still deletes expired detached history and leaves attached, recent, and undated
+rows alone.
+
+## Jellyfin compatibility and limits
+
+The pinned Jellyfin 12.0 implementation at
+`6c073e19ddf604b2369c638716164fdab4c952dc` detaches history before deletion and
+recovers it using `GetUserDataKeys()` in
+[ItemPersistenceService.cs](https://github.com/jellyfin/jellyfin/blob/6c073e19ddf604b2369c638716164fdab4c952dc/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs).
+Ferrofin additionally normalizes a recovered snapshot across current keys and
+explicitly preserves existing destination state to make retries and read
+selection predictable.
 
 Jellyfin's
-[CleanupUserDataTask](https://github.com/jellyfin/jellyfin/blob/6c073e19ddf604b2369c638716164fdab4c952dc/Emby.Server.Implementations/ScheduledTasks/Tasks/CleanupUserDataTask.cs#L49)
-deletes placeholder rows older than 90 days when the task runs; it declares no
-default triggers. This is retention with later cleanup, not a promise of
-permanent history. Recovery also requires a matching key: moving unidentified
-media whose only key is its path-derived GUID cannot guarantee recovery.
+[CleanupUserDataTask](https://github.com/jellyfin/jellyfin/blob/6c073e19ddf604b2369c638716164fdab4c952dc/Emby.Server.Implementations/ScheduledTasks/Tasks/CleanupUserDataTask.cs)
+removes detached rows older than 90 days when executed and declares no default
+triggers. Ferrofin retains its existing 90-day cleanup behavior; this change
+adds no cleanup schedule.
 
-Ferrofin already has the placeholder, `CustomDataKey`, `RetentionDate`, key
-derivation, and a 90-day cleanup task
-(`scheduled_tasks/maintenance.rs:635–688`). No schema change appears necessary
-for the basic retention lifecycle. The cleanup task's comments currently claim
-that deletion parks rows on the placeholder, which the implementation does not do.
+Recovery requires a shared identity key. A file restored at its original path
+can match its GUID; an unidentified file moved to a new path cannot be matched
+reliably if its only key was the old path-derived GUID. Unmatched history stays
+detached until eligible cleanup. History already deleted before this fix needs
+a pre-loss backup or another external source.
 
-## Recommended implementation
+## Commits
 
-Preserve user data for the entire deletion set before deleting any `BaseItems`,
-within the existing transaction. Resolve duplicate keys across the whole set,
-including across SQL chunks, and existing placeholder conflicts. Retain the
-foreign keys and normal media-row deletion semantics.
+1. `8cadd5b9` — detach history before deleting media.
+2. `e270ee29` — resolve detached-history key collisions.
+3. `48fbde73` — share stored user-data key resolution.
+4. `59ac214d` — restore history using shared identity keys.
+5. `1b4ac837` — recover history after refresh and scan pruning.
+6. `a38aa772` — preserve history in repairs and orphan cleanup.
+7. Final validation commit — extend regression coverage and document behavior.
 
-Share the full key resolution currently used by `FerrofinUserDataManager`
-with recovery. This includes provider IDs, series context for episodes and
-seasons, and audio metadata. Reattach all matching users' rows, clear retention,
-and define how to handle a key already attached to the destination so a retry
-or concurrent playback write cannot cause a uniqueness failure or silently
-overwrite newer state.
+## Regression coverage
 
-Wire recovery after item metadata and provider IDs are persisted. Also handle
-same-scan moves: the scanner processes new items before `prune_after_scan`
-(`library_scan.rs:4290–4333`), so the old history may not be detached during
-the new item's first save. A recovery pass after pruning, including already
-saved destinations affected by the deletion, is one approach. Cover watcher
-events arriving in either order and retries after interrupted scans.
+The tests exercise deletion and original-path restoration; movie, episode,
+season, audio, and audiobook identities; every persisted history field;
+multiple users; destination-state conflicts; repeated and concurrent recovery;
+deterministic duplicate selection; deletion batches and recovery scans larger
+than one page; unknown keys; transaction rollback; container and view ID
+migration; orphan cleanup; and expired versus attached retention data.
 
-Audit direct production `BaseItems` deletions outside the persistence service,
-including adoption repairs, for whether they should preserve user data. Keep
-intentional user deletion and retention cleanup distinct from media removal.
-Already cascaded-away rows need a pre-loss backup or other external history
-source; adding retention cannot reconstruct them.
+`library_scan_watcher` uses actual temporary files and directories with a local
+metadata fixture. Its four retention cases cover a move in one scan,
+destination-first and source-first scans, and restoring the original path.
+All four pass, including an unchanged rescan after recovery.
 
-## Reproduction and acceptance checks
+The shared user-data tests compare individual-item and batch DTOs after
+recovery and after a subsequent state change. These are service-level DTO
+checks, not browser interaction tests.
 
-The three `retention_investigation` cases in
-`crates/ferrofin-core/src/item_persistence_service.rs` use the real persistence
-service and a migrated in-memory database. They are ignored by default because
-this branch investigates the defect without implementing its fix. Run:
+Provider refresh tests record the provider IDs visible at the recovery call,
+verifying that recovery follows metadata and identity writes. The scan tracing
+smoke test waits for span export separately from queue idleness, since SQLite's
+worker thread can briefly retain a span after returning a query result.
+
+Validation commands use `RUSTC_WRAPPER=` and the shared `CARGO_TARGET_DIR`:
 
 ```sh
-cargo test -p ferrofin-core --lib --offline retention_investigation -- --ignored
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --offline -- -D warnings
+cargo nextest run --workspace --offline --no-fail-fast
+cargo test --workspace --doc --offline
 ```
 
-They require history to survive deletion on the placeholder, GUID-keyed history
-to recover despite a different presentation key, and successful reattachment
-to clear the retention timestamp. The timestamp case deliberately aligns the
-presentation key with the history key to isolate that defect.
-
-Explicit execution produced three failures, each at its intended assertion:
-
-| Case | Observed result |
-| --- | --- |
-| Delete preserves history | Zero rows remained; one retained row was expected. |
-| Reattach by user-data key | The row still belonged to the placeholder. |
-| Clear retention timestamp | The row moved to the item but retained its timestamp. |
-
-Compilation succeeded and the three cases completed in 0.13 seconds. Their
-failure is the reproduction result, not a passing retention implementation.
-The normal persistence test run passed all 62 existing tests, with the three
-new cases ignored. `cargo fmt --all --check` and `git diff --check` passed.
-
-The implementation should additionally cover:
-
-- Delete and restore at the same path, preserving every user-data field for
-  multiple users.
-- Movie moves with provider IDs, episode and season moves with series keys,
-  and audio moves with stable metadata; verify both individual and batch DTOs.
-- A destination discovered before the source is pruned, including watcher
-  scans and an already indexed destination.
-- Duplicate provider keys within a deletion batch, preexisting placeholder
-  conflicts, existing destination history, and repeats after recovery.
-- Descendants and owned extras, deletion sets larger than the bind chunk,
-  and rollback on a failure after detachment.
-- Recovery from a Jellyfin-created detached row, expired placeholder cleanup,
-  and preservation of attached or unexpired rows.
-
-These service-level regressions do not constitute an end-to-end filesystem or
-HTTP reproduction. The scan and API reachability above comes from source tracing.
+Final validation passed: 7,570 workspace tests, with 5 skipped; all 3 doctests;
+formatting; and Clippy across all targets and features with warnings denied.
+The full workspace run includes the SQL boundary check and scan tracing smoke
+test. The work was validated without a database schema migration.
