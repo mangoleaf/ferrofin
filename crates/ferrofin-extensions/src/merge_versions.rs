@@ -1833,7 +1833,7 @@ mod tests {
             )),
             plugins,
             fingerprinter: None,
-            cache_dir: std::env::temp_dir(),
+            cache_dir: std::env::temp_dir().into(),
             merge_versions: svc,
         };
 

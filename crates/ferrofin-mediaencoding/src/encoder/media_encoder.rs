@@ -55,7 +55,7 @@ pub struct MediaEncoderConfig {
     /// `TempDirectory`). Empty (the `Default`) falls back to the OS temp dir.
     /// Must be a server-writable path: media directories are often read-only
     /// mounts, so extraction output can never go next to the input file.
-    pub temp_dir: std::path::PathBuf,
+    pub temp_dir: ferrofin_util::directory_path::DirectoryPath,
     /// The probed ffmpeg version, which decides `-fps_mode` versus the
     /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
     /// takes `-vsync`, which every supported build still understands.
@@ -359,10 +359,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
     ) -> Result<String, ServiceError> {
         // Match video extraction: media libraries may be mounted read-only.
         // The scanner copies the result into the item's data/metadata directory.
-        let temp_dir = if self.config.temp_dir.as_os_str().is_empty() {
+        let configured_temp = self.config.temp_dir.resolve();
+        let temp_dir = if configured_temp.as_os_str().is_empty() {
             std::env::temp_dir()
         } else {
-            self.config.temp_dir.clone()
+            configured_temp
         };
         ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
             MediaEncodingError::process(format!(
@@ -440,10 +441,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         // `Guid.NewGuid()` shape), never next to the input: media is routinely
         // a read-only mount, and even a writable library must not accumulate
         // extraction droppings beside the files.
-        let temp_dir = if self.config.temp_dir.as_os_str().is_empty() {
+        let configured_temp = self.config.temp_dir.resolve();
+        let temp_dir = if configured_temp.as_os_str().is_empty() {
             std::env::temp_dir()
         } else {
-            self.config.temp_dir.clone()
+            configured_temp
         };
         // Creating the directory is not enough to know ffmpeg can write into
         // it: a pre-existing one owned by another user (a container that once
@@ -732,7 +734,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: temp_dir.clone(),
+                temp_dir: temp_dir.clone().into(),
                 ..MediaEncoderConfig::default()
             },
         );
@@ -786,7 +788,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: tmp.path().to_path_buf(),
+                temp_dir: tmp.path().to_path_buf().into(),
                 ..MediaEncoderConfig::default()
             },
         );
@@ -806,7 +808,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: tmp.path().to_path_buf(),
+                temp_dir: tmp.path().to_path_buf().into(),
                 ..MediaEncoderConfig::default()
             },
         );
@@ -840,7 +842,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: tmp.path().to_path_buf(),
+                temp_dir: tmp.path().to_path_buf().into(),
                 ..MediaEncoderConfig::default()
             },
         );
@@ -877,7 +879,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: tmp.path().to_path_buf(),
+                temp_dir: tmp.path().to_path_buf().into(),
                 ..MediaEncoderConfig::default()
             },
         );
@@ -1044,7 +1046,7 @@ mod tests {
             "/usr/bin/ffmpeg".to_owned(),
             "/usr/bin/ffprobe".to_owned(),
             MediaEncoderConfig {
-                temp_dir: temp_dir.clone(),
+                temp_dir: temp_dir.clone().into(),
                 ..MediaEncoderConfig::default()
             },
         );

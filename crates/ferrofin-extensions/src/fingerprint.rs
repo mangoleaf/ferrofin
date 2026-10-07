@@ -15,7 +15,7 @@
 //! (`start > 0`) is decoded to a temp WAV by ffmpeg first, then fingerprinted.
 //! Both backends emit the same points for the same window.
 
-use std::path::PathBuf;
+use ferrofin_util::directory_path::DirectoryPath;
 use std::process::{Output, Stdio};
 
 use async_trait::async_trait;
@@ -42,7 +42,7 @@ pub struct ChromaprintFingerprinter {
     /// cache so the decode does not depend on the size of a container's `/tmp`
     /// (a full or read-only `/tmp` made every credits fingerprint fail, and
     /// with it every "Skip Credits" button).
-    scratch_dir: Option<PathBuf>,
+    scratch_dir: Option<DirectoryPath>,
 }
 
 impl ChromaprintFingerprinter {
@@ -98,8 +98,8 @@ impl ChromaprintFingerprinter {
     /// Writes the `fpcalc` fallback's intermediate WAV under `dir` instead of
     /// the system temp dir.
     #[must_use]
-    pub fn with_scratch_dir(mut self, dir: PathBuf) -> Self {
-        self.scratch_dir = Some(dir);
+    pub fn with_scratch_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.scratch_dir = Some(dir.into());
         self
     }
 
@@ -160,10 +160,11 @@ impl Fingerprinter for ChromaprintFingerprinter {
             let mut builder = tempfile::Builder::new();
             builder.prefix("ferrofin-fp-").suffix(".wav");
             let tmp = match &self.scratch_dir {
-                Some(dir) => {
-                    std::fs::create_dir_all(dir)
+                Some(source) => {
+                    let dir = source.resolve();
+                    std::fs::create_dir_all(&dir)
                         .map_err(|e| format!("scratch dir {}: {e}", dir.display()))?;
-                    builder.tempfile_in(dir)
+                    builder.tempfile_in(&dir)
                 }
                 None => builder.tempfile(),
             }

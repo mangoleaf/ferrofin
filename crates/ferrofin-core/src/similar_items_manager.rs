@@ -41,6 +41,7 @@
 //! (`SortName`, `Id`), the flat path by `SortName` — so a client sees a stable
 //! answer instead of a fresh shuffle per request.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -388,7 +389,7 @@ pub struct FerrofinSimilarItemsManager {
     library: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     /// Where a remote provider's references are cached between requests.
     /// Absent → no caching, exactly as a `None` cache duration does.
-    cache_dir: Option<PathBuf>,
+    cache_dir: Option<DirectoryPath>,
     /// Reads `EnableExternalContentInSuggestions`, which widens movie
     /// suggestions to trailers and Live TV programs. Absent → Jellyfin's
     /// default for that setting (`true`).
@@ -445,8 +446,8 @@ impl FerrofinSimilarItemsManager {
     /// `{cache}/{provider}-similar-{type}/{itemId}.json` layout Jellyfin uses,
     /// so a shared cache directory stays valid across the two.
     #[must_use]
-    pub fn with_cache_dir(mut self, cache_dir: PathBuf) -> Self {
-        self.cache_dir = Some(cache_dir);
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<DirectoryPath>) -> Self {
+        self.cache_dir = Some(cache_dir.into());
         self
     }
 

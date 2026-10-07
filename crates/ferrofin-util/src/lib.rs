@@ -6,6 +6,7 @@
 
 pub mod copy_to_extensions;
 pub mod dictionary_extensions;
+pub mod directory_path;
 pub mod enumerable_extensions;
 pub mod error;
 pub mod file_helper;

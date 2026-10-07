@@ -302,6 +302,10 @@ pub async fn build_app_state(
             .context("failed to load server configuration")?,
     );
     let server_config = config_mgr.snapshot();
+    let cache_root = {
+        let paths = Arc::clone(&paths);
+        ferrofin_util::directory_path::DirectoryPath::live(move || paths.cache_path().into())
+    };
 
     // A stable server/system id, persisted across restarts. Jellyfin persists its
     // SystemId and the web client keys stored sessions by it, so regenerating it on
@@ -469,9 +473,11 @@ pub async fn build_app_state(
     // The real `image`-crate encoder (resize + format-convert), not the no-op
     // `NullImageEncoder` — so `maxWidth`/`fillHeight`/`format` image requests are
     // honoured instead of serving the full-size original.
-    let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
-        ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), paths.image_cache_path()),
-    );
+    let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> =
+        Arc::new(ImageProcessor::new(
+            Arc::new(ImageCrateEncoder::new()),
+            cache_root.child("images"),
+        ));
     // The shared TMDB client — the scan's automatic artwork, the remote-search
     // ("Identify") providers, and the remote-image ("Choose Image") methods all
     // use Jellyfin's built-in key.
@@ -508,7 +514,7 @@ pub async fn build_app_state(
     // FERROFIN_OMDB_KEY (config `omdb_api_key`) overrides it. Its responses
     // are cached for a day under `{cache}/omdb`, as Jellyfin caches them.
     let omdb_client = ferrofin_providers::OmdbClient::new(&config.omdb_api_key)
-        .with_cache_dir(std::path::PathBuf::from(paths.cache_path()).join("omdb"));
+        .with_cache_dir(cache_root.child("omdb"));
     let omdb_client = Arc::new(match endpoints.omdb.as_deref() {
         Some(base) => omdb_client.with_base_url(base),
         None => omdb_client,
@@ -658,7 +664,7 @@ pub async fn build_app_state(
                 // the media file — media mounts are commonly read-only. The
                 // path comes from `ServerApplicationPaths` so the chapter-image
                 // task's pre-flight probes the same directory this writes to.
-                temp_dir: std::path::PathBuf::from(paths.temp_path()),
+                temp_dir: cache_root.child("temp"),
                 ffmpeg_version: ffmpeg.capabilities.ffmpeg_version(),
             },
         ));
@@ -703,7 +709,7 @@ pub async fn build_app_state(
             Arc::new(ferrofin_livetv::ReqwestFetcher::new()),
             server_id.clone(),
             // `{cache}/sd-countries.json` — `IApplicationPaths.CachePath` upstream.
-            paths.cache_path(),
+            cache_root.clone(),
         )
         .with_users(Arc::clone(&users))
         // ffmpeg, for the DVR's encoded recorder (the remux upstream falls
@@ -713,9 +719,7 @@ pub async fn build_app_state(
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
         .with_paths(ferrofin_livetv::LiveTvPaths {
-            transcode_dir: std::path::PathBuf::from(
-                ferrofin_traits::system::ServerApplicationPaths::transcode_path(paths.as_ref()),
-            ),
+            transcode_dir: cache_root.child("transcodes"),
             data_dir: std::path::PathBuf::from(paths.data_path()),
             options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
                 .join("named")
@@ -980,7 +984,7 @@ pub async fn build_app_state(
             // The cache root itself: the manager appends Jellyfin's own
             // `{provider}-similar-{type}/{id}.json` layout under it, so a
             // cache directory shared with a Jellyfin install stays valid.
-            .with_cache_dir(std::path::PathBuf::from(paths.cache_path()))
+            .with_cache_dir(cache_root.clone())
             // `EnableExternalContentInSuggestions` (Trailer/LiveTvProgram fold-in).
             .with_configuration(Arc::clone(&config_trait)),
     );
@@ -1345,6 +1349,23 @@ pub async fn build_app_state(
     let lifecycle_concrete = Arc::new(FerrofinLifecycleController::new(shutdown));
     let lifecycle: Arc<dyn ferrofin_core::system_manager::LifecycleController> =
         lifecycle_concrete.clone();
+    {
+        let lifecycle = Arc::downgrade(&lifecycle_concrete);
+        let paths = Arc::clone(&paths);
+        let startup_cache = config.cache_dir.clone();
+        config_mgr.add_configuration_listener(Arc::new(move |update| {
+            if let ferrofin_traits::configuration::ConfigurationUpdate::Server(config) = update
+                && config
+                    .cache_path
+                    .as_deref()
+                    .is_none_or(|p| p.trim().is_empty())
+                && std::path::Path::new(&paths.cache_path()) != startup_cache
+                && let Some(lifecycle) = lifecycle.upgrade()
+            {
+                lifecycle.mark_restart_required();
+            }
+        }));
+    }
     // The install-time artifact validator (component + descriptor checks) —
     // built from the same settings as the host so limits match.
     let wasm_validator: Arc<dyn ferrofin_traits::plugins::PluginArtifactValidator> = Arc::new(
@@ -1440,9 +1461,7 @@ pub async fn build_app_state(
                 // server's cache dir, not the system temp dir: a container's
                 // /tmp is routinely small or read-only, and the failed decode
                 // silently cost every "Skip Credits" segment.
-                fp.with_scratch_dir(
-                    std::path::PathBuf::from(paths.cache_path()).join("extensions"),
-                ),
+                fp.with_scratch_dir(cache_root.child("extensions")),
             ) as Arc<dyn ferrofin_extensions::fingerprint::Fingerprinter>
         });
     // The Merge Versions extension's bulk merge/split service — shared by its
@@ -1462,7 +1481,7 @@ pub async fn build_app_state(
         media_segments: Arc::clone(&media_segments),
         plugins: Arc::clone(&plugins),
         fingerprinter,
-        cache_dir: config.cache_dir.join("extensions"),
+        cache_dir: cache_root.child("extensions"),
         merge_versions: Arc::clone(&merge_versions),
     };
     // "Media Segment Scan" (Library category): upstream registers this one in

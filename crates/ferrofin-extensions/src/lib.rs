@@ -13,7 +13,6 @@
 //! descriptors ([`registered_plugins`]) and registers each extension's tasks
 //! ([`register_tasks`]).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use ferrofin_core::{FerrofinTaskManager, PluginConfigPage, RegisteredPlugin, ScheduledTask};
@@ -45,7 +44,7 @@ pub struct ExtensionContext {
     /// reports unavailable.
     pub fingerprinter: Option<Arc<dyn Fingerprinter>>,
     /// Root for per-extension caches (fingerprints): `{cache}/extensions`.
-    pub cache_dir: PathBuf,
+    pub cache_dir: ferrofin_util::directory_path::DirectoryPath,
     /// Bulk merge/split of duplicate versions — the Merge Versions extension's
     /// service, shared by its scheduled tasks and the `/MergeVersions/*` routes.
     pub merge_versions: Arc<dyn MergeVersionsManager>,
@@ -167,7 +166,9 @@ mod tests {
             library,
             plugins: Arc::new(DisabledPluginManager),
             fingerprinter: None,
-            cache_dir: PathBuf::from("/tmp/ferrofin-extensions-test-cache"),
+            cache_dir: ferrofin_util::directory_path::DirectoryPath::from(
+                "/tmp/ferrofin-extensions-test-cache",
+            ),
             merge_versions: Arc::new(NoMerges),
         }
     }

@@ -411,6 +411,7 @@ impl FerrofinServerConfigurationManager {
             }
         }
 
+        initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
 
         Ok(Self {
@@ -624,6 +625,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         // notification. A cancelled caller must not leave disk ahead of memory.
         let save = Arc::clone(&self.write_lock).lock_owned().await;
         self.validate_metadata_path(&configuration.metadata_path)?;
+        let old_cache = self.snapshot_shared().cache_path.clone();
         let replacement = Arc::new(configuration.clone());
         let json = serde_json::to_vec_pretty(configuration)
             .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
@@ -633,9 +635,30 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         let listeners = Arc::clone(&self.listeners);
         tokio::task::spawn_blocking(move || {
             let _save = save;
+            if let Some(cache) = replacement
+                .cache_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                let cache_path = PathBuf::from(cache);
+                if old_cache.as_deref() != Some(cache) {
+                    if !cache_path.is_dir() {
+                        return Err(ServiceError::not_found(format!(
+                            "cache path does not exist: {cache}"
+                        )));
+                    }
+                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
+                    std::fs::File::create_new(&probe)
+                        .and_then(|_| std::fs::remove_file(&probe))
+                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
+                }
+                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
+                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
+            }
             ferrofin_util::file_helper::atomic_write(&path, &json)
                 .map_err(|e| io_err("write configuration", &path, &e))?;
             *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            paths.set_cache_path(replacement.cache_path.as_deref());
             paths.set_internal_metadata_path(Some(&replacement.metadata_path));
             notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
             Ok(())
@@ -689,6 +712,19 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
     }
+}
+
+fn initialize_cache_path(
+    paths: &FerrofinServerApplicationPaths,
+    configured: Option<&str>,
+) -> Result<(), ServiceError> {
+    let cache = configured
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(|| PathBuf::from(paths.cache_path()), PathBuf::from);
+    FerrofinServerApplicationPaths::prepare_cache_path(&cache)
+        .map_err(|e| io_err("prepare cache directory", &cache, &e))?;
+    paths.set_cache_path(configured);
+    Ok(())
 }
 
 fn notify_listeners(
@@ -949,6 +985,75 @@ mod tests {
             mgr2.snapshot().server_name,
             "reload should observe the same configuration"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_override_is_live_persisted_and_clear_requires_fresh_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let original = paths.cache_path();
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut config = mgr.snapshot();
+        for name in ["cache-one", "cache-two"] {
+            let cache = tmp.path().join(name);
+            std::fs::create_dir(&cache).expect("cache");
+            config.cache_path = Some(cache.to_string_lossy().into_owned());
+            mgr.update_configuration(&config).await.expect("save");
+            assert_eq!(paths.cache_path(), cache.to_string_lossy());
+            assert_eq!(
+                paths.image_cache_path(),
+                cache.join("images").to_string_lossy()
+            );
+            assert!(cache.join(".jellyfin-cache").is_file());
+            assert!(
+                std::fs::read_to_string(cache.join("CACHEDIR.TAG"))
+                    .expect("tag")
+                    .starts_with("Signature: 8a477f597d28d172789f06886806bc55\n")
+            );
+        }
+        let reloaded_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&reloaded_paths))
+            .await
+            .expect("reload");
+        assert_eq!(reloaded_paths.cache_path(), paths.cache_path());
+        config.cache_path = Some("  ".into());
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_ne!(paths.cache_path(), original);
+        let restarted_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&restarted_paths))
+            .await
+            .expect("restart");
+        assert_eq!(restarted_paths.cache_path(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_paths_preserve_saved_configuration_and_live_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let previous = std::fs::read(&mgr.config_file).expect("config");
+        let original = paths.cache_path();
+        let mut config = mgr.snapshot();
+        config.cache_path = Some(tmp.path().join("missing").to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        let incompatible = tmp.path().join("config-root");
+        std::fs::create_dir(&incompatible).expect("mkdir");
+        std::fs::write(incompatible.join(".jellyfin-config"), "").expect("marker");
+        config.cache_path = Some(incompatible.to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(std::fs::read(&mgr.config_file).expect("config"), previous);
+        assert_eq!(paths.cache_path(), original);
+        assert!(!incompatible.join(".jellyfin-cache").exists());
     }
 
     #[tokio::test]

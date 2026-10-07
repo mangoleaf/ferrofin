@@ -15,7 +15,6 @@
 //! backend is available.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -133,7 +132,7 @@ impl Extension for IntroSkipperExtension {
             media_segments: Arc::clone(&cx.media_segments),
             plugins: Arc::clone(&cx.plugins),
             fingerprinter: cx.fingerprinter.clone(),
-            cache_dir: cx.cache_dir.join("introskipper"),
+            cache_dir: cx.cache_dir.child("introskipper"),
             running: Arc::new(AtomicBool::new(false)),
         });
         vec![
@@ -475,7 +474,7 @@ struct DetectSegmentsTask {
     media_segments: Arc<dyn MediaSegmentManager>,
     plugins: Arc<dyn PluginManager>,
     fingerprinter: Option<Arc<dyn Fingerprinter>>,
-    cache_dir: PathBuf,
+    cache_dir: ferrofin_util::directory_path::DirectoryPath,
     /// `true` while an analysis pass is running, so a second trigger is a no-op
     /// instead of a duplicate concurrent pass.
     running: Arc<AtomicBool>,
@@ -788,7 +787,8 @@ impl DetectSegmentsTask {
         mode: AnalysisMode,
         fingerprinter: &dyn Fingerprinter,
     ) -> Result<Vec<u32>, String> {
-        let cache = self.cache_dir.join(format!(
+        let cache_dir = self.cache_dir.resolve();
+        let cache = cache_dir.join(format!(
             "{}.{}.{start:.0}-{end:.0}.fp",
             ep.id,
             mode_tag(mode),
@@ -799,7 +799,7 @@ impl DetectSegmentsTask {
             return Ok(points);
         }
         let points = fingerprinter.fingerprint(&ep.path, start, end).await?;
-        let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
+        let _ = tokio::fs::create_dir_all(&cache_dir).await;
         let _ = tokio::fs::write(&cache, encode_points(&points)).await;
         Ok(points)
     }
@@ -1255,7 +1255,7 @@ mod tests {
                     config: config.as_bytes().to_vec(),
                 }),
                 fingerprinter,
-                cache_dir: cache.path().join("introskipper"),
+                cache_dir: cache.path().join("introskipper").into(),
                 running: Arc::new(AtomicBool::new(false)),
             },
             segments,

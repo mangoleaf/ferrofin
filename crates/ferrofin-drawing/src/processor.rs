@@ -27,6 +27,7 @@
 //!   sit behind the small [`FileMeta`] seam so tests use a fake and the real
 //!   `std::fs` stat stays out of the parity/coverage numbers.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,7 +125,7 @@ pub struct ImageProcessor<F = StdFileMeta> {
     encoder: Arc<dyn ImageEncoder>,
 
     /// The base image-cache directory (`IServerApplicationPaths.ImageCachePath`).
-    image_cache_path: PathBuf,
+    image_cache_path: DirectoryPath,
 
     /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`).
     file_meta: F,
@@ -140,7 +141,7 @@ impl ImageProcessor<StdFileMeta> {
     /// beneath `image_cache_path`, using the real `std::fs`-backed [`FileMeta`]
     /// and the default [`cache_version`](Self::with_cache_version) of `'4'`.
     #[must_use]
-    pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<PathBuf>) -> Self {
+    pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<DirectoryPath>) -> Self {
         Self {
             encoder,
             image_cache_path: image_cache_path.into(),
@@ -156,7 +157,7 @@ impl<F: FileMeta> ImageProcessor<F> {
     #[must_use]
     pub fn with_file_meta(
         encoder: Arc<dyn ImageEncoder>,
-        image_cache_path: impl Into<PathBuf>,
+        image_cache_path: impl Into<DirectoryPath>,
         file_meta: F,
     ) -> Self {
         Self {
@@ -1021,12 +1022,14 @@ mod tests {
     async fn resize_produces_then_hits_cache() {
         let dir = TempDir::new().expect("tempdir");
         let cache = TempDir::new().expect("cache");
+        let current = Arc::new(std::sync::RwLock::new(cache.path().to_path_buf()));
+        let source = Arc::clone(&current);
         let input = fixture(&dir, "big.png", 1920, 1080);
         let fs = FakeFs::with(&[&input]);
         // A real encoder writes the resized file; a max-width forces a resize.
         let proc = ImageProcessor::with_file_meta(
             Arc::new(ImageCrateEncoder::new()),
-            cache.path().to_path_buf(),
+            DirectoryPath::live(move || source.read().expect("path").clone()),
             fs,
         );
 
@@ -1058,6 +1061,18 @@ mod tests {
         proc.file_meta.add(&first.path);
         let second = proc.process_image(&options).await.expect("process again");
         assert_eq!(first.path, second.path);
+        let replacement = TempDir::new().expect("replacement");
+        *current.write().expect("path") = replacement.path().to_path_buf();
+        let third = proc
+            .process_image(&options)
+            .await
+            .expect("after reconfiguration");
+        assert!(Path::new(&third.path).starts_with(replacement.path()));
+        assert!(Path::new(&third.path).is_file());
+        assert!(
+            Path::new(&first.path).is_file(),
+            "old cache is not relocated or deleted"
+        );
     }
 
     #[tokio::test]

@@ -311,7 +311,7 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 pub struct LiveTvPaths {
     /// Where a shared live stream's `{uniqueId}.ts` buffer is written
     /// (C# `GetTranscodePath()`).
-    pub transcode_dir: PathBuf,
+    pub transcode_dir: ferrofin_util::directory_path::DirectoryPath,
     /// The server data directory, under which `livetv/recordings` is the
     /// default DVR target (C# `CommonApplicationPaths.DataPath`).
     pub data_dir: PathBuf,
@@ -623,7 +623,7 @@ impl FerrofinLiveTvManager {
         db: Database,
         fetcher: Arc<dyn SourceFetcher>,
         server_id: String,
-        cache_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<ferrofin_util::directory_path::DirectoryPath>,
     ) -> Self {
         let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
         // The same two hosts, in the same order, that
@@ -4369,12 +4369,13 @@ impl FerrofinLiveTvManager {
 
     /// The directory a shared live stream's buffer is written to.
     fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
-        if self.paths.transcode_dir.as_os_str().is_empty() {
+        let path = self.paths.transcode_dir.resolve();
+        if path.as_os_str().is_empty() {
             return Err(ServiceError::Backend(
                 "live tv transcode path not wired".to_owned(),
             ));
         }
-        Ok(self.paths.transcode_dir.clone())
+        Ok(path)
     }
 
     /// The API base URL a live stream's buffered file is served from.
@@ -6725,7 +6726,7 @@ mod tests {
             .await
             .with_tuner_source(Arc::new(tuner))
             .with_paths(LiveTvPaths {
-                transcode_dir: transcode_dir.to_path_buf(),
+                transcode_dir: transcode_dir.to_path_buf().into(),
                 ..LiveTvPaths::default()
             });
         mgr.set_local_api_url("http://127.0.0.1:8096");
@@ -7016,7 +7017,7 @@ mod tests {
             .await
             .with_tuner_source(Arc::new(tuner))
             .with_paths(LiveTvPaths {
-                transcode_dir: root.join("transcodes"),
+                transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: root.join("named").join("livetv.json"),
             });
@@ -7048,7 +7049,7 @@ mod tests {
         manager_with(FakeFetcher(HashMap::new()))
             .await
             .with_paths(LiveTvPaths {
-                transcode_dir: root.join("transcodes"),
+                transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: named.join("livetv.json"),
             })

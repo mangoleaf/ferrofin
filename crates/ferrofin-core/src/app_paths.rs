@@ -13,8 +13,8 @@
 //!   deferred to [`make_sanity_check`](Self::make_sanity_check), which the host
 //!   calls at startup. This keeps the accessors — every trait method — free of
 //!   filesystem side effects and safe to call from tests over a temp root.
-//! - `InternalMetadataPath` is a *mutable* property in C# (the configuration
-//!   manager rewrites it when `Configuration.MetadataPath` changes). It is held
+//! - `InternalMetadataPath` and `CachePath` are mutable properties in C# (the
+//!   configuration manager rewrites them when configuration changes). They are held
 //!   here behind an [`RwLock`] so the shared `Arc<FerrofinServerApplicationPaths>`
 //!   can be updated in place by
 //!   [`FerrofinServerConfigurationManager`](crate::configuration_manager::FerrofinServerConfigurationManager)
@@ -33,10 +33,9 @@ use ferrofin_traits::system::ServerApplicationPaths;
 
 /// The concrete server application paths, derived from a fixed set of roots.
 ///
-/// Constructed once at startup (the roots cannot change while the server runs)
-/// and shared as an `Arc` by the host, configuration, path, and system
-/// managers. Cloning is cheap: the resolved fields are shared, and the mutable
-/// internal-metadata path lives behind a shared lock.
+/// Constructed once at startup; cache and metadata roots follow configuration.
+/// Other roots remain fixed. The host and managers share an `Arc` to these
+/// paths; mutable cache and metadata roots live behind shared locks.
 // Every field names a well-known directory, so the shared `_path` suffix is
 // intrinsic to the domain, not a naming smell.
 #[allow(clippy::struct_field_names)]
@@ -44,7 +43,7 @@ pub struct FerrofinServerApplicationPaths {
     program_data_path: PathBuf,
     log_directory_path: PathBuf,
     configuration_directory_path: PathBuf,
-    cache_path: PathBuf,
+    cache_path: RwLock<PathBuf>,
     web_path: PathBuf,
     data_path: PathBuf,
     root_folder_path: PathBuf,
@@ -101,7 +100,7 @@ impl FerrofinServerApplicationPaths {
             data_path,
             log_directory_path: log_directory_path.into(),
             configuration_directory_path: configuration_directory_path.into(),
-            cache_path: cache_path.into(),
+            cache_path: RwLock::new(cache_path.into()),
             web_path: web_path.into(),
             program_data_path,
         }
@@ -129,6 +128,58 @@ impl FerrofinServerApplicationPaths {
         }
     }
 
+    /// Publishes a configured cache root. Clearing an override takes effect on restart.
+    pub fn set_cache_path(&self, path: Option<&str>) {
+        if let Some(path) = path.filter(|p| !p.trim().is_empty()) {
+            *self
+                .cache_path
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = path.into();
+        }
+    }
+
+    /// Prepares a cache root, rejecting conflicting Jellyfin directory markers.
+    ///
+    /// # Errors
+    /// Returns filesystem errors or a conflicting directory marker.
+    pub fn prepare_cache_path(path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(path)?;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_file()
+                && name.starts_with(".jellyfin-")
+                && !name.eq_ignore_ascii_case(".jellyfin-cache")
+            {
+                return Err(std::io::Error::other(format!(
+                    "conflicting cache directory marker: {name}"
+                )));
+            }
+        }
+        for (name, bytes) in [
+            (".jellyfin-cache", ""),
+            (
+                "CACHEDIR.TAG",
+                "Signature: 8a477f597d28d172789f06886806bc55\n# Cache directory created by Ferrofin.\n",
+            ),
+        ] {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(name))
+            {
+                Ok(mut file) => file.write_all(bytes.as_bytes())?,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && path.join(name).is_file() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Records the database file the server actually opened.
     pub fn set_database_path(&self, path: impl Into<PathBuf>) {
         if let Ok(mut guard) = self.database_path.write() {
@@ -151,7 +202,7 @@ impl FerrofinServerApplicationPaths {
     /// The image cache directory as a [`PathBuf`].
     #[must_use]
     fn image_cache_path_buf(&self) -> PathBuf {
-        self.cache_path.join("images")
+        PathBuf::from(self.cache_path()).join("images")
     }
 
     /// A snapshot of the current internal metadata path.
@@ -166,9 +217,8 @@ impl FerrofinServerApplicationPaths {
     /// Creates the well-known base directories, mirroring
     /// `BaseApplicationPaths.MakeSanityCheckOrThrow`.
     ///
-    /// Idempotent (`create_dir_all`). The C# variant additionally drops
-    /// `.jellyfin-*` marker and `CACHEDIR.TAG` files; those are diagnostic only
-    /// and are not reproduced here.
+    /// Idempotent (`create_dir_all`). The configuration manager additionally
+    /// prepares the effective cache root with its marker and backup-exclusion tag.
     ///
     /// # Errors
     ///
@@ -178,7 +228,7 @@ impl FerrofinServerApplicationPaths {
             &self.configuration_directory_path,
             &self.log_directory_path,
             &self.program_data_path,
-            &self.cache_path,
+            &PathBuf::from(self.cache_path()),
             &self.data_path,
             &self.root_folder_path,
             &self.internal_metadata_path_buf(),
@@ -263,7 +313,12 @@ impl ServerApplicationPaths for FerrofinServerApplicationPaths {
     }
 
     fn cache_path(&self) -> String {
-        path_string(&self.cache_path)
+        path_string(
+            &self
+                .cache_path
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     fn log_directory_path(&self) -> String {
