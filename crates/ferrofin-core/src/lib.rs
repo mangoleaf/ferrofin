@@ -187,6 +187,8 @@ mod item_deletion;
 pub mod item_persistence_service;
 pub mod item_repository;
 pub mod item_type_lookup;
+pub mod item_visibility;
+mod item_visibility_repository;
 pub mod keyframe_repository;
 pub mod kinds;
 pub mod library_changed_notifier;

@@ -336,6 +336,21 @@ type RecordedScans = Arc<Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>>;
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         if let Some(other) = self.tree.others.iter().find(|row| row.id == id.to_string()) {
             return Ok(Some(other.clone()));

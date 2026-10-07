@@ -2927,6 +2927,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
 
+    async fn get_recording_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
+            .await?
+            .map(|row| crate::projection::recording_entity(&row, parse_dt)))
+    }
+
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
             return Ok(None);
