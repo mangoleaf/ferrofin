@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, JsonValueBody};
+use crate::extract::JsonBody;
 use crate::state::AppState;
 
 /// The compiled-in Intro Skipper extension id (mirrors `EXTENSION_ID` in
@@ -755,17 +755,67 @@ async fn get_analyzer_actions(
     Ok(Json(actions))
 }
 
+/// The analysis an analyzer action applies to. Port of `IntroSkipper.Data.AnalysisMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+enum AnalysisMode {
+    /// The intro.
+    Introduction,
+    /// The end credits.
+    Credits,
+    /// The next-episode preview.
+    Preview,
+    /// The previously-on recap.
+    Recap,
+    /// A commercial break.
+    Commercial,
+}
+
+/// How a season's analysis runs. Port of `IntroSkipper.Data.AnalyzerAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum AnalyzerAction {
+    /// The configured default.
+    Default,
+    /// Chapter names.
+    Chapter,
+    /// Audio fingerprints.
+    Chromaprint,
+    /// Black frames.
+    BlackFrame,
+    /// No analysis.
+    None,
+}
+
+/// The body of `POST /Intros/AnalyzerActions/UpdateSeason`. Port of
+/// `IntroSkipper.Data.UpdateAnalyzerActionsRequest`, bound by the MVC binder
+/// upstream (`VisualizationController.UpdateAnalyzerActions([FromBody] …)`), so
+/// it takes an object only and its names and enum values bind ignoring case.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateAnalyzerActionsRequest {
+    /// The season. `null` is the empty id, as Jellyfin's `JsonGuidConverter` reads it.
+    #[serde(default, with = "ferrofin_model::json::guid")]
+    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
+    id: Uuid,
+    /// The action per analysis mode.
+    #[serde(default)]
+    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
+    analyzer_actions: HashMap<AnalysisMode, AnalyzerAction>,
+}
+
 /// `POST /Intros/AnalyzerActions/UpdateSeason` — accept per-season analyzer
 /// actions.
 ///
-/// Accepted for contract compatibility; Ferrofin's detection uses the global
-/// config and does not persist per-season analyzer overrides, so this reports
-/// success without storing anything.
-// ponytail: no per-season analyzer-action store; detection is global-config driven.
+/// Binds the body as upstream does, then reports success without storing it:
+/// Ferrofin's detection uses the global config only.
+///
+/// TODO(F10): upstream persists the actions (`Plugin.SetAnalyzerActionAsync`)
+/// and detection honours them per season. The open work item is finding F10 of
+/// `brain/plans/PLAN_JSON_BODY_CASE_INSENSITIVE.md`: add a per-season store, read
+/// it in detection and in `GetAnalyzerActions`.
 async fn update_analyzer_actions(
     State(_state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    JsonValueBody(_request): JsonValueBody<serde_json::Value>,
+    JsonBody(_request): JsonBody<UpdateAnalyzerActionsRequest>,
 ) -> StatusCode {
     StatusCode::NO_CONTENT
 }

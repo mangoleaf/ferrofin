@@ -15,8 +15,8 @@
 //! It is fixed here as a class, once, rather than per route: [`JsonBody`]
 //! replaces `axum::Json` in extractor position everywhere (`Json` stays the
 //! *response* type), [`JsonSeqBody`] is its variant for the two operations whose
-//! body is a JSON array, and [`JsonValueBody`] the one for the two that bind
-//! `[FromBody] JsonDocument` and therefore take any JSON kind.
+//! body is a JSON array, and [`JsonValueBody`] the one for the operation that
+//! binds `[FromBody] JsonDocument` and therefore takes any JSON kind.
 //!
 //! Two behaviours beyond the status matter, and both were measured against a
 //! live Jellyfin 10.11.8:
@@ -179,9 +179,6 @@ enum TopLevel {
     Object,
     /// A JSON array — the handful of operations whose body is a list.
     Array,
-    /// Any JSON value — the port of `[FromBody] JsonDocument`, which
-    /// `System.Text.Json` fills from an object, an array or a scalar alike.
-    Any,
 }
 
 impl TopLevel {
@@ -190,7 +187,6 @@ impl TopLevel {
         match self {
             Self::Object => value.is_object(),
             Self::Array => value.is_array(),
-            Self::Any => true,
         }
     }
 }
@@ -221,15 +217,18 @@ fn bind_doc<T: DeserializeOwned>(doc: Doc, want: TopLevel) -> Result<T, ProblemD
             "The JSON value could not be converted to the expected type.",
         ));
     }
-    serde_path_to_error::deserialize(doc).map_err(|e| {
-        let path = e.path().to_string();
-        let key = if path.is_empty() || path == "." {
-            "$".to_owned()
-        } else {
-            format!("$.{path}")
-        };
-        ProblemDetails::validation(&key, e.into_inner().to_string())
-    })
+    serde_path_to_error::deserialize(doc).map_err(member_error)
+}
+
+/// The 400 for a member the DTO's types cannot take, keyed by its JSON path.
+fn member_error<E: std::fmt::Display>(e: serde_path_to_error::Error<E>) -> ProblemDetails {
+    let path = e.path().to_string();
+    let key = if path.is_empty() || path == "." {
+        "$".to_owned()
+    } else {
+        format!("$.{path}")
+    };
+    ProblemDetails::validation(&key, e.into_inner().to_string())
 }
 
 /// Binds `bytes` into a REQUIRED `T`.
@@ -238,6 +237,36 @@ fn bind<T: DeserializeOwned>(bytes: &[u8], want: TopLevel) -> Result<T, ProblemD
         Some(doc) => bind_doc(doc, want),
         None => Err(ProblemDetails::empty_body()),
     }
+}
+
+/// Binds a REQUIRED `[FromBody] JsonDocument` body into `T`: any JSON kind (an
+/// object, an array or a scalar alike), member names matched **exactly**.
+///
+/// Case-sensitive on purpose. `JsonDocument` has no members for the MVC binder
+/// to fold; the controller deserializes it itself with `JsonDefaults.Options`,
+/// which never sets `PropertyNameCaseInsensitive` (v12.2
+/// `ConfigurationController.UpdateNamedConfiguration`, `.Deserialize(type,
+/// _serializerOptions)`). Measured on a live Jellyfin 12.2.0:
+/// `POST /System/Configuration/metadata` with
+/// `{"useFileCreationTimeForDateAdded":false}` ignores the member and saves the
+/// default (`true`). So this binds through a plain `serde_json::Value`, not a
+/// folding [`Doc`].
+///
+/// This reproduces only the member-name half of `JsonDefaults.Options`. Its
+/// value coercions (`JsonStringEnumConverter` reading enum names in any case,
+/// `AllowReadingFromString` numbers) are the separate
+/// `PLAN_JSON_NUMBER_HANDLING.md` work item, and apply here too: the typed
+/// readers of a stored named configuration still parse its values strictly.
+fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(ProblemDetails::empty_body());
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| ProblemDetails::validation("$", e.to_string()))?;
+    if value.is_null() {
+        return Err(ProblemDetails::empty_body());
+    }
+    serde_path_to_error::deserialize(value).map_err(member_error)
 }
 
 /// Reads the body of a REQUIRED parameter.
@@ -368,12 +397,13 @@ where
 
 /// The **any-shape** body extractor — the port of `[FromBody] JsonDocument`.
 ///
-/// Exactly two operations bind one upstream (`POST /System/Configuration/{key}`,
-/// v10.11.8 Jellyfin.Api/Controllers/ConfigurationController.cs:96, and the
-/// intro-skipper analyzer-actions route), and `JsonDocument` takes any JSON
-/// kind — so tightening those two to an object would be a divergence Ferrofin
-/// invented. An empty or `null` body is still refused: the parameter is
-/// `[Required]`.
+/// Exactly one operation binds one upstream (`POST /System/Configuration/{key}`,
+/// v10.11.8 Jellyfin.Api/Controllers/ConfigurationController.cs:96), and
+/// `JsonDocument` takes any JSON kind — so tightening it to an object would be
+/// a divergence Ferrofin invented. An empty or `null` body is still refused: the
+/// parameter is `[Required]`. Unlike [`JsonBody`], member names bind
+/// case-sensitively, as upstream's own `JsonDefaults.Options` deserialization
+/// of the document does.
 #[derive(Debug, Clone, Default)]
 pub struct JsonValueBody<T>(pub T);
 
@@ -385,7 +415,7 @@ where
     type Rejection = ProblemDetails;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        bind(&read_required(req, state).await?, TopLevel::Any).map(Self)
+        bind_document(&read_required(req, state).await?).map(Self)
     }
 }
 
@@ -439,12 +469,22 @@ mod tests {
     fn an_any_shape_body_takes_every_json_kind_but_still_needs_one() {
         // `[FromBody] JsonDocument` fills from an object, an array or a scalar.
         for body in [br#"{"a":1}"#.as_slice(), b"[1,2]", b"5", br#""x""#] {
-            assert!(bind::<serde_json::Value>(body, TopLevel::Any).is_ok());
+            assert!(bind_document::<serde_json::Value>(body).is_ok());
         }
         // …but `[Required]` still refuses an absent one.
         for body in [b"".as_slice(), b"null"] {
-            assert!(bind::<serde_json::Value>(body, TopLevel::Any).is_err());
+            assert!(bind_document::<serde_json::Value>(body).is_err());
         }
+    }
+
+    #[test]
+    fn a_json_document_body_binds_member_names_exactly() {
+        // Upstream deserializes it with `JsonDefaults.Options`: no case fold.
+        let dto: Dto = bind_document(br#"{"limit":3,"Names":["a"]}"#).expect("binds");
+        assert_eq!(dto.limit, None);
+        assert_eq!(dto.names, ["a"]);
+        let value: serde_json::Value = bind_document(br#"{"limit":3}"#).expect("value");
+        assert_eq!(value, serde_json::json!({"limit":3}));
     }
 
     #[test]
