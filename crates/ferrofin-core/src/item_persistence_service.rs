@@ -1480,6 +1480,59 @@ pub(crate) async fn detach_user_data(
     Ok(())
 }
 
+/// Restore a coherent snapshot under every current key, as SaveUserData does.
+/// Existing destination state for a user wins as a whole (including explicit
+/// unplayed/unfavorite changes); retained rows must never overwrite it.
+async fn reattach_user_data_keys(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: &str,
+    keys: &[String],
+) -> Result<(), ServiceError> {
+    let keys = serde_json::to_string(keys).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    sqlx::query(
+        r#"WITH keys AS (SELECT key, value FROM json_each(?1)),
+        retained AS MATERIALIZED (
+            SELECT ud.*, ROW_NUMBER() OVER (
+                PARTITION BY ud."UserId"
+                ORDER BY CASE WHEN ud."CustomDataKey" = lower(?2) THEN -1
+                              ELSE CAST(keys.key AS INTEGER) END
+            ) AS priority
+            FROM "UserData" ud JOIN keys ON keys.value = ud."CustomDataKey"
+            WHERE ud."ItemId" = ?3 AND NOT EXISTS (
+                SELECT 1 FROM "UserData" current
+                WHERE current."ItemId" = ?2 AND current."UserId" = ud."UserId")
+        )
+        INSERT INTO "UserData" (
+            "ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+            "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
+            "Played", "Rating", "RetentionDate", "SubtitleStreamIndex")
+        SELECT ?2, retained."UserId", keys.value, "AudioStreamIndex", "IsFavorite",
+            "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
+            "Played", "Rating", NULL, "SubtitleStreamIndex"
+        FROM retained CROSS JOIN keys WHERE priority = 1
+        ON CONFLICT("ItemId", "UserId", "CustomDataKey") DO NOTHING"#,
+    )
+    .bind(&keys)
+    .bind(item_id)
+    .bind(PLACEHOLDER_ID)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    // Consume the matching retained snapshots, including those superseded by
+    // an explicit destination state. Unmatched keys remain available until
+    // their retention period expires.
+    sqlx::query(
+        r#"DELETE FROM "UserData" WHERE "ItemId" = ?1
+           AND "CustomDataKey" IN (SELECT value FROM json_each(?2))"#,
+    )
+    .bind(PLACEHOLDER_ID)
+    .bind(&keys)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 #[async_trait]
 impl ItemPersistenceService for FerrofinItemPersistenceService {
     async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
@@ -2871,22 +2924,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // Reattach user-data rows detached onto the placeholder item back to this
-        // item when their CustomDataKey matches the item's presentation key
-        // (C# `RetentionDate` reattachment keys user data by presentation key).
-        let Some(key) = item.presentation_unique_key.as_ref() else {
+        let id = Uuid::parse_str(&item.id).map_err(|e| ServiceError::Backend(e.to_string()))?;
+        if guid_to_db(id) == PLACEHOLDER_ID {
             return Ok(());
-        };
-        sqlx::query(
-            r#"UPDATE OR IGNORE "UserData" SET "ItemId" = ?1
-               WHERE "ItemId" = ?2 AND "CustomDataKey" = ?3"#,
-        )
-        .bind(&item.id)
-        .bind(PLACEHOLDER_ID)
-        .bind(key)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        if let Some(keys) = crate::user_data_key_repository::load_keys(&mut tx, id).await? {
+            reattach_user_data_keys(&mut tx, &guid_to_db(id), &keys).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -3954,9 +4000,76 @@ mod tests {
         assert_eq!(rows, vec![(super::PLACEHOLDER_ID.to_owned(), 2)]);
     }
 
-    // Investigation regressions: run explicitly with
-    // cargo test -p ferrofin-core --lib retention_investigation -- --ignored
-    // Remove the ignores when the retention lifecycle is implemented.
+    // Regressions from the retention investigation, now enabled by default.
+    #[tokio::test]
+    async fn retention_move_restores_every_field_and_preserves_destination_state() {
+        use ferrofin_db::entities::playback::UserDataEntity;
+        let db = test_db().await;
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let users = [Uuid::new_v4(), Uuid::new_v4()];
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        for item in [old, new] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            svc.save_provider_id(item, "Tmdb", "retained-movie")
+                .await
+                .unwrap();
+        }
+        for user in users {
+            crate::test_support::seed_named_user(&db, user, &user.to_string()).await;
+            crate::test_support::seed_user_data(&db, user, old, true, None).await;
+        }
+        sqlx::query(
+            r#"UPDATE "UserData" SET "CustomDataKey" = 'retained-movie',
+               "AudioStreamIndex" = 2, "SubtitleStreamIndex" = 3, "IsFavorite" = 1,
+               "LastPlayedDate" = '2026-10-01 00:00:00.0000000', "Likes" = 0,
+               "PlayCount" = 7, "PlaybackPositionTicks" = 1234567, "Rating" = 8.5"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let original: UserDataEntity =
+            sqlx::query_as(r#"SELECT * FROM "UserData" WHERE "UserId" = ?1"#)
+                .bind(guid_to_db(users[0]))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        // This user's explicit unplayed state must win over retained history.
+        crate::test_support::seed_user_data(&db, users[1], new, false, None).await;
+        svc.delete_items(&[old]).await.unwrap();
+        let new_row = crate::test_support::fetch_item(&db, new).await;
+        svc.reattach_user_data(&new_row).await.unwrap();
+        svc.reattach_user_data(&new_row).await.unwrap();
+        let restored: Vec<UserDataEntity> = sqlx::query_as(
+            r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 ORDER BY "UserId", "CustomDataKey""#,
+        )
+        .bind(guid_to_db(new))
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(restored.len(), 3);
+        for row in restored {
+            if row.user_id == guid_to_db(users[0]) {
+                let mut expected = original.clone();
+                expected.item_id = guid_to_db(new);
+                expected.custom_data_key.clone_from(&row.custom_data_key);
+                assert_eq!(row, expected, "every saved field survives");
+            } else {
+                assert!(!row.played);
+                assert!(!row.is_favorite);
+                assert_eq!(row.play_count, 0);
+                assert!(row.retention_date.is_none());
+            }
+        }
+        let retained: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1"#)
+                .bind(super::PLACEHOLDER_ID)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 0, "matching snapshots are consumed");
+    }
+
     #[tokio::test]
     async fn retention_investigation_delete_preserves_history() {
         let db = test_db().await;
@@ -3991,7 +4104,6 @@ mod tests {
     #[case::user_data_key(false)]
     #[case::retention_timestamp(true)]
     #[tokio::test]
-    #[ignore = "Known retention gaps: wrong reattachment key and uncleared timestamp"]
     async fn retention_investigation_reattach_restores_history(
         #[case] match_presentation_key: bool,
     ) {
