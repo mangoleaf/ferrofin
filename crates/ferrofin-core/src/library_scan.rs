@@ -9386,7 +9386,11 @@ impl LibraryScanner {
                             } else {
                                 BaseItemKind::Movie
                             };
-                        self.plan_movies(location, location, cf, kind, &ctx, &mut out);
+                        let walk = MovieWalk {
+                            kind,
+                            collection_type: folder.collection_type,
+                        };
+                        self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                         // Upstream folds the separate `photos` collection type
                         // into `homevideos`, where photos are resolved only when
                         // the library enables them (`PhotoResolver.Resolve`).
@@ -9547,7 +9551,7 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
-        kind: BaseItemKind,
+        walk: MovieWalk,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
@@ -9559,7 +9563,7 @@ impl LibraryScanner {
             dir,
             root,
             cf,
-            kind,
+            walk,
             ctx,
             out,
             &mut extras,
@@ -9574,7 +9578,7 @@ impl LibraryScanner {
             if !ctx.scope.keeps(&path) {
                 continue;
             }
-            let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
+            let Some(owner) = owner_for_extra(&path, &movies_by_dir, ctx.naming) else {
                 // This candidate was listed, but no eligible containing movie
                 // searches for it. Reconcile legacy rows at this exact path.
                 ctx.excluded.borrow_mut().push(path);
@@ -9778,13 +9782,14 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
-        kind: BaseItemKind,
+        walk: MovieWalk,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
         extras: &mut Vec<MovieExtra>,
         movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) {
         let naming = ctx.naming;
+        let kind = walk.kind;
         let extras_folder = is_extras_folder_below_top(dir, root, naming);
         // A disc rip (`…/Movie (2009)/BDMV/` or `VIDEO_TS/`) is ONE item for the
         // containing folder, not one per .vob/.m2ts inside — port of
@@ -9812,12 +9817,30 @@ impl LibraryScanner {
         // any regular movie, and drops sample filenames from that list. If it
         // finds none, individual-file resolution can still accept a title
         // whose name contains "sample".
+        // A plain folder's files resolve with the folder as their library
+        // root (`ResolveVideos` passes `parent.ContainingFolderPath`), so a
+        // folder's own name never makes them extras: `Movies/trailers/x.mkv`,
+        // a top-level folder no rule ignores, is a movie upstream.
+        let plain_folder = movie.is_none() && !extras_folder && dir != root;
+        let extras_root = if plain_folder { dir } else { root };
         let has_movie_files = entries.iter().any(|entry| {
             entry.type_ != FileSystemEntryType::Directory
                 && !video_resolver::is_sample_filename(&entry.name)
-                && video_resolver::resolve_file(Some(&entry.path), naming, Some(root))
+                && video_resolver::resolve_file(Some(&entry.path), naming, Some(extras_root))
                     .is_some_and(|video| video.extra_type.is_none())
         });
+        // A video in its own folder is not in a mixed folder; one at the
+        // library root always is (`IsTopParent`); elsewhere `ResolveVideos`
+        // decides, and a lone video owns the folder's extras.
+        let mixed = if plain_folder {
+            let lone = lone_video(&entries, dir, naming, walk);
+            if let Some(lone) = &lone {
+                self.register_extras_owner(dir, lone, kind, ctx, movies_by_dir);
+            }
+            lone.is_none()
+        } else {
+            dir == root
+        };
         if let Some(movie) = movie {
             self.register_extras_owner(dir, &movie, kind, ctx, movies_by_dir);
         }
@@ -9852,7 +9875,7 @@ impl LibraryScanner {
                         &entry.path,
                         root,
                         cf,
-                        kind,
+                        walk,
                         ctx,
                         out,
                         extras,
@@ -9876,7 +9899,7 @@ impl LibraryScanner {
             let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
                 &entry.path,
                 naming,
-                Some(root),
+                Some(extras_root),
             );
             if let Some(extra_type) = extra.extra_type {
                 extras.push(MovieExtra {
@@ -9908,7 +9931,8 @@ impl LibraryScanner {
             if !ctx.scope.keeps(&entry.path) {
                 continue;
             }
-            if let Some(planned) = self.movie_file(&entry, dir, own_folder, kind, cf, ctx) {
+            if let Some(mut planned) = self.movie_file(&entry, dir, own_folder, kind, cf, ctx) {
+                planned.entity.is_in_mixed_folder = mixed;
                 ctx.emit(out, planned);
             }
         }
@@ -9939,7 +9963,6 @@ impl LibraryScanner {
         };
         let (id, mut entity) = self.base_item(ctx, kind, cf, cf, name, &entry.path, false)?;
         entity.is_movie = kind == BaseItemKind::Movie;
-        entity.is_in_mixed_folder = !own_folder;
         entity.media_type = Some("Video".to_owned());
         entity.production_year = year.map(i64::from);
         set_video_type(&mut entity, file_video_type(&entry.path));
@@ -9953,6 +9976,7 @@ impl LibraryScanner {
     /// Registers `movie`, resolved in `dir`, as the owner of the extras its
     /// folder holds. Ownership follows the same grouped title as `FindMovie`:
     /// stacked parts are one owner; alternate versions can own named extras.
+    /// A version the walk does not plan (a `.disc` stub) owns nothing.
     fn register_extras_owner(
         &self,
         dir: &str,
@@ -9964,6 +9988,7 @@ impl LibraryScanner {
         let owners = movies_by_dir.entry(dir.to_owned()).or_default();
         for version in std::iter::once(movie).chain(movie.alternate_versions.iter()) {
             if let Some(file) = version.files.first()
+                && video_resolver::is_video_file(&file.path, ctx.naming)
                 && let Some(id) =
                     item_type_lookup::derive_item_id_with(&self.id_derivation, kind, &file.path)
             {
@@ -11807,6 +11832,100 @@ fn is_extras_folder_below_top(dir: &str, root: &str, naming: &NamingOptions) -> 
             .contains_key(&entry_name(dir).to_lowercase())
 }
 
+/// What the movie walk resolves in a library: the item kind of a video,
+/// and the library's collection type.
+#[derive(Debug, Clone, Copy)]
+struct MovieWalk {
+    /// `Movie` or `MusicVideo`.
+    kind: BaseItemKind,
+    /// The library's collection type (`None` for an untyped library).
+    collection_type: Option<CollectionTypeOptions>,
+}
+
+/// How `MovieResolver.ResolveMultipleInternal` resolves a folder's files in
+/// `walk`'s library (`MovieResolver.cs:200-226`): whether alternate versions
+/// group, whether names are parsed, and the collection type it passes on.
+fn movie_walk_resolution(
+    walk: MovieWalk,
+) -> (bool, bool, Option<ferrofin_model::data::CollectionType>) {
+    use ferrofin_model::data::CollectionType;
+    match walk.collection_type {
+        Some(CollectionTypeOptions::musicvideos) => {
+            (true, false, Some(CollectionType::musicvideos))
+        }
+        Some(CollectionTypeOptions::homevideos) => (false, false, Some(CollectionType::homevideos)),
+        // `mixed.collection` parses to no collection type upstream.
+        None | Some(CollectionTypeOptions::mixed) => (false, true, None),
+        Some(_) => (true, true, Some(CollectionType::movies)),
+    }
+}
+
+/// The lone video `ResolveVideos` makes of a folder below the top level that
+/// is no movie's own folder (a plain `Folder` upstream), if it makes exactly
+/// one and it is no extra: that video is not in a mixed folder
+/// (`IsInMixedFolder = Count > 1`, `MovieResolver.cs:283-287`) and so owns
+/// the folder's extras (`BaseItem.SearchesContainingFolderForExtras`).
+/// Otherwise — several items, or one extra, whose folder falls back to
+/// resolving each file as a mixed-folder video (`MovieResolver.cs:167-186`)
+/// — `None`. Without a collection type a folder holding `tvshow.nfo` or
+/// `season.nfo` takes that fallback too (`MovieResolver.cs:256-263`).
+fn lone_video(
+    entries: &[FileSystemEntryInfo],
+    dir: &str,
+    naming: &NamingOptions,
+    walk: MovieWalk,
+) -> Option<ferrofin_naming::video::VideoInfo> {
+    let (multi_editions, parse_name, collection_type) = movie_walk_resolution(walk);
+    if collection_type.is_none()
+        && entries.iter().any(|e| {
+            e.name.eq_ignore_ascii_case("tvshow.nfo") || e.name.eq_ignore_ascii_case("season.nfo")
+        })
+    {
+        return None;
+    }
+    let mut resolved = resolved_videos(
+        entries,
+        dir,
+        naming,
+        multi_editions,
+        parse_name,
+        collection_type,
+    );
+    (resolved.len() == 1 && resolved[0].extra_type.is_none()).then(|| resolved.remove(0))
+}
+
+/// The items upstream's `ResolveVideos` resolves from `entries`, the
+/// listing of the folder `dir` (`MovieResolver.cs:241-287`): the files less
+/// `\bsample\b` names, grouped by `VideoListResolver` — a stack or a version
+/// group is one item, and an extra is one too. Their count decides
+/// `IsInMixedFolder = Count > 1 || parent.IsTopParent`.
+fn resolved_videos(
+    entries: &[FileSystemEntryInfo],
+    dir: &str,
+    naming: &NamingOptions,
+    support_multi_editions: bool,
+    parse_name: bool,
+    collection_type: Option<ferrofin_model::data::CollectionType>,
+) -> Vec<ferrofin_naming::video::VideoInfo> {
+    let videos: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.type_ != FileSystemEntryType::Directory
+                && !video_resolver::is_sample_filename(&e.name)
+        })
+        .filter_map(|e| {
+            video_resolver::resolve(Some(&e.path), false, naming, parse_name, Some(dir))
+        })
+        .collect();
+    ferrofin_naming::video::VideoListResolver::new(naming).resolve(
+        &videos,
+        support_multi_editions,
+        parse_name,
+        Some(dir),
+        collection_type,
+    )
+}
+
 /// An extra the movie walk found, before its owner is known.
 struct MovieExtra {
     /// The extra's file.
@@ -11984,21 +12103,12 @@ fn movie_in_own_folder(
     {
         return None;
     }
-    let videos: Vec<_> = entries
-        .iter()
-        .filter(|e| {
-            e.type_ != FileSystemEntryType::Directory
-                && !video_resolver::is_sample_filename(&e.name)
-        })
-        .filter_map(|e| {
-            video_resolver::resolve(Some(&e.path), false, naming, parse_name, Some(root))
-        })
-        .collect();
-    let movies = ferrofin_naming::video::VideoListResolver::new(naming).resolve(
-        &videos,
+    let movies = resolved_videos(
+        entries,
+        root,
+        naming,
         true,
         parse_name,
-        Some(root),
         Some(ferrofin_model::data::CollectionType::movies),
     );
     let mut titles = movies
@@ -12014,6 +12124,7 @@ fn movie_in_own_folder(
 fn owner_for_extra(
     path: &str,
     movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    naming: &NamingOptions,
 ) -> Option<Uuid> {
     let dir = Path::new(path).parent()?;
     if let Some(movies) = dir.to_str().and_then(|dir| movies_by_dir.get(dir)) {
@@ -12031,6 +12142,16 @@ fn owner_for_extra(
             }
         }
         return Some(owner);
+    }
+    // One level up only from an extras-named folder: `FindExtras` searches
+    // the owner's folder and those subfolders, no other
+    // (`LibraryManager.cs:3459`).
+    let dir_name = dir.file_name()?.to_str()?;
+    if !naming
+        .all_extras_types_folder_names
+        .contains_key(&dir_name.to_lowercase())
+    {
+        return None;
     }
     movies_by_dir
         .get(dir.parent()?.to_str()?)?

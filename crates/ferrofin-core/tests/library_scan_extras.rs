@@ -314,17 +314,35 @@ async fn nested_release_and_mixed_folders_do_not_lend_the_wrong_owner() {
         })
         .await
         .unwrap();
-    assert_eq!(extras.len(), 1);
+    // `Heat (1995)` has a real subfolder, so it is no own-folder movie; its
+    // files resolve to one item (`Heat-sample.mkv` is left out of the count),
+    // which is not in a mixed folder and so owns the folder's extras
+    // (`MovieResolver.cs:283-287`, `BaseItem.SearchesContainingFolderForExtras`).
+    // `Mixed/` resolves to three items (an extra counts), so its videos are
+    // mixed and own nothing.
+    let heat = f.row(MOVIE).await;
+    let other = f.row("Heat (1995)/Release/Other.mkv").await;
+    let mut owners: Vec<_> = extras
+        .iter()
+        .map(|extra| (extra.path.clone().unwrap(), extra.owner_id.clone()))
+        .collect();
+    owners.sort();
+    let at = |relative: &str| f.media.join(relative).to_string_lossy().into_owned();
     assert_eq!(
-        extras[0].owner_id,
-        Some(f.row("Heat (1995)/Release/Other.mkv").await.id)
+        owners,
+        vec![
+            (at(EXTRA), Some(heat.id.clone())),
+            (at("Heat (1995)/Heat-sample.mkv"), Some(heat.id.clone())),
+            (
+                at("Heat (1995)/Release/other-sample.mkv"),
+                Some(other.id.clone())
+            ),
+        ]
     );
-    assert!(f.row(MOVIE).await.is_in_mixed_folder);
-    assert!(
-        !f.row("Heat (1995)/Release/Other.mkv")
-            .await
-            .is_in_mixed_folder
-    );
+    assert!(!heat.is_in_mixed_folder);
+    assert!(!other.is_in_mixed_folder);
+    assert!(f.row("Mixed/First.mkv").await.is_in_mixed_folder);
+    assert!(f.row("Mixed/Second.mkv").await.is_in_mixed_folder);
 }
 
 #[tokio::test]
@@ -1103,4 +1121,97 @@ async fn an_extras_subfolder_holding_several_files_is_a_mixed_folder() {
     assert_eq!(unresolved().await, 1);
     f.scanner.scan_all().await.unwrap();
     assert_eq!(unresolved().await, 0, "the older row is pruned");
+}
+
+/// Upstream `MovieResolverTests.ResolvePath_MovieFolderWithRealSubfolder_DoesNotResolveToSingleMovie`
+/// (its fixture): a folder holding a real subfolder is no movie's own folder.
+/// Derived from `MovieResolver.ResolveVideos` (`MovieResolver.cs:283-306`):
+/// its video is then the folder's one item below the top level, so not in a
+/// mixed folder, named by its parsed file name, and the owner of the folder's
+/// extras (`BaseItem.SearchesContainingFolderForExtras`) — those beside it and
+/// in an extras-named subfolder, not those in another plain subfolder
+/// (`FindExtras`, `LibraryManager.cs:3459`).
+#[tokio::test]
+async fn a_movie_folder_with_a_real_subfolder_holds_a_lone_unmixed_video() {
+    let f = Fixture::new(&[
+        "Outer Colony (2026)/Outer Colony (2026).mkv",
+        "Outer Colony (2026)/Feature/notes.txt",
+        "Outer Colony (2026)/trailers/teaser.mkv",
+        "Outer Colony (2026)/Promo/trailer.mp4",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let lone = f.row("Outer Colony (2026)/Outer Colony (2026).mkv").await;
+    assert!(!lone.is_in_mixed_folder);
+    assert_eq!(lone.name.as_deref(), Some("Outer Colony"));
+    assert_eq!(
+        f.row("Outer Colony (2026)/trailers/teaser.mkv")
+            .await
+            .owner_id
+            .as_ref(),
+        Some(&lone.id)
+    );
+    let promo: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '%/Promo/%'")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(promo, 0, "an extra in a plain subfolder has no owner");
+}
+
+/// A folder whose only resolved item is an extra falls back to resolving
+/// each file on its own, as a mixed-folder video (`ResolvePaths` →
+/// `MovieResolver.cs:167-186`): `Sample.Movie.mkv`, left out of the count by
+/// `\bsample\b` and taken by no extra rule, is a movie in a mixed folder.
+#[tokio::test]
+async fn a_folder_resolving_to_one_extra_is_a_mixed_folder() {
+    let f = Fixture::new(&["X/trailer.mkv", "X/Sample.Movie.mkv", "X/Sub/notes.txt"]).await;
+    f.scanner.scan_all().await.unwrap();
+    assert!(f.row("X/Sample.Movie.mkv").await.is_in_mixed_folder);
+}
+
+/// A home-video library does not group versions (`ResolveVideos<Video>(…,
+/// supportMultiEditions: false, …)`, `MovieResolver.cs:206-209`): two cuts of
+/// one clip beside a real subfolder are two items, so both are mixed.
+#[tokio::test]
+async fn home_video_cuts_are_not_grouped_into_one_item() {
+    let f = Fixture::with_type(
+        &[
+            "Trip/Clip - 1080p.mkv",
+            "Trip/Clip - 720p.mkv",
+            "Trip/Day 2/a.mkv",
+        ],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    for path in ["Trip/Clip - 1080p.mkv", "Trip/Clip - 720p.mkv"] {
+        assert!(f.row(path).await.is_in_mixed_folder, "{path}");
+    }
+}
+
+/// An extras-named folder directly under the library root is a plain folder
+/// no rule ignores (`CoreResolutionIgnoreRule`: top-level folders are never
+/// ignored); its files resolve with the folder as their library root, so the
+/// folder's name makes none of them an extra — they are movies, a lone one
+/// not in a mixed folder, several in one.
+#[tokio::test]
+async fn an_extras_named_folder_at_the_top_holds_movies() {
+    let f = Fixture::new(&[
+        "trailers/Lone.mkv",
+        "featurettes/A.mkv",
+        "featurettes/B.mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    for (path, mixed) in [
+        ("trailers/Lone.mkv", false),
+        ("featurettes/A.mkv", true),
+        ("featurettes/B.mkv", true),
+    ] {
+        let row = f.row(path).await;
+        assert!(row.type_.ends_with(".Movie"), "{path}: {}", row.type_);
+        assert_eq!(row.owner_id, None, "{path}");
+        assert_eq!(row.is_in_mixed_folder, mixed, "{path}");
+    }
 }
