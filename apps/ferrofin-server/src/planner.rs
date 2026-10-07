@@ -1864,10 +1864,33 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn raw_query_params_match_keys_ignoring_case() {
+        // The transcode URL reaches the planner as sent (the server no longer
+        // folds query keys), and ASP.NET's `IQueryCollection` ignores case.
+        for query in [
+            "?SubtitleStreamIndex=3&SubtitleMethod=Encode",
+            "?subtitleStreamIndex=3&subtitleMethod=Encode",
+            "?SUBTITLESTREAMINDEX=3&subtitlemethod=Encode",
+        ] {
+            assert_eq!(
+                query_param_i32(query, "SubtitleStreamIndex"),
+                Some(3),
+                "{query}"
+            );
+            assert_eq!(
+                query_param(query, "SubtitleMethod"),
+                Some("Encode"),
+                "{query}"
+            );
+        }
+    }
 
     /// A fake [`MediaSourceManager`] returning a fixed source list, plus the
     /// open live streams `get_live_stream` can hand back.

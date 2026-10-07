@@ -127,3 +127,22 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(erase_provider_segments),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::include_segment_types;
+
+    #[test]
+    fn include_segment_types_matches_the_key_ignoring_case() {
+        let pairs = [
+            ("IncludeSegmentTypes".to_owned(), "Intro".to_owned()),
+            ("includesegmenttypes".to_owned(), "Outro".to_owned()),
+            ("other".to_owned(), "x".to_owned()),
+        ];
+        assert_eq!(
+            include_segment_types(&pairs).as_deref(),
+            Some("Intro,Outro")
+        );
+        assert_eq!(include_segment_types(&[]), None);
+    }
+}

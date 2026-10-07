@@ -1279,6 +1279,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_api_key_query_parameter_matches_ignoring_case() {
+        // Upstream reads `Request.Query["ApiKey"]`, and ASP.NET's
+        // `IQueryCollection` is case-insensitive; the server no longer folds
+        // query keys before this lookup, so it must ignore case itself.
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x22);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+        let ctx = context(db.clone());
+        for query in ["apikey=dev-tok", "APIKEY=dev-tok", "apiKey=dev-tok"] {
+            let info = ctx
+                .get_authorization_info(&query_request(query))
+                .await
+                .unwrap();
+            assert!(info.is_authenticated, "{query}");
+            assert_eq!(info.user_id(), uid, "{query}");
+        }
+    }
+
+    #[tokio::test]
     async fn cached_token_is_served_without_the_database_until_cleared() {
         let db = crate::test_support::test_db().await;
         let uid = Uuid::from_u128(8);

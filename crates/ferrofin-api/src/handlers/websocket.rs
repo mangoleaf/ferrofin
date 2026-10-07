@@ -216,8 +216,8 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
-/// The host normalizes the SDK's `ApiKey` to `apiKey` before this handler.
+/// Extracts a query-string parameter case-insensitively, as Jellyfin does
+/// (keys arrive as the client sent them: `ApiKey`, `apiKey`, `api_key`).
 /// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|pair| {
