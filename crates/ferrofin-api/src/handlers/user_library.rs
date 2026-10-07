@@ -864,6 +864,16 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/CriticReviews", get(get_critic_reviews))
 }
 
+crate::query::query_parameters! {
+    UserIdQuery {} => [("post", "/UserFavoriteItems/{itemId}"), ("delete", "/UserFavoriteItems/{itemId}"), ("delete", "/UserItems/{itemId}/Rating"), ("get", "/UserItems/{itemId}/UserData"), ("post", "/UserItems/{itemId}/UserData"), ("get", "/Items/Root"), ("get", "/Items/{itemId}/LocalTrailers"), ("get", "/Items/{itemId}/SpecialFeatures"), ("get", "/Items/{itemId}/Intros")];
+    RatingQuery {} => [("post", "/UserItems/{itemId}/Rating")];
+    LatestQuery {
+        "fields" => ',',
+        "includeItemTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items/Latest")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::type_name_matches;

@@ -367,3 +367,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(from_music_genre_name),
         )
 }
+crate::query::query_parameters! {
+    InstantMixQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Songs/{itemId}/InstantMix"), ("get", "/Albums/{itemId}/InstantMix"), ("get", "/Playlists/{itemId}/InstantMix"), ("get", "/Artists/{itemId}/InstantMix"), ("get", "/Items/{itemId}/InstantMix"), ("get", "/MusicGenres/{name}/InstantMix"), ("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
+    InstantMixIdQuery {} => [("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
+}

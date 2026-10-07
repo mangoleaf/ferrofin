@@ -1873,6 +1873,41 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/LiveTv/Tuners/{tunerId}/Reset", post(reset_tuner))
 }
 
+crate::query::query_parameters! {
+    ChannelsQuery {
+        "enableImageTypes" => ',',
+        "fields" => ',',
+        "sortBy" => ',',
+    } => [("get", "/LiveTv/Channels")];
+    UserIdQuery {} => [("get", "/LiveTv/Channels/{channelId}"), ("get", "/LiveTv/Programs/{programId}")];
+    ProgramsQuery {
+        "channelIds" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "enableImageTypes" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs")];
+    RecommendedProgramsQuery {
+        "enableImageTypes" => ',',
+        "genreIds" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs/Recommended")];
+    IdQuery {} => [("delete", "/LiveTv/TunerHosts"), ("delete", "/LiveTv/ListingProviders")];
+    RecordingsQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/LiveTv/Recordings")];
+    LiveTvUserQuery {} => [("get", "/LiveTv/Recordings/{recordingId}"), ("get", "/LiveTv/Recordings/Folders")];
+    TimersQuery {} => [("get", "/LiveTv/Timers")];
+    TimerDefaultsQuery {} => [("get", "/LiveTv/Timers/Defaults")];
+    SeriesTimersQuery {} => [("get", "/LiveTv/SeriesTimers")];
+    ChannelMappingOptionsQuery {} => [("get", "/LiveTv/ChannelMappingOptions")];
+    LineupsQuery {} => [("get", "/LiveTv/ListingProviders/Lineups")];
+    DiscoverTunersQuery {} => [("get", "/LiveTv/Tuners/Discover")];
+}
+
 #[cfg(test)]
 mod tests {
     use ferrofin_traits::options::AuthorizationInfo;

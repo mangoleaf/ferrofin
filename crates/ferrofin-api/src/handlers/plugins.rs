@@ -805,6 +805,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    PackageInfoQuery {} => [("get", "/Packages/{name}")];
+    InstallPackageQuery {} => [("post", "/Packages/Installed/{name}")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_assembly_guid;

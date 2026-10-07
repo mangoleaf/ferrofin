@@ -1066,6 +1066,11 @@ async fn get_metadata_editor(
     Ok(Json(info))
 }
 
+crate::query::query_parameters! {
+    ContentTypeQuery {} => [("post", "/Items/{itemId}/ContentType")];
+    RefreshQuery {} => [("post", "/Items/{itemId}/Refresh")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{UpdateItemRequest, containing_folder_path, join_distinct, non_empty};

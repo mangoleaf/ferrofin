@@ -1130,6 +1130,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Users/Me", get(get_current_user))
 }
 
+crate::query::query_parameters! {
+    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
+    GetUsersQuery {} => [("get", "/Users")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

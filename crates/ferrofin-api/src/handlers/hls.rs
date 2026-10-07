@@ -668,6 +668,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/universal")];
+    StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
+    HlsQueryPub {} => [("get", "/Audio/{itemId}/universal")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

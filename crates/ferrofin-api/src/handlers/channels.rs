@@ -216,3 +216,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Channels/{channelId}/Items", get(get_channel_items))
         .route("/Channels/Items/Latest", get(get_latest_channel_items))
 }
+crate::query::query_parameters! {
+    ChannelUserQuery {} => [("get", "/Channels"), ("get", "/Channels/{channelId}/Items"), ("get", "/Channels/Items/Latest")];
+}

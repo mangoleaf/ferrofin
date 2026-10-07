@@ -937,6 +937,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    CreateSegmentQuery {} => [];
+    EraseQuery {} => [];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

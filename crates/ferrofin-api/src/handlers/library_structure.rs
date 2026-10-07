@@ -581,3 +581,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             post(update_media_path),
         )
 }
+crate::query::query_parameters! {
+    AddVirtualFolderQuery {
+        "paths" => ',',
+    } => [("post", "/Library/VirtualFolders")];
+    RemoveVirtualFolderQuery {} => [("delete", "/Library/VirtualFolders")];
+    RenameVirtualFolderQuery {} => [("post", "/Library/VirtualFolders/Name")];
+    MediaPathQuery {} => [("post", "/Library/VirtualFolders/Paths"), ("delete", "/Library/VirtualFolders/Paths")];
+}

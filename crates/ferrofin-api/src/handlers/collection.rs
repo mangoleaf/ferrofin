@@ -180,3 +180,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         post(add_to_collection).delete(remove_from_collection),
     )
 }
+crate::query::query_parameters! {
+    CreateCollectionQuery {
+        "ids" => ',',
+    } => [("post", "/Collections")];
+    CollectionItemsQuery {
+        "ids" => ',',
+    } => [("post", "/Collections/{collectionId}/Items"), ("delete", "/Collections/{collectionId}/Items")];
+}

@@ -17,7 +17,41 @@ use serde::de::{self, DeserializeOwned, Visitor};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
 
-impl<T: DeserializeOwned> Query<T> {
+/// Collection fields carried as delimited strings by a typed query DTO.
+///
+/// Every other field is scalar. Metadata belongs to the DTO because names such
+/// as `id`, `sortBy` and `type` have different cardinality on different routes.
+pub trait QueryParameters: DeserializeOwned {
+    /// Accepted field names and their collection delimiters (comma or pipe).
+    const COLLECTIONS: &'static [(&'static str, char)];
+}
+
+impl QueryParameters for Vec<(String, String)> {
+    const COLLECTIONS: &'static [(&'static str, char)] = &[];
+}
+
+/// Keep each module's cardinality declarations beside its query DTOs. Requiring
+/// the trait on the extractor makes a newly added DTO an explicit audit point.
+macro_rules! query_parameters {
+    ($($ty:ident { $($field:literal => $delimiter:literal),* $(,)? }
+        => [$($route:expr),* $(,)?];)*) => {
+        $(impl $crate::query::QueryParameters for $ty {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[$(($field, $delimiter)),*];
+        })*
+
+        #[cfg(test)]
+        mod query_contract {
+            #[test]
+            fn collection_metadata_matches_contract() {
+                $($crate::query::tests::assert_contract::<super::$ty>(&[$($route),*]);)*
+            }
+        }
+    };
+}
+
+pub(crate) use query_parameters;
+
+impl<T: QueryParameters> Query<T> {
     /// Binds query parameters using the same rules as the HTTP extractor.
     ///
     /// # Errors
@@ -37,7 +71,7 @@ impl<T: DeserializeOwned> Query<T> {
     }
 }
 
-impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Query<T> {
+impl<T: QueryParameters, S: Send + Sync> FromRequestParts<S> for Query<T> {
     type Rejection = QueryRejection;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
@@ -170,8 +204,69 @@ fn decoded_key(key: &str) -> Cow<'_, str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Query;
+
+    /// Audit every implemented query field against the newest vendored operation
+    /// that declares it. The older contract still covers removed/legacy routes;
+    /// newer cardinality takes precedence (e.g. DELETE /Devices now takes ids).
+    pub(crate) fn assert_contract<T: super::QueryParameters>(routes: &[(&str, &str)]) {
+        use std::sync::OnceLock;
+        static SPECS: OnceLock<[serde_json::Value; 2]> = OnceLock::new();
+        let specs = SPECS.get_or_init(|| {
+            [
+                serde_json::from_str(include_str!(
+                    "../../../contracts/jellyfin-openapi-12.1.0.json"
+                ))
+                .unwrap(),
+                serde_json::from_str(include_str!(
+                    "../../../contracts/jellyfin-openapi-10.11.8.json"
+                ))
+                .unwrap(),
+            ]
+        });
+        let fields = super::fields::<T>();
+        for &(name, delimiter) in T::COLLECTIONS {
+            assert!(
+                fields.iter().any(|f| f.eq_ignore_ascii_case(name)),
+                "{}: unknown collection {name}",
+                std::any::type_name::<T>()
+            );
+            assert!(matches!(delimiter, ',' | '|'));
+        }
+        for &(method, path) in routes {
+            assert!(
+                specs
+                    .iter()
+                    .any(|spec| spec["paths"][path][method].is_object()),
+                "unknown operation: {method} {path}"
+            );
+            for field in fields {
+                let param = specs.iter().find_map(|spec| {
+                    spec["paths"][path][method]["parameters"]
+                        .as_array()?
+                        .iter()
+                        .find(|p| {
+                            p["in"] == "query"
+                                && p["name"]
+                                    .as_str()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(field))
+                        })
+                });
+                if let Some(param) = param {
+                    let collection = T::COLLECTIONS
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(field));
+                    assert_eq!(
+                        collection,
+                        param["schema"]["type"] == "array",
+                        "{}: {method} {path}?{field}",
+                        std::any::type_name::<T>()
+                    );
+                }
+            }
+        }
+    }
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -180,6 +275,10 @@ mod tests {
         device_id: Option<String>,
         #[serde(rename = "is4K")]
         is_4k: Option<bool>,
+    }
+
+    impl super::QueryParameters for Parameters {
+        const COLLECTIONS: &'static [(&'static str, char)] = &[];
     }
 
     #[test]

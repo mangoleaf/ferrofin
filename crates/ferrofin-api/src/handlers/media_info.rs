@@ -939,6 +939,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Playback/BitrateTest", get(get_bitrate_test))
 }
 
+crate::query::query_parameters! {
+    PlaybackInfoQuery {} => [("get", "/Items/{itemId}/PlaybackInfo"), ("post", "/Items/{itemId}/PlaybackInfo")];
+    OpenLiveStreamQuery {} => [("post", "/LiveStreams/Open")];
+    CloseLiveStreamQuery {} => [("post", "/LiveStreams/Close")];
+    BitrateTestQuery {} => [("get", "/Playback/BitrateTest")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

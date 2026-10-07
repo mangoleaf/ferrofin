@@ -683,3 +683,25 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Shows/{itemId}/Seasons", get(get_seasons))
         .route("/Shows/{itemId}/Similar", get(get_similar_shows))
 }
+crate::query::query_parameters! {
+    NextUpParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/NextUp")];
+    UpcomingParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/Upcoming")];
+    EpisodesParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Episodes")];
+    SeasonsParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Seasons")];
+    SimilarParams {
+        "excludeArtistIds" => ',',
+        "fields" => ',',
+    } => [("get", "/Shows/{itemId}/Similar")];
+}

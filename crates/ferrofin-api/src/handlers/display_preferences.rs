@@ -512,3 +512,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         get(get_display_preferences).post(update_display_preferences),
     )
 }
+crate::query::query_parameters! {
+    DisplayPreferencesParams {} => [("get", "/DisplayPreferences/{displayPreferencesId}"), ("post", "/DisplayPreferences/{displayPreferencesId}")];
+}

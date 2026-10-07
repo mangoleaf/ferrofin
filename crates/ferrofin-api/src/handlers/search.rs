@@ -152,3 +152,10 @@ async fn get_search_hints(
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Search/Hints", get(get_search_hints))
 }
+crate::query::query_parameters! {
+    SearchHintsQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+    } => [("get", "/Search/Hints")];
+}

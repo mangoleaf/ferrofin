@@ -258,3 +258,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_device_options).post(update_device_options),
         )
 }
+crate::query::query_parameters! {
+    GetDevicesQuery {} => [("get", "/Devices")];
+    DeviceIdQuery {} => [("get", "/Devices/Info"), ("get", "/Devices/Options"), ("post", "/Devices/Options")];
+    DeleteDevicesQuery {
+        "id" => ',',
+    } => [("delete", "/Devices")];
+}

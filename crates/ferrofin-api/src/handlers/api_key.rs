@@ -100,3 +100,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Auth/Keys", get(get_keys).post(create_key))
         .route("/Auth/Keys/{key}", delete(revoke_key))
 }
+crate::query::query_parameters! {
+    CreateKeyQuery {} => [("post", "/Auth/Keys")];
+}

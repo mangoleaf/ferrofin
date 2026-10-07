@@ -767,3 +767,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Library/Movies/Updated", post(post_updated_movies))
         .route("/Library/Media/Updated", post(post_updated_media))
 }
+crate::query::query_parameters! {
+    ThemeMediaQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+    } => [("get", "/Items/{itemId}/ThemeSongs"), ("get", "/Items/{itemId}/ThemeVideos"), ("get", "/Items/{itemId}/ThemeMedia")];
+    MediaFoldersQuery {} => [("get", "/Library/MediaFolders")];
+    AvailableOptionsQuery {} => [("get", "/Libraries/AvailableOptions")];
+    SeriesUpdatedQuery {} => [("post", "/Library/Series/Updated")];
+    MoviesUpdatedQuery {} => [("post", "/Library/Movies/Updated")];
+}

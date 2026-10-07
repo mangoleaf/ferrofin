@@ -231,6 +231,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    UserViewsQuery {} => [("get", "/UserViews"), ("get", "/UserViews/GroupingOptions")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -767,6 +767,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    MarkPlayedQuery {} => [("post", "/UserPlayedItems/{itemId}")];
+    UserIdQuery {} => [("delete", "/UserPlayedItems/{itemId}")];
+    PingQuery {} => [("post", "/Sessions/Playing/Ping")];
+    LegacyStartQuery {} => [("post", "/PlayingItems/{itemId}")];
+    LegacyProgressQuery {} => [("post", "/PlayingItems/{itemId}/Progress")];
+    LegacyStopQuery {} => [("delete", "/PlayingItems/{itemId}")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PlaybackPhase, is_theme_media, playback_item_name, playback_notification_type};

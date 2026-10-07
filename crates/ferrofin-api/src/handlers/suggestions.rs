@@ -113,3 +113,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/Suggestions", get(get_suggestions))
         .route("/Users/{userId}/Suggestions", get(get_suggestions_for_user))
 }
+crate::query::query_parameters! {
+    SuggestionsQuery {
+        "mediaType" => ',',
+        "type" => ',',
+    } => [("get", "/Items/Suggestions")];
+}

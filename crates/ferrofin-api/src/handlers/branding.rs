@@ -242,3 +242,6 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .delete(delete_splashscreen),
         )
 }
+crate::query::query_parameters! {
+    SplashscreenQuery {} => [("get", "/Branding/Css")];
+}
