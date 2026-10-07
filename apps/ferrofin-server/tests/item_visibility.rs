@@ -452,3 +452,211 @@ async fn hidden_items_return_404_before_direct_reads_and_writes() {
     assert_eq!(item["Name"], "Gamma (2001)");
     assert!(f.h.path("more/Gamma (2001)/Gamma (2001).mkv").exists());
 }
+
+async fn image_response(
+    f: &Fixture,
+    uri: &str,
+    token: Option<&str>,
+    head: bool,
+    etag: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method(if head { "HEAD" } else { "GET" })
+        .uri(uri);
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, format!(r#"MediaBrowser Token="{token}", Client="test", Device="d", DeviceId="image-test", Version="1""#));
+    }
+    if let Some(etag) = etag {
+        request = request.header(header::IF_NONE_MATCH, etag);
+    }
+    f.router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn hidden_images_and_indirect_media_are_checked_before_cached_responses() {
+    let f = fixture().await;
+    let id = uuid::Uuid::parse_str(&f.hidden).unwrap();
+    let png: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2,
+        0, 0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0,
+        68, 12, 16, 10, 0, 31, 238, 3, 253, 139, 95, 20, 212, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+        96, 130,
+    ];
+    f.h.wired
+        .state
+        .providers
+        .save_image(
+            id,
+            png,
+            "image/png",
+            ferrofin_model::entities::ImageType::Primary,
+            None,
+        )
+        .await
+        .unwrap();
+    let uri = format!("/Items/{id}/Images/Primary");
+    let tagged_uri = format!("{uri}?tag=fixture");
+    let response = image_response(&f, &tagged_uri, Some(&f.admin), false, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let image_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!image_bytes.is_empty());
+    assert_eq!(
+        image_response(&f, &tagged_uri, Some(&f.admin), false, Some(&etag))
+            .await
+            .status(),
+        StatusCode::NOT_MODIFIED
+    );
+    // An administrator's warmed image/transform cache never authorizes another user.
+    for uri in [
+        tagged_uri,
+        format!("{uri}/0?tag=fixture"),
+        format!("{uri}/0/fixture/Png/100/100/0/0"),
+        format!("{uri}?maxWidth=1&tag=fixture"),
+    ] {
+        assert_eq!(
+            image_response(&f, &uri, Some(&f.admin), false, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        for head in [false, true] {
+            for etag in [None, Some(etag.as_str())] {
+                assert_eq!(
+                    image_response(&f, &uri, Some(&f.viewer), head, etag)
+                        .await
+                        .status(),
+                    StatusCode::NOT_FOUND,
+                    "{uri}"
+                );
+            }
+        }
+    }
+    // Upstream permits user-less public images; retain that policy.
+    assert_eq!(
+        image_response(&f, &uri, None, false, None).await.status(),
+        StatusCode::OK
+    );
+    for uri in [
+        format!("/Items/{id}/Images"),
+        format!("/Items/{id}/Ancestors"),
+        format!("/MediaSegments/{id}"),
+        format!("/Videos/{id}/{id}/Attachments/0"),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&f.viewer), None).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    f.h.wired
+        .state
+        .trickplay
+        .save_trickplay_info(&ferrofin_db::entities::playback::TrickplayInfoEntity {
+            item_id: ferrofin_db::store::guid_to_db(id),
+            width: 320,
+            height: 180,
+            interval: 1000,
+            bandwidth: 100,
+            thumbnail_count: 1,
+            tile_width: 1,
+            tile_height: 1,
+        })
+        .await
+        .unwrap();
+    let tile =
+        f.h.wired
+            .state
+            .trickplay
+            .get_trickplay_tile_path(id, 320, 0)
+            .await
+            .unwrap()
+            .unwrap();
+    touch(Path::new(&tile), "synthetic tile");
+    for uri in [
+        format!("/Videos/{id}/Trickplay/320/0.jpg"),
+        format!(
+            "/Videos/{}/Trickplay/320/0.jpg?mediaSourceId={id}",
+            f.allowed
+        ),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&f.admin), None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&f.viewer), None).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    // The tile playlist is intentionally unscoped in the upstream controller.
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Videos/{id}/Trickplay/320/tiles.m3u8"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["IsAdministrator"] = json!(true);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(policy)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (method, uri) in [
+        ("DELETE", format!("/Items/{id}/Images/Primary")),
+        ("DELETE", format!("/Items/{id}/Images/Primary/0")),
+        ("POST", format!("/Items/{id}/Images/Primary")),
+        ("POST", format!("/Items/{id}/Images/Primary/0")),
+        (
+            "POST",
+            format!("/Items/{id}/Images/Backdrop/0/Index?newIndex=1"),
+        ),
+    ] {
+        assert_eq!(
+            call(&f.router, method, &uri, Some(&f.viewer), None).await.0,
+            StatusCode::NOT_FOUND,
+            "{method} {uri}"
+        );
+    }
+    assert_eq!(
+        image_response(&f, &uri, Some(&f.admin), false, None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}

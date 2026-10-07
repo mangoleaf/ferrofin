@@ -963,18 +963,20 @@ async fn item_image_wrong_type_is_404() {
 }
 
 #[tokio::test]
-async fn serving_an_item_image_reads_no_item_row() {
-    // The hot path: the image row the handler found already proves the item
-    // exists (`BaseItemImageInfos.ItemId` is a cascading foreign key), so the
-    // served request must not also read `BaseItems`. Restoring the eager
-    // existence check makes this one, not zero.
+async fn authenticated_image_aliases_resolve_the_item_before_serving() {
+    // An existing image row proves existence, but does not establish visibility.
+    // Every authenticated alias must resolve the item before serving bytes.
     let img = TempImage::new(b"IMAGEBYTES");
     let s = stubs(img.path(), String::new());
 
     let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"IMAGEBYTES");
-    assert_eq!(s.library.item_reads(), 0, "served image read an item row");
+    assert_eq!(
+        s.library.item_reads(),
+        1,
+        "served image must check visibility"
+    );
 
     // Same for the indexed and fully-parametrized aliases.
     let (status, _) = send(
@@ -993,20 +995,22 @@ async fn serving_an_item_image_reads_no_item_row() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(s.library.item_reads(), 0, "alias route read an item row");
+    assert_eq!(
+        s.library.item_reads(),
+        3,
+        "each alias must check visibility"
+    );
 }
 
 #[tokio::test]
 async fn item_image_404_still_tells_missing_item_from_missing_image() {
-    // The item read moved onto the miss path — it did not disappear. A request
-    // for an item that does not exist still says so, and one for an item that
-    // exists but has no image of that type still names the image.
+    // Missing items and missing images retain their respective responses.
     let img = TempImage::new(b"X");
     let s = stubs(img.path(), String::new());
 
     let missing = Uuid::from_u128(0xDEAD);
 
-    // All THREE route shapes that pass `ItemResolved::No` must keep the
+    // All three item-image route shapes must keep the
     // distinction — the bare route, the indexed alias, and the fully
     // parametrized alias. Flipping either alias to `ItemResolved::Yes` changes
     // its missing-item body from "item {id}" to "item {id} has no Primary image

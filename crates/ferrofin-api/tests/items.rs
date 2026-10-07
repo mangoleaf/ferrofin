@@ -391,6 +391,13 @@ impl LibraryManager for OkLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == PLAYLIST_ID {
+            return Ok(Some(item_entity(
+                PLAYLIST_ID,
+                "Playlist",
+                BaseItemKind::Playlist,
+            )));
+        }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
             return Ok(Some(item_entity(
                 COLLECTION_FOLDER_ID,

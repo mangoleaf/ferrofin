@@ -122,7 +122,7 @@ async fn get_trickplay_hls_playlist(
 )]
 async fn get_trickplay_tile_image(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, width, index)): Path<(Uuid, i32, String)>,
     Query(query): Query<TrickplayQuery>,
     request: Request,
@@ -131,6 +131,7 @@ async fn get_trickplay_tile_image(
     // the `.jpg` literal is parsed off here (as the HLS segment handlers do).
     let index = parse_segment_index(&index)?;
     let source_id = query.media_source_id.unwrap_or(item_id);
+    crate::handlers::items::require_visible_item(&state, source_id, auth.user.as_ref()).await?;
     let Some(path) = state
         .trickplay
         .get_trickplay_tile_path(source_id, width, index)

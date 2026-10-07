@@ -909,6 +909,7 @@ async fn get_ancestors(
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_item(&state, item_id, user.as_ref()).await?;
     let mut chain = state
         .library
         .get_ancestors(item_id)
