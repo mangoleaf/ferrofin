@@ -40,7 +40,6 @@
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
 //! final while the on-disk pipeline is a later wave.
 
-use crate::extract::Query;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -58,6 +57,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::image_upload::{
     decode_base64, image_extension_from_content_type, image_mime_from_content_type,
 };

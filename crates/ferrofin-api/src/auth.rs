@@ -438,6 +438,7 @@ fn day_of_week_contains(
         D::Thursday => weekday == Weekday::Thu,
         D::Friday => weekday == Weekday::Fri,
         D::Saturday => weekday == Weekday::Sat,
+        D::Unrecognized(_) => false,
     }
 }
 

@@ -53,7 +53,6 @@
 //! - `GET /Channels/{channelId}/Items` — a channel's items (400: no provider).
 //! - `GET /Channels/Items/Latest` — latest items across channels (empty).
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -64,6 +63,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 

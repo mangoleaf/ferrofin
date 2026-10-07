@@ -306,6 +306,25 @@ async fn hidden_items_return_404_before_direct_reads_and_writes() {
         .0,
         StatusCode::OK
     );
+    // Shared JSON binding still runs before the per-user visibility check:
+    // quoted numbers bind with mixed-case keys, while padded integers are 400.
+    for (item_id, bitrate, expected) in [
+        (&f.allowed, "140000000", StatusCode::OK),
+        (&f.hidden, "140000000", StatusCode::NOT_FOUND),
+        (&f.allowed, " 140000000", StatusCode::BAD_REQUEST),
+        (&f.hidden, " 140000000", StatusCode::BAD_REQUEST),
+    ] {
+        let uri = format!("/Items/{item_id}/PlaybackInfo");
+        let (status, body) = call(
+            &f.router,
+            "POST",
+            &uri,
+            Some(&f.viewer),
+            Some(json!({"mAxStReAmInGbItRaTe": bitrate})),
+        )
+        .await;
+        assert_eq!(status, expected, "{uri}, bitrate {bitrate:?}: {body}");
+    }
     for uri in [
         format!("/Items/{id}"),
         format!("/Users/{}/Items/{id}", f.viewer_id),

@@ -31,14 +31,17 @@ pub struct SearchHint {
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the primary image tag.
@@ -67,10 +70,12 @@ pub struct SearchHint {
 
     /// Gets or sets a value indicating whether this instance is a folder.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_folder: Option<bool>,
 
     /// Gets or sets the run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
 
     /// Gets or sets the type of the media.
@@ -115,10 +120,12 @@ pub struct SearchHint {
 
     /// Gets or sets the song count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub song_count: Option<i32>,
 
     /// Gets or sets the episode count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub episode_count: Option<i32>,
 
     /// Gets or sets the channel identifier.
@@ -133,6 +140,7 @@ pub struct SearchHint {
 
     /// Gets or sets the primary image aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub primary_image_aspect_ratio: Option<f64>,
 }
 
@@ -173,10 +181,12 @@ pub struct SearchQuery {
 
     /// Gets or sets the start index. Used for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets a value indicating whether to include people.
@@ -211,22 +221,27 @@ pub struct SearchQuery {
 
     /// Gets or sets a value indicating whether the item is a movie.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether the item is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets a value indicating whether the item is news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether the item is kids content.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether the item is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 }
 

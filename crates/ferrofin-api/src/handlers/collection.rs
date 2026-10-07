@@ -16,7 +16,6 @@
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -27,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 

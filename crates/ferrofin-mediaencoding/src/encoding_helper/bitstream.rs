@@ -100,7 +100,7 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     }
     let wants = |t: VideoRangeType| {
         let name = range_type_name(t);
-        requested.iter().any(|r| r.eq_ignore_ascii_case(name))
+        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
     };
     let has_hdr10 = wants(VideoRangeType::Hdr10);
     let has_dovi = wants(VideoRangeType::Dovi);
@@ -142,22 +142,8 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
 }
 
 /// The wire name of a range type, as the client spells it in its profile.
-fn range_type_name(t: VideoRangeType) -> &'static str {
-    match t {
-        VideoRangeType::Unknown => "Unknown",
-        VideoRangeType::Sdr => "SDR",
-        VideoRangeType::Hdr10 => "HDR10",
-        VideoRangeType::Hlg => "HLG",
-        VideoRangeType::Dovi => "DOVI",
-        VideoRangeType::DoviWithHdr10 => "DOVIWithHDR10",
-        VideoRangeType::DoviWithHlg => "DOVIWithHLG",
-        VideoRangeType::DoviWithSdr => "DOVIWithSDR",
-        VideoRangeType::DoviWithEl => "DOVIWithEL",
-        VideoRangeType::DoviWithHdr10Plus => "DOVIWithHDR10Plus",
-        VideoRangeType::DoviWithElhdr10Plus => "DOVIWithELHDR10Plus",
-        VideoRangeType::DoviInvalid => "DOVIInvalid",
-        VideoRangeType::Hdr10Plus => "HDR10Plus",
-    }
+fn range_type_name(t: VideoRangeType) -> String {
+    t.json_name().into_owned()
 }
 
 /// Whether this ffmpeg can perform `plan` on `video_stream`. Port of

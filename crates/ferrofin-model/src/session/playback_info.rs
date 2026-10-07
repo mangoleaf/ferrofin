@@ -54,10 +54,12 @@ pub struct PlaybackProgressInfo {
 
     /// Gets or sets the index of the audio stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
 
     /// Gets or sets the index of the subtitle stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
 
     /// Gets or sets a value indicating whether this instance is paused.
@@ -68,18 +70,22 @@ pub struct PlaybackProgressInfo {
 
     /// Gets or sets the position ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub position_ticks: Option<i64>,
 
     /// Gets or sets the playback start time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub playback_start_time_ticks: Option<i64>,
 
     /// Gets or sets the volume level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub volume_level: Option<i32>,
 
     /// Gets or sets the brightness.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub brightness: Option<i32>,
 
     /// Gets or sets the aspect ratio.
@@ -144,6 +150,7 @@ pub struct PlaybackStopInfo {
 
     /// Gets or sets the position ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub position_ticks: Option<i64>,
 
     /// Gets or sets the live stream identifier.

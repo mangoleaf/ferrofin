@@ -171,9 +171,9 @@ pub fn input_video_hwaccel_args(
         HardwareAccelerationType::amf => amf_input_args(&job),
         HardwareAccelerationType::videotoolbox => videotoolbox_input_args(&job),
         HardwareAccelerationType::rkmpp => rkmpp_input_args(&job),
-        HardwareAccelerationType::v4l2m2m | HardwareAccelerationType::none => {
-            Some(InputHwaccelArgs::default())
-        }
+        HardwareAccelerationType::v4l2m2m
+        | HardwareAccelerationType::none
+        | HardwareAccelerationType::Unrecognized(_) => Some(InputHwaccelArgs::default()),
     };
     let Some(mut out) = branch else {
         return InputHwaccelArgs::default();

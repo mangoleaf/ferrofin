@@ -10,7 +10,6 @@
 //! persistable subset shared with `GET /Items` is honored here (the remainder is
 //! applied by the persistence layer where portable, exactly as for `/Items`).
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -23,6 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;

@@ -18,7 +18,6 @@
 //! the persistence layer where portable and otherwise left to later waves; the
 //! handler maps the request faithfully onto the query struct.
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -33,6 +32,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
@@ -293,7 +293,8 @@ struct ItemsQuery {
     /// Restrict to 4K items.
     #[serde(default, rename = "is4K")]
     is_4k: Option<bool>,
-    /// Restrict to HD items (including jellyfin-web's `IsHD` spelling).
+    /// Restrict to HD items (jellyfin-web's filter dialog sends `IsHD`; keys
+    /// bind ignoring case).
     #[serde(default)]
     is_hd: Option<bool>,
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).

@@ -18,7 +18,6 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// The SQLite database file name inside the data directory.

@@ -69,40 +69,14 @@ impl TryFrom<MediaSegmentEntity> for MediaSegmentDto {
     /// and `ItemId` `Guid`s and the `Type` discriminant.
     ///
     /// # Errors
-    /// Returns [`DbError::InvalidGuid`] for a malformed `Id`/`ItemId`, or
-    /// [`DbError::InvalidEnumValue`] for a `Type` outside `0..=5`.
+    /// Returns [`DbError::InvalidGuid`] for a malformed `Id`/`ItemId`.
     fn try_from(entity: MediaSegmentEntity) -> Result<Self, Self::Error> {
         Ok(Self {
             id: parse_guid("MediaSegments.Id", &entity.id)?,
             item_id: parse_guid("MediaSegments.ItemId", &entity.item_id)?,
-            type_: media_segment_type_from_i32(entity.type_)?,
+            type_: MediaSegmentType::from_json_value(entity.type_),
             start_ticks: entity.start_ticks,
             end_ticks: entity.end_ticks,
         })
     }
-}
-
-/// Reads a [`MediaSegmentType`] from its stored `INTEGER` discriminant.
-///
-/// Discriminants match the C# `MediaSegmentType` declaration order (0-based),
-/// mirrored by the target enum.
-///
-/// # Errors
-/// Returns [`DbError::InvalidEnumValue`] for a discriminant outside `0..=5`.
-fn media_segment_type_from_i32(value: i32) -> Result<MediaSegmentType, DbError> {
-    let kind = match value {
-        0 => MediaSegmentType::Unknown,
-        1 => MediaSegmentType::Commercial,
-        2 => MediaSegmentType::Preview,
-        3 => MediaSegmentType::Recap,
-        4 => MediaSegmentType::Outro,
-        5 => MediaSegmentType::Intro,
-        other => {
-            return Err(DbError::InvalidEnumValue {
-                enum_name: "MediaSegmentType",
-                value: other,
-            });
-        }
-    };
-    Ok(kind)
 }

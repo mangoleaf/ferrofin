@@ -47,7 +47,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true
 form_urlencoded.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true

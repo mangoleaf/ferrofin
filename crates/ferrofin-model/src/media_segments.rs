@@ -9,8 +9,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// The type of content a media segment defines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaSegmentType {
     /// An unknown segment.
     #[default]
@@ -25,6 +26,20 @@ pub enum MediaSegmentType {
     Outro,
     /// An intro segment.
     Intro,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaSegmentType, None, {
+        Unknown => ("Unknown", 0),
+        Commercial => ("Commercial", 1),
+        Preview => ("Preview", 2),
+        Recap => ("Recap", 3),
+        Outro => ("Outro", 4),
+        Intro => ("Intro", 5),
+    }
 }
 
 /// API model for a media segment.

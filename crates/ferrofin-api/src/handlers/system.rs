@@ -6,7 +6,6 @@
 //! Jellyfin auth policies (elevation/local-access) applied at the composition
 //! root; the [`RequireAuth`] extractor enforces authentication here.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -20,6 +19,7 @@ use ferrofin_traits::net::RequestContext;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +

@@ -26,7 +26,6 @@
 
 use std::fmt::Write as _;
 
-use crate::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -40,7 +39,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -302,23 +301,23 @@ fn parse_subtitle_format(segment: &str) -> String {
 
 /// Query parameters shared by the on-the-fly subtitle-conversion routes.
 ///
-/// The `PascalCase` aliases match the query keys the server emits in its own HLS
-/// subtitle-playlist links (`stream.vtt?CopyTimestamps=true&AddVttTimeMap=…`), so
-/// those `stream.vtt` requests bind correctly regardless of the client's casing.
+/// Keys bind ignoring case ([`crate::extract::Query`]), so the PascalCase keys
+/// the server emits in its own HLS subtitle-playlist links
+/// (`stream.vtt?CopyTimestamps=true&AddVttTimeMap=…`) reach these fields.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubtitleStreamQuery {
     /// Optional. The end position of the subtitle in ticks.
-    #[serde(default, alias = "EndPositionTicks")]
+    #[serde(default)]
     end_position_ticks: Option<i64>,
     /// Optional. Whether to copy (preserve) the original timestamps.
-    #[serde(default, alias = "CopyTimestamps")]
+    #[serde(default)]
     copy_timestamps: bool,
     /// Optional. Whether to prepend a WebVTT `X-TIMESTAMP-MAP` header.
-    #[serde(default, alias = "AddVttTimeMap")]
+    #[serde(default)]
     add_vtt_time_map: bool,
     /// The start position of the subtitle in ticks.
-    #[serde(default, alias = "StartPositionTicks")]
+    #[serde(default)]
     start_position_ticks: i64,
 }
 

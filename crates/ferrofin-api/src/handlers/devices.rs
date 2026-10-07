@@ -16,7 +16,6 @@
 //! returned every device row — each carrying a plaintext `AccessToken`,
 //! including an administrator's live token — to any authenticated caller.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -27,7 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 

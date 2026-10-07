@@ -17,10 +17,40 @@
 //!   fraction digits are written, otherwise trailing zeros are trimmed (that is
 //!   `Utf8JsonWriter.WriteStringValue(DateTime)`).
 
+mod datetime_input;
+pub mod enums;
+pub mod number;
+pub mod value;
+
 /// `JsonGuidConverter` — `Uuid` fields.
 pub mod guid {
     use serde::{Deserialize, Deserializer, Serializer};
     use uuid::Uuid;
+
+    struct ReadGuid(Uuid);
+
+    impl<'de> Deserialize<'de> for ReadGuid {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct GuidVisitor;
+            impl serde::de::Visitor<'_> for GuidVisitor {
+                type Value = ReadGuid;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a GUID string or null")
+                }
+                fn visit_unit<E: serde::de::Error>(self) -> Result<ReadGuid, E> {
+                    Ok(ReadGuid(Uuid::nil()))
+                }
+                fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<ReadGuid, E> {
+                    ferrofin_util::guid_extensions::parse_dotnet_guid(text)
+                        .map(ReadGuid)
+                        .ok_or_else(|| E::custom("invalid GUID"))
+                }
+            }
+            // deserialize_any deliberately accepts actual strings only: the
+            // string-member coercion must not turn numeric tokens into GUIDs.
+            d.deserialize_any(GuidVisitor)
+        }
+    }
 
     /// Writes `ToString("N")`.
     ///
@@ -37,7 +67,7 @@ pub mod guid {
     ///
     /// Fails when the value is neither a guid string nor `null`.
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Uuid, D::Error> {
-        Ok(Option::<Uuid>::deserialize(deserializer)?.unwrap_or_default())
+        ReadGuid::deserialize(deserializer).map(|guid| guid.0)
     }
 
     /// `JsonNullableGuidConverter` — `Option<Uuid>` fields.
@@ -70,7 +100,8 @@ pub mod guid {
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<Uuid>, D::Error> {
-            Option::<Uuid>::deserialize(deserializer)
+            Option::<super::ReadGuid>::deserialize(deserializer)
+                .map(|value| value.map(|guid| guid.0))
         }
     }
 
@@ -101,7 +132,8 @@ pub mod guid {
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Vec<Uuid>, D::Error> {
-            Vec::<Uuid>::deserialize(deserializer)
+            Vec::<super::ReadGuid>::deserialize(deserializer)
+                .map(|values| values.into_iter().map(|guid| guid.0).collect())
         }
     }
 
@@ -133,7 +165,8 @@ pub mod guid {
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<Vec<Uuid>>, D::Error> {
-            Option::<Vec<Uuid>>::deserialize(deserializer)
+            Option::<Vec<super::ReadGuid>>::deserialize(deserializer)
+                .map(|values| values.map(|ids| ids.into_iter().map(|guid| guid.0).collect()))
         }
     }
 }
@@ -190,10 +223,9 @@ pub mod datetime {
         serializer.serialize_str(&format(value))
     }
 
-    /// Parses what `Utf8JsonReader.GetDateTime` accepts: an ISO 8601 timestamp
-    /// with an offset or `Z`, one without (read as UTC), or a bare date
-    /// (midnight UTC — jellyfin-web's metadata editor sends `"2022-01-01"` for an
-    /// edited date).
+    /// Parses stored and query-string dates, including surrounding whitespace.
+    /// JSON body converters use the stricter `Utf8JsonReader.GetDateTime`
+    /// grammar; this helper retains the broader non-JSON input behavior.
     ///
     /// # Errors
     ///
@@ -216,7 +248,7 @@ pub mod datetime {
         }
     }
 
-    /// Reads a timestamp with [`parse`].
+    /// Reads the strict ISO-8601 grammar of `Utf8JsonReader.GetDateTime`.
     ///
     /// # Errors
     ///
@@ -224,8 +256,8 @@ pub mod datetime {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<DateTime<Utc>, D::Error> {
-        let text = std::borrow::Cow::<str>::deserialize(deserializer)?;
-        parse(&text).map_err(serde::de::Error::custom)
+        let text = super::value::StringToken::deserialize(deserializer)?;
+        super::datetime_input::parse(&text.0).map_err(serde::de::Error::custom)
     }
 
     /// `JsonDateTimeConverter` through `JsonNullableStructConverterFactory` —
@@ -249,7 +281,7 @@ pub mod datetime {
             }
         }
 
-        /// Reads a timestamp with [`super::parse`]; `null`/absent — and `""`,
+        /// Reads a strict ISO-8601 timestamp; `null`/absent — and `""`,
         /// which `JsonNullableStructConverter` reads as null because "some
         /// clients send an empty string" — is `None`.
         ///
@@ -259,10 +291,10 @@ pub mod datetime {
         pub fn deserialize<'de, D: Deserializer<'de>>(
             deserializer: D,
         ) -> Result<Option<DateTime<Utc>>, D::Error> {
-            match Option::<std::borrow::Cow<str>>::deserialize(deserializer)? {
+            match Option::<super::super::value::StringToken>::deserialize(deserializer)? {
                 None => Ok(None),
-                Some(text) if text.trim().is_empty() => Ok(None),
-                Some(text) => super::parse(&text)
+                Some(text) if text.0.is_empty() => Ok(None),
+                Some(text) => super::super::datetime_input::parse(&text.0)
                     .map(Some)
                     .map_err(serde::de::Error::custom),
             }

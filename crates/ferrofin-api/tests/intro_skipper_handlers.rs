@@ -507,6 +507,29 @@ async fn no_op_success_routes() {
     }
 }
 
+/// Upstream binds `UpdateAnalyzerActionsRequest` through the MVC binder: an
+/// object only, names and enum values (keys too) ignoring case.
+#[tokio::test]
+async fn analyzer_actions_bind_like_the_mvc_binder() {
+    let (_seg, app) = state();
+    let uri = "/Intros/AnalyzerActions/UpdateSeason";
+    for body in [
+        r#"{"id":"00000000-0000-0000-0000-000000000000","analyzerActions":{"introduction":"chromaprint","Credits":"None"}}"#,
+        r#"{"Id":"00000000-0000-0000-0000-000000000000","AnalyzerActions":{"Recap":"BlackFrame"}}"#,
+        // `JsonGuidConverter` reads null as the empty id.
+        r#"{"Id":null,"AnalyzerActions":{}}"#,
+        // The plugin UI's own request (web/src/store/api.ts, action-bar.ts).
+        r#"{"id":"28c3ad34d0306759137254e7c81d74e0","analyzerActions":{"Recap":"Default","Introduction":"Chromaprint","Credits":"BlackFrame","Preview":"Chapter","Commercial":"None"}}"#,
+    ] {
+        let (status, _) = send(app.clone(), "POST", uri, body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    for body in ["[]", "5", r#"{"AnalyzerActions":{"Nope":"Default"}}"#] {
+        let (status, _) = send(app.clone(), "POST", uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+}
+
 /// `POST /FileTransformation/RegisterTransformation` registers a callback that
 /// rewrites the JavaScript served to every browser, and each accepted
 /// registration is retained for the life of the process in a registry nothing

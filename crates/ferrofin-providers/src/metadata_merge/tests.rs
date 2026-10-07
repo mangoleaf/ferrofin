@@ -1215,6 +1215,7 @@ fn locked_fields_hold_in_every_mode(
     let pick = |r: &MetadataResult| -> String {
         let i = &r.item;
         match field {
+            MetadataField::Unrecognized(_) => unreachable!("fixture uses a declared field"),
             MetadataField::Name => i.name.clone().unwrap_or_default(),
             MetadataField::Genres => i.genres.clone().unwrap_or_default(),
             MetadataField::OfficialRating => i.official_rating.clone().unwrap_or_default(),

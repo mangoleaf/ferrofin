@@ -10,7 +10,6 @@
 //!   names return `404` like the C#. Also registered under the lowercase
 //!   `configurationpage` spelling jellyfin-web actually requests.
 
-use crate::extract::Query;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -20,6 +19,7 @@ use ferrofin_model::plugins::ConfigurationPageInfo;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Query parameters for `GET /web/ConfigurationPages`.

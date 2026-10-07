@@ -23,7 +23,6 @@
 //! toggles) and honors the `refreshLibrary` query flag by queueing a scan —
 //! mirroring the `finally` block of each C# controller action.
 
-use crate::extract::Query;
 use axum::Router;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
@@ -35,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// Restarts the library monitor so its watch set matches the just-mutated
@@ -491,6 +490,7 @@ struct UpdateLibraryOptionsBody {
     /// The library item id.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
+    #[serde(with = "ferrofin_model::json::guid::option")]
     id: Option<Uuid>,
     /// The library name (Ferrofin's filesystem seam resolves by name; see below).
     #[serde(default)]

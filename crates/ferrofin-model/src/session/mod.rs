@@ -32,8 +32,9 @@ pub use requests::{BrowseRequest, PlayRequest, PlaystateRequest};
 pub use transcoding_info::TranscodingInfo;
 
 /// The play method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum PlayMethod {
     /// The media is transcoded before it is sent to the client.
     #[default]
@@ -42,6 +43,17 @@ pub enum PlayMethod {
     DirectStream = 1,
     /// The media is sent to the client as-is.
     DirectPlay = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    PlayMethod, None, {
+        Transcode => ("Transcode", 0),
+        DirectStream => ("DirectStream", 1),
+        DirectPlay => ("DirectPlay", 2),
+    }
 }
 
 /// Enum `PlayCommand`.
@@ -62,19 +74,31 @@ pub enum PlayCommand {
 }
 
 /// Enum `PlaybackOrder`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum PlaybackOrder {
     /// Sorted playlist.
     #[default]
     Default = 0,
     /// Shuffled playlist.
     Shuffle = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    PlaybackOrder, None, {
+        Default => ("Default", 0),
+        Shuffle => ("Shuffle", 1),
+    }
 }
 
 /// The repeat mode of a play queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum RepeatMode {
     /// Nothing is repeated.
     #[default]
@@ -83,6 +107,17 @@ pub enum RepeatMode {
     RepeatAll = 1,
     /// The current item is repeated.
     RepeatOne = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    RepeatMode, None, {
+        RepeatNone => ("RepeatNone", 0),
+        RepeatAll => ("RepeatAll", 1),
+        RepeatOne => ("RepeatOne", 2),
+    }
 }
 
 /// Enum `PlaystateCommand`.
@@ -111,8 +146,9 @@ pub enum PlaystateCommand {
 }
 
 /// A set of known remote-control commands a client can issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum GeneralCommandType {
     /// Move the focus up.
     MoveUp = 0,
@@ -200,11 +236,63 @@ pub enum GeneralCommandType {
     SetMaxStreamingBitrate = 41,
     /// Set the playback order.
     SetPlaybackOrder = 42,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    GeneralCommandType, None, {
+        MoveUp => ("MoveUp", 0),
+        MoveDown => ("MoveDown", 1),
+        MoveLeft => ("MoveLeft", 2),
+        MoveRight => ("MoveRight", 3),
+        PageUp => ("PageUp", 4),
+        PageDown => ("PageDown", 5),
+        PreviousLetter => ("PreviousLetter", 6),
+        NextLetter => ("NextLetter", 7),
+        ToggleOsd => ("ToggleOsd", 8),
+        ToggleContextMenu => ("ToggleContextMenu", 9),
+        Select => ("Select", 10),
+        Back => ("Back", 11),
+        TakeScreenshot => ("TakeScreenshot", 12),
+        SendKey => ("SendKey", 13),
+        SendString => ("SendString", 14),
+        GoHome => ("GoHome", 15),
+        GoToSettings => ("GoToSettings", 16),
+        VolumeUp => ("VolumeUp", 17),
+        VolumeDown => ("VolumeDown", 18),
+        Mute => ("Mute", 19),
+        Unmute => ("Unmute", 20),
+        ToggleMute => ("ToggleMute", 21),
+        SetVolume => ("SetVolume", 22),
+        SetAudioStreamIndex => ("SetAudioStreamIndex", 23),
+        SetSubtitleStreamIndex => ("SetSubtitleStreamIndex", 24),
+        ToggleFullscreen => ("ToggleFullscreen", 25),
+        DisplayContent => ("DisplayContent", 26),
+        GoToSearch => ("GoToSearch", 27),
+        DisplayMessage => ("DisplayMessage", 28),
+        SetRepeatMode => ("SetRepeatMode", 29),
+        ChannelUp => ("ChannelUp", 30),
+        ChannelDown => ("ChannelDown", 31),
+        Guide => ("Guide", 32),
+        ToggleStats => ("ToggleStats", 33),
+        PlayMediaSource => ("PlayMediaSource", 34),
+        PlayTrailers => ("PlayTrailers", 35),
+        SetShuffleQueue => ("SetShuffleQueue", 36),
+        PlayState => ("PlayState", 37),
+        PlayNext => ("PlayNext", 38),
+        ToggleOsdMenu => ("ToggleOsdMenu", 39),
+        Play => ("Play", 40),
+        SetMaxStreamingBitrate => ("SetMaxStreamingBitrate", 41),
+        SetPlaybackOrder => ("SetPlaybackOrder", 42),
+    }
 }
 
 /// The different kinds of messages used in the WebSocket API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SessionMessageType {
     /// Server → client: force a keep-alive.
     ForceKeepAlive,
@@ -274,6 +362,48 @@ pub enum SessionMessageType {
     ScheduledTasksInfoStop,
     /// Shared: keep-alive.
     KeepAlive,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SessionMessageType, None, {
+        ForceKeepAlive => ("ForceKeepAlive", 0),
+        GeneralCommand => ("GeneralCommand", 1),
+        UserDataChanged => ("UserDataChanged", 2),
+        Sessions => ("Sessions", 3),
+        Play => ("Play", 4),
+        SyncPlayCommand => ("SyncPlayCommand", 5),
+        SyncPlayGroupUpdate => ("SyncPlayGroupUpdate", 6),
+        Playstate => ("Playstate", 7),
+        RestartRequired => ("RestartRequired", 8),
+        ServerShuttingDown => ("ServerShuttingDown", 9),
+        ServerRestarting => ("ServerRestarting", 10),
+        LibraryChanged => ("LibraryChanged", 11),
+        UserDeleted => ("UserDeleted", 12),
+        UserUpdated => ("UserUpdated", 13),
+        SeriesTimerCreated => ("SeriesTimerCreated", 14),
+        TimerCreated => ("TimerCreated", 15),
+        SeriesTimerCancelled => ("SeriesTimerCancelled", 16),
+        TimerCancelled => ("TimerCancelled", 17),
+        RefreshProgress => ("RefreshProgress", 18),
+        ScheduledTaskEnded => ("ScheduledTaskEnded", 19),
+        PackageInstallationCancelled => ("PackageInstallationCancelled", 20),
+        PackageInstallationFailed => ("PackageInstallationFailed", 21),
+        PackageInstallationCompleted => ("PackageInstallationCompleted", 22),
+        PackageInstalling => ("PackageInstalling", 23),
+        PackageUninstalled => ("PackageUninstalled", 24),
+        ActivityLogEntry => ("ActivityLogEntry", 25),
+        ScheduledTasksInfo => ("ScheduledTasksInfo", 26),
+        ActivityLogEntryStart => ("ActivityLogEntryStart", 27),
+        ActivityLogEntryStop => ("ActivityLogEntryStop", 28),
+        SessionsStart => ("SessionsStart", 29),
+        SessionsStop => ("SessionsStop", 30),
+        ScheduledTasksInfoStart => ("ScheduledTasksInfoStart", 31),
+        ScheduledTasksInfoStop => ("ScheduledTasksInfoStop", 32),
+        KeepAlive => ("KeepAlive", 33),
+    }
 }
 
 /// A single reason the server chose to transcode rather than direct-play.
