@@ -92,14 +92,19 @@ impl Default for TranscodingProfile {
 /// Deserializes a [`MediaStreamProtocol`], treating an empty string (or a
 /// missing value) as the default `http` — as Jellyfin's device profiles encode
 /// an unspecified transcoding protocol.
+///
+/// The port of `JsonDefaultStringEnumConverter` over `JsonStringEnumConverter`
+/// (`MediaStreamProtocol` carries `[DefaultValue(http)]`): null and `""` are
+/// the default, and a name matches ignoring case (`"HLS"` is `hls`).
 fn deserialize_protocol<'de, D>(deserializer: D) -> Result<MediaStreamProtocol, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
     match raw.as_deref() {
-        None | Some("" | "http") => Ok(MediaStreamProtocol::http),
-        Some("hls") => Ok(MediaStreamProtocol::hls),
+        None | Some("") => Ok(MediaStreamProtocol::http),
+        Some(name) if name.eq_ignore_ascii_case("http") => Ok(MediaStreamProtocol::http),
+        Some(name) if name.eq_ignore_ascii_case("hls") => Ok(MediaStreamProtocol::hls),
         Some(other) => Err(serde::de::Error::custom(format!(
             "invalid MediaStreamProtocol: {other}"
         ))),
@@ -125,5 +130,29 @@ where
         IntOrString::Int(n) => Ok(n),
         IntOrString::Str(s) if s.is_empty() => Ok(0),
         IntOrString::Str(s) => s.parse().map_err(serde::de::Error::custom),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn protocol(json: &str) -> Result<MediaStreamProtocol, serde_json::Error> {
+        serde_json::from_str::<TranscodingProfile>(json).map(|p| p.protocol)
+    }
+
+    #[test]
+    fn protocol_defaults_to_http_and_matches_ignoring_case() {
+        for (json, want) in [
+            ("{}", MediaStreamProtocol::http),
+            (r#"{"Protocol":null}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":""}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":"HTTP"}"#, MediaStreamProtocol::http),
+            (r#"{"Protocol":"hls"}"#, MediaStreamProtocol::hls),
+            (r#"{"Protocol":"HLS"}"#, MediaStreamProtocol::hls),
+        ] {
+            assert_eq!(protocol(json).expect(json), want, "{json}");
+        }
+        assert!(protocol(r#"{"Protocol":"rtsp"}"#).is_err());
     }
 }

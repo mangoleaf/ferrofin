@@ -1203,8 +1203,9 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
 /// Deserializes a [`MediaStreamType`] from either its PascalCase string name or
 /// its integer discriminant.
 ///
-/// Jellyfin's `System.Text.Json` enum converter accepts both forms on read; the
-/// checked-in test fixtures encode `MediaStream.Type` as an integer.
+/// Jellyfin's `System.Text.Json` enum converter accepts both forms on read, and
+/// matches a name ignoring case (`"audio"` is `Audio`); the checked-in test
+/// fixtures encode `MediaStream.Type` as an integer.
 fn deserialize_media_stream_type<'de, D>(deserializer: D) -> Result<MediaStreamType, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1228,15 +1229,15 @@ where
                 "invalid MediaStreamType discriminant: {other}"
             ))),
         },
-        IntOrString::Str(s) => match s.as_str() {
-            "Audio" => Ok(MediaStreamType::Audio),
-            "Video" => Ok(MediaStreamType::Video),
-            "Subtitle" => Ok(MediaStreamType::Subtitle),
-            "EmbeddedImage" => Ok(MediaStreamType::EmbeddedImage),
-            "Data" => Ok(MediaStreamType::Data),
-            "Lyric" => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType: {other}"
+        IntOrString::Str(s) => match s.to_ascii_lowercase().as_str() {
+            "audio" => Ok(MediaStreamType::Audio),
+            "video" => Ok(MediaStreamType::Video),
+            "subtitle" => Ok(MediaStreamType::Subtitle),
+            "embeddedimage" => Ok(MediaStreamType::EmbeddedImage),
+            "data" => Ok(MediaStreamType::Data),
+            "lyric" => Ok(MediaStreamType::Lyric),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid MediaStreamType: {s}"
             ))),
         },
     }
@@ -1836,6 +1837,16 @@ mod tests {
             let from_str: MediaStream =
                 serde_json::from_value(serde_json::json!({ "Type": str_wire })).unwrap();
             assert_eq!(from_str.stream_type, expected);
+        }
+        // A name matches ignoring case, as `JsonStringEnumConverter` reads it.
+        for (wire, expected) in [
+            ("audio", MediaStreamType::Audio),
+            ("SUBTITLE", MediaStreamType::Subtitle),
+            ("embeddedImage", MediaStreamType::EmbeddedImage),
+        ] {
+            let stream: MediaStream =
+                serde_json::from_value(serde_json::json!({ "Type": wire })).unwrap();
+            assert_eq!(stream.stream_type, expected, "{wire}");
         }
         // Out-of-range int and unknown string both error.
         assert!(serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 })).is_err());

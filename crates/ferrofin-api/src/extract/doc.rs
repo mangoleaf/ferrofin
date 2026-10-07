@@ -15,7 +15,12 @@
 //!   — `{"A":"first","a":"second"}` and `{"a":"first","A":"second"}` both give
 //!   `second` — with no error;
 //! * dictionary keys (`DisplayPreferences.CustomPrefs`) are never folded:
-//!   `{"MyKey":…,"mykey":…}` keeps both.
+//!   `{"MyKey":…,"mykey":…}` keeps both;
+//! * enum **values** bind ignoring case too — `{"SubtitleMode":"onlyforced"}`
+//!   is `OnlyForced` — because `JsonStringEnumConverter` reads names that way,
+//!   as values and as dictionary keys (`{"ImageTags":{"primary":…}}`).
+//!   [`Doc`]'s `deserialize_enum` folds a string against the enum's variant
+//!   names (aliases included), exact match first.
 //!
 //! The fold therefore lives in [`Doc`]'s `deserialize_struct`, the one place a
 //! serde-derived struct hands over its member names (`FIELDS`, aliases
@@ -38,8 +43,9 @@
 //! * the struct variants of an externally tagged enum (serde asks for
 //!   `deserialize_map`), which also accept an array as `Value` did not.
 //!
-//! None of their member names fold, so a body DTO of either shape binds through
-//! a flat wire struct instead. TODO: `TimerInfoDto`, `SeriesTimerInfoDto` and the
+//! Neither their member names nor their enum values fold (serde hands a
+//! buffered string straight to the variant visitor), so a body DTO of either
+//! shape binds through a flat wire struct instead. TODO: `TimerInfoDto`, `SeriesTimerInfoDto` and the
 //! `RemoteSearchQuery` lookup infos still flatten (`POST /LiveTv/Timers*`,
 //! `POST /LiveTv/SeriesTimers*`, `POST /Items/RemoteSearch/*`); their wire
 //! structs are execution step 2 (D3) of `PLAN_JSON_BODY_CASE_INSENSITIVE.md`. Also unsupported,
@@ -216,6 +222,19 @@ fn fold_members(members: Vec<(String, Doc)>, fields: &[&'static str]) -> Vec<(St
     out
 }
 
+/// `name` as the entry of `names` it equals — exactly, else ignoring ASCII case
+/// (the first such entry) — or unchanged when none matches, so the target's own
+/// "unknown variant" error still names what the client sent.
+fn fold_name(name: String, names: &[&'static str]) -> String {
+    if names.contains(&name.as_str()) {
+        return name;
+    }
+    names
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(&name))
+        .map_or(name, |n| (*n).to_owned())
+}
+
 /// Collapses members whose names are EXACTLY equal to the last one, as the
 /// sorted `serde_json::Value` map did and as `System.Text.Json`'s dictionary
 /// converter (`dict[key] = value`) does. Names differing only in case stay
@@ -299,7 +318,9 @@ impl<'de> de::Deserializer<'de> for Doc {
         visitor: V,
     ) -> Result<V::Value, Error> {
         match self {
-            Self::String(variant) => visitor.visit_enum(variant.into_deserializer()),
+            Self::String(variant) => {
+                visitor.visit_enum(fold_name(variant, variants).into_deserializer())
+            }
             // An externally tagged data variant: `{"Variant": value}`, exactly
             // one member, as `serde_json::Value` demands.
             Self::Object(members) if members.len() == 1 => MapAccessDeserializer::new(
@@ -408,10 +429,12 @@ impl<'de> de::Deserializer<'de> for Key {
     fn deserialize_enum<V: Visitor<'de>>(
         self,
         _name: &'static str,
-        _variants: &'static [&'static str],
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_enum(self.0.into_deserializer())
+        // `EnumConverter.ReadAsPropertyNameCore` falls back to ignoring case
+        // too, so `{"ImageTags":{"primary":…}}` binds `ImageType::Primary`.
+        visitor.visit_enum(fold_name(self.0, variants).into_deserializer())
     }
 
     forward_to_deserialize_any! {
@@ -550,14 +573,30 @@ mod tests {
     }
 
     #[test]
-    fn enums_bind_by_exact_name() {
-        assert_eq!(bind::<Kind>(r#""Plain""#).expect("unit"), Kind::Plain);
+    fn enum_values_bind_ignoring_case() {
+        for body in [r#""Plain""#, r#""plain""#, r#""PLAIN""#] {
+            assert_eq!(bind::<Kind>(body).expect("unit"), Kind::Plain, "{body}");
+        }
+        let all: Vec<Option<Kind>> = bind(r#"["plain",null]"#).expect("nested");
+        assert_eq!(all, [Some(Kind::Plain), None]);
         assert_eq!(
             bind::<Kind>(r#"{"Wrapped":3}"#).expect("newtype"),
             Kind::Wrapped(3)
         );
-        assert!(bind::<Kind>(r#""Nope""#).is_err());
+        let unknown = bind::<Kind>(r#""Nope""#).expect_err("unknown");
+        assert!(unknown.to_string().contains("Nope"), "{unknown}");
         assert!(bind::<Kind>("3").is_err());
+    }
+
+    #[test]
+    fn jellyfin_s_measured_user_configuration_body_binds() {
+        // Live Jellyfin 12.2, POST /Users/{id}/Configuration.
+        use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
+        let config: UserConfiguration =
+            bind(r#"{"subtitlelanguagepreference":"eng","SUBTITLEMODE":"onlyforced"}"#)
+                .expect("binds");
+        assert_eq!(config.subtitle_language_preference.as_deref(), Some("eng"));
+        assert_eq!(config.subtitle_mode, SubtitlePlaybackMode::OnlyForced);
     }
 
     #[test]
@@ -592,8 +631,13 @@ mod tests {
         assert_eq!(ints[&-1], "b");
         let bools: HashMap<bool, i32> = bind(r#"{"true":1}"#).expect("bool keys");
         assert_eq!(bools[&true], 1);
-        let kinds: HashMap<Kind, i32> = bind(r#"{"Plain":1}"#).expect("enum keys");
-        assert_eq!(kinds[&Kind::Plain], 1);
+        for body in [r#"{"Plain":1}"#, r#"{"plain":1}"#] {
+            let kinds: HashMap<Kind, i32> = bind(body).expect("enum keys");
+            assert_eq!(kinds[&Kind::Plain], 1, "{body}");
+        }
+        // String keys are data, never folded.
+        let names: HashMap<String, i32> = bind(r#"{"plain":1}"#).expect("string keys");
+        assert!(names.contains_key("plain"));
         for bad in [r#"{"x":1}"#, r#"{"+5":1}"#, r#"{"05":1}"#] {
             assert!(bind::<HashMap<i32, i32>>(bad).is_err(), "{bad}");
         }
