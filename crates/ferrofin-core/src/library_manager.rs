@@ -2149,17 +2149,27 @@ mod tests {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
         mgr.queue_library_scan().await.expect("queued");
-        // Wait for completion rather than assuming the scan finishes within 50 ms.
-        // On this current-thread runtime, the worker closes its span before this
-        // test can observe the idle queue, so the simple exporter has seen it.
+        // Queue idleness does not guarantee span export: SQLite's separate
+        // worker can still hold the command's span after sending its result.
+        // The final retention query makes that race visible even on an empty
+        // library. Wait for the observable export, with a bounded timeout.
         until_idle(&mgr).await;
-        provider.force_flush().expect("flush");
-
-        let spans = exporter.get_finished_spans().expect("spans");
-        let span = spans
-            .iter()
-            .find(|s| s.name == "library_scan")
-            .expect("library_scan span exported");
+        let span = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                provider.force_flush().expect("flush");
+                if let Some(span) = exporter
+                    .get_finished_spans()
+                    .expect("spans")
+                    .into_iter()
+                    .find(|span| span.name == "library_scan")
+                {
+                    break span;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("library_scan span exported");
         let trigger = span
             .attributes
             .iter()

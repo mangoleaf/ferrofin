@@ -936,19 +936,9 @@ impl PeopleValidationTask {
 
     /// Phase 2: drop `Person` items whose people row no longer exists.
     async fn validate_person_items(&self) -> Result<(), ServiceError> {
-        let removed = sqlx::query(
-            r#"DELETE FROM "BaseItems"
-               WHERE "Type" = ?1
-                 AND ("Name" IS NULL OR "Name" NOT IN (SELECT "Name" FROM "Peoples"))"#,
-        )
-        .bind(PERSON_TYPE)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-        tracing::info!(
-            removed = removed.rows_affected(),
-            "removed dead person items"
-        );
+        let removed =
+            crate::item_persistence_service::remove_orphaned_person_items(&self.db).await?;
+        tracing::info!(removed, "removed dead person items");
         Ok(())
     }
 
