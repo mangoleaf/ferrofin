@@ -32,7 +32,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get};
@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's

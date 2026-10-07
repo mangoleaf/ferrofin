@@ -7,7 +7,7 @@
 //! profile + stream selections) is accepted and ignored for now; both verbs
 //! share one handler, matching Jellyfin's two actions.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::item_update::opt_i32;
 use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
 use crate::state::AppState;

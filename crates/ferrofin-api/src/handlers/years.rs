@@ -10,7 +10,7 @@
 //! other by-name browses; the year rows come from
 //! [`LibraryManager::get_years`](ferrofin_traits::library::LibraryManager::get_years).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::by_name::{additional_dto_options, project_item_rows};
 use crate::handlers::items::{parse_order_by, resolve_user};
 use crate::handlers::query_parse::parse_csv_enums_lenient;

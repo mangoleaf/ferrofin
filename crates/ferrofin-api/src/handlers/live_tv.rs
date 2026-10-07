@@ -24,7 +24,7 @@
 //! not expose).
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -45,7 +45,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{effective_user_id, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,

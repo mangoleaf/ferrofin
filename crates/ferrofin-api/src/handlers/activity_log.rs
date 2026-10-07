@@ -9,7 +9,7 @@
 //! for this route; the handler still accepts the full C# filter/sort set (the
 //! richer manager query is honoured when a client sends them).
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Query parameters for `GET /System/ActivityLog/Entries`.
