@@ -503,6 +503,7 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
+    check_parent_visibility(&state, &auth, &internal).await?;
     redirect_container_browse(&state, &mut internal).await;
 
     let result = state.library.query_items(&internal).await?;
@@ -1265,6 +1266,38 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
         short_type_name,
         "BoxSet" | "Playlist" | "PlaylistsFolder" | "ManualPlaylistsFolder"
     )
+}
+
+/// ItemsController uses IsVisible on its explicit parent, not standalone
+/// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
+/// Container-only browses re-root to UserRootFolder before the upstream check.
+async fn check_parent_visibility(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    query: &InternalItemsQuery,
+) -> Result<(), ApiError> {
+    if query.parent_id.is_nil() {
+        return Ok(());
+    }
+    let parent = state
+        .library
+        .get_item_by_id(query.parent_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
+    let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
+    let rerooted = matches!(
+        query.include_item_types.as_slice(),
+        [BaseItemKind::BoxSet | BaseItemKind::Playlist]
+    ) && !matches!(kind, "BoxSet" | "Playlist");
+    if !auth.is_api_key
+        && kind != "UserRootFolder"
+        && !rerooted
+        && let Some(user) = query.user.as_ref()
+        && !state.library.is_item_visible(&parent, user).await?
+    {
+        return Err(ApiError::Unauthorized("Unauthorized access".into()));
+    }
+    Ok(())
 }
 
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a

@@ -821,3 +821,127 @@ async fn deletion_checks_visibility_before_permission_and_stops_in_input_order()
         StatusCode::OK
     );
 }
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
+    let f = fixture().await;
+    let id = &f.hidden;
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let hidden_library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["Name"] == "Hidden")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    let parent_uri = format!("/Items?parentId={hidden_library}");
+    assert_eq!(
+        call(&f.router, "GET", &parent_uri, Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&f.router, "GET", &parent_uri, Some(&f.admin), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    // A container-only request re-roots before the parent visibility check.
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("{parent_uri}&includeItemTypes=BoxSet"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (status, ids) = call(
+        &f.router,
+        "GET",
+        &format!("/Items?ids={id}"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ids["Items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        uuid::Uuid::parse_str(ids["Items"][0]["Id"].as_str().unwrap()).unwrap(),
+        uuid::Uuid::parse_str(id).unwrap()
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Videos/{id}/stream"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            "/Auth/Keys?app=visibility-fixture",
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    let key = keys["Items"][0]["AccessToken"].as_str().unwrap();
+    for uri in [
+        format!("/Items/{id}/Download"),
+        format!("/Items/{id}/PlaybackInfo"),
+        format!("/Items/{id}/ThemeSongs"),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(key), None).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+    for uri in [
+        format!("/Items/{id}?userId={}", f.viewer_id),
+        format!("/Items/{id}/PlaybackInfo?userId={}", f.viewer_id),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(key), None).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    // Upstream explicitly exempts API keys from the parent IsVisible gate,
+    // including keys specifying a target user for DTO preferences.
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("{parent_uri}&userId={}", f.viewer_id),
+            Some(key),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+}

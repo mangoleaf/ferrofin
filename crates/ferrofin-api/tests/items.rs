@@ -1372,7 +1372,7 @@ async fn get_items_forwards_the_artist_id_filters() {
 #[tokio::test]
 async fn get_items_forwards_the_image_types_filter() {
     let library = OkLibrary {
-        item_id: Uuid::from_u128(0x5B),
+        item_id: Uuid::from_u128(0x5C),
         adopted_tree: false,
         last_query: Arc::default(),
         deleted: Arc::default(),
