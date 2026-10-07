@@ -2316,7 +2316,9 @@ struct PlanCtx<'a> {
     scope: PlanScope<'a>,
     /// The directories that failed to list this pass.
     unlisted: std::cell::RefCell<Vec<String>>,
-    /// Paths confirmed excluded by successfully listed discovery entries.
+    /// Paths confirmed excluded by successfully listed discovery entries,
+    /// and files the resolver chain never resolves (a cue sheet, a theme
+    /// song) — a stored row at one is reconciled away.
     excluded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
@@ -6190,7 +6192,8 @@ impl LibraryScanner {
     /// ([`ItemPersistenceService::library_top_parents`]); both are read. The
     /// library's own folders are never removed ([`LibraryFolders`]), nor is
     /// a row whose own file or folder is still on disk, whatever its kind
-    /// ([`Self::still_on_disk`]).
+    /// ([`Self::still_on_disk`]) — except a media item at a library location,
+    /// which no resolver produces there ([`LibraryFolders::invented`]).
     ///
     /// A path-scoped scan plans only its roots' subtrees, so only the rows
     /// there may be stale: the rows at or under a root, and the path-less
@@ -6288,7 +6291,7 @@ impl LibraryScanner {
             else {
                 continue;
             };
-            let own = LibraryFolders::of(&top_parents, &folder.locations);
+            let own = LibraryFolders::of(&top_parents, &folder.locations, folders);
             let Some((ids, paths)) = self
                 .stale_rows(cf, &existing, &live, &keep_on_disk, &listed, &own)
                 .await
@@ -6348,7 +6351,8 @@ impl LibraryScanner {
     /// deletes: those whose file is gone — not planned (`live`), known
     /// (`listed`: not under a folder that failed to list, and a path-less
     /// one only where its parent's folder is), not one of the library's own
-    /// folders (`own`), and not still on disk — less the ones still holding
+    /// folders (`own`), and not still on disk (unless invented at a location,
+    /// [`LibraryFolders::invented`]) — less the ones still holding
     /// a row this scan keeps ([`hold_back_kept_children`]). Returns the ids
     /// to delete and the paths of the rows read, for the report; `None` when
     /// the rows under them could not be read, when nothing is pruned.
@@ -6387,7 +6391,7 @@ impl LibraryScanner {
             .iter()
             .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = keep_on_disk(row.path.as_deref());
+                let keep = !own.invented(row) && keep_on_disk(row.path.as_deref());
                 if keep {
                     if planner_resolves(&row.item_type) {
                         kept_on_disk += 1;
@@ -10422,9 +10426,13 @@ impl LibraryScanner {
                 self.plan_music_node(&entry.path, cf, cf, false, ctx, out);
             }
         }
-        // Loose audio directly in the library root still becomes an album, so
-        // stray files are browsable rather than invisible.
-        self.plan_music_album(dir, cf, cf, ctx, out);
+        // Loose audio directly in the library root is `Audio` under the
+        // library, with no album: `MusicAlbumResolver` resolves only a
+        // directory below the root, so a root file reaches
+        // `AudioResolver.Resolve` (`AudioResolver.cs:108-134`). An album here
+        // would have the library location as its path — and its multi-disc
+        // subfolders, already albums of their own, planned twice.
+        self.plan_loose_audio(dir, cf, cf, ctx, out);
     }
 
     /// Persists an item's probed chapter markers, when there are any and a
@@ -10696,10 +10704,10 @@ impl LibraryScanner {
             // parent is the artist. Wrapping them invented a `MusicAlbum` row
             // Jellyfin has no row for and stamped the artist's folder name
             // into every such track's `Album`.
-            self.plan_loose_artist_audio(dir, cf, artist_id, ctx, out);
+            self.plan_loose_audio(dir, cf, artist_id, ctx, out);
             return;
         }
-        if self.is_music_album(dir, ctx, true) {
+        if self.is_music_album(dir, ctx, true, true) {
             self.plan_music_album(dir, cf, parent, ctx, out);
             return;
         }
@@ -10753,7 +10761,7 @@ impl LibraryScanner {
             }
             // `MusicAlbumResolver.IsMusicAlbum(path, dirService)` is
             // `ContainsMusic(entries, allowSubfolders: true)`.
-            if self.is_music_album(&entry.path, ctx, true) {
+            if self.is_music_album(&entry.path, ctx, true, false) {
                 return true;
             }
         }
@@ -10772,12 +10780,10 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        // Every track, whatever the scope: whether the album exists at all
-        // depends on the folder holding any.
+        // Every track, whatever the scope. The caller decided the folder is
+        // an album (`ContainsMusic`), which a cue sheet alone makes it: such
+        // an album has no tracks, as upstream's has none.
         let tracks = self.collect_album_tracks(dir, ctx);
-        if tracks.is_empty() {
-            return;
-        }
         // A directory name is not a filename (`EnsureName` keeps it whole):
         // `file_stem` would cut "Greatest Hits Vol. 2" at the dot.
         let album_name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
@@ -10848,22 +10854,30 @@ impl LibraryScanner {
         }
     }
 
-    /// The audio files sitting directly in a resolved artist directory, as
-    /// `Audio` rows parented straight to the `MusicArtist` — no album.
+    /// The audio files sitting directly in `dir` — a resolved artist
+    /// directory (`parent` the `MusicArtist`) or the library root (`parent`
+    /// the library) — as `Audio` rows parented straight to `parent`: no album.
+    /// Each is `IsInMixedFolder`, as `AudioResolver.Resolve` sets for every
+    /// file it resolves (`AudioResolver.cs:133`); a cue sheet is no item.
     ///
     /// Subdirectories are deliberately NOT walked: `plan_music_node` has
-    /// already recursed into every child directory of the artist, so reusing
+    /// already recursed into every child directory, so reusing
     /// [`collect_album_tracks`](Self::collect_album_tracks) here (which also
     /// pulls a multi-disc subfolder's tracks in) would plan those tracks
-    /// twice — once under their own album and once under the artist.
-    fn plan_loose_artist_audio(
+    /// twice — once under their own album and once under `parent`.
+    fn plan_loose_audio(
         &self,
         dir: &str,
         cf: Uuid,
-        artist_id: Uuid,
+        parent: Uuid,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let ancestors = if parent == cf {
+            vec![cf]
+        } else {
+            vec![cf, parent]
+        };
         for entry in self.list(dir, ctx) {
             if entry.type_ == FileSystemEntryType::Directory
                 || !is_audio_file(&entry.path, ctx.naming)
@@ -10871,11 +10885,16 @@ impl LibraryScanner {
             {
                 continue;
             }
+            if is_cue_sheet(&entry.path) || is_theme_song(&entry.path, ctx.naming) {
+                // Older scans planned these as tracks; reconcile those rows.
+                ctx.excluded.borrow_mut().push(entry.path);
+                continue;
+            }
             let Some((id, mut entity)) = self.base_item(
                 ctx,
                 BaseItemKind::Audio,
                 cf,
-                artist_id,
+                parent,
                 file_stem(&entry.path),
                 &entry.path,
                 false,
@@ -10883,6 +10902,7 @@ impl LibraryScanner {
                 continue;
             };
             entity.media_type = Some("Audio".to_owned());
+            entity.is_in_mixed_folder = true;
             // No `album` placeholder: there is no album. A file that carries an
             // ALBUM tag still gets it from `apply_audio_metadata`; one that does
             // not is albumless on both servers.
@@ -10891,7 +10911,7 @@ impl LibraryScanner {
                 Planned {
                     id,
                     entity,
-                    ancestors: vec![cf, artist_id],
+                    ancestors: ancestors.clone(),
                 },
             );
         }
@@ -10902,9 +10922,25 @@ impl LibraryScanner {
     fn collect_album_tracks(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<String> {
         let naming = ctx.naming;
         let entries = self.list(dir, ctx);
+        // A cue sheet makes a folder an album (`ContainsMusic` counts it) but
+        // is no track (`AudioResolver.Resolve` returns null for it); a theme
+        // song is never resolved at all.
+        // Older scans planned them as tracks; those rows are reconciled.
+        let is_track = |e: &FileSystemEntryInfo| {
+            if e.type_ == FileSystemEntryType::Directory || !is_audio_file(&e.path, naming) {
+                return false;
+            }
+            if is_cue_sheet(&e.path) || is_theme_song(&e.path, naming) {
+                if ctx.scope.keeps(&e.path) {
+                    ctx.excluded.borrow_mut().push(e.path.clone());
+                }
+                return false;
+            }
+            true
+        };
         let mut tracks: Vec<String> = entries
             .iter()
-            .filter(|e| e.type_ != FileSystemEntryType::Directory && is_audio_file(&e.path, naming))
+            .filter(|e| is_track(e))
             .map(|e| e.path.clone())
             .collect();
         let parser = ferrofin_naming::audio::AlbumParser::new(naming);
@@ -10913,10 +10949,7 @@ impl LibraryScanner {
                 tracks.extend(
                     self.list(&entry.path, ctx)
                         .into_iter()
-                        .filter(|e| {
-                            e.type_ != FileSystemEntryType::Directory
-                                && is_audio_file(&e.path, naming)
-                        })
+                        .filter(|e| is_track(e))
                         .map(|e| e.path),
                 );
             }
@@ -10928,13 +10961,26 @@ impl LibraryScanner {
     /// `MusicAlbumResolver.ContainsMusic`: any audio file directly inside, or
     /// (with `allow_subfolders`) at least one multi-disc subfolder holding
     /// music and no non-disc subfolder holding music.
-    fn is_music_album(&self, dir: &str, ctx: &PlanCtx<'_>, allow_subfolders: bool) -> bool {
+    ///
+    /// `resolving` is `MusicAlbumResolver.Resolve`'s own call, over
+    /// `args.FileSystemChildren` — the folder's entries less the ignored ones
+    /// (`ItemResolveArgs.GetActualFileSystemChildren`), so a theme song does
+    /// not count. The artist probe and the disc-subfolder probe list the
+    /// folder unfiltered (`IDirectoryService.GetFileSystemEntries`).
+    fn is_music_album(
+        &self,
+        dir: &str,
+        ctx: &PlanCtx<'_>,
+        allow_subfolders: bool,
+        resolving: bool,
+    ) -> bool {
         let naming = ctx.naming;
         let entries = self.list(dir, ctx);
-        if entries
-            .iter()
-            .any(|e| e.type_ != FileSystemEntryType::Directory && is_audio_file(&e.path, naming))
-        {
+        if entries.iter().any(|e| {
+            e.type_ != FileSystemEntryType::Directory
+                && is_audio_file(&e.path, naming)
+                && !(resolving && is_theme_song(&e.path, naming))
+        }) {
             return true;
         }
         if !allow_subfolders {
@@ -10946,7 +10992,7 @@ impl LibraryScanner {
             if entry.type_ != FileSystemEntryType::Directory {
                 continue;
             }
-            if !self.is_music_album(&entry.path, ctx, false) {
+            if !self.is_music_album(&entry.path, ctx, false, false) {
                 continue;
             }
             if parser.is_multi_part(&entry.path) {
@@ -11138,14 +11184,27 @@ const BOOK_RUN_TIME_TICKS: i64 = 10_000_000;
 /// any item: a cue sheet *describes* a rip, it is not one, so resolving it puts
 /// a phantom row in the library next to the file it indexes.
 ///
-/// Only the per-file arm needs this. `single_audio_book` passes every file to
-/// `AudioBookListResolver` exactly as `ResolveMultipleAudio` does, and a
-/// `book.m4b` + `book.cue` pair fails the single-audiobook guard there on both
-/// sides, falling through to this arm.
+/// Every arm that resolves single audio files needs this — the books
+/// planner's per-file arm, and the music planner's tracks.
+/// `single_audio_book` passes every file to `AudioBookListResolver` exactly
+/// as `ResolveMultipleAudio` does, and a `book.m4b` + `book.cue` pair fails
+/// the single-audiobook guard there on both sides, falling through to the
+/// per-file arm.
 fn is_cue_sheet(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
+}
+
+/// Whether `path` is a theme song: an audio file whose name, without its
+/// extension, is exactly `theme` (`BaseItem.ThemeSongFileName`, compared
+/// ordinally). `CoreResolutionIgnoreRule.cs:64-66` keeps the resolver chain
+/// from ever resolving one; it reaches the library only as an extra.
+fn is_theme_song(path: &str, naming: &NamingOptions) -> bool {
+    std::path::Path::new(path)
+        .file_stem()
+        .is_some_and(|stem| stem == "theme")
+        && is_audio_file(path, naming)
 }
 
 /// Whether `path` is one of the [`BOOK_EXTENSIONS`] documents.
@@ -11601,31 +11660,71 @@ fn affected_libraries(
 /// collection folder and the physical folders its `PhysicalFolderIds` names
 /// (on a database adopted from Jellyfin, the rows its items hang off — the
 /// top parents [`LibraryScanner::library_top_parents`] reads), and any row
-/// at one of its locations. The scan plans none of them, and removing one
-/// would take the library's structure (and, by the `ParentId` cascade,
-/// anything still under it) with it.
+/// at one of its locations that is not a media item. The scan plans none of
+/// them, and removing one would take the library's structure (and, by the
+/// `ParentId` cascade, anything still under it) with it.
 struct LibraryFolders<'a> {
     /// The collection folder and its physical folders.
     ids: std::collections::HashSet<Uuid>,
     /// The library's locations, without trailing slashes.
     locations: std::collections::HashSet<&'a str>,
+    /// Those of them inside another configured location, where that
+    /// library's walk plans items.
+    nested: std::collections::HashSet<&'a str>,
 }
 
 impl<'a> LibraryFolders<'a> {
-    fn of(top_parents: &[Uuid], locations: &'a [String]) -> Self {
+    fn of(top_parents: &[Uuid], locations: &'a [String], folders: &[VirtualFolderInfo]) -> Self {
+        let locations: std::collections::HashSet<&str> =
+            locations.iter().map(|l| trimmed_dir(l)).collect();
+        let nested = locations
+            .iter()
+            .copied()
+            .filter(|location| {
+                folders
+                    .iter()
+                    .flat_map(|f| &f.locations)
+                    .map(|other| trimmed_dir(other))
+                    .any(|other| other != *location && path_is_under(location, other))
+            })
+            .collect();
         Self {
             ids: top_parents.iter().copied().collect(),
-            locations: locations.iter().map(|l| trimmed_dir(l)).collect(),
+            locations,
+            nested,
         }
     }
 
     /// Whether `row` is one of them.
     fn holds(&self, row: &ItemPathRow) -> bool {
-        self.ids.contains(&row.id)
-            || row
+        self.ids.contains(&row.id) || (self.at_location(row) && !self.invented(row))
+    }
+
+    /// Whether `row`'s path is one of the library's locations.
+    fn at_location(&self, row: &ItemPathRow) -> bool {
+        row.path
+            .as_deref()
+            .is_some_and(|path| self.locations.contains(trimmed_dir(path)))
+    }
+
+    /// Whether `row` is a media item at a library location, which no resolver
+    /// produces from that location (`MusicAlbumResolver` and its siblings
+    /// resolve only below it): an album older scans made of a music library's
+    /// loose root tracks. It is neither one of the library's folders nor kept
+    /// for its folder still being on disk. (A row this scan planned — an
+    /// album at a location nested inside another library's — never gets
+    /// here.)
+    ///
+    /// A location inside another library's is skipped: that library's walk
+    /// plans an item there (an album or artist folder), and a scan of this
+    /// library alone must not take it.
+    fn invented(&self, row: &ItemPathRow) -> bool {
+        planner_resolves(&row.item_type)
+            && row
                 .path
                 .as_deref()
-                .is_some_and(|path| self.locations.contains(trimmed_dir(path)))
+                .map(trimmed_dir)
+                .is_some_and(|path| self.locations.contains(path) && !self.nested.contains(path))
     }
 }
 
@@ -25861,6 +25960,21 @@ mod tests {
             .unwrap()
     }
 
+    /// The rows of `kind`, read through the item repository.
+    async fn rows_of_kind(db: &Database, kind: BaseItemKind) -> Vec<BaseItemEntity> {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![kind],
+            ..Default::default()
+        })
+        .await
+        .expect("rows of a kind")
+    }
+
     /// Creates a library of `ct` over `media`, scans it, and returns the DB handle
     /// plus the library's projected CollectionFolder id.
     async fn scan_one(
@@ -27263,6 +27377,156 @@ mod tests {
             .find(|a| a.name.as_deref() == Some("01 Archangel"))
             .expect("the album track");
         assert_eq!(inside.parent_id.as_deref(), Some(albums[0].id.as_str()));
+    }
+
+    /// Loose audio directly in a music library's root is `Audio` under the
+    /// library, `IsInMixedFolder`, with no album (`MusicAlbumResolver`
+    /// resolves only a directory below the root; `AudioResolver.Resolve` takes
+    /// the file). A root `CD1` folder is an album of its own, its track
+    /// planned once. A cue sheet is no track, though it makes its folder an
+    /// album (`ContainsMusic`); a theme song is never resolved
+    /// (`CoreResolutionIgnoreRule.cs:64-66`).
+    #[tokio::test]
+    async fn loose_audio_in_a_music_library_root_is_audio_under_the_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        for dir in [
+            "CD1",
+            "Untrue",
+            "Cue Only",
+            "Theme Only",
+            "Burial/Box/Live",
+            "Burial/Other",
+        ] {
+            std::fs::create_dir_all(media.join(dir)).unwrap();
+        }
+        for file in [
+            "Stray.flac",
+            "Stray.cue",
+            "theme.mp3",
+            "CD1/01 Disc.flac",
+            "Untrue/01 Archangel.flac",
+            "Untrue/Untrue.cue",
+            "Untrue/theme.mp3",
+            "Cue Only/Rip.cue",
+            "Theme Only/theme.mp3",
+            "Burial/Box/theme.mp3",
+            "Burial/Box/Live/01 Live.flac",
+            "Burial/Other/01 Other.flac",
+        ] {
+            std::fs::write(media.join(file), b"").unwrap();
+        }
+
+        let (db, cf) = scan_one(CollectionTypeOptions::music, "Music", &media).await;
+        let rows = rows_of_kind(&db, BaseItemKind::MusicAlbum).await;
+        let mut albums: Vec<_> = rows.iter().map(|r| r.name.clone()).collect();
+        albums.sort();
+        assert_eq!(
+            albums,
+            vec![
+                Some("CD1".to_owned()),
+                Some("Cue Only".to_owned()),
+                Some("Live".to_owned()),
+                Some("Other".to_owned()),
+                Some("Untrue".to_owned())
+            ],
+            "no album at the library root; a theme song makes no album \
+             (`Theme Only`, `Box`), so `Box/Live` is one"
+        );
+        let audio = rows_of_kind(&db, BaseItemKind::Audio).await;
+        assert_eq!(
+            audio.len(),
+            5,
+            "each track once, no cue sheet or theme song: {:?}",
+            audio.iter().map(|a| a.path.clone()).collect::<Vec<_>>()
+        );
+        let stray = audio
+            .iter()
+            .find(|a| a.name.as_deref() == Some("Stray"))
+            .expect("the root track");
+        assert_eq!(stray.parent_id.as_deref(), Some(cf.as_str()));
+        assert!(stray.is_in_mixed_folder);
+        assert_eq!(stray.album, None);
+    }
+
+    /// An album an older scan made of a music library's root tracks — a
+    /// `MusicAlbum` whose path is the library location — is pruned by the
+    /// next scan, its folder still on disk notwithstanding, and its tracks
+    /// stay, under the library.
+    #[tokio::test]
+    async fn a_root_album_from_an_older_scan_is_pruned() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("music");
+        std::fs::create_dir_all(&media).unwrap();
+        for file in ["Stray.flac", "Stray.cue", "theme.mp3"] {
+            std::fs::write(media.join(file), b"").unwrap();
+        }
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Music",
+            Some(CollectionTypeOptions::music),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_items(items);
+        scanner.scan_all().await.unwrap();
+
+        // What the older scan stored: the album at the location, the track
+        // under it.
+        let mut track = rows_of_kind(&db, BaseItemKind::Audio).await.remove(0);
+        let cf = track.parent_id.clone().expect("parented to the library");
+        let location = media.to_string_lossy().into_owned();
+        let album_id = Uuid::from_u128(0xA1B);
+        let mut album = track.clone();
+        album.id = ferrofin_db::store::guid_to_db(album_id);
+        album.type_ = crate::item_type_lookup::stored_type_name(BaseItemKind::MusicAlbum)
+            .expect("a stored type")
+            .to_owned();
+        album.path = Some(location);
+        album.name = Some("music".to_owned());
+        album.is_folder = true;
+        crate::test_support::save_item(&db, &album).await;
+        track.parent_id = Some(ferrofin_db::store::guid_to_db(album_id));
+        crate::test_support::save_item(&db, &track).await;
+        // It made tracks of the cue sheet and the theme song too.
+        for (n, file) in ["Stray.cue", "theme.mp3"].into_iter().enumerate() {
+            let mut stale = track.clone();
+            stale.id = ferrofin_db::store::guid_to_db(Uuid::from_u128(0xC0 + n as u128));
+            stale.path = Some(media.join(file).to_string_lossy().into_owned());
+            crate::test_support::save_item(&db, &stale).await;
+        }
+        assert_eq!(rows_of_kind(&db, BaseItemKind::Audio).await.len(), 3);
+
+        scanner.scan_all().await.unwrap();
+        assert!(
+            rows_of_kind(&db, BaseItemKind::MusicAlbum).await.is_empty(),
+            "the root album is pruned"
+        );
+        let audio = rows_of_kind(&db, BaseItemKind::Audio).await;
+        assert_eq!(audio.len(), 1, "its track stays, the cue and theme rows go");
+        assert_eq!(audio[0].parent_id.as_deref(), Some(cf.as_str()));
     }
 
     // The art-dir helpers behind uploaded-image survival: stem parsing is the
