@@ -29,7 +29,8 @@
 //! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
 //! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::dto::{BaseItemDto, UpdateUserItemDataDto, UserItemDataDto};

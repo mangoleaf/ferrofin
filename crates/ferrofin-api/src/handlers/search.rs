@@ -7,7 +7,8 @@
 //! `IImageProcessor` are left unset here (the image processor is a later wave);
 //! the search manager already fills the textual hint fields.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};

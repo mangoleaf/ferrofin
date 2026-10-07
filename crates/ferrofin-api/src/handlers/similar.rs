@@ -15,7 +15,8 @@
 //! to the number of rows. The transform is identical for every alias — only the
 //! route path differs — so one handler backs all five.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;

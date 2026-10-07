@@ -26,7 +26,8 @@
 
 use std::fmt::Write as _;
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};

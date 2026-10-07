@@ -25,7 +25,8 @@
 //! `FullRefresh`/`ReplaceAllMetadata` refresh queued when a series'
 //! `DisplayOrder` changes (`ItemUpdateController.cs:83-86,120-132`).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::routing::post;

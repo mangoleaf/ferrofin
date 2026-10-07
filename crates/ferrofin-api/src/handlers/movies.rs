@@ -5,7 +5,8 @@
 //! through the
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::RecommendationDto;

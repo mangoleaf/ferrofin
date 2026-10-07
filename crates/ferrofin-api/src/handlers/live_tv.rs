@@ -23,8 +23,9 @@
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
 //! not expose).
 
+use crate::extract::Query;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};

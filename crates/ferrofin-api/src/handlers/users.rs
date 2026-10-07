@@ -34,7 +34,8 @@
 //! - The `PlaylistManager.RemovePlaylistsAsync` cleanup on delete is deferred
 //!   (no playlist manager at this layer); token revocation + user deletion run.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::routing::{get, post};

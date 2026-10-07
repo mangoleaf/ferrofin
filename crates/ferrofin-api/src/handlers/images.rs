@@ -40,9 +40,10 @@
 //! `400`/`404` validation, and the `save_image`/`delete_image` contract here are
 //! final while the on-disk pipeline is a later wave.
 
+use crate::extract::Query;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;

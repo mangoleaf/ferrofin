@@ -21,7 +21,8 @@
 //!   manager, which is deferred; the reporting call to [`SessionManager`] still
 //!   runs, so the session/play-state bookkeeping is faithful.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};

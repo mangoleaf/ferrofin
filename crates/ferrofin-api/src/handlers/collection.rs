@@ -16,7 +16,8 @@
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};

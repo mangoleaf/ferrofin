@@ -34,7 +34,8 @@
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
-use axum::extract::{Path, Query, Request, State};
+use crate::extract::Query;
+use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};

@@ -16,7 +16,8 @@
 //! returned every device row — each carrying a plaintext `AccessToken`,
 //! including an administrator's live token — to any authenticated caller.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::dto::{DeviceInfoDto, DeviceOptionsDto};

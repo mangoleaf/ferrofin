@@ -8,7 +8,8 @@
 //! `SegmentEditor` in the contract) belong to a dynamic plugin host and stay on
 //! the `501` stub.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};

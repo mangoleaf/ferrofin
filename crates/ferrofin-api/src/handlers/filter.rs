@@ -15,7 +15,8 @@
 //! as Jellyfin does). The genre facet dispatches to the music-genre aggregate for
 //! a music-only type set and to the plain-genre aggregate otherwise.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};

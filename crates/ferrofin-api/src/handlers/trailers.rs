@@ -10,7 +10,8 @@
 //! persistable subset shared with `GET /Items` is honored here (the remainder is
 //! applied by the persistence layer where portable, exactly as for `/Items`).
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;

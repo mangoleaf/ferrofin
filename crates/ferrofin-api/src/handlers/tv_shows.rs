@@ -25,7 +25,8 @@
 //! alternate-version primary-episode remap, neither of which is persistable
 //! without the reconstructed domain tree.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;

@@ -6,7 +6,8 @@
 //! Jellyfin auth policies (elevation/local-access) applied at the composition
 //! root; the [`RequireAuth`] extractor enforces authentication here.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};

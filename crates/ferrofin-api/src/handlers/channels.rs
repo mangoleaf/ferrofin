@@ -53,7 +53,8 @@
 //! - `GET /Channels/{channelId}/Items` — a channel's items (400: no provider).
 //! - `GET /Channels/Items/Latest` — latest items across channels (empty).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::channels::ChannelFeatures;

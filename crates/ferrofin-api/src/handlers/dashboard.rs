@@ -10,7 +10,8 @@
 //!   names return `404` like the C#. Also registered under the lowercase
 //!   `configurationpage` spelling jellyfin-web actually requests.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;

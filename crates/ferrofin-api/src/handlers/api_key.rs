@@ -11,7 +11,8 @@
 //! `AuthenticationManager` over `dbContext.ApiKeys` (distinct from device-session
 //! tokens issued by the session manager).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};

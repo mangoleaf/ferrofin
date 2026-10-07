@@ -28,7 +28,8 @@
 //! `404` (the C# `GetPlaylistForUser` null). Playlists predating owner tracking
 //! grant owner-equivalent access to every caller (back-compat).
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};

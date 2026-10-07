@@ -7,7 +7,8 @@
 //! profile + stream selections) is accepted and ignored for now; both verbs
 //! share one handler, matching Jellyfin's two actions.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};

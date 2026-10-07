@@ -6,7 +6,8 @@
 //! Jellyfin, so it is absent from the vendored contract (no `501` stub exists);
 //! it is registered here directly so clients still calling it don't get a `404`.
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};

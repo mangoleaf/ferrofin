@@ -33,8 +33,9 @@
 //! - `DELETE /Packages/Installing/{packageId}` — cancel an install (admin;
 //!   none tracked — installs are synchronous)
 
+use crate::extract::Query;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};

@@ -17,7 +17,8 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Query, State};
+use crate::extract::Query;
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::CollectionType;

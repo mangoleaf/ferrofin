@@ -18,7 +18,8 @@
 //! the persistence layer where portable and otherwise left to later waves; the
 //! handler maps the request faithfully onto the query struct.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -278,10 +279,8 @@ struct ItemsQuery {
     /// Restrict to 4K items.
     #[serde(default, rename = "is4K")]
     is_4k: Option<bool>,
-    /// Restrict to HD items. The alias covers jellyfin-web's stable filter
-    /// dialog, which sends `IsHD` — the server's key fold only lowercases the
-    /// first character, leaving `isHD`.
-    #[serde(default, alias = "isHD")]
+    /// Restrict to HD items (including jellyfin-web's `IsHD` spelling).
+    #[serde(default)]
     is_hd: Option<bool>,
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
     #[serde(default, rename = "is3D")]

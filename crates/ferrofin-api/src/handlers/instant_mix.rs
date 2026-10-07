@@ -21,7 +21,8 @@
 //! list — not [`DtoOptions::default`], which is Jellyfin's *parameterless*
 //! constructor with all 47 fields on.
 
-use axum::extract::{Path, Query, State};
+use crate::extract::Query;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;

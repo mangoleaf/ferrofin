@@ -13,8 +13,9 @@
 //! "Generate Trickplay Images" task, so an item whose metadata exists but
 //! whose tiles are absent yields `404` — matching the C# `File.Exists` gate.
 
+use crate::extract::Query;
 use axum::Router;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;

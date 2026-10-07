@@ -18,8 +18,9 @@
 //! branches, plus the full transcoding parameter set, are deferred (no ffmpeg
 //! runner) and are not exercised by this port.
 
+use crate::extract::Query;
 use axum::Router;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::get;
 use uuid::Uuid;
