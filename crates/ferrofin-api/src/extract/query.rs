@@ -49,6 +49,9 @@ impl<T: DeserializeOwned> Query<T> {
             .query()
             .and_then(|query| fold_keys(query, members::<T>()))
             .and_then(|query| format!("/?{query}").parse::<Uri>().ok());
+        // The one place axum's case-sensitive binder may be used: on keys
+        // already folded to the member names.
+        #[allow(clippy::disallowed_types)]
         let axum::extract::Query(value) =
             axum::extract::Query::try_from_uri(folded.as_ref().unwrap_or(uri))?;
         Ok(Self(value))
@@ -66,15 +69,13 @@ impl<T: DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for Query<T
     }
 }
 
-/// Rewrites each key of a raw query string to its member's canonical name —
-/// the FIRST entry of `members` equal to it ignoring ASCII case — then merges
-/// any keys that made equal. `None` when nothing changed (the common case).
+/// Rewrites each key of a raw query string to the member it equals ignoring
+/// ASCII case, then merges any keys that made equal. `None` when nothing
+/// changed (the common case).
 ///
-/// Always the first match, even when the key spells another entry exactly: a
-/// field's aliases can differ from its name only by case (`transcodeReasons` /
-/// `TranscodeReasons`), and ASP.NET reads those as one key, so they must land on
-/// one spelling to merge instead of tripping serde's duplicate-field check.
-/// Values, unknown keys and percent-encoding are left as written.
+/// A struct's members are unique ignoring case (debug-checked in [`members`]),
+/// so a key folds to at most one name. Values, unknown keys and
+/// percent-encoding are left as written.
 ///
 /// ponytail: keys are compared as written, so a percent-encoded key (`%55serId`)
 /// is not folded; no client encodes key names. Decode here if one ever does.
@@ -112,11 +113,30 @@ fn fold_keys(query: &str, members: &[&'static str]) -> Option<String> {
 /// `T`'s member names (aliases included), as its derived `Deserialize` hands
 /// them to `deserialize_struct`; empty when `T` is not a plain struct (a map,
 /// or a struct with a `flatten` member), whose keys are then left as written.
+///
+/// Two names equal ignoring case would make every spelling bind the first one
+/// (ASP.NET could not tell them apart either), so debug builds refuse them; the
+/// contract-wide `query_casing` test sends a query string to every contract
+/// operation it can reach, which runs this check on each query struct.
 fn members<T: DeserializeOwned>() -> &'static [&'static str] {
-    match T::deserialize(Capture) {
+    let members = match T::deserialize(Capture) {
         Err(Captured(members)) => members,
         Ok(_) => &[],
-    }
+    };
+    debug_assert!(
+        !has_case_collision(members),
+        "query struct {} has members equal ignoring case: {members:?}",
+        std::any::type_name::<T>()
+    );
+    members
+}
+
+/// Whether two of `members` are equal ignoring ASCII case.
+fn has_case_collision(members: &[&str]) -> bool {
+    members
+        .iter()
+        .enumerate()
+        .any(|(i, a)| members[i + 1..].iter().any(|b| a.eq_ignore_ascii_case(b)))
 }
 
 /// The "error" [`Capture`] stops with, carrying the captured member names.
@@ -190,7 +210,7 @@ mod tests {
         is_locked: Option<bool>,
         #[serde(default, rename = "is4K")]
         is_4k: Option<bool>,
-        #[serde(default, alias = "isHD")]
+        #[serde(default, alias = "hd")]
         is_hd: Option<bool>,
         #[serde(default)]
         parent_id: Option<String>,
@@ -209,7 +229,7 @@ mod tests {
             [
                 "isLocked",
                 "is4K",
-                "isHD",
+                "hd",
                 "isHd",
                 "parentId",
                 "includeItemTypes"
@@ -250,17 +270,32 @@ mod tests {
     }
 
     #[test]
-    fn a_case_only_alias_and_its_field_land_on_one_key() {
-        // `isHd` (the field) and `isHD` (its alias) both fold to the first
-        // match, `isHD`, and merge as one repeated key rather than reaching
-        // serde as two names of one field ("duplicate field", 400). How a
+    fn spellings_of_one_member_land_on_one_key() {
+        // Every casing of `isHd` folds to that one name and merges as a
+        // repeated key, rather than reaching serde as a duplicate field. How a
         // repeated scalar binds is PLAN_QUERY_SCALAR_DUPLICATES.md.
         assert_eq!(
-            fold_keys("isHd=1&ISHD=2", members::<ItemsQuery>()).as_deref(),
-            Some("isHD=1,2")
+            fold_keys("IsHd=1&ISHD=2", members::<ItemsQuery>()).as_deref(),
+            Some("isHd=1,2")
         );
-        let query: ItemsQuery = bind("/Items?IsHd=true").expect("binds");
+        let query: ItemsQuery = bind("/Items?HD=true").expect("alias binds");
         assert_eq!(query.is_hd, Some(true));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "equal ignoring case")]
+    fn a_case_only_alias_is_refused_in_debug_builds() {
+        // Redundant now that keys fold, and indistinguishable from two members
+        // that collide; the guard keeps query structs free of both.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
+        struct CaseAlias {
+            #[serde(default, alias = "isHD")]
+            is_hd: Option<bool>,
+        }
+        let _ = members::<CaseAlias>();
     }
 
     #[test]
@@ -287,6 +322,12 @@ mod tests {
         assert_eq!(members::<Option<ItemsQuery>>(), members::<ItemsQuery>());
         assert_eq!(members::<Wrapper>(), members::<ItemsQuery>()); // `#[serde(transparent)]` (the HLS routes' query) forwards too.
         assert!(members::<crate::handlers::hls::HlsQueryPub>().contains(&"videoCodec"));
+    }
+
+    #[test]
+    fn case_collisions_are_detected() {
+        assert!(has_case_collision(&["parentId", "ParentID"]));
+        assert!(!has_case_collision(&["parentId", "userId"]));
     }
 
     #[test]
