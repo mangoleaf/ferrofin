@@ -424,7 +424,7 @@ mod tests {
             assert_eq!(dto.names, ["a"]);
         }
         // A failing member is still named by path (the DTO's own spelling).
-        let rejected = bind::<Dto>(br#"{"names":[1]}"#, TopLevel::Object).expect_err("rejected");
+        let rejected = bind::<Dto>(br#"{"names":[{}]}"#, TopLevel::Object).expect_err("rejected");
         assert!(
             rejected
                 .errors
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn a_member_that_will_not_convert_is_named_by_path() {
-        let rejected = bind::<Dto>(br#"{"Names":[1]}"#, TopLevel::Object).expect_err("rejected");
+        let rejected = bind::<Dto>(br#"{"Names":[{}]}"#, TopLevel::Object).expect_err("rejected");
         assert_eq!(rejected.status, 400);
         assert!(
             rejected

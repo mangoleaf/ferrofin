@@ -305,6 +305,18 @@ impl<'de> de::Deserializer<'de> for Doc {
         }
     }
 
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self {
+            Self::String(text) | Self::Number(text) => visitor.visit_string(text),
+            Self::Bool(value) => visitor.visit_string(value.to_string()),
+            other => Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+        }
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.deserialize_str(visitor)
+    }
+
     fn deserialize_struct<V: Visitor<'de>>(
         self,
         _name: &'static str,
@@ -363,7 +375,7 @@ impl<'de> de::Deserializer<'de> for Doc {
     }
 
     forward_to_deserialize_any! {
-        bool char str string
+        bool char
         bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier
     }
 }
@@ -634,7 +646,7 @@ mod tests {
     #[test]
     fn a_type_mismatch_is_still_an_error() {
         assert!(bind::<Outer>(r#"{"Updates":"nope"}"#).is_err());
-        assert!(bind::<Outer>(r#"{"Name":5}"#).is_err());
+        assert!(bind::<Outer>(r#"{"Name":{}}"#).is_err());
     }
     #[test]
     fn numeric_body_binding_matches_every_oracle_case() {
@@ -692,5 +704,36 @@ mod tests {
         let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
         assert!(serde_json::from_str::<Doc>(&nested).is_err());
         assert!(serde_json::from_str::<Doc>("[1,]").is_err());
+    }
+    #[test]
+    fn string_and_boolean_binding_match_jellyfin_oracle() {
+        let fixture = include_str!("../../tests/data/json-binding/jellyfin-12.2.jsonl");
+        for line in fixture.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let input = row["input"].as_str().unwrap();
+            let accepted = row["accepted"].as_bool().unwrap();
+            match row["type"].as_str().unwrap() {
+                "string" => {
+                    let actual = bind::<Option<String>>(input);
+                    assert_eq!(actual.is_ok(), accepted, "string from {input}: {actual:?}");
+                    if let Ok(value) = actual {
+                        assert_eq!(value.as_deref(), row["value"].as_str(), "{input}");
+                    }
+                }
+                "bool" => assert_eq!(bind::<bool>(input).is_ok(), accepted, "bool from {input}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn strings_inside_lists_and_dictionaries_preserve_raw_numbers() {
+        let list: Vec<String> = bind(r#"[1.50,-0,1E+02,true,false]"#).unwrap();
+        assert_eq!(list, ["1.50", "-0", "1E+02", "true", "false"]);
+        let map: HashMap<String, Option<String>> = bind(r#"{"a":1.50,"A":null}"#).unwrap();
+        assert_eq!(map["a"].as_deref(), Some("1.50"));
+        assert_eq!(map["A"], None);
+        assert!(bind::<Vec<String>>("[{}]").is_err());
+        assert!(bind::<Vec<String>>("[[]]").is_err());
     }
 }
