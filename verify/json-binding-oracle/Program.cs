@@ -7,6 +7,35 @@ using System.Globalization;
 using System.Text.Json;
 using Jellyfin.Extensions.Json;
 
+// Reflection records the actual discriminants, including framework enums.
+if (args is ["--enum-inventory", var directory])
+{
+    System.Runtime.Loader.AssemblyLoadContext.Default.Resolving += (context, name) =>
+    {
+        var path = Path.Combine(directory, name.Name + ".dll");
+        return File.Exists(path) ? context.LoadFromAssemblyPath(path) : null;
+    };
+    var assemblies = new[] { "MediaBrowser.Model", "Jellyfin.Data", "Jellyfin.Database.Implementations" };
+    var enums = assemblies.SelectMany(name =>
+        System.Reflection.Assembly.LoadFrom(Path.Combine(directory, name + ".dll")).GetTypes())
+        .Concat([typeof(DayOfWeek), typeof(System.Diagnostics.ProcessPriorityClass)])
+        .Where(type => type.IsEnum).OrderBy(type => type.FullName);
+    foreach (var type in enums)
+    {
+        var members = type.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .ToDictionary(field => field.Name, field => field.GetRawConstantValue());
+        var defaultValue = type.GetCustomAttributes(typeof(DefaultValueAttribute), false)
+            .Cast<DefaultValueAttribute>().FirstOrDefault()?.Value;
+        Console.WriteLine(JsonSerializer.Serialize(new {
+            name = type.Name, full_name = type.FullName,
+            underlying = Enum.GetUnderlyingType(type).Name, members,
+            flags = type.IsDefined(typeof(FlagsAttribute), false),
+            default_value = defaultValue?.ToString()
+        }));
+    }
+    return;
+}
+
 var types = new Dictionary<string, Type>
 {
     ["i8"] = typeof(sbyte), ["i16"] = typeof(short), ["i32"] = typeof(int),
