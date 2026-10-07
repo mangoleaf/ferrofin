@@ -1109,3 +1109,47 @@ async fn named_configuration_converts_values_before_persisting_and_keeps_failed_
             .unwrap();
     assert_eq!(live.guide_days, None);
 }
+
+#[tokio::test]
+async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    let uri = "/System/Configuration/encoding";
+    for field in [
+        "DownMixAudioBoost",
+        "TonemappingDesat",
+        "TonemappingPeak",
+        "TonemappingParam",
+        "VppTonemappingBrightness",
+        "VppTonemappingContrast",
+    ] {
+        for literal in ["NaN", "Infinity", "-Infinity"] {
+            assert_eq!(
+                post(app.clone(), uri, &serde_json::json!({field: literal})).await,
+                StatusCode::NO_CONTENT
+            );
+            let saved = std::fs::read(dir.path().join("named/encoding.json")).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+            assert_eq!(value[field], literal);
+            // The same ordinary model reader used by the configuration manager
+            // restores the actual floating-point value, not null or a default.
+            let options: ferrofin_model::configuration::EncodingOptions =
+                serde_json::from_slice(&saved).unwrap();
+            assert_eq!(serde_json::to_value(options).unwrap()[field], literal);
+            assert_eq!(get(app.clone(), uri).await.0, StatusCode::BAD_REQUEST);
+        }
+    }
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"DownMixAudioBoost":2})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(get(app, uri).await.0, StatusCode::OK);
+}

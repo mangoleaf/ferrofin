@@ -405,6 +405,9 @@ impl<'de, const FOLD: bool> de::Deserializer<'de> for Doc<FOLD> {
             let value = i32::deserialize(self)?;
             return visitor.visit_newtype_struct(value.into_deserializer());
         }
+        if name == ferrofin_model::json::number::stored_f64::MARKER {
+            return self.deserialize_f64(visitor);
+        }
         match (name, self) {
             (NULLABLE_VALUE, Self::String(text)) if text.is_empty() => {
                 visitor.visit_newtype_struct(Self::Null)
@@ -762,6 +765,7 @@ mod tests {
         assert!(bind::<Outer>(r#"{"Name":{}}"#).is_err());
     }
     #[test]
+    #[allow(clippy::float_cmp)] // Parsing must match the oracle exactly.
     fn numeric_body_binding_matches_every_oracle_case() {
         let fixture = include_str!("../../tests/data/json-binding/jellyfin-12.2.jsonl");
         let mut checked = 0;
@@ -841,7 +845,7 @@ mod tests {
 
     #[test]
     fn strings_inside_lists_and_dictionaries_preserve_raw_numbers() {
-        let list: Vec<String> = bind(r#"[1.50,-0,1E+02,true,false]"#).unwrap();
+        let list: Vec<String> = bind("[1.50,-0,1E+02,true,false]").unwrap();
         assert_eq!(list, ["1.50", "-0", "1E+02", "true", "false"]);
         let map: HashMap<String, Option<String>> = bind(r#"{"a":1.50,"A":null}"#).unwrap();
         assert_eq!(map["a"].as_deref(), Some("1.50"));
@@ -972,6 +976,11 @@ mod tests {
     #[test]
     fn nullable_markers_apply_to_value_fields_only() {
         use ferrofin_model::tasks::TaskTriggerInfo;
+        #[derive(Deserialize)]
+        struct Ids {
+            #[serde(with = "ferrofin_model::json::guid::vec")]
+            ids: Vec<uuid::Uuid>,
+        }
         let task: TaskTriggerInfo =
             bind(r#"{"Type":0,"IntervalTicks":"","DayOfWeek":""}"#).unwrap();
         assert_eq!(task.interval_ticks, None);
@@ -984,15 +993,26 @@ mod tests {
         assert!(bind::<Option<Vec<i32>>>(r#""""#).is_err());
         assert!(bind::<Guid>("12345678901234567890123456789012").is_err());
         assert!(bind::<Guid>(r#""urn:uuid:00000000-0000-0000-0000-000000000001""#).is_err());
-        #[derive(Deserialize)]
-        struct Ids {
-            #[serde(with = "ferrofin_model::json::guid::vec")]
-            ids: Vec<uuid::Uuid>,
-        }
         let ids: Ids = bind(r#"{"ids":[null,"(00000000-0000-0000-0000-000000000001)"]}"#).unwrap();
         assert_eq!(ids.ids, [uuid::Uuid::nil(), uuid::Uuid::from_u128(1)]);
         assert!(bind::<Ids>(r#"{"ids":[""]}"#).is_err());
     }
+    #[test]
+    fn stored_floating_point_fields_keep_typed_negative_zero_and_overflow_rules() {
+        use ferrofin_model::configuration::EncodingOptions;
+        for input in [
+            r#"{"DownMixAudioBoost":-0}"#,
+            r#"{"DownMixAudioBoost":"-0"}"#,
+        ] {
+            let options: EncodingOptions = bind(input).unwrap();
+            assert_eq!(options.down_mix_audio_boost.to_bits(), (-0.0_f64).to_bits());
+        }
+        let options: EncodingOptions = bind(r#"{"DownMixAudioBoost":1e999}"#).unwrap();
+        assert!(options.down_mix_audio_boost.is_infinite());
+        assert!(options.down_mix_audio_boost.is_sign_positive());
+        assert!(bind::<EncodingOptions>(r#"{"DownMixAudioBoost":"1e999"}"#).is_err());
+    }
+
     #[test]
     fn exact_property_mode_shares_values_and_recurses_without_folding() {
         #[derive(Debug, Default, Deserialize, PartialEq)]

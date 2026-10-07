@@ -62,6 +62,70 @@ macro_rules! floats {
 }
 floats!(f32, f64);
 
+/// Lossless JSON storage for floating-point configuration fields. Jellyfin's
+/// XML store can retain non-finite values; our JSON store uses their quoted
+/// spellings. HTTP response writers must reject these values separately,
+/// matching System.Text.Json without AllowNamedFloatingPointLiterals.
+pub mod stored_f64 {
+    use super::JsonNumber;
+    use serde::{Deserializer, Serializer, de};
+
+    /// Requests typed floating-point binding before the stored-file reader.
+    pub const MARKER: &str = "$ferrofin::stored_f64";
+
+    /// Reads a stored number or a quoted number using the shared parser.
+    ///
+    /// # Errors
+    /// Rejects invalid numeric strings and non-numeric token kinds.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        struct Number;
+        impl<'de> de::Visitor<'de> for Number {
+            type Value = f64;
+            fn visit_newtype_struct<D: Deserializer<'de>>(self, d: D) -> Result<f64, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a floating-point number")
+            }
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<f64, E> {
+                Ok(value)
+            }
+            #[allow(clippy::cast_precision_loss)] // Standard integer-to-double conversion.
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<f64, E> {
+                Ok(value as f64)
+            }
+            #[allow(clippy::cast_precision_loss)] // Standard integer-to-double conversion.
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<f64, E> {
+                Ok(value as f64)
+            }
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<f64, E> {
+                f64::parse_json_number(text, true)
+                    .ok_or_else(|| E::custom("invalid floating-point number"))
+            }
+        }
+        d.deserialize_newtype_struct(MARKER, Number)
+    }
+
+    /// Stores finite values as numbers and non-finite values as named strings.
+    ///
+    /// # Errors
+    /// Propagates serializer failures.
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde's serialize_with signature.
+    pub fn serialize<S: Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if value.is_finite() {
+            s.serialize_f64(*value)
+        } else {
+            s.serialize_str(if value.is_nan() {
+                "NaN"
+            } else if value.is_sign_negative() {
+                "-Infinity"
+            } else {
+                "Infinity"
+            })
+        }
+    }
+}
+
 /// Identifies legacy device-profile integers to the request binder, which
 /// enforces numeric JSON rules before the file reader sees the value.
 pub const PROFILE_I32: &str = "$ferrofin::profile_i32";
@@ -147,6 +211,29 @@ mod tests {
     }
 
     #[test]
+    fn stored_floats_are_lossless_and_use_the_same_numeric_rules() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Stored(#[serde(with = "super::stored_f64")] f64);
+        for input in [
+            "-2",
+            "2",
+            "1.50",
+            "-0",
+            "\"NaN\"",
+            "\"Infinity\"",
+            "\"-Infinity\"",
+        ] {
+            let value: Stored = serde_json::from_str(input).unwrap();
+            let saved = serde_json::to_string(&value).unwrap();
+            let restored: Stored = serde_json::from_str(&saved).unwrap();
+            assert_eq!(value.0.to_bits(), restored.0.to_bits());
+        }
+        for input in ["\" 2\"", "\"nan\"", "\"1e999\"", "null", "true", "{}", "[]"] {
+            assert!(serde_json::from_str::<Stored>(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
     fn named_nan_and_single_precision_overflow() {
         assert!(f32::parse_json_number("NaN", true).unwrap().is_nan());
         assert!(f64::parse_json_number("NaN", true).unwrap().is_nan());
@@ -155,6 +242,7 @@ mod tests {
         assert_eq!(f64::parse_json_number("1e40", true), Some(1e40));
     }
     #[test]
+    #[allow(clippy::float_cmp)] // Parsing must match the oracle exactly.
     fn quoted_numbers_match_jellyfin_oracle() {
         let fixture =
             include_str!("../../../ferrofin-api/tests/data/json-binding/jellyfin-12.2.jsonl");

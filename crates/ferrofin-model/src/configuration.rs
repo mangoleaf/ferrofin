@@ -959,6 +959,7 @@ pub struct EncodingOptions {
     pub enable_audio_vbr: bool,
 
     /// Gets or sets the audio boost applied when downmixing audio.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub down_mix_audio_boost: f64,
 
     /// Gets or sets the algorithm used for downmixing audio to stereo.
@@ -1018,18 +1019,23 @@ pub struct EncodingOptions {
     pub tonemapping_range: TonemappingRange,
 
     /// Gets or sets the tone-mapping desaturation.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_desat: f64,
 
     /// Gets or sets the tone-mapping peak.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_peak: f64,
 
     /// Gets or sets the tone-mapping parameters.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_param: f64,
 
     /// Gets or sets the VPP tone-mapping brightness.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub vpp_tonemapping_brightness: f64,
 
     /// Gets or sets the VPP tone-mapping contrast.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub vpp_tonemapping_contrast: f64,
 
     /// Gets or sets the H264 CRF.
