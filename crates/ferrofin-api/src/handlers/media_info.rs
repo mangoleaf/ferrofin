@@ -75,39 +75,37 @@ impl TranscoderSupport for FerrofinTranscoderSupport {
 
 /// Query parameters for the playback-info endpoints.
 ///
-/// Jellyfin clients send these PascalCase (the C# model binder is
-/// case-insensitive; axum's `Query` is not), so each field carries a PascalCase
-/// alias alongside the camelCase rename.
+/// Jellyfin clients send these PascalCase; keys bind ignoring case, as the C#
+/// model binder's do ([`crate::extract::Query`]).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlaybackInfoQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
-        alias = "UserId",
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
     /// The requested audio stream index override.
-    #[serde(default, alias = "AudioStreamIndex")]
+    #[serde(default)]
     audio_stream_index: Option<i32>,
     /// The requested subtitle stream index override (`-1` = none).
-    #[serde(default, alias = "SubtitleStreamIndex")]
+    #[serde(default)]
     subtitle_stream_index: Option<i32>,
     /// Whether direct play is permitted (default true).
-    #[serde(default, alias = "EnableDirectPlay")]
+    #[serde(default)]
     enable_direct_play: Option<bool>,
     /// Whether direct stream is permitted (default true).
-    #[serde(default, alias = "EnableDirectStream")]
+    #[serde(default)]
     enable_direct_stream: Option<bool>,
     /// Whether transcoding is permitted (default true).
-    #[serde(default, alias = "EnableTranscoding")]
+    #[serde(default)]
     enable_transcoding: Option<bool>,
     /// Whether `-c:v copy` is permitted in a transcode (default true).
-    #[serde(default, alias = "AllowVideoStreamCopy")]
+    #[serde(default)]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted in a transcode (default true).
-    #[serde(default, alias = "AllowAudioStreamCopy")]
+    #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
 }
 
