@@ -1420,6 +1420,30 @@ pub(crate) fn scan_save_changes_row(
         })
 }
 
+/// Preserve history before any member of a deletion set can cascade away.
+/// The caller owns the transaction covering both detachment and deletion.
+pub(crate) async fn detach_user_data(
+    tx: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<(), ServiceError> {
+    let retained_at = datetime_to_db(chrono::Utc::now());
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let mut query = QueryBuilder::<Sqlite>::new(r#"UPDATE "UserData" SET "ItemId" = "#);
+        query
+            .push_bind(PLACEHOLDER_ID)
+            .push(r#", "RetentionDate" = "#)
+            .push_bind(&retained_at)
+            .push(r#" WHERE "ItemId" IN ("#);
+        let mut values = query.separated(",");
+        for id in chunk {
+            values.push_bind(id);
+        }
+        values.push_unseparated(")");
+        query.build().execute(&mut *tx).await.map_err(db_err)?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ItemPersistenceService for FerrofinItemPersistenceService {
     async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
@@ -1484,6 +1508,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             closure.extend(next.iter().cloned());
             frontier = next;
         }
+        detach_user_data(&mut tx, &closure).await?;
         // The containers whose membership shrinks, for their `Data` re-sync
         // after the commit (the deleted ones among them no-op there).
         let mut containers: Vec<String> = Vec::new();
@@ -3850,6 +3875,89 @@ mod tests {
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
     };
+
+    // Investigation regressions: run explicitly with
+    // cargo test -p ferrofin-core --lib retention_investigation -- --ignored
+    // Remove the ignores when the retention lifecycle is implemented.
+    #[tokio::test]
+    async fn retention_investigation_delete_preserves_history() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        svc.delete_items(&[item]).await.expect("delete item");
+        assert!(
+            crate::test_support::fetch_item_opt(&db, item)
+                .await
+                .is_none()
+        );
+        let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+            r#"SELECT "ItemId", "Played", "RetentionDate" FROM "UserData"
+               WHERE "UserId" = ?1 AND "CustomDataKey" = ?2"#,
+        )
+        .bind(guid_to_db(user))
+        .bind(item.to_string())
+        .fetch_all(db.pool())
+        .await
+        .expect("read retained history");
+        assert_eq!(rows.len(), 1, "history must survive deletion");
+        assert_eq!(rows[0].0, super::PLACEHOLDER_ID);
+        assert_eq!(rows[0].1, 1);
+        assert!(rows[0].2.is_some());
+    }
+
+    #[rstest::rstest]
+    #[case::user_data_key(false)]
+    #[case::retention_timestamp(true)]
+    #[tokio::test]
+    #[ignore = "Known retention gaps: wrong reattachment key and uncleared timestamp"]
+    async fn retention_investigation_reattach_restores_history(
+        #[case] match_presentation_key: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        // Simulate detached history imported from Jellyfin, independently
+        // of Ferrofin's broken deletion path. A GUID key should reconnect
+        // a file restored at its original path.
+        sqlx::query(
+            r#"UPDATE "UserData" SET "ItemId" = ?1,
+               "RetentionDate" = '2026-10-01 00:00:00.0000000'
+               WHERE "ItemId" = ?2"#,
+        )
+        .bind(super::PLACEHOLDER_ID)
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("detach fixture");
+        let mut row = crate::test_support::fetch_item(&db, item).await;
+        row.presentation_unique_key = Some(if match_presentation_key {
+            item.to_string()
+        } else {
+            crate::kinds::presentation_unique_key(BaseItemKind::Movie, item, None, None, None, None)
+        });
+        FerrofinItemPersistenceService::new(db.clone())
+            .reattach_user_data(&row)
+            .await
+            .expect("reattach");
+        let (owner, played, retention): (String, i64, Option<String>) = sqlx::query_as(
+            r#"SELECT "ItemId", "Played", "RetentionDate" FROM "UserData"
+               WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_one(db.pool())
+        .await
+        .expect("read history");
+        assert_eq!(owner, guid_to_db(item), "match the user-data key");
+        assert_eq!(played, 1);
+        assert!(retention.is_none(), "clear retention on reattachment");
+    }
 
     /// `ensure_container` writes the `Data` blob it was given onto a row that
     /// has none, and NEVER over one that already has content.
