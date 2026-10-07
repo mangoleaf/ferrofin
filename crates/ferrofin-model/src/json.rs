@@ -17,6 +17,8 @@
 //!   fraction digits are written, otherwise trailing zeros are trimmed (that is
 //!   `Utf8JsonWriter.WriteStringValue(DateTime)`).
 
+pub mod number;
+
 /// `JsonGuidConverter` — `Uuid` fields.
 pub mod guid {
     use serde::{Deserialize, Deserializer, Serializer};

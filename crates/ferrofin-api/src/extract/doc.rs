@@ -47,10 +47,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ferrofin_model::json::number::JsonNumber;
 use serde::de::value::{MapAccessDeserializer, MapDeserializer, SeqDeserializer};
-use serde::de::{self, IntoDeserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, IntoDeserializer, MapAccess, Visitor};
 use serde::{Deserialize, forward_to_deserialize_any};
-use serde_json::Number;
+use serde_json::value::RawValue;
 
 /// The error every [`Doc`] binding reports — `serde_json`'s, so messages read
 /// exactly as they did when the binder deserialized a `serde_json::Value`.
@@ -65,8 +66,8 @@ pub(crate) enum Doc {
     Null,
     /// `true` / `false`.
     Bool(bool),
-    /// A number, as `serde_json` parsed it.
-    Number(Number),
+    /// A validated number token, retaining its original spelling.
+    Number(String),
     /// A string.
     String(String),
     /// An array.
@@ -77,77 +78,61 @@ pub(crate) enum Doc {
 
 impl<'de> Deserialize<'de> for Doc {
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(DocVisitor)
+        let raw = <&RawValue>::deserialize(deserializer)?;
+        Self::from_raw(raw.get(), 0).map_err(de::Error::custom)
     }
 }
 
-/// Builds a [`Doc`] from any self-describing format (in practice `serde_json`).
-struct DocVisitor;
+/// Reads an object's raw member values without sorting or collapsing its keys.
+struct RawMembers;
 
-impl<'de> Visitor<'de> for DocVisitor {
-    type Value = Doc;
+impl<'de> Visitor<'de> for RawMembers {
+    type Value = Vec<(String, &'de RawValue)>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("any JSON value")
+        f.write_str("a JSON object")
     }
 
-    fn visit_unit<E>(self) -> Result<Doc, E> {
-        Ok(Doc::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Doc, E> {
-        Ok(Doc::Null)
-    }
-
-    fn visit_some<D: de::Deserializer<'de>>(self, d: D) -> Result<Doc, D::Error> {
-        Doc::deserialize(d)
-    }
-
-    fn visit_bool<E>(self, b: bool) -> Result<Doc, E> {
-        Ok(Doc::Bool(b))
-    }
-
-    fn visit_i64<E>(self, n: i64) -> Result<Doc, E> {
-        Ok(Doc::Number(n.into()))
-    }
-
-    fn visit_u64<E>(self, n: u64) -> Result<Doc, E> {
-        Ok(Doc::Number(n.into()))
-    }
-
-    fn visit_f64<E: de::Error>(self, n: f64) -> Result<Doc, E> {
-        // `serde_json` never yields a non-finite float from JSON text.
-        Number::from_f64(n)
-            .map(Doc::Number)
-            .ok_or_else(|| E::custom("a JSON number must be finite"))
-    }
-
-    fn visit_str<E>(self, s: &str) -> Result<Doc, E> {
-        Ok(Doc::String(s.to_owned()))
-    }
-
-    fn visit_string<E>(self, s: String) -> Result<Doc, E> {
-        Ok(Doc::String(s))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Doc, A::Error> {
-        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or_default());
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Doc::Array(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Doc, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut members = Vec::with_capacity(map.size_hint().unwrap_or_default());
         while let Some(member) = map.next_entry()? {
             members.push(member);
         }
-        Ok(Doc::Object(members))
+        Ok(members)
     }
 }
 
 impl Doc {
+    /// Builds the ordered tree while retaining numeric lexemes. Raw values
+    /// borrow the request only during parsing; the completed tree owns its data.
+    fn from_raw(raw: &str, depth: usize) -> Result<Self, Error> {
+        if depth >= 128 {
+            return Err(de::Error::custom("recursion limit exceeded"));
+        }
+        match raw.as_bytes()[0] {
+            b'n' => Ok(Self::Null),
+            b't' => Ok(Self::Bool(true)),
+            b'f' => Ok(Self::Bool(false)),
+            b'"' => serde_json::from_str(raw).map(Self::String),
+            b'[' => serde_json::from_str::<Vec<&RawValue>>(raw)?
+                .into_iter()
+                .map(|value| Self::from_raw(value.get(), depth + 1))
+                .collect::<Result<_, _>>()
+                .map(Self::Array),
+            b'{' => {
+                use serde::Deserializer;
+                let members =
+                    serde_json::Deserializer::from_str(raw).deserialize_map(RawMembers)?;
+                members
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, Self::from_raw(value.get(), depth + 1)?)))
+                    .collect::<Result<_, _>>()
+                    .map(Self::Object)
+            }
+            _ => Ok(Self::Number(raw.to_owned())),
+        }
+    }
+
     /// Whether this is an object — the top-level kind every struct DTO needs.
     pub(crate) fn is_object(&self) -> bool {
         matches!(self, Self::Object(_))
@@ -261,14 +246,54 @@ impl IntoDeserializer<'_, Error> for Doc {
     }
 }
 
+/// Numeric reads retain the target width and distinguish quoted overflow.
+macro_rules! read_number {
+    ($($method:ident => $visit:ident: $ty:ty),* $(,)?) => {$(
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+            let (text, quoted) = match self {
+                Self::String(text) => (text, true),
+                Self::Number(text) => (text, false),
+                other => return Err(de::Error::invalid_type(other.unexpected(), &visitor)),
+            };
+            match <$ty>::parse_json_number(&text, quoted) {
+                Some(number) => visitor.$visit(number),
+                None => Err(de::Error::invalid_value(de::Unexpected::Str(&text), &visitor)),
+            }
+        }
+    )*};
+}
+
 impl<'de> de::Deserializer<'de> for Doc {
     type Error = Error;
+
+    read_number! {
+        deserialize_i8 => visit_i8: i8,
+        deserialize_i16 => visit_i16: i16,
+        deserialize_i32 => visit_i32: i32,
+        deserialize_i64 => visit_i64: i64,
+        deserialize_i128 => visit_i128: i128,
+        deserialize_u8 => visit_u8: u8,
+        deserialize_u16 => visit_u16: u16,
+        deserialize_u32 => visit_u32: u32,
+        deserialize_u64 => visit_u64: u64,
+        deserialize_u128 => visit_u128: u128,
+        deserialize_f32 => visit_f32: f32,
+        deserialize_f64 => visit_f64: f64,
+    }
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self {
             Self::Null => visitor.visit_unit(),
             Self::Bool(b) => visitor.visit_bool(b),
-            Self::Number(n) => de::Deserializer::deserialize_any(n, visitor),
+            Self::Number(n) => {
+                if let Ok(value) = n.parse::<i64>() {
+                    visitor.visit_i64(value)
+                } else if let Ok(value) = n.parse::<u64>() {
+                    visitor.visit_u64(value)
+                } else {
+                    visitor.visit_f64(n.parse().map_err(de::Error::custom)?)
+                }
+            }
             Self::String(s) => visitor.visit_string(s),
             Self::Array(items) => {
                 let mut seq = SeqDeserializer::new(items.into_iter());
@@ -338,7 +363,7 @@ impl<'de> de::Deserializer<'de> for Doc {
     }
 
     forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bool char str string
         bytes byte_buf unit unit_struct seq tuple tuple_struct map identifier
     }
 }
@@ -528,12 +553,12 @@ mod tests {
     }
 
     #[test]
-    fn scalars_bind_as_serde_json_values_did() {
+    fn scalars_bind_with_jellyfin_number_handling() {
         assert_eq!(bind::<i32>("-5").expect("i32"), -5);
         assert_eq!(bind::<u64>("18446744073709551615").expect("u64"), u64::MAX);
         assert!((bind::<f64>("1.5").expect("f64") - 1.5).abs() < f64::EPSILON);
         assert!(bind::<i32>("1.5").is_err());
-        assert!(bind::<i32>(r#""5""#).is_err());
+        assert_eq!(bind::<i32>(r#""5""#).unwrap(), 5);
         assert!(bind::<bool>(r#""true""#).is_err());
         assert_eq!(bind::<Option<i32>>("null").expect("none"), None);
         assert_eq!(bind::<()>("null").expect("unit"), ());
@@ -610,5 +635,62 @@ mod tests {
     fn a_type_mismatch_is_still_an_error() {
         assert!(bind::<Outer>(r#"{"Updates":"nope"}"#).is_err());
         assert!(bind::<Outer>(r#"{"Name":5}"#).is_err());
+    }
+    #[test]
+    fn numeric_body_binding_matches_every_oracle_case() {
+        let fixture = include_str!("../../tests/data/json-binding/jellyfin-12.2.jsonl");
+        let mut checked = 0;
+        for line in fixture.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let input = row["input"].as_str().unwrap();
+            macro_rules! check {
+                ($ty:ty) => {{
+                    let actual = bind::<$ty>(input);
+                    assert_eq!(
+                        actual.is_ok(),
+                        row["accepted"].as_bool().unwrap(),
+                        "{} from {input}: {actual:?}",
+                        stringify!($ty)
+                    );
+                    if let Ok(actual) = actual {
+                        let expected = row["value"].as_str().unwrap();
+                        if expected == "NaN" {
+                            assert_eq!(actual.to_string(), "NaN");
+                        } else {
+                            let expected: $ty = expected.parse().unwrap();
+                            assert_eq!(actual, expected, "{} from {input}", stringify!($ty));
+                        }
+                    }
+                    checked += 1;
+                }};
+            }
+            match row["type"].as_str().unwrap() {
+                "i8" => check!(i8),
+                "i16" => check!(i16),
+                "i32" => check!(i32),
+                "i64" => check!(i64),
+                "u8" => check!(u8),
+                "u16" => check!(u16),
+                "u32" => check!(u32),
+                "u64" => check!(u64),
+                "f32" => check!(f32),
+                "f64" => check!(f64),
+                _ => {}
+            }
+        }
+        assert_eq!(checked, 1090);
+    }
+
+    #[test]
+    fn raw_numbers_preserve_lexemes_and_depth_is_bounded() {
+        for raw in ["1.50", "1E+02", "-0", "18446744073709551616", "1e400"] {
+            assert_eq!(
+                serde_json::from_str::<Doc>(raw).unwrap(),
+                Doc::Number(raw.into())
+            );
+        }
+        let nested = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+        assert!(serde_json::from_str::<Doc>(&nested).is_err());
+        assert!(serde_json::from_str::<Doc>("[1,]").is_err());
     }
 }
