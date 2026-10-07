@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::effective_user_id;
+use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::streaming::{serve_static_file, stream_path};
 use crate::state::AppState;
 
@@ -98,7 +98,8 @@ async fn get_universal_audio_stream(
     Query(user_query): Query<UniversalAudioUserQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    effective_user_id(&state, &auth, user_query.user_id).await?;
+    let user = resolve_user_opt(&state, &auth, user_query.user_id).await?;
+    require_visible_item(&state, item_id, user.as_ref()).await?;
     // Direct-play when a static source exists; otherwise transcode (the
     // UniversalAudioController fallback), now wired to the real runtime.
     match stream_path(&state, item_id).await {

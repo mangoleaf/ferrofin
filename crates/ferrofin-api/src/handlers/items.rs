@@ -35,6 +35,20 @@ use crate::error::ApiError;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
+/// Resolves a user-addressed item before returning data or performing a side effect.
+/// Invisible and missing IDs deliberately have the same response.
+pub(crate) async fn require_visible_item(
+    state: &AppState,
+    item_id: Uuid,
+    user: Option<&UserEntity>,
+) -> Result<BaseItemEntity, ApiError> {
+    state
+        .library
+        .get_item_by_id_for_user(item_id, user)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
+}
+
 /// The effective user id for a request, porting C#
 /// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
 /// lines 67-85) in both of its halves:
@@ -556,11 +570,15 @@ async fn get_item(
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let item = state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let item = if item_id.is_nil() {
+        state
+            .library
+            .get_user_root_folder()
+            .await?
+            .ok_or_else(|| ApiError::NotFound("user root folder".into()))?
+    } else {
+        require_visible_item(&state, item_id, Some(&user)).await?
+    };
     // A single-item fetch backs a detail page, so return the full DTO (overview,
     // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
     // detail view needs. Port of `UserLibraryController.GetItem`, which builds a

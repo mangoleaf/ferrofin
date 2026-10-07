@@ -1,0 +1,454 @@
+//! Per-user item visibility over the real router and composition root.
+//! Fixtures use disposable databases and files; policy changes go through HTTP.
+
+use std::path::{Path, PathBuf};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use ferrofin_db::Database;
+use ferrofin_server::config::Config;
+use ferrofin_server::state::{WiredApp, build_app_state};
+use ferrofin_traits::library::ScanTrigger;
+use serde_json::{Value, json};
+use tower::ServiceExt as _;
+
+const ADMIN_USER: &str = "admin";
+const ADMIN_PASSWORD: &str = "visibility-admin-pw";
+
+/// A booted server and the temp dir holding its data and the media it
+/// scanned.
+struct Harness {
+    wired: WiredApp,
+    temp: tempfile::TempDir,
+}
+
+impl Harness {
+    fn path(&self, relative: &str) -> PathBuf {
+        self.temp.path().join(relative)
+    }
+}
+
+/// Writes a small file (and its directories).
+fn touch(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("dir");
+    }
+    std::fs::write(path, contents).expect("write");
+}
+
+async fn boot() -> Harness {
+    let temp = tempfile::tempdir().expect("temp dir");
+    for d in ["config", "data", "cache"] {
+        std::fs::create_dir_all(temp.path().join(d)).expect("dir");
+    }
+    let config = Config {
+        server_name: "ferrofin-item-visibility".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        ..Config::test_stub(temp.path())
+    };
+    for (path, contents) in [
+        ("movies/Alpha (1999)/Alpha (1999).mkv", String::new()),
+        ("movies/Epsilon (2003)/Epsilon (2003).mkv", String::new()),
+        ("more/Gamma (2001)/Gamma (2001).mkv", String::new()),
+        ("more/Delta (2002)/Delta (2002).mkv", String::new()),
+    ] {
+        touch(&temp.path().join(path), &contents);
+    }
+    let db = Database::connect(&config.database_url())
+        .await
+        .expect("open db");
+    db.run_migrations().await.expect("migrations");
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        ffmpeg: PathBuf::from("ffmpeg"),
+        ffprobe: PathBuf::from("ffprobe"),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    };
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+        .await
+        .expect("wire app state");
+    ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
+        .await
+        .expect("seed admin");
+    Harness { wired, temp }
+}
+
+/// Sends one request as `token` (on its own device) and returns status + body.
+async fn call(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let device = token.map_or("anonymous", |t| &t[..8.min(t.len())]);
+    let ident = format!(r#"Client="test", Device="d", DeviceId="{device}", Version="1""#);
+    let req = Request::builder().method(method).uri(uri).header(
+        header::AUTHORIZATION,
+        match token {
+            Some(t) => format!(r#"MediaBrowser Token="{t}", {ident}"#),
+            None => format!("MediaBrowser {ident}"),
+        },
+    );
+    let req = match body {
+        Some(v) => req
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&v).expect("body")))
+            .expect("request"),
+        None => req.body(Body::empty()).expect("request"),
+    };
+    let res = router.clone().oneshot(req).await.expect("response");
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// Authenticates `name` and returns its token and user id.
+async fn login(router: &axum::Router, name: &str, password: &str) -> (String, String) {
+    let ident =
+        format!(r#"MediaBrowser Client="test", Device="d", DeviceId="login-{name}", Version="1""#);
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(header::AUTHORIZATION, ident)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "Username": name, "Pw": password }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), StatusCode::OK, "{name} authenticates");
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let v: Value = serde_json::from_slice(&bytes).expect("json");
+    (
+        v["AccessToken"].as_str().expect("token").to_owned(),
+        v["User"]["Id"].as_str().expect("id").to_owned(),
+    )
+}
+
+/// Percent-encodes a path for a query string.
+fn encode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// The library items by `Path`, as the administrator sees them.
+async fn items_by_path(
+    router: &axum::Router,
+    token: &str,
+) -> std::collections::HashMap<String, String> {
+    let (status, items) = call(
+        router,
+        "GET",
+        "/Items?recursive=true&includeItemTypes=Movie&fields=Path",
+        Some(token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    items["Items"]
+        .as_array()
+        .expect("Items")
+        .iter()
+        .filter_map(|i| Some((i["Path"].as_str()?.to_owned(), i["Id"].as_str()?.to_owned())))
+        .collect()
+}
+
+/// Creates an account and returns its id.
+async fn create_user(router: &axum::Router, admin: &str, name: &str, password: &str) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/Users/New",
+        Some(admin),
+        Some(json!({ "Name": name, "Password": password })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    created["Id"].as_str().expect("id").to_owned()
+}
+
+struct Fixture {
+    h: Harness,
+    router: axum::Router,
+    admin: String,
+    viewer: String,
+    viewer_id: String,
+    allowed: String,
+    hidden: String,
+}
+
+async fn fixture() -> Fixture {
+    let h = boot().await;
+    let router = ferrofin_api::create_router(h.wired.state.clone());
+    let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    for (name, dir) in [("Allowed", "movies"), ("Hidden", "more")] {
+        let path = encode(&h.path(dir).to_string_lossy());
+        let (status, _) = call(&router, "POST", &format!(
+            "/Library/VirtualFolders?name={name}&collectionType=movies&paths={path}&refreshLibrary=false"
+        ), Some(&admin), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    assert!(
+        h.wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .unwrap()
+    );
+    let (_, folders) = call(
+        &router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&admin),
+        None,
+    )
+    .await;
+    let folder = |name| {
+        folders
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["Name"] == name)
+            .unwrap()["ItemId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let allowed_library = folder("Allowed");
+    let items = items_by_path(&router, &admin).await;
+    let allowed = items[&h
+        .path("movies/Alpha (1999)/Alpha (1999).mkv")
+        .to_string_lossy()
+        .into_owned()]
+        .clone();
+    let hidden = items[&h
+        .path("more/Gamma (2001)/Gamma (2001).mkv")
+        .to_string_lossy()
+        .into_owned()]
+        .clone();
+    let viewer_id = create_user(&router, &admin, "viewer", "viewer-pw").await;
+    let (_, user) = call(
+        &router,
+        "GET",
+        &format!("/Users/{viewer_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnableAllFolders"] = json!(false);
+    policy["EnabledFolders"] = json!([allowed_library]);
+    policy["EnableContentDeletion"] = json!(true);
+    let (status, _) = call(
+        &router,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        Some(&admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (viewer, _) = login(&router, "viewer", "viewer-pw").await;
+    Fixture {
+        h,
+        router,
+        admin,
+        viewer,
+        viewer_id,
+        allowed,
+        hidden,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn hidden_items_return_404_before_direct_reads_and_writes() {
+    let f = fixture().await;
+    let id = &f.hidden;
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{}", f.allowed),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for uri in [
+        format!("/Items/{id}"),
+        format!("/Users/{}/Items/{id}", f.viewer_id),
+        format!("/Items/{id}/PlaybackInfo"),
+        format!("/Items/{id}/Download"),
+        format!("/Items/{id}/File"),
+        format!("/Items/{id}/SpecialFeatures"),
+        format!("/Items/{id}/LocalTrailers"),
+        format!("/Items/{id}/Intros"),
+        format!("/Items/{id}/Similar"),
+        format!("/Items/{id}/ThemeSongs"),
+        format!("/Items/{id}/ThemeVideos"),
+        format!("/UserItems/{id}/UserData"),
+        format!("/Items/{id}/InstantMix"),
+        format!("/Videos/{id}/AdditionalParts"),
+        format!("/Audio/{id}/universal"),
+        format!("/Items/{id}/RemoteImages"),
+        format!("/Items/{id}/RemoteImages/Providers"),
+        format!("/Items/{id}/RemoteSearch/Subtitles/en"),
+        format!("/Videos/{id}/{id}/Subtitles/0/subtitles.m3u8?segmentLength=10"),
+    ] {
+        let (status, body) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    for (uri, body) in [
+        (format!("/Items/{id}/PlaybackInfo"), json!({})),
+        (format!("/UserFavoriteItems/{id}"), json!({})),
+        (format!("/UserPlayedItems/{id}"), json!({})),
+        (format!("/UserItems/{id}/Rating?likes=true"), json!({})),
+        (
+            format!("/UserItems/{id}/UserData"),
+            json!({"IsFavorite": true, "Played": true}),
+        ),
+        (
+            format!("/Videos/{id}/Subtitles"),
+            json!({"Language":"en","Format":"srt","Data":"eA==","IsForced":false,"IsHearingImpaired":false}),
+        ),
+        (
+            format!("/Items/{id}/RemoteSearch/Subtitles/unused"),
+            json!({}),
+        ),
+    ] {
+        let (status, response) = call(&f.router, "POST", &uri, Some(&f.viewer), Some(body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {response}");
+    }
+    let user_data =
+        f.h.wired
+            .state
+            .user_data
+            .get_user_data_dto(
+                uuid::Uuid::parse_str(id).unwrap(),
+                uuid::Uuid::parse_str(&f.viewer_id).unwrap(),
+            )
+            .await
+            .unwrap();
+    assert!(user_data.is_none_or(|data| !data.is_favorite && !data.played));
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Items/{id}?userId={}", f.viewer_id),
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // Elevation does not bypass the administrator's own library restrictions.
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["IsAdministrator"] = json!(true);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(policy)
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (method, uri, body) in [
+        ("GET", format!("/Items/{id}/ExternalIdInfos"), None),
+        ("GET", format!("/Items/{id}/MetadataEditor"), None),
+        (
+            "POST",
+            format!("/Items/{id}"),
+            Some(json!({"Id": id, "Name": "Should not change"})),
+        ),
+        (
+            "POST",
+            format!("/Items/{id}/ContentType?contentType=movies"),
+            None,
+        ),
+        ("POST", format!("/Items/{id}/Refresh"), None),
+        (
+            "POST",
+            format!("/Items/RemoteSearch/Apply/{id}"),
+            Some(json!({})),
+        ),
+        (
+            "POST",
+            format!(
+                "/Items/{id}/RemoteImages/Download?type=Primary&imageUrl=http://127.0.0.1:9/no"
+            ),
+            None,
+        ),
+        ("DELETE", format!("/Videos/{id}/AlternateSources"), None),
+        ("DELETE", format!("/Videos/{id}/Subtitles/0"), None),
+    ] {
+        let (status, response) = call(&f.router, method, &uri, Some(&f.viewer), body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {response}");
+    }
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Videos/MergeVersions?ids={},{}", f.allowed, f.hidden),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, item) = call(
+        &f.router,
+        "GET",
+        &format!("/Items/{id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(item["Name"], "Gamma (2001)");
+    assert!(f.h.path("more/Gamma (2001)/Gamma (2001).mkv").exists());
+}

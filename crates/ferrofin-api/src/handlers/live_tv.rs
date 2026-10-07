@@ -46,7 +46,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::JsonBody;
-use crate::handlers::items::{effective_user_id, resolve_user_opt};
+use crate::handlers::items::{effective_user_id, require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
     parse_pipe_strings,
@@ -217,6 +217,7 @@ async fn get_channel(
         return Err(ApiError::NotFound("channel".into()));
     };
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_item(&state, channel_id, user.as_ref()).await?;
     m.get_channel(channel_id, user.as_ref(), &DtoOptions::default())
         .await?
         .map(Json)
@@ -1075,7 +1076,8 @@ async fn get_recording(
     Path(recording_id): Path<Uuid>,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    effective_user_id(&state, &auth, query.user_id).await?;
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_recording(&state, recording_id, user.as_ref()).await?;
     live_tv(&state)?
         .get_recording(recording_id)
         .await?
@@ -1083,12 +1085,39 @@ async fn get_recording(
         .ok_or_else(|| ApiError::NotFound("recording".into()))
 }
 
+/// DVR recordings have an entity even before the scanner inserts BaseItems.
+/// Prefer a scanned row so its inherited metadata and library membership apply.
+async fn require_visible_recording(
+    state: &AppState,
+    id: Uuid,
+    user: Option<&UserEntity>,
+) -> Result<(), ApiError> {
+    let manager = live_tv(state)?;
+    let item = match state.library.get_item_by_id(id).await? {
+        Some(item) => item,
+        None => manager
+            .get_recording_item(id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("recording".into()))?,
+    };
+    if let Some(user) = user
+        && !state
+            .library
+            .is_item_visible_standalone(&item, user)
+            .await?
+    {
+        return Err(ApiError::NotFound("recording".into()));
+    }
+    Ok(())
+}
+
 /// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
 async fn delete_recording(
     State(state): State<AppState>,
-    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
+    RequireLiveTvManagement(auth): RequireLiveTvManagement,
     Path(recording_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    require_visible_recording(&state, recording_id, auth.user.as_ref()).await?;
     live_tv(&state)?.delete_recording(recording_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

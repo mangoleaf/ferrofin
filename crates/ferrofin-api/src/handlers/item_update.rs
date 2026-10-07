@@ -65,13 +65,13 @@ use crate::state::AppState;
 )]
 pub(crate) async fn update_item(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     JsonBody(request): JsonBody<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
@@ -653,13 +653,13 @@ struct ContentTypeQuery {
 )]
 async fn update_item_content_type(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ContentTypeQuery>,
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let folder = containing_folder_path(item.path.as_deref());
@@ -937,13 +937,13 @@ impl From<RefreshMode> for MetadataRefreshMode {
 )]
 async fn refresh_item(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
@@ -1035,10 +1035,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 )]
 async fn get_metadata_editor(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
 

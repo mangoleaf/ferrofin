@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::state::AppState;
 
@@ -97,6 +97,9 @@ async fn similar_items(
     query: SimilarParams,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(state, auth, query.user_id).await?;
+    if !item_id.is_nil() {
+        require_visible_item(state, item_id, user.as_ref()).await?;
+    }
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
     let mut options = DtoOptions {

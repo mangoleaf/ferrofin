@@ -67,11 +67,11 @@ struct RemoteImagesQuery {
 )]
 async fn get_remote_images(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<RemoteImagesQuery>,
 ) -> Result<Json<RemoteImageResult>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
 
     let image_query = RemoteImageQuery {
         provider_name: query.provider_name.clone().unwrap_or_default(),
@@ -126,10 +126,10 @@ async fn get_remote_images(
 )]
 async fn get_remote_image_providers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ImageProviderInfo>>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let providers = state
         .providers
         .get_remote_image_provider_info(item_id)
@@ -169,11 +169,11 @@ struct DownloadQuery {
 )]
 async fn download_remote_image(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<DownloadQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let image_type = query
         .image_type
         .ok_or_else(|| ApiError::BadRequest("type is required".to_owned()))?;
@@ -193,10 +193,14 @@ async fn download_remote_image(
 }
 
 /// Resolves an item, returning a `404` when it does not exist.
-async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+async fn require_item(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok(())
