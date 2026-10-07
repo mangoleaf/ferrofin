@@ -74,12 +74,21 @@ struct Paths {
 /// Generic over the [`Transcoder`] seam (real ffmpeg spawn vs. a test fake).
 pub struct MediaEncoderImpl<T: Transcoder> {
     transcoder: Arc<T>,
+    image_encoding_pool: Arc<tokio::sync::Semaphore>,
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
     normalizer: ProbeResultNormalizer<PassthroughLocalization>,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
+    /// Shares the startup thumbnail/trickplay ceiling with the other extractor.
+    /// The host resolves the dashboard setting and supplies a nonzero pool.
+    #[must_use]
+    pub fn with_image_encoding_pool(mut self, pool: Arc<tokio::sync::Semaphore>) -> Self {
+        self.image_encoding_pool = pool;
+        self
+    }
+
     /// Creates an encoder using `transcoder` for process invocation and the
     /// given `ffmpeg`/`ffprobe` paths and `config`.
     pub fn new(
@@ -90,6 +99,9 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     ) -> Self {
         Self {
             transcoder,
+            image_encoding_pool: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            )),
             config,
             paths: RwLock::new(Paths {
                 ffmpeg: ffmpeg_path.into(),
@@ -391,6 +403,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
+        let _permit = self
+            .image_encoding_pool
+            .acquire()
+            .await
+            .map_err(ServiceError::backend_source)?;
         let result = self
             .transcoder
             .get_process_output(&ffmpeg, &args, true, None, &[])
@@ -485,6 +502,11 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             self.config.threads,
         );
         let ffmpeg = self.encoder_path();
+        let _permit = self
+            .image_encoding_pool
+            .acquire()
+            .await
+            .map_err(ServiceError::backend_source)?;
         let stderr = self
             .transcoder
             .get_process_output(&ffmpeg, &args, true, None, &[])
@@ -1073,5 +1095,126 @@ mod tests {
         }
 
         std::fs::set_permissions(&temp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    struct GatedFrames {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl Transcoder for GatedFrames {
+        async fn get_process_output(
+            &self,
+            _: &str,
+            arguments: &str,
+            _: bool,
+            _: Option<&str>,
+            _: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            let args = shlex::split(arguments).unwrap();
+            let path = args.last().unwrap().replace("%08d", "00000001");
+            std::fs::write(path, b"jpg").unwrap();
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: true,
+            })
+        }
+        async fn get_process_exit_code(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_video_and_trickplay_share_thumbnail_slots_and_release_on_cancel() {
+        use ferrofin_model::entities_media::MediaStream;
+        use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor as _};
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = Arc::new(tokio::sync::Semaphore::new(2));
+        let process = Arc::new(GatedFrames {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let encoder = Arc::new(
+            MediaEncoderImpl::new(
+                Arc::clone(&process),
+                "ffmpeg",
+                "ffprobe",
+                MediaEncoderConfig {
+                    temp_dir: tmp.path().into(),
+                    ..Default::default()
+                },
+            )
+            .with_image_encoding_pool(Arc::clone(&pool)),
+        );
+        let audio = {
+            let encoder = Arc::clone(&encoder);
+            tokio::spawn(async move { encoder.extract_audio_image("/audio.flac", None).await })
+        };
+        let video = {
+            let encoder = Arc::clone(&encoder);
+            tokio::spawn(async move {
+                encoder
+                    .extract_video_image(
+                        "/movie.mkv",
+                        "mkv",
+                        &MediaSourceInfo::default(),
+                        &MediaStream::default(),
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            process.entered.acquire_many(2),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        let extractor =
+            crate::encoder::TrickplayFrameExtractorImpl::new(Arc::clone(&process), "ffmpeg", None)
+                .with_image_encoding_pool(Arc::clone(&pool));
+        let output_dir = tmp.path().join("trickplay").to_string_lossy().into_owned();
+        let trickplay = tokio::spawn(async move {
+            extractor
+                .extract_trickplay_frames(&TrickplayExtraction {
+                    input_path: "/movie.mkv",
+                    video_stream: None,
+                    interval_ms: 10_000,
+                    max_width: 320,
+                    qscale: 4,
+                    threads: 1,
+                    output_dir: &output_dir,
+                    allow_hw_accel: false,
+                    enable_hw_encoding: false,
+                    keyframe_only: false,
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                process.entered.acquire()
+            )
+            .await
+            .is_err()
+        );
+        audio.abort();
+        assert!(audio.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(3), process.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert_eq!(pool.available_permits(), 0);
+        process.release.add_permits(2);
+        video.await.unwrap().unwrap();
+        assert_eq!(trickplay.await.unwrap().unwrap().len(), 1);
+        assert_eq!(pool.available_permits(), 2);
     }
 }

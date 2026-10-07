@@ -475,15 +475,25 @@ pub async fn build_app_state(
     let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
         Arc::new(FerrofinNextUpService::new(db.clone()));
 
+    let image_encoding_limit = parallel_image_encoding_limit(
+        server_config.parallel_image_encoding_limit,
+        ferrofin_db::database::usable_cores(),
+    );
+    // Upstream has a separate pool for frame extraction, shared by single
+    // thumbnails and interval extraction (trickplay).
+    let thumbnail_pool = Arc::new(tokio::sync::Semaphore::new(image_encoding_limit));
+
     // ---- standalone leaves (no manager deps) ------------------------------
     // The real `image`-crate encoder (resize + format-convert), not the no-op
     // `NullImageEncoder` — so `maxWidth`/`fillHeight`/`format` image requests are
     // honoured instead of serving the full-size original.
-    let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> =
-        Arc::new(ImageProcessor::new(
+    let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+        ImageProcessor::new(
             Arc::new(ImageCrateEncoder::new()),
             cache_root.child("images"),
-        ));
+        )
+        .with_encoding_limit(image_encoding_limit),
+    );
     // The shared TMDB client — the scan's automatic artwork, the remote-search
     // ("Identify") providers, and the remote-image ("Choose Image") methods all
     // use Jellyfin's built-in key.
@@ -657,8 +667,8 @@ pub async fn build_app_state(
         ));
 
     // ---- media encoder (probe-only; ffmpeg process seam) ------------------
-    let media_encoder: Arc<dyn ferrofin_traits::media_encoding::MediaEncoder> =
-        Arc::new(MediaEncoderImpl::new(
+    let media_encoder: Arc<dyn ferrofin_traits::media_encoding::MediaEncoder> = Arc::new(
+        MediaEncoderImpl::new(
             Arc::new(TokioTranscoder::new()),
             ffmpeg.ffmpeg.to_string_lossy().into_owned(),
             ffmpeg.ffprobe.to_string_lossy().into_owned(),
@@ -673,7 +683,9 @@ pub async fn build_app_state(
                 temp_dir: cache_root.child("temp"),
                 ffmpeg_version: ffmpeg.capabilities.ffmpeg_version(),
             },
-        ));
+        )
+        .with_image_encoding_pool(Arc::clone(&thumbnail_pool)),
+    );
 
     // ---- config trait object (shared by many managers) --------------------
     let config_trait: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> =
@@ -754,6 +766,7 @@ pub async fn build_app_state(
                 ffmpeg.ffmpeg.to_string_lossy().into_owned(),
                 ffmpeg.capabilities.ffmpeg_version(),
             )
+            .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
             // Trickplay decodes a whole file to produce a handful of frames,
             // which is what a GPU is for and what makes a library-wide pass
             // take hours in software. Gated by the dashboard's trickplay
@@ -1361,16 +1374,20 @@ pub async fn build_app_state(
         let lifecycle = Arc::downgrade(&lifecycle_concrete);
         let paths = Arc::clone(&paths);
         let startup_cache = config.cache_dir.clone();
+        let startup_image_limit = server_config.parallel_image_encoding_limit;
         config_mgr.add_configuration_listener(Arc::new(move |update| {
-            if let ferrofin_traits::configuration::ConfigurationUpdate::Server(config) = update
-                && config
+            if let ferrofin_traits::configuration::ConfigurationUpdate::Server(config) = update {
+                let cache_needs_restart = config
                     .cache_path
                     .as_deref()
                     .is_none_or(|p| p.trim().is_empty())
-                && std::path::Path::new(&paths.cache_path()) != startup_cache
-                && let Some(lifecycle) = lifecycle.upgrade()
-            {
-                lifecycle.mark_restart_required();
+                    && std::path::Path::new(&paths.cache_path()) != startup_cache;
+                if (cache_needs_restart
+                    || config.parallel_image_encoding_limit != startup_image_limit)
+                    && let Some(lifecycle) = lifecycle.upgrade()
+                {
+                    lifecycle.mark_restart_required();
+                }
             }
         }));
     }
@@ -2331,10 +2348,26 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     }
 }
 
+/// C# ImageProcessor / MediaEncoder constructor rule: nonpositive means CPU count.
+fn parallel_image_encoding_limit(setting: i32, processors: u32) -> usize {
+    usize::try_from(setting)
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| usize::try_from(processors).unwrap_or(1).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn dashboard_image_limit_matches_upstream_constructor_defaults() {
+        for (setting, cores, expected) in [(-1, 8, 8), (0, 4, 4), (0, 1, 1), (1, 8, 1), (20, 2, 20)]
+        {
+            assert_eq!(parallel_image_encoding_limit(setting, cores), expected);
+        }
+    }
 
     /// A bootstrap [`Config`] pointing every path at a fresh temp dir.
     fn test_config(root: &std::path::Path) -> Config {

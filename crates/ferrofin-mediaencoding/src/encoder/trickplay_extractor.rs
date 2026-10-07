@@ -58,6 +58,7 @@ use super::Transcoder;
 /// in unit tests).
 pub struct TrickplayFrameExtractorImpl<T: Transcoder> {
     transcoder: Arc<T>,
+    image_encoding_pool: Arc<tokio::sync::Semaphore>,
     ffmpeg_path: String,
     ffmpeg_version: Option<FfmpegVersion>,
     caps: Arc<FfmpegCapabilities>,
@@ -74,6 +75,14 @@ impl<T: Transcoder> std::fmt::Debug for TrickplayFrameExtractorImpl<T> {
 }
 
 impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
+    /// Shares the startup thumbnail/trickplay ceiling with the other extractor.
+    /// The host resolves the dashboard setting and supplies a nonzero pool.
+    #[must_use]
+    pub fn with_image_encoding_pool(mut self, pool: Arc<tokio::sync::Semaphore>) -> Self {
+        self.image_encoding_pool = pool;
+        self
+    }
+
     /// Creates a **software-only** extractor spawning `ffmpeg_path` through
     /// `transcoder`.
     ///
@@ -91,6 +100,9 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     ) -> Self {
         Self {
             transcoder,
+            image_encoding_pool: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            )),
             ffmpeg_path: ffmpeg_path.into(),
             ffmpeg_version,
             caps: Arc::new(FfmpegCapabilities::default()),
@@ -747,6 +759,11 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             hardware = plan.hardware,
             "trickplay ffmpeg arguments"
         );
+        let _permit = self
+            .image_encoding_pool
+            .acquire()
+            .await
+            .map_err(ServiceError::backend_source)?;
         self.transcoder
             .get_process_output(&self.ffmpeg_path, &plan.args, true, None, &plan.env)
             .await
