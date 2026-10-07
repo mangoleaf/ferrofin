@@ -506,3 +506,65 @@ async fn plan_paths_walks_only_the_path_to_the_item() {
         "listed outside the track's artist: {listed:?}"
     );
 }
+
+/// Parallel discovery must keep the serial plan, including extras ownership and
+/// deletion guards, for every resolver. One scanner observes saved limit changes.
+#[tokio::test]
+async fn live_fanout_keeps_full_and_scoped_plans_identical() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let folders = fixture(tmp.path());
+    touch(tmp.path(), "movies/Ignored/.ignore");
+    touch(tmp.path(), "movies/Ignored/Hidden.mkv");
+    let fs = Arc::new(CountingFs::default());
+    let setting = Arc::new(AtomicI32::new(1));
+    let source = Arc::clone(&setting);
+    let scanner = scanner(tmp.path(), fs)
+        .await
+        .with_scan_fanout(move || source.load(Ordering::Acquire));
+    let baseline = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+    );
+    let expected = canon(baseline.items);
+    let roots = [
+        tmp.path()
+            .join("tv/Firefly (2002)/Season 01")
+            .to_string_lossy()
+            .into_owned(),
+        tmp.path()
+            .join("movies/Heat (1995)")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let scoped = canon(scanner.plan_paths(&folders, PlanScope::paths(&roots, None)));
+    for limit in [2, 4, 1] {
+        setting.store(limit, Ordering::Release);
+        let actual = scanner.plan_in(
+            &folders,
+            &folders,
+            PlanScope::ALL,
+            super::DateAdded::default(),
+            None,
+        );
+        assert_eq!(canon(actual.items), expected, "limit {limit}");
+        assert_eq!(actual.owner_paths, baseline.owner_paths);
+        for (mut got, want) in [
+            (actual.excluded, &baseline.excluded),
+            (actual.unlisted, &baseline.unlisted),
+            (actual.inaccessible, &baseline.inaccessible),
+        ] {
+            let mut want = want.clone();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want);
+        }
+        assert_eq!(
+            canon(scanner.plan_paths(&folders, PlanScope::paths(&roots, None))),
+            scoped
+        );
+    }
+}

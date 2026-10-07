@@ -1048,8 +1048,11 @@ fn spawn_probe(
     request: MediaInfoRequest,
     external: Option<ExternalProbe>,
     slots: Option<Arc<tokio::sync::Semaphore>>,
+    fanout: Option<fanout::Permit>,
 ) -> tokio::task::JoinHandle<Option<MediaInfo>> {
     tokio::task::spawn(async move {
+        // Keep the fanout slot inside the task until I/O or cancellation finishes.
+        let _fanout = fanout;
         // Held for the probe: the scan's budget of running ffprobes.
         let _slot = match slots {
             Some(slots) => Some(slots.acquire_owned().await.ok()?),
@@ -1128,6 +1131,8 @@ struct ProbePipeline<'a> {
     /// The permits every probe of this scan — and of the lane refreshes it
     /// serves — runs under ([`LibraryScanner::probe_slots`]).
     slots: Option<Arc<tokio::sync::Semaphore>>,
+    fanout: Option<Arc<fanout::Budget>>,
+    current: Option<usize>,
 }
 
 impl<'a> ProbePipeline<'a> {
@@ -1157,7 +1162,29 @@ impl<'a> ProbePipeline<'a> {
             inflight: std::collections::VecDeque::new(),
             window: window.max(1),
             slots: None,
+            fanout: None,
+            current: None,
         }
+    }
+
+    fn with_fanout(mut self, fanout: Option<Arc<fanout::Budget>>) -> Self {
+        self.fanout = fanout;
+        self
+    }
+
+    /// Reserve the foreground slot for a refresh served between items.
+    fn pause_foreground(&mut self) {
+        self.current = None;
+    }
+
+    /// The current item's own probe can use its foreground slot even at limit 1.
+    fn begin_item(&mut self, index: usize) {
+        self.current = Some(index);
+        self.fill();
+    }
+
+    fn fill(&mut self) {
+        while self.inflight.len() < self.window && self.dispatch_next() {}
     }
 
     /// Runs every probe under a permit of `slots`, shared with the other
@@ -1192,10 +1219,20 @@ impl<'a> ProbePipeline<'a> {
         };
         while self.next < self.eligible.len().min(self.decided) {
             let index = self.next;
-            self.next += 1;
             if self.eligible[index].is_some()
                 && let Some(request) = probe_request(&self.planned[index].entity)
             {
+                let permit = if self.current == Some(index) {
+                    None
+                } else if let Some(budget) = &self.fanout {
+                    let Some(permit) = budget.try_acquire() else {
+                        return false;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
+                self.next += 1;
                 // Sidecar streams are a video concern (`FFProbeVideoInfo`);
                 // an audio item's probe is the embedded-tag path only.
                 let external = self
@@ -1207,10 +1244,17 @@ impl<'a> ProbePipeline<'a> {
                 self.inflight.push_back((
                     index,
                     is_audio,
-                    spawn_probe(Arc::clone(encoder), request, external, self.slots.clone()),
+                    spawn_probe(
+                        Arc::clone(encoder),
+                        request,
+                        external,
+                        self.slots.clone(),
+                        permit,
+                    ),
                 ));
                 return true;
             }
+            self.next += 1;
         }
         false
     }
@@ -2329,6 +2373,8 @@ struct PlanCtx<'a> {
     inaccessible: std::cell::RefCell<Vec<String>>,
     /// How the pass dates the items it resolves.
     date_added: DateAdded,
+    fanout: Option<Arc<fanout::Budget>>,
+    cancel: Option<ScanCancel>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -2344,6 +2390,8 @@ impl<'a> PlanCtx<'a> {
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
+            fanout: None,
+            cancel: None,
         }
     }
 
@@ -2741,6 +2789,8 @@ pub struct LibraryScanner {
     /// `probe_concurrency` permits, one held by each running ffprobe: a scan
     /// and the lane refreshes it serves share the one budget.
     probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Shared ceiling for folder workers and speculative probes.
+    scan_fanout: Option<Arc<fanout::Budget>>,
     /// Optional TMDB client for fetching remote artwork (posters/backdrops) for
     /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
     tmdb: Option<Arc<TmdbClient>>,
@@ -2906,6 +2956,7 @@ impl LibraryScanner {
             media_streams: None,
             probe_concurrency: default_probe_concurrency(),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(default_probe_concurrency())),
+            scan_fanout: None,
             tmdb: None,
             omdb: None,
             tvdb: None,
@@ -3003,6 +3054,16 @@ impl LibraryScanner {
             .as_ref()
             .map(|read| read())
             .unwrap_or_default()
+    }
+
+    /// Reads the dashboard's library fanout ceiling for folder and probe work.
+    /// Nonpositive values use Jellyfin's processor-count-minus-three default.
+    /// One foreground slot is reserved for ordered metadata writes and lane
+    /// refreshes; background work shares the remaining slots across both paths.
+    #[must_use]
+    pub fn with_scan_fanout(mut self, read: impl Fn() -> i32 + Send + Sync + 'static) -> Self {
+        self.scan_fanout = Some(fanout::Budget::new(read));
+        self
     }
 
     /// Overrides how many ffprobe processes the scan keeps in flight
@@ -3507,7 +3568,13 @@ impl LibraryScanner {
                 });
             }
             Box::pin(self.serve_lane(run)).await;
-            let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
+            let part = self.plan_in(
+                library,
+                &all_folders,
+                PlanScope::ALL,
+                date_added,
+                Some(run.cancel),
+            );
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
             plan.excluded.extend(part.excluded);
@@ -3815,6 +3882,7 @@ impl LibraryScanner {
             &folders,
             PlanScope::paths(roots, also_path),
             self.date_added(),
+            Some(run.cancel),
         );
         tracing::info!(
             changed,
@@ -3996,6 +4064,12 @@ impl LibraryScanner {
         scope: Option<PathScope<'_>>,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
+        if run.cancel.is_cancelled() {
+            return Ok(ScanOutcome {
+                stopped: true,
+                ..ScanOutcome::default()
+            });
+        }
         let PlanOutput {
             items: mut planned,
             excluded,
@@ -4103,6 +4177,7 @@ impl LibraryScanner {
         };
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
+            probes.pause_foreground();
             let touched = Box::pin(self.serve_lane_between_items(
                 run,
                 scanned,
@@ -4125,6 +4200,7 @@ impl LibraryScanner {
                 &refresh,
             ))
             .await;
+            probes.begin_item(scanned);
             // Between two items (the one before was written whole), and
             // after the window read, whose planning stops at a cancel: a
             // read that takes seconds never delays the stop by an item.
@@ -6616,6 +6692,7 @@ impl LibraryScanner {
             self.probe_concurrency,
         )
         .sharing(Arc::clone(&self.probe_slots))
+        .with_fanout(self.scan_fanout.clone())
     }
 
     /// The external subtitle/audio resolvers plus the metadata root, or
@@ -9289,7 +9366,7 @@ impl LibraryScanner {
     /// folds it into `homevideos`.
     #[cfg(test)]
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
-        self.plan_in(folders, folders, PlanScope::ALL, DateAdded::default())
+        self.plan_in(folders, folders, PlanScope::ALL, DateAdded::default(), None)
             .items
     }
 
@@ -9304,7 +9381,7 @@ impl LibraryScanner {
     #[cfg(test)]
     fn plan_paths(&self, folders: &[VirtualFolderInfo], scope: PlanScope<'_>) -> Vec<Planned> {
         let affected = affected_libraries(folders, scope.roots.unwrap_or_default(), scope.exact);
-        self.plan_in(&affected, folders, scope, DateAdded::default())
+        self.plan_in(&affected, folders, scope, DateAdded::default(), None)
             .items
     }
 
@@ -9320,11 +9397,14 @@ impl LibraryScanner {
         key_folders: &[VirtualFolderInfo],
         scope: PlanScope<'_>,
         date_added: DateAdded,
+        cancel: Option<&ScanCancel>,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
-        let ctx = PlanCtx::new(&naming, scope)
+        let mut ctx = PlanCtx::new(&naming, scope)
             .with_locations(plan_folders)
             .with_date_added(date_added);
+        ctx.fanout.clone_from(&self.scan_fanout);
+        ctx.cancel = cancel.cloned();
         let folders = key_folders;
         let mut out = Vec::new();
         for folder in plan_folders {
@@ -9393,6 +9473,9 @@ impl LibraryScanner {
     /// library location that lists empty as inaccessible
     /// ([`PlanOutput::inaccessible`]).
     fn list(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
+        if ctx.cancel.as_ref().is_some_and(ScanCancel::is_cancelled) {
+            return Vec::new();
+        }
         match self.file_system.try_get_file_system_entries(dir) {
             Ok(entries) => {
                 // Availability is measured before exclusions: a mounted
@@ -9722,7 +9805,8 @@ impl LibraryScanner {
     /// The recursive walk behind [`Self::plan_movies`]: emits movie rows,
     /// collects extras for post-resolution, and records each directory's
     /// movies for extras ownership.
-    #[allow(clippy::too_many_arguments)]
+    // Keep discovery and the ordered merge of child items/extras together.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn collect_movie_plan(
         &self,
         dir: &str,
@@ -9773,6 +9857,29 @@ impl LibraryScanner {
                 }
             }
         }
+        let dirs: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path)
+            })
+            .collect();
+        let mut children = fanout::map(&dirs, ctx, |entry, ctx| {
+            let mut rows = Vec::new();
+            let mut extras = Vec::new();
+            let mut owners = HashMap::new();
+            self.collect_movie_plan(
+                &entry.path,
+                root,
+                cf,
+                kind,
+                ctx,
+                &mut rows,
+                &mut extras,
+                &mut owners,
+            );
+            (rows, extras, owners)
+        })
+        .into_iter();
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
                 // TODO(parity): a plain subfolder (`Movies/Collection/…`,
@@ -9793,17 +9900,12 @@ impl LibraryScanner {
                 // down as the `ParentId` of what is planned in it while the
                 // `TopParentId` stays the library, and prove it with a
                 // `plan_paths` invariant case plus an adopted-library browse.
-                if ctx.scope.visits(&entry.path) {
-                    self.collect_movie_plan(
-                        &entry.path,
-                        root,
-                        cf,
-                        kind,
-                        ctx,
-                        out,
-                        extras,
-                        movies_by_dir,
-                    );
+                if ctx.scope.visits(&entry.path)
+                    && let Some((rows, found_extras, owners)) = children.next()
+                {
+                    out.extend(rows);
+                    extras.extend(found_extras);
+                    movies_by_dir.extend(owners);
                 }
                 continue;
             }
@@ -9945,49 +10047,57 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        for entry in self.list(location, ctx) {
-            if entry.type_ != FileSystemEntryType::Directory {
-                continue; // loose files directly under a tvshows root are skipped in v1
+        let entries = self.list(location, ctx);
+        for rows in fanout::map(&entries, ctx, |entry, ctx| {
+            let mut rows = Vec::new();
+            let out = &mut rows;
+            for entry in std::iter::once(entry) {
+                if entry.type_ != FileSystemEntryType::Directory {
+                    continue; // loose files directly under a tvshows root are skipped in v1
+                }
+                if !ctx.scope.visits(&entry.path) {
+                    continue;
+                }
+                let info = series_resolver::resolve(ctx.naming, &entry.path);
+                let name = info.name.unwrap_or_else(|| entry.name.clone());
+                let series_name = name.clone();
+                let Some((series_id, mut series)) =
+                    self.base_item(ctx, BaseItemKind::Series, cf, cf, name, &entry.path, true)
+                else {
+                    continue;
+                };
+                series.production_year = info.year.map(i64::from);
+                // The series' presentation key groups its seasons/episodes: the
+                // `/Shows/{id}/{Seasons,Episodes}` queries filter on
+                // `SeriesPresentationUniqueKey`. Planned under 12.0's rule
+                // (`Series.CreatePresentationUniqueKey`) from what is known before
+                // any provider ran — no provider ids yet, so with grouping on this
+                // is the `series-{name}` fallback; the refresh recomputes it once
+                // the ids are settled (`sync_series_key`) and re-points the
+                // children, exactly as `SeriesMetadataService` does.
+                let series_key = self.series_key_for(folders, &series, &[], &[]);
+                series.presentation_unique_key = Some(series_key.clone());
+                ctx.emit(
+                    out,
+                    Planned {
+                        id: series_id,
+                        entity: series,
+                        ancestors: vec![cf],
+                    },
+                );
+                self.plan_series(
+                    &entry.path,
+                    cf,
+                    series_id,
+                    &series_name,
+                    &series_key,
+                    ctx,
+                    out,
+                );
             }
-            if !ctx.scope.visits(&entry.path) {
-                continue;
-            }
-            let info = series_resolver::resolve(ctx.naming, &entry.path);
-            let name = info.name.unwrap_or_else(|| entry.name.clone());
-            let series_name = name.clone();
-            let Some((series_id, mut series)) =
-                self.base_item(ctx, BaseItemKind::Series, cf, cf, name, &entry.path, true)
-            else {
-                continue;
-            };
-            series.production_year = info.year.map(i64::from);
-            // The series' presentation key groups its seasons/episodes: the
-            // `/Shows/{id}/{Seasons,Episodes}` queries filter on
-            // `SeriesPresentationUniqueKey`. Planned under 12.0's rule
-            // (`Series.CreatePresentationUniqueKey`) from what is known before
-            // any provider ran — no provider ids yet, so with grouping on this
-            // is the `series-{name}` fallback; the refresh recomputes it once
-            // the ids are settled (`sync_series_key`) and re-points the
-            // children, exactly as `SeriesMetadataService` does.
-            let series_key = self.series_key_for(folders, &series, &[], &[]);
-            series.presentation_unique_key = Some(series_key.clone());
-            ctx.emit(
-                out,
-                Planned {
-                    id: series_id,
-                    entity: series,
-                    ancestors: vec![cf],
-                },
-            );
-            self.plan_series(
-                &entry.path,
-                cf,
-                series_id,
-                &series_name,
-                &series_key,
-                ctx,
-                out,
-            );
+            rows
+        }) {
+            out.extend(rows);
         }
     }
 
@@ -10085,7 +10195,6 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let naming = ctx.naming;
         // Episodes not under a `Season NN` folder (a flat series folder, or loose
         // videos in a non-season subfolder). Grouped into *virtual* seasons below
         // by their filename-detected season number, so a show without season
@@ -10098,66 +10207,77 @@ impl LibraryScanner {
             .insert(series_id, series_dir.to_owned());
         let entries = self.list(series_dir, ctx);
         let extras = self.plan_tv_extras(&entries, series_dir, series_id, cf, ctx, out);
-        for entry in entries {
-            if extras.contains(&entry.path) {
-                continue;
-            }
-            if entry.type_ == FileSystemEntryType::Directory {
-                if !ctx.scope.visits(&entry.path) {
+        for (rows, paths) in fanout::map(&entries, ctx, |entry, ctx| {
+            let naming = ctx.naming;
+            let mut rows = Vec::new();
+            let out = &mut rows;
+            let mut loose = Vec::new();
+            for entry in std::iter::once(entry) {
+                if extras.contains(&entry.path) {
                     continue;
                 }
-                let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
-                if season.season_number.is_some() || season.is_season_folder {
-                    let num = season.season_number;
-                    let name = num.map_or_else(|| entry.name.clone(), season_display_name);
-                    let Some((season_id, mut e)) = self.base_item(
-                        ctx,
-                        BaseItemKind::Season,
-                        cf,
-                        series_id,
-                        name.clone(),
-                        &entry.path,
-                        true,
-                    ) else {
+                if entry.type_ == FileSystemEntryType::Directory {
+                    if !ctx.scope.visits(&entry.path) {
                         continue;
-                    };
-                    ctx.owner_paths
-                        .borrow_mut()
-                        .insert(season_id, entry.path.clone());
-                    e.index_number = num.map(i64::from);
-                    e.sort_name = Some(season_sort_name(e.index_number, &name));
-                    e.series_id = Some(guid_to_db(series_id));
-                    e.series_name = Some(series_name.to_owned());
-                    e.series_presentation_unique_key = Some(series_key.to_owned());
-                    ctx.emit(
-                        out,
-                        Planned {
-                            id: season_id,
-                            entity: e,
-                            ancestors: vec![cf, series_id],
-                        },
-                    );
-                    self.plan_episodes(
-                        &entry.path,
-                        cf,
-                        series_id,
-                        Some((season_id, num)),
-                        series_name,
-                        series_key,
-                        Some(&name),
-                        ctx,
-                        out,
-                    );
-                } else {
-                    // A non-season subfolder: collect its videos as
-                    // loose episodes (grouped into virtual seasons below).
-                    self.collect_videos(&entry.path, ctx, &mut loose);
+                    }
+                    let season =
+                        season_path_parser::parse(&entry.path, Some(series_dir), true, true);
+                    if season.season_number.is_some() || season.is_season_folder {
+                        let num = season.season_number;
+                        let name = num.map_or_else(|| entry.name.clone(), season_display_name);
+                        let Some((season_id, mut e)) = self.base_item(
+                            ctx,
+                            BaseItemKind::Season,
+                            cf,
+                            series_id,
+                            name.clone(),
+                            &entry.path,
+                            true,
+                        ) else {
+                            continue;
+                        };
+                        ctx.owner_paths
+                            .borrow_mut()
+                            .insert(season_id, entry.path.clone());
+                        e.index_number = num.map(i64::from);
+                        e.sort_name = Some(season_sort_name(e.index_number, &name));
+                        e.series_id = Some(guid_to_db(series_id));
+                        e.series_name = Some(series_name.to_owned());
+                        e.series_presentation_unique_key = Some(series_key.to_owned());
+                        ctx.emit(
+                            out,
+                            Planned {
+                                id: season_id,
+                                entity: e,
+                                ancestors: vec![cf, series_id],
+                            },
+                        );
+                        self.plan_episodes(
+                            &entry.path,
+                            cf,
+                            series_id,
+                            Some((season_id, num)),
+                            series_name,
+                            series_key,
+                            Some(&name),
+                            ctx,
+                            out,
+                        );
+                    } else {
+                        // A non-season subfolder: collect its videos as
+                        // loose episodes (grouped into virtual seasons below).
+                        self.collect_videos(&entry.path, ctx, &mut loose);
+                    }
+                } else if video_resolver::is_video_file(&entry.path, naming)
+                    && ctx.scope.keeps(&entry.path)
+                {
+                    loose.push(entry.path.clone());
                 }
-            } else if video_resolver::is_video_file(&entry.path, naming)
-                && ctx.scope.keeps(&entry.path)
-            {
-                loose.push(entry.path);
             }
+            (rows, loose)
+        }) {
+            out.extend(rows);
+            loose.extend(paths);
         }
         // A scoped plan groups only its own loose episodes: each one's virtual
         // season follows from its own season number, so the scoped plan
@@ -10178,7 +10298,10 @@ impl LibraryScanner {
     /// Collects every video file under `dir` (recursively) into `out_paths` —
     /// the ones `ctx`'s scope keeps.
     fn collect_videos(&self, dir: &str, ctx: &PlanCtx<'_>, out_paths: &mut Vec<String>) {
-        for entry in self.list(dir, ctx) {
+        let entries = self.list(dir, ctx);
+        for paths in fanout::map(&entries, ctx, |entry, ctx| {
+            let mut paths = Vec::new();
+            let out_paths = &mut paths;
             if entry.type_ == FileSystemEntryType::Directory {
                 if ctx.scope.visits(&entry.path) {
                     self.collect_videos(&entry.path, ctx, out_paths);
@@ -10186,8 +10309,11 @@ impl LibraryScanner {
             } else if video_resolver::is_video_file(&entry.path, ctx.naming)
                 && ctx.scope.keeps(&entry.path)
             {
-                out_paths.push(entry.path);
+                out_paths.push(entry.path.clone());
             }
+            paths
+        }) {
+            out_paths.extend(paths);
         }
     }
 
@@ -10294,7 +10420,6 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let naming = ctx.naming;
         let owner = season.map_or(series_id, |(id, _)| id);
         let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
         let entries = self.list(dir, ctx);
@@ -10303,40 +10428,48 @@ impl LibraryScanner {
         } else {
             std::collections::HashSet::new()
         };
-        for entry in entries {
-            if extras.contains(&entry.path) {
-                continue;
-            }
-            if entry.type_ == FileSystemEntryType::Directory {
-                if !ctx.scope.visits(&entry.path) {
+        for rows in fanout::map(&entries, ctx, |entry, ctx| {
+            let naming = ctx.naming;
+            let mut rows = Vec::new();
+            let out = &mut rows;
+            for entry in std::iter::once(entry) {
+                if extras.contains(&entry.path) {
                     continue;
                 }
-                self.plan_episodes(
-                    &entry.path,
-                    cf,
-                    series_id,
-                    season,
-                    series_name,
-                    series_key,
-                    season_name,
-                    ctx,
-                    out,
-                );
-            } else if video_resolver::is_video_file(&entry.path, naming)
-                && ctx.scope.keeps(&entry.path)
-            {
-                self.emit_episode(
-                    &entry.path,
-                    cf,
-                    series_id,
-                    season,
-                    series_name,
-                    series_key,
-                    season_name,
-                    ctx,
-                    out,
-                );
+                if entry.type_ == FileSystemEntryType::Directory {
+                    if !ctx.scope.visits(&entry.path) {
+                        continue;
+                    }
+                    self.plan_episodes(
+                        &entry.path,
+                        cf,
+                        series_id,
+                        season,
+                        series_name,
+                        series_key,
+                        season_name,
+                        ctx,
+                        out,
+                    );
+                } else if video_resolver::is_video_file(&entry.path, naming)
+                    && ctx.scope.keeps(&entry.path)
+                {
+                    self.emit_episode(
+                        &entry.path,
+                        cf,
+                        series_id,
+                        season,
+                        series_name,
+                        series_key,
+                        season_name,
+                        ctx,
+                        out,
+                    );
+                }
             }
+            rows
+        }) {
+            out.extend(rows);
         }
     }
 
@@ -10414,11 +10547,9 @@ impl LibraryScanner {
     fn plan_music(&self, dir: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
         // The library root itself is the CollectionFolder — never an artist or
         // an album (upstream's `args.Parent.IsRoot` guard), so recurse into it.
-        for entry in self.list(dir, ctx) {
-            if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
-                self.plan_music_node(&entry.path, cf, cf, false, ctx, out);
-            }
-        }
+        fanout::directories(&self.list(dir, ctx), ctx, out, |path, ctx, out| {
+            self.plan_music_node(path, cf, cf, false, ctx, out);
+        });
         // Loose audio directly in the library root still becomes an album, so
         // stray files are browsable rather than invisible.
         self.plan_music_album(dir, cf, cf, ctx, out);
@@ -10629,11 +10760,9 @@ impl LibraryScanner {
             );
         }
 
-        for entry in &entries {
-            if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
-                self.plan_photos(&entry.path, root, cf, photo_parent, ctx, out);
-            }
-        }
+        fanout::directories(&entries, ctx, out, |path, ctx, out| {
+            self.plan_photos(path, root, cf, photo_parent, ctx, out);
+        });
     }
 
     /// Resolves one directory beneath a music library: a `MusicArtist` (port of
@@ -10678,11 +10807,9 @@ impl LibraryScanner {
                     ancestors: vec![cf],
                 },
             );
-            for entry in self.list(dir, ctx) {
-                if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
-                    self.plan_music_node(&entry.path, cf, artist_id, true, ctx, out);
-                }
-            }
+            fanout::directories(&self.list(dir, ctx), ctx, out, |path, ctx, out| {
+                self.plan_music_node(path, cf, artist_id, true, ctx, out);
+            });
             // Loose audio sitting DIRECTLY in a resolved artist folder is not
             // an album, and used to be wrapped in one here. Upstream never
             // wraps it: once the directory resolves as a `MusicArtist`, its
@@ -10700,11 +10827,9 @@ impl LibraryScanner {
             self.plan_music_album(dir, cf, parent, ctx, out);
             return;
         }
-        for entry in self.list(dir, ctx) {
-            if entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path) {
-                self.plan_music_node(&entry.path, cf, parent, in_artist, ctx, out);
-            }
-        }
+        fanout::directories(&self.list(dir, ctx), ctx, out, |path, ctx, out| {
+            self.plan_music_node(path, cf, parent, in_artist, ctx, out);
+        });
     }
 
     /// Whether `dir` resolves as a `MusicArtist` — port of
@@ -11018,10 +11143,14 @@ impl LibraryScanner {
                 return;
             }
         }
+        let mut children = fanout::directory_plans(&entries, ctx, |path, ctx, out| {
+            self.plan_books(path, root, cf, ctx, out);
+        })
+        .into_iter();
         for entry in &entries {
             if entry.type_ == FileSystemEntryType::Directory {
                 if ctx.scope.visits(&entry.path) {
-                    self.plan_books(&entry.path, root, cf, ctx, out);
+                    out.extend(children.next().unwrap_or_default());
                 }
                 continue;
             }
@@ -14064,6 +14193,7 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
         .collect()
 }
 
+mod fanout;
 mod music;
 
 #[cfg(test)]
@@ -23891,6 +24021,7 @@ mod tests {
         movies: usize,
         concurrency: usize,
         rendezvous: Option<usize>,
+        fanout: Option<i32>,
     ) -> (
         usize,
         Arc<dyn ferrofin_traits::persistence::ItemRepository>,
@@ -23953,7 +24084,7 @@ mod tests {
             rendezvous: rendezvous.map(|n| Arc::new(tokio::sync::Barrier::new(n))),
             met: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
-        let scanner = LibraryScanner::new(
+        let mut scanner = LibraryScanner::new(
             Arc::clone(&vf),
             Arc::new(FerrofinFileSystem::new()),
             persistence.clone(),
@@ -23966,6 +24097,9 @@ mod tests {
                 db.clone(),
             )),
         );
+        if let Some(limit) = fanout {
+            scanner = scanner.with_scan_fanout(move || limit);
+        }
         // Boxed: the scan future is over clippy's `large_futures` ceiling.
         Box::pin(scanner.scan_all()).await.unwrap();
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -23987,7 +24121,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pipelined_probe_results_stay_with_their_own_items() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_, items, expected) = scan_with_probe_concurrency(tmp.path(), 12, 8, None).await;
+        let (_, items, expected) = scan_with_probe_concurrency(tmp.path(), 12, 8, None, None).await;
         for (kind, path) in &expected {
             let id = crate::item_type_lookup::derive_item_id(*kind, path).expect("derivable id");
             let row = items
@@ -24011,7 +24145,7 @@ mod tests {
     async fn probe_window_bounds_how_many_probes_overlap() {
         let wide = tempfile::tempdir().unwrap();
         let (peak_wide, _, _) =
-            scan_with_probe_concurrency(wide.path(), 12, 8, Some(RENDEZVOUS_WIDTH)).await;
+            scan_with_probe_concurrency(wide.path(), 12, 8, Some(RENDEZVOUS_WIDTH), None).await;
         assert!(
             peak_wide >= RENDEZVOUS_WIDTH,
             "a window of 8 must run {RENDEZVOUS_WIDTH} probes at once; peak was {peak_wide}"
@@ -24022,11 +24156,35 @@ mod tests {
         );
 
         let serial = tempfile::tempdir().unwrap();
-        let (peak_serial, _, _) = scan_with_probe_concurrency(serial.path(), 12, 1, None).await;
+        let (peak_serial, _, _) =
+            scan_with_probe_concurrency(serial.path(), 12, 1, None, None).await;
         assert_eq!(
             peak_serial, 1,
             "a window of 1 must stay strictly serial (the pre-pipeline behaviour)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dashboard_fanout_bounds_probes_without_skipping_items_or_deadlocking() {
+        for limit in [1, 2, 4] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (peak, items, expected) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                scan_with_probe_concurrency(tmp.path(), 8, 8, None, Some(limit)),
+            )
+            .await
+            .expect("scan did not deadlock");
+            assert!((1..=usize::try_from(limit).unwrap()).contains(&peak));
+            for (kind, path) in expected {
+                let id = crate::item_type_lookup::derive_item_id(kind, &path).unwrap();
+                let row = items
+                    .retrieve_item(id)
+                    .await
+                    .unwrap()
+                    .expect("item persisted");
+                assert_eq!(row.run_time_ticks, Some(TracingProbe::ticks_for(&path)));
+            }
+        }
     }
 
     // `0` is not a legal window — it would deadlock the scan on an empty
