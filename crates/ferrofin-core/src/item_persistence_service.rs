@@ -542,6 +542,7 @@ pub(crate) async fn rekey_container(
     }
     // Last, once nothing points at it any more, so the ON DELETE CASCADE has
     // nothing left to take with it.
+    move_user_data(&mut tx, &legacy_db, &correct_db).await?;
     sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
         .bind(&legacy_db)
         .execute(&mut *tx)
@@ -1418,6 +1419,66 @@ pub(crate) fn scan_save_changes_row(
             };
             result != old
         })
+}
+
+/// An identity repair knows the survivor. Move history directly, translating
+/// its GUID key, and preserve any state already recorded for that user there.
+pub(crate) async fn move_user_data(
+    tx: &mut sqlx::SqliteConnection,
+    old: &str,
+    new: &str,
+) -> Result<(), ServiceError> {
+    if old == new {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"WITH incoming AS MATERIALIZED (
+            SELECT * FROM "UserData" old WHERE "ItemId" = ?1
+            AND NOT EXISTS (SELECT 1 FROM "UserData" current
+                WHERE current."ItemId" = ?2 AND current."UserId" = old."UserId")
+        )
+        INSERT INTO "UserData" (
+            "ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+            "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks",
+            "Played", "Rating", "RetentionDate", "SubtitleStreamIndex")
+        SELECT ?2, "UserId", CASE WHEN "CustomDataKey" = lower(?1) THEN lower(?2)
+                                 ELSE "CustomDataKey" END,
+            "AudioStreamIndex", "IsFavorite", "LastPlayedDate", "Likes", "PlayCount",
+            "PlaybackPositionTicks", "Played", "Rating", NULL, "SubtitleStreamIndex"
+        FROM incoming WHERE true
+        ON CONFLICT("ItemId", "UserId", "CustomDataKey") DO NOTHING"#,
+    )
+    .bind(old)
+    .bind(new)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    sqlx::query(r#"DELETE FROM "UserData" WHERE "ItemId" = ?1"#)
+        .bind(old)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Person cleanup uses the same retention-aware deletion as media pruning.
+pub(crate) async fn remove_orphaned_person_items(db: &Database) -> Result<usize, ServiceError> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1
+           AND ("Name" IS NULL OR "Name" NOT IN (SELECT "Name" FROM "Peoples"))"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Person).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let ids = ids
+        .iter()
+        .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::Backend(e.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FerrofinItemPersistenceService::new(db.clone())
+        .delete_items(&ids)
+        .await?
+        .len())
 }
 
 /// Preserve history before any member of a deletion set can cascade away.
@@ -4054,6 +4115,53 @@ mod tests {
     }
 
     // Regressions from the retention investigation, now enabled by default.
+    #[tokio::test]
+    async fn retention_container_rekey_moves_history_and_its_guid_key() {
+        let db = test_db().await;
+        let old = Uuid::new_v4();
+        let new = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, old, BaseItemKind::CollectionFolder).await;
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, old, true, None).await;
+        super::rekey_container(&db, old, new, BaseItemKind::CollectionFolder)
+            .await
+            .unwrap();
+        let (item, key, played): (String, String, bool) = sqlx::query_as(
+            r#"SELECT "ItemId", "CustomDataKey", "Played" FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (item, key, played),
+            (guid_to_db(new), new.to_string(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_person_cleanup_preserves_favorites() {
+        let db = test_db().await;
+        let person = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, person, BaseItemKind::Person).await;
+        crate::test_support::seed_user(&db, user).await;
+        crate::test_support::seed_user_data(&db, user, person, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1, "CustomDataKey" = 'Person-Kept'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(super::remove_orphaned_person_items(&db).await.unwrap(), 1);
+        let (item, favorite): (String, bool) =
+            sqlx::query_as(r#"SELECT "ItemId", "IsFavorite" FROM "UserData" WHERE "UserId" = ?1"#)
+                .bind(guid_to_db(user))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((item.as_str(), favorite), (super::PLACEHOLDER_ID, true));
+    }
+
     #[tokio::test]
     async fn retention_move_restores_every_field_and_preserves_destination_state() {
         use ferrofin_db::entities::playback::UserDataEntity;

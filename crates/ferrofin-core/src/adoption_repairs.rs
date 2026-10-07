@@ -22,8 +22,11 @@ use uuid::Uuid;
 
 use crate::db_error::db_err;
 use crate::item_data::{import_membership, parse_data, read_linked_children};
-use crate::item_persistence_service::alternate_version_child_type;
+use crate::item_persistence_service::{
+    FerrofinItemPersistenceService, alternate_version_child_type, detach_user_data, move_user_data,
+};
 use crate::item_type_lookup::stored_type_name;
+use ferrofin_traits::persistence::ItemPersistenceService;
 
 /// `LinkedChildType::LocalAlternateVersion`.
 const LOCAL_ALTERNATE_VERSION: i64 = 2;
@@ -311,20 +314,13 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
             .fetch_all(db.pool())
             .await
             .map_err(db_err)?;
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for id in &ids {
-        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-    }
-    tx.commit().await.map_err(db_err)?;
+    let parsed = ids
+        .iter()
+        .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::Backend(e.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    FerrofinItemPersistenceService::new(db.clone())
+        .delete_items(&parsed)
+        .await?;
     done(db, KEY).await?;
     Ok(ids.len())
 }
@@ -476,6 +472,21 @@ async fn dedupe_paths(
         // Highest flags win; equal flags → lowest index (newest DateCreated).
         ranked.sort_by(|a, b| (b.0, b.1, b.2, a.3).cmp(&(a.0, a.1, a.2, b.3)));
         for (_, _, _, _, id) in ranked.iter().skip(1) {
+            move_user_data(tx, id, &ranked[0].4).await?;
+            // ParentId cascades may reach children even though the repair
+            // keeps owned extras by clearing OwnerId below.
+            let descendants: Vec<String> = sqlx::query_scalar(
+                r#"WITH RECURSIVE gone("Id") AS (
+                    SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1
+                    UNION SELECT b."Id" FROM "BaseItems" b JOIN gone g ON b."ParentId" = g."Id"
+                ) SELECT "Id" FROM gone"#,
+            )
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            detach_user_data(tx, &descendants).await?;
+
             sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
                 .bind(id)
                 .execute(&mut *tx)
@@ -1330,6 +1341,19 @@ mod tests {
         let db = test_db().await;
         let extra = Uuid::new_v4();
         seed_item(&db, extra, BaseItemKind::Trailer).await;
+        let child = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        seed_item(&db, child, BaseItemKind::Video).await;
+        crate::test_support::seed_user(&db, user).await;
+        for item in [extra, child] {
+            crate::test_support::seed_user_data(&db, user, item, true, None).await;
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(child))
+            .bind(guid_to_db(extra))
+            .execute(db.writer())
+            .await
+            .unwrap();
         sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
             .bind(guid_to_db(extra))
             .bind(PLACEHOLDER_ID)
@@ -1344,6 +1368,14 @@ mod tests {
             .expect("count");
         assert_eq!(left, 0);
         assert_eq!(cleanup_orphaned_extras(&db).await.expect("again"), 0);
+        let kept: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1"#,
+        )
+        .bind(PLACEHOLDER_ID)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kept, 2, "history survives for the extra and its descendant");
     }
 
     #[tokio::test]
