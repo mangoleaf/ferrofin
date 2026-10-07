@@ -64,6 +64,7 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 #[derive(Clone)]
 pub struct FerrofinLibraryManager {
     items: Arc<dyn ItemRepository>,
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     counts: Arc<dyn ItemCountService>,
     persistence: Arc<dyn ItemPersistenceService>,
@@ -965,6 +966,7 @@ impl FerrofinLibraryManager {
     ) -> Self {
         Self {
             items,
+            visibility: None,
             virtual_folders: None,
             counts,
             persistence,
@@ -979,6 +981,16 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
         }
+    }
+
+    /// Installs the standalone item-visibility evaluator.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -1236,6 +1248,61 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    async fn is_item_visible(
+        &self,
+        item: &BaseItemEntity,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        Ok(service
+            .visible(std::slice::from_ref(item), user, false)
+            .await?[0])
+    }
+
+    async fn is_item_visible_standalone(
+        &self,
+        item: &BaseItemEntity,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        Ok(service
+            .visible(std::slice::from_ref(item), user, true)
+            .await?[0])
+    }
+
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(ids).await?;
+        let visible: std::collections::HashSet<_> = rows
+            .iter()
+            .zip(service.visible(&rows, user, true).await?)
+            .filter(|(_, visible)| *visible)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .filter(|id| !id.is_nil() && *id != PLACEHOLDER_ITEM_ID)
+            .collect();
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| visible.contains(id))
+            .collect())
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
