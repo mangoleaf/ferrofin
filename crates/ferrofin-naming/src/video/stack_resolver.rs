@@ -2,6 +2,7 @@
 
 use crate::audiobook::AudioBookFileInfo;
 use crate::common::NamingOptions;
+use crate::culture::culture_cmp;
 use crate::io::FileSystemMetadata;
 use crate::path;
 use crate::video::{FileStack, is_stub_file, is_video_file};
@@ -72,7 +73,8 @@ pub fn resolve(files: &[FileSystemMetadata], naming_options: &NamingOptions) -> 
                 || is_stub_file(&i.full_name, naming_options)
         })
         .collect();
-    potential_files.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    // `OrderBy(i => i.FullName)`: the current culture's order, not ordinal.
+    potential_files.sort_by(|a, b| culture_cmp(&a.full_name, &b.full_name));
 
     // Insertion-ordered map of stack name → metadata.
     let mut order: Vec<String> = Vec::new();

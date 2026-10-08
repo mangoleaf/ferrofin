@@ -21,3 +21,13 @@ fn series_path_parser_parse_test(#[case] path: &str, #[case] name: &str) {
     assert_eq!(res.series_name.as_deref(), Some(name));
     assert!(res.success);
 }
+
+#[rstest]
+#[case("/media/Jujutsu Kaisen (BD_1280x720)")]
+#[case("/media/Show.1920x1080.BluRay")]
+fn series_path_parser_resolution_pattern_is_not_a_series(#[case] path: &str) {
+    let options = NamingOptions::new();
+    let res = series_path_parser::parse(&options, path);
+
+    assert!(!res.success);
+}

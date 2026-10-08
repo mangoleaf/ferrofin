@@ -89,9 +89,9 @@ impl NamingOptions {
             ".001", ".3g2", ".3gp", ".amv", ".asf", ".asx", ".avi", ".bin", ".bivx", ".divx",
             ".dv", ".dvr-ms", ".f4v", ".fli", ".flv", ".ifo", ".img", ".iso", ".m2t", ".m2ts",
             ".m2v", ".m4v", ".mkv", ".mk3d", ".mov", ".mp4", ".mpe", ".mpeg", ".mpg", ".mts",
-            ".mxf", ".nrg", ".nsv", ".nuv", ".ogg", ".ogm", ".ogv", ".pva", ".qt", ".rec", ".rm",
-            ".rmvb", ".strm", ".svq3", ".tp", ".ts", ".ty", ".viv", ".vob", ".vp3", ".webm",
-            ".wmv", ".wtv", ".xvid",
+            ".mxf", ".nrg", ".nsv", ".nuv", ".ogm", ".ogv", ".pva", ".qt", ".rec", ".rm", ".rmvb",
+            ".strm", ".svq3", ".tp", ".ts", ".ty", ".viv", ".vob", ".vp3", ".webm", ".wmv", ".wtv",
+            ".xvid",
         ]);
 
         let video_flag_delimiters = vec!['(', ')', '-', '.', '_', '[', ']'];
@@ -128,7 +128,7 @@ impl NamingOptions {
         ]);
 
         let clean_strings = str_vec(&[
-            r"^\s*(?<cleaned>.+?)[ _\,\.\(\)\[\]\-](3d|sbs|tab|hsbs|htab|mvc|HDR|HDC|UHD|UltraHD|4k|ac3|dts|custom|dc|divx|divx5|dsr|dsrip|dutch|dvd|dvdrip|dvdscr|dvdscreener|screener|dvdivx|cam|fragment|fs|hdtv|hdrip|hdtvrip|internal|limited|multi|subs|ntsc|ogg|ogm|pal|pdtv|proper|repack|rerip|retail|cd[1-9]|r5|bd5|bd|se|svcd|swedish|german|read.nfo|nfofix|unrated|ws|telesync|ts|telecine|tc|brrip|bdrip|480p|480i|576p|576i|720p|720i|1080p|1080i|2160p|hrhd|hrhdtv|hddvd|bluray|blu-ray|x264|x265|h264|h265|xvid|xvidvd|xxx|www.www|AAC|DTS)(?=[ _\,\.\(\)\[\]\-]|$)",
+            r"^\s*(?<cleaned>.+?)[ _\,\.\(\)\[\]\-](3d|sbs|tab|hsbs|htab|mvc|HDR|HDC|UHD|UltraHD|4k|ac3|dts|custom|dc|divx|divx5|dsr|dsrip|dutch|dvd|dvdrip|dvdscr|dvdscreener|screener|dvdivx|cam|fragment|fs|hdtv|hdrip|hdtvrip|internal|limited|multi|subs|ntsc|ogg|ogm|pal|pdtv|proper|repack|rerip|retail|cd[1-9]|r5|bd5|bd|se|svcd|swedish|german|read.nfo|nfofix|unrated|ws|web-dl|telesync|ts|telecine|tc|brrip|bdrip|480p|480i|576p|576i|720p|720i|1080p|1080i|2160p|hrhd|hrhdtv|hddvd|bluray|blu-ray|x264|x265|h264|h265|xvid|xvidvd|xxx|www.www|AAC|DTS)(?=[ _\,\.\(\)\[\]\-]|$)",
             r"^\s*(?<cleaned>.+?)((\s*\[[^\]]+\]\s*)+)(\.[^\s]+)?$",
             r"^\s*(?<cleaned>.+?)\WE[0-9]+(-|~)E?[0-9]+(\W|$)",
             r"^\s*\[[^\]]+\](?!\.\w+$)\s*(?<cleaned>.+)",
@@ -358,8 +358,13 @@ fn build_episode_expressions() -> Vec<EpisodeExpression> {
         r".*[\\\/]((?<seriesname>[^\\/]+?)\s)?[Ss](?:eason)?\s*(?<seasonnumber>[0-9]+)\s+[Ee](?:pisode)?\s*(?<epnumber>[0-9]+).*$",
     ));
     // "Foo Bar 889"
+    // Names carrying an SxxEyy marker are excluded because the Kodi expression above already covers them.
+    // Without that guard this expression reads digits out of the title instead, turning
+    // "S01E01 1-23-45 [Bluray-1080p]" into episodes 1 through 45.
+    // (.NET's `[][ ._-]` is written `[\]\[ ._-]`: the Rust class syntax would read
+    // the inner `[` as a nested class.)
     list.push(named(
-        r".*[\\\/](?![Ee]pisode)(?<seriesname>[\w\s]+?)\s(?<epnumber>[0-9]{1,4})(-(?<endingepnumber>[0-9]{2,4}))*[^\\\/x]*$",
+        r".*[\\\/](?![Ee]pisode)(?![^\\\/]*[Ss][0-9]+[\]\[ ._-]*[Ee][0-9]+)(?<seriesname>[\w\s]+?)\s(?<epnumber>[0-9]{1,4})(-(?<endingepnumber>[0-9]{2,4}))*[^\\\/x]*$",
     ));
     {
         let mut e = EpisodeExpression::new(
@@ -518,6 +523,7 @@ fn build_video_extra_rules() -> Vec<ExtraRule> {
         ExtraRule::new(Interview, DirectoryName, "interviews", Video),
         ExtraRule::new(Scene, DirectoryName, "scenes", Video),
         ExtraRule::new(Sample, DirectoryName, "samples", Video),
+        ExtraRule::new(Sample, DirectoryName, "sample", Video),
         ExtraRule::new(Short, DirectoryName, "shorts", Video),
         ExtraRule::new(Featurette, DirectoryName, "featurettes", Video),
         ExtraRule::new(Unknown, DirectoryName, "extras", Video),

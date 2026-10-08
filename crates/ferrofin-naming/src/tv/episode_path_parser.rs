@@ -127,8 +127,16 @@ impl<'a> EpisodePathParser<'a> {
                     let next_char = name[next_index..].chars().next();
                     let follows_resolution =
                         next_char.is_some_and(|c| matches!(c, '0'..='9' | 'i' | 'I' | 'p' | 'P'));
+                    // A range cannot end before it starts, so a lower number
+                    // belongs to the episode title rather than to a range
+                    // (`S03E21 - E2`). C#'s lifted `>=` is false for a missing
+                    // episode number.
                     if !follows_resolution {
-                        result.ending_episode_number = ending.as_str().parse::<i32>().ok();
+                        result.ending_episode_number = ending
+                            .as_str()
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|end| result.episode_number.is_some_and(|ep| *end >= ep));
                     }
                 }
 
@@ -141,12 +149,7 @@ impl<'a> EpisodePathParser<'a> {
                 result.success = result.episode_number.is_some();
             }
 
-            // Invalidate seasons 200–1927 or above 2500 (false positives from
-            // resolutions like "1920x1080").
-            if result
-                .season_number
-                .is_some_and(|s| (200..1928).contains(&s) || s > 2500)
-            {
+            if result.season_number.is_some_and(is_implausible_season) {
                 result.success = false;
             }
 
@@ -195,8 +198,11 @@ impl<'a> EpisodePathParser<'a> {
                 info.series_name.clone_from(&result.series_name);
             }
 
-            if info.ending_episode_number.is_none() && info.episode_number.is_some() {
-                info.ending_episode_number = result.ending_episode_number;
+            if info.ending_episode_number.is_none()
+                && let (Some(end), Some(ep)) = (result.ending_episode_number, info.episode_number)
+                && end >= ep
+            {
+                info.ending_episode_number = Some(end);
             }
 
             if !info.series_name.as_deref().unwrap_or("").is_empty()
@@ -247,4 +253,12 @@ fn ymd(date: NaiveDate) -> (i32, i32, i32) {
     use chrono::Datelike;
     #[allow(clippy::cast_possible_wrap)]
     (date.year(), date.month() as i32, date.day() as i32)
+}
+
+/// Whether `season` is 200 through 1927 or above 2500: an error unless the
+/// show deliberately uses false season numbers, and in practice a resolution
+/// such as "1920x1080" read as season 1920 (`EpisodePathParser.cs:188-195`;
+/// `SeriesPathParser` mirrors it since upstream PR #18061).
+pub(crate) fn is_implausible_season(season: i32) -> bool {
+    (200..1928).contains(&season) || season > 2500
 }

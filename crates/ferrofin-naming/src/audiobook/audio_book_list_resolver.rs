@@ -5,6 +5,7 @@ use crate::audiobook::{
     AudioBookResolver,
 };
 use crate::common::NamingOptions;
+use crate::culture::culture_cmp;
 use crate::io::FileSystemMetadata;
 use crate::path;
 use crate::video::stack_resolver;
@@ -108,21 +109,13 @@ fn find_extra_and_alternative_files(
                 }
 
                 if !ex.is_empty() {
-                    ex.sort_by(|a, b| {
-                        a.container
-                            .cmp(&b.container)
-                            .then_with(|| a.path.cmp(&b.path))
-                    });
+                    ex.sort_by(by_container_then_path);
                     remove_all(stack_files, &ex);
                     extras.extend(ex);
                 }
 
                 if !alt.is_empty() {
-                    alt.sort_by(|a, b| {
-                        a.container
-                            .cmp(&b.container)
-                            .then_with(|| a.path.cmp(&b.path))
-                    });
+                    alt.sort_by(by_container_then_path);
                     let main = find_main_audio_book_file(&alt, &name);
                     let alternatives: Vec<AudioBookFileInfo> =
                         alt.into_iter().filter(|f| f != &main).collect();
@@ -132,11 +125,7 @@ fn find_extra_and_alternative_files(
             }
         } else if group.len() > 1 {
             let mut sorted = group.clone();
-            sorted.sort_by(|a, b| {
-                a.container
-                    .cmp(&b.container)
-                    .then_with(|| a.path.cmp(&b.path))
-            });
+            sorted.sort_by(by_container_then_path);
             let alternatives: Vec<AudioBookFileInfo> = sorted.into_iter().skip(1).collect();
             remove_all(stack_files, &alternatives);
             alternative_versions.extend(alternatives);
@@ -162,13 +151,16 @@ fn find_main_audio_book_file(files: &[AudioBookFileInfo], name: &str) -> AudioBo
     // OrderBy(Container).ThenBy(Path).First()
     files
         .iter()
-        .min_by(|a, b| {
-            a.container
-                .cmp(&b.container)
-                .then_with(|| a.path.cmp(&b.path))
-        })
+        .min_by(|a, b| by_container_then_path(a, b))
         .cloned()
         .expect("find_main_audio_book_file called on non-empty list")
+}
+
+/// `OrderBy(x => x.Container).ThenBy(x => x.Path)`: both keys in the default
+/// string comparer's (culture) order, unlike `AudioBookFileInfo.CompareTo`'s
+/// ordinal path tie-break that `stack_files.sort()` uses.
+fn by_container_then_path(a: &AudioBookFileInfo, b: &AudioBookFileInfo) -> std::cmp::Ordering {
+    culture_cmp(&a.container, &b.container).then_with(|| culture_cmp(&a.path, &b.path))
 }
 
 fn remove_all(stack_files: &mut Vec<AudioBookFileInfo>, to_remove: &[AudioBookFileInfo]) {

@@ -9865,6 +9865,14 @@ impl LibraryScanner {
                         .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
                         .count(),
                 );
+                // TODO(parity): only `IgnorePatterns` filters here; upstream's
+                // `DotIgnoreIgnoreRule` (`.ignore` files) has no port yet. It
+                // filters the resolver chain (`IgnoreFile`), `FindExtras`
+                // (`LibraryManager.cs:3445`) and the library monitor
+                // (`LibraryMonitor.cs:388`). Un-defer path: port the rule
+                // (gitignore matching per directory, cached by mtime), apply
+                // it here, in `plan_folder_extras`, and in
+                // `FerrofinLibraryMonitor::report_change`.
                 entries
                     .into_iter()
                     .filter(|entry| {
@@ -10378,19 +10386,8 @@ impl LibraryScanner {
         if !is_video && !is_audio {
             return;
         }
-        let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
-            &entry.path,
-            naming,
-            Some(folder.extras_root),
-        );
-        if let Some(extra_type) = extra.extra_type {
-            extras.push(MovieExtra {
-                path: entry.path.clone(),
-                extra_type,
-                // False beside its owner (`LibraryManager.cs:3478`);
-                // more than one file in its extras folder (`:3464`).
-                in_mixed_folder: folder.extras_folder_mixed,
-            });
+        if let Some(extra) = movie_walk_extra(&entry, folder, naming) {
+            extras.push(extra);
             return;
         }
         // In an extras folder a file no extra rule takes is nothing
@@ -12897,6 +12894,31 @@ fn resolved_videos(
         Some(dir),
         collection_type,
     )
+}
+
+/// The extra `entry`, a file of `folder`, is to its owner, if an extra rule
+/// takes it: `ExtraRuleResolver` over audio and video files alike (`theme.mp3`
+/// is an audio rule).
+fn movie_walk_extra(
+    entry: &FileSystemEntryInfo,
+    folder: &MovieFolder<'_>,
+    naming: &NamingOptions,
+) -> Option<MovieExtra> {
+    if !video_resolver::is_video_file(&entry.path, naming) && !is_audio_file(&entry.path, naming) {
+        return None;
+    }
+    let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+        &entry.path,
+        naming,
+        Some(folder.extras_root),
+    );
+    extra.extra_type.map(|extra_type| MovieExtra {
+        path: entry.path.clone(),
+        extra_type,
+        // False beside its owner (`LibraryManager.cs:3478`);
+        // more than one file in its extras folder (`:3464`).
+        in_mixed_folder: folder.extras_folder_mixed,
+    })
 }
 
 /// What the movie walk knows of a folder while it plans the folder's files.
@@ -27951,6 +27973,167 @@ mod tests {
             audio[0].extra_type,
             Some(ferrofin_model::entities::ExtraType::ThemeSong as i32)
         );
+    }
+
+    /// Upstream `MovieResolverTests.ResolveMultiple_GivenNumberedSampleFiles_IgnoresSamples`
+    /// (PR #18255): `Sample1`/`Sample2` slip past `ResolveVideos`'s `\bsample\b`
+    /// filter, but the `sample` filename rule now matches with trailing digits
+    /// trimmed, so they are `Sample` extras and the folder is one movie.
+    #[tokio::test]
+    async fn numbered_sample_files_are_not_movies() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("La Chimera (2023)");
+        touch(&folder, "La Chimera (2023).mkv");
+        touch(&folder, "Sample1.mkv");
+        touch(&folder, "Sample2.mkv");
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        let movies = scanned_by_kind(&db, BaseItemKind::Movie).await;
+        assert_eq!(movies.len(), 1, "the numbered samples are not movies");
+        assert_eq!(
+            movies[0].path.as_deref(),
+            Some(folder.join("La Chimera (2023).mkv").to_str().unwrap())
+        );
+        let samples: Vec<_> = scanned_by_kind(&db, BaseItemKind::Video)
+            .await
+            .into_iter()
+            .filter(|v| v.extra_type == Some(ferrofin_model::entities::ExtraType::Sample as i32))
+            .collect();
+        assert_eq!(samples.len(), 2, "both are the movie's Sample extras");
+    }
+
+    /// `IgnorePatterns` reaches extras too: `FindExtras` resolves each
+    /// candidate through `ResolvePath` (`LibraryManager.cs:3499-3501`), which
+    /// drops what `IgnoreFile` ignores (`:951-955`, `CoreResolutionIgnoreRule.cs:40`).
+    /// So a `sample.mkv` beside the movie (`**/sample.???`) and a clip in its
+    /// `Sample/` folder (`**/sample/*`) are no extras — and no movies: the
+    /// folder is still exactly one movie with no `Sample` extra.
+    #[rstest::rstest]
+    #[case::beside_the_movie(&["sample.mkv"])]
+    #[case::in_its_sample_folder(&["Sample/clip.mkv"])]
+    #[case::both(&["sample.mkv", "Sample/clip.mkv"])]
+    #[tokio::test]
+    async fn ignored_sample_files_are_neither_movies_nor_extras(#[case] samples: &[&str]) {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::ExtraType;
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Heat (1995)");
+        touch(&folder, "Heat (1995).mkv");
+        for sample in samples {
+            let path = folder.join(sample);
+            touch(
+                path.parent().unwrap(),
+                path.file_name().unwrap().to_str().unwrap(),
+            );
+        }
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        let movies = scanned_by_kind(&db, BaseItemKind::Movie).await;
+        assert_eq!(movies.len(), 1, "a sample is never a movie");
+        let movie_id = uuid::Uuid::parse_str(&movies[0].id).unwrap();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
+        let repo = crate::FerrofinItemRepository::new(db.clone(), lookup);
+        let extras = repo
+            .get_item_list(&InternalItemsQuery {
+                owner_ids: vec![movie_id],
+                extra_types: vec![ExtraType::Sample],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(extras.is_empty(), "{extras:?}");
+    }
+
+    /// The same for a folder owner ([`LibraryScanner::plan_folder_extras`]):
+    /// a `sample.mkv` in a series folder is neither an episode nor the
+    /// series' extra.
+    #[tokio::test]
+    async fn an_ignored_sample_in_a_series_folder_is_no_episode_and_no_extra() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("tv");
+        let series = media.join("Firefly");
+        touch(&series.join("Season 1"), "Firefly S01E01.mkv");
+        touch(&series, "sample.mkv");
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::tvshows, "TV", &media).await;
+
+        assert_eq!(scanned_by_kind(&db, BaseItemKind::Series).await.len(), 1);
+        let episodes = scanned_by_kind(&db, BaseItemKind::Episode).await;
+        assert_eq!(episodes.len(), 1, "the sample is no episode");
+        let sample = series.join("sample.mkv").to_string_lossy().into_owned();
+        assert!(
+            scanned_by_kind(&db, BaseItemKind::Video)
+                .await
+                .iter()
+                .all(|v| v.path.as_deref() != Some(sample.as_str())),
+            "the sample is no extra"
+        );
+    }
+
+    /// Upstream `MovieResolverTests.AllExtrasTypesFolderNames_ContainsSampleSingularAndPlural`
+    /// (PR #17964): the `sample` directory rule joins `samples`, and the
+    /// lookup the scanner's extras-folder checks read is case-blind.
+    #[test]
+    fn all_extras_types_folder_names_contains_sample_singular_and_plural() {
+        let naming = super::NamingOptions::new();
+        let names = &naming.all_extras_types_folder_names;
+        for name in ["sample", "Sample", "samples"] {
+            assert!(names.contains_key(&name.to_lowercase()), "{name}");
+        }
+    }
+
+    /// Upstream `MovieResolverTests.ResolvePath_MovieFolderWithSampleSubfolder_ResolvesToMovie`
+    /// and `…WithRealSubfolder_DoesNotResolveToSingleMovie` (PR #17964): a
+    /// sample subfolder, like any extras-named one, leaves the folder the
+    /// movie's own (named after the folder, `FindMovie`); any other subfolder
+    /// makes it a plain folder whose files resolve one by one.
+    #[rstest::rstest]
+    #[case("Sample", true)]
+    #[case("sample", true)]
+    #[case("SAMPLE", true)]
+    #[case("samples", true)]
+    #[case("Feature", false)]
+    #[tokio::test]
+    async fn a_movie_folder_with_a_subfolder_is_the_movies_own_unless_it_is_real(
+        #[case] sub_dir: &str,
+        #[case] own_folder: bool,
+    ) {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Outer Colony (2026)");
+        touch(&folder, "Outer Colony (2026).mkv");
+        std::fs::create_dir_all(folder.join(sub_dir)).unwrap();
+
+        let (db, _cf) = scan_one(CollectionTypeOptions::movies, "Movies", &media).await;
+
+        let movies = scanned_by_kind(&db, BaseItemKind::Movie).await;
+        assert_eq!(movies.len(), 1);
+        assert_eq!(
+            movies[0].path.as_deref(),
+            Some(folder.join("Outer Colony (2026).mkv").to_str().unwrap())
+        );
+        // A movie in its own folder takes the folder's raw name (year kept);
+        // a file of a plain folder keeps its cleaned file name.
+        let expected = if own_folder {
+            "Outer Colony (2026)"
+        } else {
+            "Outer Colony"
+        };
+        assert_eq!(movies[0].name.as_deref(), Some(expected));
     }
 
     // A disc rip is one item for its folder (never one per .vob/.m2ts), and
