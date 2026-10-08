@@ -2877,6 +2877,11 @@ pub struct LibraryScanner {
     /// image rows store, for the local image validation's existence check.
     /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// The `AggregateFolder` (`CreateRootFolder()`), which each library
+    /// location's `Folder` row hangs off. `None` until
+    /// [`with_root_folder`](Self::with_root_folder): items then hang off
+    /// their collection folder directly, with no location folder.
+    root_folder: Option<Uuid>,
     /// Reads the server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), live: the fetcher gate for a
     /// kind a library saved no `TypeOptions` entry for, and for an item in no
@@ -2981,6 +2986,7 @@ impl LibraryScanner {
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            root_folder: None,
             metadata_options: None,
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
@@ -3121,6 +3127,15 @@ impl LibraryScanner {
         virtual_paths: crate::virtual_paths::VirtualPathExpander,
     ) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// The `AggregateFolder` id: with it, each library location is planned as
+    /// the `Folder` row Jellyfin keeps for it, under that root, and what the
+    /// location holds hangs off it (owner decision D1).
+    #[must_use]
+    pub fn with_root_folder(mut self, aggregate: Uuid) -> Self {
+        self.root_folder = Some(aggregate);
         self
     }
 
@@ -3560,6 +3575,81 @@ impl LibraryScanner {
         touched
     }
 
+    /// Deletes each location `Folder` under the aggregate root whose path no
+    /// configured library lists any more, with what hangs off it — the
+    /// `AggregateFolder.ValidateChildren` removal of a physical child the
+    /// root's `PhysicalLocations` no longer name (owner decision D1), and
+    /// returns what went, under the root (`FoldersRemovedFrom`). Stored paths
+    /// are compared expanded (`%AppDataPath%/collections`, as Jellyfin stores
+    /// the Collections folder) and `OrdinalIgnoreCase`.
+    ///
+    /// Runs only after successfully listing the configured libraries. An empty
+    /// library contributes no location; removing the last library therefore
+    /// prunes its old physical roots on the requested scan too.
+    async fn prune_orphan_locations(
+        &self,
+        folders: &[VirtualFolderInfo],
+    ) -> Vec<(Uuid, Vec<Uuid>)> {
+        let (Some(aggregate), Some(items)) = (self.root_folder, &self.item_repository) else {
+            return Vec::new();
+        };
+        let configured: std::collections::HashSet<String> = folders
+            .iter()
+            .flat_map(|f| &f.locations)
+            .map(|location| trimmed_dir(location).to_lowercase())
+            .collect();
+        // The browse repository projects the aggregate root as user views.
+        // Read physical parent links first, then retrieve those exact rows;
+        // otherwise production wiring silently finds no orphan locations.
+        let links = match self.persistence.child_links(&[aggregate]).await {
+            Ok(Some(links)) => links,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read physical root children");
+                return Vec::new();
+            }
+        };
+        let ids: Vec<_> = links
+            .iter()
+            .filter(|link| link.parent_id == Some(aggregate))
+            .map(|link| link.id)
+            .collect();
+        let rows = match items.retrieve_items(&ids).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read the library locations' folders");
+                return Vec::new();
+            }
+        };
+        let orphans: Vec<Uuid> = rows
+            .iter()
+            .filter(|row| row.type_.ends_with("Entities.Folder"))
+            .filter(|row| {
+                row.path.as_deref().is_some_and(|path| {
+                    let path = self.virtual_paths.expand(path);
+                    !configured.contains(&trimmed_dir(&path).to_lowercase())
+                })
+            })
+            .filter_map(|row| parse_id(&row.id))
+            .collect();
+        if orphans.is_empty() {
+            return Vec::new();
+        }
+        match self.persistence.delete_items(&orphans).await {
+            Ok(deleted) => {
+                tracing::info!(
+                    removed = deleted.len(),
+                    "pruned the folders of locations no library lists"
+                );
+                vec![(aggregate, deleted)]
+            }
+            Err(err) => {
+                tracing::warn!(%err, "failed to prune the folders of removed locations");
+                Vec::new()
+            }
+        }
+    }
+
     /// The library-wide half of [`scan_target`](Self::scan_target).
     async fn scan_libraries(
         &self,
@@ -3584,6 +3674,12 @@ impl LibraryScanner {
         let widen = *options == MetadataRefreshOptions::default();
         let folders = self.scoped_folders(only, widen).await?;
         let all_folders = self.virtual_folders.get_virtual_folders().await?;
+        // `AggregateFolder.ValidateChildren` likewise drops a location's
+        // folder once no library lists the location.
+        let orphaned = self.prune_orphan_locations(&all_folders).await;
+        if !orphaned.is_empty() {
+            self.publish_library_changed(&[], &orphaned).await;
+        }
         let tracking = self
             .scan_progress
             .begin(folders.iter().filter_map(collection_folder_id));
@@ -3628,7 +3724,10 @@ impl LibraryScanner {
                 ..ScanOutcome::default()
             });
         }
-        let result = self.run_scan(&folders, &all_folders, plan, None, run).await;
+        let mut result = self.run_scan(&folders, &all_folders, plan, None, run).await;
+        if let Ok(outcome) = &mut result {
+            outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+        }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
@@ -9457,6 +9556,24 @@ impl LibraryScanner {
                 if !scope.visits(location) {
                     continue;
                 }
+                // `AggregateFolder.CreateResolveArgs` normalises the root's
+                // paths (`NormalizeRootPathList`): a location inside another
+                // location is no child of the root, so it has no folder of
+                // its own and what it holds keeps the library as its parent.
+                let nested = key_folders
+                    .iter()
+                    .flat_map(|f| &f.locations)
+                    .map(|other| trimmed_dir(other))
+                    .any(|other| {
+                        other != trimmed_dir(location)
+                            && path_is_under(trimmed_dir(location), other)
+                    });
+                let placed = if nested {
+                    None
+                } else {
+                    self.plan_location_folder(location, &ctx, &mut out)
+                };
+                let first = out.len();
                 match folder.collection_type {
                     Some(CollectionTypeOptions::tvshows) => {
                         self.plan_tv(folders, location, cf, &ctx, &mut out);
@@ -9497,6 +9614,27 @@ impl LibraryScanner {
                     // curated through the collection API, not resolved off disk.
                     Some(_) => {}
                 }
+                if let Some((location_folder, aggregate)) = placed {
+                    place_under_location(&mut out[first..], cf, location_folder, aggregate);
+                    // GetCollectionFolders names every library referring to
+                    // this physical root, including during a single-library
+                    // refresh. Inherited tag restrictions need the same closure.
+                    for shared in key_folders.iter().filter(|shared| {
+                        shared.locations.iter().any(|other| {
+                            trimmed_dir(other).eq_ignore_ascii_case(trimmed_dir(location))
+                        })
+                    }) {
+                        if let Some(shared_id) = collection_folder_id(shared) {
+                            for item in &mut out[first..] {
+                                if item.entity.owner_id.is_none()
+                                    && !item.ancestors.contains(&shared_id)
+                                {
+                                    item.ancestors.push(shared_id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         PlanOutput {
@@ -9507,6 +9645,40 @@ impl LibraryScanner {
             inaccessible: ctx.inaccessible.into_inner(),
             date_added,
         }
+    }
+
+    /// The `Folder` row Jellyfin keeps for a library location (owner decision
+    /// D1): its id derives from the location's path, it hangs off the
+    /// `AggregateFolder` and is its own top parent, and the library's
+    /// `CollectionFolder` names it in `PhysicalFolderIds`. Emitted before
+    /// what the location holds, which hangs off it. Even an exact-path refresh
+    /// must provision this parent before inserting its first child. `None`
+    /// only when no physical root is attached to this scanner.
+    fn plan_location_folder(
+        &self,
+        location: &str,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) -> Option<(Uuid, Uuid)> {
+        let aggregate = self.root_folder?;
+        let location = trimmed_dir(location);
+        let name = folder_name(location).unwrap_or_else(|| location.to_owned());
+        let (id, mut entity) = self.base_item(
+            ctx,
+            BaseItemKind::Folder,
+            aggregate,
+            aggregate,
+            name,
+            location,
+            true,
+        )?;
+        entity.top_parent_id = Some(guid_to_db(id));
+        out.push(Planned {
+            id,
+            entity,
+            ancestors: vec![aggregate],
+        });
+        Some((id, aggregate))
     }
 
     /// `dir`'s entries; a directory that fails to list is recorded as
@@ -11757,6 +11929,30 @@ fn affected_libraries(
         })
         .cloned()
         .collect()
+}
+
+/// Hangs what a library location holds off its `Folder` row (owner
+/// decision D1), as Jellyfin stores it: `TopParentId` the location folder,
+/// a top-level item's `ParentId` too, and every item's ancestors the
+/// location folder and the `AggregateFolder` besides its collection folder
+/// (which stays first: the scan keys the library by it). An owned extra
+/// keeps its own shape.
+fn place_under_location(items: &mut [Planned], cf: Uuid, location_folder: Uuid, aggregate: Uuid) {
+    let (cf_db, location_db) = (guid_to_db(cf), guid_to_db(location_folder));
+    for item in items {
+        if item.entity.owner_id.is_some() {
+            continue;
+        }
+        if item.entity.top_parent_id.as_deref() == Some(cf_db.as_str()) {
+            item.entity.top_parent_id = Some(location_db.clone());
+        }
+        if item.entity.parent_id.as_deref() == Some(cf_db.as_str()) {
+            item.entity.parent_id = Some(location_db.clone());
+        }
+        if item.ancestors.first() == Some(&cf) {
+            item.ancestors.extend([location_folder, aggregate]);
+        }
+    }
 }
 
 /// A library's own folders, which the pruning never deletes: its

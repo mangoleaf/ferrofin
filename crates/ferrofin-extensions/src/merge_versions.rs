@@ -382,12 +382,17 @@ impl MergeVersionsService {
     /// no-op (the C# returns), unlike the strict `POST /Videos/MergeVersions`
     /// route.
     ///
-    /// `scope`, when given, is the library (`TopParentId`) the group belongs
-    /// to: expansion can walk a stale pointer out of that library, and any
-    /// member it drags in from elsewhere is unlinked and dropped instead of
-    /// re-merged. Callers with no library scope (episodes, whose merge key is
-    /// already series-scoped) pass `None` for upstream's semantics.
-    async fn merge_group(&self, ids: &[Uuid], scope: Option<&str>) -> Result<(), ServiceError> {
+    /// `scope`, when given, is the library ([`library_key`], read against
+    /// the configured libraries) the group belongs to: expansion can walk a
+    /// stale pointer out of that library, and any member it drags in from
+    /// elsewhere is unlinked and dropped instead of re-merged. Callers with no
+    /// library scope (episodes, whose merge key is already series-scoped) pass
+    /// `None` for upstream's semantics.
+    async fn merge_group(
+        &self,
+        ids: &[Uuid],
+        scope: Option<(&str, &[VirtualFolderInfo])>,
+    ) -> Result<(), ServiceError> {
         let mut items = Vec::new();
         for &id in ids {
             if let Some(row) = self.items.retrieve_item(id).await? {
@@ -401,13 +406,12 @@ impl MergeVersionsService {
         }
 
         let mut group = self.expand_group(&items).await?;
-        if let Some(scope) = scope {
+        if let Some((scope, folders)) = scope {
             let foreign: Vec<BaseItemEntity> = group
                 .values()
                 // The empty scope is the unscoped bucket: it matches exactly
-                // the movies with no `TopParentId`, the same way grouping
-                // keys them.
-                .filter(|item| item.top_parent_id.as_deref().unwrap_or("") != scope)
+                // the movies in no library, the same way grouping keys them.
+                .filter(|item| library_key(folders, item) != scope)
                 .cloned()
                 .collect();
             for item in &foreign {
@@ -505,6 +509,25 @@ impl MergeVersionsService {
     }
 }
 
+/// The library `item` belongs to, as merging scopes it: the configured
+/// library whose collection folder is its `TopParentId` or one of whose
+/// locations holds it (a location's folder is the `TopParentId` of what it
+/// holds, and two locations are one library), else the raw `TopParentId` —
+/// empty when it has none.
+fn library_key(folders: &[VirtualFolderInfo], item: &BaseItemEntity) -> String {
+    ferrofin_model::entities_media::owning_library(
+        folders,
+        item.top_parent_id.as_deref(),
+        item.path.as_deref(),
+    )
+    .and_then(|folder| folder.item_id.as_deref())
+    .and_then(|id| Uuid::parse_str(id).ok())
+    .map_or_else(
+        || item.top_parent_id.clone().unwrap_or_default(),
+        |id| id.simple().to_string(),
+    )
+}
+
 #[async_trait]
 impl MergeVersionsManager for MergeVersionsService {
     async fn merge_movies(&self, progress: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
@@ -518,14 +541,15 @@ impl MergeVersionsManager for MergeVersionsService {
             .into_iter()
             .collect();
 
-        // The owning library (`TopParentId`) per movie — the merge scope. A
-        // movie with no `TopParentId` (never scanned into a library) is
-        // "unscoped": it groups under the empty key with its own kind, and is
-        // never itself healed, since it has no library to be in the wrong
-        // one of.
-        let library_of: HashMap<&str, &str> = movies
+        // The owning library per movie ([`library_key`]) — the merge scope. A
+        // movie in no library (never scanned into one) is "unscoped": it
+        // groups under the empty key with its own kind, and is never itself
+        // healed, since it has no library to be in the wrong one of.
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let library_of: HashMap<&str, String> = movies
             .iter()
-            .filter_map(|m| Some((m.id.as_str(), m.top_parent_id.as_deref()?)))
+            .map(|m| (m.id.as_str(), library_key(&folders, m)))
+            .filter(|(_, library)| !library.is_empty())
             .collect();
 
         // Self-heal before grouping: unlink any alternate whose library
@@ -552,7 +576,7 @@ impl MergeVersionsManager for MergeVersionsService {
                 continue;
             }
             let primary_lib = if let Some(found) = library_of.get(pid) {
-                Some(*found)
+                Some(found.as_str())
             } else {
                 if !fetched.contains_key(pid) {
                     let row = match Uuid::parse_str(pid) {
@@ -562,12 +586,12 @@ impl MergeVersionsManager for MergeVersionsService {
                     // A primary that exists but sits in no library is
                     // "unscoped" — the same empty key grouping uses — so an
                     // alternate in a real library is still healed.
-                    fetched.insert(pid, row.map(|p| p.top_parent_id.unwrap_or_default()));
+                    fetched.insert(pid, row.map(|p| library_key(&folders, &p)));
                 }
                 fetched[pid].as_deref()
             };
             if let Some(primary_lib) = primary_lib
-                && *lib != primary_lib
+                && lib != primary_lib
             {
                 self.persistence.set_primary_version_id(id, None).await?;
                 healed.insert(id);
@@ -597,7 +621,7 @@ impl MergeVersionsManager for MergeVersionsService {
             let Some(value) = tmdb.get(&id) else {
                 continue; // no Tmdb id → skipped (`ProviderIds.ContainsKey`)
             };
-            let library = library_of.get(movie.id.as_str()).copied().unwrap_or("");
+            let library = library_of.get(movie.id.as_str()).map_or("", String::as_str);
             let entry = groups.entry((library, value.as_str())).or_default();
             entry.0.push(id);
             entry.1 |= movie.primary_version_id.is_none() || healed.contains(&id);
@@ -610,7 +634,7 @@ impl MergeVersionsManager for MergeVersionsService {
 
         for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
-            self.merge_group(ids, Some(library)).await?;
+            self.merge_group(ids, Some((library, &folders))).await?;
         }
         report(progress, 100.0);
         Ok(())

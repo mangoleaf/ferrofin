@@ -195,6 +195,7 @@ pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
 pub mod library_scan;
+mod library_structure_repository;
 pub mod linked_children_service;
 pub mod live_tv_import;
 pub mod localization_manager;

@@ -144,20 +144,37 @@ async fn add_virtual_folder_without_body_uses_query_paths() {
 }
 
 #[tokio::test]
-async fn add_virtual_folder_empty_name_is_bad_request() {
-    let (state, _vf) = working_state();
-    let response = create_router(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Library/VirtualFolders?name=%20%20")
-                .header("X-Emby-Token", TOKEN)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+async fn add_virtual_folder_rejects_names_outside_the_upstream_regex() {
+    let (state, vf) = working_state();
+    let router = create_router(state);
+    for name in [
+        "",
+        "%20%20",
+        "%20Leading",
+        "Trailing%20",
+        "Line%0ABreak",
+        "%C2%A0Name",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Library/VirtualFolders?name={name}"))
+                    .header("X-Emby-Token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+    assert!(
+        ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

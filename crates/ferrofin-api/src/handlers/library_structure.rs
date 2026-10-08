@@ -162,7 +162,7 @@ async fn add_virtual_folder(
     body: Option<JsonBody<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
-    if name.trim().is_empty() {
+    if name.trim().is_empty() || name.trim() != name || name.contains('\n') {
         return Err(ApiError::BadRequest(
             "Library name cannot be empty or have leading/trailing spaces.".to_owned(),
         ));

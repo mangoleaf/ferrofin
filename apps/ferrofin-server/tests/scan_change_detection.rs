@@ -1810,8 +1810,9 @@ async fn rows(h: &Harness) {
     // ---- 1: the first scan creates everything and asks the providers ----
     let first = h.rescan("1").await;
     // Movies: 3. Harbor: series, season, 2 episodes. Lantern: series,
-    // season, 1 episode. Music: artist, album, 2 tracks.
-    let all_items = 14.0;
+    // season, 1 episode. Music: artist, album, 2 tracks. And each of the
+    // four library locations' `Folder` rows (owner decision D1).
+    let all_items = 18.0;
     assert_eq!(first.outcome("created"), all_items, "row 1: {first:?}");
     for outcome in ["updated", "unchanged", "removed"] {
         assert_eq!(first.outcome(outcome), 0.0, "row 1: {outcome} {first:?}");
@@ -2064,10 +2065,12 @@ async fn rows(h: &Harness) {
         BTreeMap::from([("webhook".to_owned(), 1.0)]),
         "row 5: {added:?}"
     );
-    // A movie's nearest existing item is its library: the scan validates
-    // the reported path alone, so nothing else is even counted unchanged.
+    // A movie's nearest existing item is its library location: the scan
+    // validates the reported path, with the location's folder above it as
+    // context (owner decision D1) — counted unchanged, nothing else.
     assert_eq!(added.item("webhook", "created"), 1.0, "row 5: {added:?}");
-    for outcome in ["updated", "unchanged", "removed"] {
+    assert_eq!(added.outcome("unchanged"), 1.0, "row 5: {added:?}");
+    for outcome in ["updated", "removed"] {
         assert_eq!(added.outcome(outcome), 0.0, "row 5: {outcome} {added:?}");
     }
     assert_eq!(
@@ -2118,7 +2121,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    for outcome in ["created", "updated", "unchanged"] {
+    // The location's folder above the path is context (owner decision D1).
+    assert_eq!(removed.outcome("unchanged"), 1.0, "row 6: {removed:?}");
+    for outcome in ["created", "updated"] {
         assert_eq!(
             removed.outcome(outcome),
             0.0,
@@ -2157,10 +2162,12 @@ async fn rows(h: &Harness) {
         "row 5: {added:?}"
     );
     // The episode is created; its season is the nearest existing item and
-    // goes through the decision (its folder's mtime moved: D3); the series
-    // and the sibling episode are context and validation only.
+    // goes through the decision (its folder's mtime moved: D3); the sibling
+    // episode is saved, now in a mixed folder (a second episode beside it,
+    // `ResolveVideos`' count); the series and the location's folder are
+    // context only.
     assert_eq!(added.item("watcher", "created"), 1.0, "row 5: {added:?}");
-    assert_eq!(added.item("watcher", "updated"), 1.0, "row 5: {added:?}");
+    assert_eq!(added.item("watcher", "updated"), 2.0, "row 5: {added:?}");
     assert_eq!(added.item("watcher", "unchanged"), 2.0, "row 5: {added:?}");
     assert_eq!(added.outcome("removed"), 0.0, "row 5: {added:?}");
     assert_eq!(
@@ -2185,6 +2192,7 @@ async fn rows(h: &Harness) {
     let mut expected = vec![
         lantern_series.clone(),
         lantern_season.clone(),
+        m.key(&m.lantern_e2.with_file_name("Lantern - S01E01.mkv")),
         m.key(&m.lantern_e2),
     ];
     expected.sort_unstable();
@@ -2211,10 +2219,11 @@ async fn rows(h: &Harness) {
     );
     // The season goes through the decision again (its folder changed):
     // `requiresRefresh` runs its one ticked season provider, TheMovieDb's,
-    // which asks for the season once — nothing else is asked for.
+    // which asks for the season once — nothing else is asked for. The
+    // sibling, alone again, leaves its mixed folder and is saved.
     assert_eq!(
         removed.item("watcher", "updated"),
-        1.0,
+        2.0,
         "row 6: {removed:?}"
     );
     assert_eq!(removed.outcome("created"), 0.0, "row 6: {removed:?}");
@@ -2239,11 +2248,28 @@ async fn rows(h: &Harness) {
     })
     .await;
     let edited = h.rescan("7").await;
-    assert_eq!(edited.outcome("unchanged"), all_items, "row 7: {edited:?}");
+    // The movies location's own directory changed in row 6 (Delta's folder
+    // went), so its folder is saved; nothing else. (Plan step 10, D2, stores
+    // a folder's `DateModified` as Jellyfin does — none — and this goes.)
+    assert_eq!(
+        edited.outcome("unchanged"),
+        all_items - 1.0,
+        "row 7: {edited:?}"
+    );
+    assert_eq!(edited.outcome("updated"), 1.0, "row 7: {edited:?}");
     assert_no_probe(&edited, "7");
     assert_no_provider_request(&edited, "7");
     assert_no_artwork_or_people(&edited, "7");
-    assert!(edited.item_tables().is_empty(), "row 7: {edited:?}");
+    assert_eq!(
+        edited.written_items(),
+        [m.key(
+            m.delta
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("location")
+        )],
+        "row 7: {edited:?}"
+    );
     assert_no_ffmpeg(&edited, "7");
     let dto = h.item(&alpha).await;
     assert_eq!(dto["Overview"], "Edited overview.", "row 7");
@@ -2508,15 +2534,18 @@ async fn rows(h: &Harness) {
     // never joined into a wider scan, then had nothing left to create.
     assert_eq!(queued.item("api", "created"), 1.0, "row 14: {queued:?}");
     assert_eq!(queued.item("webhook", "created"), 0.0, "row 14: {queued:?}");
+    // The movie, with its location's folder as context (owner decision D1).
     assert_eq!(
         queued.item("webhook", "unchanged"),
-        1.0,
+        2.0,
         "row 14: {queued:?}"
     );
-    // Shows (series, season, 2 episodes; the touched one updated) and
-    // Movies (4 with the new one): 8 items, not the 15 of every library.
-    assert_eq!(queued.item("api", "updated"), 1.0, "row 14: {queued:?}");
-    assert_eq!(queued.item("api", "unchanged"), 6.0, "row 14: {queued:?}");
+    // Shows (series, season, 2 episodes; the touched one updated; the
+    // location's folder) and Movies (4 with the new one; the location's
+    // folder, saved — its directory gained the new movie's: plan step 10,
+    // D2, makes that quiet): 10 items, not the 19 of every library.
+    assert_eq!(queued.item("api", "updated"), 2.0, "row 14: {queued:?}");
+    assert_eq!(queued.item("api", "unchanged"), 7.0, "row 14: {queued:?}");
     assert_eq!(queued.outcome("removed"), 0.0, "row 14: {queued:?}");
     assert!(
         queued.probed("Harbor - S01E02.mkv") && queued.probed("Epsilon (1999).mkv"),
@@ -3019,14 +3048,15 @@ fn assert_no_artwork_or_people(seen: &Seen, row: &str) {
 }
 
 /// A full pass over the Movies library: every movie re-probed, fetched by
-/// its stored TMDB id (no search) and saved; no other library touched.
+/// its stored TMDB id (no search) and saved, with the location's folder;
+/// no other library touched.
 fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
     assert_eq!(
         seen.scans,
         BTreeMap::from([("api".to_owned(), 1.0)]),
         "row {row}: {seen:?}"
     );
-    assert_eq!(seen.outcome("updated"), movies, "row {row}: {seen:?}");
+    assert_eq!(seen.outcome("updated"), movies + 1.0, "row {row}: {seen:?}");
     for outcome in ["created", "unchanged", "removed"] {
         assert_eq!(seen.outcome(outcome), 0.0, "row {row}: {outcome} {seen:?}");
     }
@@ -3062,8 +3092,8 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
         keys.iter().all(|k| written.contains(k))
             && written
                 .iter()
-                .all(|w| w.starts_with("movies/") || w.contains(':')),
-        "row {row}: the three movies (and their people, genres, years) {written:?}"
+                .all(|w| w == "movies" || w.starts_with("movies/") || w.contains(':')),
+        "row {row}: the three movies, the location (and their people, genres, years) {written:?}"
     );
 }
 

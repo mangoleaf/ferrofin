@@ -21,12 +21,9 @@
 //!   stores `system.json` in place of C# `system.xml`). The per-library options
 //!   are therefore `options.json`; the shortcut and marker files are byte-for-byte
 //!   the same as C#.
-//! - **The `refresh_library` flag and the `ILibraryMonitor` stop/start dance are
-//!   dropped.** The scan pipeline and filesystem watcher are later-wave
-//!   subsystems, so a mutation takes effect on disk immediately and the requested
-//!   refresh is a no-op (the same stance `queue_library_scan` takes today).
-//! - The `ExpandVirtualPath`/`ReverseVirtualPath` network-share remapping is the
-//!   identity here (no virtual-path substitution is configured at this seam).
+//! - The API coordinates the library refresh and monitor stop/start around
+//!   these filesystem mutations.
+//! - The configured virtual-path expander resolves adopted shortcut tokens.
 //! - When an item store is attached ([`with_item_store`](FerrofinVirtualFolderManager::with_item_store)),
 //!   add/remove also creates/deletes the library's `CollectionFolder` `BaseItem`,
 //!   and `GetVirtualFolders` projects its deterministic id onto
@@ -66,6 +63,16 @@ const OPTIONS_FILE: &str = "options.json";
 /// [`FerrofinVirtualFolderManager::load_options`].
 const JELLYFIN_OPTIONS_FILE: &str = "options.xml";
 
+/// Whether `path` is a shortcut: its .NET extension (`Path.GetExtension`,
+/// which counts a leading dot — `.mblink` is one) is `.mblink`, compared
+/// `OrdinalIgnoreCase` as `ManagedFileSystem.IsShortcut` compares it.
+fn is_shortcut(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case(SHORTCUT_EXTENSION))
+}
+
 /// The collection-marker file extension (`<type>.collection`).
 const COLLECTION_EXTENSION: &str = "collection";
 
@@ -86,6 +93,8 @@ pub struct FerrofinVirtualFolderManager {
     /// library with a null `ItemId`) and that `/UserViews` returns. `None` in unit
     /// tests keeps the manager filesystem-only.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// Storage and physical root for preserving pre-D1 library children.
+    physical_root: Option<(ferrofin_db::Database, uuid::Uuid)>,
     /// The item *reader*, set by the composition root alongside
     /// [`persistence`](Self::persistence). Only the orphan prune needs it: it has
     /// to enumerate the `UserRootFolder`'s existing `CollectionFolder` children to
@@ -116,6 +125,10 @@ pub struct FerrofinVirtualFolderManager {
     /// `item_exists` probe. `None` falls back to a private store built from
     /// this manager's own fields — the shape unit tests use.
     user_root: Option<UserRootFolderStore>,
+    /// Expands the virtual-path tokens a shortcut Jellyfin wrote may carry
+    /// (`%AppDataPath%/collections`). Identity until the composition root
+    /// sets it.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinVirtualFolderManager {
@@ -151,12 +164,26 @@ impl FerrofinVirtualFolderManager {
             root: default_user_views_path.into(),
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence: None,
+            physical_root: None,
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             playlists_path: None,
             user_root: None,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
+    }
+
+    /// Expands the virtual-path tokens in shortcut targets
+    /// (`ExpandVirtualPath`), as Jellyfin reads the shortcuts it wrote with
+    /// `ReverseVirtualPath`. Called once by the composition root.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Attaches the item store so add/remove also creates/deletes the library's
@@ -165,6 +192,27 @@ impl FerrofinVirtualFolderManager {
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
         self
+    }
+
+    /// Enables atomic conversion of legacy library children before removing
+    /// their collection folder. Media identities and metadata remain intact.
+    #[must_use]
+    pub fn with_physical_root(mut self, db: ferrofin_db::Database, root: uuid::Uuid) -> Self {
+        self.physical_root = Some((db, root));
+        self
+    }
+
+    async fn preserve_legacy_children(&self, id: uuid::Uuid) -> Result<(), ServiceError> {
+        if let Some((db, aggregate)) = &self.physical_root {
+            crate::library_structure_repository::preserve_children(
+                db,
+                id,
+                *aggregate,
+                &self.id_derivation,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Attaches the item reader used by
@@ -293,6 +341,7 @@ impl FerrofinVirtualFolderManager {
             if let Some(marker) = collection_type {
                 persistence.set_collection_type(id, marker).await?;
             }
+            self.sync_physical_folders(folder_path, id).await?;
             if let Ok(mut set) = self.parented.lock() {
                 set.insert(id);
             }
@@ -317,10 +366,72 @@ impl FerrofinVirtualFolderManager {
             .save_items(std::slice::from_ref(&entity))
             .await?;
         persistence.set_ancestors(id, &[root_id]).await?;
+        self.sync_physical_folders(folder_path, id).await?;
         if let Ok(mut set) = self.parented.lock() {
             set.insert(id);
         }
         Ok(())
+    }
+
+    /// Records the library's locations on its `CollectionFolder` row as
+    /// Jellyfin keeps them (`CollectionFolder.PhysicalLocationsList` and
+    /// `PhysicalFolderIds`): the folder's own path then each location, and
+    /// the id of the `Folder` row the scan keeps for each location (owner
+    /// decision D1) — what every library read resolves a library's items
+    /// through.
+    async fn sync_physical_folders(
+        &self,
+        folder_path: &Path,
+        id: uuid::Uuid,
+    ) -> Result<(), ServiceError> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let locations = self.resolve_locations(folder_path).await?;
+        let trimmed = |location: &str| match location.trim_end_matches('/') {
+            "" => "/".to_owned(),
+            rest => rest.to_owned(),
+        };
+        let mut paths = vec![serde_json::Value::String(
+            folder_path.to_string_lossy().into_owned(),
+        )];
+        paths.extend(
+            locations
+                .iter()
+                .map(|location| serde_json::Value::String(location.clone())),
+        );
+        let ids: Vec<serde_json::Value> = locations
+            .iter()
+            .filter_map(|location| {
+                item_type_lookup::derive_item_id_with(
+                    &self.id_derivation,
+                    BaseItemKind::Folder,
+                    &trimmed(location),
+                )
+            })
+            .map(|folder| serde_json::Value::String(folder.simple().to_string()))
+            .collect();
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "PhysicalLocationsList".to_owned(),
+            serde_json::Value::Array(paths),
+        );
+        fields.insert(
+            "PhysicalFolderIds".to_owned(),
+            serde_json::Value::Array(ids),
+        );
+        persistence.merge_data_fields(id, &fields).await
+    }
+
+    /// Forgets that the library at `folder_path` was set up this boot, so the
+    /// next [`ensure_collection_folder`](Self::ensure_collection_folder)
+    /// records its changed locations.
+    fn forget_setup(&self, folder_path: &Path) {
+        if let (Some(id), Ok(mut set)) =
+            (self.collection_folder_id(folder_path), self.parented.lock())
+        {
+            set.remove(&id);
+        }
     }
 
     /// Deletes every `CollectionFolder` row under the `UserRootFolder` whose
@@ -416,6 +527,9 @@ impl FerrofinVirtualFolderManager {
         }
         if stale.is_empty() {
             return Ok(0);
+        }
+        for id in &stale {
+            self.preserve_legacy_children(*id).await?;
         }
         persistence.delete_items(&stale).await?;
         if let Ok(mut set) = self.parented.lock() {
@@ -551,6 +665,24 @@ impl FerrofinVirtualFolderManager {
         Some(imported)
     }
 
+    /// `SyncLibraryOptionsToLocations`: restore paths represented by shortcuts
+    /// when the counts differ. Existing option entries are preserved upstream.
+    async fn sync_options_to_locations(
+        &self,
+        folder_path: &Path,
+        options: &mut LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let locations = self.resolve_locations(folder_path).await?;
+        if !locations.is_empty() && locations.len() != options.path_infos.len() {
+            for path in locations {
+                if !options.path_infos.iter().any(|info| info.path == path) {
+                    options.path_infos.push(MediaPathInfo { path });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes `options` to a folder's `options.json` (C# `SaveLibraryOptions`).
     async fn save_options(
         folder_path: &Path,
@@ -564,9 +696,10 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("write options.json", &e))
     }
 
-    /// Lists the resolved `.mblink` shortcut targets in a folder, sorted, exactly
-    /// as `GetVirtualFolderInfo` builds `VirtualFolderInfo.Locations`.
-    async fn resolve_locations(folder_path: &Path) -> Result<Vec<String>, ServiceError> {
+    /// Lists the resolved `.mblink` shortcut targets in a folder, expanded
+    /// and sorted, exactly as `GetVirtualFolderInfo` builds
+    /// `VirtualFolderInfo.Locations`.
+    async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
         let mut locations = Vec::new();
         let mut dir = match tokio::fs::read_dir(folder_path).await {
             Ok(dir) => dir,
@@ -579,10 +712,10 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("iterate folder", &e))?
         {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some(SHORTCUT_EXTENSION)
+            if is_shortcut(&path)
                 && let Some(target) = Self::resolve_shortcut(&path).await
             {
-                locations.push(target);
+                locations.push(self.virtual_paths.expand(&target));
             }
         }
         locations.sort();
@@ -643,7 +776,12 @@ impl FerrofinVirtualFolderManager {
     /// Deletes the `.mblink` shortcut in `folder_path` that resolves to `target`,
     /// if one exists (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
     /// shortcut was removed.
-    async fn delete_shortcut_for(folder_path: &Path, target: &str) -> Result<bool, ServiceError> {
+    async fn delete_shortcut_for(
+        &self,
+        folder_path: &Path,
+        target: &str,
+    ) -> Result<bool, ServiceError> {
+        let target = target.trim_end_matches(['/', '\\']);
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -653,8 +791,12 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("iterate folder", &e))?
         {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some(SHORTCUT_EXTENSION)
-                && Self::resolve_shortcut(&path).await.as_deref() == Some(target)
+            if is_shortcut(&path)
+                && Self::resolve_shortcut(&path).await.is_some_and(|found| {
+                    self.virtual_paths
+                        .expand(&found)
+                        .eq_ignore_ascii_case(target)
+                })
             {
                 tokio::fs::remove_file(&path)
                     .await
@@ -731,7 +873,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 self.ensure_collection_folder(&path, name).await?;
             }
             let library_id = self.collection_folder_id(&path);
-            let locations = Self::resolve_locations(&path).await?;
+            let locations = self.resolve_locations(&path).await?;
             folders.push(VirtualFolderInfo {
                 name,
                 locations,
@@ -828,9 +970,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // Every configured media path must exist on disk (C# validation before
         // any side effect).
         for path_info in &options.path_infos {
-            if !tokio::fs::try_exists(&path_info.path)
+            if !tokio::fs::metadata(&path_info.path)
                 .await
-                .unwrap_or(false)
+                .is_ok_and(|metadata| metadata.is_dir())
             {
                 return Err(ServiceError::invalid_input(format!(
                     "the specified path does not exist: {}.",
@@ -881,10 +1023,13 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
         let folder_path = self.require_folder(name).await?;
         // Delete the CollectionFolder row before the directory (its id derives from
-        // the path). Child items are pruned by a later scan.
+        // the path). The items hang off the locations' folders, which the next
+        // library scan prunes once no library lists them
+        // (`AggregateFolder.ValidateChildren`).
         if let (Some(persistence), Some(id)) =
             (&self.persistence, self.collection_folder_id(&folder_path))
         {
+            self.preserve_legacy_children(id).await?;
             persistence.delete_items(std::slice::from_ref(&id)).await?;
         }
         tokio::fs::remove_dir_all(&folder_path)
@@ -932,6 +1077,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // case-only hop reassigns `current` to a temporary uuid directory, whose
         // id is not the one to delete.
         let vacated = self.collection_folder_id(&current);
+        if let Some(id) = vacated {
+            self.preserve_legacy_children(id).await?;
+        }
 
         // A case-only rename hops through a temporary directory so a
         // case-insensitive filesystem does not treat it as a no-op (C# path).
@@ -954,9 +1102,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // the very next read (ids are path-derived), and nothing would ever remove
         // the first. This is what `LibraryManager.ValidateTopLibraryFolders` does
         // for upstream after a rename; do it eagerly here so a caller that passed
-        // `refreshLibrary=false` still converges. Deleting the row takes its
-        // children with it (`FK_BaseItems_BaseItems_ParentId … ON DELETE CASCADE`),
-        // which is why the API layer rescans the renamed library unconditionally.
+        // `refreshLibrary=false` still converges. Legacy children were moved
+        // transactionally before the directory rename; the physical hierarchy
+        // survives deletion of the old collection folder.
         if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
             persistence.delete_items(std::slice::from_ref(&id)).await?;
             if let Ok(mut set) = self.parented.lock() {
@@ -978,9 +1126,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         if path_info.path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
         }
-        if !tokio::fs::try_exists(&path_info.path)
+        if !tokio::fs::metadata(&path_info.path)
             .await
-            .unwrap_or(false)
+            .is_ok_and(|metadata| metadata.is_dir())
         {
             return Err(ServiceError::not_found("the path does not exist"));
         }
@@ -990,27 +1138,27 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
         let mut options = Self::load_options(&folder_path).await;
         options.path_infos.push(path_info.clone());
-        Self::save_options(&folder_path, &options).await
+        self.sync_options_to_locations(&folder_path, &mut options)
+            .await?;
+        Self::save_options(&folder_path, &options).await?;
+        self.forget_setup(&folder_path);
+        Ok(())
     }
 
     async fn update_media_path(
         &self,
         virtual_folder_name: &str,
-        path_info: &MediaPathInfo,
+        _path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let mut options = Self::load_options(&folder_path).await;
-        // Replace the matching entry (by path); append when it is new.
-        if let Some(existing) = options
-            .path_infos
-            .iter_mut()
-            .find(|i| i.path == path_info.path)
-        {
-            *existing = path_info.clone();
-        } else {
-            options.path_infos.push(path_info.clone());
-        }
-        Self::save_options(&folder_path, &options).await
+        // The pinned UpdateMediaPath synchronizes existing shortcut locations;
+        // it does not add or replace the caller's Path. AddMediaPath owns that.
+        self.sync_options_to_locations(&folder_path, &mut options)
+            .await?;
+        Self::save_options(&folder_path, &options).await?;
+        self.forget_setup(&folder_path);
+        Ok(())
     }
 
     async fn remove_media_path(
@@ -1023,11 +1171,13 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         }
         let folder_path = self.require_folder(virtual_folder_name).await?;
 
-        Self::delete_shortcut_for(&folder_path, path).await?;
+        self.delete_shortcut_for(&folder_path, path).await?;
 
         let mut options = Self::load_options(&folder_path).await;
         options.path_infos.retain(|i| i.path != path);
-        Self::save_options(&folder_path, &options).await
+        Self::save_options(&folder_path, &options).await?;
+        self.forget_setup(&folder_path);
+        Ok(())
     }
 
     async fn update_library_options(
@@ -1047,7 +1197,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             }
         }
 
-        Self::save_options(&folder_path, options).await
+        Self::save_options(&folder_path, options).await?;
+        self.forget_setup(&folder_path);
+        Ok(())
     }
 }
 
@@ -1392,6 +1544,49 @@ mod tests {
     </TypeOptions>
   </TypeOptions>
 </LibraryOptions>"#;
+
+    /// Every shortcut Jellyfin reads is a location: a dotfile `.mblink`
+    /// (what a path entered with a trailing slash names) and any case of
+    /// the extension count, and a target written with `ReverseVirtualPath`
+    /// is expanded; removing the path finds the shortcut the same way.
+    #[tokio::test]
+    async fn jellyfin_shortcuts_resolve_as_jellyfin_reads_them() {
+        let (tmp, mgr) = manager();
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            tmp.path().join("srv").to_str().expect("utf-8"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        let mgr = mgr.with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+            Arc::clone(&paths),
+        ));
+        let folder = tmp.path().join("default").join("Educational");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join(".mblink"), "/media/cold/Educational/").expect("dotfile");
+        std::fs::write(folder.join("Docs.MBLINK"), "/media/docs").expect("upper");
+        std::fs::write(
+            folder.join("collections.mblink"),
+            "%AppDataPath%/collections",
+        )
+        .expect("virtual");
+
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref());
+        let mut want = vec![
+            format!("{data}/collections"),
+            "/media/cold/Educational".to_owned(),
+            "/media/docs".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(folders[0].locations, want);
+
+        mgr.remove_media_path("Educational", &format!("{data}/Collections/"))
+            .await
+            .expect("remove");
+        assert!(!folder.join("collections.mblink").exists());
+    }
 
     #[tokio::test]
     async fn adopted_jellyfin_options_xml_is_imported_once_and_persisted_as_json() {
@@ -1855,6 +2050,70 @@ mod tests {
         assert_eq!(
             folder.library_options.unwrap().path_infos,
             vec![MediaPathInfo { path: m2 }]
+        );
+    }
+
+    #[tokio::test]
+    async fn media_roots_must_be_directories_before_mutating_library_options() {
+        let (tmp, mgr) = manager();
+        let file = tmp.path().join("file.mkv");
+        std::fs::write(&file, "fixture").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        assert!(
+            mgr.add_virtual_folder("File", None, &opts_with_paths(std::slice::from_ref(&file)))
+                .await
+                .is_err()
+        );
+        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let media = media_dir(&tmp, "media");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
+            .await
+            .unwrap();
+        assert!(
+            mgr.add_media_path("Lib", &MediaPathInfo { path: file })
+                .await
+                .is_err()
+        );
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(folder.locations, vec![media.clone()]);
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            vec![MediaPathInfo { path: media }]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_update_syncs_shortcuts_without_adding_the_request_path() {
+        let (tmp, mgr) = manager();
+        let first = media_dir(&tmp, "first");
+        let second = media_dir(&tmp, "second");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&first)))
+            .await
+            .unwrap();
+        let root = mgr.require_folder("Lib").await.unwrap();
+        FerrofinVirtualFolderManager::create_shortcut(
+            &root,
+            &MediaPathInfo {
+                path: second.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        mgr.update_media_path(
+            "Lib",
+            &MediaPathInfo {
+                path: "/never-added".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            vec![
+                MediaPathInfo { path: first },
+                MediaPathInfo { path: second }
+            ]
         );
     }
 

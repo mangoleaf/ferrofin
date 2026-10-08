@@ -1454,30 +1454,46 @@ impl LocalProviderManager {
         self
     }
 
-    /// The saved `LibraryOptions` of the library that owns `entity`, resolved
-    /// through its `TopParentId` (the collection-folder id every scanned row
-    /// carries). `None` when no library manager is wired, the row has no top
-    /// parent, or the library saved no options — all of which mean "no
+    /// The saved `LibraryOptions` of the library that owns `entity` —
+    /// `LibraryManager.GetLibraryOptions(item)`, through the item's location
+    /// ([`owning_library`](ferrofin_model::entities_media::owning_library)):
+    /// its own path, or for a path-less item (a virtual season) its nearest
+    /// ancestor's. `None` when no library manager is wired, no library holds
+    /// the item, or the library saved no options — all of which mean "no
     /// customisation", i.e. the built-in defaults.
     async fn library_options_for(
         &self,
         entity: &BaseItemEntity,
     ) -> Option<ferrofin_model::configuration::LibraryOptions> {
+        /// How far up a path-less item's parents the path is looked for.
+        const MAX_PARENT_HOPS: usize = 8;
         let folders = self.virtual_folders.as_ref()?;
-        let top = entity
-            .top_parent_id
-            .as_deref()
-            .and_then(|raw| Uuid::parse_str(raw).ok())?;
         let folders = folders.get_virtual_folders().await.ok()?;
-        folders.into_iter().find_map(|folder| {
-            let id = folder
-                .item_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
-            (id == Some(top))
-                .then_some(folder.library_options)
-                .flatten()
-        })
+        let mut path = entity.path.clone().filter(|p| !p.is_empty());
+        let mut parent = entity.parent_id.clone();
+        for _ in 0..MAX_PARENT_HOPS {
+            if path.is_some() {
+                break;
+            }
+            let (Some(items), Some(id)) = (
+                self.items.as_ref(),
+                parent.as_deref().and_then(|raw| Uuid::parse_str(raw).ok()),
+            ) else {
+                break;
+            };
+            let Ok(Some(row)) = items.retrieve_item(id).await else {
+                break;
+            };
+            path = row.path.filter(|p| !p.is_empty());
+            parent = row.parent_id;
+        }
+        ferrofin_model::entities_media::owning_library(
+            &folders,
+            entity.top_parent_id.as_deref(),
+            path.as_deref(),
+        )?
+        .library_options
+        .clone()
     }
 
     /// `options` with the refresh modes forced to `None` wherever the C# gate
