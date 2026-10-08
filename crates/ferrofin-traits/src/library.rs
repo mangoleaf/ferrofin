@@ -570,6 +570,26 @@ pub trait LibraryManager: Send + Sync {
         ))
     }
 
+    /// The other parts of a stacked video, ordered by `SortName`.
+    ///
+    /// Port of `Video.GetAdditionalParts(user)` (`Video.cs:492-498`): one
+    /// `Video` item per path in the video's `AdditionalParts` (its id derived
+    /// from the path as a `Video`'s), those that exist and — with a user —
+    /// that the user may see (parental rating and tags). Empty for a video
+    /// that is not stacked, and for any other item.
+    ///
+    /// The default implementation reports the operation as unsupported (see
+    /// [`merge_versions`](Self::merge_versions)); `FerrofinLibraryManager`
+    /// overrides it.
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (video, user);
+        Err(ServiceError::backend("get_additional_parts not supported"))
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,

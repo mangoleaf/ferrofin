@@ -118,11 +118,47 @@ fn extra_type_name(disc: i32) -> Option<&'static str> {
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
+/// Where the user-data manager announces user data it saved on its own —
+/// the other versions [`FerrofinUserDataManager`]'s played-state propagation
+/// wrote — as the `UserDataChanged` message the request paths push for the
+/// item they saved (upstream's `UserDataSaved` event, which
+/// `UserDataChangedNotifier` turns into that message for every save).
+#[async_trait]
+pub trait UserDataChangedSink: Send + Sync {
+    /// Sends one serialized `UserDataChanged` message (`data`) to every
+    /// session of `user_id`. Best-effort: delivery never fails a save.
+    async fn user_data_changed(&self, user_id: Uuid, data: &str);
+}
+
+/// [`UserDataChangedSink`] over the session manager, held weakly: the
+/// session manager owns the user-data manager, so a strong handle back
+/// would be a cycle. Once the session manager is gone nothing is sent.
+pub struct SessionUserDataSink(pub std::sync::Weak<dyn ferrofin_traits::session::SessionManager>);
+
+#[async_trait]
+impl UserDataChangedSink for SessionUserDataSink {
+    async fn user_data_changed(&self, user_id: Uuid, data: &str) {
+        if let Some(sessions) = self.0.upgrade() {
+            let _ = sessions
+                .send_message_to_user_sessions(
+                    &[user_id],
+                    ferrofin_model::session::SessionMessageType::UserDataChanged,
+                    data,
+                )
+                .await;
+        }
+    }
+}
+
 /// The concrete user-data manager.
 #[derive(Clone)]
 pub struct FerrofinUserDataManager {
     db: Database,
     config: Arc<dyn ServerConfigurationManager>,
+    /// Where propagated saves are announced, set by the composition root
+    /// once the session manager exists ([`Self::set_user_data_changed_sink`]).
+    /// Unset (unit tests), they are announced nowhere.
+    changed: Arc<std::sync::OnceLock<Arc<dyn UserDataChangedSink>>>,
 }
 
 impl std::fmt::Debug for FerrofinUserDataManager {
@@ -136,7 +172,19 @@ impl FerrofinUserDataManager {
     /// Creates a user-data manager over the given database and configuration.
     #[must_use]
     pub fn new(db: Database, config: Arc<dyn ServerConfigurationManager>) -> Self {
-        Self { db, config }
+        Self {
+            db,
+            config,
+            changed: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Sets where the user data this manager saves on its own (the other
+    /// versions of a video marked played or unplayed) is announced. The
+    /// first call wins; it closes the session manager ↔ user-data manager
+    /// cycle after both exist.
+    pub fn set_user_data_changed_sink(&self, sink: Arc<dyn UserDataChangedSink>) {
+        let _ = self.changed.set(sink);
     }
 
     /// Reads the user-data row for an item/user pair, or `None`.
@@ -479,6 +527,99 @@ impl FerrofinUserDataManager {
             retention_date: None,
             subtitle_stream_index: None,
         }
+    }
+
+    /// Gives every other version of a video the played state just set on
+    /// it — port of `Video.PropagatePlayedState` (`Video.cs:370-410`), which
+    /// `Video.MarkPlayed`/`MarkUnplayed` and the session's progress and stop
+    /// reports (`SessionManager.cs:1001-1006,1206-1211`) run after saving
+    /// the video's own data.
+    ///
+    /// Marking played sets `Played` on each version and, with
+    /// `reset_position`, clears its resume point — only those fields, as the
+    /// partial `UpdateUserItemDataDto` upstream saves (play count and the
+    /// rest stay). Marking unplayed fully resets each version
+    /// (`ResetPlayedState`: played, play count, position, last played) and
+    /// saves it, data or none, as upstream's `GetUserData` hands back a new
+    /// record for a version never played. Every version saved is announced
+    /// (`UserDataChanged`). A video with no versions — and any item that is
+    /// no video — is left alone after one indexed read (upstream's
+    /// `!PrimaryVersionId.HasValue && LinkedAlternateVersions.Length == 0 &&
+    /// !HasLocalAlternateVersions` guard); only a video with versions pays
+    /// the two reads that find them
+    /// ([`VersionRows`](crate::video_versions::VersionRows)), and a third
+    /// only when a merged version lists local versions of its own.
+    async fn propagate_played_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        played: bool,
+        reset_position: bool,
+    ) -> Result<(), ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRowReader as _, VersionRows};
+        // The cheap guard: a version, or a video some row names as its
+        // primary (`FerrofinIX_BaseItems_PrimaryVersionId`).
+        let has_versions: Option<bool> = sqlx::query_scalar(
+            r#"SELECT b."PrimaryVersionId" IS NOT NULL
+                      OR EXISTS (SELECT 1 FROM "BaseItems" x
+                                 WHERE x."PrimaryVersionId" = b."Id" AND x."Id" <> b."Id")
+               FROM "BaseItems" b WHERE b."Id" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if has_versions != Some(true) {
+            return Ok(());
+        }
+        let reader = DbVersionReader(&self.db);
+        let rows = reader.rows_by_id(&[item_id]).await?;
+        let Some(item) = rows.first() else {
+            return Ok(());
+        };
+        if !kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video) {
+            return Ok(());
+        }
+        let versions = VersionRows::load(&reader, &[item]).await?;
+        let mut saved: Vec<UserItemDataDto> = Vec::new();
+        for version in versions.all_version_ids(item) {
+            if version == item_id {
+                continue;
+            }
+            let stored = self.read_row(version, user_id).await?;
+            let row = if played {
+                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
+                row.played = true;
+                if reset_position {
+                    row.playback_position_ticks = 0;
+                }
+                row
+            } else {
+                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
+                row.played = false;
+                row.play_count = 0;
+                row.playback_position_ticks = 0;
+                row.last_played_date = None;
+                row
+            };
+            self.upsert_row(&row).await?;
+            saved.push(to_dto(&row, version));
+        }
+        // Each save is a `UserDataSaved` upstream, which the user's sessions
+        // hear as `UserDataChanged` — the request path announces only the
+        // video it saved, so the versions are announced here, together.
+        if let Some(sink) = self.changed.get()
+            && !saved.is_empty()
+        {
+            let info = ferrofin_model::session::UserDataChangeInfo {
+                user_id,
+                user_data_list: saved,
+            };
+            if let Ok(data) = serde_json::to_string(&info) {
+                sink.user_data_changed(user_id, &data).await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -838,6 +979,15 @@ impl UserDataManager for FerrofinUserDataManager {
 
         row.playback_position_ticks = position_ticks;
         self.upsert_row(&row).await?;
+        // "A completed version marks every alternate version played and
+        // clears their resume points" — `if (data.Played == true && item is
+        // Video playedVideo) playedVideo.PropagatePlayedState(user, true)`
+        // after the progress and the stop save (`SessionManager.cs:
+        // 1001-1006,1206-1211`).
+        if row.played {
+            self.propagate_played_state(user_id, item_id, true, true)
+                .await?;
+        }
 
         Ok(played_to_completion)
     }
@@ -870,6 +1020,9 @@ impl UserDataManager for FerrofinUserDataManager {
         row.played = true;
 
         self.upsert_row(&row).await?;
+        // `Video.MarkPlayed` → `PropagatePlayedState(user, true, resetPosition)`.
+        self.propagate_played_state(user_id, item_id, true, true)
+            .await?;
         Ok(to_dto(&row, item_id))
     }
 
@@ -890,6 +1043,9 @@ impl UserDataManager for FerrofinUserDataManager {
         row.played = false;
 
         self.upsert_row(&row).await?;
+        // `Video.MarkUnplayed` → `PropagatePlayedState(user, false, true)`.
+        self.propagate_played_state(user_id, item_id, false, true)
+            .await?;
         Ok(to_dto(&row, item_id))
     }
 
@@ -2145,5 +2301,315 @@ mod tests {
                 .is_none(),
             "an unknown user is 'no policy', not 'nothing permitted'"
         );
+    }
+
+    // ---- `Video.PropagatePlayedState` (upstream `BaseItemTests`) ----------
+
+    /// Upstream `SetupVersionGroup`: a primary `Movie.mkv` and two local
+    /// alternates, owned by and pointing at it, as the scan stores them.
+    async fn version_group(db: &Database) -> (Uuid, Uuid, Uuid) {
+        let (primary, alt1, alt2) = (
+            Uuid::from_u128(10),
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+        );
+        for (id, path) in [
+            (primary, "/Movies/Movie/Movie.mkv"),
+            (alt1, "/Movies/Movie/Movie - 1080p.mkv"),
+            (alt2, "/Movies/Movie/Movie - 4K.mkv"),
+        ] {
+            seed_item(db, id, BaseItemKind::Movie).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "Path" = ?2, "RunTimeTicks" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(path)
+            .bind(72_000_000_000_i64)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        for alt in [alt1, alt2] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(alt))
+            .bind(guid_to_db(primary))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        (primary, alt1, alt2)
+    }
+
+    async fn data(mgr: &FerrofinUserDataManager, item: Uuid, user: Uuid) -> UserItemDataDto {
+        mgr.get_user_data_dto(item, user)
+            .await
+            .unwrap()
+            .expect("user data")
+    }
+
+    async fn resume_at(mgr: &FerrofinUserDataManager, item: Uuid, user: Uuid, ticks: i64) {
+        mgr.save_user_data(
+            user,
+            item,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(ticks),
+                play_count: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Both alternate versions are marked played, and their positions reset
+    /// so a watched version does not linger in "Continue Watching"; their
+    /// other state (the play count) stays.
+    #[tokio::test]
+    async fn propagate_played_state_marks_alternate_versions_and_resets_position_by_default() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        resume_at(&mgr, alt1, user, 1000).await;
+
+        mgr.mark_played(user, primary, None).await.unwrap();
+
+        for alt in [alt1, alt2] {
+            let dto = data(&mgr, alt, user).await;
+            assert!(dto.played, "{alt}");
+            assert_eq!(dto.playback_position_ticks, 0);
+        }
+        assert_eq!(
+            data(&mgr, alt1, user).await.play_count,
+            3,
+            "only Played and the position"
+        );
+    }
+
+    #[tokio::test]
+    async fn propagate_played_state_without_reset_leaves_position_untouched() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        resume_at(&mgr, alt1, user, 1000).await;
+
+        mgr.propagate_played_state(user, primary, true, false)
+            .await
+            .unwrap();
+
+        let dto = data(&mgr, alt1, user).await;
+        assert!(dto.played);
+        assert_eq!(dto.playback_position_ticks, 1000);
+        assert!(data(&mgr, alt2, user).await.played);
+    }
+
+    /// Every alternate is fully reset to an unwatched state, mirroring
+    /// `MarkUnplayed`: the played flag, play count, resume point and
+    /// last-played date are all cleared.
+    #[tokio::test]
+    async fn propagate_played_state_unwatched_clears_all_watched_state_on_versions() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        for alt in [alt1, alt2] {
+            mgr.save_user_data(
+                user,
+                alt,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    play_count: Some(3),
+                    playback_position_ticks: Some(1000),
+                    last_played_date: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        mgr.mark_unplayed(user, primary).await.unwrap();
+
+        for alt in [alt1, alt2] {
+            let dto = data(&mgr, alt, user).await;
+            assert!(!dto.played);
+            assert_eq!(dto.play_count, 0);
+            assert_eq!(dto.playback_position_ticks, 0);
+            assert_eq!(dto.last_played_date, None);
+        }
+    }
+
+    /// Records each announced `UserDataChanged` message.
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<(Uuid, serde_json::Value)>>);
+
+    #[async_trait]
+    impl UserDataChangedSink for RecordingSink {
+        async fn user_data_changed(&self, user_id: Uuid, data: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((user_id, serde_json::from_str(data).unwrap()));
+        }
+    }
+
+    /// Each version the propagation saved is announced to the user's
+    /// sessions as `UserDataChanged` (upstream fires `UserDataSaved` per
+    /// save); the primary itself is the request path's to announce.
+    #[tokio::test]
+    async fn propagated_played_state_is_announced_for_each_other_version() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        let sink = Arc::new(RecordingSink::default());
+        mgr.set_user_data_changed_sink(sink.clone());
+
+        mgr.mark_played(user, primary, None).await.unwrap();
+
+        let sent = sink.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one message for the group");
+        let (to, info) = &sent[0];
+        assert_eq!(*to, user);
+        let mut items: Vec<(String, bool)> = info["UserDataList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["ItemId"].as_str().unwrap().to_owned(),
+                    d["Played"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        items.sort();
+        let mut want = vec![
+            (alt1.simple().to_string(), true),
+            (alt2.simple().to_string(), true),
+        ];
+        want.sort();
+        assert_eq!(items, want);
+
+        // A video with no versions announces nothing of its own.
+        let solo = Uuid::from_u128(30);
+        seed_item(&mgr.db, solo, BaseItemKind::Movie).await;
+        mgr.mark_played(user, solo, None).await.unwrap();
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn propagate_played_state_single_version_does_nothing() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let solo = Uuid::from_u128(20);
+        seed_item(&db, solo, BaseItemKind::Movie).await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        mgr.mark_played(user, solo, None).await.unwrap();
+
+        let rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(DISTINCT "ItemId") FROM "UserData""#)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "only the video's own data is written");
+    }
+
+    /// A completed playback report on an alternate (`SessionManager.cs:
+    /// 1206-1211`) marks the primary and the other alternate played.
+    #[tokio::test]
+    async fn a_version_played_to_completion_marks_its_whole_group_played() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        resume_at(&mgr, primary, user, 1000).await;
+
+        assert!(
+            mgr.update_play_state(user, alt1, Some(72_000_000_000))
+                .await
+                .unwrap()
+        );
+
+        for version in [primary, alt2] {
+            let dto = data(&mgr, version, user).await;
+            assert!(dto.played, "{version}");
+            assert_eq!(dto.playback_position_ticks, 0);
+        }
+    }
+
+    /// Across a merged (`Grouping`) group: marking the merged version played
+    /// reaches its primary, the primary's local versions and its own local
+    /// version (`GetAllItemsForMediaSources` spans them all); marking the
+    /// primary unplayed saves and announces every other version, a version
+    /// with no data of its own included.
+    #[tokio::test]
+    async fn propagation_spans_a_merged_group_and_its_local_versions() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, alt1, alt2) = version_group(&db).await;
+        let (merged, merged_local) = (Uuid::from_u128(13), Uuid::from_u128(14));
+        for (id, path) in [
+            (merged, "/Movies/Cut/Cut.mkv"),
+            (merged_local, "/Movies/Cut/Cut - 720p.mkv"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2,
+               "Data" = '{"LocalAlternateVersions":["/Movies/Cut/Cut - 720p.mkv"]}' WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(merged))
+        .bind(guid_to_db(primary))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(merged_local))
+        .bind(guid_to_db(merged))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mgr = FerrofinUserDataManager::new(db, config());
+        let sink = Arc::new(RecordingSink::default());
+        mgr.set_user_data_changed_sink(sink.clone());
+
+        mgr.mark_played(user, merged, None).await.unwrap();
+        for version in [primary, alt1, alt2, merged_local] {
+            assert!(data(&mgr, version, user).await.played, "{version}");
+        }
+
+        // A fresh user: no version has data, and unplaying still saves them.
+        let other = Uuid::from_u128(2);
+        crate::test_support::seed_named_user(&mgr.db, other, "other").await;
+        mgr.mark_unplayed(other, primary).await.unwrap();
+        let rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(DISTINCT "ItemId") FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(other))
+        .fetch_one(mgr.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(rows, 5, "the primary and its four other versions");
+        let last = sink.0.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last.0, other);
+        assert_eq!(last.1["UserDataList"].as_array().map(Vec::len), Some(4));
     }
 }

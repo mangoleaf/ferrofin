@@ -106,6 +106,12 @@ pub struct FerrofinLibraryManager {
     /// the composition root. `None` (unit tests) means item writes announce
     /// nothing, which is what every test that does not assert on the push wants.
     changed: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
+    /// How this database derives an item's id from its path, set by the
+    /// composition root ([`FerrofinLibraryManager::with_id_derivation`]): a
+    /// stacked video's parts are found by the ids their paths derive to
+    /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
+    /// with no program-data path, which is the same for every media path.
+    id_derivation: crate::item_type_lookup::IdDerivation,
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -982,6 +988,9 @@ impl FerrofinLibraryManager {
             linked_children: None,
             user_root: None,
             years: None,
+            id_derivation: crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
             by_name: None,
             changed: None,
         }
@@ -1038,6 +1047,14 @@ impl FerrofinLibraryManager {
     #[must_use]
     pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
         self.user_root = Some(store);
+        self
+    }
+
+    /// Sets how this database derives an item's id from its path (the
+    /// `item_id_derivation` meta), which finds a stacked video's parts.
+    #[must_use]
+    pub fn with_id_derivation(mut self, mode: crate::item_type_lookup::IdDerivation) -> Self {
+        self.id_derivation = mode;
         self
     }
 
@@ -1331,7 +1348,13 @@ impl LibraryManager for FerrofinLibraryManager {
         }
         self.items
             .swap_item_images(item_id, image_type, index1, index2)
-            .await
+            .await?;
+        // `SwapImagesAsync` saves the item (`UpdateToRepositoryAsync`), which
+        // gives a primary's local versions its reordered images.
+        self.persistence
+            .copy_metadata_to_owned_videos(&[item_id], true, false)
+            .await?;
+        Ok(())
     }
 
     async fn query_items(
@@ -1551,6 +1574,19 @@ impl LibraryManager for FerrofinLibraryManager {
             let values = crate::library_scan::item_values_of(item);
             self.persistence.save_item_values(id, &values).await?;
         }
+        // `Video.UpdateToRepositoryAsync` (`Video.cs:704-726`): a saved
+        // primary's local versions take its metadata. Only a video whose
+        // `Data` lists owned videos is asked — none of the others has any.
+        let owners: Vec<Uuid> = items
+            .iter()
+            .filter(|item| crate::video_versions::owns_videos(item.data.as_deref()))
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        if !owners.is_empty() {
+            self.persistence
+                .copy_metadata_to_owned_videos(&owners, true, false)
+                .await?;
+        }
         // No `ItemUpdated` hook here: `save_items` above is the repository save,
         // and the notifier is attached THERE so that every writer announces
         // itself, not just this one. Recording it again here would be a
@@ -1568,7 +1604,13 @@ impl LibraryManager for FerrofinLibraryManager {
         // the rest in one transaction.
         self.persistence
             .replace_provider_ids(item_id, provider_ids)
-            .await
+            .await?;
+        // The edit's save copies the new ids to the item's local versions
+        // (`Video.UpdateToRepositoryAsync`); a non-owner has none to copy to.
+        self.persistence
+            .copy_metadata_to_owned_videos(&[item_id], true, false)
+            .await?;
+        Ok(())
     }
 
     async fn get_locked_fields_batch(
@@ -1732,6 +1774,54 @@ impl LibraryManager for FerrofinLibraryManager {
             }
         }
         Ok(())
+    }
+
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // A method of `Video`; the controller answers `[]` for anything else.
+        if !crate::item_type_lookup::kind_from_type_name(&video.type_)
+            .is_some_and(crate::kinds::is_video)
+        {
+            return Ok(Vec::new());
+        }
+        // `GetAdditionalPartIds`: `GetNewItemId(path, typeof(Video))` per path.
+        let ids: Vec<Uuid> = crate::video_versions::additional_parts(video.data.as_deref())
+            .iter()
+            .filter_map(|path| {
+                crate::item_type_lookup::derive_item_id_with(
+                    &self.id_derivation,
+                    BaseItemKind::Video,
+                    path,
+                )
+            })
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `.Where(i => i is not null && (user is null || i.IsVisible(user)))`
+        // as one query: the parts are owned non-extras, which a general
+        // query hides, so ask for owned items.
+        let query = InternalItemsQuery {
+            item_ids: ids.clone(),
+            include_owned_items: true,
+            user: user.cloned(),
+            ..InternalItemsQuery::default()
+        };
+        let mut parts = self.items.get_item_list(&query).await?;
+        // `.OrderBy(i => i.SortName)` — a stable sort over the parts in their
+        // `AdditionalParts` order, so parts sharing a sort name keep it.
+        let position = |row: &BaseItemEntity| {
+            Uuid::parse_str(&row.id)
+                .ok()
+                .and_then(|id| ids.iter().position(|p| *p == id))
+                .unwrap_or(usize::MAX)
+        };
+        parts.sort_by_key(position);
+        parts.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        Ok(parts)
     }
 
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
@@ -4049,6 +4139,90 @@ mod tests {
         let images = mgr.get_item_images(item).await.expect("images");
         assert_eq!(images[0].path, "/two.jpg");
         assert_eq!(images[1].path, "/one.jpg");
+    }
+
+    /// A primary `Movie` with one local version, as the scan stores them.
+    async fn primary_with_local_version(db: &Database) -> (Uuid, Uuid) {
+        let (primary, version) = (Uuid::from_u128(0x5E_0001), Uuid::from_u128(0x5E_0002));
+        seed_named_item(db, primary, BaseItemKind::Movie, "Heat").await;
+        seed_named_item(db, version, BaseItemKind::Movie, "Heat").await;
+        let mut row = crate::test_support::fetch_item(db, primary).await;
+        row.path = Some("/m/Heat/Heat.mkv".to_owned());
+        row.data = Some(r#"{"LocalAlternateVersions":["/m/Heat/Heat - 4K.mkv"]}"#.to_owned());
+        crate::test_support::save_item(db, &row).await;
+        let mut row = crate::test_support::fetch_item(db, version).await;
+        row.path = Some("/m/Heat/Heat - 4K.mkv".to_owned());
+        row.owner_id = Some(guid_to_db(primary));
+        row.primary_version_id = Some(guid_to_db(primary));
+        crate::test_support::save_item(db, &row).await;
+        (primary, version)
+    }
+
+    /// The API edit paths are saves of the primary, so its local version
+    /// takes what changed (`Video.UpdateToRepositoryAsync`): the edited
+    /// columns, the replaced provider ids, the reordered images.
+    #[tokio::test]
+    async fn an_edit_of_a_primary_reaches_its_local_version() {
+        let db = test_db().await;
+        let (primary, version) = primary_with_local_version(&db).await;
+        let mgr = manager(&db);
+
+        let mut row = crate::test_support::fetch_item(&db, primary).await;
+        row.overview = Some("Edited.".to_owned());
+        row.genres = Some("Crime".to_owned());
+        mgr.update_items(std::slice::from_ref(&row), None)
+            .await
+            .expect("update");
+        let v = crate::test_support::fetch_item(&db, version).await;
+        assert_eq!(v.overview.as_deref(), Some("Edited."));
+        assert_eq!(v.genres.as_deref(), Some("Crime"));
+
+        mgr.update_item_provider_ids(primary, &[("Imdb".to_owned(), "tt0113277".to_owned())])
+            .await
+            .expect("ids");
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let ids = store
+            .provider_ids_for_items(&[version])
+            .await
+            .expect("version ids");
+        assert_eq!(
+            ids.get(&version).cloned().unwrap_or_default(),
+            [("Imdb".to_owned(), "tt0113277".to_owned())]
+        );
+
+        let backdrop = |path: &str| ferrofin_traits::options::ItemImageInfo {
+            path: path.to_owned(),
+            image_type: ImageType::Backdrop,
+            date_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        store
+            .save_item_images(primary, &[backdrop("/one.jpg"), backdrop("/two.jpg")])
+            .await
+            .expect("images");
+        mgr.swap_images(primary, ImageType::Backdrop, 0, 1)
+            .await
+            .expect("swap");
+        let paths = |id: Uuid| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_item_images(id)
+                    .await
+                    .expect("images")
+                    .into_iter()
+                    .map(|i| i.path)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let theirs = paths(primary).await;
+        assert_eq!(theirs, ["/two.jpg", "/one.jpg"]);
+        assert_eq!(
+            paths(version).await,
+            theirs,
+            "the version holds the primary's images, in its order"
+        );
     }
 
     #[tokio::test]

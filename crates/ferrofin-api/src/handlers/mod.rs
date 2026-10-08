@@ -866,13 +866,15 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
-         the primary episode row. Un-defer path: port v12's Video.GetMediaSourceName \
-         common-prefix naming in media_source_manager, then swap by name in \
-         tv_series_manager (see the TODO there).",
-            "Video.GetAllVersions also spans file-based local alternates \
-         (LinkedChildType.LocalAlternateVersion); Ferrofin's version model links alternates \
-         through PrimaryVersionId only, so the resumable check and the last-played date span \
-         that group.",
+         the primary episode row. Un-defer path: v12's Video.GetMediaSourceName \
+         common-prefix naming is ported (video_versions::media_source_name); swap by that \
+         name in tv_series_manager (see the TODO there).",
+            "Video.GetAllVersions spans the local alternates of every version in the group; \
+         Ferrofin groups by COALESCE(PrimaryVersionId, Id), which covers a primary's local \
+         and merged versions but not the local versions of a version MERGED onto another \
+         primary (they point at the merged version), so the resumable check and the \
+         last-played date miss those. Un-defer path: group by the primary of the version's \
+         primary (one more level) in next_up_service.",
             "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
@@ -1030,10 +1032,12 @@ const GENRES_DIVERGENCES: &[&str] = &[
 /// does differently from v12's `ItemsController.GetResumeItems` +
 /// `TranslateQuery`'s `IsResumable` block.
 const RESUME_DIVERGENCES: &[&str] = &[
-    "Video.GetAllVersions also spans file-based local alternates \
-     (LinkedChildType.LocalAlternateVersion); Ferrofin links alternates through \
-     PrimaryVersionId only, so the per-version resumable test, the most-recently-played \
-     dedupe and the DatePlayed order span that group.",
+    "Video.GetAllVersions spans the local alternates of every version in the group; \
+     Ferrofin groups by COALESCE(PrimaryVersionId, Id), which covers a primary's local and \
+     merged versions but not the local versions of a version MERGED onto another primary \
+     (they point at the merged version), so the per-version resumable test, the \
+     most-recently-played dedupe and the DatePlayed order miss those. Un-defer path: group \
+     by the primary of the version's primary (one more level) in translate_query.",
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",

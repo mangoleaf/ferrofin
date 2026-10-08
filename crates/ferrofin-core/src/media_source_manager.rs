@@ -63,6 +63,11 @@ pub struct FerrofinMediaSourceManager {
     /// leaves every source exactly as it was built, which is upstream's
     /// `user is null` path.
     user_data: Option<Arc<dyn ferrofin_traits::library::UserDataManager>>,
+    /// The user manager, when configured — resolves the requesting user, whose
+    /// parental rating and tags decide which of a video's versions are
+    /// sources for them (`GetStaticMediaSources`' per-user filter). `None`
+    /// (unit tests) lists every version.
+    users: Option<Arc<dyn ferrofin_traits::library::UserManager>>,
     /// Localization for the `MediaStream.Localized*` labels re-stamped on
     /// every read (the C# `MediaStreamRepository.Map` does the same — they are
     /// not persisted). `None` (unit tests) leaves them unset.
@@ -108,6 +113,7 @@ impl FerrofinMediaSourceManager {
             provider,
             live_tv: None,
             user_data: None,
+            users: None,
             localization: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -137,6 +143,41 @@ impl FerrofinMediaSourceManager {
     ) -> Self {
         self.user_data = Some(user_data);
         self
+    }
+
+    /// Wires the user manager, so a user is offered only the versions they may
+    /// see ([`Self::visible_versions`]).
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn ferrofin_traits::library::UserManager>) -> Self {
+        self.users = Some(users);
+        self
+    }
+
+    /// The versions among `ids` the user may open — `GetStaticMediaSources`'
+    /// per-user filter (`MediaSourceManager.cs:397-403`: `GetItemById(id,
+    /// user) is not null`), as one batched read with the user's parental
+    /// rating and tag rules ([`InternalItemsQuery::user`]). `None` when there
+    /// is no user (or no user manager), which keeps every version.
+    async fn visible_versions(
+        &self,
+        ids: Vec<Uuid>,
+        user_id: Option<Uuid>,
+    ) -> Result<Option<std::collections::HashSet<Uuid>>, ServiceError> {
+        let (Some(user_id), Some(users)) = (user_id, self.users.as_ref()) else {
+            return Ok(None);
+        };
+        let Some(user) = users.get_user_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        let query = ferrofin_traits::options::InternalItemsQuery {
+            item_ids: ids,
+            include_owned_items: true,
+            user: Some(user),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        Ok(Some(
+            self.items.get_item_ids(&query).await?.into_iter().collect(),
+        ))
     }
 
     /// Sets the localization the read-back `Localized*` stream labels come from.
@@ -369,7 +410,10 @@ impl FerrofinMediaSourceManager {
         let mut source = MediaSourceInfo {
             id: Some(id),
             path: item.path.clone(),
-            name: Some(media_source_name(item)),
+            // A lone source's name (`BaseItem.GetMediaSourceName` with no
+            // common prefix); a version group renames its sources
+            // (`VersionRows::media_sources`).
+            name: Some(crate::video_versions::media_source_name(None, item, None)),
             container: container_of(item),
             size: item.size,
             run_time_ticks: item.run_time_ticks,
@@ -459,7 +503,10 @@ fn set_live_tv_key_properties(source: &mut MediaSourceInfo) {
 /// `GetStaticMediaSources` returns the builders' order untouched, and so does
 /// Ferrofin.
 ///
-/// `OrderBy(VideoType == VideoFile ? 0 : 1)`, then `ThenBy(Video3DFormat is
+/// The source of the queried item first (`OrderByDescending(id ==
+/// preferredId)`, `MediaSourceManager.cs:617-642`, so resuming a 1080p
+/// alternate is not handed the wider 4K primary), then
+/// `ThenBy(VideoType == VideoFile ? 0 : 1)`, then `ThenBy(Video3DFormat is
 /// null ? 0 : 1)`, then `ThenByDescending(VideoStream?.Width ?? 0)`, dropping
 /// `MediaSourceType.Placeholder`. LINQ's `OrderBy` is a STABLE sort and so is
 /// [`slice::sort_by_key`], which is load-bearing here: an HDHomeRun EXTEND
@@ -470,10 +517,14 @@ fn set_live_tv_key_properties(source: &mut MediaSourceInfo) {
 /// (heavy, internet540/480/360/240, mobile, native) where Jellyfin answers them
 /// widest-first (heavy, native, mobile, internet540/480/360/240) — a client
 /// picking `MediaSources[0]` got a different stream from each server.
-fn sort_media_sources(sources: &mut Vec<MediaSourceInfo>) {
+fn sort_media_sources(sources: &mut Vec<MediaSourceInfo>, preferred: Uuid) {
+    let preferred = preferred.simple().to_string();
     sources.retain(|s| s.type_ != MediaSourceType::Placeholder);
     sources.sort_by_key(|s| {
         (
+            !s.id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&preferred)),
             u8::from(s.video_type != Some(ferrofin_model::entities::VideoType::VideoFile)),
             u8::from(s.video3d_format.is_some()),
             std::cmp::Reverse(s.video_stream().and_then(|v| v.width).unwrap_or(0)),
@@ -655,40 +706,6 @@ fn estimated_video_bitrate(width: i32) -> Option<i32> {
         w if w >= 700 => Some(2_000_000),
         _ => None,
     }
-}
-
-/// The display name of an item's media source — port of
-/// `BaseItem.GetMediaSourceName` (v10.11.8 `BaseItem.cs:1224-1249`).
-///
-/// A file-protocol item names its source after the file stem, NOT after the
-/// item's own `Name`; `item.Name` is only the fallback when there is no usable
-/// path. That is what makes a movie's source read `Movie 0001 (2020)` rather
-/// than `Movie 0001`.
-///
-/// Two upstream branches cannot fire on a Ferrofin row and are therefore not
-/// reachable rather than skipped:
-///
-/// * the `HasLocalAlternateVersions` containing-folder prefix strip reads
-///   `Video.LocalAlternateVersions`, which Ferrofin does not model — alternate
-///   versions are linked through `PrimaryVersionId` (upstream's
-///   *Linked*AlternateVersions), for which `HasLocalAlternateVersions` is
-///   `false` upstream too;
-/// * the `3D`/`Bluray`/`DVD`/`ISO` terms read `Video.Video3DFormat`,
-///   `VideoType` and `IsoType`, none of which the pinned 10.11.8 `BaseItems`
-///   schema carries as a column — Ferrofin reports every video source as
-///   `VideoType::VideoFile` with no 3D format, so upstream would append no
-///   terms either.
-fn media_source_name(item: &BaseItemEntity) -> String {
-    // `item.IsFileProtocol && !string.IsNullOrEmpty(path)`.
-    let stem = item
-        .path
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .and_then(|p| std::path::Path::new(p).file_stem())
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty());
-
-    stem.or_else(|| item.name.clone()).unwrap_or_default()
 }
 
 /// The container of an item, derived from its stored path extension when present.
@@ -1004,7 +1021,15 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         let mut sources = self
             .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
             .await?;
-        sort_media_sources(&mut sources);
+        // `preferredId`: the first static source's id when it is a `Guid` —
+        // the queried version's own file — else the item's id
+        // (`MediaSourceManager.cs:232-234`).
+        let preferred = sources
+            .first()
+            .and_then(|s| s.id.as_deref())
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .unwrap_or(item_id);
+        sort_media_sources(&mut sources, preferred);
         Ok(sources)
     }
 
@@ -1064,33 +1089,51 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
                 .await?;
             return Ok(sources);
         }
-        let Some(mut item) = stored else {
+        let Some(item) = stored else {
             return Ok(Vec::new());
         };
-        // An ALTERNATE version (PrimaryVersionId set) resolves through its
-        // primary, so playing any version yields the full merged source list
-        // (upstream navigates the same way; the alternate alone would hide its
-        // siblings from the version picker).
-        if let Some(primary) = item
-            .primary_version_id
-            .as_deref()
-            .and_then(|p| Uuid::parse_str(p).ok())
-            && let Some(primary_item) = self.items.retrieve_item(primary).await?
-        {
-            item = primary_item;
-        }
+        // `hasMediaSources.GetMediaSources(...)` on the item itself
+        // (`BaseItem.GetMediaSources`, `BaseItem.cs:1156-1189`): every version
+        // in its group, each once, its own source first — so playing an
+        // alternate (or a part) by its own id defaults to that file, and a
+        // version's sources list the whole group.
         let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
-        let streams = self.streams_dto(item_id).await?;
-        let attachments = self.get_media_attachments(item_id).await?;
-        let mut sources = vec![Self::static_source(&item, streams, attachments)];
-        // Append merged alternate versions' sources (C# GetStaticMediaSources includes the item's
-        // LinkedAlternateVersions). After MergeVersions the alternates point at this item via
-        // PrimaryVersionId, so a merged item reports all its versions as selectable sources.
-        for alt in self.items.get_items_by_primary_version(item_id).await? {
-            if let Ok(alt_id) = Uuid::parse_str(&alt.id) {
-                let alt_streams = self.streams_dto(alt_id).await?;
-                let alt_attachments = self.get_media_attachments(alt_id).await?;
-                sources.push(Self::static_source(&alt, alt_streams, alt_attachments));
+        let versions = crate::video_versions::VersionRows::load(
+            &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
+            &[&item],
+        )
+        .await?;
+        let group = versions.items_for_media_sources(&item);
+        let mut built: HashMap<Uuid, MediaSourceInfo> = HashMap::with_capacity(group.len());
+        for (row, _) in &group {
+            let Ok(row_id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let streams = self.streams_dto(row_id).await?;
+            let attachments = self.get_media_attachments(row_id).await?;
+            built.insert(row_id, Self::static_source(row, streams, attachments));
+        }
+        let mut sources = versions.media_sources(&item, |row| {
+            Uuid::parse_str(&row.id)
+                .ok()
+                .and_then(|id| built.remove(&id))
+                .unwrap_or_else(|| Self::static_source(row, Vec::new(), Vec::new()))
+        });
+        // `GetStaticMediaSources(item, …, user)`: a version the user may not
+        // open is no source for them (`MediaSourceManager.cs:397-403`); the
+        // queried item itself always is.
+        if sources.len() > 1 {
+            let others: Vec<Uuid> = group
+                .iter()
+                .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+                .filter(|id| *id != item_id)
+                .collect();
+            if let Some(visible) = self.visible_versions(others, user_id).await? {
+                sources.retain(|s| {
+                    s.id.as_deref()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .is_none_or(|id| id == item_id || visible.contains(&id))
+                });
             }
         }
         // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
@@ -1100,6 +1143,21 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         // (`GET /Videos/{id}/stream`), and there the sources stay as built.
         self.apply_playback_permissions(&mut sources, item_id, item.media_type.as_deref(), user_id)
             .await?;
+        // `SetAlternateVersionResumeStates` (`MediaSourceManager.cs:420`), for
+        // a user, when there are versions: one batched user-data read.
+        if let (Some(user_id), Some(user_data)) = (user_id, self.user_data.as_ref())
+            && sources.len() > 1
+            && item.primary_version_id.is_none()
+        {
+            let ids: Vec<Uuid> = sources
+                .iter()
+                .filter_map(|s| s.id.as_deref().and_then(|id| Uuid::parse_str(id).ok()))
+                .collect();
+            let data = user_data.get_user_data_batch(&ids, user_id).await?;
+            crate::video_versions::put_resumed_version_first(&item, &mut sources, |id| {
+                data.get(&id)
+            });
+        }
         Ok(sources)
     }
 
@@ -1376,7 +1434,7 @@ mod tests {
     }
 
     /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
-    struct StubEncoder;
+    pub(super) struct StubEncoder;
 
     #[async_trait]
     impl MediaEncoder for StubEncoder {
@@ -1433,7 +1491,7 @@ mod tests {
     }
 
     /// A no-op provider manager (unused by the tested paths).
-    struct StubProvider;
+    pub(super) struct StubProvider;
 
     #[async_trait]
     impl ProviderManager for StubProvider {
@@ -1559,7 +1617,9 @@ mod tests {
 
     /// The real user-data manager over the test db — the source of the
     /// `Permissions` rows the playback overwrite reads.
-    fn user_data_manager(db: &Database) -> Arc<dyn ferrofin_traits::library::UserDataManager> {
+    pub(super) fn user_data_manager(
+        db: &Database,
+    ) -> Arc<dyn ferrofin_traits::library::UserDataManager> {
         Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
             db.clone(),
             Arc::new(FixedConfig),
@@ -1901,7 +1961,7 @@ mod tests {
                 ..MediaSourceInfo::default()
             },
         ];
-        sort_media_sources(&mut sources);
+        sort_media_sources(&mut sources, Uuid::nil());
         assert_eq!(
             sources
                 .iter()
@@ -1932,13 +1992,49 @@ mod tests {
             },
         ];
         ranked[0].video3d_format = Some(Video3DFormat::HalfSideBySide);
-        sort_media_sources(&mut ranked);
+        sort_media_sources(&mut ranked, Uuid::nil());
         assert_eq!(
             ranked
                 .iter()
                 .map(|s| s.id.clone().unwrap_or_default())
                 .collect::<Vec<_>>(),
             ["narrow-file", "wide-flat", "wide-3d"],
+        );
+    }
+
+    /// `SortMediaSources(list, preferredId)` (`MediaSourceManager.cs:
+    /// 617-642`): the queried version's own source leads, ahead of a wider
+    /// one — resuming a 1080p alternate must not hand the client the 4K
+    /// primary (upstream `BaseItemTests.
+    /// GetMediaSources_DefaultsToTheQueriedVersionsOwnSource`, playback leg).
+    #[test]
+    fn playback_sources_put_the_queried_version_first() {
+        use ferrofin_model::entities::{MediaStreamType, VideoType};
+        let alternate = Uuid::from_u128(2);
+        let src = |id: Uuid, width: i32| MediaSourceInfo {
+            id: Some(id.simple().to_string()),
+            video_type: Some(VideoType::VideoFile),
+            media_streams: vec![ferrofin_model::entities_media::MediaStream {
+                stream_type: MediaStreamType::Video,
+                width: Some(width),
+                ..Default::default()
+            }],
+            ..MediaSourceInfo::default()
+        };
+        let mut sources = vec![
+            src(Uuid::from_u128(1), 3840),
+            src(alternate, 1920),
+            src(Uuid::from_u128(3), 1920),
+        ];
+        sort_media_sources(&mut sources, alternate);
+        assert_eq!(
+            sources[0].id.as_deref(),
+            Some(alternate.simple().to_string().as_str())
+        );
+        assert_eq!(
+            sources[1].id.as_deref(),
+            Some(Uuid::from_u128(1).simple().to_string().as_str()),
+            "the rest stay widest first"
         );
     }
 
@@ -2270,6 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn static_source_carries_path_and_streams() {
         use ferrofin_traits::persistence::ItemPersistenceService as _;
         let db = test_db().await;
@@ -2322,6 +2419,84 @@ mod tests {
             .expect("alternates");
         assert_eq!(batch[&id].len(), 1);
         assert_eq!(batch[&id][0].path.as_deref(), Some("/media/alt.mkv"));
+
+        // `Video.GetMediaSources`: either version lists both, its own first,
+        // the merged one a `Grouping` source — and playing the alternate by
+        // its own id defaults to the alternate's file.
+        let alt_id = Uuid::from_u128(0x102);
+        let listed = |sources: &[MediaSourceInfo]| -> Vec<(String, MediaSourceType)> {
+            sources
+                .iter()
+                .map(|s| (s.id.clone().unwrap(), s.type_))
+                .collect()
+        };
+        let (p, a) = (id.simple().to_string(), alt_id.simple().to_string());
+        assert_eq!(
+            listed(&mgr.get_static_media_sources(id, false, None).await.unwrap()),
+            [
+                (p.clone(), MediaSourceType::Default),
+                (a.clone(), MediaSourceType::Grouping)
+            ]
+        );
+        assert_eq!(
+            listed(
+                &mgr.get_static_media_sources(alt_id, false, None)
+                    .await
+                    .unwrap()
+            ),
+            [
+                (a.clone(), MediaSourceType::Default),
+                (p, MediaSourceType::Grouping)
+            ]
+        );
+        let playback = mgr
+            .get_playback_media_sources(alt_id, Uuid::new_v4(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(playback[0].id.as_deref(), Some(a.as_str()));
+
+        // `SetAlternateVersionResumeStates`: for a user part-way through the
+        // alternate, the PRIMARY's sources lead with the alternate; asked
+        // for the alternate itself, its own source stays first either way.
+        let user = Uuid::from_u128(0x103);
+        crate::test_support::seed_user(&db, user).await;
+        let user_data = user_data_manager(&db);
+        user_data
+            .save_user_data(
+                user,
+                alt_id,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    playback_position_ticks: Some(50),
+                    last_played_date: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mgr = manager(&db).with_user_data(user_data);
+        let first = |sources: Vec<MediaSourceInfo>| sources[0].id.clone().unwrap();
+        assert_eq!(
+            first(
+                mgr.get_static_media_sources(id, false, Some(user))
+                    .await
+                    .unwrap()
+            ),
+            a
+        );
+        assert_eq!(
+            first(
+                mgr.get_playback_media_sources(id, user, false, false)
+                    .await
+                    .unwrap()
+            ),
+            a,
+            "and it is the default the client plays"
+        );
+        assert_eq!(
+            first(mgr.get_static_media_sources(id, false, None).await.unwrap()),
+            id.simple().to_string(),
+            "no user, no reordering"
+        );
     }
 
     #[test]
@@ -2476,5 +2651,146 @@ mod tests {
 
         mgr.close_live_stream(&shouted).await.expect("close");
         assert!(mgr.get_live_stream(&id).await.is_err());
+    }
+}
+
+/// The version a user is part-way through, through the playback path, and
+/// the per-user filter it runs after (`GetStaticMediaSources`,
+/// `MediaSourceManager.cs:383-423`, then `GetPlaybackMediaSources`'
+/// `preferredId`).
+#[cfg(test)]
+mod version_resume_tests {
+    use super::*;
+    use crate::item_repository::FerrofinItemRepository;
+    use crate::item_type_lookup::ItemTypeLookup;
+    use crate::media_attachment_repository::FerrofinMediaAttachmentRepository;
+    use crate::media_stream_repository::FerrofinMediaStreamRepository;
+    use crate::test_support::{fetch_item, save_item, seed_item, seed_named_user, test_db};
+    use ferrofin_db::Database;
+    use ferrofin_db::store::guid_to_db;
+    use ferrofin_model::data::BaseItemKind;
+
+    /// A 4K primary and a 1080p local version, `version` rated `rating`
+    /// (score), and `user` part-way through the version.
+    async fn group(db: &Database, version_score: Option<i64>) -> (Uuid, Uuid, Uuid) {
+        let (primary, version, user) = (
+            Uuid::from_u128(0x7E_0001),
+            Uuid::from_u128(0x7E_0002),
+            Uuid::from_u128(0x7E_0003),
+        );
+        for (id, path, width) in [
+            (primary, "/m/Heat/Heat.mkv", 3840),
+            (version, "/m/Heat/Heat - 1080p.mkv", 1920),
+        ] {
+            seed_item(db, id, BaseItemKind::Movie).await;
+            let mut row = fetch_item(db, id).await;
+            row.path = Some(path.to_owned());
+            row.media_type = Some("Video".to_owned());
+            if id == version {
+                row.owner_id = Some(guid_to_db(primary));
+                row.primary_version_id = Some(guid_to_db(primary));
+                row.inherited_parental_rating_value = version_score;
+            } else {
+                row.data =
+                    Some(r#"{"LocalAlternateVersions":["/m/Heat/Heat - 1080p.mkv"]}"#.to_owned());
+            }
+            save_item(db, &row).await;
+            let stream = ferrofin_model::entities_media::MediaStream {
+                stream_type: MediaStreamType::Video,
+                width: Some(width),
+                ..Default::default()
+            };
+            FerrofinMediaStreamRepository::new(db.clone())
+                .save_media_streams(id, &[stream_dto_to_entity(&guid_to_db(id), &stream)])
+                .await
+                .unwrap();
+        }
+        seed_named_user(db, user, "viewer").await;
+        restrict_below_r(db, user).await;
+        (primary, version, user)
+    }
+
+    /// Holds the user below an R rating (score 13).
+    async fn restrict_below_r(db: &Database, user: Uuid) {
+        use ferrofin_traits::library::UserManager as _;
+        let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+        let mut row = users.get_user_by_id(user).await.unwrap().unwrap();
+        row.max_parental_rating_score = Some(13);
+        users.update_user(&row).await.unwrap();
+    }
+
+    fn manager(db: &Database) -> FerrofinMediaSourceManager {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        FerrofinMediaSourceManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+            Arc::new(FerrofinMediaAttachmentRepository::new(db.clone())),
+            Arc::new(super::tests::StubEncoder),
+            Arc::new(super::tests::StubProvider),
+        )
+        .with_user_data(super::tests::user_data_manager(db))
+        .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+            db.clone(),
+        )))
+    }
+
+    async fn resume(db: &Database, user: Uuid, item: Uuid) {
+        super::tests::user_data_manager(db)
+            .save_user_data(
+                user,
+                item,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    playback_position_ticks: Some(50),
+                    last_played_date: Some(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Resuming the primary plays the 1080p version the user was part-way
+    /// through: it leads the static sources, and so it is the playback
+    /// `preferredId`, ahead of the wider primary the width order would put
+    /// first.
+    #[tokio::test]
+    async fn playback_defaults_to_the_version_being_resumed() {
+        let db = test_db().await;
+        let (primary, version, user) = group(&db, None).await;
+        resume(&db, user, version).await;
+        let sources = manager(&db)
+            .get_playback_media_sources(primary, user, false, false)
+            .await
+            .unwrap();
+        let ids: Vec<String> = sources.iter().map(|s| s.id.clone().unwrap()).collect();
+        assert_eq!(
+            ids,
+            [version.simple().to_string(), primary.simple().to_string()]
+        );
+    }
+
+    /// A version the user may not see is no source for them, resume point or
+    /// not: the primary is the default and the only source.
+    #[tokio::test]
+    async fn a_hidden_version_is_never_the_default() {
+        let db = test_db().await;
+        let (primary, version, user) = group(&db, Some(17)).await;
+        resume(&db, user, version).await;
+        let mgr = manager(&db);
+        let sources = mgr
+            .get_playback_media_sources(primary, user, false, false)
+            .await
+            .unwrap();
+        let ids: Vec<String> = sources.iter().map(|s| s.id.clone().unwrap()).collect();
+        assert_eq!(ids, [primary.simple().to_string()]);
+        // Without a user, every version is a source.
+        assert_eq!(
+            mgr.get_static_media_sources(primary, false, None)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

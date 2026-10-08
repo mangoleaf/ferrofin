@@ -2743,6 +2743,41 @@ fn placeholders(n: usize) -> String {
     s
 }
 
+/// `SELECT *` of the `BaseItems` rows whose `column` is one of `ids`,
+/// chunked under the bind ceiling — the version-group reads
+/// ([`crate::video_versions::DbVersionReader`]).
+pub(crate) async fn select_item_rows(
+    db: &Database,
+    column: &str,
+    ids: &[Uuid],
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let mut conn = db.pool().acquire().await.map_err(db_err)?;
+    select_item_rows_on(&mut conn, column, ids).await
+}
+
+/// [`select_item_rows`] on a given connection — inside a transaction, the
+/// owned-video copy reads what it is about to write.
+pub(crate) async fn select_item_rows_on(
+    conn: &mut sqlx::SqliteConnection,
+    column: &str,
+    ids: &[Uuid],
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let mut rows = Vec::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let marks = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(r#"SELECT * FROM "BaseItems" WHERE {column} IN ({marks})"#);
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        rows.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

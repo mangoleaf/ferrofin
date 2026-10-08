@@ -693,6 +693,41 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Copies each owner video's metadata onto the videos it owns, as a save
+    /// (or refresh) of the owner does upstream, and returns how many owned
+    /// rows were written.
+    ///
+    /// - With `versions`, its local alternate versions (`OwnerId` =
+    ///   `PrimaryVersionId` = the owner, no `ExtraType`) take its overview,
+    ///   production year, premiere date, community rating, official rating,
+    ///   genres, provider ids and images — `Video.UpdateToRepositoryAsync`
+    ///   (`Video.cs:704-726`), run on every save of the primary.
+    /// - With `parts`, its stacked parts (owned, no `ExtraType`, no
+    ///   `PrimaryVersionId`) take its title metadata — genres, studios,
+    ///   production locations, community and critic rating, overview,
+    ///   official and custom rating, and the year and premiere date it has —
+    ///   the `copyTitleMetadata` every refresh of a primary runs for each part
+    ///   (`Video.RefreshedOwnedItems` → `BaseItem.RefreshMetadataForOwnedItem`,
+    ///   `BaseItem.cs:2805-2858`).
+    ///
+    /// Each written row's parental score follows the ratings it was given
+    /// (`BaseItem.OnMetadataChanged`, run by every save). Only a row that
+    /// differs is written, so a call over owners whose owned rows already
+    /// match writes nothing. The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn copy_metadata_to_owned_videos(
+        &self,
+        owner_ids: &[Uuid],
+        versions: bool,
+        parts: bool,
+    ) -> Result<usize, ServiceError> {
+        let _ = (owner_ids, versions, parts);
+        Ok(0)
+    }
+
     /// Points an item's `ParentId` at `parent_id` without touching any other
     /// column, and without a write at all when it already does.
     ///

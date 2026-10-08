@@ -26,6 +26,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
+use ferrofin_traits::options::DtoOptions;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
@@ -90,11 +91,12 @@ struct AdditionalPartsQuery {
 
 /// `GET /Videos/{itemId}/AdditionalParts` — the item's additional parts.
 ///
-/// Port of `VideosController.GetAdditionalPart`. Jellyfin returns the video's
-/// `GetAdditionalParts()` children (the split parts of a multi-file movie).
-/// Ferrofin does not model additional-part children at this seam, so a video with
-/// none yields an empty [`QueryResult`], matching the C# `else` branch (non-video
-/// items also return empty). A missing item is `404`.
+/// Port of `VideosController.GetAdditionalPart` (`VideosController.cs:
+/// 97-130`): for a video, its `GetAdditionalParts(user)` — the other files of
+/// a stacked movie, those the user may see, ordered by `SortName` — each
+/// projected with the video as its owner; for any other item, none. An empty
+/// item id means the (user) root folder, which is no video. A missing item is
+/// `404`.
 // Body schema omitted: `BaseItemDto` is self-referential and its derived
 // `utoipa::ToSchema` recurses without bound (a `ferrofin-model` DTO defect),
 // overflowing the OpenAPI generator when inlined — see `items::get_items`.
@@ -111,13 +113,41 @@ async fn get_additional_parts(
     Path(item_id): Path<Uuid>,
     Query(query): Query<AdditionalPartsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    // Honour the userId filter for parity (resolving a bad user is a 404); the
-    // resolved user is otherwise unused since no parts are attached.
-    let _user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    if state.library.get_item_by_id(item_id).await?.is_none() {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    let empty = || Json(QueryResult::from_items(Vec::new()));
+    if item_id.is_nil() {
+        return Ok(empty());
     }
-    Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())))
+    // TODO(parity, open work item): upstream resolves the item as the user
+    // (`GetItemById<BaseItem>(itemId, user)`, `null` → `404` for an item the
+    // user cannot see); there is no per-user by-id read yet. Un-defer path:
+    // `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md`.
+    let video = state
+        .library
+        .get_item_by_id(item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let parts = state
+        .library
+        .get_additional_parts(&video, user.as_ref())
+        .await?;
+    if parts.is_empty() {
+        return Ok(empty());
+    }
+    // `_dtoService.GetBaseItemDto(i, dtoOptions, user, video)` per part: no
+    // visibility pass beyond the parts' own.
+    let dtos = state
+        .dto
+        .get_base_item_dtos(
+            &parts,
+            &DtoOptions::default(),
+            user.as_ref(),
+            Some(item_id),
+            true,
+        )
+        .await?;
+    // `new QueryResult<BaseItemDto>(items)`: the count is the items'.
+    Ok(Json(QueryResult::from_items(dtos)))
 }
 
 /// Query parameters for `POST /Videos/MergeVersions`.

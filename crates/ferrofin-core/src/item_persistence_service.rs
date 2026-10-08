@@ -633,6 +633,11 @@ pub struct FerrofinItemPersistenceService {
     /// A `OnceLock` rather than a constructor argument: this service is built
     /// long before the event bus the notifier publishes on exists.
     changed: std::sync::OnceLock<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
+    /// The rating tables an owned video's parental score is derived from
+    /// when the owner's ratings are copied onto it. Set by the composition
+    /// root ([`FerrofinItemPersistenceService::set_localization`]); unset,
+    /// the copy leaves the stored scores alone.
+    localization: std::sync::OnceLock<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -649,7 +654,18 @@ impl FerrofinItemPersistenceService {
         Self {
             db,
             changed: std::sync::OnceLock::new(),
+            localization: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attaches the rating tables the owned-video copy scores the ratings it
+    /// copies with ([`ItemPersistenceService::copy_metadata_to_owned_videos`]).
+    /// The first call wins.
+    pub fn set_localization(
+        &self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) {
+        let _ = self.localization.set(localization);
     }
 
     /// Attaches the `LibraryChanged` notifier so every item save announces
@@ -1634,6 +1650,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn copy_metadata_to_owned_videos(
+        &self,
+        owner_ids: &[Uuid],
+        versions: bool,
+        parts: bool,
+    ) -> Result<usize, ServiceError> {
+        copy_owned_video_metadata(self, owner_ids, (versions, parts)).await
     }
 
     async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
@@ -5023,6 +5048,401 @@ pub(crate) async fn seed_container_data(db: &Database, id: Uuid, data: &str) {
         .expect("seed container data");
 }
 
+/// One owned video's planned copy from its owner
+/// ([`ItemPersistenceService::copy_metadata_to_owned_videos`]).
+struct OwnedCopy {
+    /// The row with the owner's metadata applied.
+    row: BaseItemEntity,
+    /// A local alternate version (the `Video.UpdateToRepositoryAsync` set);
+    /// else a stacked part (the `copyTitleMetadata` set).
+    local: bool,
+    /// Whether a `BaseItems` column changed.
+    columns: bool,
+    /// Whether its genres or studios changed, so its `ItemValues` links
+    /// must follow.
+    values: bool,
+    /// The owner's provider ids, when they replace the row's.
+    provider_ids: Option<Vec<(String, String)>>,
+    /// The owner's images, when they replace the row's.
+    images: Option<Vec<ferrofin_db::entities::base_items::BaseItemImageInfoEntity>>,
+}
+
+/// The provider ids of `ids`, each item's set sorted.
+async fn provider_id_sets(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+    let mut sets: HashMap<Uuid, Vec<(String, String)>> = HashMap::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let marks = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ItemId" IN ({marks})"#
+        );
+        let mut query = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        for (item, provider, value) in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+            if let Ok(item) = Uuid::parse_str(&item) {
+                sets.entry(item).or_default().push((provider, value));
+            }
+        }
+    }
+    for set in sets.values_mut() {
+        set.sort();
+    }
+    Ok(sets)
+}
+
+/// The image rows of `ids`, each item's in stored order.
+async fn image_rows(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[Uuid],
+) -> Result<
+    HashMap<Uuid, Vec<ferrofin_db::entities::base_items::BaseItemImageInfoEntity>>,
+    ServiceError,
+> {
+    use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
+    let mut rows: HashMap<Uuid, Vec<BaseItemImageInfoEntity>> = HashMap::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let marks = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" IN ({marks}) ORDER BY rowid"#
+        );
+        let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        for row in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+            if let Ok(item) = Uuid::parse_str(&row.item_id) {
+                rows.entry(item).or_default().push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// An image row without its own identity, for comparing two items'
+/// `ImageInfos` lists.
+fn image_key(
+    row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
+) -> (i32, &str, i64, i64, Option<&[u8]>, Option<String>) {
+    (
+        row.image_type,
+        row.path.as_str(),
+        row.width,
+        row.height,
+        row.blurhash.as_deref(),
+        row.date_modified.map(datetime_to_db),
+    )
+}
+
+/// Re-derives an owned row's stored parental score from the ratings it was
+/// just given, returning whether it changed — `BaseItem.OnMetadataChanged`
+/// (`BaseItem.cs:2935-2967`), which `LibraryManager.UpdateItemsAsync` runs
+/// on every save (`LibraryManager.cs:2665`): the score of its custom, else
+/// official rating; none clears a stored one.
+fn settle_rating_score(
+    row: &mut BaseItemEntity,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) -> bool {
+    let (value, sub) = crate::localization_manager::parental_rating_score(row, localization)
+        .map_or((None, None), |s| {
+            (Some(i64::from(s.score)), s.sub_score.map(i64::from))
+        });
+    if row.inherited_parental_rating_value == value
+        && (value.is_none() || row.inherited_parental_rating_sub_value == sub)
+    {
+        return false;
+    }
+    row.inherited_parental_rating_value = value;
+    row.inherited_parental_rating_sub_value = sub;
+    true
+}
+
+/// [`ItemPersistenceService::copy_metadata_to_owned_videos`]: decided on a
+/// reader first, so owners whose owned rows already match — every one on a
+/// quiet rescan — take no writer lock; otherwise read again and written
+/// under one `BEGIN IMMEDIATE` transaction, so a save landing in between is
+/// never overwritten with what was read before it. The genres/studios of the
+/// rows whose lists changed are re-linked after, and every written row is
+/// announced (`ItemUpdated`).
+async fn copy_owned_video_metadata(
+    service: &FerrofinItemPersistenceService,
+    owner_ids: &[Uuid],
+    which: (bool, bool),
+) -> Result<usize, ServiceError> {
+    if owner_ids.is_empty() || which == (false, false) {
+        return Ok(0);
+    }
+    let localization = service.localization.get().cloned();
+    let localization = localization.as_deref();
+    {
+        let mut conn = service.db.pool().acquire().await.map_err(db_err)?;
+        if plan_owned_copies(&mut conn, owner_ids, which, localization)
+            .await?
+            .is_empty()
+        {
+            return Ok(0);
+        }
+    }
+    let mut tx = service
+        .db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    let copies = plan_owned_copies(&mut tx, owner_ids, which, localization).await?;
+    write_owned_copies(&mut tx, &copies).await?;
+    tx.commit().await.map_err(db_err)?;
+    for copy in copies.iter().filter(|c| c.values) {
+        if let Ok(id) = Uuid::parse_str(&copy.row.id) {
+            service
+                .save_item_values(
+                    id,
+                    &ferrofin_db::entities::base_items::item_values_of(&copy.row),
+                )
+                .await?;
+        }
+    }
+    if let Some(changed) = service.changed.get() {
+        let rows: Vec<BaseItemEntity> = copies.iter().map(|c| c.row.clone()).collect();
+        changed.record_updated(&rows);
+    }
+    Ok(copies.len())
+}
+
+/// The owned rows of `owner_ids` that differ from what their owner gives
+/// them, each with what it takes ([`copy_owned_video_metadata`]'s reads):
+/// the owners' owned non-extra rows (one query on `OwnerId`), and — only
+/// when there are any — the owners, plus the provider ids and images of the
+/// owners and their local versions.
+async fn plan_owned_copies(
+    conn: &mut sqlx::SqliteConnection,
+    owner_ids: &[Uuid],
+    (versions, parts): (bool, bool),
+    localization: Option<&dyn ferrofin_traits::localization::LocalizationManager>,
+) -> Result<Vec<OwnedCopy>, ServiceError> {
+    use crate::item_repository::select_item_rows_on;
+    use crate::video_versions::{copy_title_metadata, copy_version_metadata, is_local_version_of};
+    let candidates: Vec<(Uuid, BaseItemEntity)> =
+        select_item_rows_on(&mut *conn, r#""OwnerId""#, owner_ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.extra_type.is_none())
+            .filter_map(|row| {
+                let owner = Uuid::parse_str(row.owner_id.as_deref()?).ok()?;
+                let take = if is_local_version_of(&row, owner) {
+                    versions
+                } else {
+                    parts && row.primary_version_id.is_none()
+                };
+                take.then_some((owner, row))
+            })
+            .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut wanted: Vec<Uuid> = candidates.iter().map(|(owner, _)| *owner).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let owners: HashMap<Uuid, BaseItemEntity> = select_item_rows_on(&mut *conn, r#""Id""#, &wanted)
+        .await?
+        .into_iter()
+        .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+        .collect();
+    let locals: Vec<Uuid> = candidates
+        .iter()
+        .filter(|(owner, row)| is_local_version_of(row, *owner))
+        .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
+        .collect();
+    let (providers, images) = if locals.is_empty() {
+        (HashMap::new(), HashMap::new())
+    } else {
+        let ids: Vec<Uuid> = wanted.iter().chain(&locals).copied().collect();
+        (
+            provider_id_sets(&mut *conn, &ids).await?,
+            image_rows(&mut *conn, &ids).await?,
+        )
+    };
+    let mut copies: Vec<OwnedCopy> = Vec::new();
+    for (owner_id, row) in candidates {
+        let Some(owner) = owners.get(&owner_id) else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(&row.id) else {
+            continue;
+        };
+        let local = is_local_version_of(&row, owner_id);
+        let mut copy = OwnedCopy {
+            row: row.clone(),
+            local,
+            columns: false,
+            values: false,
+            provider_ids: None,
+            images: None,
+        };
+        if local {
+            copy.columns = copy_version_metadata(owner, &mut copy.row);
+            copy.values = copy.row.genres != row.genres;
+            let theirs = providers.get(&owner_id).cloned().unwrap_or_default();
+            if providers.get(&id).cloned().unwrap_or_default() != theirs {
+                copy.provider_ids = Some(theirs);
+            }
+            let theirs = images.get(&owner_id).cloned().unwrap_or_default();
+            // In stored order: `ImageInfos` is a list, and reordering a
+            // primary's backdrops reorders its versions'.
+            let mine: Vec<_> = images
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .map(image_key)
+                .collect();
+            let want: Vec<_> = theirs.iter().map(image_key).collect();
+            if mine != want {
+                copy.images = Some(theirs);
+            }
+        } else {
+            copy.columns = copy_title_metadata(owner, &mut copy.row);
+            copy.values = copy.row.genres != row.genres || copy.row.studios != row.studios;
+        }
+        if let Some(localization) = localization {
+            copy.columns |= settle_rating_score(&mut copy.row, localization);
+        }
+        if copy.columns || copy.provider_ids.is_some() || copy.images.is_some() {
+            copies.push(copy);
+        }
+    }
+    Ok(copies)
+}
+
+/// Writes the planned copies on `tx`: for a local version only the columns
+/// `Video.UpdateToRepositoryAsync` copies (`Video.cs:704-726`), its provider
+/// ids and its images; for a part only the `copyTitleMetadata` columns and
+/// the dates (`BaseItem.cs:2805-2858`) — each with the parental score its
+/// ratings now give.
+async fn write_owned_copies(
+    tx: &mut sqlx::SqliteConnection,
+    copies: &[OwnedCopy],
+) -> Result<(), ServiceError> {
+    let saved_at = datetime_to_db(chrono::Utc::now());
+    for copy in copies {
+        let row = &copy.row;
+        if copy.local {
+            sqlx::query(
+                r#"UPDATE "BaseItems"
+                   SET "Overview" = ?2, "ProductionYear" = ?3, "PremiereDate" = ?4,
+                       "CommunityRating" = ?5, "OfficialRating" = ?6, "Genres" = ?7,
+                       "InheritedParentalRatingValue" = ?8,
+                       "InheritedParentalRatingSubValue" = ?9, "DateLastSaved" = ?10
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(&row.id)
+            .bind(&row.overview)
+            .bind(row.production_year)
+            .bind(opt_datetime_to_db(row.premiere_date))
+            .bind(row.community_rating)
+            .bind(&row.official_rating)
+            .bind(&row.genres)
+            .bind(row.inherited_parental_rating_value)
+            .bind(row.inherited_parental_rating_sub_value)
+            .bind(&saved_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        } else {
+            sqlx::query(
+                r#"UPDATE "BaseItems"
+                   SET "Genres" = ?2, "Studios" = ?3, "ProductionLocations" = ?4,
+                       "CommunityRating" = ?5, "CriticRating" = ?6, "Overview" = ?7,
+                       "OfficialRating" = ?8, "CustomRating" = ?9, "ProductionYear" = ?10,
+                       "PremiereDate" = ?11, "InheritedParentalRatingValue" = ?12,
+                       "InheritedParentalRatingSubValue" = ?13, "DateLastSaved" = ?14
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(&row.id)
+            .bind(&row.genres)
+            .bind(&row.studios)
+            .bind(&row.production_locations)
+            .bind(row.community_rating)
+            .bind(row.critic_rating)
+            .bind(&row.overview)
+            .bind(&row.official_rating)
+            .bind(&row.custom_rating)
+            .bind(row.production_year)
+            .bind(opt_datetime_to_db(row.premiere_date))
+            .bind(row.inherited_parental_rating_value)
+            .bind(row.inherited_parental_rating_sub_value)
+            .bind(&saved_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        write_owned_relations(&mut *tx, copy).await?;
+    }
+    Ok(())
+}
+
+/// A copied local version's provider ids and images, replaced whole when
+/// they differ from its primary's ([`write_owned_copies`]).
+async fn write_owned_relations(
+    tx: &mut sqlx::SqliteConnection,
+    copy: &OwnedCopy,
+) -> Result<(), ServiceError> {
+    let row = &copy.row;
+    if let Some(ids) = &copy.provider_ids {
+        sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for (provider, value) in ids {
+            sqlx::query(
+                r#"INSERT OR REPLACE INTO "BaseItemProviders"
+                   ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+            )
+            .bind(&row.id)
+            .bind(provider)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+    }
+    if let Some(images) = &copy.images {
+        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for image in images {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                   ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(&row.id)
+            .bind(image.image_type)
+            .bind(&image.path)
+            .bind(image.width)
+            .bind(image.height)
+            .bind(image.blurhash.as_deref())
+            .bind(image.date_modified.map(datetime_to_db))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use ferrofin_model::data::BaseItemKind;
@@ -9963,5 +10383,169 @@ mod tests {
         let svc = FerrofinItemPersistenceService::new(db.clone());
         assert!(svc.delete_items(&[season]).await.is_err());
         assert_eq!(rows_and_links(&db).await, before, "nothing half-deleted");
+    }
+}
+
+/// [`ItemPersistenceService::copy_metadata_to_owned_videos`] at the row
+/// level: what a local version and a stacked part each take, and that a
+/// second copy writes nothing.
+#[cfg(test)]
+mod owned_video_copy_tests {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_db::store::guid_to_db;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::entities::ImageType;
+    use ferrofin_traits::options::ItemImageInfo;
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    use uuid::Uuid;
+
+    use super::FerrofinItemPersistenceService;
+    use crate::test_support::{fetch_item, save_item, seed_item, test_db};
+
+    fn image(path: &str, image_type: ImageType) -> ItemImageInfo {
+        ItemImageInfo {
+            path: path.to_owned(),
+            image_type,
+            date_modified: "2026-01-01T00:00:00Z".parse().unwrap(),
+            width: 1000,
+            height: 1500,
+            blur_hash: None,
+        }
+    }
+
+    async fn image_paths(db: &ferrofin_db::Database, id: Uuid) -> Vec<(i32, String)> {
+        sqlx::query_as(
+            r#"SELECT "ImageType", "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
+               ORDER BY rowid"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn owned_by(db: &ferrofin_db::Database, id: Uuid, owner: Uuid, version: bool) {
+        let mut row: BaseItemEntity = fetch_item(db, id).await;
+        row.owner_id = Some(guid_to_db(owner));
+        row.primary_version_id = version.then(|| guid_to_db(owner));
+        row.overview = Some("Its own".to_owned());
+        row.studios = Some("Own Studio".to_owned());
+        row.production_year = Some(2001);
+        save_item(db, &row).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_primarys_versions_and_parts_take_its_metadata_once() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (primary, version, part) = (
+            Uuid::from_u128(0x5C_0001),
+            Uuid::from_u128(0x5C_0002),
+            Uuid::from_u128(0x5C_0003),
+        );
+        for id in [primary, version, part] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let mut row: BaseItemEntity = fetch_item(&db, primary).await;
+        row.overview = Some("A heist.".to_owned());
+        row.genres = Some("Crime|Drama".to_owned());
+        row.studios = Some("Warner".to_owned());
+        row.critic_rating = Some(87.0);
+        row.community_rating = Some(8.3);
+        row.production_year = None;
+        save_item(&db, &row).await;
+        owned_by(&db, version, primary, true).await;
+        owned_by(&db, part, primary, false).await;
+        service
+            .replace_provider_ids(primary, &[("Imdb".to_owned(), "tt0113277".to_owned())])
+            .await
+            .unwrap();
+        service
+            .replace_provider_ids(version, &[("Tmdb".to_owned(), "1".to_owned())])
+            .await
+            .unwrap();
+        service
+            .save_item_images(
+                primary,
+                &[
+                    image("/m/poster.jpg", ImageType::Primary),
+                    image("/m/fanart.jpg", ImageType::Backdrop),
+                ],
+            )
+            .await
+            .unwrap();
+        service
+            .save_item_images(version, &[image("/m/other.jpg", ImageType::Primary)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .copy_metadata_to_owned_videos(&[primary], true, true)
+                .await
+                .unwrap(),
+            2
+        );
+
+        let v: BaseItemEntity = fetch_item(&db, version).await;
+        assert_eq!(v.overview.as_deref(), Some("A heist."));
+        assert_eq!(v.genres.as_deref(), Some("Crime|Drama"));
+        assert_eq!(v.community_rating, Some(8.3));
+        assert_eq!(v.production_year, None, "taken as it is");
+        assert_eq!(
+            v.studios.as_deref(),
+            Some("Own Studio"),
+            "not a version field"
+        );
+        assert_eq!(v.critic_rating, None, "not a version field");
+        assert_eq!(
+            image_paths(&db, version).await,
+            image_paths(&db, primary).await
+        );
+        let ids: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(version))
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(ids, [("Imdb".to_owned(), "tt0113277".to_owned())]);
+
+        let p: BaseItemEntity = fetch_item(&db, part).await;
+        assert_eq!(p.overview.as_deref(), Some("A heist."));
+        assert_eq!(p.studios.as_deref(), Some("Warner"));
+        assert_eq!(p.critic_rating, Some(87.0));
+        assert_eq!(
+            p.production_year,
+            Some(2001),
+            "the owner has no year to give"
+        );
+        assert!(
+            image_paths(&db, part).await.is_empty(),
+            "a part takes no images"
+        );
+
+        assert_eq!(
+            service
+                .copy_metadata_to_owned_videos(&[primary], true, true)
+                .await
+                .unwrap(),
+            0,
+            "a second copy writes nothing"
+        );
+        // An edit's save copies to the versions only.
+        let mut row: BaseItemEntity = fetch_item(&db, primary).await;
+        row.overview = Some("Edited.".to_owned());
+        save_item(&db, &row).await;
+        assert_eq!(
+            service
+                .copy_metadata_to_owned_videos(&[primary], true, false)
+                .await
+                .unwrap(),
+            1
+        );
+        let p: BaseItemEntity = fetch_item(&db, part).await;
+        assert_eq!(p.overview.as_deref(), Some("A heist."));
     }
 }

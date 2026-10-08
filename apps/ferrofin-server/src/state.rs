@@ -637,6 +637,8 @@ pub async fn build_app_state(
             move || config_mgr.snapshot_shared().ui_culture.clone()
         }),
     );
+    // An owned video's parental score follows the ratings its owner gives it.
+    item_persistence_impl.set_localization(Arc::clone(&localization));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
@@ -702,9 +704,13 @@ pub async fn build_app_state(
             .with_configuration(Arc::clone(&config_trait)),
     );
     let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
-    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
-        FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
-    );
+    // Kept concrete until the session manager exists: the versions a
+    // played-state change propagates to are announced through it (below).
+    let user_data_impl = Arc::new(FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::clone(&config_trait),
+    ));
+    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = user_data_impl.clone();
     // Live TV. Built after `users` (EnabledUsers needs the user manager) and
     // kept concrete: the DTO service the channel/programme projections need is
     // built later — it consumes the media-source manager, which consumes this
@@ -1034,7 +1040,7 @@ pub async fn build_app_state(
         Arc::clone(&file_system),
         Arc::clone(&item_persistence_service),
     )
-    .with_id_derivation(id_derivation)
+    .with_id_derivation(id_derivation.clone())
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).
     .with_virtual_paths(virtual_paths.clone())
@@ -1177,7 +1183,9 @@ pub async fn build_app_state(
         // the year on first use — both as Jellyfin does.
         .with_user_root(user_root_store)
         .with_years(year_store)
-        .with_by_name_store(by_name_store),
+        .with_by_name_store(by_name_store)
+        // A stacked video's parts are found by the ids their paths derive to.
+        .with_id_derivation(id_derivation),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the
@@ -1282,6 +1290,9 @@ pub async fn build_app_state(
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.
         .with_user_data(Arc::clone(&user_data))
+        // A user is offered only the versions their parental rules let them
+        // see (`GetStaticMediaSources`' per-user filter).
+        .with_users(Arc::clone(&users))
         .with_localization(Arc::clone(&localization)),
     );
 
@@ -1698,6 +1709,11 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
+    // The versions a played-state change propagates to are announced to the
+    // user's sessions (`UserDataChanged`), as each save is upstream.
+    user_data_impl.set_user_data_changed_sink(Arc::new(
+        ferrofin_core::user_data_manager::SessionUserDataSink(Arc::downgrade(&sessions)),
+    ));
 
     // Every repository save announces itself (`ItemUpdated`), which is where
     // Jellyfin's notifier hooks in. Attached here rather than at construction

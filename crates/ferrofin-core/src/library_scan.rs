@@ -3347,16 +3347,33 @@ impl LibraryScanner {
         self
     }
 
-    /// Stamps the numeric parental score derived from `OfficialRating` — what
-    /// the Parental Rating sort and the max-rating filters read (upstream
-    /// `BaseItem.OnMetadataChanged` → `GetParentalRatingScore`).
+    /// Stamps the numeric parental score derived from the custom rating, else
+    /// `OfficialRating` — what the Parental Rating sort and the max-rating
+    /// filters read — and clears a stored score when neither rating scores:
+    /// upstream `BaseItem.OnMetadataChanged` (`BaseItem.cs:2935-2967`) →
+    /// `GetParentalRatingScore`
+    /// ([`crate::localization_manager::parental_rating_score`]). The owned-video
+    /// copy applies the same rule (`settle_rating_score`).
+    ///
+    /// An adopted database's rows that carry a score and no rating of their
+    /// own (Jellyfin 10.11 stamped episodes and seasons with their series'
+    /// score) are cleared before any scan by the boot repair
+    /// (`repair_rating_levels`, Jellyfin 12.1's `MigrateRatingLevels`), so
+    /// the clear here rewrites none of them.
     fn apply_parental_rating_score(&self, entity: &mut BaseItemEntity) {
-        if let Some(localization) = &self.localization
-            && let Some(rating) = entity.official_rating.as_deref()
-            && let Some(score) = localization.get_rating_score(rating, None)
-        {
-            entity.inherited_parental_rating_value = Some(i64::from(score.score));
-            entity.inherited_parental_rating_sub_value = score.sub_score.map(i64::from);
+        let Some(localization) = &self.localization else {
+            return;
+        };
+        match crate::localization_manager::parental_rating_score(entity, localization.as_ref()) {
+            Some(score) => {
+                entity.inherited_parental_rating_value = Some(i64::from(score.score));
+                entity.inherited_parental_rating_sub_value = score.sub_score.map(i64::from);
+            }
+            None if entity.inherited_parental_rating_value.is_some() => {
+                entity.inherited_parental_rating_value = None;
+                entity.inherited_parental_rating_sub_value = None;
+            }
+            None => {}
         }
     }
 
@@ -4732,6 +4749,9 @@ impl LibraryScanner {
         // that owned them ([`released_from`]). A stop still unlinks them: the
         // next scan reads them saved unowned, and could no longer tell.
         let mut released: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        // The saved videos that own parts or local versions, which take
+        // their metadata once every row is saved ([`Self::copy_to_owned_videos`]).
+        let mut owners = OwnedCopies::default();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             let touched = Box::pin(self.serve_lane_between_items(
@@ -4761,6 +4781,7 @@ impl LibraryScanner {
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
+                self.copy_to_owned_videos(&owners).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &moved_away),
@@ -4911,10 +4932,39 @@ impl LibraryScanner {
                     }
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
+                    self.copy_to_owned_videos(&owners).await;
                     return Ok(self
                         .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
                         .await);
                 }
+            }
+            // A saved owner copies to its owned videos; so does an owner
+            // whose part or local version this walk created or moved (re-keyed),
+            // though the owner itself was unchanged — upstream's refresh of
+            // the owner reports a change when its version links do not match
+            // (`Video.cs:560-575`), and its save copies (`Video.cs:704-726`).
+            // A version saved for its own reasons (its own NFO) keeps what it
+            // found until its owner is saved, as upstream.
+            // Every refresh of a stacked primary — a quiet one too — copies
+            // its title metadata to its parts (`Video.RefreshedOwnedItems`,
+            // `Video.cs:549-555`); that copy writes only a part that differs.
+            if matches!(saved, ItemSaved::Saved) {
+                if crate::video_versions::owns_videos(item.entity.data.as_deref()) {
+                    owners.saved.push(item.id);
+                } else if (is_new || moved_ids.contains(&item.id))
+                    && item.entity.extra_type.is_none()
+                    && let Some(owner) = item
+                        .entity
+                        .owner_id
+                        .as_deref()
+                        .and_then(|o| Uuid::parse_str(o).ok())
+                {
+                    owners.saved.push(owner);
+                }
+            } else if matches!(saved, ItemSaved::Unchanged)
+                && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
+            {
+                owners.stacked.push(item.id);
             }
             if let Some(owner) = released_by {
                 released.entry(owner).or_default().push(item.id);
@@ -4934,6 +4984,7 @@ impl LibraryScanner {
         // and the closing passes, as one between items does.
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
+            self.copy_to_owned_videos(&owners).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &moved_away),
@@ -4947,6 +4998,9 @@ impl LibraryScanner {
         // the prune, whose delete follows `OwnerId`.
         self.sync_local_version_groups(&resolved_groups, &released)
             .await;
+        // After the groups are linked, so each local version points at its
+        // primary.
+        self.copy_to_owned_videos(&owners).await;
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -5067,6 +5121,52 @@ impl LibraryScanner {
                 groups = groups.len(),
                 "could not write the local alternate versions; the next scan retries"
             );
+        }
+    }
+
+    /// Gives each saved video's owned videos its metadata
+    /// ([`ItemPersistenceService::copy_metadata_to_owned_videos`]): its local
+    /// versions what `Video.UpdateToRepositoryAsync` copies on a save of the
+    /// primary (`Video.cs:704-726`), its stacked parts the title metadata its
+    /// refresh copies (`Video.cs:549-555` → `BaseItem.cs:2805-2858`).
+    ///
+    /// `owners.saved` copy to both; `owners.stacked`, the stacked primaries
+    /// the walk refreshed without a save, to their parts only.
+    ///
+    /// Upstream refreshes a primary's versions and parts BEFORE it saves the
+    /// primary (`BaseItem.RefreshMetadata` runs `RefreshedOwnedItems` first),
+    /// so the primary's values are the ones left standing whatever a
+    /// version's own providers found; running once every row of the pass is
+    /// saved keeps that order here, whichever the walk reached first. Only a
+    /// SAVED primary copies — as only a save runs the copy upstream — and
+    /// only rows that differ are written, so a quiet rescan stays quiet.
+    /// Best-effort, as the version links are: a failure is logged, and the
+    /// primary's next save copies again.
+    async fn copy_to_owned_videos(&self, owners: &OwnedCopies) {
+        let mut saved = owners.saved.clone();
+        saved.sort_unstable();
+        saved.dedup();
+        let stacked: Vec<Uuid> = owners
+            .stacked
+            .iter()
+            .filter(|id| saved.binary_search(id).is_err())
+            .copied()
+            .collect();
+        for (ids, versions) in [(saved.as_slice(), true), (stacked.as_slice(), false)] {
+            if ids.is_empty() {
+                continue;
+            }
+            if let Err(err) = self
+                .persistence
+                .copy_metadata_to_owned_videos(ids, versions, true)
+                .await
+            {
+                tracing::warn!(
+                    %err,
+                    owners = ids.len(),
+                    "could not copy metadata to owned versions and parts; the next save of their primary retries"
+                );
+            }
         }
     }
 
@@ -15184,6 +15284,17 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     if probe_ran && scanned.run_time_ticks.is_some() {
         row.run_time_ticks = scanned.run_time_ticks;
     }
+}
+
+/// The owners whose owned videos a walk copies metadata to
+/// ([`LibraryScanner::copy_to_owned_videos`]).
+#[derive(Debug, Default)]
+struct OwnedCopies {
+    /// Saved owners (and owners of a part or version created or moved):
+    /// their versions and parts.
+    saved: Vec<Uuid>,
+    /// Stacked primaries refreshed without a save: their parts only.
+    stacked: Vec<Uuid>,
 }
 
 /// Whether `entity` is a stacked movie's additional part as the planner

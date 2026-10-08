@@ -1129,3 +1129,343 @@ async fn a_stub_headed_alternates_other_file_stands_alone() {
     assert_eq!(other.owner_id, None);
     assert_eq!(f.rows_at("Movie/Movie - 1080p cd1.disc").await, 0);
 }
+
+/// Step 12 S6. A saved primary gives its local versions its metadata
+/// (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`: overview, year,
+/// premiere date, community and official rating, genres, provider ids,
+/// images) and its stacked parts its title metadata (`copyTitleMetadata`,
+/// `BaseItem.cs:2805-2858`: also studios, production locations, critic and
+/// custom rating, and the dates it has) — whichever row the walk saved
+/// first, the primary's values stand. The genres reach the versions'
+/// `ItemValues` links, and a rescan writes nothing.
+#[tokio::test]
+async fn a_primarys_metadata_reaches_its_versions_and_parts_once() {
+    const PRIMARY: &str = "Heat (1995)/Heat (1995).mkv";
+    const VERSION: &str = "Heat (1995)/Heat (1995) - 1080p.mkv";
+    const FIRST: &str = "Ronin (1998)/Ronin (1998) cd1.mkv";
+    const PART: &str = "Ronin (1998)/Ronin (1998) cd2.mkv";
+    let f = Fixture::movies(&[PRIMARY, VERSION, FIRST, PART]).await;
+    let nfo = |title: &str, year: i32| {
+        format!(
+            "<movie><title>{title}</title><plot>A heist.</plot><genre>Crime</genre>\
+             <genre>Drama</genre><studio>Warner</studio><country>USA</country>\
+             <rating>8.3</rating><criticrating>87</criticrating><mpaa>R</mpaa>\
+             <customrating>Adults</customrating><year>{year}</year>\
+             <premiered>{year}-12-15</premiered><uniqueid type=\"imdb\">tt0113277</uniqueid></movie>"
+        )
+    };
+    std::fs::write(f.path("Heat (1995)/Heat (1995).nfo"), nfo("Heat", 1995)).unwrap();
+    std::fs::write(
+        f.path("Ronin (1998)/Ronin (1998) cd1.nfo"),
+        nfo("Ronin", 1998),
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+
+    let primary = f.row(PRIMARY).await;
+    let version = f.row(VERSION).await;
+    assert_eq!(version.primary_version_id.as_ref(), Some(&primary.id));
+    assert_eq!(primary.overview.as_deref(), Some("A heist."));
+    for (field, theirs, mine) in [
+        ("Overview", &primary.overview, &version.overview),
+        ("Genres", &primary.genres, &version.genres),
+        (
+            "OfficialRating",
+            &primary.official_rating,
+            &version.official_rating,
+        ),
+    ] {
+        assert_eq!(mine, theirs, "{field}");
+    }
+    assert_eq!(version.production_year, Some(1995));
+    assert_eq!(version.premiere_date, primary.premiere_date);
+    assert_eq!(version.community_rating, primary.community_rating);
+    let ids = |id: String| {
+        let db = f.db.clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" = ? ORDER BY 1"#,
+            )
+            .bind(id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(ids(version.id.clone()).await, ids(primary.id.clone()).await);
+    assert!(!ids(primary.id.clone()).await.is_empty());
+    let genre_links: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "ItemValuesMap" m JOIN "ItemValues" v
+           ON v."ItemValueId" = m."ItemValueId" WHERE m."ItemId" = ? AND v."Type" = 2"#,
+    )
+    .bind(&version.id)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(genre_links, 2, "the version's genres are indexed");
+
+    let first = f.row(FIRST).await;
+    let part = f.row(PART).await;
+    assert_eq!(part.owner_id.as_ref(), Some(&first.id));
+    assert_eq!(part.overview.as_deref(), Some("A heist."));
+    assert_eq!(part.genres, first.genres);
+    assert_eq!(part.studios, first.studios);
+    assert_eq!(part.production_locations, first.production_locations);
+    assert_eq!(part.community_rating, first.community_rating);
+    assert_eq!(part.critic_rating, first.critic_rating);
+    assert_eq!(part.official_rating.as_deref(), Some("R"));
+    assert_eq!(part.custom_rating, first.custom_rating);
+    assert_eq!(part.production_year, Some(1998));
+    assert_eq!(part.premiere_date, first.premiere_date);
+
+    // This fixture has no media prober, so every NFO-backed movie lacks its
+    // media info and refreshes — and is saved — on every scan: a primary
+    // saved with the metadata its owned rows already carry copies nothing.
+    let owned = || async { (f.row(VERSION).await, f.row(PART).await) };
+    let before = owned().await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(owned().await, before, "the owned rows are not rewritten");
+
+    // With its media info in place nothing refreshes, and nothing is written.
+    sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = 1 WHERE "IsFolder" = 0"#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    count_item_writes(&f.db).await;
+    let second = f.scanner.scan_all().await.unwrap();
+    assert_eq!((second.created, second.updated), (0, 0), "{second:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// `GET /Videos/{id}/AdditionalParts`' read (`Video.GetAdditionalParts`):
+/// a stack's primary lists its other parts by `SortName`; a part, a lone
+/// movie and a version group list none.
+#[tokio::test]
+async fn a_stacks_primary_lists_its_additional_parts() {
+    use ferrofin_traits::library::LibraryManager as _;
+    let f = Fixture::movies(&[
+        "Heist cd1.mkv",
+        "Heist cd3.mkv",
+        "Heist cd2.mkv",
+        "Ronin (1998)/Ronin (1998).mkv",
+        "Ronin (1998)/Ronin (1998) - 1080p.mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let repo = Arc::new(FerrofinItemRepository::new(
+        f.db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let manager = ferrofin_core::FerrofinLibraryManager::new(
+        repo,
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(f.db.clone())),
+        f.store.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(f.db.clone())),
+    )
+    .with_id_derivation(IdDerivation::LegacyLowercase);
+    let parts = manager
+        .get_additional_parts(&f.row("Heist cd1.mkv").await, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        parts
+            .iter()
+            .map(|p| p.path.clone().unwrap())
+            .collect::<Vec<_>>(),
+        vec![f.path("Heist cd2.mkv"), f.path("Heist cd3.mkv")]
+    );
+    for none in ["Heist cd2.mkv", "Ronin (1998)/Ronin (1998).mkv"] {
+        assert!(
+            manager
+                .get_additional_parts(&f.row(none).await, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{none}"
+        );
+    }
+}
+
+/// The parts of a stack take its ratings, and so its parental score
+/// (`BaseItem.OnMetadataChanged`, run by every save): a user held below an
+/// R rating is not handed the parts of an R movie by
+/// `GET /Videos/{id}/AdditionalParts` (`Video.GetAdditionalParts(user)`).
+#[tokio::test]
+async fn a_restricted_user_gets_no_parts_of_a_movie_rated_above_them() {
+    use ferrofin_traits::library::LibraryManager as _;
+    let f = Fixture::movies(&[
+        "Heist (2001)/Heist (2001) cd1.mkv",
+        "Heist (2001)/Heist (2001) cd2.mkv",
+    ])
+    .await;
+    std::fs::write(
+        f.path("Heist (2001)/Heist (2001) cd1.nfo"),
+        "<movie><title>Heist</title><mpaa>R</mpaa></movie>",
+    )
+    .unwrap();
+    let localization = Arc::new(ferrofin_core::LocalizationManager::new("US"));
+    f.store.set_localization(localization.clone());
+    let f = Fixture {
+        scanner: f.scanner.with_localization(localization),
+        ..f
+    };
+    f.scanner.scan_all().await.unwrap();
+    let part = f.row("Heist (2001)/Heist (2001) cd2.mkv").await;
+    assert_eq!(part.official_rating.as_deref(), Some("R"));
+    assert_eq!(
+        part.inherited_parental_rating_value,
+        f.row("Heist (2001)/Heist (2001) cd1.mkv")
+            .await
+            .inherited_parental_rating_value,
+        "the part is scored as its owner"
+    );
+    assert!(part.inherited_parental_rating_value.is_some());
+
+    let manager = ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(
+            f.db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(f.db.clone())),
+        f.store.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(f.db.clone())),
+    )
+    .with_id_derivation(IdDerivation::LegacyLowercase);
+    let user = seed_user(&f.db).await;
+    let user_row = |max: Option<i64>| {
+        let db = f.db.clone();
+        async move {
+            sqlx::query(r#"UPDATE "Users" SET "MaxParentalRatingScore" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(user))
+                .bind(max)
+                .execute(db.writer())
+                .await
+                .unwrap();
+            sqlx::query_as::<_, ferrofin_db::entities::users::UserEntity>(
+                r#"SELECT * FROM "Users" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(user))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+    let primary = f.row("Heist (2001)/Heist (2001) cd1.mkv").await;
+    let unrestricted = user_row(None).await;
+    assert_eq!(
+        manager
+            .get_additional_parts(&primary, Some(&unrestricted))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let restricted = user_row(Some(13)).await;
+    assert!(
+        manager
+            .get_additional_parts(&primary, Some(&restricted))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A local version with an NFO of its own keeps what its NFO says until
+/// its primary is saved, then takes the primary's — and rescans of the
+/// group stay quiet rather than flip between the two.
+#[tokio::test]
+async fn a_version_with_its_own_nfo_does_not_flip_flop() {
+    const PRIMARY: &str = "Heat (1995)/Heat (1995).mkv";
+    const VERSION: &str = "Heat (1995)/Heat (1995) - 1080p.mkv";
+    let f = Fixture::movies(&[PRIMARY, VERSION]).await;
+    std::fs::write(
+        f.path("Heat (1995)/Heat (1995).nfo"),
+        "<movie><title>Heat</title><plot>The primary's.</plot></movie>",
+    )
+    .unwrap();
+    std::fs::write(
+        f.path("Heat (1995)/Heat (1995) - 1080p.nfo"),
+        "<movie><title>Heat</title><plot>The version's own.</plot></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row(VERSION).await.overview.as_deref(),
+        Some("The primary's."),
+        "the primary's save wins"
+    );
+    // Media info in place, so nothing refreshes for want of it.
+    sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = 1 WHERE "IsFolder" = 0"#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    count_item_writes(&f.db).await;
+    for _ in 0..2 {
+        let rescan = f.scanner.scan_all().await.unwrap();
+        assert_eq!((rescan.created, rescan.updated), (0, 0), "{rescan:?}");
+    }
+    assert_eq!(item_writes(&f.db).await, 0);
+    assert_eq!(
+        f.row(VERSION).await.overview.as_deref(),
+        Some("The primary's.")
+    );
+}
+
+/// The scan scores an item's custom rating ahead of its official one
+/// (`GetParentalRatingScore`): a row stored with the official rating's score
+/// (as the scan once stamped it) is rewritten once, and the next scan is
+/// quiet; a rating removed from the item clears its stored score
+/// (`OnMetadataChanged`'s else branch).
+#[tokio::test]
+async fn the_scan_scores_the_custom_rating_first_and_clears_a_lost_one() {
+    const MOVIE: &str = "Heat (1995)/Heat (1995).mkv";
+    const SOLO: &str = "Solo (2000)/Solo (2000).mkv";
+    let f = Fixture::movies(&[MOVIE, SOLO]).await;
+    std::fs::write(
+        f.path("Heat (1995)/Heat (1995).nfo"),
+        "<movie><title>Heat</title><mpaa>R</mpaa><customrating>PG</customrating></movie>",
+    )
+    .unwrap();
+    let localization = Arc::new(ferrofin_core::LocalizationManager::new("US"));
+    let score = |rating: &str| {
+        localization
+            .get_rating_score(rating, None)
+            .map(|s| i64::from(s.score))
+    };
+    let (pg, r) = (score("PG"), score("R"));
+    assert_ne!(pg, r);
+    let f = Fixture {
+        scanner: f.scanner.with_localization(localization.clone()),
+        ..f
+    };
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(MOVIE).await.inherited_parental_rating_value, pg);
+
+    // The official rating's score, as stored before; and a stale score on a
+    // movie with no rating at all. Media info in place, so nothing else
+    // refreshes.
+    sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = 1 WHERE "IsFolder" = 0"#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    for (path, value) in [(MOVIE, r), (SOLO, Some(13))] {
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = ?2 WHERE "Path" = ?1"#,
+        )
+        .bind(f.path(path))
+        .bind(value)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    }
+    let once = f.scanner.scan_all().await.unwrap();
+    assert_eq!(once.updated, 2, "{once:?}");
+    assert_eq!(f.row(MOVIE).await.inherited_parental_rating_value, pg);
+    assert_eq!(f.row(SOLO).await.inherited_parental_rating_value, None);
+
+    count_item_writes(&f.db).await;
+    let again = f.scanner.scan_all().await.unwrap();
+    assert_eq!((again.created, again.updated), (0, 0), "{again:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}

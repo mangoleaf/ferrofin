@@ -239,6 +239,7 @@ pub mod user_manager;
 pub mod user_root_folder;
 pub mod user_view_manager;
 pub mod user_view_repository;
+pub mod video_versions;
 pub mod virtual_folder_manager;
 pub mod virtual_paths;
 pub mod years;
