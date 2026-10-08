@@ -14,9 +14,10 @@
 //! `sync_local_versions` keeps the type-2 links and these pointers in
 //! step). So the group is read from rows, batched: [`VersionRows::load`]
 //! reads every row a set of queried items' groups can reach — one query
-//! for the versions pointing at them, one more only when a queried item is
-//! itself a version whose primary is not among them, and a third only when
-//! a version merged into a group lists local versions of its own — and
+//! for the versions pointing at them, one more per level only when a queried
+//! item is itself a version whose primary (up its pointer chain) is not
+//! among them, and one more per level of versions that have versions of
+//! their own (each read flags them) — and
 //! [`VersionRows::items_for_media_sources`] composes one item's group from
 //! them without another round trip.
 
@@ -141,6 +142,26 @@ pub trait VersionRowReader: Send + Sync {
         &self,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError>;
+
+    /// [`Self::rows_by_primary`] with, beside each row, whether some other
+    /// row names it as its `PrimaryVersionId` — read in the same query, so
+    /// [`VersionRows::load`] goes down only where versions hang. The default
+    /// flags every row.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        Ok(self
+            .rows_by_primary(ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
+    }
 }
 
 /// [`VersionRowReader`] over an [`ItemRepository`].
@@ -157,6 +178,13 @@ impl VersionRowReader for RepositoryVersionReader<'_> {
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
         self.0.get_items_by_primary_version_batch(ids).await
+    }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        self.0.get_items_by_primary_version_batch_flagged(ids).await
     }
 }
 
@@ -185,6 +213,13 @@ impl VersionRowReader for DbVersionReader<'_> {
         }
         Ok(map)
     }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        crate::item_repository::rows_by_primary_flagged(self.0, ids).await
+    }
 }
 
 /// Every row the version groups of a set of queried items reach, read once.
@@ -204,13 +239,18 @@ pub struct VersionRows {
 impl VersionRows {
     /// Reads the rows `queried`'s version groups reach:
     ///
-    /// 1. the primary of each queried item that is a version (only when one
-    ///    is, and only those not queried themselves);
+    /// 1. the primary of each queried item that is a version — and that
+    ///    primary's, up the `PrimaryVersionId` chain to its root (only when
+    ///    one is a version, and only those not queried themselves);
     /// 2. the versions pointing at each queried item and each such primary;
-    /// 3. the local versions of each version found that is merged rather
-    ///    than local (`GetAllItemsForMediaSources` takes the local versions
-    ///    of every grouped item) — only when such a version's `Data` lists
-    ///    local versions.
+    /// 3. the versions pointing at each version found that has any, level by
+    ///    level (each read flags the rows something points at): the local
+    ///    versions of a merged version
+    ///    (`GetAllItemsForMediaSources` takes the local versions of every
+    ///    grouped item), and what a merge left pointing at a version a scan
+    ///    later grouped under another primary.
+    ///
+    /// Each row is read once, so a chain that loops ends.
     ///
     /// # Errors
     ///
@@ -226,50 +266,58 @@ impl VersionRows {
         let by_id: HashMap<Uuid, &BaseItemEntity> =
             queried.iter().map(|row| (row_id(row), *row)).collect();
         let mut keys: Vec<Uuid> = by_id.keys().copied().collect();
+        let mut climbing: Vec<BaseItemEntity> = Vec::new();
         let mut wanted: Vec<Uuid> = Vec::new();
-        for row in queried {
-            let Some(primary) = parse_id(row.primary_version_id.as_deref()) else {
-                continue;
-            };
+        let want = |row: &BaseItemEntity, out: &mut Self, wanted: &mut Vec<Uuid>| {
+            let primary = parse_id(row.primary_version_id.as_deref())?;
             if primary == row_id(row) || out.rows.contains_key(&primary) {
-                continue;
+                return None;
             }
             if let Some(stored) = by_id.get(&primary) {
                 out.rows.insert(primary, (*stored).clone());
-            } else if !wanted.contains(&primary) {
-                wanted.push(primary);
+                Some((*stored).clone())
+            } else {
+                if !wanted.contains(&primary) {
+                    wanted.push(primary);
+                }
+                None
             }
+        };
+        for row in queried {
+            climbing.extend(want(row, &mut out, &mut wanted));
         }
-        if !wanted.is_empty() {
-            for row in reader.rows_by_id(&wanted).await? {
-                let id = row_id(&row);
-                keys.push(id);
-                out.rows.insert(id, row);
+        // Up each chain: a primary read may itself point further.
+        while !wanted.is_empty() || !climbing.is_empty() {
+            let mut next: Vec<Uuid> = Vec::new();
+            let mut found: Vec<BaseItemEntity> = std::mem::take(&mut climbing);
+            if !wanted.is_empty() {
+                for row in reader.rows_by_id(&wanted).await? {
+                    let id = row_id(&row);
+                    keys.push(id);
+                    out.rows.insert(id, row.clone());
+                    found.push(row);
+                }
+                wanted.clear();
             }
+            for row in &found {
+                climbing.extend(want(row, &mut out, &mut next));
+            }
+            wanted = next;
         }
-        out.absorb(reader.rows_by_primary(&keys).await?, |_, _| true);
-        let known: HashSet<Uuid> = keys.iter().copied().collect();
-        let mut merged: Vec<Uuid> = out
-            .by_primary
-            .iter()
-            .flat_map(|(primary, ids)| {
-                ids.iter()
-                    .filter(|id| {
-                        out.rows.get(id).is_some_and(|row| {
-                            !is_local_version_of(row, *primary)
-                                && lists_local_versions(row.data.as_deref())
-                        })
-                    })
-                    .copied()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|id| !known.contains(id))
-            .collect();
-        merged.sort_unstable();
-        merged.dedup();
-        if !merged.is_empty() {
-            let found = reader.rows_by_primary(&merged).await?;
-            out.absorb(found, is_local_version_of);
+        keys.sort_unstable();
+        keys.dedup();
+        let mut known: HashSet<Uuid> = keys.iter().copied().collect();
+        let mut frontier = out.absorb(reader.rows_by_primary_flagged(&keys).await?);
+        // Down each tree, a level at a time, only into rows something points
+        // at — each read says so of every row it returns.
+        loop {
+            frontier.retain(|id| known.insert(*id));
+            if frontier.is_empty() {
+                break;
+            }
+            frontier.sort_unstable();
+            let found = reader.rows_by_primary_flagged(&frontier).await?;
+            frontier = out.absorb(found);
         }
         // The link order of each video's local versions, its `Data` read
         // once here rather than at every use.
@@ -298,24 +346,24 @@ impl VersionRows {
         Ok(out)
     }
 
-    fn absorb(
-        &mut self,
-        found: HashMap<Uuid, Vec<BaseItemEntity>>,
-        keep: impl Fn(&BaseItemEntity, Uuid) -> bool,
-    ) {
+    /// Files `found` under the ids they point at; returns the ids of the
+    /// rows it filed that have versions of their own.
+    fn absorb(&mut self, found: HashMap<Uuid, Vec<(BaseItemEntity, bool)>>) -> Vec<Uuid> {
+        let mut versioned = Vec::new();
         for (primary, rows) in found {
-            for row in rows {
-                if !keep(&row, primary) {
-                    continue;
-                }
+            for (row, has_versions) in rows {
                 let id = row_id(&row);
                 let list = self.by_primary.entry(primary).or_default();
                 if !list.contains(&id) {
                     list.push(id);
                 }
+                if has_versions {
+                    versioned.push(id);
+                }
                 self.rows.entry(id).or_insert(row);
             }
         }
+        versioned
     }
 
     /// How many rows name `primary` as their `PrimaryVersionId` — its local
@@ -447,11 +495,65 @@ impl VersionRows {
             .map(|row| (row, MediaSourceType::Default))
             .collect();
         let mut seen = HashSet::new();
-        grouped
+        let mut items: Vec<(&BaseItemEntity, MediaSourceType)> = grouped
             .into_iter()
             .chain(locals)
             .filter(|(row, _)| seen.insert(row_id(row)))
-            .collect()
+            .collect();
+        // Beyond upstream's two levels: the rest of the group of the root of
+        // `queried`'s `PrimaryVersionId` chain — a merge onto a version a scan
+        // later grouped under another primary leaves the merged items one
+        // level further down — local ones as `Default` sources, merged ones
+        // as `Grouping`.
+        let root = self.chain_root(queried);
+        let mut walked = HashSet::from([root]);
+        let mut level = vec![root];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for video in level {
+                let Some(row) = self.row(video, queried) else {
+                    continue;
+                };
+                if seen.insert(video) {
+                    items.push((row, MediaSourceType::Default));
+                }
+                for version in self.versions_of(row, queried) {
+                    let id = row_id(version);
+                    if seen.insert(id) {
+                        let source_type = if is_local_version_of(version, video) {
+                            MediaSourceType::Default
+                        } else {
+                            MediaSourceType::Grouping
+                        };
+                        items.push((version, source_type));
+                    }
+                    if walked.insert(id) {
+                        next.push(id);
+                    }
+                }
+            }
+            level = next;
+        }
+        items
+    }
+
+    /// The root of `queried`'s `PrimaryVersionId` chain over the rows read;
+    /// `queried` itself when it is no version, and the last row reached
+    /// before a row met twice when the chain loops.
+    fn chain_root(&self, queried: &BaseItemEntity) -> Uuid {
+        let mut current = row_id(queried);
+        let mut seen = HashSet::from([current]);
+        while let Some(primary) = self
+            .row(current, queried)
+            .and_then(|row| parse_id(row.primary_version_id.as_deref()))
+            .filter(|primary| self.row(*primary, queried).is_some())
+        {
+            if !seen.insert(primary) {
+                break;
+            }
+            current = primary;
+        }
+        current
     }
 
     /// The ids of every version of `queried`, itself included — `Video.
@@ -623,14 +725,6 @@ fn containing_folder_name(video: &BaseItemEntity) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// Whether a video's `Data` lists local alternate versions — read off the
-/// text first, so a blob without the key (or with `[]`) is not parsed.
-fn lists_local_versions(data: Option<&str>) -> bool {
-    data.is_some_and(|text| text.contains("\"LocalAlternateVersions\":[\""))
-        || (data.is_some_and(|text| text.contains("\"LocalAlternateVersions\""))
-            && !data_paths(data, LOCAL_ALTERNATE_VERSIONS).is_empty())
 }
 
 /// .NET `char.ToUpperInvariant` for the simple one-to-one mappings.

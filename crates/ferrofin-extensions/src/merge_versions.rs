@@ -357,35 +357,43 @@ impl MergeVersionsService {
     /// `GetAllAlternateVersions` lists linked versions only — but the
     /// members it is a version of are returned as the second set: a video
     /// with local versions has `MediaSourceCount > 1`, which the primary
-    /// choice reads.
+    /// choice reads. The walk goes on through an owned row, up and down: a
+    /// merge left on a version a scan later grouped under another primary
+    /// points at that local version, one level below the group's primary.
+    /// Each row is walked once, so a pointer chain that loops ends.
     async fn expand_group(
         &self,
         seed: &[BaseItemEntity],
     ) -> Result<(HashMap<String, BaseItemEntity>, HashSet<String>), ServiceError> {
         let mut group: HashMap<String, BaseItemEntity> = HashMap::new();
         let mut local: HashSet<String> = HashSet::new();
+        let mut walked: HashSet<String> = HashSet::new();
         let mut pending: VecDeque<BaseItemEntity> = seed.iter().cloned().collect();
         while let Some(item) = pending.pop_front() {
-            if group.contains_key(&item.id) || is_owned_version(&item) {
+            if !walked.insert(item.id.clone()) {
                 continue;
             }
             if let Some(pid) = item.primary_version_id.as_deref()
-                && !group.contains_key(pid)
+                && !walked.contains(pid)
                 && let Ok(pid) = Uuid::parse_str(pid)
                 && let Some(primary) = self.items.retrieve_item(pid).await?
             {
                 pending.push_back(primary);
             }
+            let owned = is_owned_version(&item);
             if let Ok(id) = Uuid::parse_str(&item.id) {
                 for alt in self.items.get_items_by_primary_version(id).await? {
-                    if is_owned_version(&alt) {
+                    if is_owned_version(&alt) && !owned {
                         local.insert(item.id.clone());
-                    } else if !group.contains_key(&alt.id) {
+                    }
+                    if !walked.contains(&alt.id) {
                         pending.push_back(alt);
                     }
                 }
             }
-            group.insert(item.id.clone(), item);
+            if !owned {
+                group.insert(item.id.clone(), item);
+            }
         }
         Ok((group, local))
     }
@@ -1598,6 +1606,53 @@ mod tests {
         svc.split_movies(None).await.expect("split movies");
         assert_eq!(primary_of(&db, &svc, copy).await, None);
         assert_eq!(points_at(primary_of(&db, &svc, local).await), Some(primary));
+    }
+
+    /// A copy merged onto a version that a scan later grouped as another
+    /// video's local version sits two levels below that video: the group
+    /// walk reaches the video through the owned version, which stays no
+    /// member, from either end.
+    #[tokio::test]
+    async fn expand_group_walks_through_an_owned_version() {
+        let db = test_db().await;
+        let (head, local, copy) = (
+            Uuid::from_u128(0x451),
+            Uuid::from_u128(0x452),
+            Uuid::from_u128(0x453),
+        );
+        seed(&db, head, BaseItemKind::Episode, None, 1920).await;
+        for (id, owner, primary) in [(local, Some(head), head), (copy, None, local)] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Episode).to_owned(),
+                    width: Some(1280),
+                    owner_id: owner.map(|o| o.to_string()),
+                    primary_version_id: Some(primary.to_string()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed version");
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        let row = |id: Uuid| {
+            let svc = &svc;
+            async move { svc.items.retrieve_item(id).await.unwrap().unwrap() }
+        };
+        for seed_id in [copy, head] {
+            let (group, owners) = svc.expand_group(&[row(seed_id).await]).await.unwrap();
+            let mut members: Vec<Uuid> = group
+                .keys()
+                .map(|id| Uuid::parse_str(id).unwrap())
+                .collect();
+            members.sort();
+            assert_eq!(members, vec![head, copy], "from {seed_id}");
+            let owners: Vec<Uuid> = owners
+                .iter()
+                .map(|id| Uuid::parse_str(id).unwrap())
+                .collect();
+            assert_eq!(owners, vec![head]);
+        }
     }
 
     #[tokio::test]

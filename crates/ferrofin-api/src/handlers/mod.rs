@@ -869,12 +869,6 @@ pub const VERIFIED: &[Verified] = &[
          the primary episode row. Un-defer path: v12's Video.GetMediaSourceName \
          common-prefix naming is ported (video_versions::media_source_name); swap by that \
          name in tv_series_manager (see the TODO there).",
-            "Video.GetAllVersions spans the local alternates of every version in the group; \
-         Ferrofin groups by COALESCE(PrimaryVersionId, Id), which covers a primary's local \
-         and merged versions but not the local versions of a version MERGED onto another \
-         primary (they point at the merged version), so the resumable check and the \
-         last-played date miss those. Un-defer path: group by the primary of the version's \
-         primary (one more level) in next_up_service.",
             "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \

@@ -2450,9 +2450,9 @@ struct PlanCtx<'a> {
     /// Each photo album's ancestors as [`LibraryScanner::plan_photos`]
     /// planned them, which a video in the album extends.
     album_ancestors: std::cell::RefCell<HashMap<Uuid, Vec<Uuid>>>,
-    /// Per folder holding episodes, whether they are in a mixed folder
+    /// Per folder holding episodes, what its files resolve to
     /// ([`note_episode_folder`]).
-    episode_folders_mixed: std::cell::RefCell<HashMap<String, bool>>,
+    episode_folders: std::cell::RefCell<HashMap<String, EpisodeFolder>>,
     /// Raw direct file counts before discovery ignores, for extras folder context.
     direct_file_counts: std::cell::RefCell<HashMap<String, usize>>,
     /// The library locations of the pass (without a trailing slash).
@@ -2489,7 +2489,7 @@ impl<'a> PlanCtx<'a> {
             prelisted: std::cell::RefCell::new(HashMap::new()),
             local_versions: std::cell::RefCell::new(Vec::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
-            episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
+            episode_folders: std::cell::RefCell::new(HashMap::new()),
             album_ancestors: std::cell::RefCell::new(HashMap::new()),
             tv_library: std::cell::Cell::new(false),
             key_folders: &[],
@@ -2600,9 +2600,9 @@ fn released_from(
 /// Keeps a stored owned version's owner when the scan has no opinion on it:
 /// the walk planned row `id` with no owner, the row is in none of the groups
 /// the walk resolved, and its stored owner heads none of them either. Such a
-/// row is a local version or part this scan's walk does not group yet — an
-/// owned Episode version of a 12.x database, which the TV walk plans on its
-/// own — and clearing its owner would show it as an item of its own. A row
+/// row is a local version or part whose group this scan did not resolve — a
+/// scan stopped before the walk finished passes no groups — and clearing its
+/// owner would show it as an item of its own. A row
 /// the walk did group (a primary promoted over a deleted one) never keeps
 /// its old owner: the prune of that owner follows `OwnerId`.
 fn keep_unplanned_version_owner(
@@ -2649,11 +2649,10 @@ struct PlanOutput {
     /// owner ([`keep_unplanned_version_owner`]).
     ///
     /// The movie walk lists every video it plans
-    /// ([`LibraryScanner::plan_video_group`]).
-    // TODO(parity, open work item): the TV walk (PLAN_ITEM_FILE_DELETION
-    // step 12 S8) must emit an entry — an empty one for an episode with no
-    // versions — for EVERY episode it plans in a tvshows library, so a group
-    // that dissolved (its versions renamed apart) releases them.
+    /// ([`LibraryScanner::plan_video_group`]), the TV walk every episode
+    /// ([`LibraryScanner::plan_episode_file`]) — an episode with no versions
+    /// with none, so a group that dissolved (its versions renamed apart)
+    /// releases them.
     local_versions: Vec<(Uuid, Vec<String>)>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
@@ -12169,7 +12168,7 @@ impl LibraryScanner {
                     self.collect_videos(&entry.path, ctx, &mut loose);
                 }
             } else if video_resolver::is_video_file(&entry.path, naming)
-                && ctx.scope.keeps(&entry.path)
+                && episode_file_kept(&entry.path, ctx)
             {
                 loose.push(entry.path);
             } else if !ctx.tv_library.get() {
@@ -12195,7 +12194,8 @@ impl LibraryScanner {
     }
 
     /// Collects every video file under `dir` (recursively) into `out_paths` —
-    /// the ones `ctx`'s scope keeps.
+    /// the ones `ctx`'s scope keeps, with the rest of a stack or version
+    /// group it keeps a file of ([`episode_file_kept`]).
     fn collect_videos(&self, dir: &str, ctx: &PlanCtx<'_>, out_paths: &mut Vec<String>) {
         let entries = self.list(dir, ctx);
         note_episode_folder(dir, &entries, ctx);
@@ -12205,7 +12205,7 @@ impl LibraryScanner {
                     self.collect_videos(&entry.path, ctx, out_paths);
                 }
             } else if video_resolver::is_video_file(&entry.path, ctx.naming)
-                && ctx.scope.keeps(&entry.path)
+                && episode_file_kept(&entry.path, ctx)
             {
                 out_paths.push(entry.path);
             }
@@ -12231,8 +12231,11 @@ impl LibraryScanner {
     ) {
         use std::collections::BTreeMap;
         let naming = ctx.naming;
+        // A stack's other parts and a group's other versions are planned
+        // with their first file, in its season ([`Self::plan_episode_group`]).
         let resolved: Vec<(&String, Option<i32>)> = paths
             .iter()
+            .filter(|p| episode_group(p, ctx).is_none_or(|(_, first)| first))
             .map(|p| {
                 let num = EpisodeResolver::new(naming)
                     .resolve_simple(p, false)
@@ -12286,17 +12289,15 @@ impl LibraryScanner {
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
             let season_name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
-            self.emit_episode(
-                path,
+            let home = EpisodeHome {
                 cf,
                 series_id,
                 season,
                 series_name,
                 series_key,
-                Some(&season_name),
-                ctx,
-                out,
-            );
+                season_name: Some(&season_name),
+            };
+            self.plan_episode_file(path, home, ctx, out);
         }
     }
 
@@ -12345,19 +12346,17 @@ impl LibraryScanner {
                     out,
                 );
             } else if video_resolver::is_video_file(&entry.path, naming)
-                && ctx.scope.keeps(&entry.path)
+                && episode_file_kept(&entry.path, ctx)
             {
-                self.emit_episode(
-                    &entry.path,
+                let home = EpisodeHome {
                     cf,
                     series_id,
                     season,
                     series_name,
                     series_key,
                     season_name,
-                    ctx,
-                    out,
-                );
+                };
+                self.plan_episode_file(&entry.path, home, ctx, out);
             } else if !ctx.tv_library.get() {
                 // As in the series folder: an untyped library's audio.
                 let parent = match season {
@@ -12369,49 +12368,168 @@ impl LibraryScanner {
         }
     }
 
-    /// Emits one `Episode` row, parented to its season (or the series when there is
-    /// no season folder), carrying `IndexNumber`/`ParentIndexNumber` from the
-    /// filename's episode/season numbers.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_episode(
+    /// Plans the episode file at `path` (one the scope keeps,
+    /// [`episode_file_kept`]): with the rest of its stack or version group
+    /// when it is the group's first file, not at all when it is another
+    /// ([`Self::plan_episode_group`]), else as an episode of its own — no
+    /// parts, no versions (`MovieResolver.cs:287-317`, or `EpisodeResolver`
+    /// under an untyped library's series).
+    fn plan_episode_file(
         &self,
         path: &str,
-        cf: Uuid,
-        series_id: Uuid,
-        season: Option<(Uuid, Option<i32>)>,
-        series_name: &str,
-        series_key: &str,
-        season_name: Option<&str>,
+        home: EpisodeHome<'_>,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let info = EpisodeResolver::new(ctx.naming).resolve_simple(path, false);
-        let (parent, ancestors) = match season {
-            Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
-            None => (series_id, vec![cf, series_id]),
+        match episode_group(path, ctx) {
+            Some((video, true)) => self.plan_episode_group(&video, home, ctx, out),
+            Some((_, false)) => {}
+            None => {
+                let Some(mut episode) = self.episode_row(path, home, ctx) else {
+                    return;
+                };
+                set_resolved_lists(&mut episode.entity, &[], &[]);
+                ctx.local_versions
+                    .borrow_mut()
+                    .push((episode.id, Vec::new()));
+                out.push(episode);
+            }
+        }
+    }
+
+    /// An episode stack or version group `ResolveVideos<Episode>` resolved
+    /// (`MovieResolver.cs:231-234,287-317`; the versions grouped by
+    /// `VideoListResolver.GetEpisodesGroupedByVersion`), planned whole: the
+    /// primary episode, its file the first, carrying the other parts' paths
+    /// as `AdditionalParts` and each alternate's first file as
+    /// `LocalAlternateVersions`; a `Video` row per other part, owned by the
+    /// primary (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:636-701`);
+    /// and an `Episode` per alternate — the primary's kind
+    /// (`LibraryManager.ResolveAlternateVersion`, `LibraryManager.cs:865-922`)
+    /// resolved from its own file as `EpisodeResolver` does, in the primary's
+    /// season — owned by and pointing at the primary, in its mixed-folder
+    /// state (`CreateItems`, `:2446-2487`), with its own stack as its
+    /// `AdditionalParts` and part rows (`SetAdditionalPartsFromStack`,
+    /// `:828-862`). The primary's group goes to [`PlanOutput::local_versions`].
+    /// A `.disc` stub the naming rules group is left out, as the movie walk
+    /// leaves it ([`Self::plan_video_group`]).
+    fn plan_episode_group(
+        &self,
+        video: &ferrofin_naming::video::VideoInfo,
+        home: EpisodeHome<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let naming = ctx.naming;
+        let playable = |files: &[ferrofin_naming::video::VideoFileInfo]| -> Vec<String> {
+            files
+                .iter()
+                .map(|file| file.path.clone())
+                .filter(|path| video_resolver::is_video_file(path, naming))
+                .collect()
         };
-        let Some((id, mut entity)) = self.base_item(
+        let parts = playable(video.files.get(1..).unwrap_or_default());
+        let alternates: Vec<(String, Vec<String>)> = video
+            .alternate_versions
+            .iter()
+            .filter_map(|alternate| {
+                let (first, rest) = alternate.files.split_first()?;
+                video_resolver::is_video_file(&first.path, naming)
+                    .then(|| (first.path.clone(), playable(rest)))
+            })
+            .collect();
+        let Some(mut primary) = self.episode_row(&video.files[0].path, home, ctx) else {
+            return;
+        };
+        let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
+        set_resolved_lists(&mut primary.entity, &parts, &versions);
+        let owner = primary.id;
+        let mixed = primary.entity.is_in_mixed_folder;
+        ctx.local_versions.borrow_mut().push((owner, versions));
+        out.push(primary);
+        self.plan_episode_parts(&parts, owner, mixed, home, ctx, out);
+        for (first, rest) in &alternates {
+            let Some(mut alternate) = self.episode_row(first, home, ctx) else {
+                continue;
+            };
+            alternate.entity.owner_id = Some(guid_to_db(owner));
+            alternate.entity.primary_version_id = Some(guid_to_db(owner));
+            alternate.entity.is_in_mixed_folder = mixed;
+            set_resolved_lists(&mut alternate.entity, rest, &[]);
+            let id = alternate.id;
+            out.push(alternate);
+            self.plan_episode_parts(rest, id, mixed, home, ctx, out);
+        }
+    }
+
+    /// The `Video` rows of the stacked `parts` of the episode `owner`, owned
+    /// by it, hung where it hangs and created in its mixed-folder state
+    /// `mixed` (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`: a
+    /// part resolves from its file alone, then takes the base type —
+    /// `EpisodeResolver`'s name for it is the file name — and the owner's
+    /// `OwnerId` and `IsInMixedFolder`).
+    fn plan_episode_parts(
+        &self,
+        parts: &[String],
+        owner: Uuid,
+        mixed: bool,
+        home: EpisodeHome<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let (parent, ancestors) = home.parent();
+        for path in parts {
+            let Some((id, mut entity)) = self.base_item(
+                ctx,
+                BaseItemKind::Video,
+                home.cf,
+                parent,
+                file_stem(path),
+                path,
+                false,
+            ) else {
+                continue;
+            };
+            entity.media_type = Some("Video".to_owned());
+            set_video_type(&mut entity, file_video_type(path));
+            entity.owner_id = Some(guid_to_db(owner));
+            entity.is_in_mixed_folder = mixed;
+            set_resolved_lists(&mut entity, &[], &[]);
+            out.push(Planned {
+                id,
+                entity,
+                ancestors: ancestors.clone(),
+            });
+        }
+    }
+
+    /// One `Episode` row at `path`, parented to its season (or the series
+    /// when there is no season folder), carrying `IndexNumber` /
+    /// `ParentIndexNumber` from the filename's episode/season numbers.
+    fn episode_row(&self, path: &str, home: EpisodeHome<'_>, ctx: &PlanCtx<'_>) -> Option<Planned> {
+        let info = EpisodeResolver::new(ctx.naming).resolve_simple(path, false);
+        let (parent, ancestors) = home.parent();
+        let (id, mut entity) = self.base_item(
             ctx,
             BaseItemKind::Episode,
-            cf,
+            home.cf,
             parent,
             file_stem(path),
             path,
             false,
-        ) else {
-            return;
-        };
+        )?;
         entity.media_type = Some("Video".to_owned());
         entity.is_in_mixed_folder = Path::new(path)
             .parent()
             .and_then(Path::to_str)
-            .and_then(|dir| ctx.episode_folders_mixed.borrow().get(dir).copied())
+            .and_then(|dir| ctx.episode_folders.borrow().get(dir).map(|f| f.mixed))
             .unwrap_or(false);
         // `EpisodeResolver` is a `BaseVideoResolver`: the file's
         // `VideoType` (and an image's `IsoType`) as for a movie.
         set_video_type(&mut entity, file_video_type(path));
         entity.index_number = info.as_ref().and_then(|i| i.episode_number).map(i64::from);
-        entity.parent_index_number = season
+        entity.parent_index_number = home
+            .season
             .and_then(|(_, n)| n)
             .or_else(|| info.as_ref().and_then(|i| i.season_number))
             .map(i64::from);
@@ -12420,13 +12538,13 @@ impl LibraryScanner {
         // series.Name`). A filename-derived series name is release-group noise
         // ("Show.2009", "Show - 4x09 - Title") and fragments the parent line on
         // every episode card.
-        entity.series_name = Some(series_name.to_owned());
-        entity.season_name = season_name.map(str::to_owned);
+        entity.series_name = Some(home.series_name.to_owned());
+        entity.season_name = home.season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
-        entity.series_id = Some(guid_to_db(series_id));
-        entity.series_presentation_unique_key = Some(series_key.to_owned());
-        entity.season_id = season.map(|(sid, _)| guid_to_db(sid));
+        entity.series_id = Some(guid_to_db(home.series_id));
+        entity.series_presentation_unique_key = Some(home.series_key.to_owned());
+        entity.season_id = home.season.map(|(sid, _)| guid_to_db(sid));
         // Episodes sort by position, not title (`Episode.CreateSortName`) — the
         // numbers are only known here, after the resolver ran.
         entity.sort_name = Some(episode_sort_name(
@@ -12434,11 +12552,11 @@ impl LibraryScanner {
             entity.index_number,
             entity.name.as_deref().unwrap_or_default(),
         ));
-        out.push(Planned {
+        Some(Planned {
             id,
             entity,
             ancestors,
-        });
+        })
     }
 
     /// Music library: an artist directory is a `MusicArtist`
@@ -14265,28 +14383,108 @@ fn lone_video(
     }
 }
 
-/// Records whether the episodes in `dir` (listed as `entries`) are in a
-/// mixed folder: a tvshows library resolves a folder's files through
-/// `ResolveVideos<Episode>` (`MovieResolver.cs:231-234`), which sets
-/// `IsInMixedFolder = Count > 1` — a series or season folder is never a
-/// top parent.
+/// What a tvshows library's walk resolved of a folder holding episodes
+/// ([`note_episode_folder`]).
+struct EpisodeFolder {
+    /// Whether its episodes are in a mixed folder.
+    mixed: bool,
+    /// Its stacks and episode version groups, when it has any: a folder whose
+    /// every video is one file resolves each file as an episode of its own.
+    groups: Option<VideoGroups>,
+}
+
+/// Where the TV walk plans an episode: its library, series and season.
+#[derive(Clone, Copy)]
+struct EpisodeHome<'a> {
+    /// The library's collection folder.
+    cf: Uuid,
+    /// The series.
+    series_id: Uuid,
+    /// The season's id and number, when the episode has one.
+    season: Option<(Uuid, Option<i32>)>,
+    /// The series' name.
+    series_name: &'a str,
+    /// The series' presentation key.
+    series_key: &'a str,
+    /// The season's name.
+    season_name: Option<&'a str>,
+}
+
+impl EpisodeHome<'_> {
+    /// What an episode here hangs off — its season, else the series — and its
+    /// ancestors.
+    fn parent(self) -> (Uuid, Vec<Uuid>) {
+        match self.season {
+            Some((season_id, _)) => (season_id, vec![self.cf, self.series_id, season_id]),
+            None => (self.series_id, vec![self.cf, self.series_id]),
+        }
+    }
+}
+
+/// Records what the episodes in `dir` (listed as `entries`) resolve to: a
+/// tvshows library resolves a folder's files through `ResolveVideos<Episode>`
+/// (`MovieResolver.cs:231-234`), which groups stacks and episode versions
+/// (`VideoListResolver.GetEpisodesGroupedByVersion`) and sets
+/// `IsInMixedFolder = Count > 1` — a series or season folder is never a top
+/// parent. A folder of an untyped library's series is not recorded: its
+/// files resolve one by one (`MovieResolver.cs:219-222`).
 fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx<'_>) {
     if !ctx.tv_library.get() {
         return;
     }
-    let mixed = resolved_videos(
+    let videos = resolved_videos(
         entries,
         dir,
         ctx.naming,
         true,
         true,
         Some(ferrofin_model::data::CollectionType::tvshows),
-    )
-    .len()
-        > 1;
-    ctx.episode_folders_mixed
-        .borrow_mut()
-        .insert(dir.to_owned(), mixed);
+    );
+    let mixed = videos.len() > 1;
+    let groups = VideoGroups::of(videos, ctx.naming);
+    let grouped = groups
+        .videos
+        .iter()
+        .any(|video| video.files.len() > 1 || !video.alternate_versions.is_empty());
+    ctx.episode_folders.borrow_mut().insert(
+        dir.to_owned(),
+        EpisodeFolder {
+            mixed,
+            groups: grouped.then_some(groups),
+        },
+    );
+}
+
+/// The stack or version group the episode file at `path` is in, if its
+/// folder resolved one holding it ([`note_episode_folder`]), and whether
+/// `path` is its first file — where the walk plans it.
+fn episode_group(
+    path: &str,
+    ctx: &PlanCtx<'_>,
+) -> Option<(ferrofin_naming::video::VideoInfo, bool)> {
+    let dir = Path::new(path).parent().and_then(Path::to_str)?;
+    let folders = ctx.episode_folders.borrow();
+    let (video, first) = folders.get(dir)?.groups.as_ref()?.holding(path)?;
+    let grouped = video.files.len() > 1 || !video.alternate_versions.is_empty();
+    grouped.then(|| (video.clone(), first))
+}
+
+/// Every file of `video`, a stack or version group: its own and each
+/// alternate version's.
+fn group_files(video: &ferrofin_naming::video::VideoInfo) -> impl Iterator<Item = &str> {
+    std::iter::once(video)
+        .chain(&video.alternate_versions)
+        .flat_map(|version| &version.files)
+        .map(|file| file.path.as_str())
+}
+
+/// Whether the TV walk plans the episode file at `path`: the scope keeps it
+/// or — when it is in a stack or a version group — any file of the group,
+/// which is planned whole ([`LibraryScanner::plan_episode_group`]).
+fn episode_file_kept(path: &str, ctx: &PlanCtx<'_>) -> bool {
+    ctx.scope.keeps(path)
+        || episode_group(path, ctx)
+            .is_some_and(|(video, _)| group_files(&video).any(|file| ctx.scope.keeps(file)))
 }
 
 /// The items upstream's `ResolveVideos` resolves from `entries`, the
@@ -29652,7 +29850,9 @@ mod tests {
     /// video extra get the file's `VideoType` like a movie
     /// (`BaseVideoResolver.SetVideoType`, `BaseVideoResolver.cs:139-145`):
     /// a disc image is `Iso` (with the path's `IsoType`), anything else a
-    /// `VideoFile`. A theme song is audio and gets none.
+    /// `VideoFile`. A theme song is audio and gets none. An episode, which
+    /// `ResolveVideos<Episode>` resolves, carries its (empty) parts and
+    /// versions lists too (`MovieResolver.cs:298-309`).
     #[tokio::test]
     async fn episodes_and_video_extras_carry_the_resolvers_video_type() {
         let tmp = tempfile::tempdir().unwrap();
@@ -29680,7 +29880,7 @@ mod tests {
             )
             .await
             .as_deref(),
-            Some(r#"{"VideoType":"VideoFile"}"#)
+            Some(r#"{"AdditionalParts":[],"LocalAlternateVersions":[],"VideoType":"VideoFile"}"#)
         );
         assert_eq!(
             data(
@@ -29690,7 +29890,9 @@ mod tests {
             )
             .await
             .as_deref(),
-            Some(r#"{"IsoType":"Dvd","VideoType":"Iso"}"#)
+            Some(
+                r#"{"AdditionalParts":[],"IsoType":"Dvd","LocalAlternateVersions":[],"VideoType":"Iso"}"#
+            )
         );
 
         let movies = tmp.path().join("movies");

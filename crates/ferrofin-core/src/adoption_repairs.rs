@@ -861,17 +861,15 @@ pub struct RehomedVersions {
     pub parts: usize,
 }
 
-/// The kinds whose version groups and stacks the movie walk plans
+/// The kinds whose version groups and stacks the walks plan
 /// (`MovieResolver.ResolveVideos`, `MovieResolver.cs:287-317`): a movie,
-/// a music video, a plain video.
-// TODO(step 12 S8): an `Episode`'s local versions and stacked parts join
-// these once the TV walk plans them (`EpisodeResolver` groups); until then
-// the TV walk plans each such file as an episode of its own, and a group
-// re-homed here would be undone by the next scan.
-const GROUPED_KINDS: [BaseItemKind; 3] = [
+/// a music video, a plain video, and an episode (`ResolveVideos<Episode>`,
+/// `MovieResolver.cs:231-234`).
+const GROUPED_KINDS: [BaseItemKind; 4] = [
     BaseItemKind::Movie,
     BaseItemKind::MusicVideo,
     BaseItemKind::Video,
+    BaseItemKind::Episode,
 ];
 
 /// One stored video [`rehome_local_versions`] reads.
@@ -899,8 +897,8 @@ struct GroupRow {
 /// them the shape the scan would store, so an adopted database's first scan
 /// writes nothing for them (owner decision D9c):
 ///
-/// - a local version — a row at a path in a movie's, music video's or
-///   video's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
+/// - a local version — a row at a path in a movie's, music video's,
+///   video's or episode's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
 ///   the primary's folder — of another type moves to the id the primary's
 ///   type derives for its path (the scan's re-key, with what is keyed by its
 ///   id and its folders; a 10.11 `Video` keeps its refresh stamp and
@@ -1049,13 +1047,14 @@ async fn listing_videos(db: &Database, key: &str) -> Result<Vec<GroupRow>, Servi
     let types = grouped_type_names();
     let rows: Vec<GroupRow> = sqlx::query_as(
         r#"SELECT "Id", "Type", "Path", "Data" FROM "BaseItems"
-           WHERE "Type" IN (?1, ?2, ?3) AND "ExtraType" IS NULL AND "Path" IS NOT NULL
-             AND "Data" IS NOT NULL AND instr("Data", ?4) > 0
+           WHERE "Type" IN (?1, ?2, ?3, ?4) AND "ExtraType" IS NULL AND "Path" IS NOT NULL
+             AND "Data" IS NOT NULL AND instr("Data", ?5) > 0
            ORDER BY "Id""#,
     )
     .bind(types[0])
     .bind(types[1])
     .bind(types[2])
+    .bind(types[3])
     .bind(format!("\"{key}\""))
     .fetch_all(db.pool())
     .await
@@ -1152,7 +1151,7 @@ async fn version_pairs(db: &Database) -> Result<Vec<OwnedPair>, ServiceError> {
            FROM "LinkedChildren" lc
            JOIN "BaseItems" p ON p."Id" = lc."ParentId"
            JOIN "BaseItems" c ON c."Id" = lc."ChildId"
-           WHERE lc."ChildType" = ?1 AND p."Type" IN (?2, ?3, ?4) AND p."ExtraType" IS NULL
+           WHERE lc."ChildType" = ?1 AND p."Type" IN (?2, ?3, ?4, ?5) AND p."ExtraType" IS NULL
              AND c."ExtraType" IS NULL AND c."Path" IS NOT NULL AND p."Path" IS NOT NULL
            ORDER BY lc."ParentId", lc."SortOrder""#,
     )
@@ -1160,6 +1159,7 @@ async fn version_pairs(db: &Database) -> Result<Vec<OwnedPair>, ServiceError> {
     .bind(types[0])
     .bind(types[1])
     .bind(types[2])
+    .bind(types[3])
     .fetch_all(db.pool())
     .await
     .map_err(db_err)?;
@@ -2246,6 +2246,122 @@ mod tests {
                 .unwrap(),
             RehomedVersions::default(),
             "the repaired shape is the 12.x one"
+        );
+    }
+
+    /// An episode's group takes the shape the TV walk plans
+    /// (`ResolveVideos<Episode>`): a version stored as an episode of its own
+    /// is owned by, points at and is linked under the primary, in its season;
+    /// a part stored as an episode moves to its `Video` id, owned by it.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one group's seed, then its three rows checked
+    async fn episode_versions_and_parts_take_their_owners_shape() {
+        const EPISODE: &str = "/tv/Show/Season 1/Show - S01E01 - 1080p.mkv";
+        const VERSION: &str = "/tv/Show/Season 1/Show - S01E01 - 720p.mkv";
+        const PART: &str = "/tv/Show/Season 1/Show - S01E01 - 1080p - part2.mkv";
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x2001);
+        let season = Uuid::from_u128(0x2002);
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Shows", None).await;
+        seed_folder_item(&db, season, BaseItemKind::Season, "Season 1", None).await;
+        let id = |kind, path| derive_item_id_with(&DERIVATION, kind, path).unwrap();
+        let (primary, version) = (
+            id(BaseItemKind::Episode, EPISODE),
+            id(BaseItemKind::Episode, VERSION),
+        );
+        let stored_part = id(BaseItemKind::Episode, PART);
+        for (item, path, mixed) in [
+            (primary, EPISODE, "1"),
+            (version, VERSION, "0"),
+            (stored_part, PART, "0"),
+        ] {
+            seed_item(&db, item, BaseItemKind::Episode).await;
+            set_path(&db, item, path).await;
+            set_columns(
+                &db,
+                item,
+                r#""ParentId" = ?2, "TopParentId" = ?3, "IsInMixedFolder" = ?4,
+                   "PresentationUniqueKey" = ?5"#,
+                &[
+                    Some(guid_to_db(season)),
+                    Some(guid_to_db(library)),
+                    Some(mixed.to_owned()),
+                    Some(item.as_simple().to_string()),
+                ],
+            )
+            .await;
+            add_ancestor(&db, item, library).await;
+            add_ancestor(&db, item, season).await;
+        }
+        set_data(
+            &db,
+            primary,
+            &format!(r#"{{"AdditionalParts":["{PART}"],"LocalAlternateVersions":["{VERSION}"]}}"#),
+        )
+        .await;
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rehomed,
+            RehomedVersions {
+                rekeyed: 1,
+                versions: 1,
+                parts: 1
+            }
+        );
+        let (owner, parent, top) = (
+            Some(guid_to_db(primary)),
+            Some(guid_to_db(season)),
+            Some(guid_to_db(library)),
+        );
+        let (type_, version_owner, pointer, key, version_parent, version_top, mixed, _) =
+            shape(&db, version).await.expect("version");
+        assert_eq!(
+            (
+                type_,
+                version_owner,
+                pointer,
+                key,
+                version_parent,
+                version_top,
+                mixed
+            ),
+            (
+                stored_type_name(BaseItemKind::Episode).unwrap().to_owned(),
+                owner.clone(),
+                owner.clone(),
+                Some(primary.as_simple().to_string()),
+                parent.clone(),
+                top.clone(),
+                true
+            )
+        );
+        assert!(
+            links(&db)
+                .await
+                .contains(&(guid_to_db(primary), guid_to_db(version), 2, 0))
+        );
+        assert!(!exists(&db, stored_part).await);
+        let part = id(BaseItemKind::Video, PART);
+        let (type_, part_owner, pointer, _, part_parent, part_top, mixed, _) =
+            shape(&db, part).await.expect("part");
+        assert_eq!(
+            (type_, part_owner, pointer, part_parent, part_top, mixed),
+            (
+                stored_type_name(BaseItemKind::Video).unwrap().to_owned(),
+                owner,
+                None,
+                parent,
+                top,
+                true
+            )
+        );
+        assert_eq!(
+            ancestors(&db, &guid_to_db(part)).await,
+            ancestors(&db, &guid_to_db(primary)).await
         );
     }
 

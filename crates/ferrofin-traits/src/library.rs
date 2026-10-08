@@ -1701,6 +1701,28 @@ pub trait MediaSourceManager: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// [`Self::get_alternate_versions_batch`] with, beside each row, whether
+    /// it has versions of its own (some other row names it as its
+    /// `PrimaryVersionId`), read in the same query. The default flags every
+    /// row the unflagged form returns.
+    async fn get_alternate_versions_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<
+            Uuid,
+            Vec<(ferrofin_db::entities::base_items::BaseItemEntity, bool)>,
+        >,
+        ServiceError,
+    > {
+        Ok(self
+            .get_alternate_versions_batch(primary_ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
+    }
+
     /// Gets the media attachments of an item as presentation DTOs.
     async fn get_media_attachments(
         &self,

@@ -208,11 +208,8 @@ pub const RESOLVED_VIDEO_PATH_LISTS: [&str; 2] = ["AdditionalParts", "LocalAlter
 /// which serializes both arrays on every `Video`.
 ///
 /// Upstream replaces both lists on every resolve, so a stack or version
-/// group that dissolves clears them; the movie walk writes both keys (`[]`
-/// when empty) for every video it plans, so it does here too.
-/// TODO(parity, open work item): the TV walk does not write them yet
-/// (PLAN_ITEM_FILE_DELETION step 12 S8): an episode's stale list survives
-/// until it does.
+/// group that dissolves clears them; the movie and TV walks write both keys
+/// (`[]` when empty) for every video they plan, so it does here too.
 ///
 /// `None` when that changes nothing, or `stored` is not a JSON object (a
 /// blob that cannot be read is never rewritten). An empty or absent `stored`

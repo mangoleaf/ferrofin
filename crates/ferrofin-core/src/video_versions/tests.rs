@@ -45,6 +45,34 @@ impl VersionRowReader for Rows {
         }
         Ok(map)
     }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        let pointed_at: HashSet<Uuid> = self
+            .0
+            .iter()
+            .filter_map(|row| {
+                parse_id(row.primary_version_id.as_deref()).filter(|p| *p != row_id(row))
+            })
+            .collect();
+        Ok(self
+            .rows_by_primary(ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| {
+                let flagged = rows
+                    .into_iter()
+                    .map(|row| {
+                        let versioned = pointed_at.contains(&row_id(&row));
+                        (row, versioned)
+                    })
+                    .collect();
+                (id, flagged)
+            })
+            .collect())
+    }
 }
 
 fn video(path: &str) -> BaseItemEntity {
@@ -521,6 +549,39 @@ fn additional_part_count_reads_the_list(#[case] data: Option<&str>, #[case] coun
     assert_eq!(additional_part_count(data), count);
 }
 
+/// `BaseItemTests.SupportsOwnedItems_EpisodeWithResolvedVersionOrPart_IsTrue`
+/// (`Episode.SupportsOwnedItems`, `Episode.cs:50`: `IsStacked ||
+/// LocalAlternateVersions.Length > 0 || MediaSourceCount > 1`): a version
+/// the scan just found beside an episode is not linked yet, so it does not
+/// count towards `MediaSourceCount`; the episode still owns — refreshes and
+/// copies its metadata to — the videos its resolved lists name.
+#[rstest]
+#[case(true, false, true)]
+#[case(false, true, true)]
+#[case(false, false, false)]
+fn an_episode_with_a_resolved_version_or_part_owns_videos(
+    #[case] has_local_version: bool,
+    #[case] is_stacked: bool,
+    #[case] expected: bool,
+) {
+    let versions: &[&str] = if has_local_version {
+        &["/TV/Show/Season 1/S01E01 - 720p.mkv"]
+    } else {
+        &[]
+    };
+    let parts: &[&str] = if is_stacked {
+        &["/TV/Show/Season 1/S01E01 - 1080p-part2.mkv"]
+    } else {
+        &[]
+    };
+    let data = serde_json::json!({
+        "AdditionalParts": parts,
+        "LocalAlternateVersions": versions,
+    })
+    .to_string();
+    assert_eq!(owns_videos(Some(&data)), expected);
+}
+
 /// [`Rows`], counting the reads.
 struct Counting(Rows, std::sync::atomic::AtomicUsize);
 
@@ -538,6 +599,14 @@ impl VersionRowReader for Counting {
         self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.0.rows_by_primary(ids).await
     }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.rows_by_primary_flagged(ids).await
+    }
 }
 
 async fn reads(all: &[&BaseItemEntity], queried: &[&BaseItemEntity]) -> usize {
@@ -549,9 +618,12 @@ async fn reads(all: &[&BaseItemEntity], queried: &[&BaseItemEntity]) -> usize {
     reader.1.into_inner()
 }
 
-/// The page read is pinned: one query for a page with no versions on it;
-/// one more for a version whose primary is off the page; a third only for a
-/// merged version that lists local versions of its own.
+/// The page read is pinned: one query for a page with no versions on it,
+/// and for a page whose versions have none of their own (each read flags
+/// the rows something points at); one more for a version whose primary is
+/// off the page; one more per level of versions that have versions (a
+/// merged version's local versions, or a merge left on a version a scan
+/// later grouped under another primary).
 #[tokio::test]
 async fn a_page_reads_its_version_groups_in_as_few_queries_as_it_needs() {
     let solo = video("/Movies/Solo/Solo.mkv");
@@ -584,6 +656,37 @@ async fn a_page_reads_its_version_groups_in_as_few_queries_as_it_needs() {
         2,
         "a merged version's own local versions"
     );
+}
+
+/// A group three levels deep — a version merged onto a version that a scan
+/// later grouped as another primary's local version — lists every row from
+/// any of its members, and reaches the chain's root.
+#[tokio::test]
+async fn a_three_level_chain_lists_the_whole_group_from_any_member() {
+    let mut head = video("/TV/Show/Season 1/Show - S01E01 - 1080p.mkv");
+    let mut local = video("/TV/Show/Season 1/Show - S01E01 - 720p.mkv");
+    local_version(&mut head, &mut local);
+    let mut merged = video("/TV2/Show/Season 1/Show - S01E01.mkv");
+    merged.primary_version_id = Some(local.id.clone());
+    let all = [&head, &local, &merged];
+    let ids = |rows: &[&BaseItemEntity]| {
+        let mut ids: Vec<Uuid> = rows.iter().map(|r| row_id(r)).collect();
+        ids.sort();
+        ids
+    };
+    for queried in all {
+        let reader = Rows(all.iter().map(|r| (*r).clone()).collect());
+        let versions = VersionRows::load(&reader, &[queried]).await.unwrap();
+        let mut found = versions.all_version_ids(queried);
+        found.sort();
+        assert_eq!(
+            found,
+            ids(&all),
+            "from {}",
+            queried.path.as_deref().unwrap()
+        );
+        assert_eq!(versions.chain_root(queried), row_id(&head));
+    }
 }
 
 /// `SetAlternateVersionResumeStates` over `SelectMostRecentlyPlayed`: the

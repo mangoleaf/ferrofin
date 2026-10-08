@@ -1808,6 +1808,9 @@ impl LibraryManager for FerrofinLibraryManager {
             item_ids: ids.clone(),
             include_owned_items: true,
             user: user.cloned(),
+            // Every version is its own source: a group's versions share the
+            // primary's presentation key, which a user query groups on.
+            group_by_presentation_unique_key: false,
             ..InternalItemsQuery::default()
         };
         let mut parts = self.items.get_item_list(&query).await?;

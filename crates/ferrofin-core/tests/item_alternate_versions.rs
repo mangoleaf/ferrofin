@@ -239,7 +239,14 @@ async fn video_listed_among_its_own_versions_keeps_its_own_primary_version_id() 
     assert_eq!(version_of(&db, primary).await.0, None);
 }
 
-/// `SaveItems_PromotedVersionStillPointingAtOldPrimary_DoesNotCreateACycle`.
+/// `SaveItems_PromotedVersionStillPointingAtOldPrimary_DoesNotCreateACycle`:
+/// no pointer cycle. Upstream gets there by skipping the old primary's
+/// demotion (`:731`) and leaving the promoted video pointing at it — which
+/// hides the whole group (the promoted video is a version, the old primary
+/// owned by it once the scan owns it). Ferrofin releases the promoted video
+/// instead, local beating linked, and demotes the old primary to it: the
+/// group's primary is visible and the expected values differ from the C#
+/// test's on purpose.
 #[tokio::test]
 async fn promoted_version_still_pointing_at_old_primary_does_not_create_a_cycle() {
     let db = test_db().await;
@@ -252,10 +259,13 @@ async fn promoted_version_still_pointing_at_old_primary_does_not_create_a_cycle(
     movie(&db, promoted, PRIMARY_PATH, None, Some(old_primary)).await;
     sync(&db, promoted, &[old_primary], &[]).await;
 
-    // Pointing the old primary back would hide both, and with them the whole
-    // group.
-    assert_eq!(version_of(&db, old_primary).await.0, None);
-    assert_eq!(version_of(&db, promoted).await.0, Some(old_primary));
+    // Pointing the old primary back while the promoted video keeps its
+    // pointer would make a cycle; the promoted video lets go instead.
+    assert_eq!(version_of(&db, promoted).await, (None, Some(key(promoted))));
+    assert_eq!(
+        version_of(&db, old_primary).await,
+        (Some(promoted), Some(key(promoted)))
+    );
 }
 
 /// Local outranks linked within the primary's own list (`:688-692`): the
@@ -562,11 +572,14 @@ async fn merge_versions_keeps_a_video_with_versions_as_the_primary() {
     }
 }
 
-/// A scan of a library whose walk does not group versions yet (TV, until
-/// step 12 S8) has no opinion on an owned version: an owned Episode version
-/// of a 12.x database keeps its owner, its primary and its link.
+/// A tvshows scan groups an episode's versions as `GetEpisodesGroupedByVersion`
+/// does — the resolution-named file first (`OrganizeAlternateVersions`) — and
+/// regroups a database that grouped them the other way round (a 12.x merge
+/// or an older resolver's primary): the rows keep their ids, the version
+/// is owned by, points at and is linked under the resolver's primary, and
+/// the old primary lets it go.
 #[tokio::test]
-async fn an_owned_episode_version_survives_a_scan() {
+async fn a_tv_scan_groups_episode_versions_and_regroups_a_stored_group() {
     let tmp = tempfile::tempdir().expect("tmp");
     let tv = tmp.path().join("tv");
     let season = tv.join("Show").join("Season 1");
@@ -604,24 +617,47 @@ async fn an_owned_episode_version_survives_a_scan() {
     let episode = |path: &Path| {
         derive_item_id(BaseItemKind::Episode, &path.to_string_lossy()).expect("episode id")
     };
-    let (primary, version) = (episode(&primary_path), episode(&version_path));
-    // The version as Jellyfin 12.x stores it: owned by its primary.
+    // `Show - S01E01 - 1080p` matches the resolution rule, so it leads.
+    let (primary, version) = (episode(&version_path), episode(&primary_path));
+    let grouped = |db: Database| async move {
+        assert_eq!(owner_of(&db, version).await, Some(primary));
+        assert_eq!(owner_of(&db, primary).await, None);
+        // The primary points at nothing, keyed by its own id.
+        assert_eq!(version_of(&db, primary).await, (None, Some(key(primary))));
+        assert_eq!(
+            version_of(&db, version).await,
+            (Some(primary), Some(key(primary)))
+        );
+        assert_eq!(links_under(&db, primary).await, vec![(version, 2, 0)]);
+        assert!(links_under(&db, version).await.is_empty());
+    };
+    grouped(db.clone()).await;
+    // The group stored the other way round: the plain file leading.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "OwnerId" = NULL, "PrimaryVersionId" = NULL,
+               "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(primary))
+    .bind(key(primary))
+    .execute(db.writer())
+    .await
+    .expect("primary");
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(db.writer())
+        .await
+        .expect("links");
     sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
-        .bind(guid_to_db(version))
         .bind(guid_to_db(primary))
+        .bind(guid_to_db(version))
         .execute(db.writer())
         .await
         .expect("owner");
-    sync(&db, primary, &[version], &[]).await;
+    sync(&db, version, &[primary], &[]).await;
+    assert_eq!(owner_of(&db, primary).await, Some(version));
 
     scanner.scan_all().await.expect("second scan");
 
-    assert_eq!(owner_of(&db, version).await, Some(primary));
-    assert_eq!(
-        version_of(&db, version).await,
-        (Some(primary), Some(key(primary)))
-    );
-    assert_eq!(links_under(&db, primary).await, vec![(version, 2, 0)]);
+    grouped(db.clone()).await;
 }
 
 /// One scan's groups decide from one read: a version that moved from P's

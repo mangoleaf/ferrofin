@@ -129,7 +129,8 @@ impl Fixture {
         .unwrap()
     }
 
-    /// Whether `user` played the item `id`.
+    /// Whether `user` played the item `id` (under any of its user-data
+    /// keys: an episode's are its id and its series position).
     async fn played(&self, id: &str, user: Uuid) -> bool {
         sqlx::query_scalar::<_, i64>(
             r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2
@@ -140,7 +141,7 @@ impl Fixture {
         .fetch_one(self.db.pool())
         .await
         .unwrap()
-            == 1
+            > 0
     }
 
     /// The non-extra rows no one owns: what browse lists.
@@ -1468,4 +1469,603 @@ async fn the_scan_scores_the_custom_rating_first_and_clears_a_lost_one() {
     let again = f.scanner.scan_all().await.unwrap();
     assert_eq!((again.created, again.updated), (0, 0), "{again:?}");
     assert_eq!(item_writes(&f.db).await, 0);
+}
+
+// ── TV episode stacks and versions (step 12 S8) ──────────────────────────
+//
+// A tvshows library resolves a season's (or a series folder's) files through
+// `ResolveVideos<Episode>` (`MovieResolver.cs:231-234,287-317`): a stack is one
+// episode whose other parts are owned `Video`s, and the versions of one
+// episode — the same season and episode in a confident parse
+// (`VideoListResolver.GetEpisodesGroupedByVersion`) — one episode whose
+// alternates are `Episode`s owned by and pointing at it.
+
+const E01_1080: &str = "Show/Season 1/Show - S01E01 - 1080p.mkv";
+const E01_720: &str = "Show/Season 1/Show - S01E01 - 720p.mkv";
+const E02: &str = "Show/Season 1/Show - S01E02.mkv";
+const E02_1080: &str = "Show/Season 1/Show - S01E02 - 1080p.mkv";
+const E02_720: &str = "Show/Season 1/Show - S01E02 - 720p.mkv";
+const E03_PART1: &str = "Show/Season 1/Show - S01E03 - part1.mkv";
+const E03_PART2: &str = "Show/Season 1/Show - S01E03 - part2.mkv";
+
+async fn shows(files: &[&str]) -> Fixture {
+    Fixture::new(files, Some(CollectionTypeOptions::tvshows)).await
+}
+
+/// Upstream `MovieResolverTests.ResolveMultiple_GivenTvShowsCollection_CreatesEpisodeItems`:
+/// three files of a tvshows season make two `Episode`s, `S01E01` with one
+/// local alternate version. Its alternate is an `Episode` too (the primary's
+/// type), owned by and pointing at the primary, keyed by its presentation
+/// key, in its folder state and season, numbered from its own file, and
+/// linked under it as a local version (`ChildType` 2); the other episode
+/// lists no parts and no versions.
+#[tokio::test]
+async fn tvshows_collection_groups_episode_versions() {
+    let f = shows(&[E01_1080, E01_720, E02]).await;
+    f.scanner.scan_all().await.unwrap();
+
+    let episode = stored_type_name(BaseItemKind::Episode).unwrap().to_owned();
+    assert_eq!(
+        f.titles().await,
+        vec![
+            (episode.clone(), f.path(E01_1080)),
+            (episode.clone(), f.path(E02)),
+        ]
+    );
+    let primary = f.row(E01_1080).await;
+    assert_eq!(
+        data_list(&primary, "LocalAlternateVersions"),
+        Some(vec![f.path(E01_720)])
+    );
+    assert_eq!(data_list(&primary, "AdditionalParts"), Some(Vec::new()));
+    let alternate = f.row(E01_720).await;
+    assert_eq!(
+        alternate.id,
+        guid_to_db(f.id(BaseItemKind::Episode, E01_720))
+    );
+    assert_eq!(kind_of(&alternate), "Episode");
+    assert_eq!(alternate.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&primary.id));
+    let key = Uuid::parse_str(&primary.id).unwrap().simple().to_string();
+    assert_eq!(alternate.presentation_unique_key, Some(key));
+    assert!(primary.is_in_mixed_folder, "two items in the season");
+    assert_eq!(alternate.is_in_mixed_folder, primary.is_in_mixed_folder);
+    for (column, of_alternate, of_primary) in [
+        ("ParentId", &alternate.parent_id, &primary.parent_id),
+        (
+            "TopParentId",
+            &alternate.top_parent_id,
+            &primary.top_parent_id,
+        ),
+        ("SeasonId", &alternate.season_id, &primary.season_id),
+        ("SeriesId", &alternate.series_id, &primary.series_id),
+        (
+            "SeriesPresentationUniqueKey",
+            &alternate.series_presentation_unique_key,
+            &primary.series_presentation_unique_key,
+        ),
+    ] {
+        assert_eq!(of_alternate, of_primary, "{column}");
+        assert!(of_alternate.is_some(), "{column}");
+    }
+    assert_eq!(
+        (alternate.parent_index_number, alternate.index_number),
+        (Some(1), Some(1))
+    );
+    assert_eq!(f.links(&primary.id).await, vec![(alternate.id.clone(), 2)]);
+    let lone = f.row(E02).await;
+    assert_eq!(lone.owner_id, None);
+    assert_eq!(data_list(&lone, "LocalAlternateVersions"), Some(Vec::new()));
+    assert_eq!(data_list(&lone, "AdditionalParts"), Some(Vec::new()));
+}
+
+/// A two-part episode is ONE episode: its first file the `Episode`, listing
+/// the other as `AdditionalParts`, which is a `Video` it owns, hung in its
+/// season in its folder state (`Video.RefreshMetadataForOwnedVideo`). The
+/// season counts its distinct episodes — a version group and a stack each
+/// once (`IsDistinctLibraryItem`) — for `ChildCount` and the played counts.
+#[tokio::test]
+async fn a_two_part_episode_is_one_episode_its_season_counts_once() {
+    use ferrofin_traits::persistence::ItemCountService as _;
+    let f = shows(&[E01_1080, E01_720, E03_PART1, E03_PART2]).await;
+    f.scanner.scan_all().await.unwrap();
+
+    let primary = f.row(E03_PART1).await;
+    assert_eq!(kind_of(&primary), "Episode");
+    assert_eq!(
+        data_list(&primary, "AdditionalParts"),
+        Some(vec![f.path(E03_PART2)])
+    );
+    let part = f.row(E03_PART2).await;
+    assert_eq!(part.id, guid_to_db(f.id(BaseItemKind::Video, E03_PART2)));
+    assert_eq!(kind_of(&part), "Video");
+    assert_eq!(part.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(part.primary_version_id, None);
+    assert_eq!(part.extra_type, None);
+    assert_eq!(part.parent_id, primary.parent_id);
+    assert_eq!(part.top_parent_id, primary.top_parent_id);
+    assert_eq!(part.is_in_mixed_folder, primary.is_in_mixed_folder);
+    assert_eq!(f.rows_at(E03_PART2).await, 1);
+
+    let season = Uuid::parse_str(primary.parent_id.as_deref().unwrap()).unwrap();
+    let counts = ferrofin_core::FerrofinItemCountService::new(f.db.clone());
+    let children = counts.get_child_count_batch(&[season], None).await.unwrap();
+    assert_eq!(children.get(&season), Some(&2));
+    let user = seed_user(&f.db).await;
+    for path in [E01_1080, E01_720, E03_PART1, E03_PART2] {
+        play(&f.db, &f.row(path).await.id, user).await;
+    }
+    let user: ferrofin_db::entities::users::UserEntity =
+        sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(user))
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+    let played = counts
+        .get_played_and_total_count_batch(&[season], &user)
+        .await
+        .unwrap();
+    let season_counts = played.get(&season).expect("season counts");
+    assert_eq!((season_counts.played, season_counts.total), (2, 2));
+}
+
+/// A TV library of versions and stacks — a stacked version among them, and
+/// loose episodes in a series folder with no season folders — rescans
+/// quietly: nothing created or updated, no `BaseItems` row written.
+#[tokio::test]
+async fn a_grouped_tv_library_rescans_quietly() {
+    let f = shows(&[
+        E01_1080,
+        E01_720,
+        E02,
+        E03_PART1,
+        E03_PART2,
+        "Show/Season 1/Show - S01E04.mkv",
+        "Show/Season 1/Show - S01E04 - 1080p part1.mkv",
+        "Show/Season 1/Show - S01E04 - 1080p part2.mkv",
+        "Flat/Flat S01E01 - 1080p.mkv",
+        "Flat/Flat S01E01 - 720p.mkv",
+        "Flat/Flat S01E02.mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    // A stacked version leads its group (`OrganizeAlternateVersions`
+    // prefers a stack): an `Episode` owning its `Video` part and the plain
+    // file's `Episode`.
+    let e04 = f.row("Show/Season 1/Show - S01E04 - 1080p part1.mkv").await;
+    let e04_part = f.row("Show/Season 1/Show - S01E04 - 1080p part2.mkv").await;
+    let e04_plain = f.row("Show/Season 1/Show - S01E04.mkv").await;
+    assert_eq!(kind_of(&e04), "Episode");
+    assert_eq!(e04.owner_id, None);
+    assert_eq!(e04_part.owner_id.as_ref(), Some(&e04.id));
+    assert_eq!(kind_of(&e04_part), "Video");
+    assert_eq!(e04_plain.owner_id.as_ref(), Some(&e04.id));
+    assert_eq!(kind_of(&e04_plain), "Episode");
+    // A series folder's loose versions group too, in their virtual season.
+    let flat = f.row("Flat/Flat S01E01 - 1080p.mkv").await;
+    let flat_alternate = f.row("Flat/Flat S01E01 - 720p.mkv").await;
+    assert_eq!(flat_alternate.owner_id.as_ref(), Some(&flat.id));
+    assert_eq!(flat_alternate.parent_id, flat.parent_id);
+    assert_eq!(flat_alternate.season_id, flat.season_id);
+
+    count_item_writes(&f.db).await;
+    let second = f.scanner.scan_all().await.unwrap();
+    assert_eq!((second.created, second.updated), (0, 0), "{second:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// An older Ferrofin scan stored every file of a season as an episode of its
+/// own: the scan moves a stack's second part to the `Video` id a part
+/// derives, owned by its episode, and makes a version the primary's — same
+/// id (both `Episode`s), owner, pointer, key and link — each with its user
+/// data (owner decision D9b).
+#[tokio::test]
+async fn per_file_episodes_regroup_with_their_user_data() {
+    let f = shows(&[E01_1080, E01_720, E03_PART1, E03_PART2]).await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(E01_1080).await;
+    let stack = f.row(E03_PART1).await;
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    let version = f
+        .restore_as(E01_720, |row| {
+            row.owner_id = None;
+            row.primary_version_id = None;
+            row.presentation_unique_key = None;
+        })
+        .await;
+    let older = guid_to_db(f.id(BaseItemKind::Episode, E03_PART2));
+    let episode_type = stored_type_name(BaseItemKind::Episode).unwrap().to_owned();
+    f.restore_as(E03_PART2, |row| {
+        row.id.clone_from(&older);
+        row.type_.clone_from(&episode_type);
+        row.owner_id = None;
+        row.season_id.clone_from(&stack.season_id);
+        row.series_id.clone_from(&stack.series_id);
+    })
+    .await;
+    let user = seed_user(&f.db).await;
+    play(&f.db, &version, user).await;
+    play(&f.db, &older, user).await;
+
+    f.scanner.scan_all().await.unwrap();
+    let alternate = f.row(E01_720).await;
+    assert_eq!(alternate.id, version);
+    assert_eq!(alternate.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&primary.id));
+    assert_eq!(f.links(&primary.id).await, vec![(version.clone(), 2)]);
+    assert!(f.played(&version, user).await);
+    assert_eq!(f.rows_at(E03_PART2).await, 1);
+    let part = f.row(E03_PART2).await;
+    assert_eq!(part.id, guid_to_db(f.id(BaseItemKind::Video, E03_PART2)));
+    assert_eq!(kind_of(&part), "Video");
+    assert_eq!(part.owner_id.as_ref(), Some(&stack.id));
+    assert!(f.played(&part.id, user).await, "its user data moved");
+
+    count_item_writes(&f.db).await;
+    let again = f.scanner.scan_all().await.unwrap();
+    assert_eq!((again.created, again.updated), (0, 0), "{again:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// A configuration manager with the factory configuration, for the user
+/// data manager.
+struct FactoryConfig;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for FactoryConfig {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        unreachable!("not used in these tests")
+    }
+
+    async fn configuration(
+        &self,
+    ) -> Result<
+        Arc<ferrofin_model::configuration::ServerConfiguration>,
+        ferrofin_traits::error::ServiceError,
+    > {
+        Ok(Arc::new(ferrofin_core::default_server_configuration()))
+    }
+
+    async fn update_configuration(
+        &self,
+        _configuration: &ferrofin_model::configuration::ServerConfiguration,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ferrofin_traits::error::ServiceError>
+    {
+        Ok(ferrofin_model::branding::BrandingOptions::default())
+    }
+
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+}
+
+/// `user` marks the item at `relative` played through the user data
+/// manager, which gives its whole version group the played state
+/// (`Video.PropagatePlayedState`).
+async fn mark_played(f: &Fixture, relative: &str, user: Uuid) {
+    use ferrofin_traits::library::UserDataManager as _;
+    let id = Uuid::parse_str(&f.row(relative).await.id).unwrap();
+    ferrofin_core::FerrofinUserDataManager::new(f.db.clone(), Arc::new(FactoryConfig))
+        .mark_played(user, id, Some("2026-10-01T00:00:00Z".parse().unwrap()))
+        .await
+        .unwrap();
+}
+
+/// The user's row, for the next-up query.
+async fn user_row(f: &Fixture, user: Uuid) -> ferrofin_db::entities::users::UserEntity {
+    sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(user))
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+}
+
+/// The next-up batch of `user` over the library of the episode at
+/// `relative`: its series' key and what the batch answers for it.
+async fn next_up_of(
+    f: &Fixture,
+    relative: &str,
+    user: Uuid,
+) -> (
+    String,
+    ferrofin_traits::persistence::NextUpEpisodeBatchResult,
+) {
+    use ferrofin_traits::persistence::NextUpService as _;
+    let episode = f.row(relative).await;
+    let top = Uuid::parse_str(episode.top_parent_id.as_deref().unwrap()).unwrap();
+    let service = ferrofin_core::FerrofinNextUpService::new(f.db.clone());
+    let filter = ferrofin_traits::options::InternalItemsQuery {
+        user: Some(user_row(f, user).await),
+        top_parent_ids: vec![top],
+        ..Default::default()
+    };
+    let keys = service
+        .get_next_up_series_keys(&filter, "2000-01-01T00:00:00Z".parse().unwrap())
+        .await
+        .unwrap();
+    let key = episode.series_presentation_unique_key.unwrap();
+    assert_eq!(keys, vec![key.clone()]);
+    let mut batch = service
+        .get_next_up_episodes_batch(&filter, &keys, false, false)
+        .await
+        .unwrap();
+    let series = batch.remove(&key).expect("series");
+    (key, series)
+}
+
+/// Next up lists one item per episode group: the primary, never an
+/// alternate or a part, and the episode after the one watched — though
+/// only an alternate version of it was marked played.
+#[tokio::test]
+async fn next_up_shows_one_item_per_episode_group() {
+    let f = shows(&[E01_1080, E01_720, E02_1080, E02_720, E03_PART1, E03_PART2]).await;
+    f.scanner.scan_all().await.unwrap();
+    let user = seed_user(&f.db).await;
+    mark_played(&f, E01_720, user).await;
+    assert!(
+        f.played(&f.row(E01_1080).await.id, user).await,
+        "propagated"
+    );
+
+    let (_, series) = next_up_of(&f, E01_1080, user).await;
+    assert_eq!(
+        series.last_watched.as_ref().map(|e| e.id.clone()),
+        Some(f.row(E01_1080).await.id)
+    );
+    assert_eq!(
+        series.next_up.as_ref().map(|e| e.id.clone()),
+        Some(f.row(E02_1080).await.id)
+    );
+}
+
+/// Stores the row at `relative` with `PrimaryVersionId` = the row at
+/// `onto`, unowned, keyed by `onto`, and a type-3 merge row under `onto`:
+/// what the merge-versions plugin left on a Jellyfin 12.1 database.
+async fn merge_onto(f: &Fixture, relative: &str, onto: &str) {
+    let (row, target) = (f.row(relative).await, f.row(onto).await);
+    let key = Uuid::parse_str(&target.id).unwrap().simple().to_string();
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "OwnerId" = NULL, "PrimaryVersionId" = ?2,
+               "PresentationUniqueKey" = ?3 WHERE "Id" = ?1"#,
+    )
+    .bind(&row.id)
+    .bind(&target.id)
+    .bind(key)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, (SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = ?1), ?2, 3)"#,
+    )
+    .bind(&target.id)
+    .bind(&row.id)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+}
+
+/// Stores the row at `relative` as no version at all: unowned, pointing at
+/// nothing, keyed by its own id, no version rows under it.
+async fn unversion(f: &Fixture, relative: &str) {
+    let row = f.row(relative).await;
+    let key = Uuid::parse_str(&row.id).unwrap().simple().to_string();
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "OwnerId" = NULL, "PrimaryVersionId" = NULL,
+               "PresentationUniqueKey" = ?2 WHERE "Id" = ?1"#,
+    )
+    .bind(&row.id)
+    .bind(key)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
+        .bind(&row.id)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+}
+
+/// The episodes browse lists: no owner (or an extra) and no version of a
+/// primary in the same library (`TranslateQuery`'s default arm).
+async fn visible_episodes(f: &Fixture) -> Vec<String> {
+    let mut paths: Vec<String> = sqlx::query_scalar(
+        r#"SELECT bi."Path" FROM "BaseItems" bi
+           WHERE bi."Type" LIKE '%.Episode'
+             AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)
+             AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p
+                  WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#,
+    )
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    paths.sort();
+    paths
+}
+
+/// A Jellyfin 12.1 database merged an episode's two files the other way
+/// round from the resolver: the head (`1080p`) points at its own same-folder
+/// alternate (`720p`) through a type-3 merge. Local beats linked: the scan
+/// releases the head from the merge, drops the merge's row and makes the
+/// `720p` the head's local version — one visible episode, the next-up pick,
+/// and no pointer cycle (upstream keeps the head's pointer and hides the
+/// whole group; not ported).
+#[tokio::test]
+async fn a_head_merged_onto_its_own_alternate_is_released() {
+    const E01: &str = "Show/Season 1/Show - S01E01.mkv";
+    let f = shows(&[E01, E02_1080, E02_720]).await;
+    f.scanner.scan_all().await.unwrap();
+    unversion(&f, E02_720).await;
+    merge_onto(&f, E02_1080, E02_720).await;
+    let (head, alternate) = (f.row(E02_1080).await, f.row(E02_720).await);
+    assert_eq!(head.primary_version_id.as_ref(), Some(&alternate.id));
+
+    f.scanner.scan_all().await.unwrap();
+
+    let (head, alternate) = (f.row(E02_1080).await, f.row(E02_720).await);
+    assert_eq!(head.primary_version_id, None);
+    let head_key = Uuid::parse_str(&head.id).unwrap().simple().to_string();
+    assert_eq!(head.presentation_unique_key.as_ref(), Some(&head_key));
+    assert_eq!(alternate.owner_id.as_ref(), Some(&head.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&head.id));
+    assert_eq!(alternate.presentation_unique_key, Some(head_key));
+    assert!(
+        f.links(&alternate.id).await.is_empty(),
+        "the merge row goes"
+    );
+    assert_eq!(f.links(&head.id).await, vec![(alternate.id.clone(), 2)]);
+    assert_eq!(
+        visible_episodes(&f).await,
+        vec![f.path(E01), f.path(E02_1080)]
+    );
+
+    let user = seed_user(&f.db).await;
+    mark_played(&f, E01, user).await;
+    let (_, series) = next_up_of(&f, E01, user).await;
+    assert_eq!(series.next_up.map(|e| e.id), Some(head.id));
+
+    count_item_writes(&f.db).await;
+    let again = f.scanner.scan_all().await.unwrap();
+    assert_eq!((again.created, again.updated), (0, 0), "{again:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// The head is merged onto a copy in another folder, and so is the file
+/// beside it: the scan makes that file the head's local version (its
+/// pointer moves to the head), leaves the copy's merge rows alone and the
+/// copy visible as the group's primary — the local version two levels
+/// below it, whose progress reaches the copy in next up.
+#[tokio::test]
+async fn a_head_merged_onto_a_copy_elsewhere_keeps_the_copy() {
+    const COPY: &str = "Copy/Season 1/Copy - S01E02.mkv";
+    let f = shows(&[E02_1080, E02_720, COPY]).await;
+    f.scanner.scan_all().await.unwrap();
+    unversion(&f, E02_720).await;
+    merge_onto(&f, E02_1080, COPY).await;
+    merge_onto(&f, E02_720, COPY).await;
+    let copy = f.row(COPY).await;
+    assert_eq!(f.links(&copy.id).await.len(), 2);
+
+    f.scanner.scan_all().await.unwrap();
+
+    let (head, alternate) = (f.row(E02_1080).await, f.row(E02_720).await);
+    assert_eq!(head.primary_version_id.as_ref(), Some(&copy.id));
+    assert_eq!(alternate.owner_id.as_ref(), Some(&head.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&head.id));
+    assert_eq!(
+        f.links(&copy.id).await,
+        vec![(head.id.clone(), 3), (alternate.id.clone(), 3)],
+        "the copy's merge rows survive"
+    );
+    assert_eq!(f.links(&head.id).await, vec![(alternate.id.clone(), 2)]);
+    assert_eq!(f.row(COPY).await.primary_version_id, None);
+    assert_eq!(visible_episodes(&f).await, vec![f.path(COPY)]);
+}
+/// A path-scoped scan of a new episode version — the watcher reporting the
+/// one file — refreshes its whole group: the version is created as the
+/// primary's and the primary lists it.
+#[tokio::test]
+async fn a_scoped_scan_of_a_new_episode_version_refreshes_its_group() {
+    let f = shows(&[E01_720, E02]).await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(E01_720).await.owner_id, None);
+    touch(&f.media, E01_1080);
+    f.scanner.scan_paths(&[f.path(E01_1080)]).await.unwrap();
+
+    // The resolution-named file sorts first; the old one becomes its version.
+    let primary = f.row(E01_1080).await;
+    let version = f.row(E01_720).await;
+    assert_eq!(primary.owner_id, None);
+    assert_eq!(version.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(
+        data_list(&primary, "LocalAlternateVersions"),
+        Some(vec![f.path(E01_720)])
+    );
+    assert_eq!(f.links(&primary.id).await, vec![(version.id, 2)]);
+}
+
+/// A series' `DateLastMediaAdded` is the newest of the episodes its
+/// children list (`Folder.GetRecursiveChildren` through `GetCachedChildren`,
+/// which no local version or part reaches): a version file found beside an
+/// episode later moves no date.
+#[tokio::test]
+async fn a_new_episode_version_is_no_new_media_of_its_series() {
+    let f = shows(&[E01_1080, E02]).await;
+    f.scanner.scan_all().await.unwrap();
+    let series_added = || async {
+        let series = f.row(E02).await.series_id.unwrap();
+        sqlx::query_scalar::<_, Option<String>>(
+            r#"SELECT "DateLastMediaAdded" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(series)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
+    let before = series_added().await;
+    assert!(before.is_some());
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    touch(&f.media, E01_720);
+    f.scanner.scan_all().await.unwrap();
+    let version = f.row(E01_720).await;
+    assert!(version.owner_id.is_some(), "a local version");
+    assert_eq!(series_added().await, before);
+}
+
+/// The per-user version filter of a page's media sources
+/// (`MediaSourceManager.cs:397-403`: each version's `IsVisible(user)`) keeps
+/// every version a user may open: the versions share their primary's
+/// presentation key, which a user query groups on unless told not to — then
+/// one version of each group stood for all, and a movie with two local
+/// versions listed two sources of three.
+#[tokio::test]
+async fn every_version_a_user_may_open_passes_the_source_filter() {
+    use ferrofin_traits::persistence::ItemRepository as _;
+    const FILES: [&str; 3] = [
+        "Film (2001)/Film (2001).mkv",
+        "Film (2001)/Film (2001) - 1080p.mkv",
+        "Film (2001)/Film (2001) - 720p.mkv",
+    ];
+    let f = Fixture::movies(&FILES).await;
+    f.scanner.scan_all().await.unwrap();
+    let mut ids = Vec::new();
+    for file in FILES {
+        ids.push(Uuid::parse_str(&f.row(file).await.id).unwrap());
+    }
+    let user = seed_user(&f.db).await;
+    let repo = FerrofinItemRepository::new(f.db.clone(), Arc::new(ItemTypeLookup::new()));
+    let query = |grouped: bool| ferrofin_traits::options::InternalItemsQuery {
+        item_ids: ids.clone(),
+        include_owned_items: true,
+        group_by_presentation_unique_key: grouped,
+        ..Default::default()
+    };
+    let user = user_row_of(&f, user).await;
+    let visible = |grouped: bool| {
+        let mut q = query(grouped);
+        q.user = Some(user.clone());
+        q
+    };
+    assert_eq!(repo.get_item_ids(&visible(false)).await.unwrap().len(), 3);
+    assert!(
+        repo.get_item_ids(&visible(true)).await.unwrap().len() < 3,
+        "grouping on the key collapses the versions"
+    );
+}
+
+async fn user_row_of(f: &Fixture, user: Uuid) -> ferrofin_db::entities::users::UserEntity {
+    user_row(f, user).await
 }

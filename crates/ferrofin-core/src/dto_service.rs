@@ -380,6 +380,15 @@ impl crate::video_versions::VersionRowReader for DtoVersionReader<'_> {
     ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
         self.media_sources.get_alternate_versions_batch(ids).await
     }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        self.media_sources
+            .get_alternate_versions_batch_flagged(ids)
+            .await
+    }
 }
 
 fn row_id(item: &BaseItemEntity) -> Uuid {
@@ -3780,12 +3789,12 @@ impl FerrofinDtoService {
             .collect();
         // Every row the page's version groups reach (`Video.
         // GetAllItemsForMediaSources`): the versions pointing at a page item,
-        // the primary of a page item that is a version (and that primary's
-        // versions) and the local versions of a merged one — so each item's
-        // sources build without a per-item query; their streams join the
-        // stream batch below. One query for a page with no versions on it,
-        // as before; the other two run only when the page holds a version or
-        // a merged group.
+        // the primary of a page item that is a version (up its pointer
+        // chain, and that primary's versions) and the versions of each
+        // version, level by level — so each item's sources build without a
+        // per-item query; their streams join the stream batch below. One
+        // query for a page with no versions on it, as before; the others run
+        // only when the page holds a version or a group.
         let want_sources = options.contains_field(ItemFields::MediaSources);
         let mut versions = if want_sources && !media_ids.is_empty() {
             let media_rows: Vec<&BaseItemEntity> = items
@@ -3889,6 +3898,9 @@ impl FerrofinDtoService {
                     item_ids: versions.ids().collect(),
                     include_owned_items: true,
                     user: Some(user.clone()),
+                    // Every version is its own source: a group's versions share the
+                    // primary's presentation key, which a user query groups on.
+                    group_by_presentation_unique_key: false,
                     ..ferrofin_traits::options::InternalItemsQuery::default()
                 };
                 Some(

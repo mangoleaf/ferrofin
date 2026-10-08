@@ -547,8 +547,8 @@ impl FerrofinUserDataManager {
     /// `!PrimaryVersionId.HasValue && LinkedAlternateVersions.Length == 0 &&
     /// !HasLocalAlternateVersions` guard); only a video with versions pays
     /// the two reads that find them
-    /// ([`VersionRows`](crate::video_versions::VersionRows)), and a third
-    /// only when a merged version lists local versions of its own.
+    /// ([`VersionRows`](crate::video_versions::VersionRows)), and one more
+    /// per further level of versions it finds.
     async fn propagate_played_state(
         &self,
         user_id: Uuid,

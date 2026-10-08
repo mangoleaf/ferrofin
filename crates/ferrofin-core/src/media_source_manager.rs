@@ -173,6 +173,9 @@ impl FerrofinMediaSourceManager {
             item_ids: ids,
             include_owned_items: true,
             user: Some(user),
+            // Every version is its own source: a group's versions share the
+            // primary's presentation key, which a user query groups on.
+            group_by_presentation_unique_key: false,
             ..ferrofin_traits::options::InternalItemsQuery::default()
         };
         Ok(Some(
@@ -1049,6 +1052,18 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
     {
         self.items
             .get_items_by_primary_version_batch(primary_ids)
+            .await
+    }
+
+    async fn get_alternate_versions_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<
+        HashMap<Uuid, Vec<(ferrofin_db::entities::base_items::BaseItemEntity, bool)>>,
+        ServiceError,
+    > {
+        self.items
+            .get_items_by_primary_version_batch_flagged(primary_ids)
             .await
     }
 

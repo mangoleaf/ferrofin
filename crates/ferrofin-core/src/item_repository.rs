@@ -2282,6 +2282,13 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(map)
     }
 
+    async fn get_items_by_primary_version_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        rows_by_primary_flagged(&self.db, primary_ids).await
+    }
+
     async fn get_items_with_provider_id(
         &self,
         provider_key: &str,
@@ -2776,6 +2783,62 @@ pub(crate) async fn select_item_rows_on(
         rows.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
     }
     Ok(rows)
+}
+
+/// A row and whether some other row names it as its `PrimaryVersionId`.
+#[derive(sqlx::FromRow)]
+struct FlaggedRow {
+    #[sqlx(flatten)]
+    row: BaseItemEntity,
+    #[sqlx(rename = "HasVersions")]
+    has_versions: bool,
+}
+
+/// The statement [`rows_by_primary_flagged`] runs over `n` primary ids: the
+/// rows pointing at them (never the placeholder row, never one pointing at
+/// itself), each with whether a row points at IT — an `EXISTS` the partial
+/// `FerrofinIX_BaseItems_PrimaryVersionId` answers by one seek per row.
+pub(crate) fn rows_by_primary_flagged_sql(n: usize) -> String {
+    format!(
+        r#"SELECT b.*, EXISTS (SELECT 1 FROM "BaseItems" x
+                               WHERE x."PrimaryVersionId" = b."Id" AND x."Id" <> b."Id")
+                   AS "HasVersions"
+           FROM "BaseItems" b
+           WHERE b."PrimaryVersionId" IN ({}) AND b."Id" <> ?{} AND b."Id" <> b."PrimaryVersionId""#,
+        placeholders(n),
+        n + 1
+    )
+}
+
+/// The rows naming each of `primary_ids` as their `PrimaryVersionId`, by
+/// that id, each with whether it has versions of its own — one query per
+/// chunk ([`rows_by_primary_flagged_sql`]).
+pub(crate) async fn rows_by_primary_flagged(
+    db: &Database,
+    primary_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+    let mut map: HashMap<Uuid, Vec<(BaseItemEntity, bool)>> = HashMap::new();
+    for chunk in primary_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = rows_by_primary_flagged_sql(chunk.len());
+        let mut query = sqlx::query_as::<_, FlaggedRow>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        query = query.bind(PLACEHOLDER_ID);
+        for flagged in query.fetch_all(db.pool()).await.map_err(db_err)? {
+            if let Some(primary) = flagged
+                .row
+                .primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                map.entry(primary)
+                    .or_default()
+                    .push((flagged.row, flagged.has_versions));
+            }
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -3581,6 +3644,64 @@ mod tests {
             !plan.iter().any(|d| d.trim() == "SCAN BaseItems"),
             "the locked-item read must not scan BaseItems, got: {plan:?}"
         );
+    }
+
+    /// The flagged version read seeks a `PrimaryVersionId` index twice —
+    /// for the rows pointing at the page's ids, and for each row's "does
+    /// anything point at it" flag — and scans nothing: the flag costs one
+    /// index seek per version row, never a pass over `BaseItems`. (The
+    /// planner takes Jellyfin's `IX_BaseItems_PrimaryVersionId` where the
+    /// schema has it, Ferrofin's partial one otherwise; either seeks.) It
+    /// answers the flag too: a version with a version of its own, and one
+    /// without.
+    #[tokio::test]
+    async fn the_flagged_version_read_seeks_the_partial_index() {
+        let db = test_db().await;
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            rows_by_primary_flagged_sql(2)
+        )));
+        for _ in 0..3 {
+            query = query.bind("00000000-0000-0000-0000-000000000001");
+        }
+        let plan: Vec<String> = query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect();
+        let seeks = |alias: &str| {
+            plan.iter().any(|d| {
+                d.starts_with(&format!("SEARCH {alias} USING"))
+                    && d.contains("_PrimaryVersionId (PrimaryVersionId=?)")
+            })
+        };
+        assert!(seeks("b"), "the rows by their pointer, got: {plan:?}");
+        assert!(seeks("x"), "the flag by the same index, got: {plan:?}");
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN")),
+            "no scan, got: {plan:?}"
+        );
+
+        let (primary, merged, local) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [primary, merged, local] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        for (id, to) in [(merged, primary), (local, merged)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(guid_to_db(to))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        let flagged = rows_by_primary_flagged(&db, &[primary, merged])
+            .await
+            .unwrap();
+        let flag = |under: Uuid| -> Vec<bool> { flagged[&under].iter().map(|(_, f)| *f).collect() };
+        assert_eq!(flag(primary), vec![true], "the merged version has one");
+        assert_eq!(flag(merged), vec![false], "the local version has none");
     }
 
     /// Two rows sharing a `CleanName` must resolve to the SAME id under both

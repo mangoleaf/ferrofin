@@ -3658,11 +3658,17 @@ struct LocalVersionWrites {
     release: Vec<Uuid>,
     /// Listed versions that are not stored (skipped, as upstream does).
     missing: Vec<Uuid>,
+    /// Version rows to drop under another parent, `(ParentId, ChildId)`: the
+    /// merge that pointed the primary at one of its own local versions.
+    unlink: Vec<(Uuid, Uuid)>,
 }
 
 impl LocalVersionWrites {
     fn is_empty(&self) -> bool {
-        self.rows.is_none() && self.demote.is_empty() && self.release.is_empty()
+        self.rows.is_none()
+            && self.demote.is_empty()
+            && self.release.is_empty()
+            && self.unlink.is_empty()
     }
 }
 
@@ -3794,8 +3800,17 @@ async fn local_version_writes(
 ///   row stays for the scan's prune to judge (owner decision D9b);
 /// - each listed version not yet pointing at the primary is demoted
 ///   (`:727-756`): `PrimaryVersionId` = the primary and
-///   `PresentationUniqueKey` = its "N" id — except the one the primary
-///   itself points at (`:731`), which would hide the whole group;
+///   `PresentationUniqueKey` = its "N" id;
+/// - a primary that a merge pointed at one of its own listed versions — a
+///   type-3 row under the version — is released from it, local beating
+///   linked as within one list (`:688-692`): the primary points at nothing
+///   again, with its own id as its key, the merge's row for the pair goes,
+///   and the version is demoted to it like any other. Upstream skips that
+///   version's demotion (`:731`) and keeps the primary's pointer, which
+///   leaves the version owned by the primary and the primary merged onto the
+///   version — the whole group hidden, no next-up candidate. That is not
+///   ported. Other versions merged onto the old target stay as they are,
+///   one level further from the group's primary;
 /// - a released version still pointing at the primary and no longer owned
 ///   by it points at nothing again, with its own id as its key.
 fn group_writes(
@@ -3845,7 +3860,6 @@ fn group_writes(
     writes.demote = listed
         .iter()
         .copied()
-        .filter(|v| Some(*v) != head.primary)
         .filter(|v| states.get(v).is_some_and(|s| s.primary != Some(primary)))
         .collect();
     writes.release = released
@@ -3856,6 +3870,10 @@ fn group_writes(
                 .is_some_and(|s| s.primary == Some(primary) && s.owner != Some(primary))
         })
         .collect();
+    if let Some(target) = head.primary.filter(|target| is_listed(target)) {
+        writes.release.push(primary);
+        writes.unlink.push((target, primary));
+    }
     writes
 }
 
@@ -3933,6 +3951,16 @@ async fn apply_local_version_writes(
             .execute(&mut *conn)
             .await?;
         }
+    }
+    for &(parent, child) in &writes.unlink {
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren"
+               WHERE "ParentId" = ?1 AND "ChildId" = ?2 AND "ChildType" IN (2, 3)"#,
+        )
+        .bind(guid_to_db(parent))
+        .bind(guid_to_db(child))
+        .execute(&mut *conn)
+        .await?;
     }
     for &version in &writes.demote {
         point_version_at(conn, version, Some(primary)).await?;
@@ -4887,6 +4915,14 @@ pub(crate) fn folder_run_time_sums_sql(n: usize, kinds: usize) -> String {
 /// `YYYY-MM-DD HH:MM:SS[.fffffff]` text (EF Core's form, and
 /// [`datetime_to_db`]'s), whose textual order is chronological, so its
 /// `MAX` is the latest.
+///
+/// The descendants are the ones upstream's `Folder.GetRecursiveChildren`
+/// walks (`MetadataService.cs:429-436`): each folder's children as
+/// `GetCachedChildren` lists them (`Folder.cs:932-940`), through the default
+/// arm of `TranslateQuery` (`BaseItemRepository.TranslateQuery.cs:798-811`)
+/// — no stacked part or local alternate version (owned, no extra), and no
+/// version merged onto a primary in the same library. A version file found
+/// beside an episode is no new media of its series.
 pub(crate) fn folder_last_media_added_sql(n: usize) -> String {
     format!(
         r#"SELECT f."Id", f."DateLastMediaAdded",
@@ -4894,7 +4930,12 @@ pub(crate) fn folder_last_media_added_sql(n: usize) -> String {
                      FROM "AncestorIds" AS a
                      CROSS JOIN "BaseItems" AS c ON c."Id" = a."ItemId"
                     WHERE a."ParentItemId" = f."Id"
-                      AND c."IsFolder" = 0 AND c."IsVirtualItem" = 0)
+                      AND c."IsFolder" = 0 AND c."IsVirtualItem" = 0
+                      AND (c."OwnerId" IS NULL OR c."ExtraType" IS NOT NULL)
+                      AND (c."PrimaryVersionId" IS NULL OR NOT EXISTS (
+                          SELECT 1 FROM "BaseItems" AS p
+                           WHERE p."Id" = c."PrimaryVersionId"
+                             AND p."TopParentId" IS c."TopParentId")))
              FROM "BaseItems" AS f
             WHERE f."Id" IN ({})"#,
         numbered_placeholders(n)
@@ -8935,6 +8976,73 @@ mod tests {
                 .unwrap();
         }
         (artist, album, series, at(3))
+    }
+
+    /// A series' last-media date takes the children `GetCachedChildren`
+    /// lists: a local version (owned, no extra) and a version merged onto a
+    /// primary in the same library are not among them; a version merged onto
+    /// a primary in another library is (`ApplyAlternateVersionFiltering`
+    /// hides only a same-library one).
+    #[tokio::test]
+    async fn last_media_added_skips_versions_of_a_same_library_primary() {
+        use chrono::TimeZone as _;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let at = |d| chrono::Utc.with_ymd_and_hms(2024, 2, d, 0, 0, 0).unwrap();
+        let (library, other_library) = (Uuid::new_v4(), Uuid::new_v4());
+        let (series, primary, local, merged, elsewhere) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let episode = |id: Uuid, day: u32, top: Uuid| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Episode).unwrap().to_owned(),
+            date_created: Some(at(day)),
+            top_parent_id: Some(guid_to_db(top)),
+            ..BaseItemEntity::default()
+        };
+        let rows = vec![
+            BaseItemEntity {
+                id: guid_to_db(series),
+                type_: stored_type_name(BaseItemKind::Series).unwrap().to_owned(),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            },
+            episode(primary, 1, library),
+            BaseItemEntity {
+                owner_id: Some(guid_to_db(primary)),
+                primary_version_id: Some(guid_to_db(primary)),
+                ..episode(local, 5, library)
+            },
+            BaseItemEntity {
+                primary_version_id: Some(guid_to_db(primary)),
+                ..episode(merged, 6, library)
+            },
+        ];
+        service.save_items(&rows).await.expect("seed");
+        for id in [primary, local, merged] {
+            service.set_ancestors(id, &[series]).await.unwrap();
+        }
+        let added = |service: &FerrofinItemPersistenceService| {
+            let service = service.clone();
+            async move { service.folder_last_media_added(&[series]).await.unwrap()[&series].aggregate }
+        };
+        assert_eq!(added(&service).await, Some(at(1)), "versions skipped");
+
+        // A version merged onto the primary from another library counts.
+        service
+            .save_items(&[BaseItemEntity {
+                primary_version_id: Some(guid_to_db(primary)),
+                ..episode(elsewhere, 7, other_library)
+            }])
+            .await
+            .expect("seed");
+        service.set_ancestors(elsewhere, &[series]).await.unwrap();
+        assert_eq!(added(&service).await, Some(at(7)));
     }
 
     /// `UpdateCumulativeRunTimeTicks` / `UpdateDateLastMediaAdded`

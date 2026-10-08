@@ -356,6 +356,23 @@ pub trait ItemRepository: Send + Sync {
         Ok(map)
     }
 
+    /// [`Self::get_items_by_primary_version_batch`] with, beside each row,
+    /// whether some other row names it as its `PrimaryVersionId` — whether
+    /// it has versions of its own — read in the same query, so a walk down
+    /// a version group stops where nothing hangs below. The default reads
+    /// the rows alone and flags every one (a walk then asks again for each).
+    async fn get_items_by_primary_version_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        Ok(self
+            .get_items_by_primary_version_batch(primary_ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
+    }
+
     /// The merged versions of `primary_id` — what
     /// `LibraryManager.GetLinkedAlternateVersions` lists and
     /// `DELETE /Videos/{id}/AlternateSources` splits: the children of its
