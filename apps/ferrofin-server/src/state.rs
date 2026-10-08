@@ -1525,11 +1525,13 @@ pub async fn build_app_state(
             subtitle_providers,
             metadata_root.clone(),
         ));
-    let subtitle_downloader =
-        Arc::new(ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
+    let subtitle_downloader = Arc::new(
+        ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
             &subtitles,
             Arc::clone(&media_stream_repository),
-        ));
+        )
+        .with_live_tv(&live_tv),
+    );
     library_scanner.attach_subtitle_downloader(Arc::clone(&subtitle_downloader));
     let media_segments: Arc<dyn ferrofin_traits::media_segments::MediaSegmentManager> = Arc::new(
         FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),

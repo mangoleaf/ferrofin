@@ -1800,6 +1800,15 @@ async fn a_scan_reprocesses_only_what_changed() {
     h.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subtitle_downloads_survive_rescans_and_probe_failure() {
+    let h = Harness::boot().await;
+    subtitles_are_downloaded_during_scan(&h).await;
+    std::fs::remove_file(&h.stubs.ffprobe).expect("make ffprobe unavailable");
+    subtitle_probe_failure_is_quiet(&h).await;
+    h.shutdown().await;
+}
+
 #[allow(clippy::too_many_lines)]
 async fn rows(h: &Harness) {
     let m = &h.media;
@@ -2809,6 +2818,7 @@ async fn subtitle_probe_failure_is_quiet(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(&id, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
     assert!(of(&seen.requests, "opensubtitles").is_empty());
     assert_eq!(
         std::fs::read(movie.with_extension("eng.srt")).unwrap(),

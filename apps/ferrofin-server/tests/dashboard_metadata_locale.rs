@@ -28,6 +28,28 @@ async fn provider(
 ) -> Response {
     requests.lock().unwrap().push(uri.to_string());
     let origin = format!("http://{}", headers["host"].to_str().unwrap());
+    match uri.path() {
+        "/login" => {
+            return Json(json!({"token":"fixture","data":{"token":"fixture"}})).into_response();
+        }
+        "/download" => {
+            return Json(json!({"link":format!("{origin}/subtitle-file")})).into_response();
+        }
+        "/subtitle-file" => {
+            return (
+                [("content-type", "text/plain")],
+                "1\n00:00:00,000 --> 00:00:01,000\nDownloaded\n",
+            )
+                .into_response();
+        }
+        "/subtitles" => {
+            return Json(
+                json!({"data":[{"attributes":{"moviehash_match":false,"files":[{"file_id":42}]}}]}),
+            )
+            .into_response();
+        }
+        _ => {}
+    }
     let image_path = uri.path().strip_prefix("/original").unwrap_or(uri.path());
     if matches!(
         image_path,
@@ -181,6 +203,12 @@ EOF
 else
 for input in "$@"; do
 case "$input" in
+*.sub)
+cat <<'EOF'
+{{"streams":[{{"index":0,"codec_type":"subtitle","codec_name":"dvdsub"}}],"format":{{"format_name":"vobsub"}}}}
+EOF
+exit 0
+;;
 *.srt)
 cat <<'EOF'
 {{"streams":[{{"index":0,"codec_type":"subtitle","codec_name":"subrip"}}],"format":{{"format_name":"srt"}}}}
@@ -407,6 +435,16 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
+    verify_automatic_subtitle_constraints(
+        &api,
+        library,
+        &mut options,
+        id,
+        &media,
+        tmp.path(),
+        &requests,
+    )
+    .await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -1149,4 +1187,213 @@ async fn verify_embedded_subtitle_options(
     }
     std::fs::remove_file(snapshot).unwrap();
     std::fs::remove_file(external).unwrap();
+}
+
+// Etag proves this refresh wrote the item; Idle also waits for download/save
+// work that happens after item persistence rather than racing the provider.
+async fn await_subtitle_refresh(api: &Api, library: &Value, id: &str) {
+    let path = format!("/Items/{id}?fields=MediaStreams,Etag");
+    let previous = api.get(&path).await["Etag"].clone();
+    api.post(
+        &format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None"),
+        &Value::Null,
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let item = api.get(&path).await;
+        let folders = api.get("/Library/VirtualFolders").await;
+        if item["Etag"] != previous
+            && folders
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|folder| &folder["ItemId"] == library && folder["RefreshStatus"] == "Idle")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "subtitle refresh did not finish: {item}, {folders}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn verify_automatic_subtitle_constraints(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+    root: &std::path::Path,
+    requests: &Arc<Mutex<Vec<String>>>,
+) {
+    let original = options.clone();
+    api.post(
+        "/Plugins/4a3f8e216c944d17a2b80f5e9c3d7a10/Configuration",
+        &json!({"Username":"fixture","Password":"fixture"}),
+    )
+    .await;
+    std::fs::write(media.join("Locale.mkv"), vec![0_u8; 131_072]).unwrap();
+    let snapshot = root.join("embedded-subtitles.json");
+    std::fs::write(&snapshot, json!({
+        "streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64},
+            {"index":1,"codec_type":"audio","codec_name":"aac","disposition":{"default":1},"tags":{"language":"fra"}},
+            {"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle","tags":{"language":"spa"}}
+        ],
+        "format":{"format_name":"matroska,webm","duration":"60.0","size":"131072","bit_rate":"1000"}
+    }).to_string()).unwrap();
+    options["AllowEmbeddedSubtitles"] = json!("AllowNone");
+    options["DisabledSubtitleFetchers"] = json!([]);
+    options["SubtitleDownloadLanguages"] = json!(["eng"]);
+    options["RequirePerfectSubtitleMatch"] = json!(true);
+    options["SkipSubtitlesIfAudioTrackMatches"] = json!(false);
+    options["SkipSubtitlesIfEmbeddedSubtitlesPresent"] = json!(false);
+    options["SaveSubtitlesWithMedia"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    requests.lock().unwrap().clear();
+    await_subtitle_refresh(api, library, id).await;
+    assert!(
+        !media.join("Locale.eng.srt").exists(),
+        "perfect matching rejects the provider's title-only candidate"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri.starts_with("/subtitles?") && uri.contains("moviehash_match=only"))
+    );
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri == "/download")
+    );
+
+    options["RequirePerfectSubtitleMatch"] = json!(false);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    requests.lock().unwrap().clear();
+    await_subtitle_refresh(api, library, id).await;
+    assert_eq!(
+        std::fs::read_to_string(media.join("Locale.eng.srt")).unwrap(),
+        "1\n00:00:00,000 --> 00:00:01,000\nDownloaded\n"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri.starts_with("/subtitles?") && !uri.contains("moviehash_match=only"))
+    );
+
+    for (language, flag) in [
+        ("fra", "SkipSubtitlesIfAudioTrackMatches"),
+        ("spa", "SkipSubtitlesIfEmbeddedSubtitlesPresent"),
+    ] {
+        options["SubtitleDownloadLanguages"] = json!([language]);
+        options[flag] = json!(true);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        requests.lock().unwrap().clear();
+        await_subtitle_refresh(api, library, id).await;
+        assert!(
+            !media.join(format!("Locale.{language}.srt")).exists(),
+            "{flag} honors the matching raw probe stream"
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|uri| uri.starts_with("/subtitles?"))
+        );
+        options[flag] = json!(false);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        await_subtitle_refresh(api, library, id).await;
+        assert!(
+            media.join(format!("Locale.{language}.srt")).is_file(),
+            "changing {flag} affects the next refresh"
+        );
+    }
+
+    // Matching external VobSub is an image subtitle, not a text match and not
+    // an embedded stream. Neither suppression rule should prevent a request.
+    std::fs::write(media.join("Locale.por.sub"), b"external VobSub").unwrap();
+    options["SubtitleDownloadLanguages"] = json!(["por"]);
+    options["SkipSubtitlesIfEmbeddedSubtitlesPresent"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    await_subtitle_refresh(api, library, id).await;
+    assert!(media.join("Locale.por.sub").is_file());
+    assert!(
+        media.join("Locale.por.srt").is_file(),
+        "external image subtitle does not satisfy the text language requirement"
+    );
+
+    options["SubtitleDownloadLanguages"] = json!(["ger"]);
+    options["DisabledSubtitleFetchers"] = json!(["OPENSUBTITLES"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    requests.lock().unwrap().clear();
+    await_subtitle_refresh(api, library, id).await;
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri.starts_with("/subtitles?"))
+    );
+    assert!(!media.join("Locale.ger.srt").exists());
+    options["DisabledSubtitleFetchers"] = json!([]);
+    options["SubtitleDownloadLanguages"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    requests.lock().unwrap().clear();
+    await_subtitle_refresh(api, library, id).await;
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|uri| uri.starts_with("/subtitles?"))
+    );
+    for extension in ["eng.srt", "fra.srt", "spa.srt", "por.srt", "por.sub"] {
+        std::fs::remove_file(media.join(format!("Locale.{extension}"))).unwrap();
+    }
+    std::fs::remove_file(snapshot).unwrap();
+    *options = original;
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
 }

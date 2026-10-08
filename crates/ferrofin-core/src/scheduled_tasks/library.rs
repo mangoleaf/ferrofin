@@ -1133,19 +1133,14 @@ impl ScheduledTask for SubtitleDownloadTask {
         vec![interval_hours(24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
-        let folders: Vec<VirtualFolderInfo> = self
-            .folders
-            .get_virtual_folders()
-            .await?
-            .into_iter()
-            .filter(|f| {
-                f.library_options
-                    .as_ref()
-                    .and_then(|o| o.subtitle_download_languages.as_ref())
-                    .is_some_and(|langs| !langs.is_empty())
-            })
-            .collect();
-        if folders.is_empty() {
+        let folders = self.folders.get_virtual_folders().await?;
+        if !folders.iter().any(|folder| {
+            folder
+                .library_options
+                .as_ref()
+                .and_then(|options| options.subtitle_download_languages.as_ref())
+                .is_some_and(|languages| !languages.is_empty())
+        }) {
             progress.report(100.0);
             return Ok(());
         }
@@ -1154,6 +1149,7 @@ impl ScheduledTask for SubtitleDownloadTask {
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
                 is_virtual_item: Some(false),
+                source_types: vec![SourceType::Library],
                 recursive: true,
                 ..InternalItemsQuery::default()
             })
@@ -1162,12 +1158,17 @@ impl ScheduledTask for SubtitleDownloadTask {
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
-            let Some(path) = video.path.as_deref() else {
+            let Some(options) = ferrofin_model::entities_media::owning_library(
+                &folders,
+                video.top_parent_id.as_deref(),
+                video.path.as_deref(),
+            )
+            .and_then(|folder| folder.library_options.as_ref()) else {
                 continue;
             };
-            let Some(options) = options_for_path(&folders, path) else {
+            if !self.downloader.is_task_candidate(video, options).await? {
                 continue;
-            };
+            }
             self.downloader
                 .download_missing(video, options, &crate::ScanCancel::new())
                 .await;

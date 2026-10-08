@@ -5,10 +5,11 @@ use std::sync::{Arc, Weak};
 
 use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_model::configuration::LibraryOptions;
-use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+use ferrofin_traits::stubs::LiveTvManager;
 use ferrofin_traits::subtitles::{SubtitleManager, SubtitleMediaType, SubtitleSearchRequest};
 use uuid::Uuid;
 
@@ -22,6 +23,7 @@ use crate::db_error::media_stream_type_from_disc;
 pub struct SubtitleDownloader {
     manager: Weak<dyn SubtitleManager>,
     streams: Arc<dyn MediaStreamRepository>,
+    live_tv: Option<Weak<dyn LiveTvManager>>,
     gate: tokio::sync::Mutex<()>,
 }
 
@@ -35,8 +37,38 @@ impl SubtitleDownloader {
         Self {
             manager: Arc::downgrade(manager),
             streams,
+            live_tv: None,
             gate: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Connects the current DVR captures so incomplete recordings do not spend
+    /// subtitle download quota. A weak reference avoids the library/DVR cycle.
+    #[must_use]
+    pub fn with_live_tv(mut self, live_tv: &Arc<dyn LiveTvManager>) -> Self {
+        self.live_tv = Some(Arc::downgrade(live_tv));
+        self
+    }
+
+    /// The scheduled task first queries for videos missing at least one saved
+    /// language, using any audio track and external/all subtitle tracks. Its
+    /// subsequent download uses the stricter default-audio/text rules below.
+    pub(crate) async fn is_task_candidate(
+        &self,
+        video: &BaseItemEntity,
+        options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        let item_id = Uuid::parse_str(&video.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        let streams = self
+            .streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                stream_type: None,
+                index: None,
+            })
+            .await?;
+        Ok(task_needs_language(&streams, options))
     }
 
     /// Saves a probe without losing subtitles a scheduled download attached
@@ -132,12 +164,26 @@ impl SubtitleDownloader {
         let Some(languages) = options.subtitle_download_languages.as_ref() else {
             return;
         };
-        if languages.is_empty()
-            || video.is_virtual_item
-            || !matches!(video.type_.rsplit('.').next(), Some("Movie" | "Episode"))
-            || video.path.as_deref().is_none_or(str::is_empty)
-        {
+        if languages.is_empty() || !eligible_video(video, false) {
             return;
+        }
+        if let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) {
+            let Some(recordings) = cancel
+                .unless_cancelled(live_tv.active_recording_paths())
+                .await
+            else {
+                return;
+            };
+            match recordings {
+                Ok(paths) if paths.iter().any(|path| video.path.as_ref() == Some(path)) => {
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(item_id = %video.id, %error, "subtitle recording lookup failed");
+                    return;
+                }
+            }
         }
         let (Ok(item_id), Some(manager)) = (Uuid::parse_str(&video.id), self.manager.upgrade())
         else {
@@ -228,6 +274,64 @@ impl SubtitleDownloader {
     }
 }
 
+/// `SubtitleDownloader` accepts complete movie/episode video files only.
+/// Disc rips/images and channel livestreams cannot be matched by file hash.
+fn eligible_video(video: &BaseItemEntity, is_active_recording: bool) -> bool {
+    if video.is_virtual_item
+        || is_active_recording
+        || !matches!(video.type_.rsplit('.').next(), Some("Movie" | "Episode"))
+        || video.path.as_deref().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let data = crate::item_data::parse_data(video.data.as_deref());
+    let video_type = data
+        .get("VideoType")
+        .and_then(|value| serde_json::from_value::<VideoType>(value.clone()).ok())
+        .unwrap_or(VideoType::VideoFile);
+    if video_type != VideoType::VideoFile {
+        return false;
+    }
+    let channel = video
+        .channel_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .is_some_and(|id| !id.is_nil());
+    !(channel
+        && video
+            .tags
+            .as_deref()
+            .into_iter()
+            .flat_map(|tags| tags.split('|'))
+            .any(|tag| tag.eq_ignore_ascii_case("livestream")))
+}
+
+/// Port of the scheduled task's union of language-specific candidate queries:
+/// unlike the downloader, its audio test considers every audio track.
+fn task_needs_language(streams: &[MediaStreamInfoEntity], options: &LibraryOptions) -> bool {
+    options
+        .subtitle_download_languages
+        .as_ref()
+        .is_some_and(|languages| {
+            languages.iter().any(|language| {
+                !streams.iter().any(|stream| {
+                    stream
+                        .language
+                        .as_deref()
+                        .is_some_and(|stored| stored.eq_ignore_ascii_case(language))
+                        && match media_stream_type_from_disc(stream.stream_type) {
+                            MediaStreamType::Audio => options.skip_subtitles_if_audio_track_matches,
+                            MediaStreamType::Subtitle => {
+                                stream.is_external
+                                    || options.skip_subtitles_if_embedded_subtitles_present
+                            }
+                            _ => false,
+                        }
+                })
+            })
+        })
+}
+
 /// Text subtitles always satisfy a language. Embedded image subtitles do so
 /// only when requested; matching audio considers default tracks (or the first
 /// audio track when no default is marked), as Jellyfin does.
@@ -258,10 +362,9 @@ fn needs_language(
     !streams.iter().any(|s| {
         media_stream_type_from_disc(s.stream_type) == MediaStreamType::Subtitle
             && matches(s)
-            && (s.is_external
-                || (s.codec.as_deref().is_some_and(|c| !c.is_empty())
-                    && MediaStream::is_text_format(s.codec.as_deref()))
-                || options.skip_subtitles_if_embedded_subtitles_present)
+            && (((s.is_external || s.codec.as_deref().is_some_and(|c| !c.is_empty()))
+                && MediaStream::is_text_format(s.codec.as_deref()))
+                || (!s.is_external && options.skip_subtitles_if_embedded_subtitles_present))
     })
 }
 
@@ -272,7 +375,7 @@ mod tests {
     use ferrofin_model::providers::RemoteSubtitleInfo;
     use ferrofin_traits::persistence::ItemPersistenceService;
     use ferrofin_traits::subtitles::{SubtitleProvider, SubtitleResponse};
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
     fn stream(kind: i32, language: &str) -> MediaStreamInfoEntity {
         MediaStreamInfoEntity {
@@ -287,8 +390,13 @@ mod tests {
     #[case("ass", false, false, false)]
     #[case("hdmv_pgs_subtitle", false, false, true)]
     #[case("hdmv_pgs_subtitle", false, true, false)]
-    #[case("hdmv_pgs_subtitle", true, false, false)]
+    #[case("hdmv_pgs_subtitle", true, false, true)]
+    #[case("hdmv_pgs_subtitle", true, true, true)]
+    #[case("dvdsub", true, true, true)]
+    #[case("subrip", true, false, false)]
+    #[case("subrip", true, true, false)]
     #[case("", false, false, true)]
+    #[case("", false, true, false)]
     #[case("", true, false, false)]
     fn existing_subtitles(
         #[case] codec: &str,
@@ -327,6 +435,8 @@ mod tests {
     struct Provider {
         searches: AtomicUsize,
         downloads: AtomicUsize,
+        non_matching: AtomicBool,
+        requests: std::sync::Mutex<Vec<SubtitleSearchRequest>>,
         hang: AtomicU8,
         entered: tokio::sync::Notify,
     }
@@ -341,13 +451,14 @@ mod tests {
             request: &SubtitleSearchRequest,
         ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
             self.searches.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request.clone());
             if self.hang.load(Ordering::SeqCst) == 1 {
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
             }
             Ok(vec![RemoteSubtitleInfo {
                 id: Some(format!("fake_{}", request.language)),
-                is_hash_match: Some(true),
+                is_hash_match: Some(!self.non_matching.load(Ordering::SeqCst)),
                 ..Default::default()
             }])
         }
@@ -367,8 +478,9 @@ mod tests {
     }
 
     struct Harness {
-        _temp: tempfile::TempDir,
+        temp: tempfile::TempDir,
         _manager: Arc<dyn SubtitleManager>,
+        db: ferrofin_db::Database,
         downloader: SubtitleDownloader,
         provider: Arc<Provider>,
         video: BaseItemEntity,
@@ -397,7 +509,7 @@ mod tests {
         let provider = Arc::new(Provider::default());
         let manager: Arc<dyn SubtitleManager> = Arc::new(crate::FerrofinSubtitleManager::new(
             db.clone(),
-            crate::test_support::library_manager_over(db),
+            crate::test_support::library_manager_over(db.clone()),
             streams.clone(),
             vec![provider.clone()],
             temp.path().join("metadata"),
@@ -405,7 +517,8 @@ mod tests {
         Harness {
             downloader: SubtitleDownloader::new(&manager, streams),
             _manager: manager,
-            _temp: temp,
+            temp,
+            db,
             provider,
             video,
             options: LibraryOptions {
@@ -577,6 +690,222 @@ mod tests {
                 .with_extension("eng.srt")
                 .exists()
         );
+    }
+
+    #[rstest::rstest]
+    #[case(None, true)]
+    #[case(Some(r#"{"VideoType":"VideoFile"}"#), true)]
+    #[case(Some(r#"{"VideoType":0}"#), true)]
+    #[case(Some(r#"{"VideoType":"Dvd"}"#), false)]
+    #[case(Some(r#"{"VideoType":"BluRay"}"#), false)]
+    #[case(Some(r#"{"VideoType":"Iso"}"#), false)]
+    #[case(Some(r#"{"VideoType":2}"#), false)]
+    fn automatic_download_only_accepts_complete_video_files(
+        #[case] data: Option<&str>,
+        #[case] eligible: bool,
+    ) {
+        let mut video = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            path: Some("/media/Movie.mkv".to_owned()),
+            data: data.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(eligible_video(&video, false), eligible);
+        assert!(
+            !eligible_video(&video, true),
+            "active DVR capture is incomplete"
+        );
+        video.type_ = "MediaBrowser.Controller.Entities.TV.Episode".to_owned();
+        assert_eq!(eligible_video(&video, false), eligible);
+        video.channel_id = Some(Uuid::new_v4().to_string());
+        video.tags = Some("drama|LiVeStReAm".to_owned());
+        assert!(!eligible_video(&video, false));
+        video.channel_id = Some(Uuid::nil().to_string());
+        assert_eq!(
+            eligible_video(&video, false),
+            eligible,
+            "library livestream tag alone is harmless"
+        );
+        video.type_ = "MediaBrowser.Controller.Entities.Video".to_owned();
+        assert!(!eligible_video(&video, false));
+    }
+
+    #[test]
+    fn scheduled_language_preselection_uses_any_audio_and_subtitle_scope() {
+        let mut streams = vec![stream(0, "fra"), stream(0, "ENG"), stream(2, "ger")];
+        streams[0].is_default = true;
+        streams[2].codec = Some("hdmv_pgs_subtitle".to_owned());
+        let mut options = LibraryOptions {
+            subtitle_download_languages: Some(vec!["eng".to_owned()]),
+            skip_subtitles_if_audio_track_matches: true,
+            ..Default::default()
+        };
+        assert!(!task_needs_language(&streams, &options));
+        assert!(
+            needs_language(&streams, "eng", &options),
+            "scan uses the default audio instead"
+        );
+        options.subtitle_download_languages = Some(vec!["eng".to_owned(), "ger".to_owned()]);
+        assert!(
+            task_needs_language(&streams, &options),
+            "union includes unsatisfied German"
+        );
+        options.skip_subtitles_if_embedded_subtitles_present = true;
+        assert!(!task_needs_language(&streams, &options));
+        options.skip_subtitles_if_embedded_subtitles_present = false;
+        streams[2].is_external = true;
+        assert!(
+            !task_needs_language(&streams, &options),
+            "task excludes any matching external subtitle"
+        );
+    }
+
+    #[tokio::test]
+    async fn perfect_match_and_saved_languages_change_the_next_download() {
+        let mut h = harness().await;
+        let cancel = ScanCancel::new();
+        h.options.require_perfect_subtitle_match = true;
+        h.provider.non_matching.store(true, Ordering::SeqCst);
+        h.downloader
+            .download_missing(&h.video, &h.options, &cancel)
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 0);
+        h.options.require_perfect_subtitle_match = false;
+        h.downloader
+            .download_missing(&h.video, &h.options, &cancel)
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
+        h.options.subtitle_download_languages = Some(vec!["fra".to_owned()]);
+        h.downloader
+            .download_missing(&h.video, &h.options, &cancel)
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 2);
+        let requests = h.provider.requests.lock().unwrap();
+        assert_eq!(requests[0].is_perfect_match, Some(true));
+        assert_eq!(requests.last().unwrap().language, "fra");
+        assert!(requests.iter().all(|request| request.is_automated));
+    }
+
+    #[rstest::rstest]
+    #[case(false, false, 1)]
+    #[case(false, true, 0)]
+    #[case(true, false, 1)]
+    #[case(true, true, 1)]
+    #[tokio::test]
+    async fn image_subtitle_and_live_embedded_skip_option_choose_downloads(
+        #[case] external: bool,
+        #[case] skip_embedded: bool,
+        #[case] expected_downloads: usize,
+    ) {
+        let mut h = harness().await;
+        let mut existing = stream(2, "ENG");
+        existing.codec = Some("hdmv_pgs_subtitle".to_owned());
+        existing.is_external = external;
+        h.downloader
+            .streams
+            .save_media_streams(Uuid::parse_str(&h.video.id).unwrap(), &[existing])
+            .await
+            .unwrap();
+        h.options.skip_subtitles_if_embedded_subtitles_present = skip_embedded;
+        h.downloader
+            .download_missing(&h.video, &h.options, &ScanCancel::new())
+            .await;
+        assert_eq!(
+            h.provider.downloads.load(Ordering::SeqCst),
+            expected_downloads
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_audio_skip_option_can_be_switched_without_restarting() {
+        let mut h = harness().await;
+        h.downloader
+            .streams
+            .save_media_streams(Uuid::parse_str(&h.video.id).unwrap(), &[stream(0, "ENG")])
+            .await
+            .unwrap();
+        h.options.skip_subtitles_if_audio_track_matches = true;
+        h.downloader
+            .download_missing(&h.video, &h.options, &ScanCancel::new())
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 0);
+        h.options.skip_subtitles_if_audio_track_matches = false;
+        h.downloader
+            .download_missing(&h.video, &h.options, &ScanCancel::new())
+            .await;
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_downloads_follow_saved_nested_library_options() {
+        use crate::scheduled_tasks::{ScheduledTask, TaskProgress};
+        use ferrofin_model::configuration::MediaPathInfo;
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let h = harness().await;
+        let outer = h.temp.path().join("movies");
+        let inner = outer.join("other");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mut video = h.video.clone();
+        video.path = Some(inner.join("Film.mkv").to_string_lossy().into_owned());
+        std::fs::write(video.path.as_ref().unwrap(), b"video").unwrap();
+        crate::FerrofinItemPersistenceService::new(h.db.clone())
+            .save_items(&[video])
+            .await
+            .unwrap();
+        let folders = Arc::new(
+            crate::FerrofinVirtualFolderManager::new(h.temp.path().join("libraries"))
+                .with_item_store(Arc::new(crate::FerrofinItemPersistenceService::new(
+                    h.db.clone(),
+                ))),
+        );
+        let outer_options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: outer.to_string_lossy().into_owned(),
+            }],
+            subtitle_download_languages: Some(vec!["eng".to_owned()]),
+            ..Default::default()
+        };
+        let mut inner_options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: inner.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder("Outer", Some(CollectionTypeOptions::movies), &outer_options)
+            .await
+            .unwrap();
+        folders
+            .add_virtual_folder("Inner", Some(CollectionTypeOptions::movies), &inner_options)
+            .await
+            .unwrap();
+        let task = crate::scheduled_tasks::library::SubtitleDownloadTask::new(
+            crate::test_support::library_manager_over(h.db.clone()),
+            folders.clone(),
+            Arc::new(h.downloader),
+        );
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(
+            h.provider.searches.load(Ordering::SeqCst),
+            0,
+            "inner disabled library must not inherit outer languages"
+        );
+        inner_options.subtitle_download_languages = Some(vec!["fra".to_owned()]);
+        folders
+            .update_library_options("Inner", &inner_options)
+            .await
+            .unwrap();
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(h.provider.requests.lock().unwrap()[0].language, "fra");
+        inner_options.subtitle_download_languages = None;
+        folders
+            .update_library_options("Inner", &inner_options)
+            .await
+            .unwrap();
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(h.provider.searches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
