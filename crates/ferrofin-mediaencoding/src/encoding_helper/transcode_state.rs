@@ -558,6 +558,18 @@ impl EncodingJobInfo {
         None
     }
 
+    /// The output audio sample rate. Port of `EncodingJobInfo.OutputAudioSampleRate`:
+    /// the source's own rate for a static or copied stream, else the requested
+    /// `AudioSampleRate`, else none (the encoder keeps the source rate).
+    #[must_use]
+    pub fn output_audio_sample_rate(&self) -> Option<i32> {
+        if self.base_request.is_static || Self::is_copy_codec(self.output_audio_codec.as_deref()) {
+            self.audio_stream.as_ref().and_then(|a| a.sample_rate)
+        } else {
+            self.base_request.audio_sample_rate
+        }
+    }
+
     /// The client-requested audio channel count for `codec`. Port of
     /// `GetRequestedAudioChannels` (option → max → requested → transcoding-max).
     #[must_use]

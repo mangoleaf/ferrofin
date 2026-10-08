@@ -59,14 +59,6 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
-/// TODO(PLAN_JSON_BODY_CASE_INSENSITIVE F11): two `DynamicHlsController`
-/// members are still unported. `audioStreamIndex` (emitted by
-/// `StreamInfo::to_url`) never reaches stream selection, so a non-default audio
-/// track transcodes the default one; port it into the planner's stream pick.
-/// `audioSampleRate` needs `EncodingJobInfo.OutputAudioSampleRate` and the
-/// `-ar` argument (`DynamicHlsController.GetAudioArguments`, the ac-4 → 48 kHz
-/// branch, progressive opus snapping) before it may reach
-/// `BaseEncodingJobOptions`: wired alone it only vetoes audio copy.
 ///
 /// Keys bind ignoring case ([`crate::extract::Query`]): the PlaybackInfo-
 /// negotiated `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase
@@ -126,6 +118,15 @@ struct HlsQuery {
     /// Whether the input is force-deinterlaced (`deInterlace`).
     #[serde(default)]
     de_interlace: Option<bool>,
+    /// The audio track to transcode (`audioStreamIndex`, a media-stream index).
+    #[serde(default)]
+    audio_stream_index: Option<i32>,
+    /// The video track to transcode (`videoStreamIndex`, a media-stream index).
+    #[serde(default)]
+    video_stream_index: Option<i32>,
+    /// The requested output audio sample rate (`audioSampleRate`).
+    #[serde(default)]
+    audio_sample_rate: Option<i32>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
     /// The contract (and every Jellyfin client) spells this `videoBitRate`
@@ -273,6 +274,9 @@ fn build_request(
         max_ref_frames: query.max_ref_frames,
         max_video_bit_depth: query.max_video_bit_depth,
         deinterlace: query.de_interlace.unwrap_or(false),
+        audio_stream_index: query.audio_stream_index,
+        video_stream_index: query.video_stream_index,
+        audio_sample_rate: query.audio_sample_rate,
         video_bitrate: query.video_bitrate,
         audio_bitrate: query.audio_bitrate,
         max_width: query.max_width,
@@ -770,9 +774,11 @@ mod tests {
     fn typed_encoding_members_reach_the_request_in_any_casing() {
         for query in [
             "AudioChannels=6&MaxAudioChannels=8&MaxAudioBitDepth=24&\
-             MaxRefFrames=4&MaxVideoBitDepth=10&DeInterlace=True",
+             MaxRefFrames=4&MaxVideoBitDepth=10&DeInterlace=True&\
+             AudioStreamIndex=3&VideoStreamIndex=0&AudioSampleRate=44100",
             "audioChannels=6&maxAudioChannels=8&maxAudioBitDepth=24&\
-             maxRefFrames=4&maxVideoBitDepth=10&deInterlace=true",
+             maxRefFrames=4&maxVideoBitDepth=10&deInterlace=true&\
+             audioStreamIndex=3&videoStreamIndex=0&audioSampleRate=44100",
         ] {
             let req = build_request(
                 uuid::Uuid::from_u128(7),
@@ -786,6 +792,9 @@ mod tests {
             assert_eq!(req.max_ref_frames, Some(4), "{query}");
             assert_eq!(req.max_video_bit_depth, Some(10), "{query}");
             assert!(req.deinterlace, "{query}");
+            assert_eq!(req.audio_stream_index, Some(3), "{query}");
+            assert_eq!(req.video_stream_index, Some(0), "{query}");
+            assert_eq!(req.audio_sample_rate, Some(44_100), "{query}");
         }
         let req = build_request(
             uuid::Uuid::from_u128(7),
