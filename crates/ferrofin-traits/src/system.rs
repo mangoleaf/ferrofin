@@ -257,12 +257,13 @@ pub trait PathManager: Send + Sync {
     /// The folder holding an item's chapter images.
     fn chapter_image_folder_path(&self, item_id: Uuid, media_path: &str) -> String;
 
-    /// The path to a chapter image at a given position (in ticks).
+    /// The path to a chapter image, keyed by file modification and position ticks.
     fn chapter_image_path(
         &self,
         item_id: Uuid,
         media_path: &str,
         chapter_position_ticks: i64,
+        date_modified_ticks: i64,
     ) -> String;
 
     /// All folders holding an item's extracted data.

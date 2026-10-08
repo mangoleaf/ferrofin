@@ -1649,13 +1649,20 @@ pub async fn build_app_state(
             Arc::new(lib_tasks::TokioFfmpegRunner),
             Arc::clone(&paths_dyn),
         )));
+        let chapter_images = Arc::new(
+            ferrofin_core::chapter_image_extractor::ChapterImageExtractor::new(
+                Arc::clone(&virtual_folders),
+                Arc::clone(&media_stream_repository),
+                Arc::clone(&media_encoder),
+                Arc::clone(&path_manager),
+            )
+            .with_live_tv(&live_tv),
+        );
         task_manager.register(Arc::new(lib_tasks::ChapterImagesTask::new(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
             Arc::clone(&chapters),
-            Arc::clone(&media_stream_repository),
-            Arc::clone(&media_encoder),
-            Arc::clone(&path_manager),
+            chapter_images,
             Arc::clone(&paths_dyn),
         )));
         task_manager.register(Arc::new(lib_tasks::PeopleValidationTask::new(

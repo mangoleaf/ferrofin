@@ -31,9 +31,11 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, KeyframeDataEntity};
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::data::{BaseItemKind, MediaType};
+#[cfg(test)]
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::MediaStreamType;
-use ferrofin_model::entities_media::{MediaStream, VirtualFolderInfo};
+#[cfg(test)]
+use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
@@ -41,12 +43,16 @@ use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::{InternalItemsQuery, SourceType};
-use ferrofin_traits::persistence::{KeyframeRepository, MediaStreamQuery, MediaStreamRepository};
+use ferrofin_traits::persistence::KeyframeRepository;
+#[cfg(test)]
+use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::providers::{MetadataRefreshOptions, ProviderManager};
 use ferrofin_traits::stubs::LyricManager;
 #[cfg(test)]
 use ferrofin_traits::subtitles::{SubtitleManager, SubtitleSearchRequest};
-use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
+#[cfg(test)]
+use ferrofin_traits::system::PathManager;
+use ferrofin_traits::system::ServerApplicationPaths;
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
@@ -513,180 +519,60 @@ impl ScheduledTask for AudioNormalizationTask {
 // Extract Chapter Images
 // ---------------------------------------------------------------------------
 
-/// Chapters starting closer to the end of the file than this margin get no
-/// image: there is not enough remaining video for ffmpeg to decode a frame.
-const CHAPTER_IMAGE_EOF_MARGIN_TICKS: i64 = 10 * TICKS_PER_SECOND;
-
-/// "Extract Chapter Images" — creates thumbnails for videos that have
-/// chapters. Port of `ChapterImagesTask` + the image half of the upstream
-/// `ChapterManager.RefreshChapterImages`: for every non-virtual library video
-/// whose library enables chapter image extraction, a frame is extracted at
-/// each chapter's position into the path manager's chapter-image layout and
-/// the image path is stored on the chapter row. Videos whose extraction failed
-/// before are remembered in `chapter-failures.txt` under the cache directory
-/// and skipped until the file changes.
+/// "Extract Chapter Images" — reconciles every video's saved chapter images.
+/// Missing images are extracted only for eligible videos in enabled libraries;
+/// disabled and previously failed videos still reconcile paths and prune files.
 pub struct ChapterImagesTask {
     library: Arc<dyn LibraryManager>,
     folders: Arc<dyn VirtualFolderManager>,
     chapters: Arc<dyn ChapterManager>,
-    streams: Arc<dyn MediaStreamRepository>,
-    encoder: Arc<dyn MediaEncoder>,
-    path_manager: Arc<dyn PathManager>,
+    extractor: Arc<crate::chapter_image_extractor::ChapterImageExtractor>,
     paths: Arc<dyn ServerApplicationPaths>,
 }
 
 impl ChapterImagesTask {
-    /// Builds the task over the library, chapter, stream, encoder and path
-    /// seams.
+    /// Builds the task over the shared chapter-image extractor and row manager.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         folders: Arc<dyn VirtualFolderManager>,
         chapters: Arc<dyn ChapterManager>,
-        streams: Arc<dyn MediaStreamRepository>,
-        encoder: Arc<dyn MediaEncoder>,
-        path_manager: Arc<dyn PathManager>,
+        extractor: Arc<crate::chapter_image_extractor::ChapterImageExtractor>,
         paths: Arc<dyn ServerApplicationPaths>,
     ) -> Self {
         Self {
             library,
             folders,
             chapters,
-            streams,
-            encoder,
-            path_manager,
+            extractor,
             paths,
         }
     }
 
-    /// Extracts any missing chapter images for one video, returning `false`
-    /// when an extraction failed (the video joins the failure history).
-    ///
-    /// Port of `ChapterManager.RefreshChapterImages`'s return, which is the
-    /// same bool: a video with nothing to do and a video that extracted are
-    /// both "success", because the only question the caller asks is whether to
-    /// record this video as failed.
     async fn refresh_video(
         &self,
-        item_id: Uuid,
-        media_path: &str,
-        run_time_ticks: Option<i64>,
+        video: &BaseItemEntity,
+        extract: bool,
     ) -> Result<bool, ServiceError> {
+        let item_id = Uuid::parse_str(&video.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
         let mut chapters = self.chapters.get_chapters(item_id).await?;
-        if chapters.is_empty() {
-            return Ok(true);
+        let outcome = self
+            .extractor
+            .refresh(video, &mut chapters, extract, &crate::ScanCancel::default())
+            .await?;
+        if outcome.changed {
+            // ChapterManager.SaveChapters retains only markers inside runtime.
+            let saved = chapters
+                .iter()
+                .filter(|chapter| chapter.start_position_ticks < video.run_time_ticks.unwrap_or(0))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.chapters.save_chapters(item_id, &saved).await?;
         }
-        // The stored video stream drives the extraction arguments.
-        let video_stream = self
-            .streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id,
-                stream_type: Some(MediaStreamType::Video),
-                index: None,
-            })
-            .await?
-            .into_iter()
-            .next();
-        let Some(video_stream) = video_stream else {
-            return Ok(true);
-        };
-        let stream = MediaStream {
-            stream_type: MediaStreamType::Video,
-            index: i32::try_from(video_stream.stream_index).unwrap_or(0),
-            codec: video_stream.codec.clone(),
-            ..MediaStream::default()
-        };
-        let source = MediaSourceInfo {
-            path: Some(media_path.to_owned()),
-            ..MediaSourceInfo::default()
-        };
-
-        let mut changed = false;
-        let mut ok = true;
-        for chapter in &mut chapters {
-            // A chapter in the last seconds of the file (common for a final
-            // "credits" marker) has too little video left to decode a frame
-            // from; ffmpeg exits without writing anything. Skip it.
-            if run_time_ticks.is_some_and(|runtime| {
-                chapter.start_position_ticks > runtime - CHAPTER_IMAGE_EOF_MARGIN_TICKS
-            }) {
-                continue;
-            }
-            let target = self.path_manager.chapter_image_path(
-                item_id,
-                media_path,
-                chapter.start_position_ticks,
-            );
-            if Path::new(&target).exists() {
-                if chapter.image_path.as_deref() != Some(target.as_str()) {
-                    chapter.image_path = Some(target);
-                    chapter.image_date_modified = Utc::now();
-                    changed = true;
-                }
-                continue;
-            }
-            // Extract, then move into the chapter-image layout. A per-chapter
-            // failure (including ffmpeg silently producing no frame) marks the
-            // video for the failure history rather than failing the task.
-            let moved = match self
-                .encoder
-                .extract_video_image(
-                    media_path,
-                    "",
-                    &source,
-                    &stream,
-                    None,
-                    Some(chapter.start_position_ticks),
-                )
-                .await
-            {
-                Ok(frame) => Path::new(&target)
-                    .parent()
-                    // A directory the server cannot create is a server problem,
-                    // like the extraction failures around it — fail this video
-                    // the same way rather than aborting the whole method, which
-                    // would discard the chapters already resolved above AND
-                    // blocklist the video for something that is not its fault.
-                    .map_or(Ok(()), |parent| {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| ServiceError::backend(e.to_string()))
-                    })
-                    .and_then(|()| move_file(&frame, &target)),
-                Err(e) => Err(e),
-            };
-            match moved {
-                Ok(()) => {
-                    chapter.image_path = Some(target);
-                    chapter.image_date_modified = Utc::now();
-                    changed = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        item = %item_id,
-                        error = %e,
-                        "chapter image could not be extracted or stored"
-                    );
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if changed {
-            self.chapters.save_chapters(item_id, &chapters).await?;
-        }
-        Ok(ok)
+        outcome.prune_unused_images(&chapters);
+        Ok(outcome.success)
     }
-}
-
-/// Moves a file, falling back to copy+delete across filesystems.
-fn move_file(from: &str, to: &str) -> Result<(), ServiceError> {
-    std::fs::rename(from, to)
-        .or_else(|_| {
-            std::fs::copy(from, to)
-                .map(|_| ())
-                .and_then(|()| std::fs::remove_file(from))
-        })
-        .map_err(|e| ServiceError::backend(e.to_string()))
 }
 
 impl ChapterImagesTask {
@@ -760,6 +646,7 @@ impl ScheduledTask for ChapterImagesTask {
                 media_types: vec![MediaType::Video],
                 is_folder: Some(false),
                 is_virtual_item: Some(false),
+                include_owned_items: true,
                 recursive: true,
                 ..InternalItemsQuery::default()
             })
@@ -769,7 +656,14 @@ impl ScheduledTask for ChapterImagesTask {
         // until their file changes (the key embeds the mtime).
         let fail_history_path = Path::new(&self.paths.cache_path()).join("chapter-failures.txt");
 
-        self.preflight_writable_dirs(&fail_history_path)?;
+        if folders.iter().any(|folder| {
+            folder
+                .library_options
+                .as_ref()
+                .is_some_and(|options| options.enable_chapter_image_extraction)
+        }) {
+            self.preflight_writable_dirs(&fail_history_path)?;
+        }
 
         // A set, and lowercased once: the lookup is per video, and a history
         // that has grown to thousands of entries turns a linear scan per video
@@ -803,43 +697,29 @@ impl ScheduledTask for ChapterImagesTask {
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
-            let Ok(item_id) = Uuid::parse_str(&video.id) else {
+            let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
                 continue;
             };
-            let Some(path) = video.path.clone().filter(|p| Path::new(p).exists()) else {
-                continue;
-            };
-            if !options_for_path(&folders, &path).is_some_and(|o| o.enable_chapter_image_extraction)
+            let modified = crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
+            let history_key = format!("{path}{modified}").to_lowercase();
+            let success = match self
+                .refresh_video(video, !failed.contains(&history_key))
+                .await
             {
-                continue;
-            }
-            let mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
-            let history_key = format!("{path}{mtime}").to_lowercase();
-            if failed.contains(&history_key) {
-                continue;
-            }
-            let outcome = self
-                .refresh_video(item_id, &path, video.run_time_ticks)
-                .await;
-            if let Err(e) = &outcome {
-                tracing::warn!(item = %video.id, error = %e, "chapter image refresh failed");
-            }
-            // A failed video (extraction failure or refresh error) joins the
-            // failure history so it is skipped until its file changes.
-            // A failed video joins the failure history so it is skipped until
-            // its file changes — upstream's behaviour exactly. Nothing here can
-            // tell a per-file failure from a systemic one; that is what the
-            // pre-flight above and the skip-count log are for.
-            if !matches!(outcome, Ok(true)) {
+                Ok(success) => success,
+                Err(error) => {
+                    // Source records extraction failures, not repository/service
+                    // errors. Flush genuine failures already seen before failing.
+                    write_failure_history(&fail_history_path, &failed, history_dirty)?;
+                    return Err(error);
+                }
+            };
+            if !success {
                 failed.insert(history_key);
                 history_dirty = true;
             }
         }
-        write_failure_history(&fail_history_path, &failed, history_dirty);
+        write_failure_history(&fail_history_path, &failed, history_dirty)?;
         progress.report(100.0);
         Ok(())
     }
@@ -849,17 +729,30 @@ impl ScheduledTask for ChapterImagesTask {
 ///
 /// Written once per run rather than per failure: rewriting the whole file each
 /// time made a systemic failure quadratic in the history's own size.
-fn write_failure_history(path: &Path, failed: &std::collections::BTreeSet<String>, dirty: bool) {
-    if dirty
-        && let Err(e) = std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|"))
-    {
-        tracing::warn!(
-            path = %path.display(),
-            error = %e,
-            "cannot write the chapter failure history; failures will be retried \
-             on every run until this is fixed"
-        );
+fn write_failure_history(
+    path: &Path,
+    failed: &std::collections::BTreeSet<String>,
+    dirty: bool,
+) -> Result<(), ServiceError> {
+    if dirty {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ServiceError::backend(format!(
+                    "cannot create chapter failure history directory `{}`: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|")).map_err(
+            |error| {
+                ServiceError::backend(format!(
+                    "cannot write chapter failure history `{}`: {error}",
+                    path.display()
+                ))
+            },
+        )?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,6 +1820,8 @@ mod tests {
     /// A [`ChapterManager`] fake holding one item's chapters in memory.
     struct FakeChapters {
         chapters: Mutex<Vec<ChapterInfo>>,
+        fail_read: std::sync::atomic::AtomicBool,
+        fail_save: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1939,6 +1834,9 @@ mod tests {
             _item_id: Uuid,
             chapters: &[ChapterInfo],
         ) -> Result<(), ServiceError> {
+            if self.fail_save.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ServiceError::backend("temporary chapter save failure"));
+            }
             *self.chapters.lock().expect("lock") = chapters.to_vec();
             Ok(())
         }
@@ -1950,6 +1848,9 @@ mod tests {
             unimplemented!("fake")
         }
         async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
+            if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ServiceError::backend("temporary chapter read failure"));
+            }
             Ok(self.chapters.lock().expect("lock").clone())
         }
         async fn delete_chapter_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
@@ -2970,9 +2871,15 @@ mod tests {
         let path = media.path().join("film.mkv");
         std::fs::write(&path, b"x").expect("write");
         set_path(&db, movie, &path.to_string_lossy()).await;
+        let mut video = crate::test_support::fetch_item(&db, movie).await;
+        video.run_time_ticks = Some(1_800_000_000);
+        video.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
+        crate::test_support::save_item(&db, &video).await;
 
         let chapters = Arc::new(FakeChapters {
             chapters: Mutex::new(vec![chapter_at(0), chapter_at(600_000_000)]),
+            fail_read: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
         });
         let streams = FakeStreams(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
@@ -2990,20 +2897,25 @@ mod tests {
         ));
         let path_manager: Arc<dyn PathManager> =
             Arc::new(crate::FerrofinPathManager::new(Arc::clone(&app_paths)));
-        let task = ChapterImagesTask::new(
-            library,
-            Arc::new(folder_with(
-                LibraryOptions {
-                    enable_chapter_image_extraction: true,
-                    ..LibraryOptions::default()
-                },
-                None,
-                &media.path().to_string_lossy(),
-            )),
-            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+        let folders: Arc<dyn VirtualFolderManager> = Arc::new(folder_with(
+            LibraryOptions {
+                enable_chapter_image_extraction: true,
+                ..LibraryOptions::default()
+            },
+            None,
+            &media.path().to_string_lossy(),
+        ));
+        let extractor = Arc::new(crate::chapter_image_extractor::ChapterImageExtractor::new(
+            Arc::clone(&folders),
             Arc::new(streams),
             Arc::new(FakeEncoder { fail_extract }),
             path_manager,
+        ));
+        let task = ChapterImagesTask::new(
+            library,
+            folders,
+            Arc::clone(&chapters) as Arc<dyn ChapterManager>,
+            extractor,
             app_paths,
         );
         (media, movie, chapters, task)
@@ -3043,6 +2955,150 @@ mod tests {
                 .expect("history written");
         assert!(history.contains("film.mkv"));
         drop(media);
+    }
+
+    #[tokio::test]
+    async fn chapter_task_includes_owned_video_extras_like_the_source_query() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let fixture = crate::chapter_image_extractor::tests::Fixture::new(
+            crate::chapter_image_extractor::tests::RecordingEncoder::default(),
+        )
+        .await;
+        let original = Uuid::parse_str(&fixture.video.id).unwrap();
+        let owned_id = Uuid::from_u128(0xC2800);
+        let mut owned = fixture.video.clone();
+        owned.id = guid_to_db(owned_id);
+        owned.type_ = crate::item_type_lookup::stored_type_name(BaseItemKind::Video)
+            .unwrap()
+            .to_owned();
+        owned.owner_id = Some(guid_to_db(original));
+        owned.path = Some(format!("{}.owned.mkv", owned.path.as_deref().unwrap()));
+        std::fs::write(owned.path.as_deref().unwrap(), b"owned video").unwrap();
+        crate::test_support::save_item(&fixture.db, &owned).await;
+        fixture
+            .streams
+            .save_media_streams(
+                owned_id,
+                &[MediaStreamInfoEntity {
+                    item_id: owned.id.clone(),
+                    stream_index: 2,
+                    stream_type: media_stream_type_disc(StreamTypeEnum::Video),
+                    codec: Some("h264".to_owned()),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        let repo = Arc::new(crate::FerrofinChapterRepository::new(fixture.db.clone()));
+        repo.save_chapters(
+            owned_id,
+            &[ferrofin_db::entities::base_items::ChapterEntity {
+                item_id: owned.id.clone(),
+                chapter_index: 0,
+                image_date_modified: None,
+                image_path: None,
+                start_position_ticks: 0,
+                name: Some("Owned chapter".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        let library = library_manager_over(fixture.db.clone());
+        let chapters = Arc::new(crate::FerrofinChapterManager::new(
+            repo.clone(),
+            library.clone(),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            temp.path().join("data"),
+            temp.path().join("log"),
+            temp.path().join("config"),
+            temp.path().join("cache"),
+            temp.path().join("web"),
+        ));
+        let task = ChapterImagesTask::new(
+            library,
+            fixture.folders.clone(),
+            chapters,
+            fixture.extractor.clone(),
+            paths,
+        );
+        task.execute(&TaskProgress::default()).await.unwrap();
+        let saved = repo.get_chapters(owned_id).await.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(
+            saved[0]
+                .image_path
+                .as_deref()
+                .is_some_and(|image| Path::new(image).exists()),
+            "owned extras participate in the actual scheduled query"
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn temporary_chapter_service_errors_fail_without_poisoning_extraction_history() {
+        for read_failure in [true, false] {
+            let (media, _, chapters, task) = chapter_task_fixture(false).await;
+            let flag = if read_failure {
+                &chapters.fail_read
+            } else {
+                &chapters.fail_save
+            };
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let error = task
+                .execute(&TaskProgress::default())
+                .await
+                .expect_err("service errors fail the task");
+            assert!(error.to_string().contains(if read_failure {
+                "read failure"
+            } else {
+                "save failure"
+            }));
+            let history = media.path().join("cache/chapter-failures.txt");
+            assert!(
+                !history.exists(),
+                "a transient repository error must not blocklist extraction"
+            );
+            assert!(
+                chapters
+                    .chapters
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|chapter| chapter.image_path.is_none())
+            );
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            task.execute(&TaskProgress::default()).await.unwrap();
+            assert!(
+                chapters
+                    .chapters
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|chapter| chapter
+                        .image_path
+                        .as_deref()
+                        .is_some_and(|path| Path::new(path).exists())),
+                "retry must extract or adopt frames after service recovery"
+            );
+            assert!(!history.exists());
+        }
+    }
+
+    #[test]
+    fn failure_history_write_errors_are_reported_and_clean_runs_need_no_history_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = temp.path().join("chapter-failures.txt");
+        std::fs::create_dir(&history).unwrap();
+        let failures = std::collections::BTreeSet::from(["film.mkv123".to_owned()]);
+        assert!(write_failure_history(&history, &failures, false).is_ok());
+        let error = write_failure_history(&history, &failures, true)
+            .expect_err("history I/O failure fails execution");
+        assert!(error.to_string().contains("chapter-failures.txt"));
+        let nested = temp.path().join("new-cache/chapter-failures.txt");
+        write_failure_history(&nested, &failures, true).unwrap();
+        assert_eq!(std::fs::read_to_string(nested).unwrap(), "film.mkv123");
     }
 
     // The failure mode that cost a real library every chapter image: the

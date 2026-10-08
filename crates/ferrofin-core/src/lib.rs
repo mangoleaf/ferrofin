@@ -167,6 +167,7 @@ pub mod authorization_context;
 pub mod by_name_store;
 pub mod cached_media_segment_provider;
 pub mod channel_manager;
+pub mod chapter_image_extractor;
 pub mod chapter_manager;
 pub mod chapter_repository;
 pub mod client_event_logger;

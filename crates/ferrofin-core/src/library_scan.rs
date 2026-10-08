@@ -7274,6 +7274,21 @@ impl LibraryScanner {
             return ProbeRows::default();
         };
         let source = &probed.media_source;
+        if !media_is_audio {
+            let index = source
+                .media_streams
+                .iter()
+                .find(|stream| {
+                    stream.stream_type == ferrofin_model::entities::MediaStreamType::Video
+                })
+                .map(|stream| stream.index);
+            if let Some(data) = crate::item_data::merge_data_fields(
+                entity.data.as_deref(),
+                &[("DefaultVideoStreamIndex", Some(serde_json::json!(index)))],
+            ) {
+                entity.data = Some(data);
+            }
+        }
         if !media_is_audio && let Some(container) = source.container.as_deref() {
             entity.data =
                 crate::item_data::set_data_field(entity.data.as_deref(), "Container", container);
@@ -26001,14 +26016,20 @@ mod tests {
         // The probed duration lands on the item row. `Size` is the file's
         // stat'ed length (the empty fixture's 0), not the probe's 51753:
         // `SaveInternal` stamps `Size = file.Length` after every provider ran.
-        let (ticks, size, movie_id): (Option<i64>, Option<i64>, String) = sqlx::query_as(
-            r#"SELECT "RunTimeTicks","Size","Id" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
-        )
+        let (ticks, size, movie_id, data): (Option<i64>, Option<i64>, String, Option<String>) =
+            sqlx::query_as(
+                r#"SELECT "RunTimeTicks","Size","Id","Data" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+            )
         .fetch_one(db.pool())
         .await
         .unwrap();
         assert_eq!(ticks, Some(30_000_000));
         assert_eq!(size, Some(0));
+        assert_eq!(
+            crate::item_data::parse_data(data.as_deref())["DefaultVideoStreamIndex"],
+            0,
+            "a fresh scan persists the default video index required by chapter tasks"
+        );
 
         // Both probed streams are persisted (a video + an audio row).
         let streams: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos""#)
@@ -30344,5 +30365,60 @@ mod tests {
         );
         let changed = fx.primary().await;
         assert_eq!((changed.width, changed.height), (80, 20));
+    }
+}
+
+#[cfg(test)]
+mod chapter_image_refresh_tests {
+    use super::*;
+    #[test]
+    fn a_video_probe_refreshes_or_clears_the_default_video_index() {
+        let mut video = BaseItemEntity {
+            data: Some(r#"{"DefaultVideoStreamIndex":99,"Container":"mkv"}"#.to_owned()),
+            ..Default::default()
+        };
+        let mut info = ferrofin_model::media_info::MediaInfo::default();
+        info.media_source.media_streams = vec![
+            ferrofin_model::entities_media::MediaStream {
+                index: 2,
+                stream_type: ferrofin_model::entities::MediaStreamType::Audio,
+                ..Default::default()
+            },
+            ferrofin_model::entities_media::MediaStream {
+                index: 7,
+                stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                ..Default::default()
+            },
+            ferrofin_model::entities_media::MediaStream {
+                index: 9,
+                stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                ..Default::default()
+            },
+        ];
+        LibraryScanner::apply_probe(&mut video, Some(&info), false, FetcherPolicy::default());
+        assert_eq!(
+            crate::item_data::parse_data(video.data.as_deref())["DefaultVideoStreamIndex"],
+            7
+        );
+        let saved = video.data.clone();
+        LibraryScanner::apply_probe(&mut video, None, false, FetcherPolicy::default());
+        assert_eq!(
+            video.data, saved,
+            "a failed probe preserves the selected index"
+        );
+        info.media_source.media_streams.retain(|stream| {
+            stream.stream_type == ferrofin_model::entities::MediaStreamType::Audio
+        });
+        LibraryScanner::apply_probe(&mut video, Some(&info), true, FetcherPolicy::default());
+        assert_eq!(
+            crate::item_data::parse_data(video.data.as_deref())["DefaultVideoStreamIndex"],
+            7,
+            "audio probing does not consume the video's selected index"
+        );
+        LibraryScanner::apply_probe(&mut video, Some(&info), false, FetcherPolicy::default());
+        assert!(
+            crate::item_data::parse_data(video.data.as_deref())["DefaultVideoStreamIndex"]
+                .is_null()
+        );
     }
 }

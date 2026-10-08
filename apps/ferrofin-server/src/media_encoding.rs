@@ -738,6 +738,7 @@ mod tests {
             _item_id: Uuid,
             _media_path: &str,
             _chapter_position_ticks: i64,
+            _date_modified_ticks: i64,
         ) -> String {
             String::new()
         }

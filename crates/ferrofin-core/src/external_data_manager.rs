@@ -221,7 +221,7 @@ mod tests {
         fn chapter_image_folder_path(&self, _: Uuid, _: &str) -> String {
             String::new()
         }
-        fn chapter_image_path(&self, _: Uuid, _: &str, _: i64) -> String {
+        fn chapter_image_path(&self, _: Uuid, _: &str, _: i64, _: i64) -> String {
             String::new()
         }
         fn extracted_data_paths(&self, _: Uuid, _: &str) -> Vec<String> {
