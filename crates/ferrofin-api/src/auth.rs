@@ -310,6 +310,24 @@ impl FromRequestParts<AppState> for RequireLiveTvManagement {
     }
 }
 
+/// Jellyfin's `SubtitleManagement` policy for upload, remote search/download
+/// and remote subtitle retrieval. Deleting subtitles still requires elevation.
+#[derive(Debug, Clone)]
+pub struct RequireSubtitleManagement(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireSubtitleManagement {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (info, _) =
+            require_user_permission(parts, state, |p| p.enable_subtitle_management).await?;
+        Ok(Self(info))
+    }
+}
+
 /// Enforces Jellyfin's `Download` policy before resolving or serving a file.
 #[derive(Debug, Clone)]
 pub struct RequireDownload(
