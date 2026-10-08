@@ -235,8 +235,12 @@ pub fn series_presentation_unique_key(
     } else {
         // `GetNameBasedGroupingKey`: prefixed with the type so a series can
         // never collide with a same-named item of another kind.
-        name.filter(|n| !n.is_empty())
-            .map(|n| format!("series-{}", n.to_lowercase()))
+        name.filter(|n| !n.is_empty()).map(|n| {
+            format!(
+                "series-{}",
+                ferrofin_util::string_extensions::lower_invariant(n)
+            )
+        })
     };
     let Some(mut key) = grouping_key.filter(|k| !k.is_empty()) else {
         return own;
@@ -885,6 +889,11 @@ mod tests {
     // none: the name fallback, lower-cased
     #[case(true, Some("Breaking Bad"), &[], Some("en"), &[FOLDER_A],
            "series-breaking bad-en-0000000000000000000000000000aaaa")]
+    // .NET uses simple invariant casing, without contextual final sigma or
+    // the full-lowercase expansion of dotted capital I.
+    #[case(true, Some("ΟΣ"), &[], None, &[], "series-οσ")]
+    #[case(true, Some("οσ"), &[], None, &[], "series-οσ")]
+    #[case(true, Some("İ"), &[], None, &[], "series-İ")]
     // folder ordering is ordinal regardless of the caller's order
     #[case(true, Some("Breaking Bad"), &[("Tvdb", "81189")], Some("en"), &[FOLDER_B, FOLDER_A],
            "81189-en-0000000000000000000000000000aaaa-0000000000000000000000000000bbbb")]
