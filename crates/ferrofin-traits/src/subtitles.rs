@@ -52,6 +52,10 @@ pub struct SubtitleSearchRequest {
     pub is_perfect_match: Option<bool>,
     /// Whether the request was triggered automatically (vs. user-initiated).
     pub is_automated: bool,
+    /// Whether to search every eligible provider. `None` uses Jellyfin's
+    /// default (`true`); automatic downloads explicitly request `Some(false)`.
+    /// This is independent of whether the request is automated.
+    pub search_all_providers: Option<bool>,
     /// The kind of media (movie vs. episode).
     pub content_type: SubtitleMediaType,
     /// The item's display name / title.
@@ -70,9 +74,9 @@ pub struct SubtitleSearchRequest {
     pub media_path: Option<String>,
     /// The IMDb id (e.g. `tt1234567`), when known.
     pub imdb_id: Option<String>,
-    /// Providers disabled by the library for automatic downloads.
+    /// Providers disabled for this search, compared case-insensitively.
     pub disabled_subtitle_fetchers: Vec<String>,
-    /// Preferred provider order for automatic downloads.
+    /// Preferred provider order for this search, using exact display names.
     pub subtitle_fetcher_order: Vec<String>,
 }
 
@@ -168,6 +172,18 @@ pub trait SubtitleProvider: Send + Sync {
     /// The provider's stable display name; also the id namespace prefix.
     fn name(&self) -> &'static str;
 
+    /// The media kinds this provider supports. Existing providers serve both
+    /// movies and episodes; providers with narrower support override this.
+    fn supported_media_types(&self) -> &'static [SubtitleMediaType] {
+        &[SubtitleMediaType::Movie, SubtitleMediaType::Episode]
+    }
+
+    /// The provider's intrinsic registration order (`IHasOrder.Order`). Saved
+    /// library order takes precedence; equal ranks retain this stable order.
+    fn order(&self) -> i32 {
+        0
+    }
+
     /// Searches this provider for subtitles matching `request`. Each returned
     /// [`RemoteSubtitleInfo::id`](ferrofin_model::providers::RemoteSubtitleInfo) must
     /// be namespaced with `name()`.
@@ -204,6 +220,7 @@ mod tests {
         assert!(r.language.is_empty());
         assert!(r.is_perfect_match.is_none());
         assert!(!r.is_automated);
+        assert!(r.search_all_providers.is_none());
     }
 
     #[test]

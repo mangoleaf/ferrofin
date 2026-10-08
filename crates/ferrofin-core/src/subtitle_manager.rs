@@ -66,9 +66,10 @@ impl FerrofinSubtitleManager {
         db: Database,
         library_manager: Arc<dyn LibraryManager>,
         media_streams: Arc<dyn MediaStreamRepository>,
-        providers: Vec<Arc<dyn SubtitleProvider>>,
+        mut providers: Vec<Arc<dyn SubtitleProvider>>,
         metadata_path: impl Into<DirectoryPath>,
     ) -> Self {
+        providers.sort_by_key(|provider| provider.order());
         Self {
             db,
             library_manager,
@@ -90,13 +91,12 @@ impl FerrofinSubtitleManager {
 
     /// Fills the request's item-derived fields (name/year/series/season/episode/
     /// path/content-type) from the resolved item, so providers can build a query.
-    async fn enrich(&self, request: &mut SubtitleSearchRequest) {
-        if let Ok(Some(item)) = self.library_manager.get_item_by_id(request.item_id).await {
-            request.content_type = if item.type_.ends_with("Episode") {
-                SubtitleMediaType::Episode
-            } else {
-                SubtitleMediaType::Movie
+    async fn enrich(&self, request: &mut SubtitleSearchRequest) -> Result<bool, ServiceError> {
+        if let Some(item) = self.library_manager.get_item_by_id(request.item_id).await? {
+            let Some(content_type) = subtitle_media_type(&item.type_) else {
+                return Ok(false);
             };
+            request.content_type = content_type;
             request.name = item.name;
             request.series_name = item.series_name;
             request.production_year = item.production_year.and_then(|y| i32::try_from(y).ok());
@@ -105,6 +105,7 @@ impl FerrofinSubtitleManager {
             request.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
             request.media_path = item.path;
         }
+        Ok(true)
     }
 
     /// Selects the provider that owns a namespaced id (`"{name}_{local}"`),
@@ -114,6 +115,27 @@ impl FerrofinSubtitleManager {
             let prefix = format!("{}_", p.name());
             id.strip_prefix(&prefix).map(|local| (p, local.to_owned()))
         })
+    }
+
+    /// A failed provider contributes no candidates, letting ordered fallback
+    /// proceed. An all-provider search calls this concurrently but keeps the
+    /// configured provider order when assembling results.
+    async fn search_provider(
+        provider: &Arc<dyn SubtitleProvider>,
+        request: &SubtitleSearchRequest,
+    ) -> Vec<RemoteSubtitleInfo> {
+        match provider.search(request).await {
+            Ok(mut found) => {
+                if request.is_perfect_match == Some(true) {
+                    found.retain(|result| result.is_hash_match == Some(true));
+                }
+                found
+            }
+            Err(error) => {
+                tracing::warn!(provider = provider.name(), %error, "subtitle search failed");
+                Vec::new()
+            }
+        }
     }
 
     /// Attaches subtitle content to an item: writes a sidecar file next to the
@@ -178,6 +200,16 @@ impl FerrofinSubtitleManager {
         self.media_streams
             .save_media_streams(item_id, &streams)
             .await
+    }
+}
+
+/// Only Movies and Episodes are supported by the subtitle manager's item
+/// overload; other video kinds do not inherit Movie provider support.
+fn subtitle_media_type(type_name: &str) -> Option<SubtitleMediaType> {
+    match type_name.rsplit('.').next()? {
+        "Movie" => Some(SubtitleMediaType::Movie),
+        "Episode" => Some(SubtitleMediaType::Episode),
+        _ => None,
     }
 }
 
@@ -258,44 +290,45 @@ impl SubtitleManager for FerrofinSubtitleManager {
         request: &SubtitleSearchRequest,
     ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
         let mut request = request.clone();
-        self.enrich(&mut request).await;
-        let mut results = Vec::new();
+        if !self.enrich(&mut request).await? {
+            return Ok(Vec::new());
+        }
         let mut providers: Vec<_> = self
             .providers
             .iter()
-            .filter(|p| {
-                !request
-                    .disabled_subtitle_fetchers
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(p.name()))
+            .filter(|provider| {
+                provider
+                    .supported_media_types()
+                    .contains(&request.content_type)
+                    && !request
+                        .disabled_subtitle_fetchers
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(provider.name()))
             })
             .collect();
-        providers.sort_by_key(|p| {
+        providers.sort_by_key(|provider| {
             request
                 .subtitle_fetcher_order
                 .iter()
-                .position(|name| name.eq_ignore_ascii_case(p.name()))
+                .position(|name| name == provider.name())
                 .unwrap_or(usize::MAX)
         });
-        for provider in providers {
-            match provider.search(&request).await {
-                Ok(mut found) => {
-                    if request.is_perfect_match == Some(true) {
-                        found.retain(|r| r.is_hash_match == Some(true));
-                    }
-                    results.append(&mut found);
-                    if request.is_automated && !results.is_empty() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    // Aggregate best-effort: one provider failing must not sink
-                    // the whole search (Jellyfin skips the failed provider).
-                    tracing::warn!(provider = provider.name(), %err, "subtitle search failed");
+        if !request.search_all_providers.unwrap_or(true) {
+            for provider in providers {
+                let found = Self::search_provider(provider, &request).await;
+                if !found.is_empty() {
+                    return Ok(found);
                 }
             }
+            return Ok(Vec::new());
         }
-        Ok(results)
+        let results = futures_util::future::join_all(
+            providers
+                .into_iter()
+                .map(|provider| Self::search_provider(provider, &request)),
+        )
+        .await;
+        Ok(results.into_iter().flatten().collect())
     }
 
     async fn download_subtitles(
@@ -374,11 +407,16 @@ impl SubtitleManager for FerrofinSubtitleManager {
         &self,
         item_id: Uuid,
     ) -> Result<Vec<SubtitleProviderInfo>, ServiceError> {
-        // A missing item yields no providers (mirrors C#).
-        let _ = self.library_manager.get_item_by_id(item_id).await?;
+        let Some(item) = self.library_manager.get_item_by_id(item_id).await? else {
+            return Ok(Vec::new());
+        };
+        let Some(content_type) = subtitle_media_type(&item.type_) else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .providers
             .iter()
+            .filter(|provider| provider.supported_media_types().contains(&content_type))
             .map(|p| SubtitleProviderInfo {
                 name: Some(p.name().to_owned()),
                 id: Some(p.name().to_owned()),
@@ -726,7 +764,8 @@ mod tests {
         );
         let mut request = SubtitleSearchRequest {
             is_automated: true,
-            subtitle_fetcher_order: vec!["SECOND".to_owned(), "first".to_owned()],
+            search_all_providers: Some(false),
+            subtitle_fetcher_order: vec!["second".to_owned(), "first".to_owned()],
             ..Default::default()
         };
         let results = mgr.search_subtitles(&request).await.unwrap();
@@ -749,10 +788,259 @@ mod tests {
         request.is_perfect_match = None;
         request.disabled_subtitle_fetchers.clear();
         request.is_automated = false;
+        request.search_all_providers = None;
         assert_eq!(
             mgr.search_subtitles(&request).await.unwrap().len(),
             2,
             "interactive searches retain provider fan-out"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum SearchOutcome {
+        Failed,
+        Empty,
+        Found,
+    }
+
+    struct SelectionProvider {
+        name: &'static str,
+        kinds: &'static [SubtitleMediaType],
+        intrinsic_order: i32,
+        outcome: SearchOutcome,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl SubtitleProvider for SelectionProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn supported_media_types(&self) -> &'static [SubtitleMediaType] {
+            self.kinds
+        }
+        fn order(&self) -> i32 {
+            self.intrinsic_order
+        }
+        async fn search(
+            &self,
+            _: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            self.calls.lock().unwrap().push(self.name);
+            match self.outcome {
+                SearchOutcome::Failed => Err(ServiceError::backend("fixture provider failed")),
+                SearchOutcome::Empty => Ok(Vec::new()),
+                SearchOutcome::Found => Ok(vec![RemoteSubtitleInfo {
+                    id: Some(format!("{}_1", self.name)),
+                    ..Default::default()
+                }]),
+            }
+        }
+        async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
+            unreachable!("selection test searches only")
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_provider_selection_preserves_exact_order_and_best_effort_fallback() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn SubtitleProvider>> = [
+            ("Fallback", 5, SearchOutcome::Found),
+            ("Movies", 0, SearchOutcome::Found),
+            ("Failed", -2, SearchOutcome::Failed),
+            ("Empty", -1, SearchOutcome::Empty),
+        ]
+        .into_iter()
+        .map(|(name, intrinsic_order, outcome)| {
+            Arc::new(SelectionProvider {
+                name,
+                kinds: &[SubtitleMediaType::Movie],
+                intrinsic_order,
+                outcome,
+                calls: calls.clone(),
+            }) as Arc<dyn SubtitleProvider>
+        })
+        .collect();
+        let mgr = manager(test_db().await, providers);
+        let mut request = SubtitleSearchRequest {
+            search_all_providers: Some(false),
+            subtitle_fetcher_order: vec!["MOVIES".to_owned(), "Fallback".to_owned()],
+            ..Default::default()
+        };
+        let results = mgr.search_subtitles(&request).await.unwrap();
+        assert_eq!(
+            results[0].id.as_deref(),
+            Some("Fallback_1"),
+            "saved provider names use exact casing"
+        );
+        assert_eq!(*calls.lock().unwrap(), ["Fallback"]);
+        calls.lock().unwrap().clear();
+        request.disabled_subtitle_fetchers = vec!["FALLBACK".to_owned()];
+        let results = mgr.search_subtitles(&request).await.unwrap();
+        assert_eq!(results[0].id.as_deref(), Some("Movies_1"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["Failed", "Empty", "Movies"],
+            "failed and empty providers fall through in intrinsic order"
+        );
+        calls.lock().unwrap().clear();
+        request.disabled_subtitle_fetchers.clear();
+        request.subtitle_fetcher_order = vec!["Movies".to_owned(), "Failed".to_owned()];
+        assert_eq!(
+            mgr.search_subtitles(&request).await.unwrap()[0]
+                .id
+                .as_deref(),
+            Some("Movies_1")
+        );
+        assert_eq!(*calls.lock().unwrap(), ["Movies"]);
+        calls.lock().unwrap().clear();
+        request.disabled_subtitle_fetchers = vec![
+            "movies".to_owned(),
+            "fallback".to_owned(),
+            "failed".to_owned(),
+            "empty".to_owned(),
+        ];
+        assert!(mgr.search_subtitles(&request).await.unwrap().is_empty());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_support_filters_searches_and_dashboard_descriptors() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        let episode = Uuid::new_v4();
+        let audio = Uuid::new_v4();
+        for (id, kind) in [
+            (movie, BaseItemKind::Movie),
+            (episode, BaseItemKind::Episode),
+            (audio, BaseItemKind::Audio),
+        ] {
+            seed_item(&db, id, kind).await;
+        }
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let providers: Vec<Arc<dyn SubtitleProvider>> = [
+            ("Movies", &[SubtitleMediaType::Movie][..]),
+            ("Episodes", &[SubtitleMediaType::Episode][..]),
+        ]
+        .into_iter()
+        .map(|(name, kinds)| {
+            Arc::new(SelectionProvider {
+                name,
+                kinds,
+                intrinsic_order: 0,
+                outcome: SearchOutcome::Found,
+                calls: calls.clone(),
+            }) as Arc<dyn SubtitleProvider>
+        })
+        .collect();
+        let mgr = manager(db, providers);
+        for (id, expected) in [(movie, "Movies"), (episode, "Episodes")] {
+            let request = SubtitleSearchRequest {
+                item_id: id,
+                ..Default::default()
+            };
+            let results = mgr.search_subtitles(&request).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].id.as_deref(),
+                Some(format!("{expected}_1").as_str())
+            );
+            let descriptors = mgr.get_supported_providers(id).await.unwrap();
+            assert_eq!(descriptors.len(), 1);
+            assert_eq!(descriptors[0].name.as_deref(), Some(expected));
+        }
+        assert!(
+            mgr.search_subtitles(&SubtitleSearchRequest {
+                item_id: audio,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(mgr.get_supported_providers(audio).await.unwrap().is_empty());
+        assert!(
+            mgr.get_supported_providers(Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(*calls.lock().unwrap(), ["Movies", "Episodes"]);
+    }
+
+    struct ConcurrentProvider {
+        name: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl SubtitleProvider for ConcurrentProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn search(
+            &self,
+            _: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            self.barrier.wait().await;
+            Ok(vec![RemoteSubtitleInfo {
+                id: Some(format!("{}_1", self.name)),
+                ..Default::default()
+            }])
+        }
+        async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
+            unreachable!("concurrent search test")
+        }
+    }
+
+    #[tokio::test]
+    async fn all_provider_search_runs_concurrently_and_is_independent_of_automation() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let providers: Vec<Arc<dyn SubtitleProvider>> = ["Alpha", "Beta"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(ConcurrentProvider {
+                    name,
+                    barrier: barrier.clone(),
+                }) as Arc<dyn SubtitleProvider>
+            })
+            .collect();
+        let mgr = manager(test_db().await, providers);
+        let request = SubtitleSearchRequest {
+            is_automated: true,
+            subtitle_fetcher_order: vec!["Beta".to_owned(), "Alpha".to_owned()],
+            ..Default::default()
+        };
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            mgr.search_subtitles(&request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["Beta_1", "Alpha_1"]
+        );
+        let mgr = manager(
+            test_db().await,
+            vec![
+                Arc::new(RankedProvider("first", true)),
+                Arc::new(RankedProvider("second", true)),
+            ],
+        );
+        let request = SubtitleSearchRequest {
+            is_automated: false,
+            search_all_providers: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            mgr.search_subtitles(&request).await.unwrap().len(),
+            1,
+            "interactive request may explicitly stop after its first provider"
         );
     }
 

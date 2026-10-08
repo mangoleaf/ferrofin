@@ -200,6 +200,7 @@ impl SubtitleDownloader {
                 language: language.to_owned(),
                 is_perfect_match: options.require_perfect_subtitle_match.then_some(true),
                 is_automated: true,
+                search_all_providers: Some(false),
                 content_type: if video.type_.ends_with("Episode") {
                     SubtitleMediaType::Episode
                 } else {
@@ -906,6 +907,22 @@ mod tests {
             .unwrap();
         task.execute(&TaskProgress::default()).await.unwrap();
         assert_eq!(h.provider.searches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn automatic_download_passes_saved_provider_controls_and_stops_after_success() {
+        let mut h = harness().await;
+        h.options.subtitle_fetcher_order = vec!["fake".to_owned()];
+        h.options.disabled_subtitle_fetchers = vec!["other".to_owned()];
+        h.downloader
+            .download_missing(&h.video, &h.options, &ScanCancel::new())
+            .await;
+        let request = h.provider.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.subtitle_fetcher_order, ["fake"]);
+        assert_eq!(request.disabled_subtitle_fetchers, ["other"]);
+        assert_eq!(request.search_all_providers, Some(false));
+        assert!(request.is_automated);
+        assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
