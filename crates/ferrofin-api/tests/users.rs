@@ -100,6 +100,7 @@ impl AuthService for AdminAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            token: Some("current-session".into()),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -317,9 +318,11 @@ impl QuickConnect for OkQuickConnect {
     }
 }
 
-/// A [`SessionManager`] whose `revoke_user_tokens` no-ops (used by delete/policy);
-/// every other method is unused by these tests.
-struct NoopSessions;
+/// Records token revocation while leaving unrelated session methods unused.
+#[derive(Default)]
+struct NoopSessions {
+    revoked: Mutex<Vec<(Uuid, String)>>,
+}
 
 #[async_trait]
 impl SessionManager for NoopSessions {
@@ -493,9 +496,13 @@ impl SessionManager for NoopSessions {
     }
     async fn revoke_user_tokens(
         &self,
-        _user_id: Uuid,
-        _current_access_token: &str,
+        user_id: Uuid,
+        current_access_token: &str,
     ) -> Result<(), ServiceError> {
+        self.revoked
+            .lock()
+            .unwrap()
+            .push((user_id, current_access_token.to_owned()));
         Ok(())
     }
     async fn close_live_stream_if_needed(
@@ -534,13 +541,29 @@ fn state_with_auth(
     activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
     auth: Arc<dyn AuthService>,
 ) -> AppState {
+    state_with_sessions(
+        users,
+        config,
+        activity,
+        auth,
+        Arc::new(NoopSessions::default()),
+    )
+}
+
+fn state_with_sessions(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+    sessions: Arc<dyn SessionManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
-        Arc::new(NoopSessions),
+        sessions,
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         config,
@@ -1774,8 +1797,8 @@ async fn user_scoped_configuration_forwards() {
 /// id. `AuthorizationInfo::user_id()` is the nil GUID for a caller with no user
 /// (an API key), so degrading an unparseable *target* id to nil as well made the
 /// two compare equal and granted the update — C# compares against `User.Id`, a
-/// `Guid` that is never `Guid.Empty` for a loaded user. A userless caller must
-/// be refused whatever the target row looks like.
+/// `Guid` that is never `Guid.Empty` for a loaded user. Even an elevated API
+/// key must not turn an invalid stored id into an anonymous self-update.
 #[tokio::test]
 async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
     let users = Arc::new(MemUsers::default());
@@ -1802,4 +1825,92 @@ async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
         StatusCode::FORBIDDEN,
         "a caller with no user must not be able to update a corrupt-id row"
     );
+}
+
+#[tokio::test]
+async fn changing_password_preserves_the_requesting_session() {
+    let users = Arc::new(MemUsers::default());
+    let sessions = Arc::new(NoopSessions::default());
+    let app = state_with_sessions(
+        users,
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    );
+    let router = create_router(app);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/Password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"NewPw":"replacement"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *sessions.revoked.lock().unwrap(),
+        vec![(ADMIN_ID, "current-session".to_owned())]
+    );
+}
+
+/// A normal account editing itself with preferences disabled must be denied,
+/// while an API key retains its upstream administrator role.
+#[tokio::test]
+async fn account_updates_respect_preferences_and_api_key_elevation() {
+    struct BobAuth;
+    #[async_trait]
+    impl AuthService for BobAuth {
+        async fn authenticate(
+            &self,
+            _: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(AuthorizationInfo {
+                user: Some(user_entity(BOB_ID, "bob", None)),
+                is_authenticated: true,
+                ..Default::default()
+            })
+        }
+    }
+    for (path, body) in [
+        ("/Users", r#"{"Name":"new-name"}"#),
+        ("/Users/Password", r#"{"NewPw":"replacement"}"#),
+        (
+            "/Users/Configuration",
+            r#"{"AudioLanguagePreference":"fr"}"#,
+        ),
+    ] {
+        for (auth, expected) in [
+            (
+                Arc::new(BobAuth) as Arc<dyn AuthService>,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService) as Arc<dyn AuthService>,
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let app = state_with_auth(
+                Arc::new(MemUsers::default()),
+                Arc::new(MemConfig::new(true)),
+                Arc::new(ferrofin_api::test_support::FakeActivity),
+                auth,
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{path}?userId={BOB_ID}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 }

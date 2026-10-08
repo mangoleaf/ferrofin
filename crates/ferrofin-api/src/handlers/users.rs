@@ -317,18 +317,23 @@ async fn assert_can_update_user(
     auth: &AuthorizationInfo,
     target: &UserEntity,
 ) -> Result<(), ApiError> {
-    let caller_id = auth.user_id();
-    // `auth.user_id()` is the nil GUID for a caller with no user (an API key),
-    // and C# compares against `User.Id`, a real `Guid` that is never empty. So
-    // the self-update branch requires a real caller *and* a target whose stored
-    // id parses — degrading an unparseable target id to nil would make it
-    // compare equal to a userless caller and grant the update.
-    if !caller_id.is_nil() && Uuid::parse_str(&target.id).is_ok_and(|id| id == caller_id) {
+    let target_id = Uuid::parse_str(&target.id).ok().filter(|id| !id.is_nil());
+    if target_id.is_none() {
+        return Err(ApiError::Forbidden("user update not allowed".to_owned()));
+    }
+    // API keys carry the administrator role upstream. Validate the target
+    // first so a corrupt stored id never becomes the anonymous/nil caller.
+    if auth.is_api_key {
         return Ok(());
     }
     if let Some(caller) = &auth.user
         && is_administrator(state, caller).await?
     {
+        return Ok(());
+    }
+    // All three account-update actions pass restrictUserPreferences=true to
+    // RequestHelpers.AssertCanUpdateUser, including password changes/resets.
+    if target_id == Some(auth.user_id()) && target.enable_user_preference_access {
         return Ok(());
     }
     Err(ApiError::Forbidden("user update not allowed".to_owned()))
@@ -857,10 +862,11 @@ async fn update_user_password(
 
     // A non-admin caller (or one changing their own explicit-userId account)
     // must prove the current password.
-    let caller_is_admin = match &auth.user {
-        Some(caller) => is_administrator(&state, caller).await?,
-        None => false,
-    };
+    let caller_is_admin = auth.is_api_key
+        || match &auth.user {
+            Some(caller) => is_administrator(&state, caller).await?,
+            None => false,
+        };
     let updating_self = query.user_id.is_some_and(|id| id == auth.user_id());
     if !caller_is_admin || updating_self {
         let ok = state
@@ -868,7 +874,7 @@ async fn update_user_password(
             .authenticate_user(
                 &user.username,
                 body.current_pw.as_ref().map_or("", Secret::expose),
-                "",
+                auth.remote_endpoint.as_deref().unwrap_or("127.0.0.1"),
                 false,
             )
             .await?;
@@ -883,7 +889,10 @@ async fn update_user_password(
         .users
         .change_password(user_id, body.new_pw.as_ref().map_or("", Secret::expose))
         .await?;
-    state.sessions.revoke_user_tokens(user_id, "").await?;
+    state
+        .sessions
+        .revoke_user_tokens(user_id, auth.token.as_ref().map_or("", Secret::expose))
+        .await?;
     log_password_changed(&state, user_id, &user.username).await;
     Ok(StatusCode::NO_CONTENT)
 }
