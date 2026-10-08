@@ -1340,3 +1340,143 @@ async fn saved_unrated_policy_filters_browse_and_numeric_enum_values_round_trip(
         );
     }
 }
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn saved_tags_filter_lists_counts_and_views_with_root_allow_exception() {
+    let f = fixture().await;
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    dto["Policy"]["EnableAllFolders"] = json!(true);
+    for (id, name, tags) in [
+        (&f.allowed, "Tagged", json!(["Café"])),
+        (&f.hidden, "Private", json!(["private"])),
+    ] {
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Items/{id}"),
+                Some(&f.admin),
+                Some(json!({"Name":name,"Tags":tags,"Genres":["Shared"]}))
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    for (blocked, allowed, count) in [
+        (json!([]), json!([]), 4),
+        (json!(["private"]), json!([]), 3),
+        (json!([]), json!(["CAFE"]), 1),
+        (json!(["café"]), json!(["CAFE"]), 0),
+        (json!([]), json!([]), 4),
+    ] {
+        dto["Policy"]["BlockedTags"] = blocked;
+        dto["Policy"]["AllowedTags"] = allowed;
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Users/{}/Policy", f.viewer_id),
+                Some(&f.admin),
+                Some(dto["Policy"].clone())
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, listed) = call(
+            &f.router,
+            "GET",
+            "/Items?recursive=true&includeItemTypes=Movie",
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["TotalRecordCount"], count);
+        assert_eq!(
+            listed["Items"].as_array().unwrap().len(),
+            usize::try_from(count).unwrap()
+        );
+        let (status, counts) = call(&f.router, "GET", "/Items/Counts", Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(counts["MovieCount"], count);
+        for path in ["/Items", "/UserViews?includeHidden=true"] {
+            let (status, roots) = call(&f.router, "GET", path, Some(&f.viewer), None).await;
+            assert_eq!(status, StatusCode::OK, "{path} {roots}");
+            let names: Vec<_> = roots["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|i| i["Name"].as_str())
+                .collect();
+            assert!(
+                names.contains(&"Allowed") && names.contains(&"Hidden"),
+                "{path} {names:?}"
+            );
+        }
+    }
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Name"] == "Allowed")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Items/{folder}"),
+            Some(&f.admin),
+            Some(json!({"Name":"Allowed","Tags":["Private"]}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    dto["Policy"]["BlockedTags"] = json!(["private"]);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for path in ["/Items", "/UserViews?includeHidden=true"] {
+        let (status, roots) = call(&f.router, "GET", path, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{path} {roots}");
+        let names: Vec<_> = roots["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"Allowed") && names.contains(&"Hidden"),
+            "{path} {names:?}"
+        );
+    }
+}

@@ -420,13 +420,14 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
     qb
 }
 
-/// Jellyfin's parental score and unrated-kind restrictions on one item alias.
+/// Jellyfin's parental score, unrated-kind and inherited-tag restrictions.
 pub(crate) fn append_parental_restrictions(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     alias: &str,
 ) {
     append_max_parental_rating(qb, filter, alias);
+    append_inherited_tags(qb, filter, alias);
     if filter.block_unrated_items.is_empty() {
         return;
     }
@@ -453,14 +454,70 @@ pub(crate) fn append_parental_restrictions(
     qb.push("))");
 }
 
-/// Whether an access query has a maximum rating or an unrated-kind restriction.
+/// Whether an access query has any parental restriction.
 pub(crate) fn has_parental_restrictions(filter: &InternalItemsQuery) -> bool {
     !filter.block_unrated_items.is_empty()
+        || !filter.exclude_inherited_tags.is_empty()
+        || !filter.include_inherited_tags.is_empty()
         || filter.max_parental_rating.is_some()
         || filter
             .user
             .as_ref()
             .is_some_and(|user| user.max_parental_rating_score.is_some())
+}
+
+// ApplyParentalRestrictions uses four separate indexed membership checks. A
+// correlated EXISTS with a four-way OR defeats the tag-map index seeks.
+fn append_inherited_tags(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery, alias: &str) {
+    for (tags, blocked) in [
+        (&filter.exclude_inherited_tags, true),
+        (&filter.include_inherited_tags, false),
+    ] {
+        if tags.is_empty() {
+            continue;
+        }
+        let tags: Vec<_> = tags.iter().map(|tag| get_clean_value(tag)).collect();
+        let join = if blocked { " AND " } else { " OR " };
+        let membership = if blocked { " NOT IN (" } else { " IN (" };
+        qb.push(" AND (");
+        for (index, column) in ["Id", "SeriesId", "TopParentId"].into_iter().enumerate() {
+            if index != 0 {
+                qb.push(join)
+                    .push(format!("({alias}.\"{column}\" IS "))
+                    .push(if blocked { "NULL OR " } else { "NOT NULL AND " });
+            }
+            qb.push(format!("{alias}.\"{column}\"")).push(membership);
+            append_tagged_item_ids(qb, &tags);
+            qb.push(")");
+            if index != 0 {
+                qb.push(")");
+            }
+        }
+        qb.push(join)
+            .push(if blocked { "NOT EXISTS (" } else { "EXISTS (" });
+        qb.push(format!(
+            r#"SELECT 1 FROM "AncestorIds" tag_parent
+            WHERE tag_parent."ItemId" = {alias}."Id" AND tag_parent."ParentItemId" IN ("#
+        ));
+        append_tagged_item_ids(qb, &tags);
+        qb.push("))");
+        if !blocked {
+            qb.push(format!(r#" OR {alias}."Type" = "#))
+                .push_bind(stored_type_name(BaseItemKind::Person).unwrap_or_default());
+        }
+        qb.push(")");
+    }
+}
+
+fn append_tagged_item_ids(qb: &mut QueryBuilder<Sqlite>, tags: &[String]) {
+    qb.push(
+        r#"SELECT tag_map."ItemId" FROM "ItemValues" tag_value
+        CROSS JOIN "ItemValuesMap" tag_map ON tag_map."ItemValueId" = tag_value."ItemValueId"
+        WHERE tag_value."Type" = "#,
+    )
+    .push_bind(i64::from(i32::from(ItemValueType::Tags)))
+    .push(" AND ");
+    push_in_list(qb, r#"tag_value."CleanValue""#, tags);
 }
 
 fn append_max_parental_rating(
@@ -517,6 +574,7 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     // clause. Access-only queries (counts and related media) retain it.
     if filter.has_parental_rating == Some(true) {
         append_max_parental_rating(qb, filter, "bi");
+        append_inherited_tags(qb, filter, "bi");
     } else {
         append_parental_restrictions(qb, filter, "bi");
     }
@@ -1718,7 +1776,7 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
 }
 
 /// A by-name row remains visible only while related media satisfies the
-/// scoped user's rating limit (`ApplyItemByNameAccessFiltering`).
+/// scoped user's parental restrictions (`ApplyItemByNameAccessFiltering`).
 fn append_by_name_rating_access(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,

@@ -173,6 +173,12 @@ impl FerrofinItemRepository {
             parent_id: roots.user_root,
             ..InternalItemsQuery::default()
         };
+        let mut children = crate::query_restrictions::resolve(&self.db, &children)
+            .await?
+            .unwrap_or(children);
+        // BaseItem.IsVisibleViaTags exempts the immediate children of the user
+        // root from the allow-list. Blocked tags still hide a root library.
+        children.include_inherited_tags.clear();
         let mut rows = self.fetch_rows(&children, QueryShape::FullRows).await?;
         // `AddChildrenFromCollection` keeps only `e.IsVisible(user)`
         // (Folder.cs:1414-1417). `Folder.IsVisible` (Folder.cs:231-253) is the
@@ -2732,6 +2738,153 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    #[rstest::rstest]
+    #[case("own")]
+    #[case("series")]
+    #[case("ancestor")]
+    #[case("top_parent")]
+    #[tokio::test]
+    async fn saved_tag_policy_filters_each_inherited_source(#[case] source: &str) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let tagged = Uuid::new_v4();
+        let plain = Uuid::new_v4();
+        let parent = Uuid::new_v4();
+        seed_named_item(&db, plain, BaseItemKind::Movie, "Plain").await;
+        seed_named_item(&db, parent, BaseItemKind::Series, "Tag source").await;
+        match source {
+            "series" => {
+                seed_item_of_series(&db, tagged, BaseItemKind::Movie, "Tagged", parent).await;
+            }
+            "top_parent" => {
+                seed_top_parented_item(&db, tagged, BaseItemKind::Movie, "Tagged", parent).await;
+            }
+            _ => seed_named_item(&db, tagged, BaseItemKind::Movie, "Tagged").await,
+        }
+        if source == "ancestor" {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)"#)
+                .bind(guid_to_db(tagged))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        seed_item_value(
+            &db,
+            if source == "own" { tagged } else { parent },
+            ItemValueType::Tags,
+            "Café",
+        )
+        .await;
+        let filter = InternalItemsQuery {
+            user: Some(user.clone()),
+            item_ids: vec![tagged, plain],
+            group_by_presentation_unique_key: false,
+            ..Default::default()
+        };
+        for (blocked, allowed, expected) in [
+            (vec![], vec![], vec![tagged, plain]),
+            (vec!["CAFE"], vec![], vec![plain]),
+            (vec![], vec!["café"], vec![tagged]),
+            (vec!["Café"], vec!["cafe"], vec![]),
+            (vec![" "], vec!["\t"], vec![tagged, plain]),
+            (vec![], vec![], vec![tagged, plain]),
+        ] {
+            for (kind, values) in [
+                (PreferenceKind::BlockedTags, &blocked),
+                (PreferenceKind::AllowedTags, &allowed),
+            ] {
+                crate::user_entity_ext::set_preference(
+                    db.writer(),
+                    &user.id,
+                    kind,
+                    &values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>(),
+                )
+                .await
+                .unwrap();
+            }
+            for has_parental_rating in [None, Some(true)] {
+                let result = repository
+                    .get_items(&InternalItemsQuery {
+                        has_parental_rating,
+                        ..filter.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.total_record_count,
+                    i32::try_from(expected.len()).unwrap(),
+                    "{source} {blocked:?} {allowed:?}"
+                );
+                assert_eq!(result.items.len(), expected.len());
+                for id in &expected {
+                    assert!(result.items.iter().any(|row| row.id == guid_to_db(*id)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn person_allow_tag_exception_does_not_override_blocked_tags() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let person = Uuid::new_v4();
+        seed_named_item(&db, person, BaseItemKind::Person, "Cast member").await;
+        let filter = InternalItemsQuery {
+            item_ids: vec![person],
+            include_inherited_tags: vec!["Safe".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            repository
+                .get_items(&filter)
+                .await
+                .unwrap()
+                .total_record_count,
+            1
+        );
+        seed_item_value(&db, person, ItemValueType::Tags, "Private").await;
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    exclude_inherited_tags: vec!["private".into()],
+                    ..filter
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_query_keeps_tag_value_map_and_ancestor_index_seeks() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery {
+            include_inherited_tags: vec!["safe".into()],
+            exclude_inherited_tags: vec!["private".into()],
+            ..Default::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().unwrap().unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(plan.matches("SEARCH tag_value USING").count(), 8, "{plan}");
+        assert_eq!(plan.matches("SEARCH tag_map USING").count(), 8, "{plan}");
+        assert_eq!(plan.matches("SEARCH tag_parent USING").count(), 2, "{plan}");
+        assert!(!plan.contains("SCAN tag_"), "{plan}");
+    }
 
     #[rstest::rstest]
     #[case(BaseItemKind::Movie, "Movie", false)]

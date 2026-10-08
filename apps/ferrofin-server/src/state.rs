@@ -962,11 +962,21 @@ pub async fn build_app_state(
             }),
     );
 
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
     let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
+            .with_visibility(Arc::clone(&item_visibility))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
             // The provisioned row's parent is the `AggregateFolder`, the way
             // `CreateRootFolder` parents it.
@@ -1051,15 +1061,6 @@ pub async fn build_app_state(
         FerrofinMusicManager::new(Arc::clone(&item_repository))
             .with_users(Arc::clone(&users))
             .with_by_name_store(by_name_store.clone()),
-    );
-    let item_visibility = Arc::new(
-        ferrofin_core::item_visibility::ItemVisibility::new(
-            db.clone(),
-            Arc::clone(&item_repository),
-            Arc::clone(&localization),
-            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-        )
-        .with_virtual_paths(virtual_paths.clone()),
     );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),

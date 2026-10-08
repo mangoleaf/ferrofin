@@ -156,6 +156,7 @@ pub struct FerrofinUserViewManager {
     /// (12.1 `UserViewManager.HasVisibleChild`). Without it (unit tests) the
     /// check is skipped and such views are always listed.
     users: Option<Arc<dyn UserManager>>,
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -183,6 +184,7 @@ impl FerrofinUserViewManager {
             virtual_folders: None,
             db: None,
             users: None,
+            visibility: None,
             metadata_path: None,
         }
     }
@@ -199,6 +201,16 @@ impl FerrofinUserViewManager {
     #[must_use]
     pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Shares the library's batched `IsVisible` evaluator for home views.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
         self
     }
 
@@ -753,6 +765,20 @@ impl UserViewManager for FerrofinUserViewManager {
         };
         let views = self.items.get_item_list(&query).await?;
         let views = self.only_canonical_user_views(user_id, views);
+        let views = if let (Some(visibility), Some(users)) = (&self.visibility, &self.users) {
+            let user = users
+                .get_user_by_id(user_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("user"))?;
+            let visible = visibility.visible(&views, &user, false).await?;
+            views
+                .into_iter()
+                .zip(visible)
+                .filter_map(|(view, allowed)| allowed.then_some(view))
+                .collect()
+        } else {
+            views
+        };
         let views = self
             .without_childless_linked_libraries(user_id, views)
             .await?;
