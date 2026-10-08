@@ -129,6 +129,7 @@ fn authed_info() -> AuthorizationInfo {
         token: Some("token-abc".into()),
         is_api_key: false,
         user: Some(user_entity(USER_ID, "alice")),
+        user_policy: None,
         is_authenticated: true,
         remote_endpoint: Some("203.0.113.9".to_owned()),
     }
