@@ -1987,8 +1987,8 @@ impl FerrofinSessionManager {
             .can_access_device(&user, device_id)
             .await?
         {
-            return Err(ServiceError::unauthorized(
-                "user is not allowed access from this device",
+            return Err(ServiceError::Forbidden(
+                "user is not allowed access from this device".to_owned(),
             ));
         }
 

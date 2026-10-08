@@ -1031,3 +1031,128 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         StatusCode::OK
     );
 }
+
+#[tokio::test]
+async fn public_user_picker_filters_authenticated_devices_after_setup() {
+    let h = boot().await;
+    let router = ferrofin_api::create_router(h.wired.state.clone());
+    let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let id = create_user(&router, &admin, "device-user", "pw").await;
+    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    dto["Policy"]["IsHidden"] = json!(false);
+    dto["Policy"]["EnableAllDevices"] = json!(false);
+    dto["Policy"]["EnabledDevices"] = json!([]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for setup in [false, true] {
+        let (_, mut config) =
+            call(&router, "GET", "/System/Configuration", Some(&admin), None).await;
+        config["IsStartupWizardCompleted"] = json!(setup);
+        assert_eq!(
+            call(
+                &router,
+                "POST",
+                "/System/Configuration",
+                Some(&admin),
+                Some(config)
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        for token in [None, Some(admin.as_str())] {
+            let (status, users) = call(&router, "GET", "/Users/Public", token, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                users.as_array().unwrap().iter().any(|u| u["Id"] == id),
+                !setup || token.is_none(),
+                "setup={setup}, authenticated={}",
+                token.is_some()
+            );
+        }
+    }
+    // Match the header device used by `call`, case-insensitively.
+    dto["Policy"]["EnabledDevices"] = json!([admin[..8].to_uppercase()]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, users) = call(&router, "GET", "/Users/Public", Some(&admin), None).await;
+    assert!(users.as_array().unwrap().iter().any(|u| u["Id"] == id));
+}
+
+#[tokio::test]
+async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
+    let h = boot().await;
+    let router = ferrofin_api::create_router(h.wired.state.clone());
+    let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let id = create_user(&router, &admin, "device-user", "pw").await;
+    let (user, _) = login(&router, "device-user", "pw").await;
+    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    dto["Policy"]["EnableAllDevices"] = json!(false);
+    dto["Policy"]["EnabledDevices"] = json!([]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::OK,
+        "policy saves do not emit OnUserUpdated in the pinned source"
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/Users/AuthenticateByName",
+            None,
+            Some(json!({"Username":"device-user", "Pw":"pw"}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "a denied device is a security error, not bad credentials"
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users?userId={id}"),
+            Some(&admin),
+            Some(json!({"Name":"renamed"}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}

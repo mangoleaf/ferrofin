@@ -217,6 +217,8 @@ impl UserManager for MemUsers {
             has_password: Some(user.password.is_some()),
             policy: Some(UserPolicy {
                 is_administrator: is_admin,
+                // This account fixture has no device restrictions.
+                enable_all_devices: true,
                 ..UserPolicy::default()
             }),
             configuration: Some(UserConfiguration::default()),

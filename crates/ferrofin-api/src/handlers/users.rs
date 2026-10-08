@@ -53,7 +53,7 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
+use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::user_uuid;
@@ -503,7 +503,7 @@ async fn get_users(
     RequireAuth(_auth): RequireAuth,
     Query(query): Query<GetUsersQuery>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled).await?;
+    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
     Ok(Json(dtos))
 }
 
@@ -512,6 +512,7 @@ async fn get_users(
 /// Port of `UserController.GetPublicUsers`: only non-hidden, non-disabled users
 /// are returned in both wizard states. After setup, remote callers only see
 /// accounts that allow remote access, using the shared live network policy.
+/// Authenticated callers also filter by their device after setup.
 #[utoipa::path(
     get,
     path = "/Users/Public",
@@ -520,16 +521,22 @@ async fn get_users(
 )]
 async fn get_public_users(
     State(state): State<AppState>,
+    identity: Result<AuthenticatedIdentity, ApiError>,
     parts: Parts,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let mut dtos = filtered_user_dtos(&state, Some(false), Some(false)).await?;
-    if state
+    let setup = state
         .config
         .configuration()
         .await?
-        .is_startup_wizard_completed
-        && !state.is_in_local_network(state.client_address(&parts))
-    {
+        .is_startup_wizard_completed;
+    // C# reads the authenticated claim, not an anonymous DeviceId header.
+    let auth = identity.ok().map(|identity| identity.0);
+    let device_id = auth
+        .as_ref()
+        .and_then(|auth| auth.device_id.as_deref())
+        .filter(|id| setup && !id.trim().is_empty());
+    let mut dtos = filtered_user_dtos(&state, Some(false), Some(false), device_id).await?;
+    if setup && !state.is_in_local_network(state.client_address(&parts)) {
         dtos.retain(|dto| {
             dto.policy
                 .as_ref()
@@ -545,6 +552,7 @@ async fn filtered_user_dtos(
     state: &AppState,
     is_hidden: Option<bool>,
     is_disabled: Option<bool>,
+    device_id: Option<&str>,
 ) -> Result<Vec<UserDto>, ApiError> {
     let mut users = state.users.get_users().await?;
     users.sort_by(|a, b| a.username.cmp(&b.username));
@@ -560,6 +568,11 @@ async fn filtered_user_dtos(
         }
         if let Some(want) = is_disabled
             && policy.is_some_and(|p| p.is_disabled) != want
+        {
+            continue;
+        }
+        if let Some(device_id) = device_id
+            && !state.devices.can_access_device(user, device_id).await?
         {
             continue;
         }
@@ -734,12 +747,44 @@ async fn update_user(
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
+        update_device_access(&state, &user).await?;
     }
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
     notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The pinned `DeviceAccessHost` observes `OnUserUpdated`, emitted by rename.
+/// Policy/configuration saves do not emit that event in the pinned source.
+async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
+    if user_policy(state, user)
+        .await?
+        .is_some_and(|p| p.enable_all_devices)
+    {
+        return Ok(());
+    }
+    let devices = state
+        .devices
+        .get_devices(&ferrofin_traits::devices::DeviceQuery {
+            user_id: Some(user_uuid(user)?),
+            ..Default::default()
+        })
+        .await?
+        .items;
+    // Empty IDs are explicitly skipped by upstream's event handler.
+    for device in &devices {
+        if !device.device_id.is_empty()
+            && !state
+                .devices
+                .can_access_device(user, &device.device_id)
+                .await?
+        {
+            state.sessions.logout_device(device).await?;
+        }
+    }
+    Ok(())
 }
 
 /// `POST /Users/{userId}/Policy` — update a user's policy.
