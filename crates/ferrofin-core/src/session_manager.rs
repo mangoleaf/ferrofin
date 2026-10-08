@@ -996,6 +996,48 @@ impl FerrofinSessionManager {
         Ok((rest.len() > 1).then_some(rest))
     }
 
+    /// The filter belongs to the requested user, which may differ from an
+    /// administrator/API-key caller. A missing user yields no cast targets.
+    async fn shared_device_control_for(&self, id: Uuid) -> Result<Option<bool>, ServiceError> {
+        let Some(user) = self.user_manager.get_user_by_id(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            has_permission(
+                self.db.pool(),
+                &user.id,
+                PermissionKind::EnableSharedDeviceControl,
+            )
+            .await?,
+        ))
+    }
+
+    /// Resolve device permissions once per session list, after releasing the
+    /// session mutex; no device/database work runs under that lock.
+    async fn retain_accessible_session_devices(
+        &self,
+        user: &UserEntity,
+        result: &mut Vec<(SessionInfoDto, Option<Uuid>)>,
+    ) -> Result<(), ServiceError> {
+        let ids: Vec<&str> = result
+            .iter()
+            .filter_map(|(dto, _)| dto.device_id.as_deref().filter(|id| !id.trim().is_empty()))
+            .collect();
+        let allowed = self.device_manager.can_access_devices(user, &ids).await?;
+        let permitted: std::collections::HashSet<String> = ids
+            .into_iter()
+            .zip(allowed)
+            .filter(|(_, allow)| *allow)
+            .map(|(id, _)| id.to_owned())
+            .collect();
+        result.retain(|(dto, _)| {
+            dto.device_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty() || permitted.contains(id))
+        });
+        Ok(())
+    }
+
     /// Sends a message to one controllable session, enforcing the controller's
     /// permission when a controlling session is named (C# `AssertCanControl`).
     async fn send_to_controllable(
@@ -1011,12 +1053,8 @@ impl FerrofinSessionManager {
         // whatever controllers the session has (none → a no-op) and returns 204 — so
         // neither do we; the guard here previously rejected controller-less sessions
         // that Jellyfin accepts.
-        let _target = self.get_session_snapshot(session_id).await?;
-        if !controlling_session_id.is_empty() {
-            // The controlling session must exist; full permission arbitration
-            // (own-vs-others) is deferred with the note below.
-            let _controller = self.get_session_snapshot(controlling_session_id).await?;
-        }
+        self.assert_can_control(controlling_session_id, session_id)
+            .await?;
         self.broadcast(message_type, data, |s| s.id == session_id)
             .await
     }
@@ -1395,6 +1433,39 @@ impl SessionManager for FerrofinSessionManager {
             .await
     }
 
+    async fn assert_can_control(
+        &self,
+        controlling_session_id: &str,
+        session_id: &str,
+    ) -> Result<(), ServiceError> {
+        let target = self.get_session_snapshot(session_id).await?;
+        if controlling_session_id.is_empty() {
+            return Ok(());
+        }
+        let controller = self.get_session_snapshot(controlling_session_id).await?;
+        // C# AssertCanControl: no administrator override. Public targets and
+        // primary/additional users are always controllable by this caller.
+        if controller.user_id.is_nil()
+            || target.user_id.is_nil()
+            || target.contains_user(controller.user_id)
+        {
+            return Ok(());
+        }
+        if let Some(user) = self.user_manager.get_user_by_id(controller.user_id).await?
+            && has_permission(
+                self.db.pool(),
+                &user.id,
+                PermissionKind::EnableRemoteControlOfOtherUsers,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        Err(ServiceError::Forbidden(
+            "the current user cannot remote control other users".to_owned(),
+        ))
+    }
+
     async fn add_additional_user(
         &self,
         session_id: &str,
@@ -1530,25 +1601,34 @@ impl SessionManager for FerrofinSessionManager {
         controllable_user_to_check: Option<Uuid>,
         is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError> {
-        // Resolve the caller's control permissions (C# `GetSessions` head).
-        let (user_can_control_others, user_is_admin) = if is_api_key {
-            (true, true)
-        } else if user_id.is_nil() {
-            (false, false)
+        let caller = if !is_api_key && !user_id.is_nil() {
+            let Some(user) = self.user_manager.get_user_by_id(user_id).await? else {
+                return Ok(Vec::new());
+            };
+            Some(user)
         } else {
-            match self.user_manager.get_user_by_id(user_id).await? {
-                Some(user) => (
-                    has_permission(
-                        self.db.pool(),
-                        &user.id,
-                        PermissionKind::EnableRemoteControlOfOtherUsers,
-                    )
-                    .await?,
-                    has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator)
-                        .await?,
-                ),
-                None => return Ok(Vec::new()),
-            }
+            None
+        };
+        let (user_can_control_others, user_is_admin) = match &caller {
+            Some(user) => (
+                has_permission(
+                    self.db.pool(),
+                    &user.id,
+                    PermissionKind::EnableRemoteControlOfOtherUsers,
+                )
+                .await?,
+                has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await?,
+            ),
+            None => (is_api_key, is_api_key),
+        };
+        let controllable_user_to_check = controllable_user_to_check.filter(|id| !id.is_nil());
+        let shared_device_control = if let Some(id) = controllable_user_to_check {
+            let Some(allowed) = self.shared_device_control_for(id).await? else {
+                return Ok(Vec::new());
+            };
+            allowed
+        } else {
+            true
         };
 
         let min_active = active_within_seconds
@@ -1565,7 +1645,9 @@ impl SessionManager for FerrofinSessionManager {
             }
 
             if controllable_user_to_check.is_some() {
-                if !self.session_supports_remote_control(session) {
+                if !self.session_supports_remote_control(session)
+                    || (!shared_device_control && session.user_id.is_nil())
+                {
                     continue;
                 }
                 if !user_can_control_others
@@ -1599,6 +1681,14 @@ impl SessionManager for FerrofinSessionManager {
             result.push((dto, session.now_playing_item_id));
         }
         drop(sessions); // release before the async NowPlayingItem enrichment below
+
+        if controllable_user_to_check.is_some() && !is_api_key {
+            let Some(user) = &caller else {
+                return Ok(Vec::new());
+            };
+            self.retain_accessible_session_devices(user, &mut result)
+                .await?;
+        }
 
         // Enrich NowPlayingItem: C# `UpdateNowPlayingItem` builds a BaseItemDto for the
         // session's current item. Done after dropping the sessions lock (async DTO build).

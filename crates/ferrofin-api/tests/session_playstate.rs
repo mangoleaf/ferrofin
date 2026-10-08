@@ -502,6 +502,14 @@ fn current_session_dto(with_guest: bool) -> SessionInfoDto {
 
 #[async_trait]
 impl SessionManager for RecordingSessions {
+    async fn assert_can_control(&self, controller: &str, target: &str) -> Result<(), ServiceError> {
+        assert_eq!(controller, SESSION_ID);
+        if target == "forbidden-session" {
+            return Err(ServiceError::Forbidden("control denied".to_owned()));
+        }
+        Ok(())
+    }
+
     async fn log_session_activity(
         &self,
         _app_name: &str,
@@ -1624,7 +1632,7 @@ async fn send_message_defaults_header() {
 }
 
 #[tokio::test]
-async fn add_and_remove_user_are_204() {
+async fn attaching_another_user_needs_admin_but_removal_only_needs_control() {
     let (sessions, user_data) = recording();
     let app = state(sessions.clone(), user_data);
     let (status, _) = send(
@@ -1634,11 +1642,8 @@ async fn add_and_remove_user_are_204() {
         Body::empty(),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(
-        sessions.calls.lock().unwrap().added_user,
-        Some((SESSION_ID.to_owned(), GUEST_ID))
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(sessions.calls.lock().unwrap().added_user, None);
 
     let (status, _) = send(
         app,
@@ -1951,4 +1956,47 @@ async fn get_sessions_controllable_by_self_as_non_admin_is_allowed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_mutations_refuse_an_uncontrollable_target_before_writing() {
+    let (sessions, user_data) = recording();
+    let app = state(sessions.clone(), user_data);
+    for (method, uri, body) in [
+        (
+            "POST",
+            format!("/Sessions/forbidden-session/User/{USER_ID}"),
+            "",
+        ),
+        (
+            "DELETE",
+            format!("/Sessions/forbidden-session/User/{GUEST_ID}"),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities?id=forbidden-session".to_owned(),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities/Full?id=forbidden-session".to_owned(),
+            "{}",
+        ),
+        (
+            "POST",
+            format!("/Sessions/Viewing?sessionId=forbidden-session&itemId={ITEM_ID}"),
+            "",
+        ),
+    ] {
+        let (status, _) = send(app.clone(), method, &uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let calls = sessions.calls.lock().unwrap();
+    assert!(
+        calls.added_user.is_none()
+            && calls.removed_user.is_none()
+            && calls.capabilities.is_none()
+            && calls.now_viewing.is_none()
+    );
 }

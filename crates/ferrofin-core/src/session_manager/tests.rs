@@ -273,6 +273,14 @@ async fn a_non_admin_sees_the_transcode_but_not_the_silicon() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "viewer").await;
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
     let dto = mgr
         .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
         .await
@@ -432,6 +440,14 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
     let dto = mgr
         .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", &user)
         .await
@@ -2005,6 +2021,14 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     let (mgr, bus) = cast_manager(&db);
     let controller_id = Uuid::new_v4();
     let controller = seed_named_user(&db, controller_id, "controller").await;
+    set_permission(
+        db.writer(),
+        &controller.id,
+        PermissionKind::EnableRemoteControlOfOtherUsers,
+        true,
+    )
+    .await
+    .unwrap();
     let target_user = seed_named_user(&db, Uuid::new_v4(), "target").await;
     allow_playback(&db, &target_user).await;
 
@@ -2284,4 +2308,170 @@ async fn saved_session_limits_apply_to_new_logins(#[case] cap: i32, #[case] admi
         mgr.authenticate_direct(&request).await,
         Err(ServiceError::Forbidden(_))
     ));
+}
+
+#[tokio::test]
+async fn remote_control_permission_gates_delivery_and_saved_changes() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let alice = seed_named_user(&db, Uuid::new_v4(), "controller").await;
+    let alice_id = Uuid::parse_str(&alice.id).unwrap();
+    let bob = seed_named_user(&db, Uuid::new_v4(), "target").await;
+    let controller = mgr
+        .log_session_activity("Web", "1", "control", "Control", "e", &alice)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let (target, received) = cast_target(&mgr, bus.as_ref(), &bob, "target").await;
+    let command = ferrofin_model::session::PlaystateRequest {
+        command: ferrofin_model::session::PlaystateCommand::Pause,
+        ..Default::default()
+    };
+    for enabled in [false, true, false] {
+        set_permission(
+            db.writer(),
+            &alice.id,
+            PermissionKind::EnableRemoteControlOfOtherUsers,
+            enabled,
+        )
+        .await
+        .unwrap();
+        received.lock().unwrap().clear();
+        let result = mgr
+            .send_playstate_command(&controller, &target, &command)
+            .await;
+        assert_eq!(result.is_ok(), enabled);
+        assert_eq!(received.lock().unwrap().len(), usize::from(enabled));
+    }
+    set_permission(
+        db.writer(),
+        &alice.id,
+        PermissionKind::IsAdministrator,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            mgr.assert_can_control(&controller, &target).await,
+            Err(ServiceError::Forbidden(_))
+        ),
+        "admin is not an override here"
+    );
+    mgr.assert_can_control(&controller, &controller)
+        .await
+        .unwrap();
+    mgr.add_additional_user(&target, alice_id).await.unwrap();
+    mgr.assert_can_control(&controller, &target).await.unwrap();
+    mgr.remove_additional_user(&target, alice_id).await.unwrap();
+    mgr.assert_can_control("", &target).await.unwrap();
+    let public = mgr
+        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    mgr.assert_can_control(&controller, &public).await.unwrap();
+    mgr.assert_can_control(&public, &target).await.unwrap();
+    assert!(matches!(
+        mgr.assert_can_control("missing", &target).await,
+        Err(ServiceError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn shared_device_filter_uses_the_requested_user_and_device_access() {
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let alice = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let id = Uuid::parse_str(&alice.id).unwrap();
+    set_permission(
+        db.writer(),
+        &alice.id,
+        PermissionKind::EnableAllDevices,
+        true,
+    )
+    .await
+    .unwrap();
+    let (own, _) = cast_target(&mgr, bus.as_ref(), &alice, "own").await;
+    mgr.report_capabilities(
+        &own,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let public = mgr
+        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    mgr.report_capabilities(
+        &public,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    bus.register(public.clone(), Box::new(|_| {}));
+    for enabled in [false, true, false] {
+        set_permission(
+            db.writer(),
+            &alice.id,
+            PermissionKind::EnableSharedDeviceControl,
+            enabled,
+        )
+        .await
+        .unwrap();
+        let listed = mgr
+            .get_sessions(id, None, None, Some(id), false)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|s| s.id.as_deref() == Some(&own)));
+        assert_eq!(
+            listed.iter().any(|s| s.id.as_deref() == Some(&public)),
+            enabled
+        );
+        let api_key = mgr
+            .get_sessions(Uuid::nil(), None, None, Some(id), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            api_key.iter().any(|s| s.id.as_deref() == Some(&public)),
+            enabled,
+            "API key filters by the named user's sharing preference"
+        );
+    }
+    assert!(
+        mgr.get_sessions(id, None, None, Some(Uuid::new_v4()), false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    set_permission(
+        db.writer(),
+        &alice.id,
+        PermissionKind::EnableAllDevices,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        mgr.get_sessions(id, None, None, Some(id), false)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !mgr.get_sessions(Uuid::nil(), None, None, Some(id), true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
