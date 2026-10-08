@@ -3,15 +3,48 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::{Json, Router, extract::State, http::Uri};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, Uri},
+    response::{IntoResponse, Response},
+};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
+
+const POSTER: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0,
+    0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 68, 12,
+    16, 10, 0, 31, 238, 3, 253, 139, 95, 20, 212, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
 
 const CLIENT: &str =
     r#"MediaBrowser Client="locale-test", Device="fixture", DeviceId="locale-test", Version="1""#;
 
-async fn provider(State(requests): State<Arc<Mutex<Vec<String>>>>, uri: Uri) -> Json<Value> {
+async fn provider(
+    State(requests): State<Arc<Mutex<Vec<String>>>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     requests.lock().unwrap().push(uri.to_string());
+    let origin = format!("http://{}", headers["host"].to_str().unwrap());
+    let artwork = match uri.path() {
+        "/artwork/types" => Some(json!({"data":[{"id":7,"name":"Poster","recordType":"season"}]})),
+        "/series/5/extended" => Some(
+            json!({"data":{"id":5,"seasons":[{"id":51,"number":1,"type":{"type":"official"}}]}}),
+        ),
+        "/series/6/extended" => Some(
+            json!({"data":{"id":6,"seasons":[{"id":61,"number":1,"type":{"type":"official"}}]}}),
+        ),
+        "/seasons/51/extended" | "/seasons/61/extended" => Some(
+            json!({"data":{"artwork":[{"type":7,"image":format!("{origin}/tvdb.png"),"language":"eng","width":2,"height":2}]}}),
+        ),
+        "/tvdb.png" => return ([("content-type", "image/png")], POSTER).into_response(),
+        _ => None,
+    };
+    if let Some(artwork) = artwork {
+        return Json(artwork).into_response();
+    }
     if uri.path() == "/movie/603" {
         let url = reqwest::Url::parse(&format!("http://fixture{uri}")).unwrap();
         let language = url
@@ -27,14 +60,15 @@ async fn provider(State(requests): State<Arc<Mutex<Vec<String>>>>, uri: Uri) -> 
                 {"iso_3166_1":"DE","release_dates":[{"certification":"12"}]},
                 {"iso_3166_1":"AR","release_dates":[{"certification":"13"}]}
             ]},"videos":{"results":[]},"credits":{"cast":[],"crew":[]}
-        }));
+        })).into_response();
     }
     if uri.path() == "/" {
         return Json(
             json!({"Title":"OMDb pick","imdbID":"tt0133093","Year":"1999","Type":"movie","Response":"True"}),
-        );
+        ).into_response();
     }
     Json(json!({"results":[],"posters":[],"backdrops":[],"logos":[],"data":{"token":"fixture"}}))
+        .into_response()
 }
 
 struct Api {
@@ -139,6 +173,23 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         "<movie><tmdbid>603</tmdbid></movie>",
     )
     .unwrap();
+    let tv = tmp.path().join("tv");
+    for (show, episode) in [
+        ("Flat", "Flat.S01E01.mkv"),
+        ("Physical", "Season 01/Physical.S01E01.mkv"),
+    ] {
+        let path = tv.join(show).join(episode);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"fixture").unwrap();
+        std::fs::write(
+            tv.join(show).join("tvshow.nfo"),
+            format!(
+                "<tvshow><tvdbid>{}</tvdbid></tvshow>",
+                if show == "Flat" { 5 } else { 6 }
+            ),
+        )
+        .unwrap();
+    }
     let requests = Arc::new(Mutex::new(Vec::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -304,6 +355,103 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         if let Some(expected) = expected {
             assert_eq!(found[0]["SearchProviderName"], expected, "{found:?}");
         }
+    }
+    // L13: both physical and path-less seasons use the selected TVDB image
+    // provider with all metadata downloaders disabled. Manual selection still
+    // lists images before enabling automatic acquisition.
+    let mut tv_options = json!({"PathInfos":[{"Path":tv}],
+        "EnableRealtimeMonitor":false,"EnableInternetProviders":true,
+        "EnableChapterImageExtraction":false,"EnableTrickplayImageExtraction":false,
+        "TypeOptions":[
+            {"Type":"Series","MetadataFetchers":[],"ImageFetchers":[]},
+            {"Type":"Season","MetadataFetchers":[],"ImageFetchers":[]},
+            {"Type":"Episode","MetadataFetchers":[],"ImageFetchers":[]}
+        ]
+    });
+    api.post(
+        "/Library/VirtualFolders?name=TV&collectionType=tvshows&refreshLibrary=false",
+        &json!({"LibraryOptions":tv_options}),
+    )
+    .await;
+    api.post("/Library/Refresh", &Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let seasons = loop {
+        let result = api
+            .get("/Items?recursive=true&includeItemTypes=Season&fields=Path")
+            .await;
+        let seasons = result["Items"].as_array().unwrap();
+        if seasons.len() == 2 {
+            break seasons.clone();
+        }
+        assert!(Instant::now() < deadline, "missing seasons: {result}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let folders = api.get("/Library/VirtualFolders").await;
+    let library = &folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "TV")
+        .unwrap()["ItemId"];
+    for season in &seasons {
+        let id = season["Id"].as_str().unwrap();
+        let available = api
+            .get(&format!(
+                "/Items/{id}/RemoteImages?providerName=TheTVDB&includeAllLanguages=true"
+            ))
+            .await;
+        assert_eq!(
+            available["Images"].as_array().unwrap().len(),
+            1,
+            "{available}"
+        );
+        assert!(
+            api.get(&format!("/Items/{id}/Images"))
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    tv_options["TypeOptions"][1]["ImageFetchers"] = json!(["TheTVDB"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":tv_options}),
+    )
+    .await;
+    for season in &seasons {
+        let id = season["Id"].as_str().unwrap();
+        api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=true"), &Value::Null).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let images = api.get(&format!("/Items/{id}/Images")).await;
+            if images
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|image| image["ImageType"] == "Primary")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no selected artwork for {season}: {images}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let image = api
+            .client
+            .get(format!("{}/Items/{id}/Images/Primary", api.base))
+            .header("Authorization", &api.auth)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(image.as_ref(), POSTER);
     }
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())

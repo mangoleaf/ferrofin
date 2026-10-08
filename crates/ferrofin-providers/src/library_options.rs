@@ -760,11 +760,8 @@ fn audio_extractor_images(_type_name: &str) -> &'static [ImageType] {
 /// `GetSupportedImages` (`TvdbSeriesImageProvider.cs:59-66`,
 /// `TvdbSeasonImageProvider.cs:59-64`, `TvdbEpisodeImageProvider.cs:49-52`).
 ///
-/// TODO(parity, open work item): the scan's image pass does not ask TheTVDB
-/// for a season's artwork yet (see `fetch_tv_still_images`); port
-/// `TvdbSeasonImageProvider.GetImages` — the season's TVDB id from the series'
-/// extended record for its display order, then `/seasons/{id}/extended`'s
-/// artworks by season artwork type.
+/// Season acquisition follows the selected display order and uses the season
+/// artwork reference types (`TvdbClient::season_images`) in scan and refresh.
 fn tvdb_images(type_name: &str) -> &'static [ImageType] {
     use ImageType::{Art, Backdrop, Banner, Logo, Primary};
     const SERIES: &[ImageType] = &[Primary, Banner, Backdrop, Logo, Art];

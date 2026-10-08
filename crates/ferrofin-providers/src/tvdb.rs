@@ -40,6 +40,18 @@ const PROJECT_API_KEY: &str = "7f7eed88-2530-4f84-8ee7-f154471b8f87";
 /// The default episode ordering — TVDB "official" (aired) order.
 pub const DEFAULT_SEASON_TYPE: &str = "official";
 
+/// TVDB's episode image provider uses supported series display orders; absolute
+/// episodes use season one except specials, which retain official numbering.
+#[must_use]
+pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
+    match order {
+        "absolute" if season == 0 => (DEFAULT_SEASON_TYPE, 0),
+        "absolute" => ("absolute", 1),
+        "regional" | "alternate" | "altdvd" | "dvd" | "alttwo" => (order, season),
+        _ => (DEFAULT_SEASON_TYPE, season),
+    }
+}
+
 /// How long a resolved TVDB id is reused unless configured otherwise
 /// ([`TvdbClient::with_cache_duration`], the server's
 /// `FERROFIN_TVDB_CACHE_HOURS`): the plugin's `CacheDurationInHours` default
@@ -424,6 +436,14 @@ struct ArtworkWire {
     height: Option<i32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtworkTypeWire {
+    id: Option<i64>,
+    name: Option<String>,
+    record_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SeriesExtendedWire {
     translations: Option<TranslationsWire>,
@@ -630,6 +650,7 @@ pub struct TvdbClient {
     /// `cache_duration` as the plugin keeps the
     /// record ([`season_id`](Self::season_id)).
     season_ids: Mutex<SeasonIdCache>,
+    artwork_types: Mutex<Option<(std::time::Instant, Vec<ArtworkTypeWire>)>>,
     /// How long both caches keep an entry: the plugin's
     /// `CacheDurationInHours` ([`DEFAULT_CACHE_DURATION`] unless set).
     cache_duration: std::time::Duration,
@@ -675,6 +696,7 @@ impl TvdbClient {
             base_url: API_BASE.to_owned(),
             episode_ids: Mutex::new(EpisodeIdCache::new()),
             season_ids: Mutex::new(SeasonIdCache::new()),
+            artwork_types: Mutex::new(None),
             cache_duration: DEFAULT_CACHE_DURATION,
         }
     }
@@ -987,6 +1009,91 @@ impl TvdbClient {
             cache.insert(series_id, (std::time::Instant::now(), seasons.clone()));
         }
         seasons
+    }
+
+    /// `TvdbSeasonImageProvider`: the selected ordering's artwork, falling
+    /// back to the official season only when the selected season has no art.
+    pub async fn season_images(
+        &self,
+        series_id: i64,
+        season_type: &str,
+        number: i32,
+    ) -> Vec<TmdbImage> {
+        #[derive(Deserialize)]
+        struct SeasonArtwork {
+            artwork: Option<Vec<ArtworkWire>>,
+        }
+        let Some(types) = self.image_types().await else {
+            return Vec::new();
+        };
+        let orders = if season_type.eq_ignore_ascii_case(DEFAULT_SEASON_TYPE) {
+            vec![DEFAULT_SEASON_TYPE]
+        } else {
+            vec![season_type, DEFAULT_SEASON_TYPE]
+        };
+        for order in orders {
+            let Some(id) = self.season_id(series_id, order, number).await else {
+                continue;
+            };
+            let Some(wire) = self
+                .get::<SeasonArtwork>(&format!("/seasons/{id}/extended"), &[])
+                .await
+            else {
+                continue;
+            };
+            let artwork = wire.artwork.unwrap_or_default();
+            if artwork.is_empty() {
+                continue;
+            }
+            return artwork
+                .into_iter()
+                .filter_map(|art| {
+                    let kind = types.iter().find(|kind| {
+                        kind.id.is_some()
+                            && kind.id == art.type_
+                            && kind
+                                .record_type
+                                .as_deref()
+                                .is_some_and(|record| record.eq_ignore_ascii_case("season"))
+                    })?;
+                    let image_type = match kind.name.as_deref()?.to_ascii_lowercase().as_str() {
+                        "poster" => ImageType::Primary,
+                        "banner" => ImageType::Banner,
+                        "background" => ImageType::Backdrop,
+                        "clearlogo" => ImageType::Logo,
+                        "clearart" => ImageType::Art,
+                        _ => return None,
+                    };
+                    Some(TmdbImage {
+                        image_type,
+                        url: art.image?,
+                        width: Some(art.width.unwrap_or(0)),
+                        height: Some(art.height.unwrap_or(0)),
+                        language: art.language,
+                        community_rating: None,
+                        vote_count: None,
+                    })
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    async fn image_types(&self) -> Option<Vec<ArtworkTypeWire>> {
+        // TvdbClientManager caches reference lists for seven days by default.
+        if let Some(types) = self.artwork_types.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_hours(168))
+                .map(|(_, types)| types.clone())
+        }) {
+            return Some(types);
+        }
+        let types: Vec<ArtworkTypeWire> = self.get("/artwork/types", &[]).await?;
+        if let Ok(mut cache) = self.artwork_types.lock() {
+            *cache = Some((std::time::Instant::now(), types.clone()));
+        }
+        Some(types)
     }
 
     /// Fetches and maps a season's record with its translations
@@ -1641,5 +1748,51 @@ mod tests {
         }
         assert_eq!(season_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(episode_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[rstest::rstest]
+    #[case("absolute", 0, "official", 0)]
+    #[case("absolute", 2, "absolute", 1)]
+    #[case("dvd", 2, "dvd", 2)]
+    #[case("invalid", 2, "official", 2)]
+    #[test]
+    fn episode_artwork_order(
+        #[case] input: &str,
+        #[case] season: i32,
+        #[case] expected: &str,
+        #[case] expected_season: i32,
+    ) {
+        assert_eq!(
+            super::episode_image_order(input, season),
+            (expected, expected_season)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing_order("missing", "[]", 1)]
+    #[case::empty_order("dvd", "[]", 1)]
+    #[case::unmapped_art_does_not_fall_back("dvd", r#"[{"type":99,"image":"unknown"}]"#, 0)]
+    #[tokio::test]
+    async fn season_artwork_uses_reference_types_and_official_fallback(
+        #[case] order: &str,
+        #[case] alternate: &str,
+        #[case] count: usize,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/artwork/types", r#"{"data":[{"id":71,"name":"Poster","recordType":"season"},{"id":72,"name":"Poster","recordType":"series"}]}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}]}}"#.to_owned()),
+            ("/seasons/51/extended", format!(r#"{{"data":{{"artwork":{alternate}}}}}"#)),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
+        ]).await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        let images = client.season_images(5, order, 1).await;
+        assert_eq!(images.len(), count);
+        if count > 0 {
+            assert_eq!(images[0].image_type, ImageType::Primary);
+            assert_eq!(images[0].url, "poster.jpg");
+            assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
+        }
+        assert!(client.artwork_types.lock().unwrap().is_some());
+        assert!(client.season_images(5, "official", 99).await.is_empty());
     }
 }

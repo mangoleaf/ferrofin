@@ -9592,6 +9592,7 @@ impl LibraryScanner {
                     sources.push((fetcher_names::FANART, images));
                 }
                 let mut images = Vec::new();
+                self.load_omdb_poster(entity, cache, policy, short).await;
                 append_omdb_poster(&mut images, entity, cache, policy, short);
                 sources.push((fetcher_names::OMDB, images));
                 let images = ordered_remote_images(sources, policy, short);
@@ -9609,6 +9610,15 @@ impl LibraryScanner {
                     .get(&entity.id)
                     .map(|d| d.tvdb_id)
                     .or_else(|| recorded_provider_id(cache, &entity.id, "Tvdb"));
+                if policy.image_enabled(short, fetcher_names::TVDB)
+                    && !cache.series_tvdb.contains_key(&entity.id)
+                    && let (Some(tvdb), Some(id)) = (&self.tvdb, tvdb_id)
+                    && let Some(details) = tvdb
+                        .series_details(id, &self.three_letter_country(&locale.1))
+                        .await
+                {
+                    cache.series_tvdb.insert(entity.id.clone(), details);
+                }
                 let tvdb_art = policy
                     .image_enabled(short, fetcher_names::TVDB)
                     .then(|| cache.series_tvdb.get(&entity.id))
@@ -9726,13 +9736,9 @@ impl LibraryScanner {
         }
     }
 
-    /// The season-poster / episode-still image pass, split out of
-    /// [`fetch_remote_images`](Self::fetch_remote_images). A **season** takes
-    /// its poster from the cached `/tv/{id}/season/{n}` response; an
-    /// **episode** downloads the still cached earlier this scan (TVDB's, else
-    /// that same season response). Both go through
-    /// [`season_details_cached`](Self::season_details_cached), so the season
-    /// request is made at most once per scan no matter which pass asks first.
+    /// The selected season and episode image providers. Season artwork uses
+    /// the provider's image listing; an episode can reuse its metadata still
+    /// when that lookup used the same display order.
     /// `replace` as [`fetch_remote_images`](Self::fetch_remote_images).
     // The pass's inputs, each used once; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
@@ -9752,45 +9758,48 @@ impl LibraryScanner {
         );
 
         if short == "Season" {
-            // Season posters are TMDB's.
-            // TODO(parity, open work item): TheTVDB's and fanart.tv's season
-            // image providers are not asked yet (`TvdbSeasonImageProvider`,
-            // fanart `SeasonProvider`); see `tvdb_images` / `fanart_images`
-            // in `ferrofin_providers::library_options` for the port.
-            if !policy.image_enabled(short, fetcher_names::TMDB) {
-                return Vec::new();
-            }
-            let (Some(series_id), Some(season_num)) = (
-                entity.series_id.clone(),
-                entity.index_number.and_then(|n| i32::try_from(n).ok()),
-            ) else {
-                return Vec::new();
+            let images = if policy.image_enabled(short, fetcher_names::TMDB) {
+                match (
+                    entity.series_id.as_deref(),
+                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                ) {
+                    (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
+                        Some(id) => tmdb
+                            .season_images(id, number)
+                            .await
+                            .into_iter()
+                            .map(|image| RemoteImage {
+                                image_type: image.image_type,
+                                url: image.url,
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
             };
-            let poster = self
-                .season_details_cached(cache, &series_id, season_num, language.as_deref())
-                .await
-                .and_then(|d| d.poster.clone());
-            let images = poster
-                .map(|url| {
-                    vec![RemoteImage {
-                        image_type: ImageType::Primary,
-                        url,
-                    }]
-                })
-                .unwrap_or_default();
+            let season_art = if policy.image_enabled(short, fetcher_names::TVDB) {
+                self.tvdb_child_images(entity, cache).await
+            } else {
+                Vec::new()
+            };
+            let images = ordered_remote_images(
+                vec![
+                    (fetcher_names::TMDB, images),
+                    (fetcher_names::TVDB, season_art),
+                ],
+                policy,
+                short,
+            );
             return download_remote_images(tmdb, item_dir, &entity.id, images, replace).await;
         }
-        // Episode: TheTVDB's still, cached during the metadata pass, and
-        // TheMovieDb's, this episode's entry in the season response (usually
-        // cached by the metadata pass too), ranked by the image-fetcher order
-        // (`ordered_remote_images`) with OMDb's poster (C#
-        // `OmdbImageProvider.Supports` covers Movie, Trailer and Episode), as
-        // series artwork is: the first one with a still supplies it, and a
-        // later one stands in when that download fails.
-        let the_tvdb_still = policy
-            .image_enabled(short, fetcher_names::TVDB)
-            .then(|| cache.episode_tvdb_still.get(&entity.id).cloned())
-            .flatten();
+        let tvdb_images = if policy.image_enabled(short, fetcher_names::TVDB) {
+            self.tvdb_child_images(entity, cache).await
+        } else {
+            Vec::new()
+        };
         let the_moviedb_still = if policy.image_enabled(short, fetcher_names::TMDB) {
             match (
                 entity.series_id.clone(),
@@ -9818,10 +9827,11 @@ impl LibraryScanner {
             .collect::<Vec<_>>()
         };
         let mut omdb = Vec::new();
+        self.load_omdb_poster(entity, cache, policy, short).await;
         append_omdb_poster(&mut omdb, entity, cache, policy, short);
         let images = ordered_remote_images(
             vec![
-                (fetcher_names::TVDB, primary(the_tvdb_still)),
+                (fetcher_names::TVDB, tvdb_images),
                 (fetcher_names::TMDB, primary(the_moviedb_still)),
                 (fetcher_names::OMDB, omdb),
             ],
@@ -9832,6 +9842,118 @@ impl LibraryScanner {
             return Vec::new();
         }
         download_remote_images(tmdb, item_dir, &entity.id, images, replace).await
+    }
+
+    /// Image providers run independently of the library's metadata selection.
+    async fn load_omdb_poster(
+        &self,
+        entity: &BaseItemEntity,
+        cache: &mut ArtworkCache,
+        policy: FetcherPolicy<'_>,
+        short: &str,
+    ) {
+        if !policy.image_enabled(short, fetcher_names::OMDB)
+            || cache.omdb_poster.contains_key(&entity.id)
+        {
+            return;
+        }
+        if let (Some(client), Some(id)) = (
+            &self.omdb,
+            imdb_id_of(cache.item_provider_ids.get(&entity.id)),
+        ) && let Some(item) = client.item(&id).await
+            && let Some(poster) = item.poster.filter(|url| url.starts_with("http"))
+        {
+            cache.omdb_poster.insert(entity.id.clone(), poster);
+        }
+    }
+
+    /// TVDB artwork resolves through the series and its display order, even
+    /// when metadata refresh was disabled. Episode-local ids do not select art.
+    async fn tvdb_child_images(
+        &self,
+        entity: &BaseItemEntity,
+        cache: &ArtworkCache,
+    ) -> Vec<RemoteImage> {
+        let Some(series_id) = entity.series_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(tvdb_id) = cache
+            .series_tvdb
+            .get(series_id)
+            .map(|d| d.tvdb_id)
+            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
+            .filter(|id| *id > 0)
+        else {
+            return Vec::new();
+        };
+        let data = if let (Some(items), Ok(id)) =
+            (&self.item_repository, Uuid::parse_str(series_id))
+        {
+            match items.retrieve_item(id).await {
+                Ok(row) => row.and_then(|row| row.data),
+                Err(err) => {
+                    tracing::warn!(%err, item_id = %series_id, "could not read image display order");
+                    ferrofin_providers::rate_limit::note_request_failure();
+                    return Vec::new();
+                }
+            }
+        } else {
+            None
+        };
+        let data: serde_json::Value = data
+            .as_deref()
+            .and_then(|data| serde_json::from_str(data).ok())
+            .unwrap_or_default();
+        let order = data
+            .get("DisplayOrder")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE);
+        // The metadata episode provider currently uses official order. Its
+        // cached still is reusable only for that same order.
+        if entity.type_.ends_with("Episode")
+            && order == ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
+            && let Some(url) = cache.episode_tvdb_still.get(&entity.id)
+        {
+            return vec![RemoteImage {
+                image_type: ImageType::Primary,
+                url: url.clone(),
+            }];
+        }
+        let Some(client) = &self.tvdb else {
+            return Vec::new();
+        };
+        let Some(number) = entity.index_number.and_then(|n| i32::try_from(n).ok()) else {
+            return Vec::new();
+        };
+        if entity.type_.ends_with("Season") {
+            return client
+                .season_images(tvdb_id, order, number)
+                .await
+                .into_iter()
+                .map(|image| RemoteImage {
+                    image_type: image.image_type,
+                    url: image.url,
+                })
+                .collect();
+        }
+        let season = entity
+            .parent_index_number
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or(1);
+        let (order, season) = ferrofin_providers::tvdb::episode_image_order(order, season);
+        client
+            .episode_by_number(tvdb_id, order, season, number)
+            .await
+            .and_then(|details| details.image_url)
+            .filter(|url| !url.is_empty())
+            .map(|url| {
+                vec![RemoteImage {
+                    image_type: ImageType::Primary,
+                    url,
+                }]
+            })
+            .unwrap_or_default()
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -15211,6 +15333,103 @@ mod tests {
         (format!("http://{addr}"), requests)
     }
 
+    #[tokio::test]
+    async fn image_only_tvdb_child_lookup_needs_no_metadata_cache() {
+        let (base, requests) = spawn_tvdb_routes(vec![
+            (
+                "/artwork/types",
+                r#"{"data":[{"id":7,"name":"Poster","recordType":"season"}]}"#,
+            ),
+            (
+                "/series/5/extended",
+                r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"official"}}]}}"#,
+            ),
+            (
+                "/seasons/51/extended",
+                r#"{"data":{"artwork":[{"type":7,"image":"season.jpg"}]}}"#,
+            ),
+            (
+                "/series/5/episodes/official",
+                r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":1}]}}"#,
+            ),
+            (
+                "/episodes/9/extended",
+                r#"{"data":{"image":"episode.jpg"}}"#,
+            ),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&base),
+        ));
+        assert!(scanner.tvdb_child_images(&episode, &cache).await.is_empty());
+        assert!(requests.lock().unwrap().is_empty());
+        cache.item_provider_ids.insert(
+            "SERIES".to_owned(),
+            vec![("Tvdb".to_owned(), "5".to_owned())],
+        );
+        for (kind, expected) in [("Season", "season.jpg"), ("Episode", "episode.jpg")] {
+            episode.type_ = format!("MediaBrowser.Controller.Entities.TV.{kind}");
+            let images = scanner.tvdb_child_images(&episode, &cache).await;
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].url, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_only_omdb_fetch_respects_checkbox_and_reuses_poster() {
+        let (base, requests) = spawn_tvdb_routes(vec![(
+            "?",
+            r#"{"Response":"True","Poster":"http://fixture/poster.jpg"}"#,
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, mut movie) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let scanner = scanner.with_omdb(Arc::new(
+            ferrofin_providers::OmdbClient::new("key").with_base_url(&base),
+        ));
+        movie.id = "MOVIE".to_owned();
+        movie.type_ = "MediaBrowser.Controller.Entities.Movies.Movie".to_owned();
+        cache.item_provider_ids.insert(
+            movie.id.clone(),
+            vec![("Imdb".to_owned(), "tt123".to_owned())],
+        );
+        let mut options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        scanner
+            .load_omdb_poster(
+                &movie,
+                &mut cache,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                "Movie",
+            )
+            .await;
+        assert!(requests.lock().unwrap().is_empty());
+        options.type_options[0].image_fetchers = vec![super::fetcher_names::OMDB.to_owned()];
+        for _ in 0..2 {
+            scanner
+                .load_omdb_poster(
+                    &movie,
+                    &mut cache,
+                    super::FetcherPolicy {
+                        options: Some(&options),
+                        ..Default::default()
+                    },
+                    "Movie",
+                )
+                .await;
+        }
+        assert_eq!(cache.omdb_poster["MOVIE"], "http://fixture/poster.jpg");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
     /// The plugin's series identity (`TvdbSeriesProvider.GetMetadata`,
     /// `:66-90`): a series with an IMDb or Zap2It id — the ids `IsSupported`
     /// names (`ProviderIdsExtensions.cs:17-22`) — resolves through
@@ -19420,6 +19639,8 @@ mod tests {
                         .map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
                 } else if req.contains("/credits") {
                     credits.map_or(("500 Internal Server Error", "{}"), |b| ("200 OK", b))
+                } else if req.contains("/season/") && req.contains("/images") {
+                    ("200 OK", r#"{"posters":[]}"#)
                 } else if req.contains("/season/") {
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     body.map_or(("404 Not Found", "{}"), |b| ("200 OK", b))

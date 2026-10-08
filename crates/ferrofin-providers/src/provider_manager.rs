@@ -1514,8 +1514,8 @@ impl LocalProviderManager {
     ///
     /// The metadata half runs when any of the item's remote metadata
     /// providers this manager drives ([`metadata_fetchers`]) is enabled; each
-    /// one is gated again by its own checkbox when it runs. The images half
-    /// is TheMovieDb's, the only remote image provider this refresh drives.
+    /// one is gated again by its own checkbox when it runs. Images likewise
+    /// run when any registered image provider is enabled.
     ///
     /// [`metadata_fetchers`]: Self::metadata_fetchers
     async fn gated_options(
@@ -1532,7 +1532,10 @@ impl LocalProviderManager {
             });
         let images_allowed = (!entity.is_locked
             || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-            && image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, fetcher_names::TMDB);
+            && entity.extra_type.is_none()
+            && self.image_sources_for(entity).iter().any(|source| {
+                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, source.name())
+            });
         MetadataRefreshOptions {
             metadata_refresh_mode: if metadata_allowed {
                 options.metadata_refresh_mode
@@ -2135,7 +2138,7 @@ impl LocalProviderManager {
             .and_then(|r| r.name.as_deref())
             .map(str::trim)
             .filter(|n| !n.is_empty());
-        let target = if fetch.metadata || fetch.images {
+        let target = if fetch.metadata {
             self.resolve_refresh_target(items, &stored).await?
         } else {
             None
@@ -2143,7 +2146,7 @@ impl LocalProviderManager {
         // The fetch, with its provider failures counted: a provider that
         // failed keeps the refresh from being stamped, one that found nothing
         // does not (owner decision D1, `RefreshResult.Failures`).
-        let (fetched, failures) = match target {
+        let (fetched, mut failures) = match target {
             Some(RefreshTarget::Season {
                 series_id,
                 season_number,
@@ -2166,7 +2169,10 @@ impl LocalProviderManager {
                         .search_result
                         .as_ref()
                         .and_then(|r| r.search_provider_name.as_deref()),
-                    fetch,
+                    fetch: Fetch {
+                        images: false,
+                        ..fetch
+                    },
                 };
                 // Boxed: the fold's future carries both providers' state
                 // (`clippy::large_futures`).
@@ -2187,7 +2193,10 @@ impl LocalProviderManager {
                         target,
                         &stored_ids,
                         chosen_name,
-                        fetch,
+                        Fetch {
+                            images: false,
+                            ..fetch
+                        },
                         language.as_deref(),
                     ))
                     .await
@@ -2197,12 +2206,6 @@ impl LocalProviderManager {
             None => (None, 0),
         };
         let mut fetched = fetched.unwrap_or_default();
-        // `ItemImageProvider.RefreshImages`: short of replacing them, the
-        // remote providers fill only the image types the item lacks.
-        if plan.remote_images == ImageFetch::MissingOnly && !fetched.images.is_empty() {
-            let present = self.stored_image_types(item_id).await;
-            keep_missing_images(&mut fetched.images, present.as_deref());
-        }
         // `RefreshWithProviders`: a locked item merges nothing; otherwise the
         // provider result — starting from what upstream's `temp` starts with,
         // the item's `ParentIndexNumber` and preferred metadata language and
@@ -2253,15 +2256,43 @@ impl LocalProviderManager {
         let mut row = merged.item;
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
+        if fetch.images {
+            let query = RemoteImageQuery {
+                include_all_languages: true,
+                include_disabled_providers: false,
+                ..Default::default()
+            };
+            let (images, image_failures) = crate::rate_limit::count_request_failures(
+                self.available_images_for(&row, &merged.provider_ids, &query),
+            )
+            .await;
+            failures += image_failures;
+            fetched.images = images?
+                .into_iter()
+                .filter_map(|image| image.url.map(|url| (image.type_, url)))
+                .collect();
+        }
+        // `ItemImageProvider.RefreshImages`: short of replacing them, the
+        // remote providers fill only the image types the item lacks.
+        if plan.remote_images == ImageFetch::MissingOnly && !fetched.images.is_empty() {
+            let present = self.stored_image_types(item_id).await;
+            keep_missing_images(&mut fetched.images, present.as_deref());
+        }
         // The remote image providers' artwork. A single failed download must
         // not fail the refresh.
         let mut image_saved = false;
         if self.image_store.is_some() {
+            let mut saved_types = std::collections::HashSet::new();
             for (image_type, url) in &fetched.images {
-                image_saved |= self
-                    .save_image_from_url(item_id, url, *image_type, None)
-                    .await
-                    .is_ok();
+                if !saved_types.contains(image_type)
+                    && self
+                        .save_image_from_url(item_id, url, *image_type, None)
+                        .await
+                        .is_ok()
+                {
+                    saved_types.insert(*image_type);
+                    image_saved = true;
+                }
             }
         }
         // `RefreshMetadata`'s tail — the stamp and `SaveInternal`'s save
@@ -2492,6 +2523,10 @@ enum RemoteImageSource {
     /// `TmdbEpisodeImageProvider`: an episode's stills, keyed off the parent
     /// series' TMDB id plus the season and episode numbers.
     TmdbEpisode,
+    /// The TVDB plugin's series, season and episode artwork.
+    TvdbSeries,
+    TvdbSeason,
+    TvdbEpisode,
     /// The fanart.tv plugin's `MovieProvider`.
     FanartMovie,
     /// The fanart.tv plugin's `SeriesProvider`.
@@ -2522,6 +2557,7 @@ impl RemoteImageSource {
             Self::FanartMovie | Self::FanartSeries | Self::FanartArtist | Self::FanartAlbum => {
                 FANART_PROVIDER_NAME
             }
+            Self::TvdbSeries | Self::TvdbSeason | Self::TvdbEpisode => fetcher_names::TVDB,
             Self::AudioDbArtist | Self::AudioDbAlbum => AUDIODB_PROVIDER_NAME,
             Self::Omdb => OMDB_PROVIDER_NAME,
             Self::Studios => crate::studios::PROVIDER_NAME,
@@ -2533,9 +2569,15 @@ impl RemoteImageSource {
     fn supported_images(self) -> &'static [ImageType] {
         use ImageType::{Art, Backdrop, Banner, Disc, Logo, Primary, Thumb};
         match self {
+            Self::TvdbSeries => &[Primary, Banner, Backdrop, Logo, Art],
+            Self::TvdbSeason => &[Primary, Banner, Backdrop],
             Self::TmdbTitle(_) => &[Primary, Backdrop, Logo, Thumb],
             Self::TmdbBoxSet => &[Primary, Backdrop, Thumb],
-            Self::TmdbPerson | Self::TmdbSeason | Self::TmdbEpisode | Self::Omdb => &[Primary],
+            Self::TvdbEpisode
+            | Self::TmdbPerson
+            | Self::TmdbSeason
+            | Self::TmdbEpisode
+            | Self::Omdb => &[Primary],
             Self::FanartMovie => &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop],
             Self::FanartSeries => &[Primary, Thumb, Art, Logo, Backdrop, Banner],
             Self::FanartArtist => &[Primary, Logo, Art, Banner, Backdrop],
@@ -2663,6 +2705,7 @@ impl LocalProviderManager {
                 sources.extend(has(self.omdb.is_some(), RemoteImageSource::Omdb));
             }
             "Series" => {
+                sources.extend(has(self.tvdb.is_some(), RemoteImageSource::TvdbSeries));
                 sources.extend(has(
                     self.tmdb.is_some(),
                     RemoteImageSource::TmdbTitle(TmdbKind::Series),
@@ -2671,8 +2714,12 @@ impl LocalProviderManager {
             }
             // `TmdbSeasonImageProvider` has no arm here at all before this —
             // the "Choose Image" dialog on a season offered NOTHING.
-            "Season" => sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbSeason)),
+            "Season" => {
+                sources.extend(has(self.tvdb.is_some(), RemoteImageSource::TvdbSeason));
+                sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbSeason));
+            }
             "Episode" => {
+                sources.extend(has(self.tvdb.is_some(), RemoteImageSource::TvdbEpisode));
                 // TMDB first: C# orders by `IHasOrder.Order`, and
                 // `TmdbEpisodeImageProvider` is 1 against `OmdbImageProvider`'s 90.
                 sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbEpisode));
@@ -2715,6 +2762,92 @@ impl LocalProviderManager {
         sources
     }
 
+    /// Shared provider ordering/gating for manual lookup and automatic refresh.
+    /// Refresh passes the newly merged ids before saving the item.
+    async fn available_images_for(
+        &self,
+        entity: &BaseItemEntity,
+        ids: &[(String, String)],
+        query: &RemoteImageQuery,
+    ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
+        // `ProviderManager.GetAvailableRemoteImages`: every remote image
+        // provider for the item, narrowed to `ProviderName` when given
+        // (`OrdinalIgnoreCase`), each asked for its images, which are then
+        // narrowed to the requested `ImageType`.
+        let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
+        let sources: Vec<RemoteImageSource> = self
+            .ordered_image_sources(entity)
+            .await
+            .into_iter()
+            .filter(|source| name_filter.is_none_or(|n| source.name().eq_ignore_ascii_case(n)))
+            .collect();
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !query.include_disabled_providers && entity.is_locked {
+            // GetAvailableRemoteImages enumerates providers with Default image
+            // mode, even when called from an outer FullRefresh.
+            return Ok(Vec::new());
+        }
+        let library = self.library_options_for(entity).await;
+        let kind = short_kind(entity);
+        let global = self.global_metadata_options_for(kind);
+        let preferred = self.preferred_metadata_language(entity).await;
+        let mut results = Vec::new();
+        for source in sources {
+            if !query.include_disabled_providers
+                && (entity.extra_type.is_some()
+                    || !image_fetcher_enabled(
+                        library.as_ref(),
+                        global.as_ref(),
+                        kind,
+                        source.name(),
+                    ))
+            {
+                continue;
+            }
+            let images = self.images_from(source, entity, ids).await;
+            // `GetImages` runs PER PROVIDER, and so must the language filter and
+            // the sort: C# concatenates each provider's already-ordered block
+            // (`results.SelectMany`), it does not sort the union. Sorting the
+            // union instead would interleave providers and reorder the whole
+            // response.
+            let mut block: Vec<RemoteImageInfo> = images
+                .into_iter()
+                .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
+                .map(|img| RemoteImageInfo {
+                    provider_name: Some(source.name().to_owned()),
+                    url: Some(img.url),
+                    width: img.width,
+                    height: img.height,
+                    community_rating: img.community_rating,
+                    vote_count: img.vote_count,
+                    language: img.language,
+                    type_: img.image_type,
+                    ..RemoteImageInfo::default()
+                })
+                .collect();
+            // `if (!includeAllLanguages && hasPreferredLanguage)`: keep images
+            // with no language, the preferred language, or English. Note the
+            // asymmetry with the sort below — the FILTER tests
+            // `IsNullOrWhiteSpace`, the sort's no-language rank tests
+            // `IsNullOrEmpty`, so a whitespace-only tag survives the filter and
+            // then sorts as "other". That is upstream's behaviour, quirk and all.
+            if !query.include_all_languages && !preferred.trim().is_empty() {
+                block.retain(|img| {
+                    img.language.as_deref().is_none_or(|l| {
+                        l.trim().is_empty()
+                            || l.eq_ignore_ascii_case(&preferred)
+                            || l.eq_ignore_ascii_case("en")
+                    })
+                });
+            }
+            order_by_language_descending(&mut block, &preferred);
+            results.extend(block);
+        }
+        Ok(results)
+    }
+
     /// Asks one provider for `entity`'s images (`IRemoteImageProvider.GetImages`),
     /// keyed by the item's stored external ids `ids`. Empty when the id the
     /// provider needs is absent or the remote has nothing.
@@ -2725,6 +2858,9 @@ impl LocalProviderManager {
         ids: &[(String, String)],
     ) -> Vec<TmdbImage> {
         match source {
+            RemoteImageSource::TvdbSeries
+            | RemoteImageSource::TvdbSeason
+            | RemoteImageSource::TvdbEpisode => self.tvdb_images(source, entity, ids).await,
             RemoteImageSource::TmdbTitle(_)
             | RemoteImageSource::TmdbBoxSet
             | RemoteImageSource::TmdbPerson
@@ -2739,6 +2875,119 @@ impl LocalProviderManager {
             | RemoteImageSource::Omdb
             | RemoteImageSource::Studios => self.keyed_images(source, entity, ids).await,
         }
+    }
+
+    /// The TVDB plugin's image sources, including the parent's display order.
+    async fn tvdb_images(
+        &self,
+        source: RemoteImageSource,
+        entity: &BaseItemEntity,
+        ids: &[(String, String)],
+    ) -> Vec<TmdbImage> {
+        let Some(client) = &self.tvdb else {
+            return Vec::new();
+        };
+        let id_of = |ids: &[(String, String)]| {
+            provider_id_of_pairs(ids, "Tvdb")
+                .and_then(parse_numeric_provider_id)
+                .filter(|id| *id > 0)
+        };
+        let mut images = if source == RemoteImageSource::TvdbSeries {
+            match id_of(ids) {
+                Some(id) => client
+                    .series_details(id, "usa")
+                    .await
+                    .map(|details| details.images)
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        } else {
+            let Some(series) = self.parent_series_of(entity).await else {
+                return Vec::new();
+            };
+            let Ok(id) = Uuid::parse_str(&series.id) else {
+                return Vec::new();
+            };
+            let Some(series_id) = id_of(&self.stored_provider_ids(id).await) else {
+                return Vec::new();
+            };
+            let data: serde_json::Value = series
+                .data
+                .as_deref()
+                .and_then(|data| serde_json::from_str(data).ok())
+                .unwrap_or_default();
+            let order = data
+                .get("DisplayOrder")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(crate::tvdb::DEFAULT_SEASON_TYPE);
+            if source == RemoteImageSource::TvdbSeason {
+                match entity
+                    .index_number
+                    .and_then(|number| i32::try_from(number).ok())
+                {
+                    Some(number) => client.season_images(series_id, order, number).await,
+                    None => Vec::new(),
+                }
+            } else {
+                let details =
+                    if let Some(number) = entity.index_number.and_then(|n| i32::try_from(n).ok()) {
+                        let season = entity
+                            .parent_index_number
+                            .and_then(|n| i32::try_from(n).ok())
+                            .unwrap_or(1);
+                        let (order, season) = crate::tvdb::episode_image_order(order, season);
+                        client
+                            .episode_by_number(series_id, order, season, number)
+                            .await
+                    } else {
+                        None
+                    };
+                details
+                    .and_then(|details| details.image_url)
+                    .filter(|url| !url.is_empty())
+                    .map(|url| vec![plain_image(ImageType::Primary, url)])
+                    .unwrap_or_default()
+            }
+        };
+        for image in &mut images {
+            image.language = image
+                .language
+                .as_deref()
+                .and_then(|language| self.tvdb_image_language(language));
+        }
+        images
+    }
+
+    /// TvdbSdkExtensions.NormalizeToJellyfin uses its culture table, with three
+    /// TVDB-specific overrides, before the shared preferred-language ordering.
+    fn tvdb_image_language(&self, language: &str) -> Option<String> {
+        match language.to_ascii_lowercase().as_str() {
+            "zhtw" => return Some("zh-tw".to_owned()),
+            "pt" => return Some("pt-br".to_owned()),
+            "por" => return Some("pt-pt".to_owned()),
+            _ => {}
+        }
+        self.localization
+            .as_ref()?
+            .get_cultures()
+            .into_iter()
+            .find(|culture| {
+                culture.name.eq_ignore_ascii_case(language)
+                    || culture.display_name.eq_ignore_ascii_case(language)
+                    || culture
+                        .two_letter_iso_language_name
+                        .eq_ignore_ascii_case(language)
+                    || culture
+                        .three_letter_iso_language_names
+                        .iter()
+                        .any(|code| code.eq_ignore_ascii_case(language))
+                    || culture
+                        .three_letter_iso_language_name
+                        .as_deref()
+                        .is_some_and(|code| code.eq_ignore_ascii_case(language))
+            })
+            .map(|culture| culture.two_letter_iso_language_name.to_ascii_lowercase())
     }
 
     /// The TMDB image providers: a title's poster/backdrop/logo set (by its
@@ -3315,64 +3564,8 @@ impl ProviderManager for LocalProviderManager {
         let Some(entity) = items.retrieve_item(item_id).await? else {
             return Ok(Vec::new());
         };
-        // `ProviderManager.GetAvailableRemoteImages`: every remote image
-        // provider for the item, narrowed to `ProviderName` when given
-        // (`OrdinalIgnoreCase`), each asked for its images, which are then
-        // narrowed to the requested `ImageType`.
-        let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
-        let sources: Vec<RemoteImageSource> = self
-            .ordered_image_sources(&entity)
-            .await
-            .into_iter()
-            .filter(|source| name_filter.is_none_or(|n| source.name().eq_ignore_ascii_case(n)))
-            .collect();
-        if sources.is_empty() {
-            return Ok(Vec::new());
-        }
         let ids = self.stored_provider_ids(item_id).await;
-        let preferred = self.preferred_metadata_language(&entity).await;
-        let mut results = Vec::new();
-        for source in sources {
-            let images = self.images_from(source, &entity, &ids).await;
-            // `GetImages` runs PER PROVIDER, and so must the language filter and
-            // the sort: C# concatenates each provider's already-ordered block
-            // (`results.SelectMany`), it does not sort the union. Sorting the
-            // union instead would interleave providers and reorder the whole
-            // response.
-            let mut block: Vec<RemoteImageInfo> = images
-                .into_iter()
-                .filter(|img| query.image_type.is_none_or(|t| t == img.image_type))
-                .map(|img| RemoteImageInfo {
-                    provider_name: Some(source.name().to_owned()),
-                    url: Some(img.url),
-                    width: img.width,
-                    height: img.height,
-                    community_rating: img.community_rating,
-                    vote_count: img.vote_count,
-                    language: img.language,
-                    type_: img.image_type,
-                    ..RemoteImageInfo::default()
-                })
-                .collect();
-            // `if (!includeAllLanguages && hasPreferredLanguage)`: keep images
-            // with no language, the preferred language, or English. Note the
-            // asymmetry with the sort below — the FILTER tests
-            // `IsNullOrWhiteSpace`, the sort's no-language rank tests
-            // `IsNullOrEmpty`, so a whitespace-only tag survives the filter and
-            // then sorts as "other". That is upstream's behaviour, quirk and all.
-            if !query.include_all_languages && !preferred.trim().is_empty() {
-                block.retain(|img| {
-                    img.language.as_deref().is_none_or(|l| {
-                        l.trim().is_empty()
-                            || l.eq_ignore_ascii_case(&preferred)
-                            || l.eq_ignore_ascii_case("en")
-                    })
-                });
-            }
-            order_by_language_descending(&mut block, &preferred);
-            results.extend(block);
-        }
-        Ok(results)
+        self.available_images_for(&entity, &ids, query).await
     }
 
     async fn get_remote_image_provider_info(
@@ -3644,6 +3837,7 @@ mod tests {
         ExternalIdInfo, ItemLookupInfo, RemoteImageQuery, RemoteSearchResult,
     };
     use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::options::ItemImageInfo;
     use ferrofin_traits::providers::{
         ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager,
         RefreshPriority, RemoteSearchRequest,
@@ -5650,6 +5844,7 @@ mod tests {
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
     struct RecordingStore {
+        images: std::sync::Mutex<Vec<(Uuid, ItemImageInfo)>>,
         stored_ids: std::sync::Mutex<HashMap<Uuid, Vec<(String, String)>>>,
         replaced: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         upserted: std::sync::Mutex<Vec<(Uuid, String, String)>>,
@@ -5662,6 +5857,14 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::persistence::ItemPersistenceService for RecordingStore {
+        async fn set_item_image(
+            &self,
+            item_id: Uuid,
+            image: &ItemImageInfo,
+        ) -> Result<(), ServiceError> {
+            self.images.lock().unwrap().push((item_id, image.clone()));
+            Ok(())
+        }
         async fn delete_items(&self, _ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
             unimplemented!()
         }
@@ -7025,7 +7228,8 @@ mod tests {
     /// re-downloaded TMDB artwork onto an item the user had locked.
     #[tokio::test]
     async fn a_locked_item_refuses_remote_metadata_and_non_full_images() {
-        let mgr = LocalProviderManager::new(Vec::new());
+        let mut mgr = LocalProviderManager::new(Vec::new());
+        mgr.tmdb = Some(Arc::new(crate::tmdb::TmdbClient::new()));
         let locked = BaseItemEntity {
             type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
             is_locked: true,
@@ -8227,5 +8431,215 @@ mod tests {
             .expect("images");
         let languages: Vec<Option<&str>> = images.iter().map(|i| i.language.as_deref()).collect();
         assert_eq!(languages, [Some("fr"), Some("en")]);
+    }
+    #[rstest::rstest]
+    #[case::none(&[], &[], None)]
+    #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
+    #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
+    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
+    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("fanart"))]
+    #[tokio::test]
+    async fn pathless_refresh_obeys_image_selection_and_order(
+        #[case] enabled: &[&str],
+        #[case] order: &[&str],
+        #[case] expected: Option<&str>,
+    ) {
+        use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
+        let images = crate::mock_http::MockServer::start_typed(vec![
+            ("/fanart.jpg", "image/jpeg", b"fanart".to_vec()),
+            ("/tmdb.jpg", "image/jpeg", b"tmdb".to_vec()),
+        ])
+        .await;
+        let origin = images.base_url.clone();
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/movie/603/images",
+                r#"{"posters":[{"file_path":"/tmdb.jpg","iso_639_1":"en"}]}"#.to_owned(),
+            ),
+            (
+                "/movies/603",
+                format!(r#"{{"movieposter":[{{"url":"{origin}/fanart.jpg","lang":"en"}}]}}"#),
+            ),
+        ])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let item_id = Uuid::new_v4();
+        let library_id = Uuid::new_v4();
+        let mut movie = row("Movies.Movie", "Movie");
+        movie.id = item_id.to_string();
+        movie.top_parent_id = Some(library_id.to_string());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .unwrap()
+            .insert(item_id, vec![("Tmdb".to_owned(), "603".to_owned())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(
+                    crate::tmdb::TmdbClient::new()
+                        .with_base_url(&server.base_url)
+                        .with_image_root(&origin),
+                ),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, movie)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(store.clone(), root.path())
+            .with_fanart(Arc::new(
+                crate::fanart::FanartClient::new(None).with_base_url(&server.base_url),
+            ))
+            .with_virtual_folders(Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: LibraryOptions {
+                    type_options: vec![TypeOptions {
+                        type_: Some("Movie".to_owned()),
+                        image_fetchers: enabled.iter().map(|name| (*name).to_owned()).collect(),
+                        image_fetcher_order: order.iter().map(|name| (*name).to_owned()).collect(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            }));
+        mgr.refresh_full_item(
+            item_id,
+            &MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::None,
+                image_refresh_mode: MetadataRefreshMode::FullRefresh,
+                replace_all_images: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let written = store.images.lock().unwrap();
+            assert_eq!(written.len(), usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert_eq!(
+                    std::fs::read(&written[0].1.path).unwrap(),
+                    expected.as_bytes()
+                );
+            }
+        }
+        // The manual Choose Image dialog explicitly includes disabled providers.
+        let manual = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    include_disabled_providers: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual.len(), 2);
+    }
+    #[rstest::rstest]
+    #[case("ENG", Some("en"))]
+    #[case("fr", Some("fr"))]
+    #[case("French", Some("fr"))]
+    #[case("fra", Some("fr"))]
+    #[case("zhtw", Some("zh-tw"))]
+    #[case("pt", Some("pt-br"))]
+    #[case("por", Some("pt-pt"))]
+    #[case("unknown", None)]
+    #[test]
+    fn tvdb_artwork_language_uses_the_culture_table(
+        #[case] input: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let mgr = LocalProviderManager::default().with_localization(Arc::new(EnglishAndFrench));
+        assert_eq!(mgr.tvdb_image_language(input).as_deref(), expected);
+    }
+
+    #[tokio::test]
+    async fn tvdb_images_resolve_series_season_and_episode_with_disabled_metadata() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/artwork/types", r#"{"data":[{"id":7,"name":"Poster","recordType":"season"}]}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"id":5,"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}}],"artworks":[{"type":2,"image":"series.jpg","language":"eng"}]}}"#.to_owned()),
+            ("/seasons/51/extended", r#"{"data":{"artwork":[{"type":7,"image":"season.jpg","language":"fre"}]}}"#.to_owned()),
+            ("/series/5/episodes/dvd", r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":2}]}}"#.to_owned()),
+            ("/episodes/9/extended", r#"{"data":{"id":9,"image":"episode.jpg"}}"#.to_owned()),
+        ]).await;
+        let series_id = Uuid::new_v4();
+        let season_id = Uuid::new_v4();
+        let episode_id = Uuid::new_v4();
+        let library_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Show");
+        series.id = series_id.to_string();
+        series.data = Some(r#"{"DisplayOrder":"dvd"}"#.to_owned());
+        let mut season = row("TV.Season", "Season");
+        season.id = season_id.to_string();
+        season.index_number = Some(1);
+        season.series_id = Some(series_id.to_string());
+        let mut episode = row("TV.Episode", "Episode");
+        episode.id = episode_id.to_string();
+        episode.index_number = Some(2);
+        episode.parent_index_number = Some(1);
+        episode.series_id = Some(series_id.to_string());
+        for item in [&mut series, &mut season, &mut episode] {
+            item.top_parent_id = Some(library_id.to_string());
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store.stored_ids.lock().unwrap().extend([
+            (series_id, vec![("Tvdb".to_owned(), "5".to_owned())]),
+            (episode_id, vec![("Tvdb".to_owned(), "999".to_owned())]),
+        ]);
+        let mut mgr = LocalProviderManager::default()
+            .with_tvdb(Arc::new(
+                crate::tvdb::TvdbClient::new().with_base_url(&server.base_url),
+            ))
+            .with_image_store(store, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_virtual_folders(Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions {
+                    type_options: ["Series", "Season", "Episode"]
+                        .into_iter()
+                        .map(|kind| ferrofin_model::configuration::TypeOptions {
+                            type_: Some(kind.to_owned()),
+                            image_fetchers: vec!["TheTVDB".to_owned()],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+            }));
+        mgr.items = Some(Arc::new(FakeItems {
+            rows: HashMap::from([
+                (series_id, series),
+                (season_id, season),
+                (episode_id, episode),
+            ]),
+            seen: tx,
+        }));
+        for (id, url, language) in [
+            (series_id, "series.jpg", Some("en")),
+            (season_id, "season.jpg", Some("fr")),
+            (episode_id, "episode.jpg", None),
+        ] {
+            let providers = mgr.get_remote_image_provider_info(id).await.unwrap();
+            assert_eq!(providers.len(), 1);
+            assert_eq!(providers[0].name.as_deref(), Some("TheTVDB"));
+            let images = mgr
+                .get_available_remote_images(
+                    id,
+                    &RemoteImageQuery {
+                        include_all_languages: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(images.len(), 1, "{id}: {images:?}");
+            assert_eq!(images[0].url.as_deref(), Some(url));
+            assert_eq!(images[0].language.as_deref(), language);
+        }
     }
 }
