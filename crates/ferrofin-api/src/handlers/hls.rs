@@ -124,10 +124,7 @@ struct HlsQuery {
     #[serde(default)]
     max_video_bit_depth: Option<i32>,
     /// Whether the input is force-deinterlaced (`deInterlace`).
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     de_interlace: Option<bool>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
@@ -154,23 +151,13 @@ struct HlsQuery {
     max_framerate: Option<f32>,
     /// Whether `-c:v copy` is permitted (PlaybackInfo appends `false` when the
     /// client forbade it).
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted.
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
-    #[serde(
-        default,
-        rename = "static",
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default, rename = "static")]
     is_static: Option<bool>,
     /// The requested video profile (the `CODECS` profile byte of a re-encode).
     #[serde(default)]
@@ -201,22 +188,13 @@ struct HlsQuery {
     transcode_reasons: Option<String>,
     /// Whether text subtitles are listed as a group in the master playlist
     /// (route-specific default: `false` for `master.m3u8`, `true` for `live.m3u8`).
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     enable_subtitles_in_manifest: Option<bool>,
     /// Whether the master playlist adds two lower-bitrate variants (default `false`).
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     enable_adaptive_bitrate_streaming: Option<bool>,
     /// Whether the master playlist lists trickplay image playlists (default `true`).
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::opt_bool_ci"
-    )]
+    #[serde(default)]
     enable_trickplay: Option<bool>,
 }
 

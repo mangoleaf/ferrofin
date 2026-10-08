@@ -64,7 +64,10 @@ struct GetLogEntriesQuery {
     #[serde(default)]
     username: Option<String>,
     /// Filter by log severity.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     severity: Option<LogLevel>,
     /// Comma-delimited sort keys (`SortBy=Name,Type`).
     #[serde(default)]

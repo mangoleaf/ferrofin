@@ -124,25 +124,32 @@ where
     }
 }
 
-/// Binds a query `bool?` the way ASP.NET's `SimpleTypeModelBinder` does:
-/// `bool.TryParse`, which ignores case and surrounding whitespace (`True`,
-/// `FALSE`), and an empty value as `null`. serde's own `bool` accepts only
-/// `true`/`false`, so `?EnableSubtitlesInManifest=True` — the spelling
-/// Ferrofin's own `StreamInfo::to_url` emits — was a `400`.
-pub(crate) fn opt_bool_ci<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+/// Binds a NULLABLE enum query member (`[FromQuery] LogLevel? severity`) the way
+/// Jellyfin's `NullableEnumModelBinder` does: a name in any case, or a numeric
+/// value, binds; a value that does not convert binds `null` instead of failing
+/// the request (measured on Jellyfin 12.2: `?severity=Nope` is 200,
+/// unfiltered). A numeric value reaches a wire enum
+/// (`ferrofin_model::json::enums::wire_enum!`) as its C# value — an undefined
+/// one is kept (`Unrecognized`), as upstream keeps it — and a plain derived
+/// enum by declaration order, where one past the last variant binds `null`.
+/// TODO(F12): `LogLevel` is still a derived enum, so `?severity=99` binds
+/// `null` (unfiltered) where upstream filters on 99; making it a `wire_enum!`
+/// (an `Unrecognized` variant + the reflection fixture) closes that.
+pub(crate) fn nullable_enum<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
 {
-    let raw = Option::<String>::deserialize(deserializer)?;
-    match raw.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(value) if value.eq_ignore_ascii_case("true") => Ok(Some(true)),
-        Some(value) if value.eq_ignore_ascii_case("false") => Ok(Some(false)),
-        Some(value) => Err(serde::de::Error::invalid_value(
-            serde::de::Unexpected::Str(value),
-            &"true or false",
-        )),
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Ok(index) = raw.trim().parse::<u32>() {
+        return Ok(T::deserialize(
+            serde::de::value::U32Deserializer::<serde::de::value::Error>::new(index),
+        )
+        .ok());
     }
+    Ok(T::deserialize(crate::query::value::Value::nullable(raw)).ok())
 }
 
 /// Splits a pipe-delimited value into owned strings, trimming and dropping empty
@@ -340,8 +347,62 @@ pub(crate) fn apply_location_types(
 #[cfg(test)]
 mod tests {
     use super::{empty_as_none_uuid, parse_csv_uuids, parse_pipe_strings};
+
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
+
+    #[test]
+    fn nullable_enums_bind_like_the_nullable_enum_model_binder() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Order {
+            Ascending,
+            Descending,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        struct Q {
+            #[serde(default, deserialize_with = "super::nullable_enum")]
+            order: Option<Order>,
+        }
+        impl crate::query::QueryParameters for Q {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[];
+        }
+        let bind = |q: &str| {
+            crate::query::Query::<Q>::try_from_uri(&format!("/?{q}").parse().unwrap())
+                .map(|crate::query::Query(q)| q.order)
+                .expect(q)
+        };
+        assert_eq!(bind("order=descending"), Some(Order::Descending));
+        assert_eq!(bind("order=%20ASCENDING%20"), Some(Order::Ascending));
+        assert_eq!(bind("order=1"), Some(Order::Descending));
+        // Unconvertible values bind null rather than failing the request.
+        assert_eq!(bind("order=Nope"), None);
+        assert_eq!(bind("order=9"), None);
+        assert_eq!(bind("order="), None);
+        assert_eq!(bind(""), None);
+    }
+
+    #[test]
+    fn nullable_wire_enums_keep_csharp_values() {
+        use ferrofin_model::dto::SortOrder;
+        // A wire enum maps numbers by C# value and keeps an undefined one.
+        #[derive(Debug, serde::Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "super::nullable_enum")]
+            order: Option<SortOrder>,
+        }
+        impl crate::query::QueryParameters for W {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[];
+        }
+        let wire = |q: &str| {
+            crate::query::Query::<W>::try_from_uri(&format!("/?{q}").parse().unwrap())
+                .map(|crate::query::Query(q)| q.order)
+                .expect(q)
+        };
+        assert_eq!(wire("order=DESCENDING"), Some(SortOrder::Descending));
+        assert_eq!(wire("order=1"), Some(SortOrder::Descending));
+        assert_eq!(wire("order=7"), Some(SortOrder::from_json_value(7)));
+        assert_eq!(wire("order=Nope"), None);
+    }
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]

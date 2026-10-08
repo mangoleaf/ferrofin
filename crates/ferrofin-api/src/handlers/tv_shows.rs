@@ -356,7 +356,10 @@ struct EpisodesParams {
     #[serde(default)]
     enable_user_data: Option<bool>,
     /// Sort order override (only `Random` is honoured, matching C#).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     sort_by: Option<ItemSortBy>,
 }
 
