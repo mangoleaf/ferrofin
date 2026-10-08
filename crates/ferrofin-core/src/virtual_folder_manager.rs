@@ -2199,6 +2199,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_restart_applies_saved_options_and_keeps_a_shared_enabled_root() {
+        use crate::library_monitor::FerrofinLibraryMonitor;
+        use crate::resolvers::FileSystemWatcher;
+        use async_trait::async_trait;
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::library::LibraryMonitor;
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Watcher(Mutex<BTreeSet<String>>);
+
+        #[async_trait]
+        impl FileSystemWatcher for Watcher {
+            async fn watch(&self, path: &str) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().insert(path.to_owned());
+                Ok(())
+            }
+
+            async fn unwatch(&self, path: &str) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().remove(path);
+                Ok(())
+            }
+
+            async fn unwatch_all(&self) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().clear();
+                Ok(())
+            }
+        }
+
+        let (tmp, mgr) = manager();
+        let one = media_dir(&tmp, "one");
+        let shared = media_dir(&tmp, "shared");
+        let mut first = opts_with_paths(&[one.clone(), shared.clone()]);
+        first.enable_realtime_monitor = true;
+        let mut second = opts_with_paths(std::slice::from_ref(&shared));
+        second.enable_realtime_monitor = true;
+        mgr.add_virtual_folder("First", None, &first).await.unwrap();
+        mgr.add_virtual_folder("Second", None, &second)
+            .await
+            .unwrap();
+        let mgr = Arc::new(mgr);
+        let watcher = Arc::new(Watcher::default());
+        let monitor = FerrofinLibraryMonitor::new(watcher.clone(), mgr.clone());
+
+        for (enabled, expected) in [
+            (true, BTreeSet::from([one.clone(), shared.clone()])),
+            (false, BTreeSet::from([shared.clone()])),
+            (true, BTreeSet::from([one, shared])),
+        ] {
+            first.enable_realtime_monitor = enabled;
+            mgr.update_library_options("First", &first).await.unwrap();
+            monitor.stop().await.unwrap();
+            assert!(watcher.0.lock().unwrap().is_empty());
+            monitor.start().await.unwrap();
+            assert_eq!(*watcher.0.lock().unwrap(), expected);
+        }
+
+        first.enable_realtime_monitor = false;
+        second.enable_realtime_monitor = false;
+        mgr.update_library_options("First", &first).await.unwrap();
+        mgr.update_library_options("Second", &second).await.unwrap();
+        monitor.stop().await.unwrap();
+        monitor.start().await.unwrap();
+        assert!(watcher.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn update_library_options_missing_library_is_not_found() {
         let (_tmp, mgr) = manager();
         assert!(

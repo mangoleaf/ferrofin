@@ -329,7 +329,25 @@ impl FerrofinLibraryMonitor {
 #[async_trait]
 impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
-        for root in self.roots.watch_roots().await {
+        let mut roots = self.roots.watch_roots().await;
+        roots.sort();
+        let mut watched_roots: Vec<String> = Vec::new();
+        for root in roots {
+            // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
+            // parent watch already covers its children and shared roots.
+            // Compare directory boundaries, using .NET ordinal casing.
+            let key = ferrofin_util::string_extensions::upper_invariant(
+                root.trim_end_matches(std::path::MAIN_SEPARATOR),
+            );
+            if watched_roots.iter().any(|parent| {
+                key == *parent
+                    || key
+                        .strip_prefix(parent)
+                        .is_some_and(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
+            }) {
+                continue;
+            }
+            watched_roots.push(key);
             // Per-root failures (root unmounted, inotify limit) must not stop
             // the remaining roots from being watched — the C# monitor
             // try/catches each path the same way.
@@ -549,6 +567,27 @@ mod tests {
 
         monitor.stop().await.expect("stop");
         assert!(*watcher.unwatched_all.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn overlapping_roots_share_one_recursive_watch_without_hiding_siblings() {
+        let watcher = Arc::new(FakeWatcher::default());
+        let monitor = FerrofinLibraryMonitor::new(
+            watcher.clone(),
+            vec![
+                "/media/tv/series".to_owned(),
+                "/media/tv".to_owned(),
+                "/media/tv/".to_owned(),
+                "/media/tv".to_owned(),
+                "/media/tv2".to_owned(),
+                "/media/tv/Series".to_owned(),
+            ],
+        );
+        monitor.start().await.unwrap();
+        assert_eq!(
+            *watcher.watched.lock().unwrap(),
+            vec!["/media/tv", "/media/tv2"]
+        );
     }
 
     #[tokio::test]
