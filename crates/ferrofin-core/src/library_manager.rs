@@ -1589,6 +1589,11 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
+        let mut rated = items.to_vec();
+        if let Some(visibility) = &self.visibility {
+            visibility.update_rating_scores(&mut rated).await?;
+        }
+        let items = rated.as_slice();
         self.persistence.save_items(items).await?;
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,

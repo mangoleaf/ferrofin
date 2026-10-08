@@ -70,7 +70,7 @@ impl ItemVisibility {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let context = self.load(items, user).await?;
+        let context = self.load(items, Some(user)).await?;
         items
             .iter()
             .map(|item| {
@@ -82,6 +82,29 @@ impl ItemVisibility {
                 }
             })
             .collect()
+    }
+
+    /// Recomputes persisted parental scores from effective custom/official ratings
+    /// and inherited metadata country, matching `BaseItem.OnMetadataChanged`.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy.
+    pub async fn update_rating_scores(
+        &self,
+        items: &mut [BaseItemEntity],
+    ) -> Result<(), ServiceError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let context = self.load(items, None).await?;
+        for item in items {
+            let row = context.rows.get(&row_id(item)).unwrap_or(item);
+            let score = context.rating_score(row)?;
+            item.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
+            item.inherited_parental_rating_sub_value =
+                score.and_then(|score| score.sub_score.map(i64::from));
+        }
+        Ok(())
     }
 
     async fn load_hierarchy(
@@ -149,10 +172,16 @@ impl ItemVisibility {
     async fn load<'a>(
         &'a self,
         items: &[BaseItemEntity],
-        user: &'a UserEntity,
+        user: Option<&'a UserEntity>,
     ) -> Result<Context<'a>, ServiceError> {
-        let permissions = repository::permissions(&self.db, &user.id).await?;
-        let preferences = repository::preferences(&self.db, &user.id).await?;
+        let (permissions, preferences) = if let Some(user) = user {
+            (
+                repository::permissions(&self.db, &user.id).await?,
+                repository::preferences(&self.db, &user.id).await?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let libraries = repository::libraries(&self.db).await?;
         let library_ids: Vec<Uuid> = libraries.iter().map(row_id).collect();
         let mut rows: HashMap<Uuid, BaseItemEntity> = libraries
@@ -184,14 +213,16 @@ impl ItemVisibility {
             .filter(|(_, row)| kind(row) == BaseItemKind::Playlist)
             .map(|(id, _)| *id)
             .collect();
-        for (id, owner, open, shared) in
-            repository::playlist_access(&self.db, &user.id, &playlist_ids).await?
-        {
-            if let Some(id) = uuid(Some(&id)) {
-                playlists.insert(
-                    id,
-                    open || shared || uuid(owner.as_deref()) == uuid(Some(&user.id)),
-                );
+        if let Some(user) = user {
+            for (id, owner, open, shared) in
+                repository::playlist_access(&self.db, &user.id, &playlist_ids).await?
+            {
+                if let Some(id) = uuid(Some(&id)) {
+                    playlists.insert(
+                        id,
+                        open || shared || uuid(owner.as_deref()) == uuid(Some(&user.id)),
+                    );
+                }
             }
         }
         Ok(Context {
@@ -221,7 +252,7 @@ impl ItemVisibility {
 
 struct Context<'a> {
     service: &'a ItemVisibility,
-    user: &'a UserEntity,
+    user: Option<&'a UserEntity>,
     rows: HashMap<Uuid, BaseItemEntity>,
     library_ids: Vec<Uuid>,
     links: HashMap<Uuid, Vec<Uuid>>,
@@ -411,6 +442,9 @@ impl Context<'_> {
 
     fn visible(&self, item: &BaseItemEntity, skip_allowed: bool) -> Result<bool, ServiceError> {
         let id = row_id(item);
+        let user = self
+            .user
+            .ok_or_else(|| ServiceError::backend("missing visibility user"))?;
         if self.shared_playlist(item) {
             if let Some(allowed) = self.playlists.get(&id) {
                 return Ok(*allowed);
@@ -420,15 +454,14 @@ impl Context<'_> {
                 .get("OpenAccess")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                || uuid(value.get("OwnerUserId").and_then(Value::as_str))
-                    == uuid(Some(&self.user.id))
+                || uuid(value.get("OwnerUserId").and_then(Value::as_str)) == uuid(Some(&user.id))
                 || value
                     .get("Shares")
                     .and_then(Value::as_array)
                     .is_some_and(|shares| {
                         shares.iter().any(|share| {
                             uuid(share.get("UserId").and_then(Value::as_str))
-                                == uuid(Some(&self.user.id))
+                                == uuid(Some(&user.id))
                         })
                     }));
         }
@@ -482,7 +515,7 @@ impl Context<'_> {
             if !accessible {
                 return Ok(false);
             }
-            if self.user.max_parental_rating_score.is_some() {
+            if user.max_parental_rating_score.is_some() {
                 let mut any = false;
                 let mut present = false;
                 for child in children.iter().filter_map(|id| self.rows.get(id)) {
@@ -580,6 +613,30 @@ impl Context<'_> {
                 return Ok(false);
             }
         }
+        let user = self
+            .user
+            .ok_or_else(|| ServiceError::backend("missing visibility user"))?;
+        let score = self.rating_score(item)?;
+        let Some(score) = score else {
+            return Ok(!self.block_unrated(item));
+        };
+        let Some(max) = user.max_parental_rating_score else {
+            return Ok(true);
+        };
+        if i64::from(score.score) != max {
+            return Ok(i64::from(score.score) < max);
+        }
+        Ok(user
+            .max_parental_rating_sub_score
+            .is_none_or(|max| i64::from(score.sub_score.unwrap_or(0)) <= max))
+    }
+
+    fn rating_score(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<ferrofin_model::entities_media::ParentalRatingScore>, ServiceError> {
+        let parents = self.chain(item, false)?;
+        let libraries = self.libraries(item)?;
         let display = self.chain(item, true)?;
         let rating = display
             .iter()
@@ -604,20 +661,7 @@ impl Context<'_> {
                     .filter_map(|id| self.options.get(id))
                     .find_map(|opts| nonempty(opts.metadata_country_code.as_deref()))
             });
-        let score = rating.and_then(|r| self.service.localization.get_rating_score(r, country));
-        let Some(score) = score else {
-            return Ok(!self.block_unrated(item));
-        };
-        let Some(max) = self.user.max_parental_rating_score else {
-            return Ok(true);
-        };
-        if i64::from(score.score) != max {
-            return Ok(i64::from(score.score) < max);
-        }
-        Ok(self
-            .user
-            .max_parental_rating_sub_score
-            .is_none_or(|max| i64::from(score.sub_score.unwrap_or(0)) <= max))
+        Ok(rating.and_then(|r| self.service.localization.get_rating_score(r, country)))
     }
 
     fn block_unrated(&self, item: &BaseItemEntity) -> bool {
@@ -958,6 +1002,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_scores_follow_parent_country_custom_rating_and_clear_unknowns() {
+        let f = Fixture::new().await;
+        let mut parent = f.item(56, BaseItemKind::Series, None, None).await;
+        parent.official_rating = Some("PG".into());
+        parent.preferred_metadata_country_code = Some("CA".into());
+        f.save(&parent).await;
+        let mut child = f.item(57, BaseItemKind::Movie, None, Some(&parent)).await;
+        f.service
+            .update_rating_scores(std::slice::from_mut(&mut child))
+            .await
+            .unwrap();
+        assert_eq!(child.inherited_parental_rating_value, Some(8));
+        assert_eq!(child.inherited_parental_rating_sub_value, Some(1));
+        child.official_rating = Some("FSK-18".into());
+        parent.custom_rating = Some("12".into());
+        f.save(&parent).await;
+        f.service
+            .update_rating_scores(std::slice::from_mut(&mut child))
+            .await
+            .unwrap();
+        assert_eq!(child.inherited_parental_rating_value, Some(12));
+        child.custom_rating = Some("Unrated".into());
+        f.service
+            .update_rating_scores(std::slice::from_mut(&mut child))
+            .await
+            .unwrap();
+        assert_eq!(child.inherited_parental_rating_value, None);
+        assert_eq!(child.inherited_parental_rating_sub_value, None);
+    }
+
+    #[tokio::test]
     async fn channel_content_and_cycles_fail_closed() {
         let f = Fixture::new().await;
         let channel = f.item(60, BaseItemKind::Channel, None, None).await;
@@ -1073,7 +1148,7 @@ mod tests {
             .await;
         let mut context = f
             .service
-            .load(std::slice::from_ref(&item), &f.user)
+            .load(std::slice::from_ref(&item), Some(&f.user))
             .await
             .expect("context");
         context.options.insert(

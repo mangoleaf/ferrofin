@@ -2854,6 +2854,8 @@ pub struct LibraryScanner {
     /// in `InheritedParentalRatingValue` (what the Parental Rating sort and
     /// the max-parental-rating filters read). `None` in minimal unit tests.
     localization: Option<Arc<crate::localization_manager::LocalizationManager>>,
+    /// Effective parental ratings, including parents and owning library options.
+    rating_resolver: Option<Arc<crate::item_visibility::ItemVisibility>>,
     /// `ServerConfiguration.PreferredMetadataLanguage` — the last fallback of
     /// `GetPreferredMetadataLanguage()`, which a series' presentation key
     /// embeds (`Series.AddLibrariesToPresentationUniqueKey`). Jellyfin's own
@@ -2974,6 +2976,7 @@ impl LibraryScanner {
             media_attachments: None,
             image_processor: None,
             localization: None,
+            rating_resolver: None,
             default_metadata_language: "en".to_owned(),
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
@@ -3142,14 +3145,40 @@ impl LibraryScanner {
     /// Stamps the numeric parental score derived from `OfficialRating` — what
     /// the Parental Rating sort and the max-rating filters read (upstream
     /// `BaseItem.OnMetadataChanged` → `GetParentalRatingScore`).
-    fn apply_parental_rating_score(&self, entity: &mut BaseItemEntity) {
-        if let Some(localization) = &self.localization
-            && let Some(rating) = entity.official_rating.as_deref()
-            && let Some(score) = localization.get_rating_score(rating, None)
-        {
-            entity.inherited_parental_rating_value = Some(i64::from(score.score));
-            entity.inherited_parental_rating_sub_value = score.sub_score.map(i64::from);
+    async fn apply_parental_rating_score(
+        &self,
+        entity: &mut BaseItemEntity,
+    ) -> Result<(), ServiceError> {
+        if let Some(resolver) = &self.rating_resolver {
+            return resolver
+                .update_rating_scores(std::slice::from_mut(entity))
+                .await;
         }
+        if let Some(localization) = &self.localization {
+            let score = entity
+                .custom_rating
+                .as_deref()
+                .filter(|rating| !rating.is_empty())
+                .or(entity.official_rating.as_deref())
+                .and_then(|rating| {
+                    localization
+                        .get_rating_score(rating, entity.preferred_metadata_country_code.as_deref())
+                });
+            entity.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
+            entity.inherited_parental_rating_sub_value =
+                score.and_then(|score| score.sub_score.map(i64::from));
+        }
+        Ok(())
+    }
+
+    /// Shares the hierarchy-aware parental-rating resolver with metadata edits.
+    #[must_use]
+    pub fn with_rating_resolver(
+        mut self,
+        resolver: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.rating_resolver = Some(resolver);
+        self
     }
 
     /// Attaches the localization manager, so scanned items carry the numeric
@@ -5001,7 +5030,7 @@ impl LibraryScanner {
             entity.name.clone_from(&item.entity.name);
             settle_sort_name(&mut entity);
         }
-        self.apply_parental_rating_score(&mut entity);
+        self.apply_parental_rating_score(&mut entity).await?;
         // The folder's new mtime is written with the music pass's save, not
         // this one (see `ItemPass::music_pending`).
         if music_pending && let Some(row) = stored_row {

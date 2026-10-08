@@ -401,7 +401,7 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
             &to_guid_strings(&filter.top_parent_ids),
         );
     }
-    append_parental_rating(&mut qb, filter);
+    append_parental_rating(&mut qb, filter, "bi");
     qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
     // `limit.HasValue ? orderedAlbums.Take(limit.Value) : orderedAlbums` — a
     // `limit` of 0 really does mean no albums, as `Take(0)` does.
@@ -421,7 +421,11 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
 }
 
 /// Jellyfin's maximum parental score, including sub-scores and manual containers.
-fn append_parental_rating(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+pub(crate) fn append_parental_rating(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    alias: &str,
+) {
     let limit = filter
         .max_parental_rating
         .as_ref()
@@ -440,14 +444,16 @@ fn append_parental_rating(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQ
     let Some((score, subscore)) = limit else {
         return;
     };
-    qb.push(" AND ");
-    push_rating_limit(qb, "bi", score, subscore);
-    qb.push(r#" AND (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc
-        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0)
+    qb.push(format!(
+        r#" AND (({alias}."InheritedParentalRatingValue" IS NOT NULL AND "#
+    ));
+    push_rating_limit(qb, alias, score, subscore);
+    qb.push(format!(r#") OR ({alias}."InheritedParentalRatingValue" IS NULL AND
+        (NOT EXISTS (SELECT 1 FROM "LinkedChildren" lc WHERE lc."ParentId" = {alias}."Id")
         OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" rated ON rated."Id" = lc."ChildId"
-        WHERE lc."ParentId" = bi."Id" AND lc."ChildType" = 0 AND "#);
+        WHERE lc."ParentId" = {alias}."Id" AND "#));
     push_rating_limit(qb, "rated", score, subscore);
-    qb.push("))");
+    qb.push("))))");
 }
 
 fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, subscore: i64) {
@@ -465,7 +471,7 @@ fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, sub
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    append_parental_rating(qb, filter);
+    append_parental_rating(qb, filter, "bi");
     // --- resolution (own-row form; the folder-descendant roll-up is an open
     // work item, see `append_resolution_predicate`) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
@@ -1167,7 +1173,7 @@ fn append_user_data_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
         push_is_played(qb, &uid, want);
     }
     if let Some(want) = filter.is_resumable {
-        push_resumable_predicate(qb, &uid, want);
+        push_resumable_predicate(qb, &uid, want, filter);
     }
 }
 
@@ -1227,9 +1233,8 @@ const COUNTABLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0"#;
 /// [`COUNTABLE_LEAF`] as `GetAccessFilteredLeafItemsQuery(context, user)`
 /// (v12 `QueryBuilding.cs:669-679`) returns it without `includeOwnedItems`:
 /// `ApplyAccessFiltering` (`:459-476`) drops alternate versions and owned
-/// non-extras. (Its other two parts are no-ops for that call: `TopParentIds`
-/// is empty on the fresh `InternalItemsQuery(user)`, and parental
-/// restrictions are not a predicate Ferrofin's query layer carries.)
+/// non-extras. The caller appends parental restrictions for the same leaf.
+/// `TopParentIds` is empty on the fresh `InternalItemsQuery(user)`.
 const ACCESSIBLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0
     AND l."PrimaryVersionId" IS NULL
     AND (l."OwnerId" IS NULL OR l."OwnerId" = '00000000-0000-0000-0000-000000000000'
@@ -1247,7 +1252,13 @@ const ACCESSIBLE_LEAF: &str = r#"l."IsFolder" = 0 AND l."IsVirtualItem" = 0
 /// predicate is ever applied to are `Series` and `Season`
 /// (`_resumableFolderKinds`), and neither has linked children — the arm can
 /// never match for them.
-fn push_folders_with_leaf(qb: &mut QueryBuilder<Sqlite>, uid: &str, leaf_set: &str, ud_cond: &str) {
+fn push_folders_with_leaf(
+    qb: &mut QueryBuilder<Sqlite>,
+    uid: &str,
+    leaf_set: &str,
+    ud_cond: &str,
+    filter: &InternalItemsQuery,
+) {
     qb.push(format!(
         r#"bi."Id" IN (SELECT a."ParentItemId" FROM "UserData" ud
             JOIN "BaseItems" l ON l."Id" = ud."ItemId" AND {leaf_set}
@@ -1255,7 +1266,9 @@ fn push_folders_with_leaf(qb: &mut QueryBuilder<Sqlite>, uid: &str, leaf_set: &s
             WHERE ud."UserId" = "#
     ))
     .push_bind(uid.to_owned())
-    .push(format!(" AND {ud_cond})"));
+    .push(format!(" AND {ud_cond}"));
+    append_parental_rating(qb, filter, "l");
+    qb.push(")");
 }
 
 /// Pushes the v12 `folderIsResumableFilter` minus its leading `IsFolder`
@@ -1267,7 +1280,7 @@ fn push_folders_with_leaf(qb: &mut QueryBuilder<Sqlite>, uid: &str, leaf_set: &s
 /// Alternate versions keep their own progress, so they count towards the
 /// in-progress check ([`COUNTABLE_LEAF`], `includeOwnedItems: true`) but not
 /// towards the played/unplayed one ([`ACCESSIBLE_LEAF`]).
-fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
+fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &InternalItemsQuery) {
     // `_resumableFolderKinds` (v12 `BaseItemRepository.cs:66-72`): "the only
     // folder kinds whose children form a single viewing sequence, so playback
     // progress on a child rolls up to them".
@@ -1278,9 +1291,15 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
     qb.push("(");
     push_in_list(qb, r#"bi."Type""#, &kinds);
     qb.push(" AND (");
-    push_folders_with_leaf(qb, uid, COUNTABLE_LEAF, r#"ud."PlaybackPositionTicks" > 0"#);
+    push_folders_with_leaf(
+        qb,
+        uid,
+        COUNTABLE_LEAF,
+        r#"ud."PlaybackPositionTicks" > 0"#,
+        filter,
+    );
     qb.push(" OR (");
-    push_folders_with_leaf(qb, uid, ACCESSIBLE_LEAF, r#"ud."Played" = 1"#);
+    push_folders_with_leaf(qb, uid, ACCESSIBLE_LEAF, r#"ud."Played" = 1"#, filter);
     // "Has an unplayed leaf descendant" is the one arm that cannot be driven
     // from the user's rows (the leaf has none), so it walks the folder's
     // descendants — evaluated only for the folders the played arm let through,
@@ -1295,8 +1314,9 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
                 CROSS JOIN "BaseItems" l ON l."Id" = a."ItemId"
                 WHERE a."ParentItemId" = bi."Id" AND "#,
     )
-    .push(ACCESSIBLE_LEAF)
-    .push(
+    .push(ACCESSIBLE_LEAF);
+    append_parental_rating(qb, filter, "l");
+    qb.push(
         r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud
                     WHERE ud."ItemId" = l."Id" AND ud."UserId" = "#,
     )
@@ -1318,12 +1338,17 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str) {
 /// `want == true` additionally keeps, of several in-progress versions of one
 /// item, only the most recently played (`:586-602`) — id as the tiebreaker;
 /// `want == false` operates on primaries only (`:604-613`).
-fn push_resumable_predicate(qb: &mut QueryBuilder<Sqlite>, uid: &str, want: bool) {
+fn push_resumable_predicate(
+    qb: &mut QueryBuilder<Sqlite>,
+    uid: &str,
+    want: bool,
+    filter: &InternalItemsQuery,
+) {
     if want {
         qb.push(r#" AND ((bi."IsFolder" = 0 AND bi."Id" IN "#);
         push_in_progress_ids(qb, uid);
         qb.push(r#") OR (bi."IsFolder" = 1 AND "#);
-        push_folder_is_resumable(qb, uid);
+        push_folder_is_resumable(qb, uid, filter);
         qb.push("))");
         // "When several versions of the same item are in progress, keep only
         // the most recently played one, use id as tiebreaker. Only in-progress
@@ -1376,7 +1401,7 @@ fn push_resumable_predicate(qb: &mut QueryBuilder<Sqlite>, uid: &str, want: bool
         // an in-progress alternate must not resurface as its group's last
         // representative.
         qb.push(r#" AND ((bi."IsFolder" = 1 AND NOT "#);
-        push_folder_is_resumable(qb, uid);
+        push_folder_is_resumable(qb, uid, filter);
         qb.push(
             r#") OR (bi."IsFolder" = 0 AND COALESCE(bi."PrimaryVersionId", bi."Id") NOT IN (SELECT COALESCE(x."PrimaryVersionId", x."Id") FROM "UserData" ud JOIN "BaseItems" x ON x."Id" = ud."ItemId" WHERE ud."UserId" = "#,
         )
@@ -1644,6 +1669,75 @@ fn item_by_name_types_in_query(filter: &InternalItemsQuery) -> Vec<String> {
     .collect()
 }
 
+/// A by-name row remains visible only while related media satisfies the
+/// scoped user's rating limit (`ApplyItemByNameAccessFiltering`).
+fn append_by_name_rating_access(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    kinds: &[String],
+) {
+    if filter.max_parental_rating.is_none()
+        && filter
+            .user
+            .as_ref()
+            .is_none_or(|user| user.max_parental_rating_score.is_none())
+    {
+        return;
+    }
+    for (kind, values) in [
+        (BaseItemKind::Person, &[][..]),
+        (BaseItemKind::Genre, &[ItemValueType::Genre][..]),
+        (BaseItemKind::MusicGenre, &[ItemValueType::Genre][..]),
+        (BaseItemKind::Studio, &[ItemValueType::Studios][..]),
+        (
+            BaseItemKind::MusicArtist,
+            &[ItemValueType::Artist, ItemValueType::AlbumArtist][..],
+        ),
+    ] {
+        let Some(name) = stored_type_name(kind) else {
+            continue;
+        };
+        if !kinds.iter().any(|value| value == name) {
+            continue;
+        }
+        qb.push(r#" AND (bi."Type" <> "#)
+            .push_bind(name.to_owned())
+            .push(" OR EXISTS (");
+        if kind == BaseItemKind::Person {
+            qb.push(
+                r#"SELECT 1 FROM "Peoples" p
+                CROSS JOIN "PeopleBaseItemMap" m ON m."PeopleId" = p."Id"
+                CROSS JOIN "BaseItems" related ON related."Id" = m."ItemId"
+                WHERE p."Name" = bi."Name""#,
+            );
+        } else {
+            qb.push(
+                r#"SELECT 1 FROM "ItemValues" v
+                CROSS JOIN "ItemValuesMap" m ON m."ItemValueId" = v."ItemValueId"
+                CROSS JOIN "BaseItems" related ON related."Id" = m."ItemId"
+                WHERE v."CleanValue" = bi."CleanName" AND "#,
+            );
+            push_in_list(
+                qb,
+                r#"v."Type""#,
+                &values
+                    .iter()
+                    .map(|value| i64::from(i32::from(*value)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        qb.push(" AND ");
+        push_in_list(
+            qb,
+            r#"+related."TopParentId""#,
+            &to_guid_strings(&filter.top_parent_ids),
+        );
+        // IncludeOwnedItems is true upstream: credits on alternate versions count.
+        append_parental_rating(qb, filter, "related");
+        qb.push("))");
+    }
+}
+
 /// Appends the ancestor / top-parent predicates.
 ///
 /// `AncestorIds` is an `EXISTS` over the `AncestorIds` closure table; top-parent
@@ -1660,8 +1754,24 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         // `TopParentId` — it belongs to no library — so without this exemption
         // any user-scoped query silently drops every genre, studio and person.
         // `/Search/Hints` is exactly such a query.
-        let by_name = item_by_name_types_in_query(filter);
-        if filter.include_items_by_name.unwrap_or(false) && !by_name.is_empty() {
+        let by_name: Vec<_> = item_by_name_types_in_query(filter)
+            .into_iter()
+            .filter(|name| {
+                filter.include_items_by_name.unwrap_or(false)
+                    || filter
+                        .include_item_types
+                        .iter()
+                        .any(|kind| stored_type_name(*kind) == Some(name.as_str()))
+            })
+            .collect();
+        if by_name.is_empty() {
+            qb.push(r#" AND bi."TopParentId" IS NOT NULL AND "#);
+            push_in_list(
+                qb,
+                r#"bi."TopParentId""#,
+                &to_guid_strings(&filter.top_parent_ids),
+            );
+        } else {
             qb.push(" AND (");
             push_in_list(qb, r#"bi."Type""#, &by_name);
             qb.push(r#" OR (bi."TopParentId" IS NOT NULL AND "#);
@@ -1671,13 +1781,7 @@ fn append_ancestor_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
                 &to_guid_strings(&filter.top_parent_ids),
             );
             qb.push("))");
-        } else {
-            qb.push(r#" AND bi."TopParentId" IS NOT NULL AND "#);
-            push_in_list(
-                qb,
-                r#"bi."TopParentId""#,
-                &to_guid_strings(&filter.top_parent_ids),
-            );
+            append_by_name_rating_access(qb, filter, &by_name);
         }
     }
     if !filter.ancestor_ids.is_empty() {

@@ -1251,6 +1251,7 @@ enum InnerScope {
 /// owned non-extras (`TranslateQuery.cs:796-807`).
 #[allow(clippy::too_many_lines)] // one predicate per C# field, kept in the C# order
 fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
+    crate::translate_query::append_parental_rating(qb, scope.filter, "ci");
     let ByNameScope {
         filter,
         content_type_names,
@@ -1764,6 +1765,18 @@ fn image_info_from_row(
 /// `DateModified` (C# leaves the `default(DateTime)`).
 fn default_epoch() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
+}
+
+/// Loads the user snapshot needed by repository count queries.
+pub(crate) async fn query_user(
+    db: &Database,
+    id: Uuid,
+) -> Result<Option<UserEntity>, ServiceError> {
+    sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
 }
 
 /// Scopes a query that carries **no scope at all** to the libraries its
@@ -2704,6 +2717,84 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    #[tokio::test]
+    async fn parental_rating_hides_facets_backed_only_by_restricted_media() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let mut user = seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        user.max_parental_rating_score = Some(12);
+        let mut movies = Vec::new();
+        for (name, rating) in [("Child", 10), ("Adult", 18)] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = ? WHERE "Id" = ?"#,
+            )
+            .bind(rating)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+            seed_item_genre(&db, id, name).await;
+            movies.push(id);
+        }
+        seed_library_over(&db, &movies).await;
+        let query = InternalItemsQuery {
+            user: Some(user),
+            ..Default::default()
+        };
+        let genres = repository.get_genres(&query).await.unwrap();
+        assert_eq!(genres.total_record_count, 1);
+        let query = InternalItemsQuery {
+            include_items_by_name: Some(true),
+            include_item_types: vec![BaseItemKind::Genre],
+            ..query
+        };
+        let found = repository.get_item_list(&query).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("Child"));
+    }
+
+    #[tokio::test]
+    async fn hidden_episode_progress_does_not_make_its_series_resumable() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let uid = Uuid::new_v4();
+        let mut user = seed_user_with_defaults(&db, uid).await;
+        let series = Uuid::new_v4();
+        let episode = Uuid::new_v4();
+        seed_folder_item(&db, series, BaseItemKind::Series, "Series", None).await;
+        seed_child_item(&db, episode, BaseItemKind::Episode, "Episode", series).await;
+        seed_library_over(&db, &[series, episode]).await;
+        sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?, ?)"#)
+            .bind(guid_to_db(episode))
+            .bind(guid_to_db(series))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        sqlx::query(r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = 18 WHERE "Id" = ?"#)
+            .bind(guid_to_db(episode))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        seed_user_data(&db, uid, episode, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "PlaybackPositionTicks" = 100 WHERE "ItemId" = ?"#)
+            .bind(guid_to_db(episode))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        for (limit, count) in [(Some(12), 0), (Some(18), 1), (None, 1)] {
+            user.max_parental_rating_score = limit;
+            let query = InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Series],
+                is_resumable: Some(true),
+                ..Default::default()
+            };
+            assert_eq!(repository.get_item_list(&query).await.unwrap().len(), count);
+        }
+    }
 
     /// The artist id filters over one artist's albums (TranslateQuery.cs:
     /// 617-650): `ArtistIds` is any credit, `AlbumArtistIds` the albums the

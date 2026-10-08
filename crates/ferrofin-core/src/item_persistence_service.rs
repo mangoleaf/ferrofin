@@ -944,7 +944,9 @@ impl FerrofinItemPersistenceService {
         // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
         // whole-value lookup first, unrated parts skipped, case-insensitive
         // tables), so the pass runs once more under a new key.
-        const META_KEY: &str = "rating_levels_v121";
+        // Earlier Ferrofin builds loaded only the US table. Re-run once with
+        // the complete upstream dataset so existing non-US rows are filtered.
+        const META_KEY: &str = "rating_levels_all_countries";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -7336,12 +7338,18 @@ mod tests {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let localization = crate::localization_manager::LocalizationManager::new("US");
-        let cases: [RatingCase; 5] = [
+        service
+            .mark_repair_done("rating_levels_v121")
+            .await
+            .unwrap();
+        let cases: [RatingCase; 7] = [
             (0x7A01, Some("12"), Some(12), None),
             (0x7A02, Some("TV-MA"), Some(17), Some(1)),
             (0x7A03, Some("Rated R"), Some(17), Some(0)),
             (0x7A04, Some("unknown-junk"), None, None),
             (0x7A05, None, None, None),
+            (0x7A06, Some("FSK-18"), Some(18), None),
+            (0x7A07, Some("CA:R"), Some(18), Some(1)),
         ];
         for (id, rating, _, _) in cases {
             let id = Uuid::from_u128(id);
@@ -7366,11 +7374,11 @@ mod tests {
             .await
             .expect("repair");
 
-        // Four rated rows plus every unrated one (upstream's blank-rating
+        // Six rated rows plus every unrated one (upstream's blank-rating
         // update matches the migration placeholder too).
         assert_eq!(
             updated,
-            4 + u64::try_from(unrated_rows).expect("count fits")
+            6 + u64::try_from(unrated_rows).expect("count fits")
         );
         for (id, rating, score, sub_score) in cases {
             let row = fetch_item(&db, Uuid::from_u128(id)).await;

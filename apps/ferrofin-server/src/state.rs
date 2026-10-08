@@ -653,12 +653,19 @@ pub async fn build_app_state(
     // take the `dyn EventManager` seam. Clones share one registry.
     let event_bus = FerrofinEventManager::new();
     let event_manager: Arc<dyn ferrofin_traits::events::EventManager> = Arc::new(event_bus.clone());
-    let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> = Arc::new(
-        LocalizationManager::new(&server_config.metadata_country_code).with_ui_culture_source({
-            let config_mgr = Arc::clone(&config_mgr);
-            move || config_mgr.snapshot_shared().ui_culture.clone()
-        }),
+    let localization_impl = Arc::new(
+        LocalizationManager::new(&server_config.metadata_country_code)
+            .with_metadata_country_source({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().metadata_country_code.clone()
+            })
+            .with_ui_culture_source({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().ui_culture.clone()
+            }),
     );
+    let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> =
+        localization_impl.clone();
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
@@ -1045,6 +1052,15 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_by_name_store(by_name_store.clone()),
     );
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -1060,9 +1076,8 @@ pub async fn build_app_state(
     .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
-    .with_localization(Arc::new(LocalizationManager::new(
-        &server_config.metadata_country_code,
-    )))
+    .with_localization(Arc::clone(&localization_impl))
+    .with_rating_resolver(Arc::clone(&item_visibility))
     // `ServerConfiguration.PreferredMetadataLanguage`, the last fallback a
     // series' presentation key embeds (`Series.AddLibrariesToPresentationUniqueKey`).
     .with_default_metadata_language(server_config.preferred_metadata_language.clone())
@@ -1175,15 +1190,7 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
-        .with_visibility(Arc::new(
-            ferrofin_core::item_visibility::ItemVisibility::new(
-                db.clone(),
-                Arc::clone(&item_repository),
-                Arc::clone(&localization),
-                ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-            )
-            .with_virtual_paths(virtual_paths.clone()),
-        ))
+        .with_visibility(Arc::clone(&item_visibility))
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)

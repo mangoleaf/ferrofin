@@ -1156,3 +1156,94 @@ async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn metadata_rating_edits_keep_browse_and_direct_access_consistent() {
+    let f = fixture().await;
+    let movies = items_by_path(&f.router, &f.admin).await;
+    let id = movies
+        .iter()
+        .find(|(path, _)| path.contains("Alpha"))
+        .unwrap()
+        .1
+        .clone();
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    dto["Policy"]["MaxParentalRating"] = json!(12);
+    dto["Policy"]["MaxParentalSubRating"] = json!(0);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (custom, official, country, expected) in [
+        (Some("10"), "FSK-18", "US", true),
+        (None, "FSK-18", "US", false),
+        (None, "PG", "CA", true),
+        (None, "PG", "AU", false),
+        (None, "", "US", true),
+    ] {
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Items/{id}"),
+                Some(&f.admin),
+                Some(
+                    json!({"Name":"Alpha", "CustomRating":custom, "OfficialRating":official,
+                "PreferredMetadataCountryCode":country})
+                )
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, listing) = call(
+            &f.router,
+            "GET",
+            "/Items?recursive=true&includeItemTypes=Movie",
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listing["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["Id"] == id),
+            expected,
+            "{custom:?} {official} {country}"
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Items/{id}"),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            if expected {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+    }
+}
