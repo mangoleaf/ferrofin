@@ -24,18 +24,30 @@ use crate::querying::ItemFields;
 use crate::secret::Secret;
 
 /// The type of a live TV channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum ChannelType {
     /// The TV.
     #[serde(rename = "TV")]
     Tv,
     /// The radio.
     Radio,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ChannelType, None, {
+        Tv => ("TV", 0),
+        Radio => ("Radio", 1),
+    }
 }
 
 /// The audio format of a live TV program.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProgramAudio {
     /// Mono audio.
     Mono,
@@ -49,11 +61,26 @@ pub enum ProgramAudio {
     Thx,
     /// Dolby Atmos audio.
     Atmos,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProgramAudio, None, {
+        Mono => ("Mono", 0),
+        Stereo => ("Stereo", 1),
+        Dolby => ("Dolby", 2),
+        DolbyDigital => ("DolbyDigital", 3),
+        Thx => ("Thx", 4),
+        Atmos => ("Atmos", 5),
+    }
 }
 
 /// The day pattern of a recurring timer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DayPattern {
     /// Every day.
     #[default]
@@ -62,11 +89,23 @@ pub enum DayPattern {
     Weekdays,
     /// Saturday and Sunday.
     Weekends,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DayPattern, None, {
+        Daily => ("Daily", 0),
+        Weekdays => ("Weekdays", 1),
+        Weekends => ("Weekends", 2),
+    }
 }
 
 /// The status of a recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum RecordingStatus {
     /// A new recording.
     #[default]
@@ -83,6 +122,21 @@ pub enum RecordingStatus {
     ConflictedNotOk,
     /// The recording errored.
     Error,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    RecordingStatus, None, {
+        New => ("New", 0),
+        InProgress => ("InProgress", 1),
+        Completed => ("Completed", 2),
+        Cancelled => ("Cancelled", 3),
+        ConflictedOk => ("ConflictedOk", 4),
+        ConflictedNotOk => ("ConflictedNotOk", 5),
+        Error => ("Error", 6),
+    }
 }
 
 /// The status of a live TV service.
@@ -97,8 +151,9 @@ pub enum LiveTvServiceStatus {
 }
 
 /// How long a recording should be kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum KeepUntil {
     /// Keep until deleted.
     #[default]
@@ -109,15 +164,28 @@ pub enum KeepUntil {
     UntilWatched,
     /// Keep until a date.
     UntilDate,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    KeepUntil, None, {
+        UntilDeleted => ("UntilDeleted", 0),
+        UntilSpaceNeeded => ("UntilSpaceNeeded", 1),
+        UntilWatched => ("UntilWatched", 2),
+        UntilDate => ("UntilDate", 3),
+    }
 }
 
 /// The sort field for items (mirrors `Jellyfin.Data.Enums.ItemSortBy`).
 ///
 /// Forward reference: defined here because [`LiveTvChannelQuery`] uses it and it
 /// has no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 #[allow(missing_docs)]
+#[repr(i32)]
 pub enum ItemSortBy {
     /// The default sort order.
     #[default]
@@ -152,6 +220,44 @@ pub enum ItemSortBy {
     SeriesDatePlayed,
     ParentIndexNumber,
     IndexNumber,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ItemSortBy, None, {
+        Default => ("Default", 0),
+        AiredEpisodeOrder => ("AiredEpisodeOrder", 1),
+        Album => ("Album", 2),
+        AlbumArtist => ("AlbumArtist", 3),
+        Artist => ("Artist", 4),
+        DateCreated => ("DateCreated", 5),
+        OfficialRating => ("OfficialRating", 6),
+        DatePlayed => ("DatePlayed", 7),
+        PremiereDate => ("PremiereDate", 8),
+        StartDate => ("StartDate", 9),
+        SortName => ("SortName", 10),
+        Name => ("Name", 11),
+        Random => ("Random", 12),
+        Runtime => ("Runtime", 13),
+        CommunityRating => ("CommunityRating", 14),
+        ProductionYear => ("ProductionYear", 15),
+        PlayCount => ("PlayCount", 16),
+        CriticRating => ("CriticRating", 17),
+        IsFolder => ("IsFolder", 18),
+        IsUnplayed => ("IsUnplayed", 19),
+        IsPlayed => ("IsPlayed", 20),
+        SeriesSortName => ("SeriesSortName", 21),
+        VideoBitRate => ("VideoBitRate", 22),
+        AirTime => ("AirTime", 23),
+        Studio => ("Studio", 24),
+        IsFavoriteOrLiked => ("IsFavoriteOrLiked", 25),
+        DateLastContentAdded => ("DateLastContentAdded", 26),
+        SeriesDatePlayed => ("SeriesDatePlayed", 27),
+        ParentIndexNumber => ("ParentIndexNumber", 28),
+        IndexNumber => ("IndexNumber", 29),
+    }
 }
 
 /// Guide date range info.
@@ -473,6 +579,7 @@ timer_info! {
 
         /// Gets or sets the run time ticks.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "crate::json::value::nullable")]
         pub run_time_ticks: Option<i64>,
 
         /// Gets or sets the program information.
@@ -507,6 +614,7 @@ timer_info! {
 
         /// Gets or sets the day pattern.
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "crate::json::value::nullable")]
         pub day_pattern: Option<DayPattern>,
 
         /// Gets or sets the image tags.
@@ -548,10 +656,12 @@ pub struct TimerQuery {
 
     /// Gets or sets a value indicating whether the timer is active.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_active: Option<bool>,
 
     /// Gets or sets a value indicating whether the timer is scheduled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_scheduled: Option<bool>,
 }
 
@@ -587,18 +697,22 @@ pub struct RecordingQuery {
 
     /// Gets or sets the start index. Use for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets the status.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub status: Option<RecordingStatus>,
 
     /// Gets or sets a value indicating whether the recording is in progress.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_in_progress: Option<bool>,
 
     /// Gets or sets the series timer identifier.
@@ -611,34 +725,42 @@ pub struct RecordingQuery {
 
     /// Gets or sets a value indicating whether images are enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_images: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a library item.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_library_item: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a movie.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is for kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether the recording is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets the image type limit.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_type_limit: Option<i32>,
 
     /// Gets or sets the enabled image types.
@@ -657,18 +779,22 @@ pub struct RecordingQuery {
 pub struct LiveTvChannelQuery {
     /// Gets or sets the type of the channel.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channel_type: Option<ChannelType>,
 
     /// Gets or sets a value indicating whether this instance is favorite.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_favorite: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is liked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_liked: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is disliked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_disliked: Option<bool>,
 
     /// Gets or sets a value indicating whether to enable favorite sorting.
@@ -681,10 +807,12 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the start index. Used for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets a value indicating whether to add the current program.
@@ -695,22 +823,27 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets a value indicating whether to return news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
 
     /// Gets or sets a value indicating whether to return movies.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is kids.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
 
     /// Gets or sets the sort fields.
@@ -718,6 +851,7 @@ pub struct LiveTvChannelQuery {
 
     /// Gets or sets the sort order to return results with.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sort_order: Option<SortOrder>,
 }
 
@@ -928,11 +1062,12 @@ impl Default for TunerHostInfo {
 
 /// Live TV options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LiveTvOptions {
     /// Gets or sets the number of guide days.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub guide_days: Option<i32>,
 
     /// Gets or sets the recording path.

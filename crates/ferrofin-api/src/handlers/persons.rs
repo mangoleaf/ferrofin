@@ -204,3 +204,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Persons", get(get_persons))
         .route("/Persons/{name}", get(get_person))
 }
+crate::query::query_parameters! {
+    PersonsQuery {
+        "filters" => ',',
+        "personTypes" => ',',
+        "excludePersonTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Persons")];
+}

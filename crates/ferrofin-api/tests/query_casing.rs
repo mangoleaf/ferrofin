@@ -7,9 +7,7 @@
 //! answers 400 naming the member (`Failed to deserialize query string:
 //! <member>: …`). The same request under the PascalCase, lowercase and
 //! UPPERCASE key must name the same member: a case-sensitive binder would
-//! ignore the unknown key and answer something else. Every query struct the
-//! probes reach also passes the extractor's debug-build guard against two
-//! members equal ignoring case.
+//! ignore the unknown key and answer something else.
 
 use axum::Router;
 use axum::body::Body;
@@ -100,8 +98,8 @@ async fn rejected_member(router: &Router, method: &str, uri: &str) -> Option<Str
         .expect("request");
     let router = router.clone();
     // A probe the binder accepts may reach a fake manager that panics
-    // (`unimplemented!("fake")`): that is "not a rejection". Any other panic —
-    // the extractor's case-collision guard included — fails the test.
+    // (`unimplemented!("fake")`): that is "not a rejection". Any other panic
+    // fails the test.
     let response = match tokio::spawn(async move { router.oneshot(request).await }).await {
         Ok(response) => response.expect("response"),
         Err(e) => {
@@ -159,10 +157,6 @@ async fn every_typed_query_parameter_binds_ignoring_case() {
             }
             let method = method.to_uppercase();
             let base = concrete_path(path, operation, &spec);
-            // Any query string makes the extractor read the handler's member
-            // names, and so run its debug-build case-collision guard; a panic
-            // from it is resumed by `rejected_member` and fails the test.
-            rejected_member(&router, &method, &format!("{base}?zzProbe=1")).await;
             for param in operation
                 .get("parameters")
                 .and_then(Value::as_array)

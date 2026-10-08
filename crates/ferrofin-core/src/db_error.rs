@@ -23,44 +23,21 @@ pub fn db_err(err: sqlx::Error) -> ServiceError {
 /// is spelled out for the raw-SQL stream queries in this crate.
 #[must_use]
 pub fn media_stream_type_disc(stream_type: MediaStreamType) -> i32 {
-    match stream_type {
-        MediaStreamType::Audio => 0,
-        MediaStreamType::Video => 1,
-        MediaStreamType::Subtitle => 2,
-        MediaStreamType::EmbeddedImage => 3,
-        MediaStreamType::Data => 4,
-        MediaStreamType::Lyric => 5,
-    }
+    stream_type.json_value()
 }
 
 /// The wire [`MediaStreamType`] for a stored `MediaStreamInfos.StreamType`
 /// discriminant — the inverse of [`media_stream_type_disc`].
 ///
-/// An unknown discriminant maps to [`MediaStreamType::Data`] (the neutral
-/// "other" bucket), since a stored row should never carry an out-of-range value
-/// and rejecting the whole read would be worse than a benign default.
+/// Unnamed C# enum values are retained so reading a row cannot change its type.
 #[must_use]
 pub fn media_stream_type_from_disc(disc: i32) -> MediaStreamType {
-    match disc {
-        1 => MediaStreamType::Video,
-        2 => MediaStreamType::Subtitle,
-        3 => MediaStreamType::EmbeddedImage,
-        5 => MediaStreamType::Lyric,
-        0 => MediaStreamType::Audio,
-        _ => MediaStreamType::Data,
-    }
+    MediaStreamType::from_json_value(disc)
 }
 
 /// The stored `StreamType` discriminant for a [`MediaStreamType`] — the inverse of
 /// [`media_stream_type_from_disc`], used when persisting a probed stream.
 #[must_use]
 pub fn media_stream_type_to_disc(stream_type: MediaStreamType) -> i32 {
-    match stream_type {
-        MediaStreamType::Audio => 0,
-        MediaStreamType::Video => 1,
-        MediaStreamType::Subtitle => 2,
-        MediaStreamType::EmbeddedImage => 3,
-        MediaStreamType::Data => 4,
-        MediaStreamType::Lyric => 5,
-    }
+    stream_type.json_value()
 }

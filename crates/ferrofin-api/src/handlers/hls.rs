@@ -645,9 +645,16 @@ async fn stop_encoding_process(
 /// `application/octet-stream`). A missing item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
+    auth: Result<crate::auth::RequireAuth, ApiError>,
     Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
 ) -> Result<Response, ApiError> {
-    if state.library.get_item_by_id(video_id).await?.is_none() {
+    let user = auth.ok().and_then(|auth| auth.0.user);
+    if state
+        .library
+        .get_item_by_id_for_user(video_id, user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("video {video_id}")));
     }
     let extracted = state
@@ -714,13 +721,19 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/universal")];
+    StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
+    HlsQueryPub {} => [("get", "/Audio/{itemId}/universal")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Binds `query` the way the routes do, through the shared [`Query`]
     /// extractor (keys matched ignoring case).
-    fn parse(query: &str) -> Result<HlsQuery, axum::extract::rejection::QueryRejection> {
+    fn parse(query: &str) -> Result<HlsQuery, crate::extract::QueryRejection> {
         let uri = format!("/Videos/x/master.m3u8?{query}")
             .parse()
             .expect("uri");

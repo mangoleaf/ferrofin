@@ -265,3 +265,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/Filters", get(get_query_filters_legacy))
         .route("/Items/Filters2", get(get_query_filters))
 }
+crate::query::query_parameters! {
+    FiltersLegacyQuery {
+        "includeItemTypes" => ',',
+        "mediaTypes" => ',',
+    } => [("get", "/Items/Filters")];
+    FiltersQuery {
+        "includeItemTypes" => ',',
+    } => [("get", "/Items/Filters2")];
+}

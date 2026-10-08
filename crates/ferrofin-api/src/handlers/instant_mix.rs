@@ -156,7 +156,7 @@ async fn instant_mix_from_item(
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     let entity = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     if let Some(kind) = require_kind
@@ -366,4 +366,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/MusicGenres/{genreName}/InstantMix",
             get(from_music_genre_name),
         )
+}
+crate::query::query_parameters! {
+    InstantMixQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Songs/{itemId}/InstantMix"), ("get", "/Albums/{itemId}/InstantMix"), ("get", "/Playlists/{itemId}/InstantMix"), ("get", "/Artists/{itemId}/InstantMix"), ("get", "/Items/{itemId}/InstantMix"), ("get", "/MusicGenres/{name}/InstantMix"), ("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
+    InstantMixIdQuery {} => [("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
 }

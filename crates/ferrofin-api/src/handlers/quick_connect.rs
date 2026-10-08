@@ -163,3 +163,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/QuickConnect/Connect", get(connect))
         .route("/QuickConnect/Authorize", post(authorize))
 }
+crate::query::query_parameters! {
+    ConnectQuery {} => [("get", "/QuickConnect/Connect")];
+    AuthorizeQuery {} => [("post", "/QuickConnect/Authorize")];
+}

@@ -31,6 +31,7 @@ pub struct LyricMetadata {
 
     /// Gets or sets the length of the song in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub length: Option<i64>,
 
     /// Gets or sets who the LRC file was created by.
@@ -39,6 +40,7 @@ pub struct LyricMetadata {
 
     /// Gets or sets the lyric offset compared to audio in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub offset: Option<i64>,
 
     /// Gets or sets the software used to create the LRC file.
@@ -51,6 +53,7 @@ pub struct LyricMetadata {
 
     /// Gets or sets a value indicating whether this lyric is synced.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_synced: Option<bool>,
 }
 
@@ -70,6 +73,7 @@ pub struct LyricLineCue {
 
     /// Gets the end timestamp the lyric is synced to in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub end: Option<i64>,
 }
 
@@ -82,6 +86,7 @@ pub struct LyricLine {
 
     /// Gets the start time in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start: Option<i64>,
 
     /// Gets the time-aligned cues for the song's lyrics.
@@ -138,6 +143,7 @@ pub struct LyricSearchRequest {
 
     /// Gets or sets the track duration in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub duration: Option<i64>,
 
     /// Gets or sets the provider ids.

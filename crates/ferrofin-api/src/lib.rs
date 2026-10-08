@@ -25,6 +25,7 @@ pub mod extract;
 pub mod handlers;
 pub mod ip_access;
 pub mod openapi;
+mod query;
 pub mod router;
 pub mod routes;
 pub mod state;

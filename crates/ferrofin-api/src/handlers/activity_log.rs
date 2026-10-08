@@ -154,3 +154,9 @@ async fn get_log_entries(
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/System/ActivityLog/Entries", get(get_log_entries))
 }
+crate::query::query_parameters! {
+    GetLogEntriesQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+    } => [("get", "/System/ActivityLog/Entries")];
+}

@@ -182,6 +182,18 @@ where
     })
 }
 
+/// The delimited GUID converter uses Guid.Parse for string entries and the
+/// global JSON GUID converter (including null-to-empty) for array entries.
+pub(crate) fn de_comma_delimited_guids<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<Uuid>>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(transparent)]
+    struct Guid(#[serde(with = "ferrofin_model::json::guid")] Uuid);
+    de_comma_delimited::<D, Guid>(deserializer)
+        .map(|values| values.map(|ids| ids.into_iter().map(|id| id.0).collect()))
+}
+
 /// Deserializes a **pipe**-delimited JSON collection field.
 ///
 /// Same converter as [`de_comma_delimited`], reached through

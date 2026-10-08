@@ -81,7 +81,11 @@ struct UserIdQuery {
 /// user root folder (C# `itemId.IsEmpty() ? GetUserRootFolder() : …`), any other
 /// id to the addressed item. A missing item is reported as `None` so the caller
 /// can map it to a `404`.
-async fn resolve_item_id(state: &AppState, item_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_item_id(
+    state: &AppState,
+    item_id: Uuid,
+    user: &ferrofin_db::entities::users::UserEntity,
+) -> Result<Option<Uuid>, ApiError> {
     if item_id.is_nil() {
         return Ok(state
             .library
@@ -91,7 +95,7 @@ async fn resolve_item_id(state: &AppState, item_id: Uuid) -> Result<Option<Uuid>
     }
     Ok(state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(user))
         .await?
         .and_then(|item| Uuid::parse_str(&item.id).ok()))
 }
@@ -144,7 +148,7 @@ async fn resolve_user_and_item(
 ) -> Result<(Uuid, Uuid), ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
     let user_uuid = user_uuid(&user)?;
-    let resolved_item = resolve_item_id(state, item_id)
+    let resolved_item = resolve_item_id(state, item_id, &user)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok((user_uuid, resolved_item))
@@ -347,7 +351,7 @@ async fn get_item_user_data(
     // C# `GetItemById<BaseItem>` requires a real item (no empty-guid fallback).
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(&user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let dto = state
@@ -383,7 +387,7 @@ async fn update_item_user_data(
     let user_uuid = user_uuid(&user)?;
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(&user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     save_and_return(&state, user_uuid, item_id, &update).await
@@ -476,7 +480,7 @@ async fn get_extras(
     extra_types: &[ExtraType],
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
-    let owner = resolve_item_id(state, item_id)
+    let owner = resolve_item_id(state, item_id, &user)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let owner_item = state
@@ -489,6 +493,7 @@ async fn get_extras(
         .get_extra_owner_ids_batch(&[owner_item])
         .await?;
     let query = InternalItemsQuery {
+        user: Some(user.clone()),
         owner_ids: owner_groups.remove(&owner).unwrap_or_else(|| vec![owner]),
         extra_types: extra_types.to_vec(),
         order_by: vec![(
@@ -861,6 +866,16 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/SpecialFeatures", get(get_special_features))
         .route("/Items/{itemId}/Intros", get(get_intros))
         .route("/Items/{itemId}/CriticReviews", get(get_critic_reviews))
+}
+
+crate::query::query_parameters! {
+    UserIdQuery {} => [("post", "/UserFavoriteItems/{itemId}"), ("delete", "/UserFavoriteItems/{itemId}"), ("delete", "/UserItems/{itemId}/Rating"), ("get", "/UserItems/{itemId}/UserData"), ("post", "/UserItems/{itemId}/UserData"), ("get", "/Items/Root"), ("get", "/Items/{itemId}/LocalTrailers"), ("get", "/Items/{itemId}/SpecialFeatures"), ("get", "/Items/{itemId}/Intros")];
+    RatingQuery {} => [("post", "/UserItems/{itemId}/Rating")];
+    LatestQuery {
+        "fields" => ',',
+        "includeItemTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items/Latest")];
 }
 
 #[cfg(test)]

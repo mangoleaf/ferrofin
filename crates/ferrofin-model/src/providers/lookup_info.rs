@@ -59,14 +59,17 @@ pub struct ItemLookupInfo {
 
     /// Gets or sets the year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub year: Option<i32>,
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the premiere date.
@@ -154,8 +157,11 @@ macro_rules! lookup_info {
                 metadata_language: Option<String>,
                 metadata_country_code: Option<String>,
                 provider_ids: Option<HashMap<String, String>>,
+                #[serde(default, deserialize_with = "crate::json::value::nullable")]
                 year: Option<i32>,
+                #[serde(default, deserialize_with = "crate::json::value::nullable")]
                 index_number: Option<i32>,
+                #[serde(default, deserialize_with = "crate::json::value::nullable")]
                 parent_index_number: Option<i32>,
                 #[serde(default, with = "crate::json::datetime::option")]
                 premiere_date: Option<DateTime<Utc>>,

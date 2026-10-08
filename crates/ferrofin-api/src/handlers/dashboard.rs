@@ -123,3 +123,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_dashboard_configuration_page),
         )
 }
+crate::query::query_parameters! {
+    ConfigurationPagesQuery {} => [("get", "/web/ConfigurationPages")];
+    ConfigurationPageQuery {} => [("get", "/web/ConfigurationPage")];
+}

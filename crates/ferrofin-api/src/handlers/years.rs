@@ -215,3 +215,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Years", get(get_years))
         .route("/Years/{year}", get(get_year))
 }
+crate::query::query_parameters! {
+    YearsQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Years")];
+    YearQuery {} => [("get", "/Years/{year}")];
+}

@@ -242,6 +242,21 @@ struct ItemLibrary {
 
 #[async_trait]
 impl LibraryManager for ItemLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(self.present.then(|| minimal_base_item(id, "clip", "Movie")))
     }
@@ -627,6 +642,33 @@ async fn body_string(resp: axum::response::Response) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn hls_binds_first_scalars_and_forwards_the_original_query() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let raw = "DEVICEID=first&deviceId=second&MaxWidth=1280&maxwidth=bad&VideoBitRate=1000000&videobitrate=bad";
+    let response = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?{raw}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = rec.last.lock().unwrap().clone().unwrap();
+    assert_eq!(request.device_id.as_deref(), Some("first"));
+    assert_eq!(request.max_width, Some(1280));
+    assert_eq!(request.video_bitrate, Some(1_000_000));
+    assert_eq!(request.query_string, format!("?{raw}"));
 }
 
 #[tokio::test]

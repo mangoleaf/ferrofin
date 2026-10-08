@@ -66,27 +66,35 @@ pub struct BaseItemDto {
     pub date_last_media_added: Option<DateTime<Utc>>,
     /// Gets or sets the extra type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub extra_type: Option<ExtraType>,
     /// Gets or sets the number of the season an episode airs before.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub airs_before_season_number: Option<i32>,
     /// Gets or sets the number of the season an episode airs after.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub airs_after_season_number: Option<i32>,
     /// Gets or sets the number of the episode an episode airs before.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub airs_before_episode_number: Option<i32>,
     /// Gets or sets a value indicating whether the item can be deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub can_delete: Option<bool>,
     /// Gets or sets a value indicating whether the item can be downloaded.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub can_download: Option<bool>,
     /// Gets or sets a value indicating whether the item has lyrics.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_lyrics: Option<bool>,
     /// Gets or sets a value indicating whether the item has subtitles.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_subtitles: Option<bool>,
     /// Gets or sets the preferred metadata language.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,6 +113,7 @@ pub struct BaseItemDto {
     pub forced_sort_name: Option<String>,
     /// Gets or sets the 3D format.
     #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video3d_format: Option<Video3DFormat>,
     /// Gets or sets the premiere date.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,6 +128,7 @@ pub struct BaseItemDto {
     pub media_sources: Option<Vec<MediaSourceInfo>>,
     /// Gets or sets the critic rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub critic_rating: Option<f32>,
     /// Gets or sets the production locations.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +138,7 @@ pub struct BaseItemDto {
     pub path: Option<String>,
     /// Gets or sets a value indicating whether media source display is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_media_source_display: Option<bool>,
     /// Gets or sets the official rating.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,24 +165,30 @@ pub struct BaseItemDto {
     pub genres: Option<Vec<String>>,
     /// Gets or sets the community rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub community_rating: Option<f32>,
     /// Gets or sets the cumulative run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub cumulative_run_time_ticks: Option<i64>,
     /// Gets or sets the run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
     /// Gets or sets the play access.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub play_access: Option<PlayAccess>,
     /// Gets or sets the aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<String>,
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
     /// Gets or sets a value indicating whether the item is a placeholder.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_place_holder: Option<bool>,
     /// Gets or sets the number.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,12 +198,15 @@ pub struct BaseItemDto {
     pub channel_number: Option<String>,
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
     /// Gets or sets the end index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number_end: Option<i32>,
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
     /// Gets or sets the remote trailers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,9 +216,11 @@ pub struct BaseItemDto {
     pub provider_ids: Option<HashMap<String, String>>,
     /// Gets or sets a value indicating whether the item is HD.
     #[serde(rename = "IsHD", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_hd: Option<bool>,
     /// Gets or sets a value indicating whether the item is a folder.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_folder: Option<bool>,
     /// Gets or sets the parent id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,15 +254,18 @@ pub struct BaseItemDto {
     pub parent_backdrop_image_tags: Option<Vec<String>>,
     /// Gets or sets the local trailer count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub local_trailer_count: Option<i32>,
     /// Gets or sets the user data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data: Option<UserItemDataDto>,
     /// Gets or sets the recursive item count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub recursive_item_count: Option<i32>,
     /// Gets or sets the child count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub child_count: Option<i32>,
     /// Gets or sets the series name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +282,7 @@ pub struct BaseItemDto {
     pub season_id: Option<Uuid>,
     /// Gets or sets the special feature count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub special_feature_count: Option<i32>,
     /// Gets or sets the display preferences id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +301,7 @@ pub struct BaseItemDto {
     pub tags: Option<Vec<String>>,
     /// Gets or sets the primary image aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub primary_image_aspect_ratio: Option<f64>,
     /// Gets or sets the artists.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +314,7 @@ pub struct BaseItemDto {
     pub album: Option<String>,
     /// Gets or sets the collection type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub collection_type: Option<CollectionType>,
     /// Gets or sets the display order.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -316,12 +344,15 @@ pub struct BaseItemDto {
     pub media_streams: Option<Vec<MediaStream>>,
     /// Gets or sets the video type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_type: Option<VideoType>,
     /// Gets or sets the part count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub part_count: Option<i32>,
     /// Gets or sets the media source count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub media_source_count: Option<i32>,
     /// Gets or sets the image tags.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -377,9 +408,11 @@ pub struct BaseItemDto {
     pub trickplay: Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>,
     /// Gets or sets the location type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub location_type: Option<LocationType>,
     /// Gets or sets the ISO type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub iso_type: Option<IsoType>,
     /// Gets or sets the media type.
     pub media_type: MediaType,
@@ -393,39 +426,51 @@ pub struct BaseItemDto {
     pub locked_fields: Option<Vec<MetadataField>>,
     /// Gets or sets the trailer count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub trailer_count: Option<i32>,
     /// Gets or sets the movie count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub movie_count: Option<i32>,
     /// Gets or sets the series count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub series_count: Option<i32>,
     /// Gets or sets the program count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub program_count: Option<i32>,
     /// Gets or sets the episode count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub episode_count: Option<i32>,
     /// Gets or sets the song count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub song_count: Option<i32>,
     /// Gets or sets the album count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub album_count: Option<i32>,
     /// Gets or sets the artist count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub artist_count: Option<i32>,
     /// Gets or sets the music video count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub music_video_count: Option<i32>,
     /// Gets or sets a value indicating whether the metadata is locked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub lock_data: Option<bool>,
     /// Gets or sets the width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
     /// Gets or sets the height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
     /// Gets or sets the camera make.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,30 +483,39 @@ pub struct BaseItemDto {
     pub software: Option<String>,
     /// Gets or sets the exposure time.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub exposure_time: Option<f64>,
     /// Gets or sets the focal length.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub focal_length: Option<f64>,
     /// Gets or sets the image orientation.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_orientation: Option<ImageOrientation>,
     /// Gets or sets the aperture.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub aperture: Option<f64>,
     /// Gets or sets the shutter speed.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub shutter_speed: Option<f64>,
     /// Gets or sets the latitude.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub latitude: Option<f64>,
     /// Gets or sets the longitude.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub longitude: Option<f64>,
     /// Gets or sets the altitude.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub altitude: Option<f64>,
     /// Gets or sets the ISO speed rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub iso_speed_rating: Option<i32>,
     /// Gets or sets the series timer id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -479,48 +533,61 @@ pub struct BaseItemDto {
     pub start_date: Option<DateTime<Utc>>,
     /// Gets or sets the completion percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub completion_percentage: Option<f64>,
     /// Gets or sets a value indicating whether the program is a repeat.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_repeat: Option<bool>,
     /// Gets or sets the episode title.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_title: Option<String>,
     /// Gets or sets the channel type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channel_type: Option<ChannelType>,
     /// Gets or sets the program audio.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio: Option<ProgramAudio>,
     /// Gets or sets a value indicating whether the item is a movie.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_movie: Option<bool>,
     /// Gets or sets a value indicating whether the item is sports.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_sports: Option<bool>,
     /// Gets or sets a value indicating whether the item is a series.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_series: Option<bool>,
     /// Gets or sets a value indicating whether the item is live.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_live: Option<bool>,
     /// Gets or sets a value indicating whether the item is news.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_news: Option<bool>,
     /// Gets or sets a value indicating whether the item is kids content.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_kids: Option<bool>,
     /// Gets or sets a value indicating whether the item is a premiere.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_premiere: Option<bool>,
     /// Gets or sets the timer id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timer_id: Option<String>,
     /// Gets or sets the gain required for audio normalization.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub normalization_gain: Option<f32>,
     /// Gets or sets the gain required for album audio normalization.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub album_normalization_gain: Option<f32>,
     /// Gets or sets the current program.
     #[serde(skip_serializing_if = "Option::is_none")]

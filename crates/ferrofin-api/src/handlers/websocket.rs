@@ -216,14 +216,19 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extracts a query-string parameter case-insensitively, as Jellyfin does
-/// (keys arrive as the client sent them: `ApiKey`, `apiKey`, `api_key`).
-/// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
+/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
+/// Raw authentication reads join nonempty StringValues; scalar model binding's
+/// first-value rule does not apply. Decode each key and value exactly once.
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_owned())
-    })
+    let mut values = form_urlencoded::parse(query?.as_bytes())
+        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
+        .map(|(_, value)| value);
+    let mut value = values.next()?.into_owned();
+    for next in values {
+        value.push(',');
+        value.push_str(&next);
+    }
+    Some(value)
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -279,24 +284,28 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
 /// (`WebSocketConnection.cs:60,262`): member names (`MessageType`, `Data`) match
 /// exactly, as there is no MVC binder to fold them, but `MessageType` is a
 /// `SessionMessageType` read by `JsonStringEnumConverter`, so its VALUE matches
-/// ignoring case (`"keepalive"` is `KeepAlive`). That converter also reads a
-/// numeric value (`28`, `"28"`); that half is `PLAN_JSON_NUMBER_HANDLING.md`.
+/// ignoring case. Numeric message types retain their actual C# discriminants.
 fn parse_inbound(text: &str) -> Option<Inbound> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let period = || subscription_period(value.get("Data").and_then(|d| d.as_str()));
-    match value
-        .get("MessageType")?
-        .as_str()?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "keepalive" => Some(Inbound::KeepAlive),
-        "sessionsstart" => Some(Inbound::SessionsStart(period())),
-        "sessionsstop" => Some(Inbound::SessionsStop),
-        "scheduledtasksinfostart" => Some(Inbound::TasksStart(period())),
-        "scheduledtasksinfostop" => Some(Inbound::TasksStop),
-        "activitylogentrystart" => Some(Inbound::ActivityStart(period())),
-        "activitylogentrystop" => Some(Inbound::ActivityStop),
+    use ferrofin_model::session::SessionMessageType as Kind;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Envelope {
+        message_type: Kind,
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+    }
+    let value: Envelope = crate::extract::deserialize_defaults(text).ok()?;
+    // C# forwards JsonElement.ToString(). Only a string can carry the
+    // comma-separated subscription period; other token kinds use the fallback.
+    let period = || subscription_period(value.data.as_ref().and_then(serde_json::Value::as_str));
+    match value.message_type {
+        Kind::KeepAlive => Some(Inbound::KeepAlive),
+        Kind::SessionsStart => Some(Inbound::SessionsStart(period())),
+        Kind::SessionsStop => Some(Inbound::SessionsStop),
+        Kind::ScheduledTasksInfoStart => Some(Inbound::TasksStart(period())),
+        Kind::ScheduledTasksInfoStop => Some(Inbound::TasksStop),
+        Kind::ActivityLogEntryStart => Some(Inbound::ActivityStart(period())),
+        Kind::ActivityLogEntryStop => Some(Inbound::ActivityStop),
         _ => None,
     }
 }
@@ -1089,6 +1098,31 @@ mod tests {
         assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
+        assert_eq!(
+            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
+            Some("first,second")
+        );
+        assert_eq!(
+            query_param(Some("api_key=&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            query_param(Some("api_key&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(query_param(Some("api_key=&api_key"), "api_key"), None);
+        assert_eq!(
+            query_param(
+                Some("%61pi_key=first%2526&API_KEY=second%2Bvalue"),
+                "api_key"
+            )
+            .as_deref(),
+            Some("first%26,second+value")
+        );
+        assert_eq!(
+            query_param(Some("%2561pi_key=ignored&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
     }
 
     #[test]
@@ -1347,5 +1381,35 @@ mod tests {
         assert_eq!(KEEPALIVE_SECS, 60);
         assert!((KEEPALIVE_FORCE_AFTER_SECS - 60.0 * 0.75).abs() < f64::EPSILON);
         assert!((KEEPALIVE_LOST_SECS - 60.0).abs() < f64::EPSILON);
+    }
+    #[test]
+    fn inbound_enum_numbers_use_csharp_values_and_exact_property_names() {
+        use ferrofin_model::session::SessionMessageType as Kind;
+        for value in [
+            Kind::KeepAlive.json_value().to_string(),
+            format!("\" {} \"", Kind::KeepAlive.json_value()),
+        ] {
+            let text = format!(r#"{{"MessageType":{value}}}"#);
+            assert_eq!(parse_inbound(&text), Some(Inbound::KeepAlive));
+        }
+        let message = format!(
+            r#"{{"MessageType":{},"Data":"0,2345"}}"#,
+            Kind::SessionsStart.json_value()
+        );
+        assert_eq!(
+            parse_inbound(&message),
+            Some(Inbound::SessionsStart(std::time::Duration::from_millis(
+                2345
+            )))
+        );
+        for text in [
+            r#"{"MessageType":28.0}"#,
+            r#"{"MessageType":"28.0"}"#,
+            r#"{"MessageType":999}"#,
+            r#"{"messageType":28}"#,
+            r#"{"MessageType":true}"#,
+        ] {
+            assert_eq!(parse_inbound(text), None, "{text}");
+        }
     }
 }

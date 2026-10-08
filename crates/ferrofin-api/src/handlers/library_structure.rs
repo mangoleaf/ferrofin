@@ -490,6 +490,7 @@ struct UpdateLibraryOptionsBody {
     /// The library item id.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
+    #[serde(with = "ferrofin_model::json::guid::option")]
     id: Option<Uuid>,
     /// The library name (Ferrofin's filesystem seam resolves by name; see below).
     #[serde(default)]
@@ -579,4 +580,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Library/VirtualFolders/Paths/Update",
             post(update_media_path),
         )
+}
+crate::query::query_parameters! {
+    AddVirtualFolderQuery {
+        "paths" => ',',
+    } => [("post", "/Library/VirtualFolders")];
+    RemoveVirtualFolderQuery {} => [("delete", "/Library/VirtualFolders")];
+    RenameVirtualFolderQuery {} => [("post", "/Library/VirtualFolders/Name")];
+    MediaPathQuery {} => [("post", "/Library/VirtualFolders/Paths"), ("delete", "/Library/VirtualFolders/Paths")];
 }

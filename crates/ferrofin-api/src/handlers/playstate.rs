@@ -91,7 +91,7 @@ async fn mark_played_item(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
-    assert_item_exists(&state, item_id).await?;
+    assert_item_exists(&state, item_id, &user).await?;
 
     let dto = state
         .user_data
@@ -131,7 +131,7 @@ async fn mark_unplayed_item(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
-    assert_item_exists(&state, item_id).await?;
+    assert_item_exists(&state, item_id, &user).await?;
 
     let dto = state.user_data.mark_unplayed(user_id, item_id).await?;
     notify_user_data_changed(&state, user_id, &dto).await;
@@ -154,7 +154,7 @@ async fn mark_played_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
     let uid = user_uuid(&user)?;
-    assert_item_exists(&state, item_id).await?;
+    assert_item_exists(&state, item_id, &user).await?;
     let dto = state
         .user_data
         .mark_played(uid, item_id, query.date_played)
@@ -178,7 +178,7 @@ async fn unmark_played_for_user(
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     let user = resolve_user(&state, &auth, Some(user_id)).await?;
     let uid = user_uuid(&user)?;
-    assert_item_exists(&state, item_id).await?;
+    assert_item_exists(&state, item_id, &user).await?;
     let dto = state.user_data.mark_unplayed(uid, item_id).await?;
     notify_user_data_changed(&state, uid, &dto).await;
     for guest in additional_user_ids(&state, &auth).await? {
@@ -699,10 +699,14 @@ fn validate_play_method(method: PlayMethod) -> PlayMethod {
 }
 
 /// Asserts the item exists (C# `GetItemById` null-check → `404`).
-async fn assert_item_exists(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+async fn assert_item_exists(
+    state: &AppState,
+    item_id: Uuid,
+    user: &ferrofin_db::entities::users::UserEntity,
+) -> Result<(), ApiError> {
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok(())
@@ -764,6 +768,15 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/PlayingItems/{itemId}/Progress",
             post(on_playback_progress_for_user),
         )
+}
+
+crate::query::query_parameters! {
+    MarkPlayedQuery {} => [("post", "/UserPlayedItems/{itemId}")];
+    UserIdQuery {} => [("delete", "/UserPlayedItems/{itemId}")];
+    PingQuery {} => [("post", "/Sessions/Playing/Ping")];
+    LegacyStartQuery {} => [("post", "/PlayingItems/{itemId}")];
+    LegacyProgressQuery {} => [("post", "/PlayingItems/{itemId}/Progress")];
+    LegacyStopQuery {} => [("delete", "/PlayingItems/{itemId}")];
 }
 
 #[cfg(test)]

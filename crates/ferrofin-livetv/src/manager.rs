@@ -2927,6 +2927,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
 
+    async fn get_recording_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
+            .await?
+            .map(|row| crate::projection::recording_entity(&row, parse_dt)))
+    }
+
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
             return Ok(None);
@@ -3284,7 +3290,7 @@ impl FerrofinLiveTvManager {
             RecordingStatus::Cancelled | RecordingStatus::Error
         ) {
             dto.timer_id.clone_from(&timer.base.id);
-            dto.status = Some(recording_status_name(timer.status).to_owned());
+            dto.status = Some(recording_status_name(timer.status));
         }
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());
@@ -4620,16 +4626,8 @@ fn push_program_paging(qb: &mut QueryBuilder<Sqlite>, limit: Option<i32>, start_
 }
 
 /// The stored `Status` string for a [`RecordingStatus`].
-fn recording_status_name(status: RecordingStatus) -> &'static str {
-    match status {
-        RecordingStatus::New => "New",
-        RecordingStatus::InProgress => "InProgress",
-        RecordingStatus::Completed => "Completed",
-        RecordingStatus::Cancelled => "Cancelled",
-        RecordingStatus::ConflictedOk => "ConflictedOk",
-        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
-        RecordingStatus::Error => "Error",
-    }
+fn recording_status_name(status: RecordingStatus) -> String {
+    status.json_name().into_owned()
 }
 
 /// Parses a timestamp stored in the guide cache: the canonical storage format

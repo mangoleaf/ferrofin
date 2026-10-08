@@ -20,19 +20,31 @@ use crate::system::CastReceiverApplication;
 use crate::updates::RepositoryInfo;
 
 /// The convention used for naming saved images.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ImageSavingConvention {
     /// The legacy naming convention.
     #[default]
     Legacy,
     /// A convention compatible with other media servers and metadata managers.
     Compatible,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ImageSavingConvention, None, {
+        Legacy => ("Legacy", 0),
+        Compatible => ("Compatible", 1),
+    }
 }
 
 /// Options for seeking the input audio stream when transcoding HLS segments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum HlsAudioSeekStrategy {
     /// Trim copied audio packets before the seek point.
     #[default]
@@ -40,23 +52,45 @@ pub enum HlsAudioSeekStrategy {
     /// Prevent audio streams from being copied if the video stream is
     /// transcoded.
     TranscodeAudio = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    HlsAudioSeekStrategy, None, {
+        TrimCopiedAudio => ("TrimCopiedAudio", 0),
+        TranscodeAudio => ("TranscodeAudio", 1),
+    }
 }
 
 /// The behavior used by the trickplay provider on library scan/update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TrickplayScanBehavior {
     /// Start generation, only return once complete.
     Blocking,
     /// Start generation, return immediately.
     #[default]
     NonBlocking,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TrickplayScanBehavior, None, {
+        Blocking => ("Blocking", 0),
+        NonBlocking => ("NonBlocking", 1),
+    }
 }
 
 /// The process priority for a spawned ffmpeg process (mirrors
 /// `System.Diagnostics.ProcessPriorityClass`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProcessPriorityClass {
     /// Normal priority.
     Normal,
@@ -71,6 +105,20 @@ pub enum ProcessPriorityClass {
     BelowNormal,
     /// Above-normal priority.
     AboveNormal,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProcessPriorityClass, None, {
+        Normal => ("Normal", 32),
+        Idle => ("Idle", 64),
+        High => ("High", 128),
+        RealTime => ("RealTime", 256),
+        BelowNormal => ("BelowNormal", 16384),
+        AboveNormal => ("AboveNormal", 32768),
+    }
 }
 
 /// The type of a metadata plugin.
@@ -105,8 +153,9 @@ pub enum MetadataPluginType {
 }
 
 /// Options for disabling embedded subtitles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum EmbeddedSubtitleOptions {
     /// Allow all embedded subs.
     #[default]
@@ -117,6 +166,18 @@ pub enum EmbeddedSubtitleOptions {
     AllowImage = 2,
     /// Disable all embedded subs.
     AllowNone = 3,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    EmbeddedSubtitleOptions, None, {
+        AllowAll => ("AllowAll", 0),
+        AllowText => ("AllowText", 1),
+        AllowImage => ("AllowImage", 2),
+        AllowNone => ("AllowNone", 3),
+    }
 }
 
 /// The subtitle playback mode (mirrors
@@ -124,8 +185,9 @@ pub enum EmbeddedSubtitleOptions {
 ///
 /// Forward reference: referenced by [`UserConfiguration`] and defined here as it
 /// has no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SubtitlePlaybackMode {
     /// The default mode.
     #[default]
@@ -138,6 +200,19 @@ pub enum SubtitlePlaybackMode {
     None,
     /// Smart subtitle display.
     Smart,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SubtitlePlaybackMode, None, {
+        Default => ("Default", 0),
+        Always => ("Always", 1),
+        OnlyForced => ("OnlyForced", 2),
+        None => ("None", 3),
+        Smart => ("Smart", 4),
+    }
 }
 
 /// A single image download option for a metadata type.
@@ -399,7 +474,7 @@ pub struct MetadataPluginSummary {
 
 /// XBMC (Kodi) NFO metadata options.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct XbmcMetadataOptions {
     /// Gets or sets the user id.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -863,7 +938,7 @@ impl Default for LibraryOptions {
 
 /// FFmpeg encoding options.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct EncodingOptions {
     /// Gets or sets the thread count used for encoding.
@@ -884,6 +959,7 @@ pub struct EncodingOptions {
     pub enable_audio_vbr: bool,
 
     /// Gets or sets the audio boost applied when downmixing audio.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub down_mix_audio_boost: f64,
 
     /// Gets or sets the algorithm used for downmixing audio to stereo.
@@ -943,18 +1019,23 @@ pub struct EncodingOptions {
     pub tonemapping_range: TonemappingRange,
 
     /// Gets or sets the tone-mapping desaturation.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_desat: f64,
 
     /// Gets or sets the tone-mapping peak.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_peak: f64,
 
     /// Gets or sets the tone-mapping parameters.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub tonemapping_param: f64,
 
     /// Gets or sets the VPP tone-mapping brightness.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub vpp_tonemapping_brightness: f64,
 
     /// Gets or sets the VPP tone-mapping contrast.
+    #[serde(with = "crate::json::number::stored_f64")]
     pub vpp_tonemapping_contrast: f64,
 
     /// Gets or sets the H264 CRF.
@@ -1256,6 +1337,7 @@ pub struct ServerConfiguration {
 
     /// Gets or sets the number of days activity logs should be retained.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub activity_log_retention_days: Option<i32>,
 
     /// Gets or sets the library scan fanout concurrency.

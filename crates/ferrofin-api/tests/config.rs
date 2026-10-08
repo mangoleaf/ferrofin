@@ -1057,3 +1057,99 @@ async fn live_tv_config_backend_failure_warns_instead_of_reading_as_unconfigured
         logs.0.lock().unwrap()
     );
 }
+
+#[tokio::test]
+async fn named_configuration_converts_values_before_persisting_and_keeps_failed_writes_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    };
+    let app = admin_state_with_paths(paths.clone());
+    let response = create_router(app.clone()).oneshot(Request::builder()
+        .method("POST").uri("/System/Configuration/encoding")
+        .header("X-Emby-Token", "tok").header("Content-Type", "application/json")
+        .body(Body::from(r#"{"EncodingThreadCount":"3","encodingThreadCount":"bad","DownMixAudioBoost":"1.5","TranscodingTempPath":1.50,"DownMixStereoAlgorithm":1}"#)).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let saved_path = dir.path().join("named/encoding.json");
+    let saved = std::fs::read(&saved_path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(value["EncodingThreadCount"], 3);
+    assert_eq!(value["DownMixAudioBoost"], 1.5);
+    assert_eq!(value["TranscodingTempPath"], "1.50");
+    assert!(
+        !value
+            .as_object()
+            .unwrap()
+            .contains_key("encodingThreadCount")
+    );
+    assert!(value["DownMixStereoAlgorithm"].is_string());
+    for bad in [
+        serde_json::json!({"EncodingThreadCount":" 3"}),
+        serde_json::json!({"EnableThrottling":"true"}),
+        serde_json::json!([]),
+    ] {
+        assert_eq!(
+            post(app.clone(), "/System/Configuration/encoding", &bad).await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(std::fs::read(&saved_path).unwrap(), saved);
+    }
+    assert_eq!(
+        post(
+            app,
+            "/System/Configuration/livetv",
+            &serde_json::json!({"GuideDays":""})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let live: ferrofin_model::live_tv::LiveTvOptions =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
+            .unwrap();
+    assert_eq!(live.guide_days, None);
+}
+
+#[tokio::test]
+async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    let uri = "/System/Configuration/encoding";
+    for field in [
+        "DownMixAudioBoost",
+        "TonemappingDesat",
+        "TonemappingPeak",
+        "TonemappingParam",
+        "VppTonemappingBrightness",
+        "VppTonemappingContrast",
+    ] {
+        for literal in ["NaN", "Infinity", "-Infinity"] {
+            assert_eq!(
+                post(app.clone(), uri, &serde_json::json!({field: literal})).await,
+                StatusCode::NO_CONTENT
+            );
+            let saved = std::fs::read(dir.path().join("named/encoding.json")).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+            assert_eq!(value[field], literal);
+            // The same ordinary model reader used by the configuration manager
+            // restores the actual floating-point value, not null or a default.
+            let options: ferrofin_model::configuration::EncodingOptions =
+                serde_json::from_slice(&saved).unwrap();
+            assert_eq!(serde_json::to_value(options).unwrap()[field], literal);
+            assert_eq!(get(app.clone(), uri).await.0, StatusCode::BAD_REQUEST);
+        }
+    }
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"DownMixAudioBoost":2})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(get(app, uri).await.0, StatusCode::OK);
+}

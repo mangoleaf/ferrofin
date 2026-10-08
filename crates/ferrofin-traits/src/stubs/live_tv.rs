@@ -744,6 +744,17 @@ pub trait LiveTvManager: Send + Sync {
     /// Gets a single recording by id, or `None` when unknown.
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError>;
 
+    /// Resolves the stored or synthetic recording entity for item authorization.
+    ///
+    /// A recording can live in the DVR store before a library scan creates its
+    /// BaseItems row. Callers must authorize this entity before accessing it.
+    async fn get_recording_item(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ServiceError> {
+        Ok(None)
+    }
+
     /// The on-disk path of a recording's captured file, or `None` when the
     /// recording is unknown or has no file yet. Backs
     /// `GET /LiveTv/LiveRecordings/{recordingId}/stream`.

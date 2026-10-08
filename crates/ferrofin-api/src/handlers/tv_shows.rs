@@ -400,7 +400,7 @@ async fn get_episodes(
         // Season id supplied — the item must be a season.
         let season = state
             .library
-            .get_item_by_id(season_id)
+            .get_item_by_id_for_user(season_id, user.as_ref())
             .await?
             .filter(|i| i.type_.ends_with("Season"))
             .ok_or_else(|| ApiError::NotFound(format!("No season exists with Id {season_id}")))?;
@@ -415,7 +415,7 @@ async fn get_episodes(
         // Series id supplied — the item must be a series.
         let series = state
             .library
-            .get_item_by_id(series_id)
+            .get_item_by_id_for_user(series_id, user.as_ref())
             .await?
             .filter(|i| i.type_.ends_with("Series"))
             .ok_or_else(|| ApiError::NotFound("Series not found".to_owned()))?;
@@ -538,7 +538,7 @@ async fn get_seasons(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let series = state
         .library
-        .get_item_by_id(series_id)
+        .get_item_by_id_for_user(series_id, user.as_ref())
         .await?
         .filter(|i| i.type_.ends_with("Series"))
         .ok_or_else(|| ApiError::NotFound(format!("series {series_id}")))?;
@@ -682,4 +682,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Shows/{itemId}/Episodes", get(get_episodes))
         .route("/Shows/{itemId}/Seasons", get(get_seasons))
         .route("/Shows/{itemId}/Similar", get(get_similar_shows))
+}
+crate::query::query_parameters! {
+    NextUpParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/NextUp")];
+    UpcomingParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/Upcoming")];
+    EpisodesParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Episodes")];
+    SeasonsParams {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Shows/{seriesId}/Seasons")];
+    SimilarParams {
+        "excludeArtistIds" => ',',
+        "fields" => ',',
+    } => [("get", "/Shows/{itemId}/Similar")];
 }

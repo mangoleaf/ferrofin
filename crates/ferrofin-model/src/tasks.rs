@@ -41,8 +41,9 @@ pub enum TaskCompletionStatus {
 }
 
 /// The type of a task trigger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TaskTriggerInfoType {
     /// A daily trigger.
     #[default]
@@ -53,6 +54,18 @@ pub enum TaskTriggerInfoType {
     IntervalTrigger,
     /// A startup trigger.
     StartupTrigger,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TaskTriggerInfoType, None, {
+        DailyTrigger => ("DailyTrigger", 0),
+        WeeklyTrigger => ("WeeklyTrigger", 1),
+        IntervalTrigger => ("IntervalTrigger", 2),
+        StartupTrigger => ("StartupTrigger", 3),
+    }
 }
 
 /// Options for tasks.
@@ -61,6 +74,7 @@ pub enum TaskTriggerInfoType {
 pub struct TaskOptions {
     /// Gets or sets the maximum runtime in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_runtime_ticks: Option<i64>,
 }
 
@@ -74,18 +88,22 @@ pub struct TaskTriggerInfo {
 
     /// Gets or sets the time of day in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub time_of_day_ticks: Option<i64>,
 
     /// Gets or sets the interval in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub interval_ticks: Option<i64>,
 
     /// Gets or sets the day of week.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub day_of_week: Option<DayOfWeek>,
 
     /// Gets or sets the maximum runtime in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_runtime_ticks: Option<i64>,
 }
 
@@ -140,6 +158,7 @@ pub struct TaskInfo {
 
     /// Gets or sets the current progress percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub current_progress_percentage: Option<f64>,
 
     /// Gets or sets the id.

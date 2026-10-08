@@ -32,7 +32,6 @@ use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
-use ferrofin_model::entities::VideoType;
 use ferrofin_model::live_tv::ItemSortBy;
 use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
@@ -742,13 +741,13 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     // of the requested extra types. C# `BaseItemRepository.TranslateQuery` casts
     // each `ExtraType` to its integer value and matches `e.ExtraType`; the
     // discriminants are stored verbatim as `INTEGER` here, so the cast is the
-    // enum's `i32` value (`ExtraType::Trailer as i32`, …).
+    // enum's `i32` value (`ExtraType::Trailer.json_value()`, …).
     if !filter.extra_types.is_empty() {
         qb.push(r#" AND bi."ExtraType" IS NOT NULL AND "#);
         let values: Vec<i64> = filter
             .extra_types
             .iter()
-            .map(|e| i64::from(*e as i32))
+            .map(|e| i64::from(e.json_value()))
             .collect();
         push_in_list(qb, r#"bi."ExtraType""#, &values);
     }
@@ -1122,12 +1121,7 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
             if i > 0 {
                 qb.push(" OR ");
             }
-            let name = match vt {
-                VideoType::VideoFile => "VideoFile",
-                VideoType::Iso => "Iso",
-                VideoType::Dvd => "Dvd",
-                VideoType::BluRay => "BluRay",
-            };
+            let name = vt.json_name();
             qb.push(r#"bi."Data" LIKE "#)
                 .push_bind(format!("%\"VideoType\":\"{name}\"%"))
                 .push(r#" OR bi."Data" LIKE "#)
@@ -1856,7 +1850,7 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
             push_order_expression(qb, *by, filter);
             qb.push(match order {
                 SortOrder::Ascending => " ASC",
-                SortOrder::Descending => " DESC",
+                SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
             });
         }
         return;
@@ -1888,7 +1882,7 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         push_order_expression(qb, *by, filter);
         qb.push(match order {
             SortOrder::Ascending => " ASC",
-            SortOrder::Descending => " DESC",
+            SortOrder::Descending | SortOrder::Unrecognized(_) => " DESC",
         });
         if matches!(by, ItemSortBy::SortName | ItemSortBy::Name) {
             has_name_sort = true;
@@ -1913,7 +1907,7 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         if index == 0 && leads_with_sort_name {
             qb.push(match order {
                 SortOrder::Ascending => r#", bi."Name" ASC"#,
-                SortOrder::Descending => r#", bi."Name" DESC"#,
+                SortOrder::Descending | SortOrder::Unrecognized(_) => r#", bi."Name" DESC"#,
             });
         }
     }

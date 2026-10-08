@@ -61,11 +61,16 @@ fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
 )]
 async fn get_item_segments(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
 
@@ -126,6 +131,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/MediaSegments/Provider/{providerId}",
             delete(erase_provider_segments),
         )
+}
+
+crate::query::query_parameters! {
+    ProviderEraseQuery {} => [];
 }
 
 #[cfg(test)]

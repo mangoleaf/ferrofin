@@ -36,6 +36,20 @@ use crate::extract::Query;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
 
+/// Resolves a user-addressed item before returning data or performing a side effect.
+/// Invisible and missing IDs deliberately have the same response.
+pub(crate) async fn require_visible_item(
+    state: &AppState,
+    item_id: Uuid,
+    user: Option<&UserEntity>,
+) -> Result<BaseItemEntity, ApiError> {
+    state
+        .library
+        .get_item_by_id_for_user(item_id, user)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
+}
+
 /// The effective user id for a request, porting C#
 /// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
 /// lines 67-85) in both of its halves:
@@ -489,6 +503,7 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
+    check_parent_visibility(&state, &auth, &internal).await?;
     redirect_container_browse(&state, &mut internal).await;
 
     let result = state.library.query_items(&internal).await?;
@@ -556,11 +571,15 @@ async fn get_item(
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let item = state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let item = if item_id.is_nil() {
+        state
+            .library
+            .get_user_root_folder()
+            .await?
+            .ok_or_else(|| ApiError::NotFound("user root folder".into()))?
+    } else {
+        require_visible_item(&state, item_id, Some(&user)).await?
+    };
     // A single-item fetch backs a detail page, so return the full DTO (overview,
     // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
     // detail view needs. Port of `UserLibraryController.GetItem`, which builds a
@@ -607,21 +626,12 @@ async fn require_can_delete(
 /// waits on scanner parity, so only the item's rows go and its files stay on
 /// disk. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
 ///
-/// TODO(parity): upstream resolves the item as the user —
-/// `_libraryManager.GetItemById<BaseItem>(itemId, user)` (`LibraryController.cs:
-/// 380,425`), `null` (so `404`) for an item the user cannot see — and Ferrofin
-/// has no per-user by-id lookup yet, so a user allowed to delete in every
-/// library but kept out of some can delete there by id. The same gap covers
-/// playlists: a private playlist the caller cannot see is a `404` upstream
-/// (and was one through 1.3.x), but a `401` from the `CanDelete` check here.
-/// Un-defer path:
-/// `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md` (a `LibraryManager` by-id
-/// read that applies `IsVisibleStandalone`, used here and by every by-id
-/// route).
+/// Resolve visibility before CanDelete: a hidden item is indistinguishable
+/// from a missing one, even when the caller may delete from every library.
 async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
     let item = state
         .library
-        .get_item_by_id(id)
+        .get_item_by_id_for_user(id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
     require_can_delete(state, auth, &item).await?;
@@ -891,6 +901,7 @@ async fn get_ancestors(
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_item(&state, item_id, user.as_ref()).await?;
     let mut chain = state
         .library
         .get_ancestors(item_id)
@@ -1257,6 +1268,38 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
     )
 }
 
+/// ItemsController uses IsVisible on its explicit parent, not standalone
+/// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
+/// Container-only browses re-root to UserRootFolder before the upstream check.
+async fn check_parent_visibility(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    query: &InternalItemsQuery,
+) -> Result<(), ApiError> {
+    if query.parent_id.is_nil() {
+        return Ok(());
+    }
+    let parent = state
+        .library
+        .get_item_by_id(query.parent_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
+    let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
+    let rerooted = matches!(
+        query.include_item_types.as_slice(),
+        [BaseItemKind::BoxSet | BaseItemKind::Playlist]
+    ) && !matches!(kind, "BoxSet" | "Playlist");
+    if !auth.is_api_key
+        && kind != "UserRootFolder"
+        && !rerooted
+        && let Some(user) = query.user.as_ref()
+        && !state.library.is_item_visible(&parent, user).await?
+    {
+        return Err(ApiError::Unauthorized("Unauthorized access".into()));
+    }
+    Ok(())
+}
+
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
 /// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
 /// `linkedChildAncestorIds` block).
@@ -1383,6 +1426,50 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/Items/{itemId}/Ancestors", get(get_ancestors))
 }
+crate::query::query_parameters! {
+    ItemsQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "imageTypes" => ',',
+        "fields" => ',',
+        "ids" => ',',
+        "excludeItemIds" => ',',
+        "genres" => '|',
+        "tags" => '|',
+        "officialRatings" => '|',
+        "years" => ',',
+        "genreIds" => ',',
+        "studioIds" => ',',
+        "personIds" => ',',
+        "artistIds" => ',',
+        "excludeArtistIds" => ',',
+        "albumArtistIds" => ',',
+        "contributingArtistIds" => ',',
+        "albumIds" => ',',
+        "videoTypes" => ',',
+        "locationTypes" => ',',
+        "excludeLocationTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items")];
+    ItemQuery {} => [("get", "/Items/{itemId}")];
+    DeleteItemsQuery {
+        "ids" => ',',
+    } => [("delete", "/Items")];
+    CountsQuery {} => [("get", "/Items/Counts")];
+    AncestorsQuery {} => [("get", "/Items/{itemId}/Ancestors")];
+    ResumeQuery {
+        "mediaTypes" => ',',
+        "excludeItemTypes" => ',',
+        "includeItemTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/UserItems/Resume")];
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

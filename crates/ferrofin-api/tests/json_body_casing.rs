@@ -191,6 +191,11 @@ async fn member_error(
     (status, key)
 }
 
+/// The `$` and first member segment of an error key (`$`, `Member`).
+fn top_segment(key: &str) -> Vec<&str> {
+    key.split(['.', '[']).take(2).collect()
+}
+
 fn camel(name: &str) -> String {
     let mut chars = name.chars();
     chars.next().map_or_else(String::new, |first| {
@@ -224,7 +229,7 @@ const KNOWN_UNREACHABLE: &[&str] = &[];
 /// The member paths the oracle compared when it was written (2026-10-07). A
 /// lower count means members quietly moved into the skip bucket; raise this
 /// when the contract or the DTOs grow.
-const MIN_MEMBERS_CHECKED: usize = 3396;
+const MIN_MEMBERS_CHECKED: usize = 3461;
 
 /// Every JSON-body operation binds each re-cased member name to the same
 /// member, and the oracle reaches every operation.
@@ -288,12 +293,19 @@ async fn every_json_body_member_binds_ignoring_case() {
                     |n: &str| n.to_ascii_uppercase(),
                 ] {
                     let recased = wrap(body_for(&member, case));
+                    // A dictionary-key segment (an enum-keyed map such as
+                    // `ImageBlurHashes`) is data and is reported as sent, so
+                    // nested segments compare ignoring case; the top-level
+                    // segment is always a struct member and must come back in
+                    // the struct's own spelling.
                     let got = member_error(&router, &method, &uri, &recased).await;
-                    assert_eq!(
-                        (got.0, got.1.as_deref()),
-                        (StatusCode::BAD_REQUEST, Some(key.as_str())),
+                    assert!(
+                        got.0 == StatusCode::BAD_REQUEST
+                            && got.1.as_deref().is_some_and(|k| {
+                                k.eq_ignore_ascii_case(&key) && top_segment(k) == top_segment(&key)
+                            }),
                         "{method} {path}: the re-cased body {recased} did not bind \
-                         member {key} (case-sensitive binding?)"
+                         member {key} (case-sensitive binding?): got {got:?}"
                     );
                 }
             }

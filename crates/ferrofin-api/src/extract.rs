@@ -45,6 +45,8 @@
 //! content type and the document's shape are the contract; the diagnostic text
 //! is Ferrofin's own, and no parity probe compares it.
 
+pub use crate::query::{Query, QueryParameters, QueryRejection};
+
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
@@ -55,10 +57,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use self::doc::Doc;
-pub use self::query::Query;
 
+#[cfg(test)]
+pub(crate) mod contract_numbers;
 mod doc;
-mod query;
 
 /// The `type` URI ASP.NET stamps on a validation failure.
 const VALIDATION_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.1";
@@ -244,34 +246,35 @@ fn bind<T: DeserializeOwned>(bytes: &[u8], want: TopLevel) -> Result<T, ProblemD
     }
 }
 
-/// Binds a REQUIRED `[FromBody] JsonDocument` body into `T`: any JSON kind (an
-/// object, an array or a scalar alike), member names matched **exactly**.
-///
-/// Case-sensitive on purpose. `JsonDocument` has no members for the MVC binder
-/// to fold; the controller deserializes it itself with `JsonDefaults.Options`,
-/// which never sets `PropertyNameCaseInsensitive` (v12.2
-/// `ConfigurationController.UpdateNamedConfiguration`, `.Deserialize(type,
-/// _serializerOptions)`). Measured on a live Jellyfin 12.2.0:
-/// `POST /System/Configuration/metadata` with
-/// `{"useFileCreationTimeForDateAdded":false}` ignores the member and saves the
-/// default (`true`). So this binds through a plain `serde_json::Value`, not a
-/// folding [`Doc`].
-///
-/// This reproduces only the member-name half of `JsonDefaults.Options`. Its
-/// value coercions (`JsonStringEnumConverter` reading enum names in any case,
-/// `AllowReadingFromString` numbers) are the separate
-/// `PLAN_JSON_NUMBER_HANDLING.md` work item, and apply here too: the typed
-/// readers of a stored named configuration still parse its values strictly.
+/// Binds a required JsonDocument without changing its property names or
+/// number spelling. Named-configuration handlers bind its raw text separately
+/// with JsonDefaults options after resolving the configuration's type.
 fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err(ProblemDetails::empty_body());
     }
-    let value: serde_json::Value = serde_json::from_slice(bytes)
+    let raw: &serde_json::value::RawValue = serde_json::from_slice(bytes)
         .map_err(|e| ProblemDetails::validation("$", e.to_string()))?;
-    if value.is_null() {
+    if raw.get() == "null" {
         return Err(ProblemDetails::empty_body());
     }
-    serde_path_to_error::deserialize(value).map_err(member_error)
+    let mut reader = serde_json::Deserializer::from_str(raw.get());
+    serde_path_to_error::deserialize(&mut reader).map_err(member_error)
+}
+
+/// The production MVC document deserializer, exposed to DTO regression tests.
+#[cfg(test)]
+pub(crate) fn deserialize_mvc<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
+    let doc: Doc = serde_json::from_str(json)?;
+    T::deserialize(doc)
+}
+
+/// Uses Jellyfin's JsonDefaults value converters with exact property names.
+pub(crate) fn deserialize_defaults<T: DeserializeOwned>(
+    json: &str,
+) -> Result<T, serde_json::Error> {
+    let doc: Doc<false> = serde_json::from_str(json)?;
+    T::deserialize(doc)
 }
 
 /// Reads the body of a REQUIRED parameter.
@@ -459,7 +462,7 @@ mod tests {
             assert_eq!(dto.names, ["a"]);
         }
         // A failing member is still named by path (the DTO's own spelling).
-        let rejected = bind::<Dto>(br#"{"names":[1]}"#, TopLevel::Object).expect_err("rejected");
+        let rejected = bind::<Dto>(br#"{"names":[{}]}"#, TopLevel::Object).expect_err("rejected");
         assert!(
             rejected
                 .errors
@@ -528,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_member_that_will_not_convert_is_named_by_path() {
-        let rejected = bind::<Dto>(br#"{"Names":[1]}"#, TopLevel::Object).expect_err("rejected");
+        let rejected = bind::<Dto>(br#"{"Names":[{}]}"#, TopLevel::Object).expect_err("rejected");
         assert_eq!(rejected.status, 400);
         assert!(
             rejected
@@ -550,7 +553,7 @@ mod tests {
     #[test]
     fn a_list_body_member_is_keyed_without_a_dot_before_the_index() {
         let rejected =
-            bind::<Vec<Dto>>(br#"[{"Names":[1]}]"#, TopLevel::Array).expect_err("rejected");
+            bind::<Vec<Dto>>(br#"[{"Names":[{}]}]"#, TopLevel::Array).expect_err("rejected");
         assert!(
             rejected
                 .errors

@@ -4291,9 +4291,6 @@ impl LibraryScanner {
         work.served(&touched);
         let removed =
             Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted, &excluded)).await;
-        // Announce what the scan changed (`LibraryChanged`) so open clients
-        // refresh their library views without a manual reload.
-        self.publish_library_changed(&items_added, &removed).await;
         // Boxed: the post-scan passes (music, years, studio/library/dynamic
         // images) run once per scan, and inlining their state kept the scan
         // future at clippy's `large_futures` ceiling.
@@ -4307,8 +4304,15 @@ impl LibraryScanner {
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
+            // New destinations may have been saved before old paths were
+            // pruned, or by an earlier watcher event outside this scope.
+            // Music's closing pass must also have persisted its final keys.
+            self.persistence.reattach_all_user_data().await?;
             run.report(100.0);
         }
+        // Clients must observe recovered history when they refresh the newly
+        // announced items. Even a cancelled closing pass announces deletions.
+        self.publish_library_changed(&items_added, &removed).await;
         Ok(outcome)
     }
 
@@ -5136,6 +5140,7 @@ impl LibraryScanner {
         }
         self.persist_provider_ids_and_values(item.id, &entity, &settled_ids)
             .await?;
+        self.persistence.reattach_user_data(&entity).await?;
         if ancestors_changed {
             self.persistence
                 .set_ancestors(item.id, &item.ancestors)
@@ -5901,8 +5906,8 @@ impl LibraryScanner {
     ///
     /// `BaseItems.ParentId` cascades, but a retired row is parentless AND
     /// childless — every album now hangs off the resolved artist — so nothing
-    /// cascades with it. Its user data is lost, which is the honest cost: the
-    /// row it was keyed to no longer exists.
+    /// cascades with it. Its user data is detached and the scan's recovery
+    /// pass can attach it to the surviving artist through the artist keys.
     async fn retire_accessed_by_name_artists(&self) -> Result<(), ServiceError> {
         // A row counts as folder-backed when it carries a TopParentId — that is
         // exactly what `scope_to_user_libraries` (`AddUserToQuery`) requires and
@@ -6180,7 +6185,8 @@ impl LibraryScanner {
     /// exist. The walk is the source of truth: any stored row (movie, series,
     /// season, episode, album, track) keyed to a scanned library that this
     /// scan did not re-plan is gone from disk — deleted, renamed, or moved —
-    /// and is removed. FK cascades clear its streams/chapters/images/user data;
+    /// and is removed. User data is detached for recovery; FK cascades clear
+    /// its streams, chapters, and images;
     /// by-name rows (genres, studios, artists, people) carry no `TopParentId`
     /// and are untouched. No-op without an item repository.
     ///
@@ -9574,7 +9580,7 @@ impl LibraryScanner {
             return;
         };
         entity.media_type = Some(media_type.to_owned());
-        entity.extra_type = Some(extra_type as i32);
+        entity.extra_type = Some(extra_type.json_value());
         entity.owner_id = Some(guid_to_db(owner));
         // BaseItem.RefreshExtras clears the physical parent. An extra's
         // library is reached through its owner, not GetTopParent's parent
@@ -9671,7 +9677,7 @@ impl LibraryScanner {
                 _ => false,
             });
             if named_after_owner {
-                let count = counts.entry(extra_type as i32).or_insert(0);
+                let count = counts.entry(extra_type.json_value()).or_insert(0);
                 *count += 1;
                 name = self.extra_type_name(extra_type, *count);
             }
@@ -9689,21 +9695,7 @@ impl LibraryScanner {
     }
 
     fn extra_type_name(&self, extra: ferrofin_model::entities::ExtraType, count: i32) -> String {
-        use ferrofin_model::entities::ExtraType;
-        let key = match extra {
-            ExtraType::Clip => "NameExtraClip",
-            ExtraType::Trailer => "NameExtraTrailer",
-            ExtraType::BehindTheScenes => "NameExtraBehindTheScenes",
-            ExtraType::DeletedScene => "NameExtraDeletedScene",
-            ExtraType::Interview => "NameExtraInterview",
-            ExtraType::Scene => "NameExtraScene",
-            ExtraType::Sample => "NameExtraSample",
-            ExtraType::ThemeSong => "NameExtraThemeSong",
-            ExtraType::ThemeVideo => "NameExtraThemeVideo",
-            ExtraType::Featurette => "NameExtraFeaturette",
-            ExtraType::Short => "NameExtraShort",
-            ExtraType::Unknown => "NameExtraUnknown",
-        };
+        let key = format!("NameExtra{}", extra.json_name());
         let fallback;
         let localization = if let Some(localization) = &self.localization {
             localization.as_ref()
@@ -9711,7 +9703,7 @@ impl LibraryScanner {
             fallback = crate::localization_manager::LocalizationManager::new("");
             &fallback
         };
-        let name = localization.get_localized_string(key);
+        let name = localization.get_localized_string(&key);
         if count == 1 {
             name
         } else {
@@ -11549,13 +11541,8 @@ fn file_video_type(path: &str) -> VideoType {
 /// blob — where Jellyfin keeps them, and what the `videoTypes` browse filter
 /// matches on. `IsoType` follows upstream's path-substring heuristic.
 fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
-    let name = match video_type {
-        VideoType::VideoFile => "VideoFile",
-        VideoType::Iso => "Iso",
-        VideoType::Dvd => "Dvd",
-        VideoType::BluRay => "BluRay",
-    };
-    if let Some(data) = crate::item_data::set_data_field(entity.data.as_deref(), "VideoType", name)
+    let name = video_type.json_name();
+    if let Some(data) = crate::item_data::set_data_field(entity.data.as_deref(), "VideoType", &name)
     {
         entity.data = Some(data);
     }
@@ -26416,7 +26403,7 @@ mod tests {
         assert_eq!(audio[0].media_type.as_deref(), Some("Audio"));
         assert_eq!(
             audio[0].extra_type,
-            Some(ferrofin_model::entities::ExtraType::ThemeSong as i32)
+            Some(ferrofin_model::entities::ExtraType::ThemeSong.json_value())
         );
     }
 

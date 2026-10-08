@@ -27,6 +27,7 @@ pub struct ValidatePathDto {
 
     /// Gets or sets a value indicating whether the path is a file.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_file: Option<bool>,
 }
 

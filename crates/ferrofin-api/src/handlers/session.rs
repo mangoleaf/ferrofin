@@ -652,3 +652,17 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             get(get_password_reset_providers),
         )
 }
+crate::query::query_parameters! {
+    GetSessionsQuery {} => [("get", "/Sessions")];
+    DisplayContentQuery {} => [("post", "/Sessions/{sessionId}/Viewing")];
+    PlayQuery {
+        "itemIds" => ',',
+    } => [("post", "/Sessions/{sessionId}/Playing")];
+    PlaystateQuery {} => [("post", "/Sessions/{sessionId}/Playing/{command}")];
+    CapabilitiesQuery {
+        "playableMediaTypes" => ',',
+        "supportedCommands" => ',',
+    } => [("post", "/Sessions/Capabilities")];
+    FullCapabilitiesQuery {} => [("post", "/Sessions/Capabilities/Full")];
+    ReportViewingQuery {} => [("post", "/Sessions/Viewing")];
+}

@@ -1045,7 +1045,7 @@ impl UserManager for FerrofinUserManager {
         .bind(config.play_default_audio_track)
         .bind(&config.subtitle_language_preference)
         .bind(config.display_missing_episodes)
-        .bind(config.subtitle_mode as i32)
+        .bind(config.subtitle_mode.json_value())
         .bind(config.display_collections_view)
         .bind(config.enable_local_password)
         .bind(config.hide_played_in_latest)
@@ -1126,7 +1126,7 @@ impl UserManager for FerrofinUserManager {
         .bind(i64::from(policy.remote_client_bitrate_limit))
         .bind(&policy.authentication_provider_id)
         .bind(&policy.password_reset_provider_id)
-        .bind(policy.sync_play_access as i32)
+        .bind(policy.sync_play_access.json_value())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1413,16 +1413,9 @@ fn cast_i32(value: i64) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
-/// Maps a stored `SubtitleMode` discriminant to its enum (C# stores the enum's
-/// ordinal). Unknown values fall back to the default.
+/// Preserves the stored C# enum value, including unnamed integer values.
 fn subtitle_mode_from_i32(value: i32) -> SubtitlePlaybackMode {
-    match value {
-        1 => SubtitlePlaybackMode::Always,
-        2 => SubtitlePlaybackMode::OnlyForced,
-        3 => SubtitlePlaybackMode::None,
-        4 => SubtitlePlaybackMode::Smart,
-        _ => SubtitlePlaybackMode::Default,
-    }
+    SubtitlePlaybackMode::from_json_value(value)
 }
 
 /// Every permission flag a [`UserPolicy`] carries, paired with its

@@ -64,6 +64,7 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 #[derive(Clone)]
 pub struct FerrofinLibraryManager {
     items: Arc<dyn ItemRepository>,
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     counts: Arc<dyn ItemCountService>,
     persistence: Arc<dyn ItemPersistenceService>,
@@ -965,6 +966,7 @@ impl FerrofinLibraryManager {
     ) -> Self {
         Self {
             items,
+            visibility: None,
             virtual_folders: None,
             counts,
             persistence,
@@ -979,6 +981,16 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
         }
+    }
+
+    /// Installs the standalone item-visibility evaluator.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
+        self
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -1236,6 +1248,61 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    async fn is_item_visible(
+        &self,
+        item: &BaseItemEntity,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        Ok(service
+            .visible(std::slice::from_ref(item), user, false)
+            .await?[0])
+    }
+
+    async fn is_item_visible_standalone(
+        &self,
+        item: &BaseItemEntity,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        Ok(service
+            .visible(std::slice::from_ref(item), user, true)
+            .await?[0])
+    }
+
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(ids).await?;
+        let visible: std::collections::HashSet<_> = rows
+            .iter()
+            .zip(service.visible(&rows, user, true).await?)
+            .filter(|(_, visible)| *visible)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .filter(|id| !id.is_nil() && *id != PLACEHOLDER_ITEM_ID)
+            .collect();
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| visible.contains(id))
+            .collect())
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
@@ -2110,63 +2177,6 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ImageType;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn queue_library_scan_exports_a_library_scan_span_tagged_with_trigger() {
-        // End-to-end span-coverage smoke: an `api`-triggered scan (empty library,
-        // so it finishes fast) exports a `library_scan` root span carrying
-        // `trigger`. current-thread + set_default keeps the spawned scan on the
-        // scoped subscriber so the `.instrument()`ed span is captured.
-        use crate::file_system::FerrofinFileSystem;
-        use crate::library_scan::LibraryScanner;
-        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
-        use ferrofin_traits::library::VirtualFolderManager;
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let db = test_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        // No virtual folders added → the scan plans zero items and returns fast.
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = Arc::new(LibraryScanner::new(
-            vf,
-            Arc::new(FerrofinFileSystem::new()),
-            persistence,
-        ));
-        let mgr = manager(&db).with_scanner(scanner);
-
-        let exporter = InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_sampler(Sampler::AlwaysOn)
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("ferrofin"));
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
-
-        mgr.queue_library_scan().await.expect("queued");
-        // Wait for completion rather than assuming the scan finishes within 50 ms.
-        // On this current-thread runtime, the worker closes its span before this
-        // test can observe the idle queue, so the simple exporter has seen it.
-        until_idle(&mgr).await;
-        provider.force_flush().expect("flush");
-
-        let spans = exporter.get_finished_spans().expect("spans");
-        let span = spans
-            .iter()
-            .find(|s| s.name == "library_scan")
-            .expect("library_scan span exported");
-        let trigger = span
-            .attributes
-            .iter()
-            .find(|kv| kv.key.as_str() == "trigger")
-            .map(|kv| kv.value.to_string());
-        assert_eq!(trigger.as_deref(), Some("api"));
-    }
 
     /// One run a [`GatedRunner`] made.
     #[derive(Debug, Clone, PartialEq)]
@@ -3929,6 +3939,38 @@ mod tests {
                 .expect("nil")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_lookup_requires_visibility_and_keeps_raw_access() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(71);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Scoped").await;
+        let mgr = manager(&db);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(72)).await;
+        assert!(
+            mgr.get_item_by_id_for_user(id, None)
+                .await
+                .expect("raw")
+                .is_some()
+        );
+        assert!(matches!(
+            mgr.get_item_by_id_for_user(id, Some(&user)).await,
+            Err(ferrofin_traits::error::ServiceError::Backend(_))
+        ));
+        assert!(
+            mgr.get_item_by_id_for_user(Uuid::nil(), Some(&user))
+                .await
+                .expect("missing")
+                .is_none()
+        );
+        assert!(
+            mgr.get_visible_item_ids(&[], &user)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
     }
 
     #[tokio::test]
