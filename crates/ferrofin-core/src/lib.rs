@@ -160,6 +160,7 @@ pub mod aggregate_folder;
 pub mod api_key_manager;
 pub mod app_paths;
 pub mod application_host;
+mod audio_tags;
 pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;

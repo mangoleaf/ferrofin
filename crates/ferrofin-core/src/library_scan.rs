@@ -7310,7 +7310,7 @@ impl LibraryScanner {
         // MusicBrainz ids) — the port of `AudioFileProber`. Fill-if-empty so an
         // NFO/prior scan wins; the ids are returned for persistence.
         let provider_ids = if media_is_audio {
-            apply_audio_metadata(entity, probed)
+            apply_audio_metadata(entity, probed, policy.options)
         } else {
             Vec::new()
         };
@@ -14682,7 +14682,12 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
 /// or prior scan wins), and returns the embedded MusicBrainz ids to persist.
 /// The port of `AudioFileProber`'s tag→item mapping (multi-values pipe-joined,
 /// matching Ferrofin's `Artists`/`AlbumArtists`/`Genres` column convention).
-fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(String, String)> {
+fn apply_audio_metadata(
+    entity: &mut BaseItemEntity,
+    info: &MediaInfo,
+    options: Option<&LibraryOptionsModel>,
+) -> Vec<(String, String)> {
+    let tags = crate::audio_tags::for_library(info, options);
     // The TITLE tag is authoritative for the track name (AudioFileProber:
     // `audio.Name = trackTitle` unconditionally, bar locked fields — the scan
     // loop already skips locked items). The resolver's file-stem name is a
@@ -14709,29 +14714,20 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     {
         entity.album = Some(album.to_owned());
     }
-    if entity.artists.as_deref().unwrap_or_default().is_empty() && !info.artists.is_empty() {
-        entity.artists = Some(info.artists.join("|"));
+    if entity.artists.as_deref().unwrap_or_default().is_empty() && !tags.artists.is_empty() {
+        entity.artists = Some(tags.artists.join("|"));
     }
-    // "Album artists not provided, fall back to performers (artists)"
-    // (`AudioFileProber.cs:353-357`). The probe's tag reader already falls
-    // back the same way (`ProbeResultNormalizer.cs:1418-1422`), so this
-    // holds for any `MediaInfo`, not only one it produced.
-    let album_artists = if info.album_artists.is_empty() {
-        &info.artists
-    } else {
-        &info.album_artists
-    };
     if entity
         .album_artists
         .as_deref()
         .unwrap_or_default()
         .is_empty()
-        && !album_artists.is_empty()
+        && !tags.album_artists.is_empty()
     {
-        entity.album_artists = Some(album_artists.join("|"));
+        entity.album_artists = Some(tags.album_artists.join("|"));
     }
-    if entity.genres.as_deref().unwrap_or_default().is_empty() && !info.genres.is_empty() {
-        entity.genres = Some(info.genres.join("|"));
+    if entity.genres.as_deref().unwrap_or_default().is_empty() && !tags.genres.is_empty() {
+        entity.genres = Some(tags.genres.join("|"));
     }
     if entity.index_number.is_none() {
         entity.index_number = info.index_number.map(i64::from);
@@ -14749,10 +14745,7 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     // numbers (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`), which
     // for a stored track may be its own rather than the tags', so the scan
     // derives it last (`settle_sort_name`, upstream's `AfterMetadataRefresh`).
-    info.provider_ids
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+    tags.provider_ids
 }
 
 /// Unions a provider's multi-value names into a pipe-joined column, preserving
@@ -19349,7 +19342,7 @@ mod tests {
             media_type: Some("Audio".into()),
             ..Default::default()
         };
-        let ids = super::apply_audio_metadata(&mut e, &info);
+        let ids = super::apply_audio_metadata(&mut e, &info, None);
         assert_eq!(e.album.as_deref(), Some("Kind of Blue"));
         assert_eq!(e.artists.as_deref(), Some("Miles Davis"));
         assert_eq!(e.album_artists.as_deref(), Some("Miles Davis"));
@@ -19368,7 +19361,7 @@ mod tests {
             album: Some("Existing".into()),
             ..Default::default()
         };
-        super::apply_audio_metadata(&mut pre, &info);
+        super::apply_audio_metadata(&mut pre, &info, None);
         assert_eq!(pre.production_year, Some(2000));
         assert_eq!(pre.album.as_deref(), Some("Existing"));
 
@@ -19389,7 +19382,7 @@ mod tests {
             ..Default::default()
         };
         let _guesses = super::ResolverGuesses::take(&mut tagged, None, false);
-        super::apply_audio_metadata(&mut tagged, &info);
+        super::apply_audio_metadata(&mut tagged, &info, None);
         assert_eq!(tagged.name.as_deref(), Some("Scar Tissue"));
         assert_eq!(tagged.album.as_deref(), Some("Kind of Blue"));
     }
@@ -19409,7 +19402,7 @@ mod tests {
             ..MediaInfo::default()
         };
         let mut row = BaseItemEntity::default();
-        super::apply_audio_metadata(&mut row, &untagged);
+        super::apply_audio_metadata(&mut row, &untagged, None);
         assert_eq!(
             row.album_artists.as_deref(),
             Some("Miles Davis|John Coltrane")
@@ -19421,19 +19414,95 @@ mod tests {
             ..untagged.clone()
         };
         let mut row = BaseItemEntity::default();
-        super::apply_audio_metadata(&mut row, &tagged);
+        super::apply_audio_metadata(&mut row, &tagged, None);
         assert_eq!(row.album_artists.as_deref(), Some("Various Artists"));
 
         let mut row = BaseItemEntity {
             album_artists: Some("Stored".into()),
             ..BaseItemEntity::default()
         };
-        super::apply_audio_metadata(&mut row, &untagged);
+        super::apply_audio_metadata(&mut row, &untagged, None);
         assert_eq!(row.album_artists.as_deref(), Some("Stored"));
 
         let mut row = BaseItemEntity::default();
-        super::apply_audio_metadata(&mut row, &MediaInfo::default());
+        super::apply_audio_metadata(&mut row, &MediaInfo::default(), None);
         assert_eq!(row.album_artists, None, "no performers, no album artists");
+    }
+
+    #[test]
+    fn audio_probe_applies_current_library_artist_and_delimiter_options_to_raw_tags() {
+        let first_id = "11111111-1111-4111-8111-111111111111";
+        let second_id = "22222222-2222-4222-8222-222222222222";
+        let mut info = ferrofin_model::media_info::MediaInfo {
+            artists: vec!["Normalizer interpretation must not win".to_owned()],
+            album_artists: vec!["Normalizer album artist".to_owned()],
+            genres: vec!["Normalizer genre".to_owned()],
+            raw_audio_tags: Some(std::collections::HashMap::from([
+                ("artist".to_owned(), "Standard / Partner".to_owned()),
+                ("artists".to_owned(), "AC/DC; Guest".to_owned()),
+                ("albumartist".to_owned(), "Album / Collective".to_owned()),
+                ("albumartists".to_owned(), "AC/DC; Album guest".to_owned()),
+                ("genre".to_owned(), "Rock; Metal".to_owned()),
+                (
+                    "musicbrainz_albumid".to_owned(),
+                    format!("{first_id};{second_id}"),
+                ),
+            ])),
+            ..Default::default()
+        };
+        info.provider_ids
+            .insert("MusicBrainzAlbum".to_owned(), first_id.to_owned());
+        for (prefer, custom, expected_artists, expected_album_artists, expected_genres) in [
+            (
+                false,
+                false,
+                "Standard / Partner",
+                "Album / Collective",
+                "Rock; Metal",
+            ),
+            (
+                true,
+                false,
+                "AC/DC; Guest",
+                "AC/DC; Album guest",
+                "Rock; Metal",
+            ),
+            (true, true, "AC/DC|Guest", "AC/DC|Album guest", "Rock|Metal"),
+        ] {
+            let options = super::LibraryOptionsModel {
+                prefer_nonstandard_artists_tag: prefer,
+                use_custom_tag_delimiters: custom,
+                custom_tag_delimiters: vec![";".to_owned(), "/".to_owned()],
+                delimiter_whitelist: vec!["AC/DC".to_owned()],
+                ..Default::default()
+            };
+            let mut row = ferrofin_db::entities::base_items::BaseItemEntity::default();
+            let rows = LibraryScanner::apply_probe(
+                &mut row,
+                Some(&info),
+                true,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(row.artists.as_deref(), Some(expected_artists));
+            assert_eq!(row.album_artists.as_deref(), Some(expected_album_artists));
+            assert_eq!(row.genres.as_deref(), Some(expected_genres));
+            assert_eq!(
+                rows.provider_ids,
+                if custom {
+                    vec![("MusicBrainzAlbum".to_owned(), first_id.to_owned())]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        assert_eq!(
+            info.artists,
+            ["Normalizer interpretation must not win"],
+            "reusing a probe cannot bake in an earlier library setting"
+        );
     }
 
     // fanart id selection prefers Tmdb over Imdb; dedup keeps the first image of
