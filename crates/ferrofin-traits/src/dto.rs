@@ -85,6 +85,23 @@ pub trait DtoService: Send + Sync {
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError>;
 
+    /// Whether the item itself supports downloading (`BaseItem.CanDownload()`),
+    /// before the user's permission is applied. Must agree with a userless DTO.
+    /// Implementations may answer directly without building the entire DTO.
+    async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let options = DtoOptions {
+            fields: vec![ferrofin_model::querying::ItemFields::CanDownload],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        Ok(self
+            .get_base_item_dto(item, &options, None, None)
+            .await?
+            .can_download
+            .unwrap_or(false))
+    }
+
     /// Whether `user` may delete `item` — C# `BaseItem.CanDelete(User)`, the
     /// check `LibraryController.DeleteItem`/`DeleteItems` make before deleting.
     ///

@@ -213,15 +213,26 @@ async fn get_download(
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
+    let item = state
+        .library
+        .get_item_by_id(item_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // The controller's CanDownload(user) check follows the policy check.
     // Administrators pass the policy, but an explicitly disabled download
     // permission still fails this per-item check. API keys have no user policy.
-    if policy.is_some_and(|p| !p.enable_content_downloading) {
+    if policy.is_some_and(|p| !p.enable_content_downloading)
+        || !state.dto.can_download(&item).await?
+    {
         return Err(ApiError::BadRequest(
             "user cannot download this item".to_owned(),
         ));
     }
+    // Download the requested item's own file. Playback-source resolution can
+    // promote an alternate version to its primary and would serve the wrong file.
+    let path = item
+        .path
+        .ok_or_else(|| ApiError::BadRequest("item has no download path".to_owned()))?;
     let filename = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())

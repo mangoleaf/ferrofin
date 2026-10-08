@@ -447,6 +447,36 @@ fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
 }
 
+/// BaseItem.CanDownload and the Video/Audio/AudioBook/Book/Photo overrides.
+/// The same predicate backs both the DTO and the download endpoint.
+fn can_download_file(item: &BaseItemEntity, kind: BaseItemKind) -> bool {
+    // Photo deliberately returns true upstream, even without a local path.
+    if kind == BaseItemKind::Photo {
+        return true;
+    }
+    if !item
+        .path
+        .as_deref()
+        .is_some_and(|p| !p.is_empty() && crate::media_info_resolver::is_file_protocol(p))
+    {
+        return false;
+    }
+    if kinds::is_video(kind) {
+        let data = crate::item_data::parse_data(item.data.as_deref());
+        let video_type = data.get("VideoType");
+        return !video_type.is_some_and(|value| {
+            matches!(value.as_i64(), Some(2 | 3))
+                || value.as_str().is_some_and(|v| {
+                    v.eq_ignore_ascii_case("Dvd") || v.eq_ignore_ascii_case("BluRay")
+                })
+        });
+    }
+    matches!(
+        kind,
+        BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::Book
+    )
+}
+
 /// Whether this kind is a Live TV channel (C# `item is LiveTvChannel`). Both
 /// spellings appear because `kind_from_type_name` maps the stored type name to
 /// `LiveTvChannel` while callers may hand a `TvChannel` row directly.
@@ -2374,10 +2404,6 @@ impl FerrofinDtoService {
         .await?;
 
         let perms = prefetched.content_permissions.as_ref();
-        // Live TV channels/programmes hard-override CanDownload to false
-        // upstream (`LiveTvProgram` keeps the `BaseItem` default — no file to
-        // download); CanDelete's own overrides live in `item_deletion`.
-        let live_tv = is_live_tv_channel(kind) || is_live_tv_program(kind);
         if options.contains_field(ItemFields::CanDelete) {
             // C# `user is null ? item.CanDelete() : item.CanDelete(user)` — the
             // one implementation the delete endpoints answer `401` by, so the
@@ -2389,11 +2415,10 @@ impl FerrofinDtoService {
             ));
         }
         if options.contains_field(ItemFields::CanDownload) {
-            // C# `CanDownload()` is false by default and only true for playable media;
-            // a by-name item is not a folder but still isn't downloadable.
-            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv;
-            dto.can_download =
-                Some(file_downloadable && perms.is_none_or(|p| p.enable_content_downloading));
+            dto.can_download = Some(
+                can_download_file(item, kind)
+                    && (user.is_none() || perms.is_some_and(|p| p.enable_content_downloading)),
+            );
         }
 
         Ok(dto)
@@ -3512,6 +3537,10 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
             }
         }
         Ok(dto)
+    }
+
+    async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        Ok(can_download_file(item, row_kind(item)))
     }
 
     async fn can_delete(
@@ -7500,6 +7529,94 @@ mod tests {
             Some(true),
             "the ids-only query still answers when nothing was prefetched"
         );
+    }
+
+    #[tokio::test]
+    async fn download_eligibility_agrees_between_endpoint_single_and_page_dtos() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Download").await;
+        let original = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::CanDownload],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        for (kind, path, data, expected) in [
+            (BaseItemKind::Movie, Some("/media/a.mkv"), None, true),
+            (
+                BaseItemKind::Movie,
+                Some("https://cdn.example/a.mkv"),
+                None,
+                false,
+            ),
+            (
+                BaseItemKind::Video,
+                Some("/media/disc"),
+                Some(r#"{"VideoType":"Dvd"}"#),
+                false,
+            ),
+            (
+                BaseItemKind::Movie,
+                Some("/media/disc"),
+                Some(r#"{"VideoType":3}"#),
+                false,
+            ),
+            (
+                BaseItemKind::Video,
+                Some("/media/a.iso"),
+                Some(r#"{"VideoType":"Iso"}"#),
+                true,
+            ),
+            (BaseItemKind::Audio, Some("/media/a.flac"), None, true),
+            (
+                BaseItemKind::Audio,
+                Some("https://cdn.example/a.flac"),
+                None,
+                false,
+            ),
+            (BaseItemKind::AudioBook, Some("/media/a.m4b"), None, true),
+            (BaseItemKind::Book, Some("/media/a.epub"), None, true),
+            (BaseItemKind::Book, None, None, false),
+            (
+                BaseItemKind::Photo,
+                Some("https://cdn.example/a.jpg"),
+                None,
+                true,
+            ),
+            (BaseItemKind::Folder, Some("/media"), None, false),
+            (BaseItemKind::Playlist, Some("/media/a.m3u"), None, false),
+            (
+                BaseItemKind::LiveTvChannel,
+                Some("/media/a.ts"),
+                None,
+                false,
+            ),
+        ] {
+            let mut item = original.clone();
+            item.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            item.path = path.map(str::to_owned);
+            item.data = data.map(str::to_owned);
+            assert_eq!(
+                svc.can_download(&item).await.unwrap(),
+                expected,
+                "{kind:?} {path:?}"
+            );
+            let single = svc
+                .get_base_item_dto(&item, &options, None, None)
+                .await
+                .unwrap();
+            let page = svc
+                .get_base_item_dtos(&[item], &options, None, None, true)
+                .await
+                .unwrap();
+            assert_eq!(single.can_download, Some(expected));
+            assert_eq!(page[0].can_download, Some(expected));
+        }
     }
 
     #[tokio::test]

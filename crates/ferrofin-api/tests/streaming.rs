@@ -278,12 +278,16 @@ impl MediaSourceManager for StreamSources {
 }
 
 /// A [`LibraryManager`] that resolves [`ITEM_ID`].
-struct StreamLibrary;
+struct StreamLibrary(String);
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Movie", "Movie")))
+        Ok((id == ITEM_ID).then(|| {
+            let mut item = minimal_base_item(ITEM_ID, "A Movie", "Movie");
+            item.path = Some(self.0.clone());
+            item
+        }))
     }
     async fn query_items(
         &self,
@@ -403,6 +407,55 @@ struct Harness {
     closed: Arc<Mutex<Vec<String>>>,
 }
 
+/// A DTO fake exposing an explicit file-eligibility answer, independently of
+/// the authenticated user's flag. The default can_download seam projects it.
+struct DownloadDto(bool);
+
+#[async_trait]
+impl ferrofin_traits::dto::DtoService for DownloadDto {
+    async fn get_primary_image_aspect_ratio(&self, _id: Uuid) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner: Option<Uuid>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        Ok(ferrofin_model::dto::BaseItemDto {
+            can_download: Some(self.0),
+            ..Default::default()
+        })
+    }
+    async fn get_base_item_dtos(
+        &self,
+        _items: &[BaseItemEntity],
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner: Option<Uuid>,
+        _skip: bool,
+    ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+    async fn can_delete(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(false)
+    }
+}
+
 /// Builds a [`Harness`] serving `path` for streams.
 fn state(path: &str) -> Harness {
     state_with_policy(
@@ -415,6 +468,15 @@ fn state(path: &str) -> Harness {
 }
 
 fn state_with_policy(path: &str, policy: ferrofin_model::users::UserPolicy) -> Harness {
+    state_with_download(path, path, true, policy)
+}
+
+fn state_with_download(
+    path: &str,
+    item_path: &str,
+    downloadable: bool,
+    policy: ferrofin_model::users::UserPolicy,
+) -> Harness {
     let opened = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(Mutex::new(Vec::new()));
     let sources = StreamSources {
@@ -423,7 +485,7 @@ fn state_with_policy(path: &str, policy: ferrofin_model::users::UserPolicy) -> H
         closed: closed.clone(),
     };
     let app = AppState::new(
-        Arc::new(StreamLibrary),
+        Arc::new(StreamLibrary(item_path.to_owned())),
         Arc::new(OkUsers(policy)),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -436,7 +498,7 @@ fn state_with_policy(path: &str, policy: ferrofin_model::users::UserPolicy) -> H
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(ferrofin_api::test_support::FakeDto),
+        Arc::new(DownloadDto(downloadable)),
         Arc::new(OkAuth),
         Arc::new(OkAuth),
         Arc::new(FakeQuickConnect),
@@ -530,6 +592,34 @@ async fn download_sets_content_disposition() {
         format!("attachment; filename={name}; filename*=UTF-8''{name}"),
         "got: {cd}"
     );
+}
+
+#[tokio::test]
+async fn download_requires_item_eligibility_and_serves_the_requested_version() {
+    let (_dir, primary) = temp_media();
+    let policy = ferrofin_model::users::UserPolicy {
+        enable_content_downloading: true,
+        ..Default::default()
+    };
+    let denied = state_with_download(&primary, &primary, false, policy.clone()).app;
+    let response = create_router(denied)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let alternate = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(alternate.path(), b"requested alternate version").unwrap();
+    let app = state_with_download(&primary, alternate.path().to_str().unwrap(), true, policy).app;
+    let response = create_router(app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"requested alternate version");
 }
 
 #[tokio::test]
