@@ -219,6 +219,12 @@ impl AuthorizationContext for OkAuth {
 fn ok_auth_info() -> AuthorizationInfo {
     AuthorizationInfo {
         token: Some(ferrofin_model::secret::Secret::new("token")),
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            enable_video_playback_transcoding: false,
+            enable_audio_playback_transcoding: false,
+            enable_playback_remuxing: false,
+            ..ferrofin_model::users::UserPolicy::default()
+        })),
         is_authenticated: true,
         ..ferrofin_api::test_support::authenticated_user_info()
     }
@@ -627,6 +633,45 @@ async fn body_string(resp: axum::response::Response) -> String {
         .await
         .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn every_planning_route_carries_trusted_playback_permissions() {
+    use ferrofin_traits::library::PlaybackPermissions;
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let rec = Arc::new(Recorded::default());
+    let router = router_no_static(ok_hls(temp.path().to_str().unwrap(), rec.clone()));
+    for route in [
+        "Videos/ITEM/master.m3u8",
+        "Videos/ITEM/main.m3u8",
+        "Videos/ITEM/live.m3u8",
+        "Audio/ITEM/master.m3u8",
+        "Audio/ITEM/main.m3u8",
+        "Videos/ITEM/hls1/main/0.ts",
+        "Audio/ITEM/hls1/main/0.ts",
+        "Videos/ITEM/stream.ts",
+        "Audio/ITEM/stream.aac",
+        "Audio/ITEM/universal",
+    ] {
+        let uri = format!(
+            "/{}?EnableVideoPlaybackTranscoding=true&EnableAudioPlaybackTranscoding=true&EnablePlaybackRemuxing=true",
+            route.replace("ITEM", &ITEM_ID.to_string())
+        );
+        let response = router.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let request = rec.last.lock().unwrap().clone().unwrap();
+        // Query parameters cannot replace the saved policy. The restricted
+        // test user's policy is still carried on every route, including segments.
+        assert_eq!(
+            request.playback_permissions,
+            Some(PlaybackPermissions {
+                video_transcoding: false,
+                audio_transcoding: false,
+                remuxing: false,
+            }),
+            "{uri}"
+        );
+    }
 }
 
 #[tokio::test]

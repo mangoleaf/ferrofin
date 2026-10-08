@@ -58,6 +58,7 @@ async fn get_video_stream(
 /// requested container hint and is ignored for the direct-stream slice.
 async fn get_video_stream_by_container(
     State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _container)): Path<(Uuid, String)>,
     Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
@@ -69,7 +70,7 @@ async fn get_video_stream_by_container(
         Ok(path) => serve_static_file(&path, request).await,
         Err(ApiError::NotFound(_)) => {
             let raw = request.uri().query().map(ToOwned::to_owned);
-            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw);
+            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw, &auth);
             crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request)
                 .await
         }

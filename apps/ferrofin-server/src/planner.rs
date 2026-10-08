@@ -798,18 +798,26 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             (value > 0).then_some(value)
         };
 
+        // EncodingHelper.TryStreamCopy: a user's transcoding veto wins even
+        // over incompatible codecs, bitrate caps, subtitles and client copy
+        // vetoes. There is no administrator bypass or remux-permission HTTP gate.
         let copy_video = video_stream
             .as_ref()
-            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v));
-        // `TryStreamCopy` runs only under `if (state.VideoRequest is not null)`:
-        // an audio-only HLS request never stream-copies its audio (the variant
-        // URL keeps `audioCodec=aac`, and ffmpeg re-encodes).
+            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v))
+            || (!is_audio
+                && request
+                    .playback_permissions
+                    .is_some_and(|p| !p.video_transcoding));
+        // Upstream only invokes TryStreamCopy for a VideoRequest. Audio-only
+        // requests retain their requested codec; negotiation enforces that flag.
         let copy_audio = !is_audio
-            && audio_stream.as_ref().is_some_and(|a| {
+            && (audio_stream.as_ref().is_some_and(|a| {
                 self.encoding_helper
                     .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
                     .0
-            });
+            }) || request
+                .playback_permissions
+                .is_some_and(|p| !p.audio_transcoding));
 
         // Resolve the effective output codecs from the copy decision.
         let output_video_codec = video_stream.as_ref().map(|_| {
@@ -1833,6 +1841,9 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.live_stream_id.hash(&mut hasher);
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
+    // Saved policy can change the effective codecs on an otherwise identical
+    // URL. Do not serve a previous encoder job after a permission change.
+    request.playback_permissions.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
     // subtitled and non-subtitled transcode of the same item would collide. The
     // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
@@ -2188,6 +2199,79 @@ mod tests {
             query_string: "?x=1".to_owned(),
             ..HlsStreamRequest::default()
         }
+    }
+
+    #[tokio::test]
+    async fn saved_transcoding_permissions_override_client_copy_vetoes() {
+        use ferrofin_traits::library::PlaybackPermissions;
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut paths = std::collections::HashSet::new();
+        for bits in 0..8 {
+            let mut req = request("abc");
+            let permissions = PlaybackPermissions {
+                video_transcoding: bits & 1 != 0,
+                audio_transcoding: bits & 2 != 0,
+                remuxing: bits & 4 != 0,
+            };
+            req.playback_permissions = Some(permissions);
+            req.allow_video_stream_copy = false;
+            req.allow_audio_stream_copy = false;
+            req.video_codec = Some("h264".to_owned());
+            req.audio_codec = Some("aac".to_owned());
+            req.max_width = Some(160);
+            req.video_bitrate = Some(100_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.state.output_video_codec.as_deref(),
+                Some(if permissions.video_transcoding {
+                    "h264"
+                } else {
+                    "copy"
+                })
+            );
+            assert_eq!(
+                plan.state.output_audio_codec.as_deref(),
+                Some(if permissions.audio_transcoding {
+                    "aac"
+                } else {
+                    "copy"
+                })
+            );
+            let args = plan.arguments.join(" ");
+            assert_eq!(
+                args.contains("-c:v copy"),
+                !permissions.video_transcoding,
+                "{args}"
+            );
+            assert_eq!(
+                args.contains("-c:a copy"),
+                !permissions.audio_transcoding,
+                "{args}"
+            );
+            assert!(
+                paths.insert(output_id(&req, "ts", false)),
+                "policy changes must not reuse old encoded segments"
+            );
+        }
+        // Userless API keys still follow the client's copy vetoes.
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_video_codec.as_deref(), Some("copy"));
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+        // TryStreamCopy is only called for a VideoRequest upstream. Preserve
+        // that exception for direct audio-only requests with a known URL.
+        req.playback_permissions = Some(PlaybackPermissions {
+            video_transcoding: false,
+            audio_transcoding: false,
+            remuxing: false,
+        });
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
     }
 
     #[tokio::test]

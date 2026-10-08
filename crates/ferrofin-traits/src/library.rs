@@ -1078,7 +1078,7 @@ fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
 /// `EnableVideoPlaybackTranscoding`, and its `SupportsDirectStream` becomes
 /// `EnablePlaybackRemuxing`. Everything else (photos, books, unknown media)
 /// is left as the source built it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlaybackPermissions {
     /// `PermissionKind.EnableVideoPlaybackTranscoding`.
     pub video_transcoding: bool,
@@ -1086,6 +1086,16 @@ pub struct PlaybackPermissions {
     pub audio_transcoding: bool,
     /// `PermissionKind.EnablePlaybackRemuxing`.
     pub remuxing: bool,
+}
+
+impl From<&UserPolicy> for PlaybackPermissions {
+    fn from(policy: &UserPolicy) -> Self {
+        Self {
+            video_transcoding: policy.enable_video_playback_transcoding,
+            audio_transcoding: policy.enable_audio_playback_transcoding,
+            remuxing: policy.enable_playback_remuxing,
+        }
+    }
 }
 
 /// The user permissions `BaseItem.CanDelete(user)`, `CanDownload(user)` and

@@ -543,6 +543,11 @@ pub struct HlsStreamRequest {
     /// The access token of the requesting session, embedded as `ApiKey` in the
     /// master playlist's subtitle/trickplay URIs (`ClaimsPrincipal.GetToken()`).
     pub api_key: Option<String>,
+    /// Saved permissions of the authenticated user, never populated from query
+    /// parameters. `None` represents a userless API key. Video requests force
+    /// copying a stream when its transcoding permission is disabled, matching
+    /// `EncodingHelper.TryStreamCopy`; remuxing controls playback negotiation.
+    pub playback_permissions: Option<crate::library::PlaybackPermissions>,
     /// Whether the request came from the local network
     /// (`INetworkManager.IsInLocalNetwork(remoteIp)`): disables the adaptive
     /// bitrate variants, which "within the local network will likely do more
@@ -592,6 +597,7 @@ impl Default for HlsStreamRequest {
             enable_adaptive_bitrate_streaming: false,
             enable_trickplay: true,
             api_key: None,
+            playback_permissions: None,
             is_in_local_network: false,
             query_string: String::new(),
         }
