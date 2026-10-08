@@ -1246,7 +1246,7 @@ impl ScheduledTask for LyricDownloadTask {
                         continue;
                     }
                 }
-                match self.lyrics.search_lyrics(item_id).await {
+                match self.lyrics.search_lyrics_automatically(item_id).await {
                     Ok(results) => {
                         if let Some(first) = results.first()
                             && let Err(e) = self.lyrics.download_lyrics(item_id, &first.id).await
@@ -1787,6 +1787,7 @@ mod tests {
     struct FakeLyrics {
         existing: Vec<Uuid>,
         downloads: Mutex<Vec<(Uuid, String)>>,
+        automated_searches: Mutex<Vec<Uuid>>,
     }
 
     #[async_trait]
@@ -1803,6 +1804,13 @@ mod tests {
                 provider_name: "LrcLib".to_owned(),
                 lyrics: LyricDto::default(),
             }])
+        }
+        async fn search_lyrics_automatically(
+            &self,
+            item_id: Uuid,
+        ) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+            self.automated_searches.lock().unwrap().push(item_id);
+            self.search_lyrics(item_id).await
         }
         async fn download_lyrics(
             &self,
@@ -2167,6 +2175,7 @@ mod tests {
         let lyrics = Arc::new(FakeLyrics {
             existing: vec![has],
             downloads: Mutex::new(Vec::new()),
+            automated_searches: Mutex::new(Vec::new()),
         });
         let task = LyricDownloadTask::new(library, lyrics.clone());
         assert_eq!(task.key(), "DownloadLyrics");
@@ -2174,6 +2183,10 @@ mod tests {
 
         let downloads = lyrics.downloads.lock().expect("lock");
         assert_eq!(downloads.as_slice(), &[(missing, "lrclib_42".to_owned())]);
+        assert_eq!(
+            lyrics.automated_searches.lock().unwrap().as_slice(),
+            &[missing]
+        );
     }
 
     // -- Generate Trickplay Images -------------------------------------------

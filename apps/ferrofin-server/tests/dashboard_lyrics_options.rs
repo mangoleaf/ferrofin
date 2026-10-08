@@ -1,9 +1,12 @@
 //! Saved lyric destinations follow live library and metadata-root settings.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ferrofin_server::config::Config;
+use axum::{Json, Router, extract::State, http::Uri};
+
+use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
 const CLIENT: &str =
@@ -72,6 +75,14 @@ impl Api {
     }
 }
 
+async fn lyric_provider(State(requests): State<Arc<Mutex<Vec<String>>>>, uri: Uri) -> Json<Value> {
+    requests.lock().unwrap().push(uri.to_string());
+    Json(
+        json!({"id":42,"trackName":"Song","artistName":"Artist","albumName":"Album", "duration":60,
+        "syncedLyrics":"[00:01.00]scheduled download"}),
+    )
+}
+
 fn probe_stub(root: &Path, tool: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = root.join(tool);
@@ -112,6 +123,15 @@ async fn saved_lyrics_destinations_change_without_restarting() {
     let media = tmp.path().join("music/Artist/Album");
     std::fs::create_dir_all(&media).unwrap();
     std::fs::write(media.join("Song.flac"), b"fixture").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .fallback(lyric_provider)
+        .with_state(requests.clone());
+    let mock = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -121,6 +141,10 @@ async fn saved_lyrics_destinations_change_without_restarting() {
         port,
         ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
         ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        provider_endpoints: ProviderEndpoints {
+            lrclib: Some(endpoint),
+            ..Default::default()
+        },
         ..Config::test_stub(tmp.path())
     };
     let server = std::thread::spawn(move || {
@@ -249,8 +273,103 @@ async fn saved_lyrics_destinations_change_without_restarting() {
         std::fs::read_to_string(internal_b).unwrap(),
         "[00:01.00]fallback"
     );
+    std::fs::remove_dir(&adjacent).unwrap();
+    api.delete_lyrics(&item).await;
+    // Disabled automatic providers remain available through manual search,
+    // matching LyricsController's Audio overload in the pinned source.
+    options["DisabledLyricFetchers"] = json!(["lRcLiB LyRiCs"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let manual = api.get(&format!("/Audio/{item}/RemoteSearch/Lyrics")).await;
+    assert!(!manual.as_array().unwrap().is_empty(), "{manual}");
+    let before = requests.lock().unwrap().len();
+    run_lyric_task(&api).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        before,
+        "disabled automatic provider ran"
+    );
+    assert!(!adjacent.exists());
+    options["DisabledLyricFetchers"] = json!([]);
+    options["LyricFetcherOrder"] = json!(["LrcLib Lyrics"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    run_lyric_task(&api).await;
+    assert!(
+        adjacent.is_file(),
+        "the live task selection did not download lyrics"
+    );
+    assert_eq!(
+        api.get(&format!("/Audio/{item}/Lyrics")).await["Lyrics"][0]["Text"],
+        "scheduled download"
+    );
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/api/get/42")
+    );
+    api.delete_lyrics(&item).await;
+    options["DisabledLyricFetchers"] = json!(["LRCLIB LYRICS"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let before = requests.lock().unwrap().len();
+    run_lyric_task(&api).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        before,
+        "selection was cached after disabling again"
+    );
+    assert!(!adjacent.exists());
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
         .unwrap();
+    mock.abort();
+}
+
+async fn run_lyric_task(api: &Api) {
+    let tasks = api.get("/ScheduledTasks").await;
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["Key"] == "DownloadLyrics")
+        .unwrap();
+    let id = task["Id"].as_str().unwrap();
+    let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
+    let started = Instant::now();
+    api.post(&format!("/ScheduledTasks/Running/{id}"), &Value::Null)
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let task = api.get(&format!("/ScheduledTasks/{id}")).await;
+        let result = &task["LastExecutionResult"];
+        if task["State"] == "Idle"
+            && !result["EndTimeUtc"].is_null()
+            && result["EndTimeUtc"] != previous
+        {
+            assert_eq!(result["Status"], "Completed", "{task}");
+            println!(
+                "lyric task completed in {:.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lyric task did not complete: {task}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }

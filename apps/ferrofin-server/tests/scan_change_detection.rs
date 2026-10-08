@@ -1216,6 +1216,7 @@ impl Harness {
                 tvdb: Some(format!("{}/tvdb", providers.base)),
                 fanart: Some(format!("{}/fanart", providers.base)),
                 audiodb: Some(format!("{}/audiodb", providers.base)),
+                lrclib: Some(format!("{}/lrclib", providers.base)),
             },
             // A passwordless administrator: no PBKDF2 round in a debug build.
             admin_password: String::new(),

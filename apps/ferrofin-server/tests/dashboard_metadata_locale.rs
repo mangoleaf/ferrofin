@@ -290,6 +290,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             fanart: Some(endpoint.clone()),
             audiodb: Some(endpoint.clone()),
             opensubtitles: Some(endpoint.clone()),
+            lrclib: Some(endpoint.clone()),
         },
         studios_repo_url: endpoint.clone(),
         musicbrainz_base_url: endpoint,

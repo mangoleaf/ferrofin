@@ -884,8 +884,12 @@ pub async fn build_app_state(
     // library's `SaveLyricsWithMedia` flag that decides whether the media
     // folder is a save target at all — so an upload works over a read-only
     // media mount.
+    let mut lrclib = ferrofin_providers::LrcLibProvider::new();
+    if let Some(endpoint) = &config.provider_endpoints.lrclib {
+        lrclib = lrclib.with_base_url(endpoint);
+    }
     let lyric_providers: Vec<Arc<dyn ferrofin_traits::stubs::LyricProvider>> =
-        vec![Arc::new(ferrofin_providers::LrcLibProvider::new())];
+        vec![Arc::new(lrclib)];
     let lyrics: Arc<dyn ferrofin_traits::stubs::LyricManager> = Arc::new(
         FerrofinLyricManager::new()
             .with_items(Arc::clone(&item_repository))
