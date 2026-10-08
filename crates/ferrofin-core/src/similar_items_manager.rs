@@ -1646,6 +1646,107 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn physical_library_selection_and_order_change_without_restart() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo, TypeOptions};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let folders = Arc::new(
+            crate::FerrofinVirtualFolderManager::new(tmp.path().join("config"))
+                .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone()))),
+        );
+        let mut options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: media.to_string_lossy().into_owned(),
+            }],
+            type_options: vec![TypeOptions {
+                type_: Some("Movie".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder("Movies", Some(CollectionTypeOptions::movies), &options)
+            .await
+            .unwrap();
+        // An adopted physical location has an ID distinct from the collection folder.
+        let seed = BaseItemEntity {
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().into(),
+            top_parent_id: Some(Uuid::new_v4().to_string()),
+            path: Some(media.join("Alien/Alien.mkv").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let providers: Vec<Arc<dyn RemoteSimilarItemsProvider>> = ["Alpha", "Beta"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(FakeRemote {
+                    name,
+                    kind: BaseItemKind::Movie,
+                    references: Vec::new(),
+                    cache: None,
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }) as Arc<dyn RemoteSimilarItemsProvider>
+            })
+            .collect();
+        let manager = manager(&db).with_remote_providers(providers, folders.clone());
+        assert!(
+            manager
+                .similarity_plan(&seed, BaseItemKind::Movie)
+                .await
+                .remote
+                .is_empty()
+        );
+        options.type_options[0].similar_item_providers = vec!["aLpHa".into(), "bEtA".into()];
+        options.type_options[0].similar_item_provider_order = vec![
+            "BETA".into(),
+            LOCAL_SIMILARITY_PROVIDER.into(),
+            "ALPHA".into(),
+        ];
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        let plan = manager.similarity_plan(&seed, BaseItemKind::Movie).await;
+        assert_eq!(
+            plan.remote
+                .iter()
+                .map(|provider| provider.name())
+                .collect::<Vec<_>>(),
+            ["Beta", "Alpha"]
+        );
+        assert_eq!(plan.local_order, 1);
+        options.type_options[0].similar_item_provider_order.clear();
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        let plan = manager.similarity_plan(&seed, BaseItemKind::Movie).await;
+        assert_eq!(
+            plan.remote
+                .iter()
+                .map(|provider| provider.name())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Beta"]
+        );
+        assert_eq!(plan.local_order, usize::MAX);
+        options.type_options[0].similar_item_providers.clear();
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .similarity_plan(&seed, BaseItemKind::Movie)
+                .await
+                .remote
+                .is_empty()
+        );
+    }
+
     // The C# score formula, verbatim: a provider-supplied score wins, else the
     // position decays it, and an earlier provider gets a small boost.
     #[test]

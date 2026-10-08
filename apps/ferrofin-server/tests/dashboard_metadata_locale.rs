@@ -46,6 +46,9 @@ async fn provider(
         }
         return ([("content-type", "image/png")], bytes).into_response();
     }
+    if uri.path() == "/movie/603/similar" {
+        return Json(json!({"results":[{"id":604}],"total_pages":1})).into_response();
+    }
     if uri.path() == "/movie/603/images" {
         return Json(json!({
             "posters":[{"file_path":"/small.png","width":500},{"file_path":"/large.png","width":1600}],
@@ -338,12 +341,12 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     api.post("/System/Configuration", &config).await;
     api.post(&refresh, &Value::Null).await;
     api.await_movie("Locale es-AR", "AR-13").await;
-    let requests = requests.lock().unwrap().clone();
+    let observed = requests.lock().unwrap().clone();
     for language in ["fr", "de", "es-AR"] {
         assert!(
-            requests.iter().any(|uri| uri.starts_with("/movie/603?")
+            observed.iter().any(|uri| uri.starts_with("/movie/603?")
                 && uri.contains(&format!("language={language}"))),
-            "{requests:?}"
+            "{observed:?}"
         );
     }
     // L12: Identify uses the same saved enable lists and exact-name order as
@@ -386,6 +389,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_movie_image_options(&api, library, &mut options, id).await;
     verify_nfo_savers(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
+    verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -976,4 +980,85 @@ async fn verify_artwork_destinations(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+}
+
+async fn verify_similarity_selection(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+    requests: &Mutex<Vec<String>>,
+) {
+    options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
+    options["TypeOptions"][0]["ImageFetchers"] = json!([]);
+    options["TypeOptions"][0]["SimilarItemProviders"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let related = media.parent().unwrap().join("Remote similar");
+    std::fs::create_dir_all(&related).unwrap();
+    std::fs::write(related.join("Related.mkv"), b"fixture").unwrap();
+    std::fs::write(
+        related.join("movie.nfo"),
+        "<movie><title>Remote similar</title><tmdbid>604</tmdbid></movie>",
+    )
+    .unwrap();
+    api.post("/Library/Refresh", &Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let candidate = loop {
+        let items = api
+            .get("/Items?recursive=true&includeItemTypes=Movie&fields=ProviderIds")
+            .await;
+        if let Some(item) = items["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["ProviderIds"]["Tmdb"] == "604")
+        {
+            break item["Id"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "related movie was not discovered: {items}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let path = format!("/Items/{id}/Similar?limit=1");
+    let similar_calls = || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|uri| uri.starts_with("/movie/603/similar"))
+            .count()
+    };
+    let before = similar_calls();
+    api.get(&path).await;
+    assert_eq!(similar_calls(), before, "unchecked remote provider ran");
+    options["TypeOptions"][0]["SimilarItemProviders"] = json!(["themoviedb"]);
+    options["TypeOptions"][0]["SimilarItemProviderOrder"] =
+        json!(["THEMOVIEDB", "Local Genre/Tag"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let result = api.get(&path).await;
+    assert_eq!(result["Items"][0]["Id"], candidate, "{result}");
+    assert_eq!(similar_calls(), before + 1);
+    options["TypeOptions"][0]["SimilarItemProviders"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    api.get(&path).await;
+    assert_eq!(
+        similar_calls(),
+        before + 1,
+        "disabled provider/cache still ran"
+    );
 }
