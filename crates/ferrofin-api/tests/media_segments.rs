@@ -524,3 +524,28 @@ async fn plugin_segment_editor_route_is_implemented() {
     );
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown item should be 404");
 }
+
+/// `DELETE /MediaSegments/Provider/{providerId}` erases server-wide, so it is
+/// elevated like upstream's bulk erases: a plain user is refused, an API key
+/// reaches the store.
+#[tokio::test]
+async fn provider_erase_requires_elevation() {
+    let plain = state(
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeSubtitles),
+    );
+    let (status, _) = call(plain, "DELETE", "/MediaSegments/Provider/IntroSkipper").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let elevated = state_as(
+        Arc::new(FakeMediaSegments),
+        Arc::new(FakeTrickplay),
+        Arc::new(FakeLyrics),
+        Arc::new(FakeSubtitles),
+        Arc::new(ferrofin_api::test_support::FakeAuthContext),
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    );
+    let (status, _) = call(elevated, "DELETE", "/MediaSegments/Provider/IntroSkipper").await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+}

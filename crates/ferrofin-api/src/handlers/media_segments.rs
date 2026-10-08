@@ -16,7 +16,7 @@ use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
@@ -101,9 +101,14 @@ struct ProviderEraseQuery {
 /// `DELETE /MediaSegments/Provider/{providerId}` — erases every segment a provider
 /// wrote, optionally limited to one type. Backs a provider's bulk "erase
 /// timestamps" tool (e.g. Intro Skipper). Not a Jellyfin contract route; additive.
+///
+/// Elevated: a server-wide erase, as every bulk segment erase upstream is
+/// (`SkipIntroController.ResetIntroTimestamps`, `EraseSeasonAsync` are
+/// `RequiresElevation`). It took a bare `RequireAuth`, so any account could
+/// wipe every provider's segments.
 async fn erase_provider_segments(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(provider_id): Path<String>,
     Query(query): Query<ProviderEraseQuery>,
 ) -> Result<StatusCode, ApiError> {
