@@ -445,6 +445,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         &requests,
     )
     .await;
+    verify_subtitle_destinations(&api, library, &mut options, id, &media, tmp.path()).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -1396,4 +1397,149 @@ async fn verify_automatic_subtitle_constraints(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+}
+
+/// The configured destination and collision names reach the real upload route.
+#[allow(clippy::too_many_lines)]
+async fn verify_subtitle_destinations(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+    root: &std::path::Path,
+) {
+    const CONTENT: &[u8] = b"1\n00:00:00,000 --> 00:00:01,000\nSubtitle fixture\n";
+    // L20 removes its fixture sidecars; reconcile their persisted streams
+    // before this independent destination scenario starts.
+    await_subtitle_refresh(api, library, id).await;
+    let initial = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+    assert!(
+        initial["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stream| stream["Type"] != "Subtitle")
+    );
+    let mut upload = json!({
+        "Language":"ENG", "Format":"SRT", "IsForced":false,
+        "IsHearingImpaired":false,
+        "Data":"MQowMDowMDowMCwwMDAgLS0+IDAwOjAwOjAxLDAwMApTdWJ0aXRsZSBmaXh0dXJlCg=="
+    });
+    let dashless = uuid::Uuid::parse_str(id).unwrap().simple().to_string();
+    let internal = root
+        .join("data/metadata/library")
+        .join(&dashless[..2])
+        .join(&dashless);
+    let endpoint = format!("/Videos/{id}/Subtitles");
+    let mut expected_paths = Vec::new();
+    for (with_media, filename) in [
+        (false, "Locale.eng.srt"),
+        (false, "Locale.eng.0.srt"),
+        (true, "Locale.eng.srt"),
+        (true, "Locale.eng.0.srt"),
+        (false, "Locale.eng.1.srt"),
+    ] {
+        options["SaveSubtitlesWithMedia"] = json!(with_media);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        api.post(&endpoint, &upload).await;
+        let destination = if with_media { media } else { &internal };
+        let path = destination.join(filename);
+        assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
+        expected_paths.push(path);
+        if !with_media {
+            assert!(
+                !media.join("Locale.eng.1.srt").exists(),
+                "disabled media writes must not consume the media folder's next filename"
+            );
+        }
+        for path in &expected_paths {
+            assert_eq!(std::fs::read(path).unwrap(), CONTENT, "{}", path.display());
+        }
+    }
+
+    options["SaveSubtitlesWithMedia"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    upload["Language"] = json!("pt-BR");
+    upload["IsForced"] = json!(true);
+    upload["IsHearingImpaired"] = json!(true);
+    api.post(&endpoint, &upload).await;
+    let path = media.join("Locale.pt-br.forced.sdh.srt");
+    assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
+    expected_paths.push(path);
+    let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+    let subtitles: Vec<_> = item["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|stream| stream["Type"] == "Subtitle")
+        .collect();
+    assert_eq!(subtitles.len(), expected_paths.len(), "{item}");
+    for path in &expected_paths {
+        assert!(
+            subtitles
+                .iter()
+                .any(|stream| stream["Path"] == path.to_str().unwrap()),
+            "missing {}: {item}",
+            path.display()
+        );
+    }
+    assert!(subtitles.iter().any(|stream| stream["Language"] == "pt-br"
+        && stream["IsForced"] == true
+        && stream["IsHearingImpaired"] == true));
+
+    // A directory at the exact filename is a deterministic write failure.
+    // Selecting media storage must return it rather than retrying metadata.
+    let blocked = media.join("Locale.fra.srt");
+    std::fs::create_dir(&blocked).unwrap();
+    upload["Language"] = json!("fra");
+    upload["IsForced"] = json!(false);
+    upload["IsHearingImpaired"] = json!(false);
+    let response = api
+        .client
+        .post(format!("{}{endpoint}", api.base))
+        .header("Authorization", &api.auth)
+        .json(&upload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!internal.join("Locale.fra.srt").exists());
+    std::fs::remove_dir(blocked).unwrap();
+
+    for (language, format) in [("x/../../outside/pwned", "srt"), ("eng", "strm")] {
+        upload["Language"] = json!(language);
+        upload["Format"] = json!(format);
+        let response = api
+            .client
+            .post(format!("{}{endpoint}", api.base))
+            .header("Authorization", &api.auth)
+            .json(&upload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+    assert_eq!(
+        item["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|stream| stream["Type"] == "Subtitle")
+            .count(),
+        expected_paths.len(),
+        "failed uploads must not append a stream: {item}"
+    );
 }

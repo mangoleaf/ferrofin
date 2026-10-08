@@ -1517,14 +1517,16 @@ pub async fn build_app_state(
     }
     let subtitle_providers: Vec<Arc<dyn ferrofin_traits::subtitles::SubtitleProvider>> =
         vec![Arc::new(opensubtitles)];
-    let subtitles: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
-        Arc::new(FerrofinSubtitleManager::new(
+    let subtitles: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> = Arc::new(
+        FerrofinSubtitleManager::new(
             db.clone(),
             Arc::clone(&library),
             Arc::clone(&media_stream_repository),
             subtitle_providers,
             metadata_root.clone(),
-        ));
+        )
+        .with_virtual_folders(Arc::clone(&virtual_folders)),
+    );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
             &subtitles,
