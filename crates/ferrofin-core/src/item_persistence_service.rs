@@ -2606,102 +2606,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
-        if moves.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        // Every reference moves inside the one transaction; the foreign
-        // keys are checked once, at its end, against the moved rows.
-        sqlx::query("PRAGMA defer_foreign_keys = ON")
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        // Read off the schema, so a table added later moves too.
-        let mut references: Vec<RekeyReference> = sqlx::query_as(
-            r#"SELECT m."name", p."from", upper(p."on_delete") = 'CASCADE'
-               FROM "sqlite_master" m
-               JOIN pragma_foreign_key_list(m."name") p
-               WHERE m."type" = 'table' AND p."table" = 'BaseItems' COLLATE NOCASE
-                 AND (p."to" IS NULL OR p."to" = 'Id' COLLATE NOCASE)"#,
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        references.extend(
-            REKEY_LOOSE_REFERENCES
-                .iter()
-                .map(|(table, column)| ((*table).to_owned(), (*column).to_owned(), false)),
-        );
-        let mut done = Vec::new();
-        for m in moves {
-            // One savepoint per move: a move that fails is undone alone and
-            // reported unmade, and the rest go ahead.
-            sqlx::query("SAVEPOINT rekey_move")
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
-            match rekey_one(&mut tx, m, &references).await {
-                Ok(made) => {
-                    sqlx::query("RELEASE rekey_move")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
-                    if made {
-                        done.push(m.clone());
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        %err,
-                        item_id = %m.from,
-                        to = %m.to,
-                        "could not move an item to its new kind's id; it keeps the old one"
-                    );
-                    sqlx::query("ROLLBACK TO rekey_move")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
-                    sqlx::query("RELEASE rekey_move")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db_err)?;
-                }
-            }
-        }
-        tx.commit().await.map_err(db_err)?;
-        Ok(done)
+        rekey_rows(&self.db, moves, RekeyKind::Changed).await
     }
 
     async fn item_user_weights(
         &self,
         ids: &[Uuid],
     ) -> Result<Option<Vec<ItemUserWeight>>, ServiceError> {
-        let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let sql = item_user_weights_sql(chunk.len());
-            let mut query = sqlx::query_as::<_, (String, bool, Option<String>, i64, bool, bool)>(
-                sqlx::AssertSqlSafe(sql.as_str()),
-            );
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            for (id, has_user_data, last_played, play_count, edited, linked) in
-                query.fetch_all(self.db.pool()).await.map_err(db_err)?
-            {
-                let Ok(id) = Uuid::parse_str(&id) else {
-                    continue;
-                };
-                out.push(ItemUserWeight {
-                    id,
-                    has_user_data,
-                    last_played: last_played.as_deref().and_then(parse_stored_datetime),
-                    play_count,
-                    edited,
-                    linked,
-                });
-            }
-        }
-        Ok(Some(out))
+        user_weights(&self.db, ids).await.map(Some)
     }
 
     async fn update_file_facts(
@@ -3088,6 +3000,138 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 }
 
+/// [`ItemPersistenceService::rekey_items`], and the boot repair that gives a
+/// Jellyfin 10.11 local version its primary's kind
+/// ([`crate::adoption_repairs::rehome_local_versions`]): every move in one
+/// transaction, one savepoint each, so a move that fails is undone alone and
+/// left out of the returned list. `kind` says whether the item changes what
+/// it is ([`RekeyKind`]).
+///
+/// # Errors
+/// Returns [`ServiceError`] if the transaction cannot be opened or committed.
+pub(crate) async fn rekey_rows(
+    db: &Database,
+    moves: &[ItemRekey],
+    kind: RekeyKind,
+) -> Result<Vec<ItemRekey>, ServiceError> {
+    if moves.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Every reference moves inside the one transaction; the foreign
+    // keys are checked once, at its end, against the moved rows.
+    sqlx::query("PRAGMA defer_foreign_keys = ON")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    // Read off the schema, so a table added later moves too.
+    let mut references: Vec<RekeyReference> = sqlx::query_as(
+        r#"SELECT m."name", p."from", upper(p."on_delete") = 'CASCADE'
+           FROM "sqlite_master" m
+           JOIN pragma_foreign_key_list(m."name") p
+           WHERE m."type" = 'table' AND p."table" = 'BaseItems' COLLATE NOCASE
+             AND (p."to" IS NULL OR p."to" = 'Id' COLLATE NOCASE)"#,
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    references.extend(
+        REKEY_LOOSE_REFERENCES
+            .iter()
+            .map(|(table, column)| ((*table).to_owned(), (*column).to_owned(), false)),
+    );
+    let mut done = Vec::new();
+    for m in moves {
+        // One savepoint per move: a move that fails is undone alone and
+        // reported unmade, and the rest go ahead.
+        sqlx::query("SAVEPOINT rekey_move")
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        match rekey_one(&mut tx, m, &references, kind).await {
+            Ok(made) => {
+                sqlx::query("RELEASE rekey_move")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                if made {
+                    done.push(m.clone());
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    item_id = %m.from,
+                    to = %m.to,
+                    "could not move an item to its new kind's id; it keeps the old one"
+                );
+                sqlx::query("ROLLBACK TO rekey_move")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                sqlx::query("RELEASE rekey_move")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+        }
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(done)
+}
+
+/// What users made of each stored item of `ids`
+/// ([`ItemPersistenceService::item_user_weights`]; also the boot repair's
+/// fold, [`crate::adoption_repairs::rehome_local_versions`]).
+///
+/// # Errors
+/// Returns [`ServiceError`] if the read fails.
+pub(crate) async fn user_weights(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<Vec<ItemUserWeight>, ServiceError> {
+    let mut out = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = item_user_weights_sql(chunk.len());
+        let mut query = sqlx::query_as::<_, (String, bool, Option<String>, i64, bool, bool)>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+        );
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        for (id, has_user_data, last_played, play_count, edited, linked) in
+            query.fetch_all(db.pool()).await.map_err(db_err)?
+        {
+            let Ok(id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            out.push(ItemUserWeight {
+                id,
+                has_user_data,
+                last_played: last_played.as_deref().and_then(parse_stored_datetime),
+                play_count,
+                edited,
+                linked,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// What a [`rekey_rows`] move says of the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RekeyKind {
+    /// Its kind changed (a scan resolved it as another): it is refreshed
+    /// as the new kind on the next pass (`DateLastRefreshed` cleared) and
+    /// its provider ids, a match for the old kind, go.
+    Changed,
+    /// Only its id and stored type change, not what it is — a Jellyfin
+    /// 10.11 local alternate version stored as a `Video` that 12.x keeps as
+    /// its primary's kind: it keeps its refresh stamp and provider ids (the
+    /// same title's), so no scan re-probes or re-matches it.
+    Represented,
+}
+
 /// Columns that hold an item id without a foreign key on it. History
 /// (`ActivityLogs`, playback sessions) and display preferences stay on the
 /// old id: they record what was, and a leaf item has none worth carrying.
@@ -3120,6 +3164,7 @@ async fn rekey_one(
     conn: &mut sqlx::SqliteConnection,
     m: &ItemRekey,
     references: &[RekeyReference],
+    kind: RekeyKind,
 ) -> Result<bool, sqlx::Error> {
     if m.from == m.to {
         if !is_stored(conn, m.to).await? {
@@ -3129,7 +3174,7 @@ async fn rekey_one(
         if m.merged.contains(&m.to) && is_stored(conn, m.from).await? {
             merge_one(conn, (m.to, m.from), m.extra, references).await?;
         }
-        if !move_one(conn, m, references).await? {
+        if !move_one(conn, m, references, kind).await? {
             return Ok(false);
         }
     }
@@ -3437,6 +3482,7 @@ async fn move_one(
     conn: &mut sqlx::SqliteConnection,
     m: &ItemRekey,
     references: &[RekeyReference],
+    kind: RekeyKind,
 ) -> Result<bool, sqlx::Error> {
     let (from, to) = (guid_to_db(m.from), guid_to_db(m.to));
     let stored: Vec<(String, bool)> =
@@ -3495,17 +3541,21 @@ async fn move_one(
     .bind(m.from.to_string())
     .execute(&mut *conn)
     .await?;
-    // The row takes its new kind and is refreshed as one on the next pass
-    // (`DateLastRefreshed` cleared). `IsMovie` is false for every kind the
-    // scan plans, a `Movie` too (upstream writes it for Live TV programs
-    // only); an older scan's `Movie` stored true.
+    // The row takes its new kind and — when that changes what it is — is
+    // refreshed as one on the next pass (`DateLastRefreshed` cleared).
+    // `IsMovie` is false for every kind the scan plans, a `Movie` too
+    // (upstream writes it for Live TV programs only); an older scan's
+    // `Movie` stored true.
+    let changed = kind == RekeyKind::Changed;
     sqlx::query(
         r#"UPDATE "BaseItems" SET "Id" = ?1, "Type" = ?2, "IsMovie" = 0,
-           "DateLastRefreshed" = NULL WHERE "Id" = ?3"#,
+           "DateLastRefreshed" = CASE WHEN ?4 THEN NULL ELSE "DateLastRefreshed" END
+           WHERE "Id" = ?3"#,
     )
     .bind(&to)
     .bind(&m.type_name)
     .bind(&from)
+    .bind(changed)
     .execute(&mut *conn)
     .await?;
     // A merged version keyed by the old id's presentation key follows it;
@@ -3520,8 +3570,9 @@ async fn move_one(
     .await?;
     // Provider ids name a match for the old kind (a movie's TMDB id is no
     // episode's): the new kind's first refresh matches it afresh. A locked
-    // item refreshes nothing, so it keeps what the user set.
-    if !locked {
+    // item refreshes nothing, so it keeps what the user set; an item whose
+    // kind changed only in representation keeps them too.
+    if changed && !locked {
         sqlx::query(r#"DELETE FROM "BaseItemProviders" WHERE "ItemId" = ?1"#)
             .bind(&to)
             .execute(&mut *conn)

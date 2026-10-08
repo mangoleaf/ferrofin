@@ -184,6 +184,7 @@ pub mod file_system;
 pub mod item_count_service;
 pub mod item_data;
 mod item_deletion;
+pub(crate) mod item_folders;
 pub mod item_persistence_service;
 pub mod item_repository;
 pub mod item_type_lookup;

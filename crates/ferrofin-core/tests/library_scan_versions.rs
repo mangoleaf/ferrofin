@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ferrofin_core::file_system::FerrofinFileSystem;
-use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id, stored_type_name};
+use ferrofin_core::item_type_lookup::{
+    IdDerivation, ItemTypeLookup, derive_item_id, stored_type_name,
+};
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
     LibraryScanner,
@@ -678,6 +680,84 @@ async fn an_adopted_alternate_becomes_the_primarys_local_version() {
     let quiet = f.scanner.scan_all().await.unwrap();
     assert_eq!((quiet.created, quiet.updated), (0, 0));
     assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// The bench's adopted Jellyfin 10.11 groups, repaired at boot
+/// (`rehome_local_versions`, owner decision D9c): a local version stored as
+/// a `Video` its primary owns — no parent, top parent, pointer, ancestors
+/// or link, keyed by its own id, played — and a stacked part owned with no
+/// parent or ancestors. After the repair the first scan writes no
+/// `BaseItems` row and the user data is where it was put.
+#[tokio::test]
+async fn an_adopted_group_repaired_at_boot_scans_quietly() {
+    const PRIMARY: &str = "Bridge Forest (2014)/Bridge Forest (2014) - 2160p.mkv";
+    const ALTERNATE: &str = "Bridge Forest (2014)/Bridge Forest (2014) - 1080p.mkv";
+    const PART: &str = "Heat (1995)/Heat (1995) cd2.mkv";
+    let f = Fixture::movies(&[PRIMARY, ALTERNATE, "Heat (1995)/Heat (1995) cd1.mkv", PART]).await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(PRIMARY).await;
+    let planned = f.row(ALTERNATE).await;
+    let part = f.row(PART).await;
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    let adopted = guid_to_db(f.id(BaseItemKind::Video, ALTERNATE));
+    f.restore_as(ALTERNATE, |row| {
+        row.id.clone_from(&adopted);
+        row.type_ = stored_type_name(BaseItemKind::Video).unwrap().to_owned();
+        // 10.11's own name for it, and the sort key the save derives from it.
+        row.name = Some("Bridge Forest (2014) - 1080p".to_owned());
+        row.sort_name = None;
+        row.primary_version_id = None;
+        row.presentation_unique_key =
+            Some(Uuid::parse_str(&adopted).unwrap().as_simple().to_string());
+        row.parent_id = None;
+        row.top_parent_id = None;
+    })
+    .await;
+    f.restore_as(PART, |row| {
+        row.parent_id = None;
+        row.top_parent_id = None;
+        row.is_in_mixed_folder = true;
+    })
+    .await;
+    let user = seed_user(&f.db).await;
+    play(&f.db, &adopted, user).await;
+
+    let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
+        &f.db,
+        &IdDerivation::LegacyLowercase,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (rehomed.rekeyed, rehomed.versions, rehomed.parts),
+        (1, 1, 1)
+    );
+    let alternate = f.row(ALTERNATE).await;
+    assert_eq!(alternate.id, planned.id);
+    assert_eq!(
+        alternate.name.as_deref(),
+        Some("Bridge Forest (2014) - 1080p")
+    );
+    assert!(f.played(&alternate.id, user).await);
+    assert_eq!(f.links(&primary.id).await, vec![(alternate.id.clone(), 2)]);
+    assert_eq!(f.row(PART).await.parent_id, part.parent_id);
+
+    count_item_writes(&f.db).await;
+    let first = f.scanner.scan_all().await.unwrap();
+    assert_eq!((first.created, first.updated), (0, 0), "{first:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+    assert!(f.played(&alternate.id, user).await, "its user data stays");
+    let part_now = f.row(PART).await;
+    assert_eq!(part_now.id, part.id);
+    assert!(
+        !part_now.is_in_mixed_folder,
+        "the part took its primary's folder state"
+    );
 }
 
 /// An older Ferrofin scan stored a stack's second part as a `Movie` of its
