@@ -1088,8 +1088,8 @@ pub struct PlaybackPermissions {
     pub remuxing: bool,
 }
 
-/// The user permissions `BaseItem.CanDelete(user)` and `CanDownload(user)`
-/// read, from [`UserDataManager::get_content_permissions`].
+/// The user permissions `BaseItem.CanDelete(user)`, `CanDownload(user)` and
+/// `GetPlayAccess(user)` read, from [`UserDataManager::get_content_permissions`].
 ///
 /// Upstream reads each with `user.HasPermission(PermissionKind.…)` and the
 /// folder list with `user.GetPreferenceValues<Guid>(PreferenceKind.
@@ -1103,6 +1103,9 @@ pub struct ContentPermissions {
     /// collection. It grants nothing for ordinary media: an administrator
     /// without "Allow media deletion" cannot delete a movie, as upstream.
     pub is_administrator: bool,
+    /// `PermissionKind.EnableMediaPlayback` — controls `PlayAccess`, including
+    /// for administrators, who have no override for this permission.
+    pub enable_media_playback: bool,
     /// `PermissionKind.EnableContentDeletion` — the dashboard's "Allow media
     /// deletion" (any library).
     pub enable_content_deletion: bool,
@@ -1450,15 +1453,15 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// The slice of the user's policy that `CanDelete(user)` and
-    /// `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
+    /// The slice of the user's policy that `CanDelete(user)`, `GetPlayAccess(user)`
+    /// and `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
     /// `BoxSet`/`Playlist` overrides, and `IsAuthorizedToDownload`), for the
-    /// DTO builder's per-user `CanDelete`/`CanDownload` and the delete
+    /// DTO builder's per-user `CanDelete`/`CanDownload`/`PlayAccess` and the delete
     /// endpoints' check, which use the same value.
     ///
     /// `None` means "no policy known". `CanDownload` then falls back to the
-    /// file-level fact, and `CanDelete` for a user is `false`: a deletion is
-    /// never granted on an unknown policy. The default returns `None`; the
+    /// file-level fact, while `CanDelete` is `false` and `PlayAccess` is `None`:
+    /// neither permission is granted on an unknown policy. The default returns `None`; the
     /// concrete manager reads the `Permissions` and `Preferences` rows.
     async fn get_content_permissions(
         &self,

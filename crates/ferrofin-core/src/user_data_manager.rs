@@ -746,21 +746,22 @@ impl UserDataManager for FerrofinUserDataManager {
     ) -> Result<Option<ContentPermissions>, ServiceError> {
         use ferrofin_db::enums::{PermissionKind, PreferenceKind};
         // One indexed read over both `(UserId, Kind)` tables, the shape
-        // `user_manager::load_permission_and_preference_maps` uses: the four
+        // `user_manager::load_permission_and_preference_maps` uses: the five
         // permissions and the "Allow media deletion from" list (stored
         // `,`-delimited, as C# writes it).
         let rows: Vec<(i64, i32, String)> = sqlx::query_as(
             r#"SELECT 0, "Kind", CAST("Value" AS TEXT) FROM "Permissions"
-               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5)
+               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5, ?6)
                UNION ALL
                SELECT 1, "Kind", "Value" FROM "Preferences"
-               WHERE "UserId" = ?1 AND "Kind" = ?6"#,
+               WHERE "UserId" = ?1 AND "Kind" = ?7"#,
         )
         .bind(guid_to_db(user_id))
         .bind(i32::from(PermissionKind::IsAdministrator))
         .bind(i32::from(PermissionKind::EnableContentDeletion))
         .bind(i32::from(PermissionKind::EnableContentDownloading))
         .bind(i32::from(PermissionKind::EnableCollectionManagement))
+        .bind(i32::from(PermissionKind::EnableMediaPlayback))
         .bind(i32::from(PreferenceKind::EnableContentDeletionFromFolders))
         .fetch_all(self.db.pool())
         .await
@@ -777,6 +778,7 @@ impl UserDataManager for FerrofinUserDataManager {
             .collect();
         Ok(Some(ContentPermissions {
             is_administrator: has(PermissionKind::IsAdministrator),
+            enable_media_playback: has(PermissionKind::EnableMediaPlayback),
             enable_content_deletion: has(PermissionKind::EnableContentDeletion),
             enable_content_downloading: has(PermissionKind::EnableContentDownloading),
             enable_collection_management: has(PermissionKind::EnableCollectionManagement),
@@ -2055,7 +2057,7 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
                VALUES (10, 1, ?1, 0), (11, 0, ?1, 0), (0, 1, ?1, 0), (21, 1, ?1, 0),
-                      (11, 1, ?2, 0)"#,
+                      (7, 1, ?1, 0), (11, 1, ?2, 0)"#,
         )
         .bind(ferrofin_db::store::guid_to_db(user))
         .bind(ferrofin_db::store::guid_to_db(other))
@@ -2085,6 +2087,7 @@ mod tests {
             perms,
             ContentPermissions {
                 is_administrator: true,
+                enable_media_playback: true,
                 enable_content_deletion: true,
                 enable_content_downloading: false,
                 enable_collection_management: true,

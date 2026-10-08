@@ -183,7 +183,7 @@ struct Prefetched {
     /// must be `false` and not absent when there is none.
     has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
-    /// `CanDelete`/`CanDownload` fields are requested and a user is present),
+    /// `CanDelete`/`CanDownload`/`PlayAccess` fields are requested and a user is present),
     /// so the whole page gates on one permissions query.
     content_permissions: Option<ContentPermissions>,
     /// Everything the page's `CanDelete` reads besides the rows (empty unless
@@ -2127,9 +2127,20 @@ impl FerrofinDtoService {
 
         // User-specific play-state.
         if user.is_some() {
-            // C# `item.GetPlayAccess(user)` — Full unless parental control blocks it (not ported).
+            // C# `BaseItem.GetPlayAccess`: the saved playback permission alone,
+            // with no administrator exception or additional parental check.
             if options.contains_field(ItemFields::PlayAccess) {
-                dto.play_access = Some(ferrofin_model::library::PlayAccess::Full);
+                dto.play_access = Some(
+                    if prefetched
+                        .content_permissions
+                        .as_ref()
+                        .is_some_and(|policy| policy.enable_media_playback)
+                    {
+                        ferrofin_model::library::PlayAccess::Full
+                    } else {
+                        ferrofin_model::library::PlayAccess::None
+                    },
+                );
             }
             if options.enable_user_data {
                 dto.user_data = take_or_clone(&mut prefetched.user_data, &item_id, repeated);
@@ -4181,13 +4192,14 @@ impl FerrofinDtoService {
                 .into_iter()
                 .collect()
         };
-        // One permissions read gates the whole page's CanDelete/CanDownload
-        // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item), and
+        // One permissions read gates the whole page's CanDelete/CanDownload/PlayAccess
+        // (C# `BaseItem` permission methods per item), and
         // CanDelete's other inputs are read once for the page too.
         let content_permissions = match user {
             Some(user)
                 if options.contains_field(ItemFields::CanDelete)
-                    || options.contains_field(ItemFields::CanDownload) =>
+                    || options.contains_field(ItemFields::CanDownload)
+                    || options.contains_field(ItemFields::PlayAccess) =>
             {
                 self.user_data
                     .get_content_permissions(parse_user_id(&user.id)?)
@@ -9370,6 +9382,84 @@ mod tests {
             item_count: 99,
         };
         assert_eq!(total_item_count(&counts), 11);
+    }
+
+    #[tokio::test]
+    async fn saved_playback_permission_controls_single_and_page_play_access() {
+        use ferrofin_model::{library::PlayAccess, users::UserPolicy};
+        use ferrofin_traits::library::UserManager;
+
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let manager = crate::FerrofinUserManager::new(db.clone());
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::PlayAccess],
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let mut rows = Vec::new();
+        for kind in [
+            BaseItemKind::Movie,
+            BaseItemKind::Audio,
+            BaseItemKind::Folder,
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, "Playable item").await;
+            rows.push(fetch_item(&db, id).await);
+        }
+
+        for admin in [false, true] {
+            for enabled in [false, true, false] {
+                manager
+                    .update_policy(
+                        user_id,
+                        &UserPolicy {
+                            is_administrator: admin,
+                            enable_media_playback: enabled,
+                            ..UserPolicy::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let want = Some(if enabled {
+                    PlayAccess::Full
+                } else {
+                    PlayAccess::None
+                });
+                let page = svc
+                    .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+                    .await
+                    .unwrap();
+                for (row, dto) in rows.iter().zip(page) {
+                    assert_eq!(dto.play_access, want, "page: admin={admin}");
+                    let single = svc
+                        .get_base_item_dto(row, &options, Some(&user), None)
+                        .await
+                        .unwrap();
+                    assert_eq!(single.play_access, want, "single: admin={admin}");
+                }
+            }
+        }
+        let anonymous = svc
+            .get_base_item_dto(&rows[0], &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(anonymous.play_access, None);
+        let omitted = svc
+            .get_base_item_dto(
+                &rows[0],
+                &DtoOptions {
+                    fields: vec![],
+                    ..options
+                },
+                Some(&user),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.play_access, None);
     }
 
     // ---- CanDelete(user): one answer for the DTO and the delete endpoints ----
