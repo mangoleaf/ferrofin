@@ -192,12 +192,9 @@ pub fn default_image_order(name: &str) -> usize {
 }
 
 /// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
-/// `name` in `order`, or last.
-fn configured_order(order: &[String], name: &str) -> usize {
-    order
-        .iter()
-        .position(|f| f.eq_ignore_ascii_case(name))
-        .unwrap_or(usize::MAX)
+/// `name` in `order`, or last. Unlike enable lists, order uses exact casing.
+pub(crate) fn configured_order(order: &[String], name: &str) -> usize {
+    order.iter().position(|f| f == name).unwrap_or(usize::MAX)
 }
 
 /// The library's configured `MetadataFetcherOrder` for item type `kind`, or
@@ -1713,7 +1710,7 @@ mod tests {
             0
         );
         assert_eq!(
-            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "musicbrainz"),
+            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "MusicBrainz"),
             1
         );
         assert_eq!(
@@ -1743,6 +1740,45 @@ mod tests {
         assert_eq!(
             metadata_fetcher_rank(None, None, "MusicAlbum", "TheAudioDB"),
             usize::MAX
+        );
+    }
+
+    #[test]
+    fn configured_order_is_exact_while_enable_lists_ignore_case() {
+        let options = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Movie".to_owned()),
+                metadata_fetchers: vec!["themoviedb".to_owned()],
+                metadata_fetcher_order: vec!["themoviedb".to_owned()],
+                image_fetchers: vec!["themoviedb".to_owned()],
+                image_fetcher_order: vec!["themoviedb".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(super::metadata_fetcher_enabled(
+            Some(&options),
+            None,
+            "Movie",
+            "TheMovieDb"
+        ));
+        assert!(super::image_fetcher_enabled(
+            Some(&options),
+            None,
+            "Movie",
+            "TheMovieDb"
+        ));
+        assert_eq!(
+            super::metadata_fetcher_rank(Some(&options), None, "Movie", "TheMovieDb"),
+            usize::MAX
+        );
+        assert_eq!(
+            super::image_fetcher_rank(Some(&options), None, "Movie", "TheMovieDb"),
+            usize::MAX
+        );
+        assert_eq!(
+            super::configured_order(&["TheMovieDb".to_owned()], "TheMovieDb"),
+            0
         );
     }
 

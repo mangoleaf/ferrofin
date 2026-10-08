@@ -3522,10 +3522,7 @@ impl ProviderManager for LocalProviderManager {
                     .unwrap_or_default()
             });
         providers.sort_by_key(|p| {
-            let ranked = order
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(p.name()))
-                .unwrap_or(usize::MAX);
+            let ranked = crate::library_options::configured_order(&order, p.name());
             (ranked, p.default_order())
         });
 
@@ -7287,6 +7284,11 @@ mod tests {
         assert_eq!(
             winner(providers(), &["MusicBrainz", "TheAudioDB"]).await,
             "MusicBrainz"
+        );
+        assert_eq!(
+            winner(providers(), &["theaudiodb", "MusicBrainz"]).await,
+            "MusicBrainz",
+            "Array.IndexOf ranks only the provider's exact name"
         );
     }
 

@@ -19,7 +19,7 @@ async fn provider(State(requests): State<Arc<Mutex<Vec<String>>>>, uri: Uri) -> 
             .find(|(key, _)| key == "language")
             .map_or_else(|| "missing".to_owned(), |(_, value)| value.into_owned());
         return Json(json!({
-            "id":603,"title":format!("Locale {language}"),"overview":format!("Overview {language}"),
+            "id":603,"imdb_id":"tt0133093","title":format!("Locale {language}"),"overview":format!("Overview {language}"),
             "release_date":"1999-03-30", "vote_average":8,
             "release_dates":{"results":[
                 {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
@@ -28,6 +28,11 @@ async fn provider(State(requests): State<Arc<Mutex<Vec<String>>>>, uri: Uri) -> 
                 {"iso_3166_1":"AR","release_dates":[{"certification":"13"}]}
             ]},"videos":{"results":[]},"credits":{"cast":[],"crew":[]}
         }));
+    }
+    if uri.path() == "/" {
+        return Json(
+            json!({"Title":"OMDb pick","imdbID":"tt0133093","Year":"1999","Type":"movie","Response":"True"}),
+        );
     }
     Json(json!({"results":[],"posters":[],"backdrops":[],"logos":[],"data":{"token":"fixture"}}))
 }
@@ -262,6 +267,43 @@ async fn saved_locales_change_provider_requests_without_restarting() {
                 && uri.contains(&format!("language={language}"))),
             "{requests:?}"
         );
+    }
+    // L12: Identify uses the same saved enable lists and exact-name order as
+    // automatic refresh. Shared IMDb ids make the first provider's result win.
+    for (fetchers, order, expected) in [
+        (json!([]), json!([]), None),
+        (
+            json!(["themoviedb", "the open movie database"]),
+            json!(["The Open Movie Database", "TheMovieDb"]),
+            Some("The Open Movie Database"),
+        ),
+        (
+            json!(["TheMovieDb", "The Open Movie Database"]),
+            json!(["TheMovieDb", "The Open Movie Database"]),
+            Some("TheMovieDb"),
+        ),
+        (
+            json!(["TheMovieDb", "The Open Movie Database"]),
+            json!(["the open movie database", "TheMovieDb"]),
+            Some("TheMovieDb"),
+        ),
+    ] {
+        options["TypeOptions"][0]["MetadataFetchers"] = fetchers;
+        options["TypeOptions"][0]["MetadataFetcherOrder"] = order;
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        let found: Value = api.client.post(format!("{}/Items/RemoteSearch/Movie", api.base))
+            .header("Authorization", &api.auth)
+            .json(&json!({"ItemId":id,"SearchInfo":{"Name":"Locale","ProviderIds":{"Tmdb":"603","Imdb":"tt0133093"}}}))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let found = found.as_array().unwrap();
+        assert_eq!(found.len(), usize::from(expected.is_some()), "{found:?}");
+        if let Some(expected) = expected {
+            assert_eq!(found[0]["SearchProviderName"], expected, "{found:?}");
+        }
     }
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
