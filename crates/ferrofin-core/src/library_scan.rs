@@ -2777,6 +2777,8 @@ pub struct LibraryScanner {
     /// Live library counts, shared with dashboard readers.
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
+    chapter_image_extractor:
+        std::sync::OnceLock<Arc<crate::chapter_image_extractor::ChapterImageExtractor>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
     collections:
         std::sync::OnceLock<std::sync::Weak<dyn ferrofin_traits::collections::CollectionManager>>,
@@ -3072,6 +3074,7 @@ impl LibraryScanner {
             metadata_locale: None,
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
+            chapter_image_extractor: std::sync::OnceLock::new(),
         }
     }
 
@@ -3104,6 +3107,15 @@ impl LibraryScanner {
         downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) {
         let _ = self.subtitle_downloader.set(downloader);
+    }
+
+    /// Shares per-video chapter reconciliation with the scheduled task. The
+    /// extractor owns no library or chapter manager, so attachment is acyclic.
+    pub fn attach_chapter_image_extractor(
+        &self,
+        extractor: Arc<crate::chapter_image_extractor::ChapterImageExtractor>,
+    ) {
+        let _ = self.chapter_image_extractor.set(extractor);
     }
 
     /// Attaches the reader of the `metadata` named configuration, whose
@@ -5566,6 +5578,14 @@ impl LibraryScanner {
                 .download_missing_from_probe_locked(&entity, options, cancel, &unfiltered)
                 .await;
         }
+        self.persist_video_chapters(
+            &entity,
+            &rows,
+            options.metadata_refresh_mode,
+            policy.options,
+            cancel,
+        )
+        .await?;
         // TODO(parity, open work item — NOT an accepted divergence): upstream's
         // `TrickplayProvider` (`MediaBrowser.Providers/Trickplay/
         // TrickplayProvider.cs:95-118`, a forced custom provider) runs here
@@ -5877,7 +5897,7 @@ impl LibraryScanner {
             repo.save_media_attachments(item_id, &probe.attachments)
                 .await?;
         }
-        self.save_chapters(item_id, &probe.chapters).await
+        Ok(())
     }
 
     /// The batches every item in the walk reads from, gathered once up front.
@@ -11527,17 +11547,67 @@ impl LibraryScanner {
         self.plan_music_album(dir, cf, cf, ctx, out);
     }
 
-    /// Persists an item's probed chapter markers, when there are any and a
-    /// chapter repository is wired.
-    async fn save_chapters(
+    /// A successful video Default/FullRefresh reconciles chapter images and
+    /// replaces markers, even with extraction disabled or an empty chapter set.
+    async fn persist_video_chapters(
         &self,
-        item_id: Uuid,
-        chapters: &[ferrofin_db::entities::base_items::ChapterEntity],
+        video: &BaseItemEntity,
+        probe: &ProbeRows,
+        mode: MetadataRefreshMode,
+        options: Option<&ferrofin_model::configuration::LibraryOptions>,
+        cancel: &ScanCancel,
     ) -> Result<(), ServiceError> {
-        if let (false, Some(repo)) = (chapters.is_empty(), &self.chapters) {
-            repo.save_chapters(item_id, chapters).await?;
+        if cancel.is_cancelled()
+            || !probe.save_attachments
+            || !matches!(
+                mode,
+                MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+            )
+        {
+            return Ok(());
         }
-        Ok(())
+        let Some(repo) = &self.chapters else {
+            return Ok(());
+        };
+        let id = Uuid::parse_str(&video.id)
+            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        let mut chapters = probe
+            .chapters
+            .iter()
+            .map(|chapter| ferrofin_model::entities_media::ChapterInfo {
+                start_position_ticks: chapter.start_position_ticks,
+                name: chapter.name.clone(),
+                image_path: chapter.image_path.clone(),
+                image_date_modified: chapter.image_date_modified.unwrap_or_default(),
+                image_tag: None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(extractor) = self.chapter_image_extractor.get() {
+            let during_scan =
+                options.is_some_and(|options| options.extract_chapter_images_during_library_scan);
+            let outcome = extractor
+                .refresh(video, &mut chapters, during_scan, cancel)
+                .await?;
+            if outcome.cancelled {
+                return Ok(());
+            }
+            // Upstream's provider requests reconciliation without saving, then
+            // writes the resulting chapter set after old images are pruned.
+            outcome.prune_unused_images(&chapters);
+        }
+        let saved = chapters
+            .into_iter()
+            .filter(|chapter| chapter.start_position_ticks < video.run_time_ticks.unwrap_or(0))
+            .map(|chapter| ChapterEntity {
+                item_id: video.id.clone(),
+                chapter_index: 0,
+                start_position_ticks: chapter.start_position_ticks,
+                name: chapter.name,
+                image_path: chapter.image_path,
+                image_date_modified: Some(chapter.image_date_modified),
+            })
+            .collect::<Vec<_>>();
+        repo.save_chapters(id, &saved).await
     }
 
     /// Emits the bounded per-item progress line (RULES_LOGGING volume rule);
@@ -30371,6 +30441,368 @@ mod tests {
 #[cfg(test)]
 mod chapter_image_refresh_tests {
     use super::*;
+    use crate::chapter_image_extractor::tests::{Fixture, RecordingEncoder};
+    use ferrofin_traits::persistence::ChapterRepository;
+
+    fn video_probe(positions: &[i64]) -> ProbeRows {
+        ProbeRows {
+            save_attachments: true,
+            chapters: positions
+                .iter()
+                .map(|position| ChapterEntity {
+                    start_position_ticks: *position,
+                    name: Some("Chapter".to_owned()),
+                    item_id: String::new(),
+                    chapter_index: 0,
+                    image_date_modified: None,
+                    image_path: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn scanner(fixture: &Fixture) -> (LibraryScanner, Arc<crate::FerrofinChapterRepository>) {
+        let repo = Arc::new(crate::FerrofinChapterRepository::new(fixture.db.clone()));
+        let mut scanner = LibraryScanner::new(
+            fixture.folders.clone(),
+            Arc::new(crate::FerrofinFileSystem::new()),
+            Arc::new(crate::FerrofinItemPersistenceService::new(
+                fixture.db.clone(),
+            )),
+        );
+        scanner.media_streams = Some(fixture.streams.clone());
+        scanner.chapters = Some(repo.clone());
+        scanner.attach_chapter_image_extractor(fixture.extractor.clone());
+        (scanner, repo)
+    }
+
+    #[tokio::test]
+    async fn cancelled_video_refresh_preserves_stored_chapters_and_old_images() {
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let target = fixture.target(0);
+        std::fs::create_dir_all(std::path::Path::new(&target).parent().unwrap()).unwrap();
+        std::fs::write(&target, b"previous frame").unwrap();
+        let mut old = video_probe(&[0]).chapters;
+        old[0].image_path = Some(target.clone());
+        old[0].name = Some("Kept chapter".to_owned());
+        repo.save_chapters(id, &old).await.unwrap();
+        let saved = repo.get_chapters(id).await.unwrap();
+        let cancel = ScanCancel::new();
+        cancel.cancel();
+        for new in [video_probe(&[]), video_probe(&[200_000_000])] {
+            scanner
+                .persist_video_chapters(
+                    &fixture.video,
+                    &new,
+                    MetadataRefreshMode::FullRefresh,
+                    Some(&fixture.options),
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            assert_eq!(repo.get_chapters(id).await.unwrap(), saved);
+            assert_eq!(std::fs::read(&target).unwrap(), b"previous frame");
+        }
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_one_frame_preserves_rows_and_retains_partial_files_like_source() {
+        let cancel = ScanCancel::new();
+        let mut fixture = Fixture::new(RecordingEncoder::cancelling_after(1, cancel.clone())).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let old_target = fixture.target(0);
+        std::fs::create_dir_all(std::path::Path::new(&old_target).parent().unwrap()).unwrap();
+        std::fs::write(&old_target, b"previous frame").unwrap();
+        let mut old = video_probe(&[0]).chapters;
+        old[0].image_path = Some(old_target.clone());
+        old[0].name = Some("Old chapter".to_owned());
+        repo.save_chapters(id, &old).await.unwrap();
+        let stored = repo.get_chapters(id).await.unwrap();
+        fixture.video.date_modified = fixture
+            .video
+            .date_modified
+            .map(|date| date + chrono::Duration::seconds(3));
+        let new_target = fixture.target(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scanner.persist_video_chapters(
+                &fixture.video,
+                &video_probe(&[0, 200_000_000, 400_000_000]),
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("between-chapter cancellation completes promptly")
+        .unwrap();
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            repo.get_chapters(id).await.unwrap(),
+            stored,
+            "cancellation does not persist partial markers"
+        );
+        assert_eq!(
+            std::fs::read(old_target).unwrap(),
+            b"previous frame",
+            "do not prune the prior saved images"
+        );
+        assert!(
+            std::path::Path::new(&new_target).exists(),
+            "source retains a completed frame when the next chapter's cancellation throws before pruning"
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_inside_encoder_follows_source_partial_failure_save_and_prune() {
+        let cancel = ScanCancel::new();
+        let mut fixture = Fixture::new(RecordingEncoder::cancelling_on(2, cancel.clone())).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let old_target = fixture.target(0);
+        std::fs::create_dir_all(std::path::Path::new(&old_target).parent().unwrap()).unwrap();
+        std::fs::write(&old_target, b"previous frame").unwrap();
+        let mut old = video_probe(&[0]).chapters;
+        old[0].image_path = Some(old_target.clone());
+        repo.save_chapters(id, &old).await.unwrap();
+        fixture.video.date_modified = fixture
+            .video
+            .date_modified
+            .map(|date| date + chrono::Duration::seconds(3));
+        let completed = fixture.target(0);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            scanner.persist_video_chapters(
+                &fixture.video,
+                &video_probe(&[0, 200_000_000, 400_000_000]),
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("cancelled encoder future must be dropped")
+        .unwrap();
+        let saved = repo.get_chapters(id).await.unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].image_path.as_deref(), Some(completed.as_str()));
+        assert!(
+            saved[1..]
+                .iter()
+                .all(|chapter| chapter.image_path.is_none())
+        );
+        assert!(
+            std::path::Path::new(&completed).exists(),
+            "completed frame survives the ordinary partial failure path"
+        );
+        assert!(
+            !std::path::Path::new(&old_target).exists(),
+            "source prunes old unreferenced images after an in-encoder failure"
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 2);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn scan_extraction_is_per_video_live_and_existing_images_are_reused_when_off() {
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (scanner, repo) = scanner(&fixture);
+        let probe = video_probe(&[0, 200_000_000, 550_000_000, 600_000_000]);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            repo.get_chapters(id).await.unwrap().len(),
+            3,
+            "markers at runtime are not persisted"
+        );
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let saved = repo.get_chapters(id).await.unwrap();
+        assert!(saved.iter().all(|chapter| chapter.image_path.is_some()));
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 3);
+        fixture.options.extract_chapter_images_during_library_scan = false;
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let reused = repo.get_chapters(id).await.unwrap();
+        assert_eq!(
+            reused
+                .iter()
+                .map(|chapter| &chapter.image_path)
+                .collect::<Vec<_>>(),
+            saved
+                .iter()
+                .map(|chapter| &chapter.image_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 3);
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        fixture.options.enable_chapter_image_extraction = false;
+        fixture
+            .folders
+            .update_library_options("Videos", &fixture.options)
+            .await
+            .unwrap();
+        let new_probe = video_probe(&[100_000_000, 300_000_000]);
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &new_probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            repo.get_chapters(id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|chapter| chapter.image_path.is_none())
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 3);
+        assert!(
+            saved
+                .iter()
+                .all(|chapter| !Path::new(chapter.image_path.as_deref().unwrap()).exists())
+        );
+    }
+
+    #[tokio::test]
+    async fn non_refresh_modes_failed_probes_and_audio_preserve_chapters_but_empty_video_clears() {
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        let (scanner, repo) = scanner(&fixture);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let probe = video_probe(&[0, 200_000_000]);
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let saved = repo.get_chapters(id).await.unwrap();
+        for mode in [
+            MetadataRefreshMode::None,
+            MetadataRefreshMode::ValidationOnly,
+        ] {
+            scanner
+                .persist_video_chapters(
+                    &fixture.video,
+                    &video_probe(&[123]),
+                    mode,
+                    Some(&fixture.options),
+                    &ScanCancel::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(repo.get_chapters(id).await.unwrap(), saved);
+        }
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &ProbeRows::default(),
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_chapters(id).await.unwrap(),
+            saved,
+            "no successful video probe preserves the old set"
+        );
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &video_probe(&[]),
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        assert!(
+            Path::new(saved[0].image_path.as_deref().unwrap()).exists(),
+            "source's empty chapter set returns before image cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_frame_keeps_successful_scan_images_and_saves_the_chapters() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (scanner, repo) = scanner(&fixture);
+        // Corrupt storage for a later target so its copy fails after the first
+        // image landed; a single video's partial extraction is still saved.
+        let second = fixture.target(200_000_000);
+        std::fs::create_dir_all(&second).unwrap();
+        let mut options = fixture.options.clone();
+        options.extract_chapter_images_during_library_scan = true;
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &video_probe(&[0, 200_000_000, 400_000_000]),
+                MetadataRefreshMode::Default,
+                Some(&options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let saved = repo
+            .get_chapters(Uuid::parse_str(&fixture.video.id).unwrap())
+            .await
+            .unwrap();
+        assert!(saved[0].image_path.is_some());
+        assert!(
+            saved[1..]
+                .iter()
+                .all(|chapter| chapter.image_path.is_none())
+        );
+        assert_eq!(fixture.encoder.calls.lock().unwrap().len(), 2);
+    }
+
     #[test]
     fn a_video_probe_refreshes_or_clears_the_default_video_index() {
         let mut video = BaseItemEntity {

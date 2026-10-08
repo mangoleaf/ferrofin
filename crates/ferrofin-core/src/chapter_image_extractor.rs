@@ -35,6 +35,8 @@ pub struct ChapterImageExtractor {
 pub struct ChapterImageRefresh {
     /// Whether every requested extraction succeeded.
     pub success: bool,
+    /// Cancellation before a new extraction stops save/prune; encoder errors remain partial failures.
+    pub cancelled: bool,
     /// Whether a chapter image path or its modification date changed.
     pub changed: bool,
     current_images: Vec<String>,
@@ -44,6 +46,9 @@ impl ChapterImageRefresh {
     /// Deletes saved image files no longer referenced by a chapter. Other files
     /// in the directory are preserved, as in `ChapterManager.DeleteDeadImages`.
     pub fn prune_unused_images(&self, chapters: &[ChapterInfo]) {
+        if self.cancelled {
+            return;
+        }
         for path in &self.current_images {
             let referenced = chapters.iter().any(|chapter| {
                 chapter
@@ -117,6 +122,7 @@ impl ChapterImageExtractor {
     ) -> Result<ChapterImageRefresh, ServiceError> {
         let mut outcome = ChapterImageRefresh {
             success: true,
+            cancelled: false,
             changed: false,
             current_images: Vec::new(),
         };
@@ -168,15 +174,33 @@ impl ChapterImageExtractor {
             .chapter_image_folder_path(item_id, video.path.as_deref().unwrap_or_default());
         outcome.current_images = saved_images(&directory);
         for chapter in chapters {
-            if chapter.start_position_ticks >= video.run_time_ticks.unwrap_or(0)
-                || cancel.is_cancelled()
-            {
+            if chapter.start_position_ticks >= video.run_time_ticks.unwrap_or(0) {
                 break;
             }
-            match self
+            // Source checks cancellation only before entering a new extraction,
+            // outside the encoder's try/catch. Cached and disabled rows still
+            // reconcile normally without asking the encoder to do more work.
+            if context.extract && context.stream.is_some() && cancel.is_cancelled() {
+                let target = self.paths.chapter_image_path(
+                    context.item_id,
+                    video.path.as_deref().unwrap_or_default(),
+                    chapter.start_position_ticks,
+                    date_modified_ticks(video.date_modified),
+                );
+                if !outcome
+                    .current_images
+                    .iter()
+                    .any(|path| path.eq_ignore_ascii_case(&target))
+                {
+                    outcome.cancelled = true;
+                    outcome.success = false;
+                    break;
+                }
+            }
+            let result = self
                 .refresh_chapter(chapter, &outcome.current_images, &context)
-                .await
-            {
+                .await;
+            match result {
                 Ok(changed) => outcome.changed |= changed,
                 Err(error) => {
                     tracing::warn!(item = %video.id, %error, "chapter image could not be extracted or stored");
@@ -304,7 +328,9 @@ impl ChapterImageExtractor {
             ))
             .await
         else {
-            return Ok(false);
+            // Source catches cancellation thrown inside the encoder as an
+            // extraction failure, then reconciles/saves earlier completed frames.
+            return Err(ServiceError::backend("chapter image extraction cancelled"));
         };
         let frame = frame?;
         std::fs::copy(&frame, target).map_err(|error| ServiceError::backend(error.to_string()))?;
@@ -410,6 +436,23 @@ pub(crate) mod tests {
         pub(crate) calls: Mutex<Vec<(i64, String, MediaSourceInfo, MediaStream)>>,
         fail_on: Option<usize>,
         missing_frame: bool,
+        cancel_on: Option<(usize, ScanCancel)>,
+        cancel_after: Option<(usize, ScanCancel)>,
+    }
+
+    impl RecordingEncoder {
+        pub(crate) fn cancelling_after(call: usize, cancel: ScanCancel) -> Self {
+            Self {
+                cancel_after: Some((call, cancel)),
+                ..Default::default()
+            }
+        }
+        pub(crate) fn cancelling_on(call: usize, cancel: ScanCancel) -> Self {
+            Self {
+                cancel_on: Some((call, cancel)),
+                ..Default::default()
+            }
+        }
     }
 
     #[async_trait]
@@ -455,12 +498,23 @@ pub(crate) mod tests {
                 ));
                 calls.len()
             };
+            if let Some((call, cancel)) = &self.cancel_on
+                && *call == count
+            {
+                cancel.cancel();
+                std::future::pending::<()>().await;
+            }
             if self.fail_on == Some(count) {
                 return Err(ServiceError::backend("broken frame"));
             }
             let path = format!("{input}.frame-{count}.jpg");
             if !self.missing_frame {
                 std::fs::write(&path, b"frame").unwrap();
+            }
+            if let Some((call, cancel)) = &self.cancel_after
+                && *call == count
+            {
+                cancel.cancel();
             }
             Ok(path)
         }
@@ -800,6 +854,41 @@ pub(crate) mod tests {
                 "source requires an explicit default stream index"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_extraction_stops_before_encoding_but_cached_rows_reconcile() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let target = fixture.target(0);
+        std::fs::create_dir_all(Path::new(&target).parent().unwrap()).unwrap();
+        std::fs::write(&target, b"cached").unwrap();
+        let cancel = ScanCancel::new();
+        cancel.cancel();
+
+        let mut cached = chapters(&[0]);
+        let outcome = fixture
+            .extractor
+            .refresh(&fixture.video, &mut cached, true, &cancel)
+            .await
+            .unwrap();
+        assert!(outcome.success && outcome.changed && !outcome.cancelled);
+        assert_eq!(cached[0].image_path.as_deref(), Some(target.as_str()));
+        outcome.prune_unused_images(&cached);
+        assert!(Path::new(&target).exists());
+
+        let mut uncached = chapters(&[200_000_000]);
+        let outcome = fixture
+            .extractor
+            .refresh(&fixture.video, &mut uncached, true, &cancel)
+            .await
+            .unwrap();
+        assert!(!outcome.success && !outcome.changed && outcome.cancelled);
+        outcome.prune_unused_images(&uncached);
+        assert!(
+            Path::new(&target).exists(),
+            "pre-extraction cancellation skips pruning"
+        );
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

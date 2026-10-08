@@ -1658,6 +1658,7 @@ pub async fn build_app_state(
             )
             .with_live_tv(&live_tv),
         );
+        library_scanner.attach_chapter_image_extractor(Arc::clone(&chapter_images));
         task_manager.register(Arc::new(lib_tasks::ChapterImagesTask::new(
             Arc::clone(&library),
             Arc::clone(&virtual_folders),
@@ -1967,38 +1968,6 @@ pub async fn build_app_state(
             "AuthenticationSucceeded",
             |user, _device| format!("{user} successfully authenticated"),
         );
-
-        // A scan that changed the library queues chapter-image extraction, so
-        // enabling a library's "Extract chapter images" option and rescanning
-        // produces thumbnails — upstream extracts them as part of the item's
-        // metadata refresh, where Ferrofin has only the nightly task. This is
-        // that same task: idempotent (existing images are reused), a no-op
-        // when no library enables the option, and the task manager coalesces a
-        // queue request arriving while it already runs.
-        {
-            let task_manager = task_manager.clone();
-            let folders = Arc::clone(&virtual_folders);
-            event_bus.subscribe(
-                "LibraryChanged",
-                Arc::new(move |_payload: &str| {
-                    let task_manager = task_manager.clone();
-                    let folders = Arc::clone(&folders);
-                    tokio::spawn(async move {
-                        let wanted = folders.get_virtual_folders().await.is_ok_and(|list| {
-                            list.iter().any(|f| {
-                                f.library_options
-                                    .as_ref()
-                                    .is_some_and(|o| o.enable_chapter_image_extraction)
-                            })
-                        });
-                        if wanted {
-                            let _ = task_manager.queue("RefreshChapterImages");
-                        }
-                    });
-                    ferrofin_core::event_manager::consumer_done()
-                }),
-            );
-        }
     }
 
     // These two maintenance tasks gate on active playback, so they register
