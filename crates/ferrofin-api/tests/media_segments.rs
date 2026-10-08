@@ -331,6 +331,25 @@ fn state(
     lyrics: Arc<dyn LyricManager>,
     subtitles: Arc<dyn SubtitleManager>,
 ) -> AppState {
+    state_as(
+        segments,
+        trickplay,
+        lyrics,
+        subtitles,
+        Arc::new(OkAuth),
+        Arc::new(OkAuth),
+    )
+}
+
+/// [`state`] with the authentication seams chosen by the caller.
+fn state_as(
+    segments: Arc<dyn MediaSegmentManager>,
+    trickplay: Arc<dyn TrickplayManager>,
+    lyrics: Arc<dyn LyricManager>,
+    subtitles: Arc<dyn SubtitleManager>,
+    context: Arc<dyn ferrofin_traits::net::AuthorizationContext>,
+    auth: Arc<dyn ferrofin_traits::net::AuthService>,
+) -> AppState {
     AppState::new(
         Arc::new(OneItemLibrary),
         Arc::new(ferrofin_api::test_support::FakeUsers),
@@ -346,8 +365,8 @@ fn state(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        context,
+        auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -475,11 +494,14 @@ async fn media_segments_missing_item_is_404() {
 
 #[tokio::test]
 async fn plugin_segment_editor_route_is_implemented() {
-    let app = state(
+    // `SegmentEditorController` is `RequiresElevation`: drive it as an API key.
+    let app = state_as(
         Arc::new(FakeMediaSegments),
         Arc::new(FakeTrickplay),
         Arc::new(FakeLyrics),
         Arc::new(FakeSubtitles),
+        Arc::new(ferrofin_api::test_support::FakeAuthContext),
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
     );
     // The Intro Skipper SegmentEditor create route (`POST /MediaSegmentsApi/{id}`)
     // used to sit on the 501 stub; it is now a real handler (see
