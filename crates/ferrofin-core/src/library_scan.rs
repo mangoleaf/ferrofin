@@ -2326,6 +2326,9 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Each resolved primary's local alternate version paths
+    /// ([`PlanOutput::local_versions`]).
+    local_versions: std::cell::RefCell<Vec<(Uuid, Vec<String>)>>,
     /// Whether the series being planned is in a tvshows library, where a
     /// folder's episodes resolve together ([`note_episode_folder`]); under a
     /// series of an untyped library each resolves on its own.
@@ -2370,6 +2373,7 @@ impl<'a> PlanCtx<'a> {
             excluded: std::cell::RefCell::new(Vec::new()),
             superseded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
+            local_versions: std::cell::RefCell::new(Vec::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
             album_ancestors: std::cell::RefCell::new(HashMap::new()),
@@ -2438,6 +2442,14 @@ struct PlanOutput {
     superseded: Vec<String>,
     /// Paths needed to reuse adopted alternate-version owner identities.
     owner_paths: HashMap<Uuid, String>,
+    /// Each resolved primary video's local alternate versions, by path in
+    /// the resolver's order (`Video.LocalAlternateVersions`, which
+    /// `ItemPersistenceService.SaveItems` turns into the primary's
+    /// `LinkedChildren` rows, `ItemPersistenceService.cs:651-780`).
+    // TODO(parity, open work item): nothing fills or writes it yet — the
+    // movie walk's version groups (PLAN_ITEM_FILE_DELETION step 12 S4) and
+    // `sync_local_versions` (S3) are the port.
+    local_versions: Vec<(Uuid, Vec<String>)>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
     /// is unknown, so nothing at or under them is removed this scan.
@@ -3663,6 +3675,7 @@ impl LibraryScanner {
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
+            plan.local_versions.extend(part.local_versions);
             plan.excluded.extend(part.excluded);
             plan.superseded.extend(part.superseded);
             plan.unlisted.extend(part.unlisted);
@@ -4346,10 +4359,21 @@ impl LibraryScanner {
             excluded,
             superseded,
             owner_paths,
+            local_versions,
             mut unlisted,
             inaccessible,
             date_added,
         } = plan;
+        if !local_versions.is_empty() {
+            tracing::debug!(
+                primaries = local_versions.len(),
+                alternates = local_versions
+                    .iter()
+                    .map(|(_, paths)| paths.len())
+                    .sum::<usize>(),
+                "planned local alternate versions"
+            );
+        }
         if let Some(first) = unlisted.first() {
             tracing::warn!(
                 count = unlisted.len(),
@@ -5301,12 +5325,7 @@ impl LibraryScanner {
             }
             None => saved_row(stored_row, &guesses, &entity, facts),
         };
-        // FindExtras corrects filename-derived names even on existing extras;
-        // an explicit Name field lock is the only opt-out upstream.
-        if entity.owner_id.is_some() && !locked_fields.contains(&MetadataField::Name) {
-            entity.name.clone_from(&item.entity.name);
-            settle_sort_name(&mut entity);
-        }
+        settle_extra_name(&mut entity, &item.entity, locked_fields);
         self.apply_parental_rating_score(&mut entity);
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
@@ -9802,6 +9821,7 @@ impl LibraryScanner {
             excluded: ctx.excluded.into_inner(),
             superseded: ctx.superseded.into_inner(),
             owner_paths: ctx.owner_paths.into_inner(),
+            local_versions: ctx.local_versions.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
             date_added,
@@ -14311,17 +14331,24 @@ fn merge_onto_stored(
 /// series/season links and names (a `Book`'s series name is a provider
 /// field, see [`ResolverGuesses`]), `IsFolder`, `IsInMixedFolder`,
 /// `MediaType`, `IsMovie`, `ExtraType`, the series presentation key a child
-/// inherits, and `Data.VideoType`. `IsInMixedFolder` and `VideoType` are
-/// `UpdateFromResolvedItem`'s (`BaseItem.cs:1749-1760`, `Video.cs:
+/// inherits, and `Data`'s `VideoType`, `AdditionalParts` and
+/// `LocalAlternateVersions`. `IsInMixedFolder` and the three `Data` fields
+/// are `UpdateFromResolvedItem`'s (`BaseItem.cs:1749-1760`, `Video.cs:
 /// 500-526`), which upstream applies whatever the item's lock or the
-/// refresh mode; `IsoType` is the resolver's on a new item only and never
-/// updated after. Stat-owned (`SaveInternal`): `DateModified` (a file's; a
-/// folder has none, D2) and `Size` (files). Probe-owned: `RunTimeTicks` of a playable
-/// kind, `TotalBitrate` and the video `Width`/`Height` (a photo's come from
-/// its EXIF reader).
+/// refresh mode — except a stacked part's `IsInMixedFolder`: a part is no
+/// item the resolver returns but one its primary creates, taking the
+/// primary's flag only then (`Video.RefreshMetadataForOwnedVideo`, from
+/// `RefreshedOwnedItems`, `Video.cs:690`), so a stored part keeps its own. `IsoType` is the resolver's on a
+/// new item only and never updated after. Stat-owned (`SaveInternal`):
+/// `DateModified` (a file's; a folder has none, D2) and `Size` (files).
+/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
+/// video `Width`/`Height` (a photo's come from its EXIF reader).
+///
+/// `row` is always a stored row's (the merge's; a new item takes the
+/// planner's row whole, [`saved_row`]).
 fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_ran: bool) {
     if let Some(data) =
-        crate::item_data::with_resolved_video_type(row.data.as_deref(), scanned.data.as_deref())
+        crate::item_data::with_resolved_video_fields(row.data.as_deref(), scanned.data.as_deref())
     {
         row.data = Some(data);
     }
@@ -14333,7 +14360,9 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     row.owner_id.clone_from(&scanned.owner_id);
     row.extra_type = scanned.extra_type;
     row.is_folder = scanned.is_folder;
-    row.is_in_mixed_folder = scanned.is_in_mixed_folder;
+    if !is_stacked_part(scanned) {
+        row.is_in_mixed_folder = scanned.is_in_mixed_folder;
+    }
     row.is_movie = scanned.is_movie;
     row.media_type.clone_from(&scanned.media_type);
     row.series_id.clone_from(&scanned.series_id);
@@ -14370,6 +14399,39 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     }
     if probe_ran && scanned.run_time_ticks.is_some() {
         row.run_time_ticks = scanned.run_time_ticks;
+    }
+}
+
+/// Whether `entity` is a stacked movie's additional part as the planner
+/// plans it: owned by its primary (`Video.RefreshMetadataForOwnedVideo` sets
+/// `OwnerId`, `Video.cs:686-690`) but neither an extra (no `ExtraType`) nor
+/// a local alternate version (which also names its primary in
+/// `PrimaryVersionId`, `LibraryManager.ResolveAlternateVersion`).
+fn is_stacked_part(entity: &BaseItemEntity) -> bool {
+    entity.owner_id.is_some() && entity.extra_type.is_none() && entity.primary_version_id.is_none()
+}
+
+/// Gives a saved extra the planner's name (and the sort key that follows
+/// it): `FindExtras` re-derives an extra's name from its file name on every
+/// scan, even on an existing item, unless the `Name` field is locked (the
+/// only opt-out upstream). A stacked part or a local alternate version is
+/// owned too, but is no `FindExtras` item: its primary refreshes it
+/// (`Video.RefreshedOwnedItems` → `RefreshMetadataForOwnedVideo` /
+/// `RefreshMetadataForVersions`, `Video.cs:528-700`), and that refresh only
+/// fills an empty `Name` — `copyTitleMetadata` (`BaseItem.cs:2805-2858`)
+/// never copies the name, and an alternate refreshes without it
+/// (`Video.cs:565`) — so its saved name stands.
+fn settle_extra_name(
+    entity: &mut BaseItemEntity,
+    planned: &BaseItemEntity,
+    locked_fields: &[MetadataField],
+) {
+    if entity.owner_id.is_some()
+        && entity.extra_type.is_some()
+        && !locked_fields.contains(&MetadataField::Name)
+    {
+        entity.name.clone_from(&planned.name);
+        settle_sort_name(entity);
     }
 }
 
@@ -20322,6 +20384,93 @@ mod tests {
             parent_index_number: Some(1),
             index_number: Some(number),
             ..BaseItemEntity::default()
+        }
+    }
+
+    /// An owned row by shape: an extra, a stacked part (owned, no
+    /// `ExtraType`, no `PrimaryVersionId`) and a local alternate version
+    /// (owned and naming its primary).
+    fn owned_row(shape: &str) -> BaseItemEntity {
+        BaseItemEntity {
+            id: "PART".into(),
+            type_: "MediaBrowser.Controller.Entities.Video".into(),
+            name: Some("Heat cd2".into()),
+            path: Some("/m/Heat (1995)/Heat cd2.mkv".into()),
+            parent_id: Some("PARENT".into()),
+            owner_id: Some("PRIMARY".into()),
+            extra_type: (shape == "extra").then_some(2),
+            primary_version_id: (shape == "alternate").then(|| "PRIMARY".into()),
+            data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    /// A stored stacked part keeps its own `IsInMixedFolder` on a rescan —
+    /// upstream sets it from the primary only when it creates the part
+    /// (`Video.cs:690`) — while an extra and a local alternate take the
+    /// planner's (`UpdateFromResolvedItem`; an alternate is re-synced from
+    /// its primary, `Video.cs:605-609`). A new part takes the planner's.
+    #[rstest::rstest]
+    #[case::part("part", true)]
+    #[case::alternate("alternate", false)]
+    #[case::extra("extra", false)]
+    fn a_stored_parts_mixed_folder_flag_stands(#[case] shape: &str, #[case] kept: bool) {
+        let planned = BaseItemEntity {
+            is_in_mixed_folder: false,
+            ..owned_row(shape)
+        };
+        let stored = BaseItemEntity {
+            is_in_mixed_folder: true,
+            ..owned_row(shape)
+        };
+        let noop = |_: &mut BaseItemEntity, _: &super::ResolverGuesses| {};
+        for locked in [false, true] {
+            let saved = save_as(Some(&stored), &planned, noop, locked, false);
+            assert_eq!(saved.is_in_mixed_folder, kept, "{shape}, locked {locked}");
+        }
+        let created = save_as(None, &planned, noop, false, false);
+        assert!(
+            !created.is_in_mixed_folder,
+            "a new {shape} is the planner's"
+        );
+    }
+
+    /// On a rescan, a stored owned row takes the planner's name only when it
+    /// is an extra (`FindExtras`) whose `Name` field is not locked; a stacked
+    /// part or a local alternate keeps its stored name, locked or not.
+    #[rstest::rstest]
+    #[case::extra("extra", &[], true)]
+    #[case::extra_name_locked("extra", &[ferrofin_model::entities::MetadataField::Name], false)]
+    #[case::extra_other_lock("extra", &[ferrofin_model::entities::MetadataField::Overview], true)]
+    #[case::part("part", &[], false)]
+    #[case::alternate("alternate", &[], false)]
+    fn only_an_extra_takes_the_planners_name(
+        #[case] shape: &str,
+        #[case] locked_fields: &[ferrofin_model::entities::MetadataField],
+        #[case] renamed: bool,
+    ) {
+        let planned = owned_row(shape);
+        let stored = BaseItemEntity {
+            name: Some("Heat (Part Two)".into()),
+            sort_name: Some("heat (part two)".into()),
+            ..owned_row(shape)
+        };
+        let noop = |_: &mut BaseItemEntity, _: &super::ResolverGuesses| {};
+        for locked in [false, true] {
+            let mut saved =
+                save_with_locks(Some(&stored), &planned, noop, locked, locked_fields, false);
+            super::settle_extra_name(&mut saved, &planned, locked_fields);
+            let (name, sort_name) = if renamed {
+                ("Heat cd2", "heat cd0000000002")
+            } else {
+                ("Heat (Part Two)", "heat (part two)")
+            };
+            assert_eq!(
+                saved.name.as_deref(),
+                Some(name),
+                "{shape}, locked {locked}"
+            );
+            assert_eq!(saved.sort_name.as_deref(), Some(sort_name));
         }
     }
 

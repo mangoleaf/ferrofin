@@ -1366,7 +1366,7 @@ fn columns_of(
 /// `PrimaryVersionId` is never written, `DateCreated` only fills a gap,
 /// `IsLocked` only rises, the never-cleared columns keep the stored value
 /// over a `NULL`, and a locked row keeps its user-owned columns (its `Data`
-/// taking only the resolver's `VideoType`, [`LOCKED_DATA_SQL`]). With
+/// taking only the resolver's video fields, [`locked_data_sql`]). With
 /// `writes_date_created` it evaluates [`scan_upsert_date_created_sql`]
 /// instead, whose `DateCreated` is never cleared but otherwise written.
 pub(crate) fn scan_save_changes_row(
@@ -1414,15 +1414,19 @@ pub(crate) fn scan_save_changes_row(
                 // `SeriesMetadataService.cs:449-451`) — port both together.
                 "DateModified" if saved.is_folder => new,
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
-                // `LOCKED_DATA_SQL`: only the resolver's `VideoType` moves.
+                // `locked_data_sql`: only the resolver's video fields move.
                 "Data" if stored.is_locked => {
-                    return crate::item_data::with_resolved_video_type(
+                    return crate::item_data::with_resolved_video_fields(
                         stored.data.as_deref(),
                         saved.data.as_deref(),
                     )
                     .is_some();
                 }
-                "Name" | "CleanName" | "SortName" if saved.owner_id.is_some() => new,
+                "Name" | "CleanName" | "SortName"
+                    if saved.owner_id.is_some() && saved.extra_type.is_some() =>
+                {
+                    new
+                }
                 col if stored.is_locked && LOCKED_PRESERVED_COLUMNS.contains(&col) => old,
                 _ => new,
             };
@@ -3195,30 +3199,90 @@ const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
     "PremiereDate",
 ];
 
-/// What a locked row's `Data` becomes on a scan save: the stored blob, with
-/// the resolver's `VideoType` from the incoming one set in it
-/// (`Video.UpdateFromResolvedItem`, `Video.cs:518-522`, which upstream runs
-/// whatever the lock) and every other key kept with its value and place
-/// (`json_set` re-renders the document minified). Left as stored when
-/// the incoming blob names no `VideoType`, the stored one already holds it,
-/// or either is not valid JSON (the stored one must be an object; `NULL` or
-/// empty is `{}`). [`with_resolved_video_type`] is the same rule in Rust,
-/// which the scan's merge and [`scan_save_changes_row`] apply.
+/// What a locked row's `Data` becomes on a scan save: the stored blob with
+/// the resolver's video fields from the incoming one patched in
+/// (`Video.UpdateFromResolvedItem`, `Video.cs:500-526`, which upstream runs
+/// whatever the lock) — its `VideoType`, and each of the
+/// [`RESOLVED_VIDEO_PATH_LISTS`] it carries that differs from the stored
+/// list (a stored list absent or `null`, or a resolved `null` or non-list,
+/// is `[]`; one the incoming blob does not carry is left as stored, until
+/// the planner writes both, PLAN_ITEM_FILE_DELETION step 12 S4) — and every other key kept
+/// with its value and place (`json_patch` re-renders the document
+/// minified). Left as stored when the incoming blob names no `VideoType`
+/// (it is no `Video`), nothing differs, or either is not valid JSON (the
+/// stored one must be an object; `NULL` or empty is `{}`).
+/// [`with_resolved_video_fields`] is the same rule in Rust, which the scan's
+/// merge and [`scan_save_changes_row`] apply; the lists compare there as
+/// JSON values and here as their minified text. Those differ for a path
+/// stored with a JSON escape the other side spells out — an adopted blob
+/// does: Jellyfin's `JsonDefaults` keeps the default `JavaScriptEncoder`,
+/// which escapes `'`, `&`, `+`, `<`, `>` and non-ASCII. That is harmless:
+/// the blob this SQL receives is the scan overlay's, not the resolver's,
+/// and the overlay passes the stored text through unchanged unless the
+/// Rust rule changes something — so the lists compared here are the same
+/// text, and no save decision differs.
 ///
 /// The CASEs nest so the JSON functions only ever read valid JSON: they
 /// raise an error on malformed input, which would fail the whole save.
 ///
-/// [`with_resolved_video_type`]: crate::item_data::with_resolved_video_type
-const LOCKED_DATA_SQL: &str = r#"CASE WHEN json_valid(excluded."Data") = 1
-            AND json_valid(coalesce(nullif("Data", ''), '{}')) = 1
-        THEN CASE WHEN json_type(excluded."Data", '$.VideoType') = 'text'
-                AND json_type(coalesce(nullif("Data", ''), '{}')) = 'object'
-                AND json_extract(coalesce(nullif("Data", ''), '{}'), '$.VideoType')
-                    IS NOT json_extract(excluded."Data", '$.VideoType')
-            THEN json_set(coalesce(nullif("Data", ''), '{}'), '$.VideoType',
-                          json_extract(excluded."Data", '$.VideoType'))
+/// [`RESOLVED_VIDEO_PATH_LISTS`]: crate::item_data::RESOLVED_VIDEO_PATH_LISTS
+/// [`with_resolved_video_fields`]: crate::item_data::with_resolved_video_fields
+fn locked_data_sql() -> &'static str {
+    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        const STORED: &str = r#"coalesce(nullif("Data", ''), '{}')"#;
+        const INCOMING: &str = r#"excluded."Data""#;
+        // (differs, the one-key patch applied when it does)
+        let mut fields = vec![(
+            format!(
+                "json_extract({STORED}, '$.VideoType') \
+                 IS NOT json_extract({INCOMING}, '$.VideoType')"
+            ),
+            format!("json_object('VideoType', json_extract({INCOMING}, '$.VideoType'))"),
+        )];
+        for key in crate::item_data::RESOLVED_VIDEO_PATH_LISTS {
+            let path = format!("'$.{key}'");
+            let resolved = format!(
+                "CASE WHEN json_type({INCOMING}, {path}) = 'array' \
+                 THEN json_extract({INCOMING}, {path}) ELSE '[]' END"
+            );
+            // A stored value that is no list (nor absent, nor `null`) is
+            // NULL here, which differs from every list.
+            let stored = format!(
+                "CASE WHEN coalesce(json_type({STORED}, {path}), 'null') = 'null' THEN '[]' \
+                 WHEN json_type({STORED}, {path}) = 'array' \
+                 THEN json_extract({STORED}, {path}) END"
+            );
+            // A list the incoming blob does not carry is left as stored.
+            fields.push((
+                format!(
+                    "json_type({INCOMING}, {path}) IS NOT NULL AND ({stored}) IS NOT ({resolved})"
+                ),
+                format!("json_object('{key}', json({resolved}))"),
+            ));
+        }
+        let any_differs = fields
+            .iter()
+            .map(|(differs, _)| format!("({differs})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let patched = fields
+            .iter()
+            .fold(STORED.to_owned(), |doc, (differs, patch)| {
+                format!("json_patch({doc}, CASE WHEN {differs} THEN {patch} ELSE '{{}}' END)")
+            });
+        format!(
+            r#"CASE WHEN json_valid({INCOMING}) = 1
+            AND json_valid({STORED}) = 1
+        THEN CASE WHEN json_type({INCOMING}, '$.VideoType') = 'text'
+                AND json_type({STORED}) = 'object'
+                AND ({any_differs})
+            THEN {patched}
             ELSE "Data" END
-        ELSE "Data" END"#;
+        ELSE "Data" END"#
+        )
+    });
+    &SQL
+}
 
 /// The columns a scan save may set but never clear — see [`scan_upsert_sql`].
 const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
@@ -3246,9 +3310,9 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
-///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill, and
-///   `Data`, whose `VideoType` alone follows the resolver
-///   ([`LOCKED_DATA_SQL`]).
+///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill,
+///   `Data`, whose video fields alone follow the resolver
+///   ([`locked_data_sql`]), and an extra's name, which `FindExtras` sets.
 ///
 /// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
 /// cannot drift between the two statements; the substitutions are asserted in
@@ -3302,15 +3366,17 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
         } else {
             r#""IsLocked" = 1"#.to_owned()
         };
-        // FindExtras owns the filename-derived display name. The scanner
-        // preserves an explicit Name field lock before handing us the row.
+        // FindExtras owns an extra's filename-derived display name (an owned
+        // row that is no extra — a stacked part, a local alternate — keeps
+        // its own). The scanner preserves an explicit Name field lock before
+        // handing us the row.
         let kept = if ["Name", "CleanName", "SortName"].contains(col) {
-            format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+            format!(r#"({kept}) AND (excluded."OwnerId" IS NULL OR excluded."ExtraType" IS NULL)"#)
         } else {
             kept
         };
         let locked_value = if *col == "Data" {
-            LOCKED_DATA_SQL.to_owned()
+            locked_data_sql().to_owned()
         } else {
             format!(r#""{col}""#)
         };
@@ -5497,56 +5563,72 @@ mod tests {
         };
         let other = guid_to_db(other);
         let (mut checked, mut changed_cases) = (0, 0);
-        for writes_date_created in [false, true] {
-            for column in &columns {
-                for locked in [false, true] {
-                    for mode in ["null", "equal", "different"] {
-                        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                            .bind(guid_to_db(id))
-                            .execute(db.writer())
-                            .await
-                            .expect("reset");
-                        svc.save_items(std::slice::from_ref(&base))
-                            .await
-                            .expect("seed");
-                        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = ?1 WHERE "Id" = ?2"#)
+        // An owned row as an extra (`FindExtras` names it) and as a stacked
+        // part (no `ExtraType`: its stored name stands).
+        let shapes = [
+            base.clone(),
+            ferrofin_db::entities::base_items::BaseItemEntity {
+                extra_type: None,
+                ..base
+            },
+        ];
+        for base in &shapes {
+            for writes_date_created in [false, true] {
+                for column in &columns {
+                    for locked in [false, true] {
+                        for mode in ["null", "equal", "different"] {
+                            sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                                .bind(guid_to_db(id))
+                                .execute(db.writer())
+                                .await
+                                .expect("reset");
+                            svc.save_items(std::slice::from_ref(base))
+                                .await
+                                .expect("seed");
+                            sqlx::query(
+                                r#"UPDATE "BaseItems" SET "IsLocked" = ?1 WHERE "Id" = ?2"#,
+                            )
                             .bind(locked)
                             .bind(guid_to_db(id))
                             .execute(db.writer())
                             .await
                             .expect("lock");
-                        let stored = repo.retrieve_item(id).await.expect("read").expect("row");
-                        let mut incoming = base.clone();
-                        if mode != "equal" {
-                            vary(&mut incoming, column, mode == "null", &other);
-                        }
-                        let predicted =
-                            super::scan_save_changes_row(&incoming, &stored, writes_date_created);
-                        let before = snapshot().await;
-                        if writes_date_created {
-                            svc.save_scanned_items_with_date_created(std::slice::from_ref(
+                            let stored = repo.retrieve_item(id).await.expect("read").expect("row");
+                            let mut incoming = base.clone();
+                            if mode != "equal" {
+                                vary(&mut incoming, column, mode == "null", &other);
+                            }
+                            let predicted = super::scan_save_changes_row(
                                 &incoming,
-                            ))
-                            .await
-                            .expect("scan save");
-                        } else {
-                            svc.save_scanned_items(std::slice::from_ref(&incoming))
+                                &stored,
+                                writes_date_created,
+                            );
+                            let before = snapshot().await;
+                            if writes_date_created {
+                                svc.save_scanned_items_with_date_created(std::slice::from_ref(
+                                    &incoming,
+                                ))
                                 .await
                                 .expect("scan save");
-                        }
-                        let row_moved = snapshot().await != before;
-                        assert_eq!(
-                            row_moved, predicted,
-                            "column {column}, locked {locked}, incoming {mode}, \
+                            } else {
+                                svc.save_scanned_items(std::slice::from_ref(&incoming))
+                                    .await
+                                    .expect("scan save");
+                            }
+                            let row_moved = snapshot().await != before;
+                            assert_eq!(
+                                row_moved, predicted,
+                                "column {column}, locked {locked}, incoming {mode}, \
                          writes DateCreated {writes_date_created}"
-                        );
-                        checked += 1;
-                        changed_cases += usize::from(row_moved);
+                            );
+                            checked += 1;
+                            changed_cases += usize::from(row_moved);
+                        }
                     }
                 }
             }
         }
-        assert_eq!(checked, columns.len() * 12);
+        assert_eq!(checked, columns.len() * 24);
         assert!(
             changed_cases > columns.len(),
             "the cases have teeth: {changed_cases} changed"
@@ -6067,12 +6149,14 @@ mod tests {
                 r#""IsLocked" = 1"#.to_owned()
             };
             let kept = if ["Name", "CleanName", "SortName"].contains(col) {
-                format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+                format!(
+                    r#"({kept}) AND (excluded."OwnerId" IS NULL OR excluded."ExtraType" IS NULL)"#
+                )
             } else {
                 kept
             };
             let locked_value = if *col == "Data" {
-                super::LOCKED_DATA_SQL.to_owned()
+                super::locked_data_sql().to_owned()
             } else {
                 format!(r#""{col}""#)
             };
@@ -6287,13 +6371,17 @@ mod tests {
         );
     }
 
-    /// A locked row's `Data` on a scan save (`LOCKED_DATA_SQL`): only the
-    /// resolver's `VideoType` is set in it (`Video.UpdateFromResolvedItem`,
-    /// whatever the lock); every other key keeps its value and its place,
-    /// though `json_set` re-renders the document minified. A blob that is not
-    /// a JSON object, an incoming blob with no `VideoType`, or one that
-    /// already matches leave the stored text as it is.
-    /// `scan_save_changes_row` agrees with the SQL in every case.
+    /// A locked row's `Data` on a scan save (`locked_data_sql`): only the
+    /// resolver's video fields are set in it (`Video.UpdateFromResolvedItem`,
+    /// `Video.cs:500-526`, whatever the lock) — its `VideoType`, and its
+    /// `AdditionalParts`/`LocalAlternateVersions` the incoming blob carries
+    /// when they differ as ordinal sequences, a stored list absent or `null`
+    /// being `[]` (one the incoming blob does not carry stays); every other key keeps
+    /// its value and its place, though `json_patch` re-renders the document
+    /// minified. A blob that is not a JSON object, an incoming blob with no
+    /// `VideoType` (no `Video`), or one that already matches leave the
+    /// stored text as it is. `scan_save_changes_row` agrees with the SQL in
+    /// every case.
     #[rstest::rstest]
     #[case::replaced(
         Some(r#"{"VideoType":"Dvd", "RemoteTrailers":[{"Url":"u"}],"IsoType":"Dvd"}"#),
@@ -6337,8 +6425,82 @@ mod tests {
         Some("{"),
         Some(r#"{"VideoType":"Dvd"}"#)
     )]
+    #[case::lists_added(
+        Some(r#"{"VideoType":"VideoFile", "Status":"Ended"}"#),
+        Some(
+            r#"{"VideoType":"VideoFile","AdditionalParts":["/m/b.mkv"],"LocalAlternateVersions":["/m/x.mkv"]}"#
+        ),
+        Some(
+            r#"{"VideoType":"VideoFile","Status":"Ended","AdditionalParts":["/m/b.mkv"],"LocalAlternateVersions":["/m/x.mkv"]}"#
+        )
+    )]
+    #[case::absent_list_is_empty(
+        Some(r#"{"VideoType":"VideoFile", "Status":"Ended"}"#),
+        Some(r#"{"VideoType":"VideoFile","AdditionalParts":[]}"#),
+        Some(r#"{"VideoType":"VideoFile", "Status":"Ended"}"#)
+    )]
+    #[case::empty_list_is_absent(
+        Some(r#"{"AdditionalParts":[], "VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":[], "VideoType":"VideoFile"}"#)
+    )]
+    #[case::null_list_is_empty(
+        Some(r#"{"LocalAlternateVersions":null,"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":[]}"#),
+        Some(r#"{"LocalAlternateVersions":null,"VideoType":"VideoFile"}"#)
+    )]
+    #[case::same_list(
+        Some(r#"{"AdditionalParts": ["/m/b.mkv"], "VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","AdditionalParts":["/m/b.mkv"]}"#),
+        Some(r#"{"AdditionalParts": ["/m/b.mkv"], "VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_reordered(
+        Some(r#"{"AdditionalParts":["/m/c.mkv","/m/b.mkv"], "Status":"Ended","VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","AdditionalParts":["/m/b.mkv","/m/c.mkv"]}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv","/m/c.mkv"],"Status":"Ended","VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_ordinal_case(
+        Some(r#"{"LocalAlternateVersions":["/m/Heat - 4K.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":["/m/heat - 4k.mkv"]}"#),
+        Some(r#"{"LocalAlternateVersions":["/m/heat - 4k.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_gone(
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":[]}"#),
+        Some(r#"{"LocalAlternateVersions":[],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_not_resolved(
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"], "VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"], "VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_not_resolved_video_type_moves(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"Dvd"}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":[]}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::resolved_null_list_is_empty(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","AdditionalParts":null}"#),
+        Some(r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_not_an_array(
+        Some(r#"{"AdditionalParts":"x","VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile","AdditionalParts":[]}"#),
+        Some(r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::list_without_video_type(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"]}"#),
+        Some(r#"{"AdditionalParts":[]}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"]}"#)
+    )]
+    #[case::video_type_and_list(
+        Some(r#"{"VideoType":"Dvd"}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":["/m/x.mkv"]}"#),
+        Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":["/m/x.mkv"]}"#)
+    )]
     #[tokio::test]
-    async fn a_locked_rows_data_takes_only_the_resolvers_video_type(
+    async fn a_locked_rows_data_takes_only_the_resolvers_video_fields(
         #[case] stored: Option<&str>,
         #[case] incoming: Option<&str>,
         #[case] expected: Option<&str>,
@@ -6385,6 +6547,61 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(data.as_deref(), expected);
+    }
+
+    /// A locked owned row's name on a scan save: an extra's follows the
+    /// planner (`FindExtras` names it), a stacked part's or a local
+    /// alternate's — owned, no `ExtraType` — is kept like any locked row's.
+    #[rstest::rstest]
+    #[case::extra(Some(2), "Deleted Scenes")]
+    #[case::part(None, "Heat (Part Two)")]
+    #[tokio::test]
+    async fn a_locked_owned_rows_name_follows_the_planner_only_for_an_extra(
+        #[case] extra_type: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (id, owner) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, owner, BaseItemKind::Movie).await;
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Video).unwrap().to_owned(),
+            name: Some("Heat (Part Two)".into()),
+            owner_id: Some(guid_to_db(owner)),
+            extra_type,
+            is_locked: true,
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("seed");
+        let stored = sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemEntity>(
+            r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("stored row");
+        let scanned = ferrofin_db::entities::base_items::BaseItemEntity {
+            name: Some("Deleted Scenes".into()),
+            ..stored.clone()
+        };
+        assert_eq!(
+            super::scan_save_changes_row(&scanned, &stored, false),
+            extra_type.is_some(),
+            "the change rule agrees with the SQL"
+        );
+        svc.save_scanned_items(std::slice::from_ref(&scanned))
+            .await
+            .expect("scan save");
+        let name: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(name.as_deref(), Some(expected));
     }
 
     // Merge/split write their link through set_primary_version_id, which must
