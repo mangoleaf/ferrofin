@@ -708,6 +708,42 @@ mod tests {
         );
     }
 
+    // Real clock, as above.
+    #[tokio::test]
+    async fn a_released_version_announces_itself() {
+        // `release_owned_versions` writes outside the save path (the prune
+        // frees a part or version whose owner goes); the row it frees is an
+        // item of its own from then on, and a client must hear so now.
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_traits::persistence::ItemPersistenceService;
+
+        let (n, events) = notifier(Duration::from_millis(50));
+        let db = crate::test_support::test_db().await;
+        let svc = crate::item_persistence_service::FerrofinItemPersistenceService::new(db);
+        // Stored as the scan stores ids (`guid_to_db`), which the release
+        // looks rows up by.
+        let (primary, id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut owner = movie(primary, Uuid::new_v4(), Uuid::new_v4());
+        owner.id = guid_to_db(primary);
+        owner.parent_id = None;
+        owner.top_parent_id = None;
+        let mut part = movie(id, Uuid::new_v4(), Uuid::new_v4());
+        part.id = guid_to_db(id);
+        part.path = Some("/media/a cd2.mkv".to_owned());
+        part.parent_id = None;
+        part.top_parent_id = None;
+        part.owner_id = Some(guid_to_db(primary));
+        svc.save_items(&[owner, part]).await.expect("save");
+        svc.set_change_notifier(Arc::clone(&n));
+
+        assert!(svc.release_owned_versions(&[id]).await.expect("release"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 1, "a release must announce itself");
+        assert_eq!(pushed[0].items_updated, vec![id.simple().to_string()]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_metadata_edit_names_no_collection_folder() {
         // `GetTopParentIds` is fed foldersAddedTo + foldersRemovedFrom. An edit

@@ -52,14 +52,25 @@ impl<'a> VideoListResolver<'a> {
             .collect();
 
         let stack_result = stack_resolver::resolve(&non_extras, self.naming_options);
+        // Every stacked file, as `FileStack.ContainsFile` compares it (ASCII
+        // case-blind, directory or not) — one lookup per file instead of a
+        // pass over every stack.
+        let stacked: std::collections::HashSet<(bool, String)> = stack_result
+            .iter()
+            .flat_map(|stack| {
+                stack
+                    .files
+                    .iter()
+                    .map(|file| (stack.is_directory_stack, file.to_ascii_lowercase()))
+            })
+            .collect();
 
         let mut remaining_files: Vec<VideoFileInfo> = Vec::new();
         let mut standalone_media: Vec<VideoFileInfo> = Vec::new();
 
         for current in video_infos {
-            if stack_result
-                .iter()
-                .any(|s| s.contains_file(&current.path, current.is_directory))
+            if !current.path.is_empty()
+                && stacked.contains(&(current.is_directory, current.path.to_ascii_lowercase()))
             {
                 continue;
             }

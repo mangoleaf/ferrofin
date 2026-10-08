@@ -1440,9 +1440,11 @@ async fn an_extras_subfolder_holding_several_files_is_a_mixed_folder() {
 
 /// Upstream `MovieResolverTests.ResolvePath_MovieFolderWithRealSubfolder_DoesNotResolveToSingleMovie`
 /// (its fixture): a folder holding a real subfolder is no movie's own folder.
-/// Derived from `MovieResolver.ResolveVideos` (`MovieResolver.cs:283-306`):
+/// Derived from `MovieResolver.ResolveVideos` (`MovieResolver.cs:287-317`):
 /// its video is then the folder's one item below the top level, so not in a
-/// mixed folder, named by its parsed file name, and the owner of the folder's
+/// mixed folder, named after the folder its file is named after (a version
+/// group of one, `VideoListResolver.GetVideosGroupedByVersion`,
+/// `VideoListResolver.cs:121-158`), and the owner of the folder's
 /// extras (`BaseItem.SearchesContainingFolderForExtras`) — those beside it and
 /// in an extras-named subfolder, not those in another plain subfolder
 /// (`FindExtras`, `LibraryManager.cs:3459`).
@@ -1458,7 +1460,7 @@ async fn a_movie_folder_with_a_real_subfolder_holds_a_lone_unmixed_video() {
     f.scanner.scan_all().await.unwrap();
     let lone = f.row("Outer Colony (2026)/Outer Colony (2026).mkv").await;
     assert!(!lone.is_in_mixed_folder);
-    assert_eq!(lone.name.as_deref(), Some("Outer Colony"));
+    assert_eq!(lone.name.as_deref(), Some("Outer Colony (2026)"));
     assert_eq!(
         f.row("Outer Colony (2026)/trailers/teaser.mkv")
             .await

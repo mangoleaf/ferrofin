@@ -1940,10 +1940,18 @@ struct PathScope<'a> {
     /// Whether the rows under the roots whose files are gone are removed:
     /// a folder's validation removes them, an item's own refresh never does.
     prune: bool,
-    /// The path-less planned items that sit in a folder the scope covers —
-    /// a virtual season of a covered series — which have no path of their
-    /// own to be judged by. `None` before the plan is known.
-    pathless: Option<&'a std::collections::HashSet<Uuid>>,
+    /// The planned items a covered one brings into scope: the path-less
+    /// ones that sit in a folder the scope covers — a virtual season of a
+    /// covered series — which have no path of their own to be judged by
+    /// ([`covered_pathless`]), and the members of a covered video's local
+    /// group ([`covered_versions`]) below it. `None` before the plan is known.
+    carried: Option<&'a std::collections::HashSet<Uuid>>,
+    /// The members of a covered video's local group above or beside it (its
+    /// primary, its sibling versions and parts, [`covered_versions`]): they
+    /// stay out of scope — no refresh of theirs runs — but are saved with
+    /// what the walk resolved for them, so the group's lists and rows agree.
+    /// `None` before the plan is known.
+    regrouped: Option<&'a std::collections::HashSet<Uuid>>,
     /// The items the scan moved to their new kind's id
     /// ([`LibraryScanner::rekey_changed_kinds`]): each is a new item under
     /// that id and is refreshed and saved as one, even where the scope
@@ -1961,17 +1969,24 @@ impl<'a> PathScope<'a> {
             roots_refreshed: true,
             also: None,
             prune,
-            pathless: None,
+            carried: None,
+            regrouped: None,
             moved: None,
         }
     }
 
+    /// Whether `item` is a member of a covered video's local group that the
+    /// scope does not cover ([`Self::regrouped`]): saved, never refreshed.
+    fn regroups(&self, item: &Planned) -> bool {
+        self.regrouped.is_some_and(|set| set.contains(&item.id))
+    }
+
     /// Whether `item` is in scope: below a root, at one when the roots
-    /// refresh, the extra item, a path-less item in a covered folder, or an
-    /// item the scan moved. The folders above the roots are context.
+    /// refresh, the extra item, an item a covered one carries, or an item
+    /// the scan moved. The folders above the roots are context.
     fn covers(&self, item: &Planned) -> bool {
         if self.also == Some(item.id)
-            || self.pathless.is_some_and(|set| set.contains(&item.id))
+            || self.carried.is_some_and(|set| set.contains(&item.id))
             || self.moved.is_some_and(|set| set.contains(&item.id))
         {
             return true;
@@ -2021,6 +2036,67 @@ fn covered_pathless(planned: &[Planned], scope: PathScope<'_>) -> std::collectio
         covered.insert(item.id, in_scope);
     }
     pathless
+}
+
+/// The members of a local group (a primary, its stacked parts, its local
+/// alternate versions and theirs — linked by `OwnerId`, [`version_owner`])
+/// that `scope` does not cover while it covers another member: the walk
+/// plans a group whole ([`LibraryScanner::plan_video_group`]). Two sets:
+///
+/// - those below a covered member (a covered primary's parts and versions,
+///   a covered version's parts), which refresh with it, as upstream's
+///   refresh of a video refreshes what it owns (`Video.RefreshedOwnedItems`,
+///   `Video.cs:528-627`);
+/// - the rest — the primary and the siblings of a covered version or part —
+///   which only take what the walk resolved for them (their `Data` lists,
+///   their owner and folder state): a refresh of one version never
+///   refreshes the item it belongs to.
+fn covered_versions(
+    planned: &[Planned],
+    scope: PathScope<'_>,
+) -> (
+    std::collections::HashSet<Uuid>,
+    std::collections::HashSet<Uuid>,
+) {
+    let owners: HashMap<Uuid, Uuid> = planned
+        .iter()
+        .filter_map(|p| Some((p.id, version_owner(&p.entity)?)))
+        .collect();
+    let (mut down, mut up) = Default::default();
+    if owners.is_empty() {
+        return (down, up);
+    }
+    // The member and its owners up to the group's primary, nearest first. A
+    // group is at most two owners deep (an alternate's part); the bound only
+    // guards a cycle no plan makes.
+    let chain = |id: Uuid| {
+        let mut chain = vec![id];
+        while let Some(&owner) = owners.get(chain.last().unwrap_or(&id)) {
+            if chain.len() > owners.len() {
+                break;
+            }
+            chain.push(owner);
+        }
+        chain
+    };
+    let covered: std::collections::HashSet<Uuid> = planned
+        .iter()
+        .filter(|p| scope.covers(p))
+        .map(|p| p.id)
+        .collect();
+    let heads: std::collections::HashSet<Uuid> = covered
+        .iter()
+        .filter_map(|&id| chain(id).last().copied())
+        .collect();
+    for p in planned.iter().filter(|p| !covered.contains(&p.id)) {
+        let chain = chain(p.id);
+        if chain[1..].iter().any(|owner| covered.contains(owner)) {
+            down.insert(p.id);
+        } else if chain.last().is_some_and(|head| heads.contains(head)) {
+            up.insert(p.id);
+        }
+    }
+    (down, up)
 }
 
 /// The file stems of the items a sidecar at `path` may belong to: its name
@@ -2546,11 +2622,13 @@ struct PlanOutput {
     /// whole: an owned version of it the walk no longer groups with it is
     /// released ([`released_from`]); an owned version of any other keeps its
     /// owner ([`keep_unplanned_version_owner`]).
-    // TODO(parity, open work item): nothing fills it yet. The movie walk
-    // (PLAN_ITEM_FILE_DELETION step 12 S4) and the TV walk (S8) must emit an
-    // entry — an empty one for a video with no versions — for EVERY video
-    // they plan in a library whose rules group versions, so a group that
-    // dissolved (its versions renamed apart) releases them.
+    ///
+    /// The movie walk lists every video it plans
+    /// ([`LibraryScanner::plan_video_group`]).
+    // TODO(parity, open work item): the TV walk (PLAN_ITEM_FILE_DELETION
+    // step 12 S8) must emit an entry — an empty one for an episode with no
+    // versions — for EVERY episode it plans in a tvshows library, so a group
+    // that dissolved (its versions renamed apart) releases them.
     local_versions: Vec<(Uuid, Vec<String>)>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
@@ -2884,11 +2962,6 @@ pub struct LibraryScanner {
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
-    /// Local groups a test adds to every library scan's plan, standing in for
-    /// the version groups the movie walk does not resolve yet
-    /// (PLAN_ITEM_FILE_DELETION step 12 S4).
-    #[cfg(test)]
-    test_local_versions: Vec<(Uuid, Vec<String>)>,
     /// Optional ffprobe seam. When present, each leaf media file is probed during
     /// the scan so its duration/size and per-stream codec info are persisted —
     /// which is what lets the web client choose direct play (and the transcoder
@@ -3074,8 +3147,6 @@ impl LibraryScanner {
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
-            #[cfg(test)]
-            test_local_versions: Vec::new(),
             media_encoder: None,
             media_streams: None,
             probe_concurrency: default_probe_concurrency(),
@@ -3796,9 +3867,6 @@ impl LibraryScanner {
                 ..ScanOutcome::default()
             });
         }
-        #[cfg(test)]
-        plan.local_versions
-            .extend(self.test_local_versions.iter().cloned());
         let mut result = self.run_scan(&folders, &all_folders, plan, None, run).await;
         if let Ok(outcome) = &mut result {
             outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
@@ -3998,7 +4066,43 @@ impl LibraryScanner {
             }
         }
         roots.extend(self.sidecar_owners(&sidecars));
+        roots.extend(self.removed_files_groups(&chains, &items).await);
         collapse_roots(roots)
+    }
+
+    /// The paths of the stored local groups of the changed paths whose
+    /// stored item's file went ([`ItemPersistenceService::local_group_paths`]),
+    /// for [`changed_roots`](Self::changed_roots). Such a file may leave the
+    /// rest of its group (a stack's parts, a primary's versions) in a folder
+    /// no root covers — a library location's loose files each root at
+    /// themselves. Upstream validates the folder the file went from
+    /// (`FileRefresher.GetAffectedBaseItem` finds its parent), which
+    /// resolves the group anew; here the group's files root too, so the walk
+    /// plans it whole and a surviving part or version is promoted or
+    /// released as a full scan would, before the prune of the gone one.
+    async fn removed_files_groups(
+        &self,
+        chains: &[(&String, Vec<String>)],
+        items: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        let gone: Vec<String> = chains
+            .iter()
+            .map(|(path, _)| (*path).clone())
+            .filter(|path| items.contains(path.as_str()) && !self.file_system.path_exists(path))
+            .collect();
+        if gone.is_empty() {
+            return Vec::new();
+        }
+        match self.persistence.local_group_paths(&gone).await {
+            Ok(paths) => paths.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not look up the local groups of removed files; scanning the paths themselves"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// The items the sidecars in `sidecars` belong to, for
@@ -4118,9 +4222,12 @@ impl LibraryScanner {
                 }
             }
         }
-        let pathless = covered_pathless(&plan.items, scope);
+        let mut carried = covered_pathless(&plan.items, scope);
+        let (owned, regrouped) = covered_versions(&plan.items, scope);
+        carried.extend(owned);
         let scope = PathScope {
-            pathless: Some(&pathless),
+            carried: Some(&carried),
+            regrouped: Some(&regrouped),
             ..scope
         };
         let result = self
@@ -4781,6 +4888,7 @@ impl LibraryScanner {
             // series key.
             if refresh.context_only()
                 && refresh.is_context(item, !is_new)
+                && !refresh.scope.is_some_and(|scope| scope.regroups(item))
                 && let Stored::Existing(row) = stored
             {
                 if let (Some(BaseItemKind::Series), Some(key)) = (
@@ -7185,7 +7293,10 @@ impl LibraryScanner {
                 return None;
             }
         };
-        let held = hold_back_kept_children(&mut stale, &children, live, listed);
+        let mut held = hold_back_kept_children(&mut stale, &children, live, listed);
+        held += self
+            .release_orphaned_versions(cf, &mut stale, &children, live, listed)
+            .await;
         if held > 0 {
             tracing::warn!(
                 library = %cf,
@@ -7206,6 +7317,58 @@ impl LibraryScanner {
             paths.entry(child.id).or_insert_with(|| child.path.clone());
         }
         Some((ids, paths))
+    }
+
+    /// Releases the stacked parts and local alternate versions (owned, no
+    /// extra) of the `stale` rows that this scan did not plan while their own
+    /// files are still on disk — a path-scoped scan rooted at a deleted
+    /// primary's file plans nothing of its group — so the owner's delete,
+    /// which follows `OwnerId`, does not take them and their user data with
+    /// it ([`ItemPersistenceService::release_owned_versions`]); the next scan
+    /// groups them afresh. Where they cannot be released, their owners are
+    /// held back instead. Returns how many rows were held back.
+    async fn release_orphaned_versions(
+        &self,
+        cf: Uuid,
+        stale: &mut std::collections::HashSet<Uuid>,
+        children: &[ferrofin_traits::persistence::ItemChildLink],
+        live: &std::collections::HashSet<Uuid>,
+        listed: &(dyn Fn(Option<&str>) -> bool + Sync),
+    ) -> usize {
+        let orphaned: Vec<Uuid> = children
+            .iter()
+            .filter(|child| {
+                child.extra_type.is_none()
+                    && child.owner_id.is_some_and(|owner| stale.contains(&owner))
+                    && !stale.contains(&child.id)
+                    && child
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| self.file_system.file_exists(path))
+            })
+            .map(|child| child.id)
+            .collect();
+        if orphaned.is_empty() {
+            return 0;
+        }
+        match self.persistence.release_owned_versions(&orphaned).await {
+            Ok(true) => {
+                tracing::info!(
+                    library = %cf,
+                    released = orphaned.len(),
+                    "released parts and versions whose owner is gone; the next scan groups them"
+                );
+                0
+            }
+            result => {
+                if let Err(err) = result {
+                    tracing::warn!(%err, library = %cf, "could not release parts and versions");
+                }
+                let mut kept = live.clone();
+                kept.extend(orphaned);
+                hold_back_kept_children(stale, children, &kept, listed)
+            }
+        }
     }
 
     /// The stored rows of the library whose rows carry `top_parents` (its
@@ -10637,12 +10800,20 @@ impl LibraryScanner {
         let extras_root = if plain_folder { dir } else { root };
         // A per-file folder's `ResolveVideos` stopped before its sample filter.
         let has_movie_files = !per_file && has_movie_files(&entries, naming, extras_root);
+        // What `ResolveVideos` makes of the folder's files, once: the own
+        // folder's movie (`FindMovie`, versions grouped in every library
+        // type, `MovieResolver.cs:472-476`), else the folder's videos by the
+        // library's rules (`MovieResolver.cs:191-237`); nothing in an extras
+        // folder, and nothing where the files resolve one by one.
+        let videos = match &movie {
+            Some(movie) => vec![movie.clone()],
+            None if extras_folder || per_file => Vec::new(),
+            None => folder_videos(&entries, extras_root, naming, walk),
+        };
         // A video in its own folder is not in a mixed folder; one at the
         // library root always is (`IsTopParent`); elsewhere `ResolveVideos`
         // decides, and a lone video owns the folder's extras.
-        let lone = plain_folder
-            .then(|| lone_video(&entries, dir, naming, walk))
-            .flatten();
+        let lone = plain_folder.then(|| lone_video(&videos)).flatten();
         let mixed = if plain_folder {
             lone.is_none()
         } else {
@@ -10650,7 +10821,7 @@ impl LibraryScanner {
         };
         // The movie, or the lone video of a folder that is no photo album,
         // owns the folder's extras.
-        if let Some(owner) = movie.as_ref().or(lone.as_ref().filter(|_| album.is_none())) {
+        if let Some(owner) = movie.as_ref().or(lone.filter(|_| album.is_none())) {
             self.register_extras_owner(dir, owner, kind, ctx, movies_by_dir);
         }
         let folder = MovieFolder {
@@ -10668,6 +10839,7 @@ impl LibraryScanner {
                 per_file,
                 ..walk
             },
+            groups: VideoGroups::of(videos, naming),
         };
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory && extras_folder {
@@ -10763,20 +10935,183 @@ impl LibraryScanner {
             ctx.excluded.borrow_mut().push(entry.path);
             return;
         }
+        // A file of a resolved video is planned with the whole of it, at its
+        // first file.
+        if let Some((video, first)) = folder.groups.holding(&entry.path) {
+            if first {
+                self.plan_video_group(video, folder, ctx, out);
+            }
+            return;
+        }
         if !ctx.scope.keeps(&entry.path) {
             return;
         }
-        if let Some(mut planned) = self.movie_file(
-            &entry,
-            folder.dir,
-            folder.own_folder,
-            folder.walk,
-            folder.cf,
-            ctx,
-        ) {
+        // A file `ResolveVideos` did not take resolves on its own: a video
+        // of its own, with no parts or versions (`MovieResolver.cs:167-186`).
+        if let Some(mut planned) = self.movie_file(&entry.path, folder, None, ctx) {
             settle_mixed_folder(&mut planned.entity, folder.mixed, folder.dir, naming);
+            set_resolved_lists(&mut planned.entity, &[], &[]);
+            ctx.local_versions
+                .borrow_mut()
+                .push((planned.id, Vec::new()));
             ctx.emit(out, planned);
         }
+    }
+
+    /// A video `ResolveVideos` resolved in `folder` — a stack's parts, a
+    /// primary's local alternate versions, or a lone file — planned whole
+    /// (`MovieResolver.cs:287-317`): the primary, its file the first,
+    /// carrying the other parts' paths as `AdditionalParts` and each
+    /// alternate's first file as `LocalAlternateVersions`; a `Video` row per
+    /// other part, owned by the primary (`Video.RefreshMetadataForOwnedVideo`,
+    /// `Video.cs:636-701`); and a row per alternate of the primary's kind,
+    /// owned by and pointing at it (`LibraryManager.ResolveAlternateVersion`
+    /// and `CreateItems`, `LibraryManager.cs:865-922,2446-2487`), whose own
+    /// stack is its `AdditionalParts` and part rows it owns
+    /// (`SetAdditionalPartsFromStack`, `:828-862`). Parts and alternates hang
+    /// where the primary does and take its `IsInMixedFolder`. The primary's
+    /// group goes to [`PlanOutput::local_versions`].
+    ///
+    /// The group is planned whole when the scope keeps any of its files
+    /// ([`covered_versions`] refreshes it whole), so its lists and its rows
+    /// never disagree. A `.disc` stub the naming rules group is left out:
+    /// the walk plans no stub.
+    fn plan_video_group(
+        &self,
+        video: &ferrofin_naming::video::VideoInfo,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        let naming = ctx.naming;
+        let playable = |files: &[ferrofin_naming::video::VideoFileInfo]| -> Vec<String> {
+            files
+                .iter()
+                .map(|file| file.path.clone())
+                .filter(|path| video_resolver::is_video_file(path, naming))
+                .collect()
+        };
+        let parts = playable(video.files.get(1..).unwrap_or_default());
+        let alternates: Vec<(String, Vec<String>)> = video
+            .alternate_versions
+            .iter()
+            .filter_map(|alternate| {
+                let (first, rest) = alternate.files.split_first()?;
+                video_resolver::is_video_file(&first.path, naming)
+                    .then(|| (first.path.clone(), playable(rest)))
+            })
+            .collect();
+        let kept = std::iter::once(&video.files[0].path)
+            .chain(&parts)
+            .chain(
+                alternates
+                    .iter()
+                    .flat_map(|(first, rest)| std::iter::once(first).chain(rest)),
+            )
+            .any(|path| ctx.scope.keeps(path));
+        if !kept {
+            return;
+        }
+        let Some(mut primary) = self.movie_file(&video.files[0].path, folder, Some(video), ctx)
+        else {
+            return;
+        };
+        settle_mixed_folder(&mut primary.entity, folder.mixed, folder.dir, naming);
+        let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
+        set_resolved_lists(&mut primary.entity, &parts, &versions);
+        let (owner, mixed) = (primary.id, primary.entity.is_in_mixed_folder);
+        ctx.local_versions.borrow_mut().push((owner, versions));
+        out.push(primary);
+        self.plan_parts(&parts, owner, mixed, folder, ctx, out);
+        for (first, rest) in &alternates {
+            let Some(mut alternate) = self.owned_video(first, folder.walk.kind, folder, ctx) else {
+                continue;
+            };
+            alternate.entity.owner_id = Some(guid_to_db(owner));
+            alternate.entity.primary_version_id = Some(guid_to_db(owner));
+            settle_mixed_folder(&mut alternate.entity, mixed, folder.dir, naming);
+            set_resolved_lists(&mut alternate.entity, rest, &[]);
+            let id = alternate.id;
+            out.push(alternate);
+            self.plan_parts(rest, id, mixed, folder, ctx, out);
+        }
+    }
+
+    /// The `Video` rows of the stacked `parts` of the video `owner`, owned
+    /// by it and created in its mixed-folder state `mixed`
+    /// (`Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`: the base
+    /// type, `OwnerId` and `IsInMixedFolder` of the video it belongs to).
+    fn plan_parts(
+        &self,
+        parts: &[String],
+        owner: Uuid,
+        mixed: bool,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        for path in parts {
+            let Some(mut part) = self.owned_video(path, BaseItemKind::Video, folder, ctx) else {
+                continue;
+            };
+            part.entity.owner_id = Some(guid_to_db(owner));
+            part.entity.is_in_mixed_folder = mixed;
+            set_resolved_lists(&mut part.entity, &[], &[]);
+            out.push(part);
+        }
+    }
+
+    /// The row of a part or an alternate version at `path`, of `kind`, as
+    /// its owner resolves it — the file alone, through the resolver chain
+    /// (`LibraryManager.ResolvePath`, then the owner's type,
+    /// `LibraryManager.cs:896-921`, `Video.cs:670-686`): named and dated
+    /// from the file in a movies library (`ResolveVideo<Movie>(args, true)`,
+    /// `MovieResolver.cs:158-162`), else by the file name, undated
+    /// (`ResolveVideo<…>(args, false)`; a music video dates itself on its
+    /// first refresh, as [`Self::movie_file`] has it). It hangs where its
+    /// owner does: the owner's parent folder (`GetParent()`).
+    fn owned_video(
+        &self,
+        path: &str,
+        kind: BaseItemKind,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+    ) -> Option<Planned> {
+        let parsed = video_resolver::resolve_file(Some(path), ctx.naming, None);
+        let movies = folder.walk.collection_type == Some(CollectionTypeOptions::movies);
+        let (name, year) = match parsed {
+            Some(info) if movies => (info.name, info.year),
+            parsed => (
+                file_stem(path),
+                parsed
+                    .and_then(|info| info.year)
+                    .filter(|_| kind == BaseItemKind::MusicVideo),
+            ),
+        };
+        self.video_row(path, kind, name, year, folder, ctx)
+    }
+
+    /// A video row of `kind` at `path` in `folder`: named `name`, dated
+    /// `year`, with its file's `VideoType`.
+    fn video_row(
+        &self,
+        path: &str,
+        kind: BaseItemKind,
+        name: String,
+        year: Option<i32>,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+    ) -> Option<Planned> {
+        let (parent, ancestors) = folder.walk.parent(folder.cf, ctx);
+        let (id, mut entity) = self.base_item(ctx, kind, folder.cf, parent, name, path, false)?;
+        entity.media_type = Some("Video".to_owned());
+        entity.production_year = year.map(i64::from);
+        set_video_type(&mut entity, file_video_type(path));
+        Some(Planned {
+            id,
+            entity,
+            ancestors,
+        })
     }
 
     /// A series in an untyped library: named by the naming rules' series
@@ -10886,48 +11221,58 @@ impl LibraryScanner {
         (walk, Some(id))
     }
 
-    /// The row for the video `entry` in `dir`, resolved in `walk`.
+    /// The row for the video at `path` in `folder`, of the folder walk's
+    /// kind; `video` is the item `ResolveVideos` made of it — its first
+    /// file — if any (a file resolved on its own has none).
     fn movie_file(
         &self,
-        entry: &FileSystemEntryInfo,
-        dir: &str,
-        own_folder: bool,
-        walk: MovieWalk,
-        cf: Uuid,
+        path: &str,
+        folder: &MovieFolder<'_>,
+        video: Option<&ferrofin_naming::video::VideoInfo>,
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned> {
-        let kind = walk.kind;
-        let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), ctx.naming, None)
-            .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
+        let kind = folder.walk.kind;
+        let parsed = || {
+            video_resolver::resolve_file(Some(path), ctx.naming, None).map_or_else(
+                || (entry_name(path).to_owned(), None),
+                |info| (info.name, info.year),
+            )
+        };
         // Port of MovieResolver: a movie in its OWN folder is named from that folder
         // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
         // file in the library root keeps its clean_date_time-parsed name (year stripped).
         // ProductionYear is still populated either way. Where names are not
         // parsed (music videos, home videos) the name is the file's and no
         // year is read (`VideoResolver.Resolve` with `parseName: false`).
-        let (_, parse_name, _) = movie_walk_resolution(walk);
+        // A resolved video is named and dated as `ResolveVideos` has it
+        // (`Name = parseName ? video.Name : firstVideo.Name`,
+        // `ProductionYear = video.Year`, `MovieResolver.cs:298-309`): a
+        // stack by its title, a version group by its folder — parsed once,
+        // by the resolver.
+        let (_, parse_name, _) = movie_walk_resolution(folder.walk);
         let (name, year) = if !parse_name {
             // A music video still dates itself from its name on its first
             // refresh (`MusicVideo.BeforeMetadataRefresh`, `MusicVideo.cs:39-72`),
             // which Ferrofin runs on stored rows only: the new row carries it
             // (and its folder's, [`settle_mixed_folder`]).
-            let year = year.filter(|_| kind == BaseItemKind::MusicVideo);
-            (file_stem(&entry.path), year)
-        } else if own_folder {
-            (folder_name(dir).unwrap_or(clean_name), year)
+            let year = (kind == BaseItemKind::MusicVideo)
+                .then(|| parsed().1)
+                .flatten();
+            (file_stem(path), year)
+        } else if let Some(video) = video {
+            let name = if folder.own_folder {
+                folder_name(folder.dir)
+            } else {
+                video.name.clone()
+            };
+            (name.unwrap_or_else(|| parsed().0), video.year)
+        } else if folder.own_folder {
+            let (clean_name, year) = parsed();
+            (folder_name(folder.dir).unwrap_or(clean_name), year)
         } else {
-            (clean_name, year)
+            parsed()
         };
-        let (parent, ancestors) = walk.parent(cf, ctx);
-        let (id, mut entity) = self.base_item(ctx, kind, cf, parent, name, &entry.path, false)?;
-        entity.media_type = Some("Video".to_owned());
-        entity.production_year = year.map(i64::from);
-        set_video_type(&mut entity, file_video_type(&entry.path));
-        Some(Planned {
-            id,
-            entity,
-            ancestors,
-        })
+        self.video_row(path, kind, name, year, folder, ctx)
     }
 
     /// Registers `movie`, resolved in `dir`, as the owner of the extras its
@@ -11013,6 +11358,12 @@ impl LibraryScanner {
         // A rip is its own folder, never a mixed one: an undated movie or
         // music video takes the folder name's year ([`settle_mixed_folder`]).
         settle_mixed_folder(&mut entity, false, dir, ctx.naming);
+        // A video with no parts or versions (`FindMovie`'s rip arm,
+        // `MovieResolver.cs:422-458`).
+        set_resolved_lists(&mut entity, &[], &[]);
+        if ctx.scope.keeps(dir) {
+            ctx.local_versions.borrow_mut().push((id, Vec::new()));
+        }
         ctx.emit(
             out,
             Planned {
@@ -13191,10 +13542,11 @@ fn is_extras_folder_below_top(dir: &str, root: &str, naming: &NamingOptions) -> 
 }
 
 /// Stores a planned video's `IsInMixedFolder`, and — for a movie or music
-/// video still undated — the year of its containing folder's name when it is
-/// not in a mixed folder, the second step of `Movie`/`MusicVideo`
-/// `.BeforeMetadataRefresh` (`Movie.cs:89-123`, `MusicVideo.cs:39-72`) that
-/// [`before_metadata_refresh`] runs for a stored row: a new one takes it here.
+/// video still undated — the year in its name, else that of its containing
+/// folder's name when it is not in a mixed folder: `Movie`/`MusicVideo`
+/// `.BeforeMetadataRefresh` (`Movie.cs:89-123`, `MusicVideo.cs:39-72`), which
+/// [`before_metadata_refresh`] runs for a stored row: a new one takes it here,
+/// so its first rescan finds nothing to date.
 fn settle_mixed_folder(
     entity: &mut BaseItemEntity,
     mixed: bool,
@@ -13202,10 +13554,18 @@ fn settle_mixed_folder(
     naming: &NamingOptions,
 ) {
     entity.is_in_mixed_folder = mixed;
-    let dated_by_folder = entity.type_.ends_with(".Movie") || entity.type_.ends_with(".MusicVideo");
-    if dated_by_folder && !mixed && entity.production_year.is_none() {
-        entity.production_year = folder_name(dir)
-            .and_then(|name| video_resolver::clean_date_time(&name, naming).year)
+    let dated_by_name = entity.type_.ends_with(".Movie") || entity.type_.ends_with(".MusicVideo");
+    if dated_by_name && entity.production_year.is_none() {
+        let year_in = |name: &str| video_resolver::clean_date_time(name, naming).year;
+        entity.production_year = entity
+            .name
+            .as_deref()
+            .and_then(year_in)
+            .or_else(|| {
+                (!mixed)
+                    .then(|| folder_name(dir).and_then(|name| year_in(&name)))
+                    .flatten()
+            })
             .map(i64::from);
     }
 }
@@ -13249,11 +13609,12 @@ fn holds_tv_nfo(entries: &[FileSystemEntryInfo]) -> bool {
 /// a top-level item's `ParentId` too, and every item's ancestors the
 /// location folder and the `AggregateFolder` besides its collection folder
 /// (which stays first: the scan keys the library by it). An owned extra
-/// keeps its own shape.
+/// keeps its own shape; a stacked part or a local alternate version hangs
+/// where its primary does.
 fn place_under_location(items: &mut [Planned], cf: Uuid, location_folder: Uuid, aggregate: Uuid) {
     let (cf_db, location_db) = (guid_to_db(cf), guid_to_db(location_folder));
     for item in items {
-        if item.entity.owner_id.is_some() {
+        if item.entity.owner_id.is_some() && item.entity.extra_type.is_some() {
             continue;
         }
         if item.entity.top_parent_id.as_deref() == Some(cf_db.as_str()) {
@@ -13329,34 +13690,48 @@ fn movie_walk_resolution(
     }
 }
 
-/// The lone video `ResolveVideos` makes of a folder below the top level that
-/// is no movie's own folder (a plain `Folder` upstream), if it makes exactly
-/// one and it is no extra: that video is not in a mixed folder
-/// (`IsInMixedFolder = Count > 1`, `MovieResolver.cs:283-287`) and so owns
-/// the folder's extras (`BaseItem.SearchesContainingFolderForExtras`).
-/// Otherwise — several items, or one extra, whose folder falls back to
-/// resolving each file as a mixed-folder video (`MovieResolver.cs:167-186`)
-/// — `None`. Without a collection type a folder holding `tvshow.nfo` or
-/// `season.nfo` takes that fallback too (`MovieResolver.cs:256-263`).
-fn lone_video(
+/// The items `ResolveVideos` makes of `entries`, the listing of a folder
+/// that is no movie's own folder (a plain `Folder` upstream, or the library
+/// root), its files classified under `root`, in `walk`'s library
+/// (`ResolveMultipleInternal`, `MovieResolver.cs:191-237`): stacks, and
+/// version groups where the library groups them, each one item; extras
+/// too. None where a library without a collection type finds `tvshow.nfo`
+/// or `season.nfo`, which stops `ResolveVideos` (`MovieResolver.cs:256-263`).
+fn folder_videos(
     entries: &[FileSystemEntryInfo],
-    dir: &str,
+    root: &str,
     naming: &NamingOptions,
     walk: MovieWalk,
-) -> Option<ferrofin_naming::video::VideoInfo> {
+) -> Vec<ferrofin_naming::video::VideoInfo> {
     let (multi_editions, parse_name, collection_type) = movie_walk_resolution(walk);
     if collection_type.is_none() && holds_tv_nfo(entries) {
-        return None;
+        return Vec::new();
     }
-    let mut resolved = resolved_videos(
+    resolved_videos(
         entries,
-        dir,
+        root,
         naming,
         multi_editions,
         parse_name,
         collection_type,
-    );
-    (resolved.len() == 1 && resolved[0].extra_type.is_none()).then(|| resolved.remove(0))
+    )
+}
+
+/// The lone video `ResolveVideos` makes of a folder below the top level that
+/// is no movie's own folder (`videos`, [`folder_videos`]), if it makes
+/// exactly one and it is no extra: that video is not in a mixed folder
+/// (`IsInMixedFolder = Count > 1`, `MovieResolver.cs:283-287`) and so owns
+/// the folder's extras (`BaseItem.SearchesContainingFolderForExtras`).
+/// Otherwise — several items, or one extra, or none (a folder that falls
+/// back to resolving each file as a mixed-folder video,
+/// `MovieResolver.cs:167-186`) — `None`.
+fn lone_video(
+    videos: &[ferrofin_naming::video::VideoInfo],
+) -> Option<&ferrofin_naming::video::VideoInfo> {
+    match videos {
+        [video] if video.extra_type.is_none() => Some(video),
+        _ => None,
+    }
 }
 
 /// Records whether the episodes in `dir` (listed as `entries`) are in a
@@ -13466,6 +13841,77 @@ struct MovieFolder<'a> {
     mixed: bool,
     /// The walk its files are resolved in.
     walk: MovieWalk,
+    /// The videos `ResolveVideos` made of its files.
+    groups: VideoGroups,
+}
+
+/// The videos `ResolveVideos` made of a folder the movie walk lists (extras
+/// left out), and which of them holds each file: a stack holds its parts, a
+/// primary its alternate versions and theirs.
+struct VideoGroups {
+    /// The videos, each named by its first file.
+    videos: Vec<ferrofin_naming::video::VideoInfo>,
+    /// The index in `videos` of the video holding each file, by path.
+    at: HashMap<String, usize>,
+}
+
+impl VideoGroups {
+    /// `videos` less the extras, and less a video or an alternate version
+    /// whose first file is no video file (a `.disc` stub, which the walk does
+    /// not plan): its other files are planned on their own.
+    fn of(videos: Vec<ferrofin_naming::video::VideoInfo>, naming: &NamingOptions) -> Self {
+        let playable = |video: &ferrofin_naming::video::VideoInfo| {
+            video
+                .files
+                .first()
+                .is_some_and(|file| video_resolver::is_video_file(&file.path, naming))
+        };
+        let videos: Vec<_> = videos
+            .into_iter()
+            .filter(|video| video.extra_type.is_none() && playable(video))
+            .map(|mut video| {
+                video.alternate_versions.retain(playable);
+                video
+            })
+            .collect();
+        let mut at = HashMap::new();
+        for (index, video) in videos.iter().enumerate() {
+            for file in std::iter::once(video)
+                .chain(&video.alternate_versions)
+                .flat_map(|version| &version.files)
+            {
+                at.insert(file.path.clone(), index);
+            }
+        }
+        Self { videos, at }
+    }
+
+    /// The video holding the file at `path`, and whether `path` is its first
+    /// file — where the walk plans it.
+    fn holding(&self, path: &str) -> Option<(&ferrofin_naming::video::VideoInfo, bool)> {
+        let video = &self.videos[*self.at.get(path)?];
+        Some((video, video.files[0].path == path))
+    }
+}
+
+/// Writes the resolver's `AdditionalParts` and `LocalAlternateVersions` —
+/// `parts` and `versions`, by path — into a planned video's `Data`, both
+/// always, empty or not: every video the resolver returns carries both
+/// (`MovieResolver.cs:298-309`; a part or an alternate is created as a new
+/// `Video` with its own, `LibraryManager.cs:2446-2487`), and the scan's
+/// `UpdateFromResolvedItem` port replaces a stored list only with one the
+/// planner wrote ([`crate::item_data::with_resolved_video_fields`]).
+fn set_resolved_lists(entity: &mut BaseItemEntity, parts: &[String], versions: &[String]) {
+    let [additional_parts, local_versions] = crate::item_data::RESOLVED_VIDEO_PATH_LISTS;
+    if let Some(data) = crate::item_data::merge_data_fields(
+        entity.data.as_deref(),
+        &[
+            (additional_parts, Some(serde_json::json!(parts))),
+            (local_versions, Some(serde_json::json!(versions))),
+        ],
+    ) {
+        entity.data = Some(data);
+    }
 }
 
 /// An extra the movie walk found, before its owner is known.
@@ -16284,24 +16730,22 @@ mod tests {
     }
 
     /// The primary's file is deleted and the walk promotes one of its
-    /// versions: V (1080p) heads the group with W (720p). Neither keeps the
-    /// old primary P as its owner — the prune of P follows `OwnerId` — so
-    /// both survive P's removal with their user data, V points at nothing
-    /// and W points at V.
+    /// versions: P (2160p) headed V (1080p) and W (720p); with P's file gone
+    /// V heads the group with W. Neither keeps P as its owner — the prune of
+    /// P follows `OwnerId` — so both survive P's removal with their user
+    /// data, V points at nothing and W, owned by V, points at V.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_version_promoted_over_a_deleted_primary_survives_its_prune() {
         use crate::item_repository::FerrofinItemRepository;
         use crate::item_type_lookup::{ItemTypeLookup, derive_item_id};
         use crate::linked_children_service::FerrofinLinkedChildrenService;
-        use crate::test_support::{
-            fetch_item, fetch_item_opt, save_item, seed_user, seed_user_data,
-        };
+        use crate::test_support::{fetch_item, fetch_item_opt, seed_user, seed_user_data};
         use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
         use ferrofin_db::store::guid_to_db;
         use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
         use ferrofin_model::entities::CollectionTypeOptions;
         use ferrofin_traits::library::VirtualFolderManager as _;
-        use ferrofin_traits::persistence::{LinkedChildrenService as _, LocalVersionGroup};
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
         use std::sync::Arc;
         use uuid::Uuid;
 
@@ -16314,7 +16758,7 @@ mod tests {
             path("Movie - 1080p.mkv"),
             path("Movie - 720p.mkv"),
         );
-        for file in [&v_path, &w_path] {
+        for file in [&p_path, &v_path, &w_path] {
             std::fs::write(file, b"").expect("write");
         }
         let db = crate::test_support::test_db().await;
@@ -16339,33 +16783,27 @@ mod tests {
             db.clone(),
             Arc::new(ItemTypeLookup::new()),
         ));
-        let mut scanner =
+        let scanner =
             LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
                 .with_items(items);
         scanner.scan_all().await.expect("first scan");
         let id = |path: &str| derive_item_id(BaseItemKind::Movie, path).expect("id");
         let (p, v, w) = (id(&p_path), id(&v_path), id(&w_path));
+        let links = FerrofinLinkedChildrenService::new(db.clone());
 
-        // The stored group as a scan before the deletion left it: P primary,
-        // V and W its owned local versions.
-        let mut primary = fetch_item(&db, v).await;
-        primary.id = guid_to_db(p);
-        primary.path = Some(p_path.clone());
-        save_item(&db, &primary).await;
+        // The walk grouped them: P primary, V and W its owned local versions.
+        assert_eq!(
+            links
+                .get_linked_children_ids(p, Some(2))
+                .await
+                .expect("links"),
+            vec![v, w]
+        );
         for version in [v, w] {
-            let mut row = fetch_item(&db, version).await;
-            row.owner_id = Some(guid_to_db(p));
-            row.primary_version_id = Some(guid_to_db(p));
-            save_item(&db, &row).await;
+            let row = fetch_item(&db, version).await;
+            assert_eq!(row.owner_id, Some(guid_to_db(p)));
+            assert_eq!(row.primary_version_id, Some(guid_to_db(p)));
         }
-        persistence
-            .sync_local_versions(&[LocalVersionGroup {
-                primary: p,
-                versions: Some(vec![v, w]),
-                released: Vec::new(),
-            }])
-            .await
-            .expect("group");
         let user = Uuid::new_v4();
         seed_user(&db, user).await;
         for version in [v, w] {
@@ -16373,7 +16811,7 @@ mod tests {
         }
 
         // P's file is gone: the walk resolves V as the primary, W its version.
-        scanner.test_local_versions = vec![(v, vec![w_path.clone()])];
+        std::fs::remove_file(&p_path).expect("remove");
         scanner.scan_all().await.expect("second scan");
 
         assert!(fetch_item_opt(&db, p).await.is_none(), "P is pruned");
@@ -16383,10 +16821,10 @@ mod tests {
             (None, None)
         );
         let version = fetch_item(&db, w).await;
-        assert_eq!(version.owner_id, None);
+        assert_eq!(version.owner_id, Some(guid_to_db(v)));
         assert_eq!(version.primary_version_id, Some(guid_to_db(v)));
         assert_eq!(
-            FerrofinLinkedChildrenService::new(db.clone())
+            links
                 .get_linked_children_ids(v, Some(2))
                 .await
                 .expect("links"),
@@ -21977,7 +22415,8 @@ mod tests {
             roots: &roots,
             roots_refreshed: false,
             also: Some(artist),
-            pathless: None,
+            carried: None,
+            regrouped: None,
             moved: None,
         };
         let at = |id: u128, path: &str| super::Planned {
@@ -22007,6 +22446,62 @@ mod tests {
             !scope.covers(&at(6, "/music/Artist A/Album A1")),
             "the artist's own albums"
         );
+    }
+
+    /// A scope covering one member of a local group carries what that member
+    /// owns into its refresh and regroups the rest — the primary, its parts,
+    /// its alternates and theirs — and nothing else: not an extra the
+    /// primary owns, not another movie.
+    #[test]
+    fn a_scope_over_one_version_carries_its_whole_group() {
+        use ferrofin_db::store::guid_to_db;
+        let id = uuid::Uuid::from_u128;
+        let row = |n: u128, path: &str, owner: Option<u128>, shape: &str| super::Planned {
+            id: id(n),
+            entity: BaseItemEntity {
+                id: guid_to_db(id(n)),
+                path: Some(format!("/movies/Twins/{path}")),
+                owner_id: owner.map(|o| guid_to_db(id(o))),
+                primary_version_id: (shape == "alternate").then(|| guid_to_db(id(owner.unwrap()))),
+                extra_type: (shape == "extra").then_some(1),
+                ..BaseItemEntity::default()
+            },
+            ancestors: Vec::new(),
+        };
+        let planned = [
+            row(1, "Twins.mkv", None, "primary"),
+            row(2, "Twins cd2.mkv", Some(1), "part"),
+            row(3, "Twins - 1080p part1.mkv", Some(1), "alternate"),
+            row(4, "Twins - 1080p part2.mkv", Some(3), "part"),
+            row(5, "Twins-trailer.mkv", Some(1), "extra"),
+            row(6, "Other.mkv", None, "primary"),
+        ];
+        let roots = vec!["/movies/Twins/Twins - 1080p part2.mkv".to_owned()];
+        let scope = super::PathScope::of(&roots, true);
+        let sorted = |set: std::collections::HashSet<uuid::Uuid>| {
+            let mut ids: Vec<_> = set.into_iter().collect();
+            ids.sort();
+            ids
+        };
+        // Over the alternate's part: the primary, its part and the alternate
+        // are above or beside it.
+        let (down, up) = super::covered_versions(&planned, scope);
+        assert!(down.is_empty());
+        assert_eq!(sorted(up), vec![id(1), id(2), id(3)]);
+        // Over the alternate: its part refreshes with it; the primary and its
+        // part are only regrouped.
+        let roots = vec!["/movies/Twins/Twins - 1080p part1.mkv".to_owned()];
+        let (down, up) = super::covered_versions(&planned, super::PathScope::of(&roots, true));
+        assert_eq!(sorted(down), vec![id(4)]);
+        assert_eq!(sorted(up), vec![id(1), id(2)]);
+        // Over the primary: everything it owns that is no extra refreshes.
+        let roots = vec!["/movies/Twins/Twins.mkv".to_owned()];
+        let (down, up) = super::covered_versions(&planned, super::PathScope::of(&roots, true));
+        assert_eq!(sorted(down), vec![id(2), id(3), id(4)]);
+        assert!(up.is_empty());
+        let roots = vec!["/movies/Twins/Other.mkv".to_owned()];
+        let (down, up) = super::covered_versions(&planned, super::PathScope::of(&roots, true));
+        assert!(down.is_empty() && up.is_empty());
     }
 
     /// A path-scoped refresh gives its options to the items at or under its
@@ -28196,6 +28691,7 @@ mod tests {
             id: id(n),
             parent_id: parent.map(id),
             owner_id: owner.map(id),
+            extra_type: owner.map(|_| 1),
             path: (!path.is_empty()).then(|| path.to_owned()),
         };
         let listed = |path: Option<&str>| path.is_none_or(|p| !p.starts_with("/unlisted"));
@@ -29052,17 +29548,17 @@ mod tests {
     /// and `…WithRealSubfolder_DoesNotResolveToSingleMovie` (PR #17964): a
     /// sample subfolder, like any extras-named one, leaves the folder the
     /// movie's own (named after the folder, `FindMovie`); any other subfolder
-    /// makes it a plain folder whose files resolve one by one.
+    /// makes it a plain folder whose files `ResolveVideos` resolves (here
+    /// into the one movie, named after the folder all the same).
     #[rstest::rstest]
-    #[case("Sample", true)]
-    #[case("sample", true)]
-    #[case("SAMPLE", true)]
-    #[case("samples", true)]
-    #[case("Feature", false)]
+    #[case::sample("Sample")]
+    #[case::lower("sample")]
+    #[case::upper("SAMPLE")]
+    #[case::plural("samples")]
+    #[case::real("Feature")]
     #[tokio::test]
     async fn a_movie_folder_with_a_subfolder_is_the_movies_own_unless_it_is_real(
         #[case] sub_dir: &str,
-        #[case] own_folder: bool,
     ) {
         use ferrofin_model::data::BaseItemKind;
 
@@ -29080,14 +29576,12 @@ mod tests {
             movies[0].path.as_deref(),
             Some(folder.join("Outer Colony (2026).mkv").to_str().unwrap())
         );
-        // A movie in its own folder takes the folder's raw name (year kept);
-        // a file of a plain folder keeps its cleaned file name.
-        let expected = if own_folder {
-            "Outer Colony (2026)"
-        } else {
-            "Outer Colony"
-        };
-        assert_eq!(movies[0].name.as_deref(), Some(expected));
+        // A movie in its own folder takes the folder's raw name (year kept,
+        // `FindMovie`); so does the lone file of a plain movies folder named
+        // after it: `ResolveVideos` groups its versions, one here, under the
+        // folder's name (`GetVideosGroupedByVersion`, `VideoListResolver.cs:
+        // 121-158`; `Name = video.Name`, `MovieResolver.cs:298-309`).
+        assert_eq!(movies[0].name.as_deref(), Some("Outer Colony (2026)"));
     }
 
     // A disc rip is one item for its folder (never one per .vob/.m2ts), and

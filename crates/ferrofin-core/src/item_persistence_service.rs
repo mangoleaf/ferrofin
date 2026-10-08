@@ -1481,10 +1481,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             let mut next = Vec::new();
             for chunk in frontier.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
                 let sql = child_links_sql(chunk.len());
-                let mut query = sqlx::query_as::<
-                    _,
-                    (String, Option<String>, Option<String>, Option<String>),
-                >(sqlx::AssertSqlSafe(sql.as_str()));
+                let mut query =
+                    sqlx::query_as::<_, ChildLinkRow>(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
                     query = query.bind(id);
                 }
@@ -2516,15 +2514,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut out: Vec<ItemChildLink> = Vec::new();
         for chunk in parents.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = child_links_sql(chunk.len());
-            let mut query = sqlx::query_as::<
-                _,
-                (String, Option<String>, Option<String>, Option<String>),
-            >(sqlx::AssertSqlSafe(sql.as_str()));
+            let mut query = sqlx::query_as::<_, ChildLinkRow>(sqlx::AssertSqlSafe(sql.as_str()));
             for parent in chunk {
                 query = query.bind(guid_to_db(*parent));
             }
             let parse = |id: Option<String>| id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-            for (id, parent, owner, path) in
+            for (id, parent, owner, path, extra_type) in
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 if let Ok(id) = Uuid::parse_str(&id) {
@@ -2532,6 +2527,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         id,
                         parent_id: parse(parent),
                         owner_id: parse(owner),
+                        extra_type,
                         path,
                     });
                 }
@@ -2540,6 +2536,73 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut seen = std::collections::HashSet::with_capacity(out.len());
         out.retain(|row| seen.insert(row.id));
         Ok(Some(out))
+    }
+
+    async fn local_group_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<String>>, ServiceError> {
+        let mut out: Vec<String> = Vec::new();
+        for chunk in paths.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = local_group_paths_sql(chunk.len());
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
+            for path in chunk {
+                query = query.bind(path);
+            }
+            out.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(Some(out))
+    }
+
+    async fn release_owned_versions(&self, ids: &[Uuid]) -> Result<bool, ServiceError> {
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for &id in ids {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "OwnerId" = NULL, "PrimaryVersionId" = NULL,
+                       "PresentationUniqueKey" = ?2
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(id.as_simple().to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            sqlx::query(
+                r#"DELETE FROM "LinkedChildren" WHERE "ChildId" = ?1 AND "ChildType" = ?2"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(LOCAL_ALTERNATE_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        // The released rows as they now stand, for `ItemUpdated`: each is an
+        // item of its own from here on, which a client must hear of now, not
+        // at its next refresh.
+        let mut released: Vec<BaseItemEntity> = Vec::with_capacity(ids.len());
+        if self.changed.get().is_some() {
+            for &id in ids {
+                released.extend(
+                    sqlx::query_as::<_, BaseItemEntity>(
+                        r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+                    )
+                    .bind(guid_to_db(id))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+                );
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        if let Some(changed) = self.changed.get() {
+            changed.record_updated(&released);
+        }
+        Ok(true)
     }
 
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
@@ -4661,10 +4724,44 @@ pub(crate) fn pathless_children_sql(libraries: usize, n: usize) -> String {
 /// `?1..?n`, each used for both columns): one `IX_BaseItems_ParentId` and
 /// one `IX_BaseItems_OwnerId` seek per id (SQLite's multi-index `OR`);
 /// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
+/// [`ItemPersistenceService::local_group_paths`] over `n` paths (binds
+/// `?1..?n`): from the rows at them up the `OwnerId` chain while the row is
+/// no extra (to the group's primary), then down every non-extra owned row
+/// from there; the paths of all of them. Each step seeks by primary key or
+/// by `IX_BaseItems_OwnerId`; a `UNION` ends an ownership cycle.
+pub(crate) fn local_group_paths_sql(n: usize) -> String {
+    let paths = numbered_placeholders(n);
+    format!(
+        r#"WITH RECURSIVE
+             up("Id") AS (
+               SELECT "Id" FROM "BaseItems" WHERE "Path" IN ({paths})
+               UNION
+               SELECT b."OwnerId" FROM "BaseItems" b JOIN up ON b."Id" = up."Id"
+                WHERE b."OwnerId" IS NOT NULL AND b."ExtraType" IS NULL),
+             down("Id") AS (
+               SELECT "Id" FROM up
+               UNION
+               SELECT b."Id" FROM "BaseItems" b JOIN down ON b."OwnerId" = down."Id"
+                WHERE b."ExtraType" IS NULL)
+           SELECT b."Path" FROM "BaseItems" b JOIN down ON b."Id" = down."Id"
+            WHERE b."Path" IS NOT NULL"#
+    )
+}
+
+/// One row of [`child_links_sql`]: `Id`, `ParentId`, `OwnerId`, `Path`,
+/// `ExtraType`.
+type ChildLinkRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+);
+
 pub(crate) fn child_links_sql(n: usize) -> String {
     let ids = numbered_placeholders(n);
     format!(
-        r#"SELECT "Id", "ParentId", "OwnerId", "Path" FROM "BaseItems"
+        r#"SELECT "Id", "ParentId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
             WHERE "ParentId" IN ({ids}) OR "OwnerId" IN ({ids})"#
     )
 }

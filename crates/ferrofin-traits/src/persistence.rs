@@ -990,6 +990,47 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
+    /// The paths of every stored row in the local groups the items at
+    /// `paths` belong to: a primary video, its stacked parts and local
+    /// alternate versions, and theirs — the rows linked by `OwnerId` that are
+    /// no extra (an extra has an `ExtraType`), followed up from each item to
+    /// its group's primary and down from there. A path-scoped scan widens a
+    /// changed file to its whole group with it, as the full scan's walk plans
+    /// a group whole.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then scans the paths themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn local_group_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<String>>, ServiceError> {
+        let _ = paths;
+        Ok(None)
+    }
+
+    /// Takes the stacked parts and local alternate versions `ids` out of
+    /// their groups — `OwnerId` and `PrimaryVersionId` cleared, the
+    /// presentation key their own id again, the `LinkedChildren` rows that
+    /// list them as a local version (`ChildType` 2) gone — so deleting their
+    /// owner no longer takes them with it, and the next scan groups them
+    /// afresh. In one transaction; each released row is announced as
+    /// updated (`ItemUpdated`), as a save is. Returns whether it did: `false` (the
+    /// default, for stub/fake services) when the service cannot, and the
+    /// caller must then not delete their owner.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn release_owned_versions(&self, ids: &[Uuid]) -> Result<bool, ServiceError> {
+        let _ = ids;
+        Ok(false)
+    }
+
     /// Moves each stored item of `moves` to its new id and type — the row
     /// and every row that references it (user data, links, streams, images,
     /// …) — so what is keyed to the old id follows the item: what a scan asks
@@ -1833,8 +1874,11 @@ pub struct ItemChildLink {
     pub id: Uuid,
     /// Its `ParentId`.
     pub parent_id: Option<Uuid>,
-    /// Its `OwnerId` (an extra's owner).
+    /// Its `OwnerId` (an extra's owner, or the primary of a stacked part or
+    /// a local alternate version).
     pub owner_id: Option<Uuid>,
+    /// Its `ExtraType`: set for an extra, `None` for a part or a version.
+    pub extra_type: Option<i32>,
     /// Its `Path`.
     pub path: Option<String>,
 }
