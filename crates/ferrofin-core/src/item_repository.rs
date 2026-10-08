@@ -187,6 +187,15 @@ impl FerrofinItemRepository {
         // a `UserView` (not an `ICollectionFolder`) and the playlists folder (a
         // `BasePluginFolder`) always pass.
         if let Some(user) = filter.user.as_ref() {
+            let mut enabled = Vec::with_capacity(rows.len());
+            for row in rows {
+                if Some(row.type_.as_str()) != stored_type_name(BaseItemKind::CollectionFolder)
+                    || library_enabled(row.path.as_deref()).await
+                {
+                    enabled.push(row);
+                }
+            }
+            rows = enabled;
             let hidden = self.hidden_media_folders(user).await?;
             if !hidden.is_empty() {
                 rows.retain(|row| Uuid::parse_str(&row.id).is_ok_and(|id| !hidden.contains(&id)));
@@ -1891,15 +1900,26 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
     let playlists_folder = stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default();
     let manual_playlists_folder =
         stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default();
-    let rows: Vec<(String, String)> =
-        sqlx::query_as(r#"SELECT "Id", "Type" FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#)
-            .bind(collection_folder)
-            .bind(user_view)
-            .bind(playlists_folder)
-            .bind(manual_playlists_folder)
-            .fetch_all(db.pool())
-            .await
-            .map_err(db_err)?;
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Id", "Type", "Path" FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#,
+    )
+    .bind(collection_folder)
+    .bind(user_view)
+    .bind(playlists_folder)
+    .bind(manual_playlists_folder)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+
+    // CollectionFolder.IsVisible checks Enabled even for administrators.
+    // Read the saved option on every request, as the direct visibility path
+    // does, so a dashboard toggle takes effect without a scan or restart.
+    let mut active = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.1 != collection_folder || library_enabled(row.2.as_deref()).await {
+            active.push(row);
+        }
+    }
 
     // Live TV is a view only while Live TV exists — see
     // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
@@ -1919,9 +1939,9 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
         None
     };
 
-    Ok(rows
+    Ok(active
         .iter()
-        .filter_map(|(id, type_)| {
+        .filter_map(|(id, type_, _)| {
             let id = Uuid::parse_str(id).ok()?;
             // Neither a `UserView` (Live TV, Playlists) nor the playlists
             // folder is a media folder, so neither carries a visibility
@@ -1941,6 +1961,19 @@ async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, Se
             }
         })
         .collect())
+}
+
+/// The saved CollectionFolder option, including adopted XML and constructor
+/// defaults. This read does not create files or repair the database.
+async fn library_enabled(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(std::path::Path::new(
+        path,
+    ))
+    .await
+    .enabled
 }
 
 /// The `UserView` row that is the Live TV view, if this database has one.
@@ -7937,5 +7970,115 @@ mod tests {
             .await
             .expect("unplayed");
         assert_eq!(ids(unplayed), vec![other]);
+    }
+
+    #[tokio::test]
+    async fn disabled_library_options_filter_unscoped_queries_and_counts_live() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (_, second, _, user) = two_libraries(&db).await;
+        let options = tempfile::tempdir().unwrap();
+        crate::test_support::set_item_path(&db, second, options.path().to_str().unwrap()).await;
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        for (enabled, expected) in [(true, 2), (false, 1), (true, 2)] {
+            std::fs::write(
+                options.path().join("options.json"),
+                format!(r#"{{"Enabled":{enabled}}}"#),
+            )
+            .unwrap();
+            let page = repository.get_items(&query).await.unwrap();
+            assert_eq!(page.items.len(), expected);
+            assert_eq!(usize::try_from(page.total_record_count).unwrap(), expected);
+            assert_eq!(
+                usize::try_from(count_over(&db, &query).await).unwrap(),
+                expected
+            );
+            assert_eq!(
+                repository
+                    .visible_library_ids(&user)
+                    .await
+                    .unwrap()
+                    .contains(&second),
+                enabled
+            );
+            // Upstream's explicit-scope exception is unchanged.
+            let explicit = InternalItemsQuery {
+                parent_id: second,
+                ..query.clone()
+            };
+            assert_eq!(repository.get_item_list(&explicit).await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_adopted_library_is_hidden_from_user_root_without_writing_options() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        let db = test_db().await;
+        let (first, second, _, user) = two_libraries(&db).await;
+        let roots = RootFolderIds {
+            user_root: Uuid::from_u128(0xA301),
+            aggregate: Uuid::from_u128(0xA302),
+        };
+        seed_folder_item(
+            &db,
+            roots.user_root,
+            BaseItemKind::UserRootFolder,
+            "Root",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            roots.aggregate,
+            BaseItemKind::AggregateFolder,
+            "Physical",
+            None,
+        )
+        .await;
+        for id in [first, second] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ? WHERE "Id" = ?"#)
+                .bind(guid_to_db(roots.user_root))
+                .bind(guid_to_db(id))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        let options = tempfile::tempdir().unwrap();
+        std::fs::write(
+            options.path().join("options.xml"),
+            "<LibraryOptions><Enabled>false</Enabled></LibraryOptions>",
+        )
+        .unwrap();
+        crate::test_support::set_item_path(&db, second, options.path().to_str().unwrap()).await;
+        let repository = repo(&db).with_root_ids(roots);
+        let query = InternalItemsQuery {
+            user_root_children: true,
+            user: Some(user),
+            ..Default::default()
+        };
+        let page = repository.get_items(&query).await.unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["First"]
+        );
+        assert_eq!(page.total_record_count, 1);
+        assert!(!options.path().join("options.json").exists());
+        let userless = repository
+            .get_items(&InternalItemsQuery {
+                user: None,
+                ..query
+            })
+            .await
+            .unwrap();
+        assert_eq!(userless.items.len(), 2);
     }
 }
