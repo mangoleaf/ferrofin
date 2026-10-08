@@ -454,8 +454,11 @@ fn parental_schedule_allows(
     if schedules.is_empty() {
         return true;
     }
-    let hour =
-        f64::from(now.hour()) + f64::from(now.minute()) / 60.0 + f64::from(now.second()) / 3600.0;
+    // TimeOfDay.TotalHours includes subsecond time: the first fraction of a
+    // second after EndHour must not remain inside the allowed window.
+    let hour = (f64::from(now.num_seconds_from_midnight())
+        + f64::from(now.nanosecond()) / 1_000_000_000.0)
+        / 3600.0;
     let weekday = now.date_naive().weekday();
     schedules.iter().any(|s| {
         day_of_week_contains(s.day_of_week, weekday) && hour >= s.start_hour && hour <= s.end_hour
@@ -725,6 +728,35 @@ impl FromRequestParts<AppState> for RequireLyricManagement {
 mod tests {
     use super::request_context;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn access_schedule_preserves_fractional_second_boundaries() {
+        use chrono::TimeZone as _;
+        for (hour, minute, second, nanos, expected) in [
+            (9, 29, 59, 999_999_900, false),
+            (9, 30, 0, 0, true),
+            (10, 30, 0, 0, true),
+            (10, 30, 0, 100, false),
+            (10, 30, 0, 500_000_000, false),
+        ] {
+            let local = chrono::NaiveDate::from_ymd_opt(2026, 10, 5)
+                .unwrap()
+                .and_hms_nano_opt(hour, minute, second, nanos)
+                .unwrap();
+            let now = chrono::Local.from_local_datetime(&local).single().unwrap();
+            let schedule = ferrofin_model::users::AccessSchedule {
+                day_of_week: ferrofin_model::users::DynamicDayOfWeek::Everyday,
+                start_hour: 9.5,
+                end_hour: 10.5,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::parental_schedule_allows(&[schedule], now),
+                expected,
+                "{local}"
+            );
+        }
+    }
 
     #[test]
     fn request_context_copies_headers_and_query() {

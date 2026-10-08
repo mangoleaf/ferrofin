@@ -1480,3 +1480,80 @@ async fn saved_tags_filter_lists_counts_and_views_with_root_allow_exception() {
         );
     }
 }
+
+#[tokio::test]
+async fn current_web_schedule_payload_saves_and_revokes_existing_requests() {
+    let f = fixture().await;
+    let (_, mut user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    for (schedules, allowed) in [
+        (json!([]), true),
+        (
+            json!([{"DayOfWeek":"Everyday","StartHour":"25","EndHour":"26"}]),
+            false,
+        ),
+        (
+            json!([{"DayOfWeek":"Everyday","StartHour":"0","EndHour":"24"}]),
+            true,
+        ),
+        (json!([]), true),
+    ] {
+        // Current Web rebuilds these three fields from HTML data attributes;
+        // its POST carries neither the database Id nor the associated UserId.
+        user["Policy"]["AccessSchedules"] = schedules;
+        let (status, saved) = call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(user["Policy"].clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{saved}");
+        let (_, saved) = call(
+            &f.router,
+            "GET",
+            &format!("/Users/{}", f.viewer_id),
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        let read = saved["Policy"]["AccessSchedules"].as_array().unwrap();
+        assert_eq!(
+            read.len(),
+            user["Policy"]["AccessSchedules"].as_array().unwrap().len()
+        );
+        for row in read {
+            assert!(row["Id"].as_i64().unwrap() > 0);
+            assert_eq!(row["UserId"], f.viewer_id);
+        }
+        assert_eq!(
+            call(&f.router, "GET", "/Users/Me", Some(&f.viewer), None)
+                .await
+                .0,
+            if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Users/{}", f.viewer_id),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+}
