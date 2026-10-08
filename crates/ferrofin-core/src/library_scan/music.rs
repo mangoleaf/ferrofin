@@ -157,6 +157,8 @@ pub(super) struct MusicFetch {
     audiodb_images: bool,
     /// fanart.tv's album/artist images.
     fanart_images: bool,
+    /// A named plugin image provider enabled for this item.
+    dynamic_images: bool,
     /// How the remote image providers fill the item's images.
     images: ImageFetch,
 }
@@ -169,7 +171,7 @@ impl MusicFetch {
 
     /// A remote image provider runs.
     fn any_images(self) -> bool {
-        self.audiodb_images || self.fanart_images
+        self.audiodb_images || self.fanart_images || self.dynamic_images
     }
 
     /// A remote provider of either kind runs.
@@ -506,6 +508,10 @@ impl LibraryScanner {
             fanart_images: images
                 && self.fanart.is_some()
                 && policy.image_enabled(name, fetcher_names::FANART),
+            dynamic_images: images
+                && self.dynamic_providers.iter().any(|provider| {
+                    provider.library_gated() && policy.image_enabled(name, provider.name())
+                }),
             images: plan.remote_images,
         }
     }
@@ -935,6 +941,7 @@ impl LibraryScanner {
             let fetched = cancel
                 .unless_cancelled(count_request_failures(Box::pin(self.music_images(
                     work,
+                    &row,
                     fetch,
                     &ids,
                     artist_key,
@@ -1543,6 +1550,7 @@ impl LibraryScanner {
     async fn music_images(
         &self,
         work: &MusicRefresh<'_>,
+        row: &BaseItemEntity,
         fetch: MusicFetch,
         ids: &[(String, String)],
         artist_key: Option<String>,
@@ -1605,7 +1613,7 @@ impl LibraryScanner {
                 }
             }
         }
-        if found.is_empty() && fanart_found.is_empty() {
+        if found.is_empty() && fanart_found.is_empty() && !fetch.dynamic_images {
             return None;
         }
         let stored = match items.get_image_infos(work.id).await {
@@ -1619,55 +1627,72 @@ impl LibraryScanner {
         append_fanart(&mut remote, found);
         let mut fanart_remote = Vec::new();
         append_fanart(&mut fanart_remote, fanart_found);
-        let remote = super::ordered_remote_images(
-            vec![
-                (fetcher_names::AUDIODB, remote),
-                (fetcher_names::FANART, fanart_remote),
-            ],
-            work.policy,
-            if matches!(work.kind, MusicKind::Album) {
-                "MusicAlbum"
-            } else {
-                "MusicArtist"
-            },
-        );
+        let kind = work.kind.type_name();
+        let mut sources = vec![
+            (fetcher_names::AUDIODB, Some(remote)),
+            (fetcher_names::FANART, Some(fanart_remote)),
+        ];
+        if fetch.dynamic_images {
+            sources.extend(
+                self.dynamic_providers
+                    .iter()
+                    .filter(|p| p.library_gated() && work.policy.image_enabled(kind, p.name()))
+                    .map(|p| (p.name(), None)),
+            );
+        }
+        sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
         let key = work.id.to_string();
         let meta_root = meta_root.resolve();
         let dir = meta_root.join(&key);
         let mut images = stored.clone();
-        match fetch.images {
-            ImageFetch::None => return None,
-            ImageFetch::MissingOnly => {
-                let present: HashSet<ImageType> = stored.iter().map(|i| i.image_type).collect();
-                let missing: Vec<RemoteImage> = remote
+        let mut filled: HashSet<ImageType> = stored
+            .iter()
+            .filter(|image| {
+                fetch.images != ImageFetch::All
+                    || !std::path::Path::new(&image.path).starts_with(&meta_root)
+            })
+            .map(|image| image.image_type)
+            .collect();
+        if fetch.images == ImageFetch::None {
+            return None;
+        }
+        for (name, candidates) in sources {
+            let mut downloaded = if let Some(candidates) = candidates {
+                let missing: Vec<_> = candidates
                     .into_iter()
-                    .filter(|i| !present.contains(&i.image_type))
+                    .filter(|image| !filled.contains(&image.image_type))
                     .collect();
-                if missing.is_empty() {
-                    return None;
+                if fetch.images == ImageFetch::All {
+                    download_remote_images(tmdb, &dir, &key, missing, Some(&filled)).await
+                } else {
+                    download_images(tmdb, &dir, &key, missing).await
                 }
-                let mut downloaded = download_images(tmdb, &dir, &key, missing).await;
-                self.fill_image_metadata(&mut downloaded).await;
-                images.extend(downloaded);
-            }
-            ImageFetch::All => {
-                // "If image file is stored with media, don't replace that
-                // later" (`MergeImages` → `UpdateReplaceImages`).
-                let with_media: HashSet<ImageType> = stored
+            } else {
+                let mut contributed: Vec<_> = images
                     .iter()
-                    .filter(|i| !std::path::Path::new(&i.path).starts_with(&meta_root))
-                    .map(|i| i.image_type)
+                    .filter(|image| filled.contains(&image.image_type))
+                    .cloned()
                     .collect();
-                let mut downloaded =
-                    download_remote_images(tmdb, &dir, &key, remote, Some(&with_media)).await;
-                self.fill_image_metadata(&mut downloaded).await;
-                let replaced: HashSet<ImageType> =
-                    downloaded.iter().map(|i| i.image_type).collect();
-                images.retain(|i| {
-                    with_media.contains(&i.image_type) || !replaced.contains(&i.image_type)
-                });
-                images.extend(downloaded);
-            }
+                self.apply_dynamic_images(
+                    row,
+                    &mut contributed,
+                    FetcherPolicy {
+                        only_image_provider: Some(name),
+                        replace_images: fetch.images == ImageFetch::All,
+                        ..work.policy
+                    },
+                )
+                .await;
+                contributed
+                    .into_iter()
+                    .filter(|image| !filled.contains(&image.image_type))
+                    .collect()
+            };
+            self.fill_image_metadata(&mut downloaded).await;
+            let replaced: HashSet<_> = downloaded.iter().map(|image| image.image_type).collect();
+            images.retain(|image| !replaced.contains(&image.image_type));
+            filled.extend(replaced);
+            images.extend(downloaded);
         }
         images_changed(&images, Some(&stored)).then_some(images)
     }

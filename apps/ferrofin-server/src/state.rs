@@ -908,6 +908,7 @@ pub async fn build_app_state(
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
+            .with_dynamic_image_providers(wasm_host.metadata_providers())
             .with_studios(Arc::clone(&studios_client))
             // The other "Choose Image" providers: fanart.tv (movies/series/
             // artists/albums), TheAudioDb (artists/albums) and OMDb's poster

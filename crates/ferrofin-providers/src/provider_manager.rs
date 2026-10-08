@@ -1098,6 +1098,8 @@ pub struct LocalProviderManager {
     /// Runtime-registered named metadata providers (WASM plugins) as
     /// (name, supported kinds), surfaced in library options.
     dynamic_fetchers: Vec<(String, Vec<String>)>,
+    /// Named plugin implementations used by automatic path-less image refresh.
+    dynamic_image_providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
     remote_search_providers: Vec<Arc<dyn RemoteSearchProvider>>,
     /// The item-image store (rows) + the directory uploaded images are written
     /// to. Present enables the `save_image`/`delete_image` write paths.
@@ -1198,6 +1200,10 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_people", &self.people.is_some())
             .field("has_localization", &self.localization.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
+            .field(
+                "dynamic_image_providers",
+                &self.dynamic_image_providers.len(),
+            )
             .field("kind_by_type_name", &self.kind_by_type_name.len())
             .field("http", &self.http)
             .field("has_metadata_options", &self.metadata_options.is_some())
@@ -1206,6 +1212,17 @@ impl std::fmt::Debug for LocalProviderManager {
 }
 
 impl LocalProviderManager {
+    /// Attaches named plugin image implementations to automatic item refresh.
+    /// These dynamic providers do not appear in the remote-image chooser.
+    #[must_use]
+    pub fn with_dynamic_image_providers(
+        mut self,
+        providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
+    ) -> Self {
+        self.dynamic_image_providers = providers;
+        self
+    }
+
     /// Creates a manager advertising `external_id_infos` for every item.
     ///
     /// No remote-search providers are registered yet, so
@@ -1217,6 +1234,7 @@ impl LocalProviderManager {
         Self {
             external_id_infos,
             dynamic_fetchers: Vec::new(),
+            dynamic_image_providers: Vec::new(),
             remote_search_providers: Vec::new(),
             image_store: None,
             metadata_dir: None,
@@ -1532,10 +1550,19 @@ impl LocalProviderManager {
             });
         let images_allowed = (!entity.is_locked
             || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-            && entity.extra_type.is_none()
-            && self.image_sources_for(entity).iter().any(|source| {
-                image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, source.name())
-            });
+            && ((entity.extra_type.is_none()
+                && self.image_sources_for(entity).iter().any(|source| {
+                    image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, source.name())
+                }))
+                || self.dynamic_image_providers.iter().any(|provider| {
+                    provider.library_gated()
+                        && image_fetcher_enabled(
+                            library.as_ref(),
+                            global.as_ref(),
+                            kind,
+                            provider.name(),
+                        )
+                }));
         MetadataRefreshOptions {
             metadata_refresh_mode: if metadata_allowed {
                 options.metadata_refresh_mode
@@ -2205,7 +2232,7 @@ impl LocalProviderManager {
             },
             None => (None, 0),
         };
-        let mut fetched = fetched.unwrap_or_default();
+        let fetched = fetched.unwrap_or_default();
         // `RefreshWithProviders`: a locked item merges nothing; otherwise the
         // provider result — starting from what upstream's `temp` starts with,
         // the item's `ParentIndexNumber` and preferred metadata language and
@@ -2256,45 +2283,21 @@ impl LocalProviderManager {
         let mut row = merged.item;
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
-        if fetch.images {
-            let query = RemoteImageQuery {
-                include_all_languages: true,
-                include_disabled_providers: false,
-                ..Default::default()
-            };
-            let (images, image_failures) = crate::rate_limit::count_request_failures(
-                self.available_images_for(&row, &merged.provider_ids, &query),
-            )
+        let image_saved = if fetch.images && self.image_store.is_some() {
+            let (saved, image_failures) = Box::pin(crate::rate_limit::count_request_failures(
+                self.refresh_ordered_images(
+                    item_id,
+                    &row,
+                    &merged.provider_ids,
+                    plan.remote_images,
+                ),
+            ))
             .await;
             failures += image_failures;
-            fetched.images = images?
-                .into_iter()
-                .filter_map(|image| image.url.map(|url| (image.type_, url)))
-                .collect();
-        }
-        // `ItemImageProvider.RefreshImages`: short of replacing them, the
-        // remote providers fill only the image types the item lacks.
-        if plan.remote_images == ImageFetch::MissingOnly && !fetched.images.is_empty() {
-            let present = self.stored_image_types(item_id).await;
-            keep_missing_images(&mut fetched.images, present.as_deref());
-        }
-        // The remote image providers' artwork. A single failed download must
-        // not fail the refresh.
-        let mut image_saved = false;
-        if self.image_store.is_some() {
-            let mut saved_types = std::collections::HashSet::new();
-            for (image_type, url) in &fetched.images {
-                if !saved_types.contains(image_type)
-                    && self
-                        .save_image_from_url(item_id, url, *image_type, None)
-                        .await
-                        .is_ok()
-                {
-                    saved_types.insert(*image_type);
-                    image_saved = true;
-                }
-            }
-        }
+            saved?
+        } else {
+            false
+        };
         // `RefreshMetadata`'s tail — the stamp and `SaveInternal`'s save
         // rule, decided as the library scan decides them.
         let metadata_changed = row != stored;
@@ -2346,6 +2349,142 @@ impl LocalProviderManager {
         } else {
             ItemUpdateType::None
         })
+    }
+
+    /// Remote and dynamic image providers share one ordered acquisition pass.
+    async fn refresh_ordered_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+        ids: &[(String, String)],
+        fetch: ImageFetch,
+    ) -> Result<bool, ServiceError> {
+        let kind = short_kind(row);
+        let library = self.library_options_for(row).await;
+        let global = self.global_metadata_options_for(kind);
+        let mut filled: std::collections::HashSet<ImageType> = if fetch == ImageFetch::MissingOnly {
+            let Some(stored) = self.stored_image_types(item_id).await else {
+                return Ok(false);
+            };
+            stored.into_iter().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let remote_sources = self.image_sources_for(row);
+        let mut sources: Vec<(
+            &str,
+            Option<&dyn ferrofin_traits::providers::DynamicMetadataProvider>,
+        )> = self
+            .dynamic_image_providers
+            .iter()
+            .filter(|p| p.library_gated())
+            .map(|p| (p.name(), Some(p.as_ref())))
+            .collect();
+        sources.extend(remote_sources.iter().map(|source| (source.name(), None)));
+        sources.retain(|(name, _)| {
+            image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
+        });
+        sources.sort_by_key(|(name, _)| {
+            (
+                crate::library_options::image_fetcher_rank(
+                    library.as_ref(),
+                    global.as_ref(),
+                    kind,
+                    name,
+                ),
+                crate::library_options::default_image_order(kind, name),
+            )
+        });
+        let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
+            item_id,
+            kind: kind.to_owned(),
+            name: row.name.clone().unwrap_or_default(),
+            production_year: row
+                .production_year
+                .and_then(|year| i32::try_from(year).ok()),
+            path: row.path.clone(),
+            provider_ids: ids.to_vec(),
+        };
+        let mut saved = false;
+        for (name, dynamic) in sources {
+            if let Some(provider) = dynamic {
+                saved |= self
+                    .refresh_plugin_images(item_id, &lookup, provider, &mut filled)
+                    .await;
+            } else {
+                let query = RemoteImageQuery {
+                    provider_name: name.to_owned(),
+                    include_all_languages: true,
+                    include_disabled_providers: false,
+                    ..Default::default()
+                };
+                let mut images: Vec<_> = self
+                    .available_images_for(row, ids, &query)
+                    .await?
+                    .into_iter()
+                    .filter_map(|image| image.url.map(|url| (image.type_, url)))
+                    .collect();
+                keep_missing_images(
+                    &mut images,
+                    Some(&filled.iter().copied().collect::<Vec<_>>()),
+                );
+                for (kind, url) in images {
+                    if !filled.contains(&kind)
+                        && self
+                            .save_image_from_url(item_id, &url, kind, None)
+                            .await
+                            .is_ok()
+                    {
+                        filled.insert(kind);
+                        saved = true;
+                    }
+                }
+            }
+        }
+        Ok(saved)
+    }
+
+    async fn refresh_plugin_images(
+        &self,
+        item_id: Uuid,
+        lookup: &ferrofin_traits::providers::DynamicMetadataLookup,
+        provider: &dyn ferrofin_traits::providers::DynamicMetadataProvider,
+        filled: &mut std::collections::HashSet<ImageType>,
+    ) -> bool {
+        let mut saved = false;
+        let wanted: Vec<_> = [ImageType::Primary, ImageType::Backdrop]
+            .into_iter()
+            .filter(|kind| !filled.contains(kind))
+            .collect();
+        if wanted.is_empty() {
+            return false;
+        }
+        let images = match provider.images(lookup, &wanted).await {
+            Ok(images) => images,
+            Err(err) => {
+                crate::rate_limit::note_request_failure();
+                tracing::warn!(%err, provider = provider.name(), %item_id, "plugin image provider failed");
+                return false;
+            }
+        };
+        for (kind, bytes) in images {
+            if !wanted.contains(&kind) || filled.contains(&kind) {
+                continue;
+            }
+            let Some(ext) = crate::sniff_image_ext(&bytes) else {
+                continue;
+            };
+            let mime = mime_types::get_mime_type(&format!("image.{ext}"));
+            if self
+                .save_image(item_id, &bytes, mime, kind, None)
+                .await
+                .is_ok()
+            {
+                filled.insert(kind);
+                saved = true;
+            }
+        }
+        saved
     }
 
     /// The error for an image operation on a manager built without the
@@ -2741,7 +2880,9 @@ impl LocalProviderManager {
             "Studio" => sources.extend(has(self.studios.is_some(), RemoteImageSource::Studios)),
             _ => {}
         }
-        sources.sort_by_key(|source| crate::library_options::default_image_order(source.name()));
+        sources.sort_by_key(|source| {
+            crate::library_options::default_image_order(short_kind(entity), source.name())
+        });
         sources
     }
 
@@ -6738,9 +6879,9 @@ mod tests {
 
         let info = mgr.get_remote_image_provider_info(item_id).await.unwrap();
         let names: Vec<&str> = info.iter().filter_map(|i| i.name.as_deref()).collect();
-        assert_eq!(names, ["FanArt", "TheMovieDb", "The Open Movie Database"]);
+        assert_eq!(names, ["TheMovieDb", "FanArt", "The Open Movie Database"]);
         assert_eq!(
-            info[1].supported_images,
+            info[0].supported_images,
             [
                 ImageType::Primary,
                 ImageType::Backdrop,
@@ -6767,8 +6908,6 @@ mod tests {
         assert_eq!(
             shape,
             [
-                ("FanArt", ImageType::Primary, "https://f/poster.jpg"),
-                ("FanArt", ImageType::Logo, "https://f/logo.png"),
                 // Within each provider the block is `OrderByLanguageDescending`,
                 // so the two `en`-tagged images (rank 4) come before the two
                 // untagged ones (rank 3) — NOT the raw poster/backdrop/logo
@@ -6796,6 +6935,8 @@ mod tests {
                     ImageType::Logo,
                     "https://image.tmdb.org/t/p/original/l.png"
                 ),
+                ("FanArt", ImageType::Primary, "https://f/poster.jpg"),
+                ("FanArt", ImageType::Logo, "https://f/logo.png"),
                 (
                     "The Open Movie Database",
                     ImageType::Primary,
@@ -6804,8 +6945,8 @@ mod tests {
             ]
         );
         // TMDB's sizes/ratings/languages ride along.
-        assert_eq!(all[2].width, Some(1000));
-        assert_eq!(all[2].language.as_deref(), Some("en"));
+        assert_eq!(all[0].width, Some(1000));
+        assert_eq!(all[0].language.as_deref(), Some("en"));
     }
 
     #[tokio::test]
@@ -8432,13 +8573,52 @@ mod tests {
         let languages: Vec<Option<&str>> = images.iter().map(|i| i.language.as_deref()).collect();
         assert_eq!(languages, [Some("fr"), Some("en")]);
     }
+
+    struct OrderingArtwork;
+    #[async_trait::async_trait]
+    impl ferrofin_traits::providers::DynamicMetadataProvider for OrderingArtwork {
+        fn name(&self) -> &'static str {
+            "ArtworkPlugin"
+        }
+        fn library_gated(&self) -> bool {
+            true
+        }
+        async fn lookup(
+            &self,
+            _: &ferrofin_traits::providers::DynamicMetadataLookup,
+        ) -> Result<
+            Option<ferrofin_traits::providers::DynamicMetadataResult>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            Ok(None)
+        }
+        async fn images(
+            &self,
+            _: &ferrofin_traits::providers::DynamicMetadataLookup,
+            wanted: &[ferrofin_model::entities::ImageType],
+        ) -> Result<
+            Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            use ferrofin_model::entities::ImageType;
+            Ok(wanted
+                .contains(&ImageType::Primary)
+                .then(|| (ImageType::Primary, b"\x89PNG\r\n\x1a\nplugin".to_vec()))
+                .into_iter()
+                .collect())
+        }
+    }
     #[rstest::rstest]
     #[case::none(&[], &[], None)]
+    #[case::plugin_only(&["ArtworkPlugin"], &[], Some("plugin"))]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], Some("plugin"))]
+    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("tmdb"))]
+    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], Some("tmdb"))]
     #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
     #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
     #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
     #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
-    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("fanart"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("tmdb"))]
     #[tokio::test]
     async fn pathless_refresh_obeys_image_selection_and_order(
         #[case] enabled: &[&str],
@@ -8477,6 +8657,7 @@ mod tests {
             .unwrap()
             .insert(item_id, vec![("Tmdb".to_owned(), "603".to_owned())]);
         let mgr = LocalProviderManager::default()
+            .with_dynamic_image_providers(vec![Arc::new(OrderingArtwork)])
             .with_remote_images(
                 Arc::new(
                     crate::tmdb::TmdbClient::new()
@@ -8521,7 +8702,11 @@ mod tests {
             if let Some(expected) = expected {
                 assert_eq!(
                     std::fs::read(&written[0].1.path).unwrap(),
-                    expected.as_bytes()
+                    if expected == "plugin" {
+                        b"\x89PNG\r\n\x1a\nplugin".as_slice()
+                    } else {
+                        expected.as_bytes()
+                    }
                 );
             }
         }

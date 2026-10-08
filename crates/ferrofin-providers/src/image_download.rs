@@ -176,3 +176,20 @@ mod quota_tests {
         assert!(send(&http, &other.base_url).await.is_ok());
     }
 }
+
+/// Recognizes JPEG, PNG, GIF and WebP magic before persisting plugin artwork.
+/// This identifies the file format; image processing validates its dimensions.
+#[must_use]
+pub fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}

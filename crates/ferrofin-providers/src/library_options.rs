@@ -178,16 +178,18 @@ pub const BUILT_IN_METADATA_FETCHERS: &[&str] = &[
     fetcher_names::AUDIODB,
 ];
 
-/// Default order for built-in artwork providers. Explicit library order is
-/// applied before this tie-breaker. Fanart leads movie and series artwork,
-/// and precedes AudioDB for music, with OMDb as the final poster fallback.
+/// The upstream image provider's `IHasOrder`, per item type. Providers without
+/// that interface have order 50; a configured rank precedes this default.
 #[must_use]
-pub fn default_image_order(name: &str) -> usize {
-    match name {
-        fetcher_names::TMDB | fetcher_names::AUDIODB => 1,
-        fetcher_names::TVDB => 50,
-        fetcher_names::OMDB => 90,
-        _ => 0,
+pub fn default_image_order(kind: &str, name: &str) -> usize {
+    match (name, kind) {
+        (fetcher_names::TMDB, "Movie" | "Trailer" | "BoxSet" | "Person")
+        | (fetcher_names::FANART, "MusicArtist") => 0,
+        (fetcher_names::TMDB, "Series") | (fetcher_names::AUDIODB, "MusicAlbum") => 2,
+        (fetcher_names::TMDB | fetcher_names::FANART | fetcher_names::AUDIODB, _) => 1,
+        (fetcher_names::OMDB, _) => 90,
+        (fetcher_names::EMBEDDED_IMAGES, _) => 99,
+        _ => 50,
     }
 }
 
@@ -1003,6 +1005,28 @@ pub fn all_metadata_plugins() -> Vec<MetadataPluginSummary> {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("Movie", "TheMovieDb", 0)]
+    #[case("Series", "TheMovieDb", 2)]
+    #[case("Season", "TheMovieDb", 1)]
+    #[case("Episode", "TheMovieDb", 1)]
+    #[case("Movie", "FanArt", 1)]
+    #[case("Series", "FanArt", 1)]
+    #[case("MusicArtist", "FanArt", 0)]
+    #[case("MusicAlbum", "TheAudioDB", 2)]
+    #[case("MusicArtist", "TheAudioDB", 1)]
+    #[case("Audio", "Image Extractor", 50)]
+    #[case("Movie", "Embedded Image Extractor", 99)]
+    #[case("Movie", "ArtworkPlugin", 50)]
+    #[test]
+    fn image_order_is_the_upstream_provider_class_order(
+        #[case] kind: &str,
+        #[case] name: &str,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(super::default_image_order(kind, name), expected);
+    }
+
     use super::{all_metadata_plugins, library_options_info};
     use ferrofin_model::configuration::MetadataPluginType;
 

@@ -690,6 +690,10 @@ struct FetcherPolicy<'a> {
     locale: Option<&'a (String, String)>,
     /// The item's resolved locale, when the image pass shares metadata's lookup.
     effective_locale: Option<&'a (String, String)>,
+    /// Restricts one execution step of the ordered image chain.
+    only_image_provider: Option<&'a str>,
+    /// A full image replacement can replace cached plugin artwork.
+    replace_images: bool,
     /// The server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
     /// library saved no `TypeOptions` entry for.
@@ -752,12 +756,14 @@ impl<'a> FetcherPolicy<'a> {
     ///
     /// Delegates to the shared gate — see [`Self::metadata_enabled`].
     fn image_enabled(self, kind: &str, name: &str) -> bool {
-        ferrofin_providers::library_options::image_fetcher_enabled(
-            self.options,
-            self.global_for(kind),
-            kind,
-            name,
-        )
+        self.only_image_provider
+            .is_none_or(|selected| selected == name)
+            && ferrofin_providers::library_options::image_fetcher_enabled(
+                self.options,
+                self.global_for(kind),
+                kind,
+                name,
+            )
     }
 
     /// The library's preferred metadata language, falling back to the server.
@@ -804,7 +810,7 @@ impl<'a> FetcherPolicy<'a> {
     fn image_order(self, kind: &str, name: &str) -> (usize, usize) {
         (
             self.image_rank(kind, name),
-            ferrofin_providers::library_options::default_image_order(name),
+            ferrofin_providers::library_options::default_image_order(kind, name),
         )
     }
 
@@ -854,17 +860,7 @@ const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
 /// or `None` for anything that is not a recognized image — enough to keep an
 /// arbitrary blob from persisting as a permanent zero-dimension image.
 fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\xFF\xD8\xFF") {
-        Some("jpg")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("png")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("webp")
-    } else {
-        None
-    }
+    ferrofin_providers::sniff_image_ext(bytes)
 }
 
 /// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
@@ -4366,6 +4362,7 @@ impl LibraryScanner {
                 global: Some(&server_options),
                 locale: Some(&server_locale),
                 effective_locale: None,
+                ..Default::default()
             },
             locked: &locked_items,
             externals: self.external_probe_seam(),
@@ -8996,17 +8993,16 @@ impl LibraryScanner {
         if matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
         }
-        if dynamic_images && !images.iter().any(|i| i.image_type == ImageType::Primary) {
-            let cover = self.embedded_primary(item_id, entity, streams, policy, art_cache);
-            match cancel.unless_cancelled(cover).await {
-                Some(cover) => images.extend(cover),
-                None => cut_short = true,
-            }
-        }
-        // A remote fetch cut short keeps nothing of its own list; the files
-        // it wrote before the cancel are picked up from the art dir below.
-        let fetched =
-            self.run_remote_image_providers(fetch, entity, art_cache, policy, &mut images);
+        let fetched = self.run_ordered_artwork(
+            item_id,
+            entity,
+            streams,
+            policy,
+            fetch,
+            dynamic_images,
+            &mut images,
+            art_cache,
+        );
         cut_short |= cancel.unless_cancelled(Box::pin(fetched)).await.is_none();
         self.append_art_dir_images(entity, &mut images);
         // An album's Primary is stored as its shared, content-addressed cover
@@ -9019,10 +9015,7 @@ impl LibraryScanner {
             images.retain(|image| image.image_type != ImageType::Primary);
             images.push(cover.clone());
         }
-        if remote {
-            let dynamic = self.apply_dynamic_images(entity, &mut images, policy);
-            cut_short |= cancel.unless_cancelled(dynamic).await.is_none();
-        } else {
+        if !remote {
             keep_stored_images(&mut images, stored, &self.virtual_paths);
         }
         if !images
@@ -9057,6 +9050,85 @@ impl LibraryScanner {
             (!images.is_empty() || stale_rows).then_some(images),
             cut_short,
         )
+    }
+
+    /// Run remote, embedded and plugin artwork in one configured order. A
+    /// provider only fills slots earlier providers/local discovery left empty.
+    // These are the existing per-item artwork pass inputs, shared with each step.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_ordered_artwork(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+        policy: FetcherPolicy<'_>,
+        fetch: ImageFetch,
+        dynamic_images: bool,
+        images: &mut Vec<ItemImageInfo>,
+        cache: &mut ArtworkCache,
+    ) {
+        enum Step {
+            Plugin,
+            Remote,
+            Embedded,
+        }
+        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        let extractor = if matches!(
+            image_item_kind(&entity.type_),
+            ImageItemKind::Audio | ImageItemKind::AudioBook
+        ) {
+            fetcher_names::AUDIO_IMAGES
+        } else {
+            fetcher_names::EMBEDDED_IMAGES
+        };
+        // Plugins without IHasOrder default to 50; registration breaks ties.
+        let mut sources: Vec<(&str, Step)> =
+            if fetch != ImageFetch::None && !music::owns_providers(short) {
+                self.dynamic_providers
+                    .iter()
+                    .filter(|p| p.library_gated() && policy.image_enabled(short, p.name()))
+                    .map(|p| (p.name(), Step::Plugin))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        if fetch != ImageFetch::None && !music::owns_providers(short) {
+            for (name, wired) in [
+                (fetcher_names::TVDB, self.tvdb.is_some()),
+                (fetcher_names::TMDB, self.tmdb.is_some()),
+                (fetcher_names::FANART, self.fanart.is_some()),
+                (fetcher_names::OMDB, self.omdb.is_some()),
+            ] {
+                if wired && policy.image_enabled(short, name) {
+                    sources.push((name, Step::Remote));
+                }
+            }
+        }
+        if dynamic_images && policy.image_enabled(short, extractor) {
+            sources.push((extractor, Step::Embedded));
+        }
+        sources.sort_by_key(|(name, _)| policy.image_order(short, name));
+        for (name, source) in sources {
+            let selected = FetcherPolicy {
+                only_image_provider: Some(name),
+                replace_images: fetch == ImageFetch::All,
+                ..policy
+            };
+            match source {
+                Step::Plugin => self.apply_dynamic_images(entity, images, selected).await,
+                Step::Remote => {
+                    self.run_remote_image_providers(fetch, entity, cache, selected, images)
+                        .await;
+                }
+                Step::Embedded if !images.iter().any(|i| i.image_type == ImageType::Primary) => {
+                    images.extend(
+                        self.embedded_primary(item_id, entity, streams, selected, cache)
+                            .await,
+                    );
+                }
+                Step::Embedded => {}
+            }
+        }
     }
 
     /// The embedded-cover provider for an item with no Primary: a track's
@@ -9120,11 +9192,14 @@ impl LibraryScanner {
         match fetch {
             ImageFetch::None => {}
             ImageFetch::MissingOnly => {
-                if images.is_empty() {
-                    *images = self
-                        .fetch_remote_images(entity, art_cache, policy, None)
-                        .await;
-                }
+                let present: std::collections::HashSet<_> =
+                    images.iter().map(|image| image.image_type).collect();
+                images.extend(
+                    self.fetch_remote_images(entity, art_cache, policy, None)
+                        .await
+                        .into_iter()
+                        .filter(|image| !present.contains(&image.image_type)),
+                );
             }
             ImageFetch::All => {
                 let with_media: std::collections::HashSet<ImageType> =
@@ -9161,7 +9236,10 @@ impl LibraryScanner {
         let mut wanted: Vec<ImageType> = [ImageType::Primary, ImageType::Backdrop]
             .into_iter()
             .filter(|kind| !images.iter().any(|i| i.image_type == *kind))
-            .filter(|kind| existing_art_file(&item_dir, image_type_file_stem(*kind)).is_none())
+            .filter(|kind| {
+                policy.replace_images
+                    || existing_art_file(&item_dir, image_type_file_stem(*kind)).is_none()
+            })
             .collect();
         if wanted.is_empty() {
             return;
@@ -9230,12 +9308,17 @@ impl LibraryScanner {
                     );
                     continue;
                 };
-                let dest = item_dir.join(format!("{}.{ext}", image_type_file_stem(kind)));
+                let stem = image_type_file_stem(kind);
+                let previous = existing_art_file(&item_dir, stem);
+                let dest = item_dir.join(format!("{stem}.{ext}"));
                 if let Err(err) =
                     std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
                 {
                     tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
                     continue;
+                }
+                if let Some(previous) = previous.filter(|path| *path != dest) {
+                    let _ = std::fs::remove_file(previous);
                 }
                 images.push(ItemImageInfo {
                     path: dest.to_string_lossy().into_owned(),
@@ -9575,7 +9658,7 @@ impl LibraryScanner {
                 };
                 let mut sources = vec![(fetcher_names::TMDB, images)];
                 // Rank all artwork before selecting the first of each type.
-                // Fanart leads by default; a saved library order wins.
+                // Defaults depend on item type; a saved library order wins.
                 if policy.image_enabled(short, fetcher_names::FANART)
                     && let Some(fanart) = &self.fanart
                     && let Some(id) = cache
@@ -15243,7 +15326,7 @@ mod tests {
     }
 
     #[test]
-    fn artwork_uses_fanart_first_unless_the_library_overrides_it() {
+    fn artwork_uses_per_kind_defaults_unless_the_library_overrides_them() {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
         use ferrofin_model::entities::ImageType;
         use ferrofin_providers::library_options::fetcher_names;
@@ -15270,8 +15353,8 @@ mod tests {
                 .url
                 .clone()
         };
-        for kind in ["Movie", "Series"] {
-            assert_eq!(choose(super::FetcherPolicy::default(), kind), "fanart");
+        for (kind, expected) in [("Movie", "tmdb"), ("Series", "fanart")] {
+            assert_eq!(choose(super::FetcherPolicy::default(), kind), expected);
             let options = LibraryOptions {
                 type_options: vec![TypeOptions {
                     type_: Some(kind.into()),
@@ -23986,7 +24069,315 @@ mod tests {
         (scanner, cache)
     }
 
-    /// The fixture series' and episode's item ids.
+    /// Named image provider with distinct bytes for order assertions.
+    struct OrderingArtwork;
+    #[async_trait::async_trait]
+    impl ferrofin_traits::providers::DynamicMetadataProvider for OrderingArtwork {
+        fn name(&self) -> &'static str {
+            "ArtworkPlugin"
+        }
+        fn library_gated(&self) -> bool {
+            true
+        }
+        async fn lookup(
+            &self,
+            _: &ferrofin_traits::providers::DynamicMetadataLookup,
+        ) -> Result<
+            Option<ferrofin_traits::providers::DynamicMetadataResult>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            Ok(None)
+        }
+        async fn images(
+            &self,
+            _: &ferrofin_traits::providers::DynamicMetadataLookup,
+            wanted: &[ferrofin_model::entities::ImageType],
+        ) -> Result<
+            Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>,
+            ferrofin_traits::error::ServiceError,
+        > {
+            use ferrofin_model::entities::ImageType;
+            Ok(wanted
+                .contains(&ImageType::Primary)
+                .then(|| (ImageType::Primary, b"\x89PNG\r\n\x1a\nplugin".to_vec()))
+                .into_iter()
+                .collect())
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], true)]
+    #[case::remote_first(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], false)]
+    #[case::disabled_plugin(&["TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], false)]
+    #[case::default_remote_first(&["ArtworkPlugin", "TheMovieDb"], &[], false)]
+    #[tokio::test]
+    async fn scan_interleaves_plugin_and_remote_artwork(
+        #[case] enabled: &[&str],
+        #[case] order: &[&str],
+        #[case] plugin_wins: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, _) = spawn_artwork_server(true);
+        let (scanner, mut cache) = artwork_fixture(&base, tmp.path(), &[], false).await;
+        let scanner = scanner.with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let entity = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Series".to_owned()),
+                image_fetchers: enabled.iter().map(|s| (*s).to_owned()).collect(),
+                image_fetcher_order: order.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        scanner
+            .run_ordered_artwork(
+                Uuid::parse_str(SERIES).unwrap(),
+                &entity,
+                &[],
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                super::ImageFetch::MissingOnly,
+                false,
+                &mut images,
+                &mut cache,
+            )
+            .await;
+        let primary = images
+            .iter()
+            .find(|image| image.image_type == ferrofin_model::entities::ImageType::Primary)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&primary.path).unwrap(),
+            if plugin_wins {
+                b"\x89PNG\r\n\x1a\nplugin".as_slice()
+            } else {
+                b"image".as_slice()
+            }
+        );
+        assert!(
+            images
+                .iter()
+                .any(|image| image.image_type == ferrofin_model::entities::ImageType::Backdrop),
+            "later providers fill missing slots"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::embedded_first(["Image Extractor", "ArtworkPlugin"], false)]
+    #[case::plugin_first(["ArtworkPlugin", "Image Extractor"], true)]
+    #[tokio::test]
+    async fn scan_interleaves_audio_embedded_artwork(
+        #[case] order: [&str; 2],
+        #[case] plugin_wins: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut scanner, mut cache, _) =
+            tmdb_episode_fixture("http://127.0.0.1:1", tmp.path()).await;
+        scanner.media_encoder = Some(Arc::new(FakeProbe));
+        let scanner = scanner.with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let entity = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            path: Some(tmp.path().join("track.flac").to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Audio".to_owned()),
+                image_fetchers: order.iter().map(|s| (*s).to_owned()).collect(),
+                image_fetcher_order: order.iter().map(|s| (*s).to_owned()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let streams = [super::MediaStreamInfoEntity {
+            stream_type: super::EMBEDDED_IMAGE_STREAM_TYPE,
+            stream_index: 1,
+            ..Default::default()
+        }];
+        let mut images = Vec::new();
+        scanner
+            .run_ordered_artwork(
+                Uuid::parse_str(SERIES).unwrap(),
+                &entity,
+                &streams,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                super::ImageFetch::MissingOnly,
+                true,
+                &mut images,
+                &mut cache,
+            )
+            .await;
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            std::fs::read(&images[0].path).unwrap(),
+            if plugin_wins {
+                b"\x89PNG\r\n\x1a\nplugin".as_slice()
+            } else {
+                b"COVER".as_slice()
+            }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::enabled(true)]
+    #[case::disabled(false)]
+    #[tokio::test]
+    async fn music_image_only_refresh_runs_selected_plugin(#[case] enabled: bool) {
+        let fixture = MusicFixture::new(true, true, None).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = fixture
+            .scanner("http://127.0.0.1:1")
+            .with_metadata(
+                Arc::new(ferrofin_providers::TmdbClient::new().with_base_url("http://127.0.0.1:1")),
+                tmp.path().join("art"),
+            )
+            .with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let options = LibraryOptions {
+            type_options: ["MusicArtist", "MusicAlbum"]
+                .into_iter()
+                .map(|kind| ferrofin_model::configuration::TypeOptions {
+                    type_: Some(kind.to_owned()),
+                    image_fetchers: if enabled {
+                        vec!["ArtworkPlugin".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        fixture
+            .pass(
+                &scanner,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+            )
+            .await;
+        for id in [fixture.album_id, fixture.artist_id] {
+            let images = fixture.items.get_image_infos(id).await.unwrap();
+            assert_eq!(images.len(), usize::from(enabled), "{id}: {images:?}");
+            if enabled {
+                assert_eq!(
+                    std::fs::read(&images[0].path).unwrap(),
+                    b"\x89PNG\r\n\x1a\nplugin"
+                );
+            }
+        }
+    }
+
+    /// Music's post-pass must interleave plugins with built-in artwork just as
+    /// the item walk does, including its per-kind default provider order.
+    #[rstest::rstest]
+    #[case::plugin_first(&["ArtworkPlugin", "TheAudioDB"], true)]
+    #[case::remote_first(&["TheAudioDB", "ArtworkPlugin"], false)]
+    #[case::default_remote_first(&[], false)]
+    #[tokio::test]
+    async fn music_interleaves_plugin_and_remote_artwork(
+        #[case] order: &[&str],
+        #[case] plugin_wins: bool,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let fixture = MusicFixture::new(true, true, None).await;
+        fixture
+            .persistence
+            .save_provider_id(fixture.artist_id, "MusicBrainzArtist", MB_ARTIST)
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = spawn_music_artwork_stub();
+        let scanner = fixture
+            .scanner(&base)
+            .with_metadata(
+                Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base)),
+                tmp.path().join("art"),
+            )
+            .with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let options = LibraryOptions {
+            type_options: ["MusicArtist", "MusicAlbum"]
+                .into_iter()
+                .map(|kind| ferrofin_model::configuration::TypeOptions {
+                    type_: Some(kind.to_owned()),
+                    image_fetchers: vec!["ArtworkPlugin".to_owned(), "TheAudioDB".to_owned()],
+                    image_fetcher_order: order.iter().map(|s| (*s).to_owned()).collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        fixture
+            .pass(
+                &scanner,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+            )
+            .await;
+        for id in [fixture.album_id, fixture.artist_id] {
+            let images = fixture.items.get_image_infos(id).await.unwrap();
+            let primary = images
+                .iter()
+                .find(|i| i.image_type == ferrofin_model::entities::ImageType::Primary)
+                .expect("cover");
+            assert_eq!(
+                std::fs::read(&primary.path).unwrap(),
+                if plugin_wins {
+                    b"\x89PNG\r\n\x1a\nplugin".as_slice()
+                } else {
+                    b"remote".as_slice()
+                }
+            );
+        }
+    }
+
+    fn spawn_music_artwork_stub() -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let (body, content_type) = if request.starts_with("GET /image") {
+                    ("remote".to_owned(), "image/jpeg")
+                } else if request.contains("/album-mb.php") {
+                    (
+                        format!(r#"{{"album":[{{"strAlbumThumb":"http://{addr}/image"}}]}}"#),
+                        "application/json",
+                    )
+                } else {
+                    (
+                        format!(r#"{{"artists":[{{"strArtistThumb":"http://{addr}/image"}}]}}"#),
+                        "application/json",
+                    )
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}")
+    }
+
     const SERIES: &str = "0f0f0f0f-0000-0000-0000-000000000001";
     const EPISODE: &str = "0f0f0f0f-0000-0000-0000-000000000002";
 
