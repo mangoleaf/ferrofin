@@ -1775,7 +1775,7 @@ fn default_epoch() -> DateTime<Utc> {
 /// that is 23,809 rows of people, studios and genres, and it is how
 /// `items:all` came back 38,004 where Jellyfin says 14,347.
 ///
-/// The seven fields checked are exactly the seven the C# checks; any one of
+/// The eight fields checked are exactly the eight the C# checks; any one of
 /// them already narrows the query, and Jellyfin leaves it alone then.
 ///
 /// An empty scope means the user can see nothing, and C# guards it with a
@@ -1795,7 +1795,8 @@ pub(crate) async fn scope_to_user_libraries(
         && filter.top_parent_ids.is_empty()
         && non_blank(filter.ancestor_with_presentation_unique_key.as_ref()).is_none()
         && non_blank(filter.series_presentation_unique_key.as_ref()).is_none()
-        && filter.item_ids.is_empty();
+        && filter.item_ids.is_empty()
+        && filter.owner_ids.is_empty();
     if !unscoped {
         return Ok(None);
     }
@@ -5161,6 +5162,20 @@ mod tests {
             ..InternalItemsQuery::default()
         };
         let res = repository.get_item_list(&query).await.expect("extras");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, guid_to_db(trailer));
+
+        // OwnerIds already scopes the query, even for an adopted extra with
+        // no TopParentId. C# AddUserToQuery must not replace it with libraries.
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE003)).await;
+        let scoped = InternalItemsQuery {
+            user: Some(user),
+            ..query.clone()
+        };
+        let res = repository
+            .get_item_list(&scoped)
+            .await
+            .expect("user extras");
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, guid_to_db(trailer));
 
