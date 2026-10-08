@@ -45,7 +45,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
@@ -293,7 +293,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 /// item is not an Episode or Movie.
 async fn update_timestamps(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(id): Path<Uuid>,
     JsonBody(timestamps): JsonBody<TimeStamps>,
 ) -> Result<StatusCode, ApiError> {
@@ -382,7 +382,7 @@ async fn get_skippable_segments(
 /// for contract compatibility but Ferrofin keeps no fingerprint cache to clear.
 async fn erase_timestamps(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<EraseQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mode = query
@@ -405,7 +405,7 @@ async fn erase_timestamps(
 // ponytail: no separate plugin DB in Ferrofin; nothing to rebuild.
 async fn rebuild_database(
     State(_state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -417,7 +417,7 @@ async fn rebuild_database(
 /// `GET /MediaSegmentsApi` — plugin metadata (version).
 async fn segment_editor_metadata(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": plugin_version(&state).await }))
 }
@@ -425,7 +425,7 @@ async fn segment_editor_metadata(
 /// `POST /MediaSegmentsApi/{itemId}` — create/replace a segment for an item.
 async fn create_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<CreateSegmentQuery>,
     JsonBody(segment): JsonBody<SegmentInput>,
@@ -451,7 +451,7 @@ async fn create_segment(
 /// The `itemId`/`type` query params are accepted for contract compatibility.)
 async fn delete_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(segment_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     state.media_segments.delete_segment(segment_id).await?;
@@ -555,7 +555,7 @@ fn inject_import(css: &str) -> String {
 /// variable into server branding CSS. Port of `SkipButtonCssController.InjectCss`.
 async fn inject_css(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
     let delay = skip_hide_delay(&state).await;
     let mut branding = state.config.get_branding().await?;
@@ -582,7 +582,7 @@ async fn inject_css(
 /// it is already present (no-op otherwise). Port of `UpdateSkipDuration`.
 async fn update_skip_duration(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
     let delay = skip_hide_delay(&state).await;
     let mut branding = state.config.get_branding().await?;
@@ -612,7 +612,7 @@ async fn save_branding(state: &AppState, branding: BrandingOptions) -> Result<()
 /// `GET /IntroSkipper` — plugin metadata (version).
 async fn troubleshooting_metadata(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "version": plugin_version(&state).await }))
 }
@@ -645,7 +645,10 @@ async fn ffmpeg_chromaprint_available() -> bool {
 /// `GET /IntroSkipper/SupportBundle` — a plain-text Markdown troubleshooting
 /// bundle. Port of `TroubleshootingController.GetSupportBundle`, reporting the
 /// facts Ferrofin can supply (server/plugin version, OS, fingerprinter presence).
-async fn support_bundle(State(state): State<AppState>, RequireAuth(_auth): RequireAuth) -> String {
+async fn support_bundle(
+    State(state): State<AppState>,
+    RequireAdmin(_auth): RequireAdmin,
+) -> String {
     let version = plugin_version(&state).await;
     format!(
         "* Server: Ferrofin {server}\n\
@@ -668,7 +671,7 @@ async fn support_bundle(State(state): State<AppState>, RequireAuth(_auth): Requi
 /// `GET /Intros/ScanStatus` — whether a detection pass is running.
 async fn scan_status(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<ScanStatusResponse>, ApiError> {
     Ok(Json(ScanStatusResponse {
         is_running: scan_running(&state).await?,
@@ -697,7 +700,7 @@ fn episode_visualizations(episodes: Vec<BaseItemEntity>) -> Vec<EpisodeVisualiza
 /// `GET /Intros/Show/{SeriesId}/{SeasonId}` — the episodes of a season.
 async fn get_season_episodes(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<EpisodeVisualization>>, ApiError> {
     let episodes = season_episodes(&state, season_id).await?;
@@ -713,7 +716,7 @@ async fn get_season_episodes(
 /// Skipper segments. Port of `VisualizationController.EraseSeasonAsync`.
 async fn erase_season(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     let episodes = season_episodes(&state, season_id).await?;
@@ -739,15 +742,14 @@ async fn erase_season(
 /// Port of `VisualizationController.GetAnalyzerAction` →
 /// `Plugin.GetAllAnalyzerActionsAsync`: every mode in declaration order, the
 /// stored action or `Default`. Elevated, as the whole controller is upstream.
-/// 404 when the season id is unknown (upstream checks its queue of analysable
-/// seasons; Ferrofin checks the library).
+/// 404 unless the id is a season with episodes — upstream's
+/// `QueuedMediaItems.ContainsKey`, the queue `season_episodes` mirrors.
 async fn get_analyzer_actions(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(season_id): Path<Uuid>,
 ) -> Result<Json<std::collections::BTreeMap<AnalysisMode, AnalyzerAction>>, ApiError> {
-    require_elevation(&state, &auth).await?;
-    if state.library.get_item_by_id(season_id).await?.is_none() {
+    if season_episodes(&state, season_id).await?.is_empty() {
         return Err(ApiError::NotFound(format!("season {season_id}")));
     }
     let stored = state.intro_skipper.analyzer_actions(season_id).await?;
@@ -783,10 +785,9 @@ struct UpdateAnalyzerActionsRequest {
 /// for the season). Elevated, as the whole controller is upstream.
 async fn update_analyzer_actions(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     JsonBody(request): JsonBody<UpdateAnalyzerActionsRequest>,
 ) -> Result<StatusCode, ApiError> {
-    require_elevation(&state, &auth).await?;
     let actions: Vec<(AnalysisMode, AnalyzerAction)> =
         request.analyzer_actions.into_iter().collect();
     state
@@ -804,7 +805,7 @@ async fn update_analyzer_actions(
 // ponytail: detection task is library-wide; per-season scoping needs task params.
 async fn scan_season(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path((_series_id, _season_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
     if scan_running(&state).await? {
@@ -866,10 +867,9 @@ struct TransformationRegistration {
 /// code, not editing metadata.
 async fn register_transformation(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     JsonBody(payload): JsonBody<TransformationRegistration>,
 ) -> Result<StatusCode, ApiError> {
-    require_elevation(&state, &auth).await?;
     let Some(service) = state.file_transformations.as_ref() else {
         tracing::warn!("file-transformation registration dropped: pipeline not wired");
         return Ok(StatusCode::OK);
@@ -893,26 +893,6 @@ async fn register_transformation(
         )
         .await;
     Ok(StatusCode::OK)
-}
-
-/// Upstream's `Policies.RequiresElevation`: an API key, or a user whose policy
-/// grants `IsAdministrator`. Mirrors `plugins::require_admin`, which gates the
-/// other "stage code for later execution" surface.
-async fn require_elevation(
-    state: &AppState,
-    auth: &ferrofin_traits::options::AuthorizationInfo,
-) -> Result<(), ApiError> {
-    if auth.is_api_key {
-        return Ok(());
-    }
-    if let Some(user) = &auth.user
-        && super::users::is_administrator(state, user).await?
-    {
-        return Ok(());
-    }
-    Err(ApiError::Forbidden(
-        "administrator access required".to_owned(),
-    ))
 }
 
 /// Registers the Intro Skipper extension's routes onto `router`.

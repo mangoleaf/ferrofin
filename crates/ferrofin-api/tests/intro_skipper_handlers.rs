@@ -260,7 +260,13 @@ impl PluginManager for MemPlugins {
 
 /// Builds an authenticated `AppState` with the four working fakes wired in.
 fn build_app(segments: Arc<MemSegments>, tasks: Arc<MemTasks>, config: Arc<MemConfig>) -> AppState {
-    build_app_as(segments, tasks, config, Arc::new(AuthedAuthService))
+    // Every route but the two episode reads is `RequiresElevation` upstream.
+    build_app_as(
+        segments,
+        tasks,
+        config,
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    )
 }
 
 /// [`build_app`] with the authentication seam chosen by the caller, so the
@@ -574,6 +580,50 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
 /// bare `RequireAuth`, which let any authenticated account grow that registry —
 /// measured at +157 MB of RssAnon over 150 requests carrying 1 MB of strings
 /// each, linearly and with no plateau.
+/// Upstream's plugin controllers are `RequiresElevation` (class-level on
+/// `VisualizationController`, `SegmentEditorController` and
+/// `TroubleshootingController`; per action on `SkipButtonCssController` and the
+/// writes of `SkipIntroController`). Only the two episode reads are plain
+/// `[Authorize]`.
+#[tokio::test]
+async fn plugin_routes_are_elevated_as_upstream() {
+    let user_app = build_app_as(
+        Arc::new(MemSegments::default()),
+        Arc::new(MemTasks {
+            running: false,
+            started: Mutex::new(Vec::new()),
+        }),
+        Arc::new(MemConfig::default()),
+        Arc::new(AuthedAuthService),
+    );
+    let id = Uuid::from_u128(1);
+    for (method, uri) in [
+        ("POST", format!("/Episode/{id}/Timestamps")),
+        ("POST", "/Intros/EraseTimestamps".to_owned()),
+        ("POST", "/Intros/RebuildDatabase".to_owned()),
+        ("GET", "/MediaSegmentsApi".to_owned()),
+        ("POST", format!("/MediaSegmentsApi/{id}")),
+        ("DELETE", format!("/MediaSegmentsApi/{id}")),
+        ("POST", "/SkipButtonCss/InjectCss".to_owned()),
+        ("POST", "/SkipButtonCss/UpdateSkipDuration".to_owned()),
+        ("GET", "/IntroSkipper".to_owned()),
+        ("GET", "/IntroSkipper/SupportBundle".to_owned()),
+        ("GET", format!("/Intros/AnalyzerActions/{id}")),
+        ("POST", "/Intros/AnalyzerActions/UpdateSeason".to_owned()),
+        ("GET", format!("/Intros/Show/{id}/{id}")),
+        ("DELETE", format!("/Intros/Show/{id}/{id}")),
+        ("POST", format!("/Intros/ScanSeason/{id}/{id}")),
+        ("GET", "/Intros/ScanStatus".to_owned()),
+        (
+            "POST",
+            "/FileTransformation/RegisterTransformation".to_owned(),
+        ),
+    ] {
+        let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
 #[tokio::test]
 async fn register_transformation_requires_an_administrator() {
     let seg = Arc::new(MemSegments::default());
