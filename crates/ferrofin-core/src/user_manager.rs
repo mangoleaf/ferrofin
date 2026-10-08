@@ -9,7 +9,7 @@
 //! Password hashing is delegated to the injected [`AuthenticationManager`]
 //! providers (the built-in [`DefaultAuthenticationProvider`] plus the fallback
 //! [`InvalidAuthProvider`]); this manager never touches crypto directly. The C#
-//! `_userLock` per-user async mutex is dropped: SQLite gives us exactly one
+//! login lock serializes authentication for each user; SQLite gives us one
 //! writer connection, so an operation whose guard reads run **inside** its
 //! writing transaction is already atomic against every other writer. That is
 //! load-bearing rather than incidental — a guard evaluated on the *read* pool
@@ -33,7 +33,7 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -72,6 +72,8 @@ pub const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
 /// name is unusable (C# `"MyJellyfinUser"`).
 const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 
+type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
+
 /// The concrete user manager.
 ///
 /// Holds the registered [`AuthenticationManager`] providers by shared reference
@@ -82,6 +84,7 @@ const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 #[derive(Clone)]
 pub struct FerrofinUserManager {
     db: Database,
+    login_locks: Arc<LoginLocks>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
@@ -125,6 +128,24 @@ impl FerrofinUserManager {
         Self::with_providers(db, Vec::new())
     }
 
+    /// Weak entries retain only active/waiting login locks, not every username
+    /// ever presented. Clones of this manager share the same lock registry.
+    fn login_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .login_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let entry = locks.entry(key.to_owned()).or_default();
+        if let Some(lock) = entry.upgrade() {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            *entry = Arc::downgrade(&lock);
+            lock
+        }
+    }
+
     /// Records a failed login: increments the invalid-attempt counter, locks the
     /// account out once the threshold is hit, and logs the security-audit `warn!`
     /// lines (never the attempted password).
@@ -134,7 +155,7 @@ impl FerrofinUserManager {
         let attempts = user.invalid_login_attempt_count + 1;
         if user
             .login_attempts_before_lockout
-            .is_some_and(|max| max > 0 && attempts >= max)
+            .is_some_and(|max| attempts >= max)
         {
             set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true).await?;
             // A locked-out account's cached auth must not outlive the lock.
@@ -164,6 +185,7 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        self.auth_cache.clear();
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -182,6 +204,7 @@ impl FerrofinUserManager {
         providers.extend(extra);
         Self {
             db,
+            login_locks: Arc::new(Mutex::new(HashMap::new())),
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
@@ -797,6 +820,12 @@ impl UserManager for FerrofinUserManager {
         }
 
         let user = self.get_user_by_name(username).await?;
+        // Authentication reads the user before password verification and writes
+        // its counters afterwards. A writer transaction alone cannot serialize
+        // that whole span. Match C#'s per-user lock and reload inside it.
+        let login_lock = self.login_lock(user.as_ref().map_or("", |user| user.id.as_str()));
+        let _login_guard = login_lock.lock().await;
+        let user = self.get_user_by_name(username).await?;
 
         // Select the candidate providers (C# `GetAuthenticationProviders(user)`):
         // when the user names a specific provider, only the matching enabled one
@@ -889,6 +918,7 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
+        self.auth_cache.clear();
         Ok(Some(user))
     }
 
@@ -1095,8 +1125,10 @@ impl UserManager for FerrofinUserManager {
         // Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
         // permission flag, the access schedules (replaced wholesale) and the
         // list-valued preferences the policy carries.
-        self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
+        let login_lock = self.login_lock(&id);
+        let _login_guard = login_lock.lock().await;
+        self.require_user(user_id).await?;
 
         // "The default number of login attempts is 3, but for some god forsaken
         // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
@@ -2160,6 +2192,99 @@ mod tests {
             mgr.change_password(id, "   ").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    #[rstest::rstest]
+    #[case(0, Some(3))]
+    #[case(-1, None)]
+    #[case(-2, Some(1))]
+    #[case(2, Some(2))]
+    #[tokio::test]
+    async fn saved_lockout_sentinels_are_enforced(
+        #[case] threshold: i32,
+        #[case] locked_at: Option<i64>,
+    ) {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db);
+        let user = mgr.create_user("sentinel").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        let mut policy = UserPolicy {
+            login_attempts_before_lockout: threshold,
+            ..UserPolicy::default()
+        };
+        mgr.update_policy(uid, &policy).await.unwrap();
+        for attempt in 1..=5 {
+            let result = mgr
+                .authenticate_user("sentinel", "wrong", "127.0.0.1", true)
+                .await;
+            if locked_at.is_some_and(|limit| attempt > limit) {
+                assert!(matches!(result, Err(ServiceError::Forbidden(_))));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+        let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+        assert_eq!(user.invalid_login_attempt_count, locked_at.unwrap_or(5));
+        assert_eq!(
+            mgr.get_user_dto(&user, None)
+                .await
+                .unwrap()
+                .policy
+                .unwrap()
+                .is_disabled,
+            locked_at.is_some()
+        );
+        policy.is_disabled = false;
+        policy.invalid_login_attempt_count = 0;
+        mgr.update_policy(uid, &policy).await.unwrap();
+        assert!(
+            mgr.authenticate_user("sentinel", "", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(-1, 24)]
+    #[case(5, 5)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_failures_do_not_lose_counts(
+        #[case] threshold: i32,
+        #[case] expected: i64,
+    ) {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db);
+        let user = mgr.create_user("concurrent").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        mgr.update_policy(
+            uid,
+            &UserPolicy {
+                login_attempts_before_lockout: threshold,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(24));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..24 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                mgr.authenticate_user("concurrent", "wrong", "127.0.0.1", true)
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(matches!(
+                result.unwrap(),
+                Ok(None) | Err(ServiceError::Forbidden(_))
+            ));
+        }
+        let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+        assert_eq!(user.invalid_login_attempt_count, expected);
     }
 
     #[tokio::test]
