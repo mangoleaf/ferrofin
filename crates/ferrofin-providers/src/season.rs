@@ -35,6 +35,38 @@ use crate::metadata_merge::MetadataResult;
 use crate::tmdb::SeasonDetails;
 use crate::tvdb::{TvdbClient, TvdbSeasonDetails};
 
+/// The configured name for season zero, including an explicitly empty name.
+#[must_use]
+pub fn zero_display_name(options: Option<&ferrofin_model::configuration::LibraryOptions>) -> &str {
+    options.map_or("Specials", |options| {
+        options.season_zero_display_name.as_str()
+    })
+}
+
+/// Applies `SeasonMetadataService.BeforeSaveInternal`'s season-zero naming
+/// rule. Item/name locks and ordinal case-only differences preserve the name.
+/// Returns whether the name changed; the caller settles the sort name.
+pub fn apply_zero_display_name(
+    item: &mut BaseItemEntity,
+    locked_fields: &[ferrofin_model::entities::MetadataField],
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+) -> bool {
+    use ferrofin_model::entities::MetadataField;
+    let name = zero_display_name(options);
+    if item.type_.rsplit('.').next() != Some("Season")
+        || item.index_number != Some(0)
+        || item.is_locked
+        || locked_fields.contains(&MetadataField::Name)
+        || item.name.as_deref().is_some_and(|current| {
+            ferrofin_util::string_extensions::equals_ordinal_ignore_case(current, name)
+        })
+    {
+        return false;
+    }
+    item.name = Some(name.to_owned());
+    true
+}
+
 /// `TmdbSeasonProvider.GetMetadata`'s answer (`:41-158`) for season
 /// `season_number`, from the season's `/tv/{id}/season/{n}` response.
 ///
@@ -164,6 +196,44 @@ pub async fn tvdb_season(
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::renamed(false, false, 0, "Old", "Bonus", "Bonus")]
+    #[case::item_lock(true, false, 0, "Mine", "Bonus", "Mine")]
+    #[case::name_lock(false, true, 0, "Mine", "Bonus", "Mine")]
+    #[case::regular(false, false, 1, "Season 1", "Bonus", "Season 1")]
+    #[case::case_only(false, false, 0, "ÉXTRAS", "éxtras", "ÉXTRAS")]
+    #[case::empty(false, false, 0, "Old", "", "")]
+    fn zero_name_respects_locks_and_ordinal_casing(
+        #[case] locked: bool,
+        #[case] name_locked: bool,
+        #[case] number: i64,
+        #[case] current: &str,
+        #[case] configured: &str,
+        #[case] expected: &str,
+    ) {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Season".to_owned(),
+            index_number: Some(number),
+            is_locked: locked,
+            name: Some(current.to_owned()),
+            ..Default::default()
+        };
+        let options = ferrofin_model::configuration::LibraryOptions {
+            season_zero_display_name: configured.to_owned(),
+            ..Default::default()
+        };
+        let fields = if name_locked {
+            vec![ferrofin_model::entities::MetadataField::Name]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            super::apply_zero_display_name(&mut row, &fields, Some(&options)),
+            current != expected
+        );
+        assert_eq!(row.name.as_deref(), Some(expected));
+    }
+
     use super::*;
     use crate::tmdb::TmdbPerson;
     use crate::tvdb::TvdbTranslation;

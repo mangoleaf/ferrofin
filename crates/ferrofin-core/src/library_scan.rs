@@ -80,6 +80,8 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// Final season names for episode `BeforeSaveInternal`, read once per pass.
+    season_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
     /// Lookup locales already resolved by this pass's metadata providers.
@@ -4687,6 +4689,7 @@ impl LibraryScanner {
             .retain(|(series, _, _), _| !keys.contains(series));
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
+        cache.season_names.retain(|id, _| !keys.contains(id));
         cache.locale_parents.retain(|id, _| !keys.contains(id));
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         let albums: Vec<Uuid> = touched
@@ -5191,12 +5194,20 @@ impl LibraryScanner {
             }
             None => saved_row(stored_row, &guesses, &entity, facts),
         };
+        if ferrofin_providers::season::apply_zero_display_name(
+            &mut entity,
+            locked_fields,
+            policy.options,
+        ) {
+            settle_sort_name(&mut entity);
+        }
         // FindExtras corrects filename-derived names even on existing extras;
         // an explicit Name field lock is the only opt-out upstream.
         if entity.owner_id.is_some() && !locked_fields.contains(&MetadataField::Name) {
             entity.name.clone_from(&item.entity.name);
             settle_sort_name(&mut entity);
         }
+        self.sync_season_name(&mut entity, state.art_cache).await?;
         self.apply_parental_rating_score(&mut entity).await?;
         // The folder's new mtime is written with the music pass's save, not
         // this one (see `ItemPass::music_pending`).
@@ -7569,6 +7580,37 @@ impl LibraryScanner {
             }
         }
         fold.result
+    }
+
+    /// `EpisodeMetadataService.BeforeSaveInternal` takes the finalized parent
+    /// season's name, including locked edits and preserved case. A season-only
+    /// refresh does not rewrite its episodes until they are refreshed as well.
+    async fn sync_season_name(
+        &self,
+        row: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Result<(), ServiceError> {
+        match item_type_lookup::kind_from_type_name(&row.type_) {
+            Some(BaseItemKind::Season) => {
+                cache.season_names.insert(row.id.clone(), row.name.clone());
+            }
+            Some(BaseItemKind::Episode) => {
+                if let Some(key) = row.season_id.as_ref() {
+                    if !cache.season_names.contains_key(key)
+                        && let Some(items) = &self.item_repository
+                        && let Some(id) = parse_id(key)
+                        && let Some(season) = items.retrieve_item(id).await?
+                    {
+                        cache.season_names.insert(key.clone(), season.name);
+                    }
+                    if let Some(name) = cache.season_names.get(key) {
+                        row.season_name.clone_from(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// `BaseItem.GetPreferredMetadataLanguage/CountryCode`: own override,
@@ -10482,6 +10524,12 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
+        let zero_name = ferrofin_providers::season::zero_display_name(
+            folders
+                .iter()
+                .find(|folder| collection_folder_id(folder) == Some(cf))
+                .and_then(|folder| folder.library_options.as_ref()),
+        );
         let entries = self.list(location, ctx);
         for rows in fanout::map(&entries, ctx, |entry, ctx| {
             let mut rows = Vec::new();
@@ -10526,6 +10574,7 @@ impl LibraryScanner {
                     series_id,
                     &series_name,
                     &series_key,
+                    zero_name,
                     ctx,
                     out,
                 );
@@ -10627,6 +10676,7 @@ impl LibraryScanner {
         series_id: Uuid,
         series_name: &str,
         series_key: &str,
+        zero_name: &str,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
@@ -10659,7 +10709,10 @@ impl LibraryScanner {
                         season_path_parser::parse(&entry.path, Some(series_dir), true, true);
                     if season.season_number.is_some() || season.is_season_folder {
                         let num = season.season_number;
-                        let name = num.map_or_else(|| entry.name.clone(), season_display_name);
+                        let name = num.map_or_else(
+                            || entry.name.clone(),
+                            |number| season_display_name(number, zero_name),
+                        );
                         let Some((season_id, mut e)) = self.base_item(
                             ctx,
                             BaseItemKind::Season,
@@ -10725,6 +10778,7 @@ impl LibraryScanner {
             series_name,
             series_key,
             series_dir,
+            zero_name,
             ctx,
             out,
         );
@@ -10766,6 +10820,7 @@ impl LibraryScanner {
         series_name: &str,
         series_key: &str,
         series_dir: &str,
+        zero_name: &str,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
@@ -10787,7 +10842,10 @@ impl LibraryScanner {
             if season_ids.contains_key(&num) {
                 continue;
             }
-            let name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
+            let name = num.map_or_else(
+                || "Season Unknown".to_owned(),
+                |number| season_display_name(number, zero_name),
+            );
             // A flat series has no season folder, so derive a stable id from a
             // synthetic path (unique per series+season) and leave the season's own
             // path unset (it is a virtual grouping, not an on-disk folder).
@@ -10825,7 +10883,10 @@ impl LibraryScanner {
 
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
-            let season_name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
+            let season_name = num.map_or_else(
+                || "Season Unknown".to_owned(),
+                |number| season_display_name(number, zero_name),
+            );
             self.emit_episode(
                 path,
                 cf,
@@ -14527,9 +14588,9 @@ fn folder_name(dir: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn season_display_name(number: i32) -> String {
+fn season_display_name(number: i32, zero_name: &str) -> String {
     if number == 0 {
-        "Specials".to_owned()
+        zero_name.to_owned()
     } else {
         format!("Season {number}")
     }

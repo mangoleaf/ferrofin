@@ -2251,6 +2251,7 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
         // The remote image providers' artwork. A single failed download must
         // not fail the refresh.
