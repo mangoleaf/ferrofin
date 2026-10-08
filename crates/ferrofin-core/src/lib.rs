@@ -212,6 +212,7 @@ pub mod path_manager;
 pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
+mod query_restrictions;
 pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;
 pub mod resolvers;

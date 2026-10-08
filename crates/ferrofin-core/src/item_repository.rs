@@ -245,6 +245,15 @@ impl FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let prepared = preferences.as_ref().unwrap_or(filter);
+        Ok(self.resolve_views_prepared(prepared).await?.or(preferences))
+    }
+
+    async fn resolve_views_prepared(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
         // `physical_children_only` is the delete-cascade path: it must keep
         // meaning "the rows this item owns", never widen to a library's whole
         // contents.
@@ -1023,10 +1032,8 @@ impl FerrofinItemRepository {
         // `AddUserToQuery` for the by-name tabs. A no-op for a query that is
         // already scoped (a browse under one library passes `ancestor_ids`).
         let scoped = scope_to_user_libraries(&self.db, filter).await?;
-        let top_parents: Vec<String> = scoped
-            .as_ref()
-            .map(|f| f.top_parent_ids.iter().copied().map(guid_to_db).collect())
-            .unwrap_or_default();
+        let filter = scoped.as_ref().unwrap_or(filter);
+        let top_parents = to_guid_strings(&filter.top_parent_ids);
 
         // v12 assigns `TotalRecordCount = representativeIds.Count` whenever
         // `EnableTotalRecordCount` (`ByName.cs:227-230`), with or without a
@@ -1251,7 +1258,7 @@ enum InnerScope {
 /// owned non-extras (`TranslateQuery.cs:796-807`).
 #[allow(clippy::too_many_lines)] // one predicate per C# field, kept in the C# order
 fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
-    crate::translate_query::append_parental_rating(qb, scope.filter, "ci");
+    crate::translate_query::append_parental_restrictions(qb, scope.filter, "ci");
     let ByNameScope {
         filter,
         content_type_names,
@@ -1693,6 +1700,10 @@ fn append_by_name_filters(
 fn by_name_outer_filter(filter: &InternalItemsQuery) -> InternalItemsQuery {
     InternalItemsQuery {
         user: filter.user.clone(),
+        user_preferences_loaded: filter.user_preferences_loaded,
+        block_unrated_items: filter.block_unrated_items.clone(),
+        exclude_inherited_tags: filter.exclude_inherited_tags.clone(),
+        include_inherited_tags: filter.include_inherited_tags.clone(),
         is_played: filter.is_played,
         is_favorite: filter.is_favorite,
         is_favorite_or_liked: filter.is_favorite_or_liked,
@@ -1796,6 +1807,17 @@ pub(crate) async fn query_user(
 /// uses the placeholder id for the same purpose — deterministic, and a row
 /// every query already excludes.
 pub(crate) async fn scope_to_user_libraries(
+    db: &Database,
+    filter: &InternalItemsQuery,
+) -> Result<Option<InternalItemsQuery>, ServiceError> {
+    let preferences = crate::query_restrictions::resolve(db, filter).await?;
+    let prepared = preferences.as_ref().unwrap_or(filter);
+    Ok(scope_to_user_libraries_prepared(db, prepared)
+        .await?
+        .or(preferences))
+}
+
+async fn scope_to_user_libraries_prepared(
     db: &Database,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
@@ -2549,31 +2571,24 @@ impl ItemRepository for FerrofinItemRepository {
         // Recursive descent (via the AncestorIds/LinkedChildren closure) is the
         // library manager's job; here the direct-children form is honored and the
         // recursive flag widens to the ancestor closure where present.
-        let uid = user.id.clone();
-        // Both forms select leaf descendants of `id`; they differ only in how a
-        // child is related to the parent. Each contributes a FROM fragment (join)
-        // and a scope predicate that folds into the single WHERE below — never a
-        // second WHERE.
-        let (join, scope) = if recursive {
-            // Any descendant, via the AncestorIds closure.
-            (
-                r#"JOIN "AncestorIds" a ON a."ItemId" = bi."Id" AND a."ParentItemId" = ?1"#,
-                "1 = 1",
-            )
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(user.clone());
+        let filter = crate::query_restrictions::resolve(&self.db, &filter)
+            .await?
+            .unwrap_or(filter);
+        let mut qb = QueryBuilder::new(r#"SELECT NOT EXISTS (SELECT 1 FROM "BaseItems" bi "#);
+        if recursive {
+            qb.push(r#"JOIN "AncestorIds" a ON a."ItemId" = bi."Id" WHERE a."ParentItemId" = "#);
         } else {
-            // Direct children only.
-            ("", r#"bi."ParentId" = ?1"#)
-        };
-        let sql = format!(
-            r#"SELECT NOT EXISTS (
-                 SELECT 1 FROM "BaseItems" bi {join}
-                 WHERE {scope} AND bi."IsFolder" = 0 AND bi."IsVirtualItem" = 0
-                   AND NOT EXISTS (SELECT 1 FROM "UserData" ud
-                       WHERE ud."ItemId" = bi."Id" AND ud."UserId" = ?2 AND ud."Played" = 1))"#,
-        );
-        let all_played: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-            .bind(guid_to_db(id))
-            .bind(uid)
+            qb.push(r#"WHERE bi."ParentId" = "#);
+        }
+        qb.push_bind(guid_to_db(id))
+            .push(r#" AND bi."IsFolder" = 0 AND bi."IsVirtualItem" = 0"#);
+        crate::translate_query::append_parental_restrictions(&mut qb, &filter, "bi");
+        qb.push(r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = bi."Id" AND ud."UserId" = "#)
+            .push_bind(user.id.clone()).push(r#" AND ud."Played" = 1))"#);
+        let all_played: i64 = qb
+            .build_query_scalar()
             .fetch_one(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -2717,6 +2732,84 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
+
+    #[rstest::rstest]
+    #[case(BaseItemKind::Movie, "Movie", false)]
+    #[case(BaseItemKind::BoxSet, "Movie", false)]
+    #[case(BaseItemKind::Series, "Series", false)]
+    #[case(BaseItemKind::Season, "Series", false)]
+    #[case(BaseItemKind::Episode, "Series", false)]
+    #[case(BaseItemKind::Trailer, "Trailer", false)]
+    #[case(BaseItemKind::Book, "Book", false)]
+    #[case(BaseItemKind::AudioBook, "Book", false)]
+    #[case(BaseItemKind::Audio, "Music", false)]
+    #[case(BaseItemKind::MusicAlbum, "Music", false)]
+    #[case(BaseItemKind::MusicVideo, "Music", false)]
+    #[case(BaseItemKind::LiveTvChannel, "LiveTvChannel", false)]
+    #[case(BaseItemKind::LiveTvProgram, "LiveTvProgram", false)]
+    #[case(BaseItemKind::Video, "ChannelContent", true)]
+    #[case(BaseItemKind::Audio, "ChannelContent", true)]
+    #[tokio::test]
+    async fn saved_unrated_policy_filters_old_rows_and_explicit_ids(
+        #[case] kind: BaseItemKind,
+        #[case] category: &str,
+        #[case] channel: bool,
+    ) {
+        use ferrofin_db::enums::PreferenceKind;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let unrated = Uuid::new_v4();
+        let rated = Uuid::new_v4();
+        for (id, score) in [(unrated, None), (rated, Some(0_i64))] {
+            seed_named_item(&db, id, kind, "Rating category").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = ?, "UnratedType" = NULL, "ChannelId" = ? WHERE "Id" = ?"#)
+                .bind(score).bind(channel.then(|| guid_to_db(Uuid::new_v4()))).bind(guid_to_db(id)).execute(db.writer()).await.unwrap();
+        }
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            item_ids: vec![unrated, rated],
+            group_by_presentation_unique_key: false,
+            ..Default::default()
+        };
+        for (blocked, count) in [
+            (Vec::new(), 2),
+            (vec![category.to_owned()], 1),
+            (vec!["Other".to_owned()], 2),
+            (Vec::new(), 2),
+        ] {
+            crate::user_entity_ext::set_preference(
+                db.writer(),
+                &user.id,
+                PreferenceKind::BlockUnratedItems,
+                &blocked,
+            )
+            .await
+            .unwrap();
+            let result = repository.get_items(&query).await.unwrap();
+            assert_eq!(result.total_record_count, count, "{blocked:?}");
+            assert_eq!(result.items.len(), usize::try_from(count).unwrap());
+            if count == 1 {
+                let selector = InternalItemsQuery {
+                    has_parental_rating: Some(true),
+                    ..query.clone()
+                };
+                assert_eq!(
+                    repository
+                        .get_items(&selector)
+                        .await
+                        .unwrap()
+                        .total_record_count,
+                    2,
+                    "TranslateQuery's explicit HasParentalRating selector skips BlockUnratedItems"
+                );
+            }
+            assert!(
+                result.items.iter().any(|item| item.id == guid_to_db(rated)),
+                "a score of zero is rated"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn parental_rating_hides_facets_backed_only_by_restricted_media() {
@@ -4816,6 +4909,21 @@ mod tests {
                 .get_is_played(&user, parent, false)
                 .await
                 .expect("is_played non-recursive with unplayed child")
+        );
+        crate::user_entity_ext::set_preference(
+            db.writer(),
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockUnratedItems,
+            &["Series".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            repository
+                .get_is_played(&user, parent, false)
+                .await
+                .unwrap(),
+            "hidden unrated episodes do not keep a folder unplayed"
         );
     }
 

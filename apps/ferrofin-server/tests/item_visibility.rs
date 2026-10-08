@@ -1247,3 +1247,96 @@ async fn metadata_rating_edits_keep_browse_and_direct_access_consistent() {
         );
     }
 }
+
+#[tokio::test]
+async fn saved_unrated_policy_filters_browse_and_numeric_enum_values_round_trip() {
+    let f = fixture().await;
+    let movies = items_by_path(&f.router, &f.admin).await;
+    let id = movies
+        .iter()
+        .find(|(path, _)| path.contains("Alpha"))
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Items/{id}"),
+            Some(&f.admin),
+            Some(json!({"Name":"Alpha","OfficialRating":"Unrated","CustomRating":null}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    for (blocked, visible) in [
+        (json!([]), true),
+        (json!(["Movie", 99]), false),
+        (json!([]), true),
+    ] {
+        dto["Policy"]["BlockUnratedItems"] = blocked.clone();
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Users/{}/Policy", f.viewer_id),
+                Some(&f.admin),
+                Some(dto["Policy"].clone())
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, saved) = call(
+            &f.router,
+            "GET",
+            &format!("/Users/{}", f.viewer_id),
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        assert_eq!(saved["Policy"]["BlockUnratedItems"], blocked);
+        let (status, listed) = call(
+            &f.router,
+            "GET",
+            &format!("/Items?ids={id}"),
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"] == id),
+            visible
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Items/{id}"),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            if visible {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+    }
+}

@@ -21,9 +21,42 @@
 //! richer per-instance behavior (which depends on runtime fields, not just the
 //! kind) is not part of this seam.
 
-use ferrofin_model::data::{BaseItemKind, CollectionType};
+use ferrofin_model::data::{BaseItemKind, CollectionType, UnratedItem};
 use ferrofin_model::entities::CollectionTypeOptions;
 use uuid::Uuid;
+
+/// The class-specific `GetBlockUnratedType` overrides. Audio depends on its source.
+pub(crate) const UNRATED_KINDS: &[(BaseItemKind, UnratedItem)] = &[
+    (BaseItemKind::Movie, UnratedItem::Movie),
+    (BaseItemKind::BoxSet, UnratedItem::Movie),
+    (BaseItemKind::Series, UnratedItem::Series),
+    (BaseItemKind::Season, UnratedItem::Series),
+    (BaseItemKind::Episode, UnratedItem::Series),
+    (BaseItemKind::Trailer, UnratedItem::Trailer),
+    (BaseItemKind::Book, UnratedItem::Book),
+    (BaseItemKind::AudioBook, UnratedItem::Book),
+    (BaseItemKind::MusicVideo, UnratedItem::Music),
+    (BaseItemKind::MusicAlbum, UnratedItem::Music),
+    (BaseItemKind::MusicArtist, UnratedItem::Music),
+    (BaseItemKind::LiveTvChannel, UnratedItem::LiveTvChannel),
+    (BaseItemKind::TvChannel, UnratedItem::LiveTvChannel),
+    (BaseItemKind::LiveTvProgram, UnratedItem::LiveTvProgram),
+];
+
+/// The unrated category stored by `BaseItemMapper`, shared with direct access.
+#[must_use]
+pub fn unrated_item(kind: BaseItemKind, channel_source: bool) -> UnratedItem {
+    if let Some((_, value)) = UNRATED_KINDS.iter().find(|(stored, _)| *stored == kind) {
+        return *value;
+    }
+    if channel_source || kind == BaseItemKind::Channel {
+        UnratedItem::ChannelContent
+    } else if kind == BaseItemKind::Audio {
+        UnratedItem::Music
+    } else {
+        UnratedItem::Other
+    }
+}
 
 /// Whether items of this kind are folders (C# `BaseItem.IsFolder`, overridden to
 /// `true` by every `Folder` subclass).

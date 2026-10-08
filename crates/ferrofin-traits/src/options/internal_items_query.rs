@@ -54,6 +54,8 @@ pub struct InternalItemsQuery {
     pub limit: Option<i32>,
     /// The user the query is scoped to.
     pub user: Option<UserEntity>,
+    /// Whether repository resolution has loaded the user content preferences.
+    pub user_preferences_loaded: bool,
 
     // --- boolean tri-state filters ---
     /// Restrict to folders / non-folders.
@@ -450,6 +452,7 @@ impl Default for InternalItemsQuery {
             start_index: None,
             limit: None,
             user: None,
+            user_preferences_loaded: false,
             is_folder: None,
             is_favorite: None,
             is_favorite_or_liked: None,
@@ -707,9 +710,13 @@ impl InternalItemsQuery {
     /// The C# method also derives `block_unrated_items`,
     /// `exclude_inherited_tags` and `include_inherited_tags` from the user's
     /// **preferences** (`PreferenceKind.*`). Those rows live in a separate
-    /// preferences table, not on [`UserEntity`], so the caller must populate
-    /// those three fields from a preference lookup; they are left untouched here.
+    /// preferences table, not on [`UserEntity`], so repository query resolution populates
+    /// those three fields from a preference lookup before translating SQL.
     pub fn set_user(&mut self, user: UserEntity) {
+        self.user_preferences_loaded = false;
+        self.block_unrated_items.clear();
+        self.exclude_inherited_tags.clear();
+        self.include_inherited_tags.clear();
         if let Some(max) = user.max_parental_rating_score {
             self.max_parental_rating = Some(ParentalRatingScore::new(
                 i32::try_from(max).unwrap_or(i32::MAX),

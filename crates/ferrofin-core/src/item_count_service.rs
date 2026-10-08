@@ -26,7 +26,7 @@ use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow, P
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{QueryShape, append_parental_rating, build_query};
+use crate::translate_query::{QueryShape, append_parental_restrictions, build_query};
 
 /// Adds the same rating predicate as browsing before an existing aggregate's
 /// GROUP BY. Its suffix contains no parameters, so the original bind order is
@@ -49,18 +49,14 @@ fn restrict_count_query<'q>(
             (prefix, Some(suffix))
         });
     let mut qb = QueryBuilder::with_arguments(prefix, arguments);
-    let restricted = filter.max_parental_rating.is_some()
-        || filter
-            .user
-            .as_ref()
-            .is_some_and(|user| user.max_parental_rating_score.is_some());
+    let restricted = crate::translate_query::has_parental_restrictions(filter);
     if restricted {
         if let Some(id) = related_id {
             qb.push(format!(
                 r#" AND EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = {id}"#
             ));
         }
-        append_parental_rating(&mut qb, filter, "bi");
+        append_parental_restrictions(&mut qb, filter, "bi");
         if related_id.is_some() {
             qb.push(")");
         }
@@ -128,6 +124,8 @@ impl FerrofinItemCountService {
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = preferences.as_ref().unwrap_or(filter);
         // Reuse the translated filter to constrain the matching item set, then
         // intersect with the ancestor's descendant closure.
         let matching = {
@@ -440,6 +438,8 @@ impl ItemCountService for FerrofinItemCountService {
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, access_filter).await?;
+        let access_filter = preferences.as_ref().unwrap_or(access_filter);
         // Every row reports counts (zeros when its CleanName is missing),
         // matching the per-item form's defaults.
         let mut out: HashMap<Uuid, ItemCounts> = rows
@@ -571,6 +571,8 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = preferences.as_ref().unwrap_or(filter);
         // Linked-children played/total: count the parent's LinkedChildren that
         // match the filter and are played. Only the direct linked children are
         // counted; recursive linked-folder descent is deferred.
@@ -651,6 +653,8 @@ impl ItemCountService for FerrofinItemCountService {
         }
         let mut access_filter = InternalItemsQuery::default();
         access_filter.set_user(user.clone());
+        let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
+        let access_filter = preferences.unwrap_or(access_filter);
         let mut total_q = restrict_count_query(total_q, &access_filter, Some(r#"a."ItemId""#))?;
         let totals = total_q
             .build_query_as::<(String, i64)>()
@@ -727,6 +731,8 @@ impl ItemCountService for FerrofinItemCountService {
         {
             access_filter.set_user(user);
         }
+        let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
+        let access_filter = preferences.unwrap_or(access_filter);
         // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
         // `BaseItems` children plus one of `LinkedChildren` rows; a parent with
         // linked children reports those instead of its hierarchical children.
@@ -914,6 +920,8 @@ impl FerrofinItemCountService {
     ) -> Result<PlayedAndTotal, ServiceError> {
         let mut filter = InternalItemsQuery::default();
         filter.set_user(user.clone());
+        let preferences = crate::query_restrictions::resolve(&self.db, &filter).await?;
+        let filter = preferences.unwrap_or(filter);
         let mut total_query = restrict_count_query(
             sqlx::query(
                 r#"SELECT COUNT(*) FROM "BaseItems" bi

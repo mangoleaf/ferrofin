@@ -401,7 +401,7 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
             &to_guid_strings(&filter.top_parent_ids),
         );
     }
-    append_parental_rating(&mut qb, filter, "bi");
+    append_parental_restrictions(&mut qb, filter, "bi");
     qb.push(r#" ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#);
     // `limit.HasValue ? orderedAlbums.Take(limit.Value) : orderedAlbums` — a
     // `limit` of 0 really does mean no albums, as `Take(0)` does.
@@ -420,8 +420,50 @@ pub(crate) fn build_latest_music_albums_query(filter: &InternalItemsQuery) -> Qu
     qb
 }
 
-/// Jellyfin's maximum parental score, including sub-scores and manual containers.
-pub(crate) fn append_parental_rating(
+/// Jellyfin's parental score and unrated-kind restrictions on one item alias.
+pub(crate) fn append_parental_restrictions(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    alias: &str,
+) {
+    append_max_parental_rating(qb, filter, alias);
+    if filter.block_unrated_items.is_empty() {
+        return;
+    }
+    qb.push(format!(r#" AND ({alias}."InheritedParentalRatingValue" IS NOT NULL OR COALESCE({alias}."UnratedType", CASE {alias}."Type""#));
+    for (kind, unrated) in crate::kinds::UNRATED_KINDS {
+        if let Some(name) = stored_type_name(*kind) {
+            qb.push(" WHEN ")
+                .push_bind(name.to_owned())
+                .push(" THEN ")
+                .push_bind(unrated.json_name().into_owned());
+        }
+    }
+    // Old Ferrofin rows did not persist UnratedType. Derive their class/source
+    // category immediately; a later normal metadata write also stamps the column.
+    qb.push(" ELSE CASE WHEN ").push(format!(r#"({alias}."ChannelId" IS NOT NULL AND {alias}."ChannelId" <> '' AND {alias}."ChannelId" <> '00000000-0000-0000-0000-000000000000') OR {alias}."Type" = "#))
+        .push_bind(stored_type_name(BaseItemKind::Channel).unwrap_or_default())
+        .push(" THEN 'ChannelContent' WHEN ").push(format!(r#"{alias}."Type" = "#))
+        .push_bind(stored_type_name(BaseItemKind::Audio).unwrap_or_default())
+        .push(" THEN 'Music' ELSE 'Other' END END) NOT IN (");
+    let mut values = qb.separated(", ");
+    for value in &filter.block_unrated_items {
+        values.push_bind(value.json_name().into_owned());
+    }
+    qb.push("))");
+}
+
+/// Whether an access query has a maximum rating or an unrated-kind restriction.
+pub(crate) fn has_parental_restrictions(filter: &InternalItemsQuery) -> bool {
+    !filter.block_unrated_items.is_empty()
+        || filter.max_parental_rating.is_some()
+        || filter
+            .user
+            .as_ref()
+            .is_some_and(|user| user.max_parental_rating_score.is_some())
+}
+
+fn append_max_parental_rating(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     alias: &str,
@@ -471,7 +513,13 @@ fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, sub
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    append_parental_rating(qb, filter, "bi");
+    // TranslateQuery's explicit rating selector bypasses the unrated-kind
+    // clause. Access-only queries (counts and related media) retain it.
+    if filter.has_parental_rating == Some(true) {
+        append_max_parental_rating(qb, filter, "bi");
+    } else {
+        append_parental_restrictions(qb, filter, "bi");
+    }
     // --- resolution (own-row form; the folder-descendant roll-up is an open
     // work item, see `append_resolution_predicate`) ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
@@ -1267,7 +1315,7 @@ fn push_folders_with_leaf(
     ))
     .push_bind(uid.to_owned())
     .push(format!(" AND {ud_cond}"));
-    append_parental_rating(qb, filter, "l");
+    append_parental_restrictions(qb, filter, "l");
     qb.push(")");
 }
 
@@ -1315,7 +1363,7 @@ fn push_folder_is_resumable(qb: &mut QueryBuilder<Sqlite>, uid: &str, filter: &I
                 WHERE a."ParentItemId" = bi."Id" AND "#,
     )
     .push(ACCESSIBLE_LEAF);
-    append_parental_rating(qb, filter, "l");
+    append_parental_restrictions(qb, filter, "l");
     qb.push(
         r#" AND NOT EXISTS (SELECT 1 FROM "UserData" ud
                     WHERE ud."ItemId" = l."Id" AND ud."UserId" = "#,
@@ -1676,12 +1724,7 @@ fn append_by_name_rating_access(
     filter: &InternalItemsQuery,
     kinds: &[String],
 ) {
-    if filter.max_parental_rating.is_none()
-        && filter
-            .user
-            .as_ref()
-            .is_none_or(|user| user.max_parental_rating_score.is_none())
-    {
+    if !has_parental_restrictions(filter) {
         return;
     }
     for (kind, values) in [
@@ -1733,7 +1776,7 @@ fn append_by_name_rating_access(
             &to_guid_strings(&filter.top_parent_ids),
         );
         // IncludeOwnedItems is true upstream: credits on alternate versions count.
-        append_parental_rating(qb, filter, "related");
+        append_parental_restrictions(qb, filter, "related");
         qb.push("))");
     }
 }

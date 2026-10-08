@@ -98,6 +98,11 @@ impl ItemVisibility {
         }
         let context = self.load(items, None).await?;
         for item in items {
+            item.unrated_type = Some(
+                crate::kinds::unrated_item(kind(item), uuid(item.channel_id.as_deref()).is_some())
+                    .json_name()
+                    .into_owned(),
+            );
             let row = context.rows.get(&row_id(item)).unwrap_or(item);
             let score = context.rating_score(row)?;
             item.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
@@ -685,25 +690,11 @@ impl Context<'_> {
         {
             return false;
         }
-        let category = match kind {
-            BaseItemKind::Movie | BaseItemKind::BoxSet => "Movie",
-            BaseItemKind::Series | BaseItemKind::Episode => "Series",
-            BaseItemKind::Trailer => "Trailer",
-            BaseItemKind::Book | BaseItemKind::AudioBook => "Book",
-            BaseItemKind::MusicVideo | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist => {
-                "Music"
-            }
-            BaseItemKind::Audio if uuid(item.channel_id.as_deref()).is_none() => "Music",
-            BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel => "LiveTvChannel",
-            BaseItemKind::LiveTvProgram => "LiveTvProgram",
-            _ if uuid(item.channel_id.as_deref()).is_some() || kind == BaseItemKind::Channel => {
-                "ChannelContent"
-            }
-            _ => "Other",
-        };
+        let category = crate::kinds::unrated_item(kind, uuid(item.channel_id.as_deref()).is_some());
         self.preference(PreferenceKind::BlockUnratedItems)
             .iter()
-            .any(|v| v == category)
+            .filter_map(|value| crate::query_restrictions::parse_unrated(value).ok())
+            .any(|value| value == category)
     }
 }
 

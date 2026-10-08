@@ -1261,7 +1261,7 @@ impl UserManager for FerrofinUserManager {
         let unrated: Vec<String> = policy
             .block_unrated_items
             .iter()
-            .map(|u| format!("{u:?}"))
+            .map(|u| u.json_name().into_owned())
             .collect();
         let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
         for (kind, values) in [
@@ -1626,18 +1626,7 @@ fn policy_permissions(policy: &UserPolicy) -> [(PermissionKind, bool); 24] {
 
 /// Parses a stored `BlockUnratedItems` entry into an [`UnratedItem`].
 fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
-    match value {
-        "Movie" => Some(UnratedItem::Movie),
-        "Trailer" => Some(UnratedItem::Trailer),
-        "Series" => Some(UnratedItem::Series),
-        "Music" => Some(UnratedItem::Music),
-        "Book" => Some(UnratedItem::Book),
-        "LiveTvChannel" => Some(UnratedItem::LiveTvChannel),
-        "LiveTvProgram" => Some(UnratedItem::LiveTvProgram),
-        "ChannelContent" => Some(UnratedItem::ChannelContent),
-        "Other" => Some(UnratedItem::Other),
-        _ => None,
-    }
+    crate::query_restrictions::parse_unrated(value).ok()
 }
 
 #[cfg(test)]

@@ -3149,6 +3149,18 @@ impl LibraryScanner {
         &self,
         entity: &mut BaseItemEntity,
     ) -> Result<(), ServiceError> {
+        let kind = crate::item_type_lookup::kind_from_type_name(&entity.type_)
+            .unwrap_or(BaseItemKind::Folder);
+        let channel = entity
+            .channel_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some_and(|id| !id.is_nil());
+        entity.unrated_type = Some(
+            crate::kinds::unrated_item(kind, channel)
+                .json_name()
+                .into_owned(),
+        );
         if let Some(resolver) = &self.rating_resolver {
             return resolver
                 .update_rating_scores(std::slice::from_mut(entity))
