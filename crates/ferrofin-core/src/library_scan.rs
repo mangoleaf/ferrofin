@@ -59,8 +59,8 @@ use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
-    ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, MediaStreamRepository,
-    StoredImageMetadata, StoredItemLinks,
+    ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, ItemUserWeight,
+    MediaStreamRepository, StoredImageMetadata, StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
@@ -1937,6 +1937,12 @@ struct PathScope<'a> {
     /// a virtual season of a covered series — which have no path of their
     /// own to be judged by. `None` before the plan is known.
     pathless: Option<&'a std::collections::HashSet<Uuid>>,
+    /// The items the scan moved to their new kind's id
+    /// ([`LibraryScanner::rekey_changed_kinds`]): each is a new item under
+    /// that id and is refreshed and saved as one, even where the scope
+    /// carries it for context only (the owner of a new extra). `None` before
+    /// the moves are made.
+    moved: Option<&'a std::collections::HashSet<Uuid>>,
 }
 
 impl<'a> PathScope<'a> {
@@ -1949,14 +1955,18 @@ impl<'a> PathScope<'a> {
             also: None,
             prune,
             pathless: None,
+            moved: None,
         }
     }
 
     /// Whether `item` is in scope: below a root, at one when the roots
-    /// refresh, the extra item, or a path-less item in a covered folder.
-    /// The folders above the roots are context.
+    /// refresh, the extra item, a path-less item in a covered folder, or an
+    /// item the scan moved. The folders above the roots are context.
     fn covers(&self, item: &Planned) -> bool {
-        if self.also == Some(item.id) || self.pathless.is_some_and(|set| set.contains(&item.id)) {
+        if self.also == Some(item.id)
+            || self.pathless.is_some_and(|set| set.contains(&item.id))
+            || self.moved.is_some_and(|set| set.contains(&item.id))
+        {
             return true;
         }
         item.entity.path.as_deref().is_some_and(|path| {
@@ -2440,7 +2450,9 @@ struct PlanOutput {
     excluded: Vec<String>,
     /// Folders a resolved item takes in whole ([`PlanCtx::superseded`]).
     superseded: Vec<String>,
-    /// Paths needed to reuse adopted alternate-version owner identities.
+    /// Each owner of extras by its planned id, at its path: what an owned
+    /// item whose owner the scan does not plan points at
+    /// ([`LibraryScanner::reuse_stored_extra_ids`]).
     owner_paths: HashMap<Uuid, String>,
     /// Each resolved primary video's local alternate versions, by path in
     /// the resolver's order (`Video.LocalAlternateVersions`, which
@@ -4020,54 +4032,55 @@ impl LibraryScanner {
         result
     }
 
-    /// Moves a stored item the scan now resolves as another kind to the id
-    /// that kind derives (owner decision D4): an older Ferrofin scan's
-    /// `Movie` for a file a home-video library resolves as a `Video`, or an
-    /// untyped library as an `Episode` or a plain `Video`. The row keeps its
-    /// user data, links and metadata and the scan updates it in place,
-    /// where it would otherwise prune it and insert a stranger.
+    /// Moves a stored video the scan now resolves as another kind to the id
+    /// that kind derives (owner decisions D4 and D9b): an older Ferrofin
+    /// scan's `Movie` for a file a home-video library resolves as a `Video`,
+    /// or an untyped library as an `Episode` or a plain `Video`; a library
+    /// whose type changed (a `MusicVideo` now planned as a `Movie`); an
+    /// adopted Jellyfin 10.11 alternate version stored as a `Video` where
+    /// the movie walk plans the primary's kind; a file that became an extra
+    /// or stopped being one (a `Movie` now planned as a `Trailer`, an extra
+    /// `Video` now planned as a `Movie`), its `ExtraType` and `OwnerId` then
+    /// following the planner; and, from the movie walk's version groups on, a
+    /// part or alternate version whose kind changed with its primary's. The
+    /// row keeps its user data, links and metadata and the scan updates it in
+    /// place, where it would otherwise prune it and insert a stranger.
     ///
-    /// Only a row this scan would otherwise prune moves: never one at a path
-    /// a library this scan does not plan also holds (that library may own
-    /// the `Movie`), and never where two planned items share the path.
-    /// Returns the moves made.
+    /// Several such rows at one path (an adopted row beside an older scan's,
+    /// or a row of the target's kind under an id it does not derive) are one
+    /// item: the one users made the most of moves
+    /// ([`ItemUserWeight::keep_rank`]) and the others fold into it — their
+    /// user data, links and references follow, and they are deleted. Where
+    /// the target's own id is stored already, the others fold into it the
+    /// same way — unless users made nothing of it (no user data, no edit)
+    /// while they did of another row: that row moves to the target's id, the
+    /// stored row folded into it first, so a user's edits outlive a bare row
+    /// the scan made.
+    ///
+    /// Divergence (owner decision D9b, the principle of D4): upstream
+    /// deletes the wrong-type row — `Folder.ValidateChildrenInternal2`
+    /// removes the child it no longer resolves and adds the new one, and
+    /// `LibraryManager.ResolveAlternateVersion` deletes a local alternate
+    /// stored as a `Video` (`DeleteItemsUnsafeFast`,
+    /// `LibraryManager.cs:870-893`; the 10.11 → 12 migration
+    /// `CleanupWrongTypeAlternateVersions` likewise) — and its user data
+    /// with it. Ferrofin moves it, so watch state survives the kind change.
+    ///
+    /// Only a video kind the scan plans at a file path moves
+    /// ([`is_rekeyable_video`]), and only a row this scan would otherwise
+    /// prune — no planned item has its id — never one at a path a library
+    /// this scan does not plan also holds (that library may own it), and
+    /// never where two planned items share the path. One pass over the
+    /// planned items, one batched read of the rows at their paths and, for
+    /// the paths holding several, one of what users made of them. Returns
+    /// the moves (and merges) made and those not made.
     async fn rekey_changed_kinds(
         &self,
         planned: &[Planned],
         folders: &[VirtualFolderInfo],
         key_folders: &[VirtualFolderInfo],
     ) -> Result<(Vec<ItemRekey>, Vec<ItemRekey>), ServiceError> {
-        // Only a home-video or untyped library resolves as another kind what
-        // an older scan stored as a `Movie`.
-        let changed_libraries: std::collections::HashSet<Uuid> = folders
-            .iter()
-            .filter(|f| {
-                matches!(
-                    f.collection_type,
-                    None | Some(CollectionTypeOptions::homevideos | CollectionTypeOptions::mixed)
-                )
-            })
-            .filter_map(collection_folder_id)
-            .collect();
-        let mut candidates: HashMap<&str, Option<&Planned>> = HashMap::new();
-        for p in planned.iter().filter(|p| {
-            p.entity.owner_id.is_none()
-                && p.ancestors
-                    .first()
-                    .is_some_and(|cf| changed_libraries.contains(cf))
-                && (p.entity.type_.ends_with("Entities.Video")
-                    || p.entity.type_.ends_with(".Episode"))
-        }) {
-            if let Some(path) = p.entity.path.as_deref() {
-                // A second item at the path makes the target ambiguous.
-                candidates
-                    .entry(path)
-                    .and_modify(|slot| *slot = None)
-                    .or_insert(Some(p));
-            }
-        }
-        candidates
-            .retain(|path, item| item.is_some() && !held_by_unscanned(path, folders, key_folders));
+        let candidates = rekey_targets(planned, folders, key_folders);
         if candidates.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -4075,30 +4088,66 @@ impl LibraryScanner {
         let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
             return Ok((Vec::new(), Vec::new()));
         };
-        let planned_ids: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
-        let stored: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
-        let mut moves: Vec<ItemRekey> = Vec::new();
-        let mut folders_of: Vec<MovedFolders> = Vec::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.item_type.ends_with(".Movie") && !planned_ids.contains(&row.id))
+        let groups = rekey_groups(planned, &candidates, &rows);
+        // Which row to keep is what users made of them: one batched read,
+        // for the paths holding more than one candidate.
+        let contested: Vec<Uuid> = groups
+            .values()
+            .filter(|group| group.target_stored || group.others.len() > 1)
+            .flat_map(|group| {
+                group
+                    .others
+                    .iter()
+                    .copied()
+                    .chain(group.target_stored.then_some(group.item.id))
+            })
+            .collect();
+        let weights = self.user_weights(&contested).await?;
+        let weight = |id: Uuid| {
+            weights
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| ItemUserWeight::none(id))
+        };
+        let mut moves: Vec<ItemRekey> = Vec::with_capacity(groups.len());
+        let mut folders_of: Vec<Option<MovedFolders>> = Vec::with_capacity(groups.len());
+        for RekeyGroup {
+            item,
+            path,
+            target_stored,
+            mut others,
+        } in groups.into_values()
         {
-            let Some(path) = row.path.as_deref() else {
-                continue;
+            // The row users made the most of moves and takes the rest in. A
+            // stored target keeps its row unless users made nothing of it
+            // while they did of another: that one moves to the target's id,
+            // the stored row folded into it first.
+            let best = kept_row(&others, &weights);
+            let from = match best {
+                Some(best)
+                    if !target_stored || (weight(item.id).is_bare() && !weight(best).is_bare()) =>
+                {
+                    others.retain(|&id| id != best);
+                    if target_stored {
+                        others.push(item.id);
+                    }
+                    best
+                }
+                _ => item.id,
             };
-            let Some(Some(item)) = candidates.get(path) else {
-                continue;
+            let (folders, dirs) = if from == item.id {
+                (None, Vec::new())
+            } else {
+                let (folders, dirs) = self.move_item_folders((from, item.id), path, target_stored);
+                (Some(folders), dirs)
             };
-            // One move per target: a second row for it waits for its own scan.
-            if stored.contains(&item.id) || moves.iter().any(|m| m.to == item.id) {
-                continue;
-            }
-            let (folders, prefixes) = self.move_item_folders(row.id, item.id, path);
             moves.push(ItemRekey {
-                from: row.id,
+                from,
                 to: item.id,
                 type_name: item.entity.type_.clone(),
-                dirs: prefixes,
+                dirs,
+                merged: others,
+                extra: item.entity.extra_type.is_some(),
             });
             folders_of.push(folders);
         }
@@ -4111,14 +4160,15 @@ impl LibraryScanner {
             tracing::warn!(%err, "could not move items whose kind changed; they keep their ids");
             Vec::new()
         });
+        let made: std::collections::HashSet<Uuid> = done.iter().map(|m| m.to).collect();
         for (m, folders) in moves.iter().zip(folders_of) {
-            if done.contains(m) {
-                folders.commit();
-            } else {
-                folders.undo();
+            match folders {
+                Some(folders) if made.contains(&m.to) => folders.commit(),
+                Some(folders) => folders.undo(),
+                None => {}
             }
         }
-        moves.retain(|m| !done.contains(m));
+        moves.retain(|m| !made.contains(&m.to));
         if !done.is_empty() {
             tracing::info!(
                 moved = done.len(),
@@ -4132,12 +4182,15 @@ impl LibraryScanner {
     /// internal metadata, trickplay, extracted subtitle and attachment
     /// folders — to `to`'s names ([`move_folders`]). Also returns the path
     /// prefixes stored paths under them take: each renamed folder, resolved
-    /// and in the `%MetadataPath%` form adopted Jellyfin rows store.
+    /// and in the `%MetadataPath%` form adopted Jellyfin rows store. When
+    /// `to` is stored (a fold: the stored target folds into `from` first),
+    /// the folders at `to`'s names are its own, never an earlier attempt's
+    /// rename ([`move_folders`]).
     fn move_item_folders(
         &self,
-        from: Uuid,
-        to: Uuid,
+        (from, to): (Uuid, Uuid),
         media_path: &str,
+        to_stored: bool,
     ) -> (MovedFolders, Vec<(String, String)>) {
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(art) = &self.metadata_dir {
@@ -4187,7 +4240,7 @@ impl LibraryScanner {
                 }
             }
         }
-        let folders = move_folders(pairs);
+        let folders = move_folders(pairs, !to_stored);
         // `%MetadataPath%` stands for the metadata root, the art root's parent.
         let root = self
             .metadata_dir
@@ -4209,91 +4262,109 @@ impl LibraryScanner {
         (folders, prefixes)
     }
 
-    /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
-    /// those rows by path before refreshing them, so the movie resolver cannot
-    /// create another item for a file that is already a linked version.
-    // Keep identity selection and owner remapping together so their priority stays visible.
-    #[allow(clippy::too_many_lines)]
-    async fn reuse_adopted_video_versions(
+    /// Points the owned items this scan plans at the stored rows already
+    /// standing for them, by path, once [`Self::rekey_changed_kinds`] has
+    /// moved the rows whose kind changed:
+    ///
+    /// - a planned extra not stored under its own id takes the id of the row
+    ///   at its path that can be one (a `Video`, `Trailer`, `Audio` or
+    ///   `Episode` — a row the re-key left: an id of the same kind derived
+    ///   otherwise) so its user data and links stay with it;
+    /// - an owned item whose owner this scan does not plan (a path-scoped
+    ///   scan below the owner, or an owner whose move was not made) and that
+    ///   is not stored under its own id points at the `Video`, `Movie` or
+    ///   `MusicVideo` row at the owner's path that is no extra, the row
+    ///   standing for the owner until a scan plans it. An owner this scan
+    ///   plans is saved under its own id, so what it owns is never
+    ///   re-pointed at a row of another kind the prune is about to remove.
+    ///
+    /// Where several rows qualify, the one users made the most of is taken
+    /// ([`ItemUserWeight::keep_rank`]; one batched read for those paths), and
+    /// the other rows at a reused extra's path fold into it
+    /// ([`ItemPersistenceService::rekey_items`]). No
+    /// planned item's id or kind changes to a stored row of another kind
+    /// here: a Jellyfin 10.11 alternate version stored as a `Video` where the
+    /// movie walk plans the primary's kind is moved by the re-key (owner
+    /// decision D9b), not reused under its old id and type as 10.11 would.
+    /// Returns the folds made and those not made (whose rows stay as they
+    /// were, out of the prune, for the next scan to try again).
+    async fn reuse_stored_extra_ids(
         &self,
         planned: &mut [Planned],
         owner_paths: &HashMap<Uuid, String>,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<(Vec<ItemRekey>, Vec<ItemRekey>), ServiceError> {
+        let planned_ids: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        // Only an owner this scan does not plan is looked up.
+        let owner_paths: Vec<(Uuid, &str)> = owner_paths
+            .iter()
+            .filter(|(id, _)| !planned_ids.contains(id))
+            .map(|(id, path)| (*id, path.as_str()))
+            .collect();
         let paths: Vec<String> = planned
             .iter()
-            .filter(|p| {
-                p.entity.type_.ends_with(".Movie")
-                    || p.entity.type_.ends_with(".MusicVideo")
-                    || p.entity.owner_id.is_some()
-            })
-            .filter_map(|p| p.entity.path.clone())
-            .chain(owner_paths.values().cloned())
+            .filter(|p| p.entity.owner_id.is_some())
+            .filter_map(|p| p.entity.path.as_deref())
+            .chain(owner_paths.iter().map(|&(_, path)| path))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        if paths.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let (extras_at, stand_ins_at) = extra_and_stand_in_rows(&rows);
+        let contested: Vec<Uuid> = extras_at
+            .values()
+            .chain(stand_ins_at.values())
+            .filter(|ids| ids.len() > 1)
+            .flatten()
+            .copied()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
-            return Ok(());
-        };
-        let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
-        let existing_extras: HashMap<String, Uuid> = rows
+        let weights = self.user_weights(&contested).await?;
+        let existing_extras: HashMap<&str, Uuid> = extras_at
             .iter()
-            .filter(|row| {
-                [".Episode", ".Video", ".Trailer", ".Audio"]
-                    .iter()
-                    .any(|kind| row.item_type.ends_with(kind))
-            })
-            .filter_map(|row| Some((row.path.clone()?, row.id)))
+            .filter_map(|(&path, ids)| Some((path, kept_row(ids, &weights)?)))
             .collect();
-        let existing_movies: HashMap<String, ItemPathRow> = rows
-            .iter()
-            .filter(|row| {
-                row.item_type.ends_with(".Movie") || row.item_type.ends_with(".MusicVideo")
-            })
-            .filter_map(|row| Some((row.path.clone()?, row.clone())))
-            .collect();
-        let versions: HashMap<String, ItemPathRow> = rows
+        let stand_ins: HashMap<&str, Uuid> = stand_ins_at
             .into_iter()
-            .filter(|row| row.item_type == "MediaBrowser.Controller.Entities.Video")
-            .filter_map(|row| Some((row.path.clone()?, row)))
+            .filter_map(|(path, ids)| Some((path, kept_row(&ids, &weights)?)))
             .collect();
         let owner_ids: HashMap<String, String> = owner_paths
             .iter()
             .filter(|(id, _)| !existing.contains(id))
-            .filter_map(|(id, path)| {
-                versions
-                    .get(path)
-                    .or_else(|| existing_movies.get(path))
-                    .map(|row| (guid_to_db(*id), guid_to_db(row.id)))
-            })
+            .filter_map(|&(id, path)| Some((guid_to_db(id), guid_to_db(*stand_ins.get(path)?))))
             .collect();
-        for item in planned {
-            if item.entity.type_.ends_with(".MusicVideo")
+        // The other rows at a reused extra's path fold into the one taken.
+        let mut folds: Vec<ItemRekey> = Vec::new();
+        for item in planned.iter_mut().filter(|p| p.entity.owner_id.is_some()) {
+            if item.entity.extra_type.is_some()
                 && !existing.contains(&item.id)
-                && let Some(row) = item
-                    .entity
-                    .path
-                    .as_ref()
-                    .and_then(|path| versions.get(path).or_else(|| existing_movies.get(path)))
+                && let Some(path) = item.entity.path.as_deref()
+                && let Some(&id) = existing_extras.get(path)
             {
-                item.id = row.id;
-                item.entity.id = guid_to_db(row.id);
-                if row.item_type == "MediaBrowser.Controller.Entities.Video" {
-                    item.entity.type_.clone_from(&row.item_type);
+                item.id = id;
+                item.entity.id = guid_to_db(id);
+                let merged: Vec<Uuid> = extras_at[path]
+                    .iter()
+                    .copied()
+                    .filter(|&other| other != id && !planned_ids.contains(&other))
+                    .collect();
+                if !merged.is_empty() {
+                    folds.push(ItemRekey {
+                        from: id,
+                        to: id,
+                        type_name: item.entity.type_.clone(),
+                        dirs: Vec::new(),
+                        merged,
+                        extra: true,
+                    });
                 }
-            }
-            if item.entity.owner_id.is_some()
-                && !existing.contains(&item.id)
-                && let Some(id) = item
-                    .entity
-                    .path
-                    .as_ref()
-                    .and_then(|path| existing_extras.get(path))
-            {
-                item.id = *id;
-                item.entity.id = guid_to_db(*id);
             }
             if let Some(owner) = item
                 .entity
@@ -4303,20 +4374,41 @@ impl LibraryScanner {
             {
                 item.entity.owner_id = Some(owner.clone());
             }
-            if (item.entity.type_.ends_with(".Movie") || item.entity.type_.ends_with(".MusicVideo"))
-                && !existing.contains(&item.id)
-                && let Some(row) = item
-                    .entity
-                    .path
-                    .as_ref()
-                    .and_then(|path| versions.get(path))
-            {
-                item.id = row.id;
-                item.entity.id = guid_to_db(row.id);
-                item.entity.type_.clone_from(&row.item_type);
-            }
         }
-        Ok(())
+        if folds.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let done = self
+            .persistence
+            .rekey_items(&folds)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "could not fold duplicate rows into reused extras");
+                Vec::new()
+            });
+        let made: std::collections::HashSet<Uuid> = done.iter().map(|m| m.to).collect();
+        folds.retain(|m| !made.contains(&m.to));
+        Ok((done, folds))
+    }
+
+    /// What users made of the stored rows `ids`
+    /// ([`ItemPersistenceService::item_user_weights`]), by id: one batched
+    /// read, none for no ids; a store that cannot answer weighs nothing.
+    async fn user_weights(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, ItemUserWeight>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        Ok(self
+            .persistence
+            .item_user_weights(ids)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|weight| (weight.id, weight))
+            .collect())
     }
 
     /// The shared scan pipeline over an already-planned item set: probe +
@@ -4393,18 +4485,40 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
-        // First, so the version and owner reuse below sees the moved rows.
-        let (moved, unmade) = self
+        // First, so the extra and owner reuse below sees the moved rows.
+        let (mut moved, unmade) = self
             .rekey_changed_kinds(&planned, folders, key_folders)
             .await?;
         // An item whose move was not made is not planned anew this scan: its
         // old row stays as it was (out of the prune), and the next scan tries
-        // the move again.
-        planned
-            .retain(|p| !unmade.iter().any(|m| m.to == p.id) || moved.iter().any(|m| m.to == p.id));
-        let unmoved: Vec<Uuid> = unmade.iter().map(|m| m.from).collect();
-        self.reuse_adopted_video_versions(&mut planned, &owner_paths)
+        // the move again — so do the rows that were to fold into it.
+        let unmade_targets: std::collections::HashSet<Uuid> = unmade
+            .iter()
+            .filter(|m| m.from != m.to)
+            .map(|m| m.to)
+            .collect();
+        planned.retain(|p| !unmade_targets.contains(&p.id));
+        let mut unmoved: Vec<Uuid> = unmade
+            .iter()
+            .flat_map(|m| std::iter::once(m.from).chain(m.merged.iter().copied()))
+            .collect();
+        // A moved item is refreshed and saved as the new item it is, even
+        // where a path-scoped scan carries it for context only.
+        let moved_ids: std::collections::HashSet<Uuid> = moved
+            .iter()
+            .filter(|m| m.from != m.to)
+            .map(|m| m.to)
+            .collect();
+        let scope = scope.map(|scope| PathScope {
+            moved: Some(&moved_ids),
+            ..scope
+        });
+        let (folded, unfolded) = self
+            .reuse_stored_extra_ids(&mut planned, &owner_paths)
             .await?;
+        unmoved.extend(unfolded.iter().flat_map(|m| m.merged.iter().copied()));
+        // A fold's rows are gone (`moved_away` below), its extra not new.
+        moved.extend(folded);
         let options = run.options;
         if let Some(touched) = run.touched {
             touched
@@ -4432,12 +4546,20 @@ impl LibraryScanner {
         // A moved item is new to a client under its new id, and its old id
         // is gone.
         let mut moved_away: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
-        if self.events.is_some() {
+        if self.events.is_some() && !moved.is_empty() {
+            let by_id: HashMap<Uuid, &Planned> = planned.iter().map(|p| (p.id, p)).collect();
             for m in &moved {
-                if let Some(item) = planned.iter().find(|p| p.id == m.to) {
-                    items_added.push(item);
+                if let Some(&item) = by_id.get(&m.to) {
+                    let mut gone: Vec<Uuid> =
+                        m.merged.iter().copied().filter(|&id| id != m.to).collect();
+                    if m.from != m.to {
+                        if !m.merged.contains(&m.to) {
+                            items_added.push(item);
+                        }
+                        gone.push(m.from);
+                    }
                     if let Some(&library) = item.ancestors.first() {
-                        moved_away.push((library, vec![m.from]));
+                        moved_away.push((library, gone));
                     }
                 }
             }
@@ -6926,6 +7048,7 @@ impl LibraryScanner {
                             item_type: row.type_.clone(),
                             path: row.path.clone(),
                             parent_id: row.parent_id.as_deref().and_then(parse_id),
+                            extra_type: row.extra_type,
                         })
                     })
                     .collect(),
@@ -12565,9 +12688,12 @@ impl MovedFolders {
 }
 
 /// Renames each `(old, new)` folder that exists, a folder already at `new`
-/// moved aside first; a pair whose `old` is gone and whose `new` is there was
-/// renamed by an earlier attempt and counts as renamed. A failure is logged
-/// and leaves that folder where it was.
+/// moved aside first; with `recover`, a pair whose `old` is gone and whose
+/// `new` is there was renamed by an earlier attempt and counts as renamed.
+/// Without it (a fold: the folder at `new` is the stored target's own), such
+/// a pair is left alone, so undoing a failed move never renames the
+/// target's folders. A failure is logged and leaves that folder where it
+/// was.
 ///
 /// The recovery reads the folders alone, so it cannot tell an earlier
 /// attempt's work from a folder a pruned item with the same id left at `new`,
@@ -12575,7 +12701,7 @@ impl MovedFolders {
 /// row) after a crash from the item's first `old`: in that window the
 /// recreated content wins and the moved one is set aside. The window is one
 /// scan's renames and transaction; the content in it is the item's own.
-fn move_folders(mut pairs: Vec<(String, String)>) -> MovedFolders {
+fn move_folders(mut pairs: Vec<(String, String)>, recover: bool) -> MovedFolders {
     pairs.sort();
     pairs.dedup();
     let mut moved = MovedFolders::default();
@@ -12586,7 +12712,7 @@ fn move_folders(mut pairs: Vec<(String, String)>) -> MovedFolders {
         let (old_path, new_path) = (Path::new(&old), Path::new(&new));
         let aside = format!("{new}.rekey-aside");
         if !old_path.is_dir() {
-            if new_path.is_dir() {
+            if recover && new_path.is_dir() {
                 // A folder set aside by that attempt goes, or comes back, with it.
                 if Path::new(&aside).is_dir() {
                     moved.aside.push((aside, new.clone()));
@@ -12628,6 +12754,172 @@ fn move_folders(mut pairs: Vec<(String, String)>) -> MovedFolders {
         }
     }
     moved
+}
+
+/// The planned items a stored row of another kind may move to
+/// ([`LibraryScanner::rekey_changed_kinds`]), by path: a video
+/// ([`is_rekeyable_video`]: an extra, a part or version, or a main item) of a
+/// video library, alone at its path, at a path no library the scan does not
+/// plan holds.
+fn rekey_targets<'a>(
+    planned: &'a [Planned],
+    folders: &[VirtualFolderInfo],
+    key_folders: &[VirtualFolderInfo],
+) -> HashMap<&'a str, &'a Planned> {
+    let video_libraries: std::collections::HashSet<Uuid> = folders
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.collection_type,
+                None | Some(
+                    CollectionTypeOptions::movies
+                        | CollectionTypeOptions::musicvideos
+                        | CollectionTypeOptions::homevideos
+                        | CollectionTypeOptions::tvshows
+                        | CollectionTypeOptions::mixed
+                )
+            )
+        })
+        .filter_map(collection_folder_id)
+        .collect();
+    let mut candidates: HashMap<&str, Option<&Planned>> = HashMap::new();
+    for p in planned {
+        if let Some(path) = p.entity.path.as_deref() {
+            // A second item at the path — of any kind — makes the target
+            // ambiguous; a repeated copy of one item does not.
+            candidates
+                .entry(path)
+                .and_modify(|slot| {
+                    if slot.is_some_and(|other| other.id != p.id) {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(p));
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(path, item)| {
+            let p = item?;
+            (is_rekeyable_video(&p.entity.type_)
+                && p.ancestors
+                    .first()
+                    .is_some_and(|cf| video_libraries.contains(cf))
+                && !held_by_unscanned(path, folders, key_folders))
+            .then_some((path, p))
+        })
+        .collect()
+}
+
+/// One target of [`LibraryScanner::rekey_changed_kinds`] and the stored
+/// rows at its path.
+struct RekeyGroup<'a> {
+    /// The planned item.
+    item: &'a Planned,
+    /// Its path.
+    path: &'a str,
+    /// Whether its own id is stored already.
+    target_stored: bool,
+    /// The other stored rows there that may fold into it: of another video
+    /// kind, or of its kind under an id it does not derive (one derived
+    /// before `EnableCaseSensitiveItemIds` was toggled), and no planned
+    /// item's.
+    others: Vec<Uuid>,
+}
+
+/// The stored `rows` grouped by the target at their path (`candidates`,
+/// [`rekey_targets`]): only the targets with other rows there.
+fn rekey_groups<'a>(
+    planned: &[Planned],
+    candidates: &HashMap<&'a str, &'a Planned>,
+    rows: &[ItemPathRow],
+) -> HashMap<Uuid, RekeyGroup<'a>> {
+    let planned_ids: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+    let mut groups: HashMap<Uuid, RekeyGroup<'a>> = HashMap::new();
+    for row in rows {
+        let Some((&path, &item)) = row
+            .path
+            .as_deref()
+            .and_then(|path| candidates.get_key_value(path))
+        else {
+            continue;
+        };
+        let group = groups.entry(item.id).or_insert_with(|| RekeyGroup {
+            item,
+            path,
+            target_stored: false,
+            others: Vec::new(),
+        });
+        if row.id == item.id {
+            group.target_stored = true;
+        } else if is_rekeyable_video(&row.item_type) && !planned_ids.contains(&row.id) {
+            group.others.push(row.id);
+        }
+    }
+    groups.retain(|_, group| !group.others.is_empty());
+    groups
+}
+
+/// The stored `rows` by path ([`LibraryScanner::reuse_stored_extra_ids`]):
+/// those that can be an extra (a `Video`, `Trailer`, `Audio` or `Episode`),
+/// and those that can stand for an owner (a `Video`, `Movie` or `MusicVideo`
+/// that is no extra).
+type RowsByPath<'a> = HashMap<&'a str, Vec<Uuid>>;
+
+/// [`RowsByPath`] of `rows`: (extras, owner stand-ins).
+fn extra_and_stand_in_rows(rows: &[ItemPathRow]) -> (RowsByPath<'_>, RowsByPath<'_>) {
+    let mut extras_at: HashMap<&str, Vec<Uuid>> = HashMap::new();
+    let mut stand_ins_at: HashMap<&str, Vec<Uuid>> = HashMap::new();
+    for row in rows {
+        let Some(path) = row.path.as_deref() else {
+            continue;
+        };
+        if [".Episode", ".Video", ".Trailer", ".Audio"]
+            .iter()
+            .any(|kind| row.item_type.ends_with(kind))
+        {
+            extras_at.entry(path).or_default().push(row.id);
+        }
+        if row.extra_type.is_none()
+            && (row.item_type == "MediaBrowser.Controller.Entities.Video"
+                || row.item_type.ends_with(".Movie")
+                || row.item_type.ends_with(".MusicVideo"))
+        {
+            stand_ins_at.entry(path).or_default().push(row.id);
+        }
+    }
+    (extras_at, stand_ins_at)
+}
+
+/// Which of the stored rows `ids` standing for one item to keep: the one
+/// users made the most of ([`ItemUserWeight::keep_rank`]), a row whose
+/// weights were not read counting as untouched; `None` for no rows.
+fn kept_row(ids: &[Uuid], weights: &HashMap<Uuid, ItemUserWeight>) -> Option<Uuid> {
+    ids.iter().copied().max_by_key(|&id| {
+        weights
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| ItemUserWeight::none(id))
+            .keep_rank()
+    })
+}
+
+/// Whether the stored type name `type_name` is a kind the scan plans a video
+/// file as (`MovieResolver`, `EpisodeResolver`, the generic video resolvers
+/// and `ExtraResolver`'s trailer resolver): `Movie`, `MusicVideo`,
+/// `Episode`, `Video` or `Trailer`. One file can be stored as one and planned
+/// as another ([`LibraryScanner::rekey_changed_kinds`]).
+fn is_rekeyable_video(type_name: &str) -> bool {
+    matches!(
+        item_type_lookup::kind_from_type_name(type_name),
+        Some(
+            BaseItemKind::Movie
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Episode
+                | BaseItemKind::Video
+                | BaseItemKind::Trailer
+        )
+    )
 }
 
 /// Whether `path` lies under a location of a library in `key_folders` that
@@ -21175,6 +21467,7 @@ mod tests {
             roots_refreshed: false,
             also: Some(artist),
             pathless: None,
+            moved: None,
         };
         let at = |id: u128, path: &str| super::Planned {
             id: uuid::Uuid::from_u128(id),
@@ -29503,7 +29796,7 @@ mod tests {
                 (at("done/OLD"), at("done/NEW")),
             ]
         };
-        let moved = super::move_folders(pairs());
+        let moved = super::move_folders(pairs(), true);
         assert_eq!(
             moved.renamed,
             vec![
@@ -29524,13 +29817,44 @@ mod tests {
 
         mk("done/NEW");
         std::fs::remove_dir_all(tmp.path().join("done/OLD")).unwrap();
-        super::move_folders(pairs()).commit();
+        super::move_folders(pairs(), true).commit();
         assert!(tmp.path().join("tp/NEW").is_dir());
         assert!(
             !tmp.path().join("tp/NEW/kept").exists(),
             "gone once committed"
         );
         assert!(!std::path::Path::new(&format!("{}.rekey-aside", at("tp/NEW"))).exists());
+    }
+
+    /// A fold's folder move (the stored target's folders at the new names)
+    /// counts nothing as renamed by an earlier attempt: undone after a failed
+    /// move, the target's folders stay where they were, one set aside comes
+    /// back, and the moving row's folder goes back to its old name.
+    #[test]
+    fn a_failed_folds_folder_move_leaves_the_targets_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = |rel: &str| tmp.path().join(rel).to_string_lossy().into_owned();
+        let mk = |rel: &str| std::fs::create_dir_all(tmp.path().join(rel)).unwrap();
+        mk("art/TARGET/own");
+        mk("tp/TARGET/own");
+        mk("tp/MOVING");
+        let moved = super::move_folders(
+            vec![
+                (at("art/MOVING"), at("art/TARGET")),
+                (at("tp/MOVING"), at("tp/TARGET")),
+            ],
+            false,
+        );
+        assert_eq!(moved.renamed, vec![(at("tp/MOVING"), at("tp/TARGET"))]);
+        assert!(
+            tmp.path().join("art/TARGET/own").is_dir(),
+            "not the mover's"
+        );
+        moved.undo();
+        for kept in ["art/TARGET/own", "tp/TARGET/own", "tp/MOVING"] {
+            assert!(tmp.path().join(kept).is_dir(), "{kept}");
+        }
+        assert!(!tmp.path().join("art/MOVING").exists());
     }
 
     /// A row at a path another, unscanned library also holds is that

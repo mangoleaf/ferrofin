@@ -925,9 +925,15 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Moves each stored item of `moves` to its new id and type — the row
     /// and every row that references it (user data, links, streams, images,
     /// …) — so what is keyed to the old id follows the item: what a scan asks
-    /// when a file's item kind changed and its id with it (owner decision D4).
-    /// A move whose old id is not stored, or whose new one already is, is
-    /// skipped. Returns the moves made.
+    /// when a file's item kind changed and its id with it (owner decisions D4
+    /// and D9b). A move whose old id is not stored, or whose new one already
+    /// is, is skipped — unless `from` is `to`: then the stored item stays
+    /// where it is and only its [`ItemRekey::merged`] rows fold into it.
+    /// After the move each merged row folds into the item: its user data (a
+    /// row the item already has for the same user and key kept by the later
+    /// `LastPlayedDate`, then the higher `PlayCount`), its playlist and
+    /// collection entries and every other row's reference to it follow, and
+    /// the row is deleted. Returns the moves made.
     ///
     /// The default (a stub/fake service) moves nothing; the scan then plans
     /// the item anew and the old row is pruned.
@@ -938,6 +944,25 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
         let _ = moves;
         Ok(Vec::new())
+    }
+
+    /// What users made of each stored item of `ids` — its user data and the
+    /// playlists and collections that link it — for choosing which of
+    /// several rows standing for one item to keep
+    /// ([`ItemUserWeight::keep_rank`]). An id not stored is left out.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the rows are then ranked by id alone.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn item_user_weights(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemUserWeight>>, ServiceError> {
+        let _ = ids;
+        Ok(None)
     }
 
     /// Writes only the file facts of a scanned item whose stored row could
@@ -1618,6 +1643,9 @@ pub struct ItemPathRow {
     pub path: Option<String>,
     /// Its `ParentId`: where a path-less item sits.
     pub parent_id: Option<Uuid>,
+    /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
+    /// for nothing else — an owned part or alternate version has none.
+    pub extra_type: Option<i32>,
 }
 
 /// One stored item to move to a new identity
@@ -1634,6 +1662,83 @@ pub struct ItemRekey {
     /// name to the new one's, `(old, new)`: stored paths under the old folder
     /// (images, external streams, chapter images) follow.
     pub dirs: Vec<(String, String)>,
+    /// Other stored rows standing for the same item (at its path), folded
+    /// into it once moved: their user data, links and references follow,
+    /// and they are deleted. It may hold `to` itself, stored: that row folds
+    /// into `from` first, and `from` then moves to its id.
+    pub merged: Vec<Uuid>,
+    /// Whether the item is an extra (planned so): a merged row's version
+    /// link is never carried to it — the containers' version entries for
+    /// that row go instead.
+    pub extra: bool,
+}
+
+/// [`ItemUserWeight::keep_rank`]: the highest is kept.
+pub type ItemKeepRank = (
+    bool,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i64,
+    bool,
+    bool,
+    std::cmp::Reverse<Uuid>,
+);
+
+/// What users made of one stored item
+/// ([`ItemPersistenceService::item_user_weights`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemUserWeight {
+    /// The item's id.
+    pub id: Uuid,
+    /// Whether any user data names it.
+    pub has_user_data: bool,
+    /// The latest `LastPlayedDate` of its user data.
+    pub last_played: Option<chrono::DateTime<chrono::Utc>>,
+    /// The highest `PlayCount` of its user data.
+    pub play_count: i64,
+    /// Whether a user edited it: `IsLocked`, or a locked field
+    /// (`BaseItemMetadataFields`).
+    pub edited: bool,
+    /// Whether a playlist or collection links it (`LinkedChildren`).
+    pub linked: bool,
+}
+
+impl ItemUserWeight {
+    /// The rank of the row to keep when several stand for one item, the
+    /// highest kept: a row with user data first, by the latest
+    /// `LastPlayedDate` then the highest `PlayCount` — upstream's order for
+    /// duplicate user data (`ItemPersistenceService.cs:103-110`) — then a
+    /// row a user edited, then a row a playlist or collection links, then
+    /// the lower id.
+    #[must_use]
+    pub fn keep_rank(&self) -> ItemKeepRank {
+        (
+            self.has_user_data,
+            self.last_played,
+            self.play_count,
+            self.edited,
+            self.linked,
+            std::cmp::Reverse(self.id),
+        )
+    }
+
+    /// Whether users made nothing of the row: no user data, no edit.
+    #[must_use]
+    pub fn is_bare(&self) -> bool {
+        !self.has_user_data && !self.edited
+    }
+
+    /// No user data and no links: a stored row whose weights were not read.
+    #[must_use]
+    pub fn none(id: Uuid) -> Self {
+        Self {
+            id,
+            has_user_data: false,
+            last_played: None,
+            play_count: 0,
+            edited: false,
+            linked: false,
+        }
+    }
 }
 
 /// One stored row under another, as

@@ -2725,10 +2725,12 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
     assert_eq!(number, Some(1));
 }
 
-/// Jellyfin stores a local movie version as a generic Video with a different
-/// path-derived id. Scanning it as a new Movie duplicated it in the library.
+/// Jellyfin 10.11 stores a local movie version as a generic Video with a
+/// different path-derived id. The scan plans a Movie there and moves the row
+/// to the Movie id (owner decision D9b) — one row, never a duplicate, its
+/// version link kept — and the next scan leaves it there.
 #[tokio::test(flavor = "multi_thread")]
-async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
+async fn adopted_generic_video_version_moves_to_the_movie_id_once() {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
     let tmp = tempfile::tempdir().unwrap();
@@ -2746,6 +2748,7 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
         .await
         .unwrap();
     let id = derive_item_id(BaseItemKind::Video, &path.to_string_lossy()).unwrap();
+    let movie = derive_item_id(BaseItemKind::Movie, &path.to_string_lossy()).unwrap();
     alternate.id = guid_to_db(id);
     alternate.path = Some(path.to_string_lossy().into_owned());
     alternate.type_ = "MediaBrowser.Controller.Entities.Video".to_owned();
@@ -2755,12 +2758,26 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
     persistence.save_items(&[alternate]).await.unwrap();
     for _ in 0..2 {
         fx.scan().await;
-        let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as(r#"SELECT "Id", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#)
-                .bind(path.to_string_lossy().as_ref())
-                .fetch_all(fx.db.pool())
-                .await
-                .unwrap();
-        assert_eq!(rows, vec![(guid_to_db(id), Some(primary.clone()))]);
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Type", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#,
+        )
+        .bind(path.to_string_lossy().as_ref())
+        .fetch_all(fx.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                guid_to_db(movie),
+                "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+                Some(primary.clone())
+            )]
+        );
+        let old: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id"=?"#)
+            .bind(guid_to_db(id))
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(old, 0);
     }
 }

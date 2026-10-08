@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ferrofin_core::file_system::FerrofinFileSystem;
-use ferrofin_core::item_type_lookup::ItemTypeLookup;
+use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id, stored_type_name};
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
     LibraryScanner,
@@ -13,6 +13,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -452,12 +453,18 @@ async fn grouped_movies_keep_generic_and_version_specific_extras_in_full_and_sco
     }
 }
 
+/// An adopted alternate version stored as a `Video` under an id of its own,
+/// where the movie walk plans a `Movie`, moves to the id the `Movie` kind
+/// derives (owner decision D9b) — in a full scan, and in a path-scoped scan
+/// of a new extra of it, which plans the version for context yet refreshes
+/// and saves it as the new item it is — and the new extra is owned there.
 #[tokio::test]
-async fn adopted_version_identity_is_reused_for_extra_owners_even_outside_scan_scope() {
+async fn adopted_version_row_moves_before_its_new_extra_takes_an_owner() {
     for scoped in [false, true] {
         let f = Fixture::new(&["Film/Film.mkv", "Film/Film - 4K.mkv"]).await;
         f.scanner.scan_all().await.unwrap();
         let mut version = f.row("Film/Film - 4K.mkv").await;
+        let planned_id = version.id.clone();
         let adopted_id = guid_to_db(Uuid::new_v4());
         f.store
             .delete_items(&[Uuid::parse_str(&version.id).unwrap()])
@@ -468,15 +475,21 @@ async fn adopted_version_identity_is_reused_for_extra_owners_even_outside_scan_s
         f.store.save_items(&[version]).await.unwrap();
         let path = "Film/Film - 4K-trailer.mkv";
         std::fs::write(f.media.join(path), b"").unwrap();
-        if scoped {
-            f.scanner
-                .scan_paths(&[f.media.join(path).to_string_lossy().into_owned()])
+        scan_after_adding(&f, path, scoped).await;
+        let moved = f.row("Film/Film - 4K.mkv").await;
+        assert_eq!(moved.id, planned_id);
+        assert!(moved.type_.ends_with(".Movie"), "{}", moved.type_);
+        // Refreshed and saved as the new item it is, even where the scoped
+        // scan carries it for context only.
+        assert!(moved.date_last_refreshed.is_some(), "scoped={scoped}");
+        assert_eq!(f.row(path).await.owner_id, Some(planned_id));
+        assert!(
+            f.repo
+                .retrieve_item(Uuid::parse_str(&adopted_id).unwrap())
                 .await
-                .unwrap();
-        } else {
-            f.scanner.scan_all().await.unwrap();
-        }
-        assert_eq!(f.row(path).await.owner_id, Some(adopted_id));
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -608,12 +621,26 @@ async fn one_scan_removes_confirmed_legacy_exclusions_without_removing_files() {
 }
 
 #[tokio::test]
+/// A legacy extra row (another id, extra type and owner) at a file the scan
+/// plans otherwise is cleaned: the user locked it and the scan's own row
+/// there is bare, so the locked row takes the planned item's id, extra type
+/// and owner (the scan's row folded into it) — no row is pruned, no movie or
+/// file deleted.
 async fn extras_in_ineligible_folders_are_cleaned_without_deleting_movies() {
     let f = Fixture::new(&[MOVIE, EXTRA, "Heat (1995)/Release/Other.mkv"]).await;
     f.scanner.scan_all().await.unwrap();
+    let planned = f.row(EXTRA).await;
     let id = f.legacy(EXTRA, false).await;
-    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 1);
+    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
     assert!(!f.has(&id).await);
+    assert_eq!(rows_at(&f, EXTRA).await, 1);
+    let row = f.row(EXTRA).await;
+    assert_eq!((row.id, row.type_), (planned.id, planned.type_));
+    assert!(row.is_locked, "the locked row was kept");
+    assert_eq!(
+        (row.extra_type, row.owner_id),
+        (planned.extra_type, planned.owner_id)
+    );
     assert!(f.media.join(EXTRA).exists());
     f.assert_browse(2).await;
 }
@@ -828,8 +855,11 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
                 .unwrap();
         assert_eq!(count, 0);
         // Simulate the old scanner's Episode at the same path, including
-        // locked metadata and episode grouping columns. Identity must survive.
+        // locked metadata and episode grouping columns. It moves to the id
+        // the extra's `Video` kind derives (owner decision D9b) with its
+        // metadata and watch state.
         let mut old = f.row(extra_path).await;
+        let planned_id = old.id.clone();
         f.store
             .delete_items(&[Uuid::parse_str(&old.id).unwrap()])
             .await
@@ -887,7 +917,14 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
             f.scanner.scan_all().await.unwrap();
         }
         let repaired = f.row(extra_path).await;
-        assert_eq!(repaired.id, old_id);
+        assert_eq!(repaired.id, planned_id);
+        assert!(
+            f.repo
+                .retrieve_item(Uuid::parse_str(&old_id).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(repaired.name.as_deref(), Some("Kept title"));
         assert!(repaired.is_locked);
         assert_eq!(repaired.owner_id.as_ref(), Some(&season.id));
@@ -896,7 +933,7 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
         assert_eq!(repaired.index_number, Some(42)); // locked user metadata
         let history: (i64, i64) =
             sqlx::query_as("SELECT Played, PlayCount FROM UserData WHERE ItemId=?")
-                .bind(&old_id)
+                .bind(&planned_id)
                 .fetch_one(f.db.pool())
                 .await
                 .unwrap();
@@ -905,13 +942,16 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
         // full scan removes it after the extra has been reparented.
         f.scanner.scan_all().await.unwrap();
         assert!(f.repo.retrieve_item(bogus_id).await.unwrap().is_none());
-        assert_eq!(f.row(extra_path).await.id, old_id);
+        assert_eq!(f.row(extra_path).await.id, planned_id);
         assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
     }
 }
 
+/// A music video an older scan stored as a `Movie` under an id of its own
+/// moves to the id its `MusicVideo` kind derives (owner decision D9b), its
+/// play history with it, and owns its extras there.
 #[tokio::test]
-async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
+async fn musicvideo_library_owns_extras_and_moves_an_older_movie_row() {
     let main = "Artist/Artist - Song (2020).mkv";
     let extra = "Artist/Extras/clip.mkv";
     let f = Fixture::with_type(
@@ -926,6 +966,7 @@ async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
     .await;
     f.scanner.scan_all().await.unwrap();
     let mut owner = f.row(main).await;
+    let derived = owner.id.clone();
     assert_eq!(owner.type_, "MediaBrowser.Controller.Entities.MusicVideo");
     assert_eq!(owner.name.as_deref(), Some("Artist - Song (2020)"));
     assert!(!owner.is_movie);
@@ -945,21 +986,27 @@ async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
     play(&f.db, &owner.id).await;
     f.scanner.scan_all().await.unwrap();
     let repaired = f.row(main).await;
-    assert_eq!(repaired.id, owner.id);
+    assert_eq!(repaired.id, derived);
     assert_eq!(
         repaired.type_,
         "MediaBrowser.Controller.Entities.MusicVideo"
     );
-    assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&owner.id));
+    assert!(
+        f.repo
+            .retrieve_item(Uuid::parse_str(&owner.id).unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&derived));
     f.assert_browse(1).await;
     assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
-    assert_eq!(f.row(main).await.id, owner.id);
-    let history: i64 = sqlx::query_scalar("SELECT PlayCount FROM UserData WHERE ItemId=?")
-        .bind(&owner.id)
-        .fetch_one(f.db.pool())
+    assert_eq!(f.row(main).await.id, derived);
+    let history: Vec<(String, i64)> = sqlx::query_as("SELECT ItemId, PlayCount FROM UserData")
+        .fetch_all(f.db.pool())
         .await
         .unwrap();
-    assert_eq!(history, 1);
+    assert_eq!(history, vec![(derived, 1)]);
 }
 
 #[tokio::test]
@@ -1029,50 +1076,289 @@ async fn musicvideo_owner_grouping_does_not_parse_filename_years() {
     }
 }
 
+/// Two rows stored at a music video's path — an adopted `Video` its user
+/// watched and put in a playlist, and a duplicate `Movie` an older scan
+/// stored first, each under an id of its own. A scan — full, or path-scoped
+/// to a new extra of it — keeps the row users made the most of: the `Video`
+/// moves to the id the `MusicVideo` kind derives with its watch state and
+/// playlist entry, the `Movie` folds into it and is gone, and the new extra
+/// is owned there.
 #[tokio::test]
-async fn musicvideo_adopted_video_identity_is_reused_in_full_and_scoped_scans() {
+async fn musicvideo_duplicate_rows_fold_into_the_watched_one() {
     for scoped in [false, true] {
         let main = "Artist/Artist - Song.mkv";
         let f = Fixture::with_type(&[main], CollectionTypeOptions::musicvideos).await;
         f.scanner.scan_all().await.unwrap();
-        let mut version = f.row(main).await;
-        f.store
-            .delete_items(&[Uuid::parse_str(&version.id).unwrap()])
-            .await
-            .unwrap();
-        version.id = guid_to_db(Uuid::new_v4());
-        version.type_ = "MediaBrowser.Controller.Entities.Video".into();
-        let adopted = version.id.clone();
-        let mut duplicate = version.clone();
-        duplicate.id = guid_to_db(Uuid::new_v4());
-        duplicate.type_ = "MediaBrowser.Controller.Entities.Movies.Movie".into();
-        f.store.save_items(&[duplicate]).await.unwrap();
-        f.store.save_items(&[version]).await.unwrap();
+        let derived = f.row(main).await.id;
+        let (adopted, user, playlist) = as_stored_kind(&f, main, BaseItemKind::Video, |row| {
+            row.id = guid_to_db(Uuid::new_v4());
+        })
+        .await;
+        let duplicate = store_duplicate(&f, main, BaseItemKind::Movie).await;
         let extra = "Artist/Artist - Song-trailer.mkv";
         std::fs::write(f.media.join(extra), b"").unwrap();
-        if scoped {
-            f.scanner
-                .scan_paths(&[f.media.join(extra).to_string_lossy().into_owned()])
-                .await
-                .unwrap();
-        } else {
-            f.scanner.scan_all().await.unwrap();
-        }
-        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&adopted));
+        scan_after_adding(&f, extra, scoped).await;
+        assert_moved(
+            &f,
+            main,
+            BaseItemKind::MusicVideo,
+            adopted,
+            (user, playlist),
+        )
+        .await;
+        assert!(f.repo.retrieve_item(duplicate).await.unwrap().is_none());
+        assert_eq!(f.row(main).await.id, derived);
+        assert_eq!(rows_at(&f, main).await, 1);
+        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&derived));
         f.scanner.scan_all().await.unwrap();
-        assert_eq!(f.row(main).await.id, adopted);
-        assert_eq!(
-            f.row(main).await.type_,
-            "MediaBrowser.Controller.Entities.Video"
+        assert_eq!(f.row(main).await.id, derived);
+        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&derived));
+    }
+}
+
+/// Two rows at one path both played: the one played last is kept, and the
+/// other's user data folds into it — a user's row for both kept by the
+/// later `LastPlayedDate`, a user's row only the other has moved over.
+#[tokio::test]
+async fn duplicate_rows_both_played_fold_into_the_one_played_last() {
+    let main = "Heat (1995)/Heat.mkv";
+    let f = Fixture::new(&[main]).await;
+    f.scanner.scan_all().await.unwrap();
+    let derived = f.row(main).await.id;
+    let (older, both, _) = as_stored_kind(&f, main, BaseItemKind::Video, |row| {
+        row.id = guid_to_db(Uuid::new_v4());
+    })
+    .await;
+    let later = store_duplicate(&f, main, BaseItemKind::MusicVideo).await;
+    let only = seed_user(&f.db).await;
+    for (item, user, played, count) in [
+        (older, both, "2020-01-01 00:00:00", 7),
+        (later, both, "2024-01-01 00:00:00", 2),
+        (older, only, "2021-01-01 00:00:00", 4),
+    ] {
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "UserData" ("ItemId", "UserId", "CustomDataKey",
+               "IsFavorite", "LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played")
+               VALUES (?1, ?2, ?3, 0, ?4, ?5, 0, 1)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user))
+        .bind(item.to_string())
+        .bind(played)
+        .bind(count)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    }
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(main).await.id, derived);
+    assert_eq!(rows_at(&f, main).await, 1);
+    for gone in [older, later] {
+        assert!(f.repo.retrieve_item(gone).await.unwrap().is_none());
+    }
+    let id = Uuid::parse_str(&derived).unwrap();
+    let mut kept: Vec<(String, String, String, i64)> = sqlx::query_as(
+        r#"SELECT "ItemId", "UserId", "CustomDataKey", "PlayCount" FROM "UserData""#,
+    )
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    kept.sort();
+    let mut expected = vec![
+        (derived.clone(), guid_to_db(both), id.to_string(), 2),
+        (derived.clone(), guid_to_db(only), id.to_string(), 4),
+    ];
+    expected.sort();
+    assert_eq!(kept, expected);
+}
+
+/// A row at the path of an item stored under its own id already — of
+/// another kind, or of its kind under an id it does not derive — folds into
+/// it, its watch state and playlist entry with it, and is gone, never
+/// pruned with them. The scan's row is bare, so the watched row is the one
+/// kept: it takes the item's id, the scan's row folded into it.
+#[tokio::test]
+async fn a_duplicate_row_beside_a_stored_item_folds_into_it() {
+    for kind in [
+        "MediaBrowser.Controller.Entities.Video",
+        "MediaBrowser.Controller.Entities.Movies.Movie",
+    ] {
+        let f = Fixture::new(&[MOVIE]).await;
+        f.scanner.scan_all().await.unwrap();
+        let movie = f.row(MOVIE).await.id;
+        let (stray, user, playlist) = stray_beside(&f, kind, "the watched copy").await;
+        f.scanner.scan_all().await.unwrap();
+        assert_eq!(rows_at(&f, MOVIE).await, 1, "{kind}");
+        assert!(f.repo.retrieve_item(stray).await.unwrap().is_none());
+        assert_moved(&f, MOVIE, BaseItemKind::Movie, stray, (user, playlist)).await;
+        let row = f.row(MOVIE).await;
+        assert_eq!(row.id, movie);
+        assert_eq!(row.overview.as_deref(), Some("the watched copy"), "{kind}");
+    }
+}
+
+/// A stored item a user edited (locked) keeps its row when a watched
+/// duplicate stands beside it: the duplicate's watch state and playlist
+/// entry fold into it, the edit stays.
+#[tokio::test]
+async fn an_edited_stored_item_keeps_its_row_and_takes_a_duplicates_watch_state() {
+    let f = Fixture::new(&[MOVIE]).await;
+    f.scanner.scan_all().await.unwrap();
+    let mut movie = f.row(MOVIE).await;
+    movie.is_locked = true;
+    movie.overview = Some("my edit".to_owned());
+    f.store
+        .save_items(std::slice::from_ref(&movie))
+        .await
+        .unwrap();
+    let (stray, user, playlist) =
+        stray_beside(&f, "MediaBrowser.Controller.Entities.Video", "a stray").await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(rows_at(&f, MOVIE).await, 1);
+    assert_moved(&f, MOVIE, BaseItemKind::Movie, stray, (user, playlist)).await;
+    let row = f.row(MOVIE).await;
+    assert_eq!(
+        (row.id, row.overview.as_deref()),
+        (movie.id, Some("my edit"))
+    );
+}
+
+/// Stores a copy of the row at [`MOVIE`] as `kind` under an id of its own,
+/// with `overview`, played and favourited by a new user and in a new
+/// playlist; returns (its id, user, playlist).
+async fn stray_beside(f: &Fixture, kind: &str, overview: &str) -> (Uuid, Uuid, Uuid) {
+    let mut stray = f.row(MOVIE).await;
+    let id = Uuid::new_v4();
+    stray.id = guid_to_db(id);
+    kind.clone_into(&mut stray.type_);
+    stray.overview = Some(overview.to_owned());
+    f.store.save_items(&[stray]).await.unwrap();
+    let user = seed_user(&f.db).await;
+    play_as(&f.db, id, user).await;
+    let playlist = link_in_playlist(f, id).await;
+    (id, user, playlist)
+}
+
+/// Two rows at a theme song's path (an extra no re-key covers): the scan
+/// reuses the watched one's id and folds the other into it. A fold that
+/// fails leaves the other row as it was — out of the prune, its playlist
+/// entry kept — and the next scan folds it.
+#[tokio::test]
+async fn a_failed_extra_fold_keeps_the_other_row_until_it_folds() {
+    let theme = "Heat (1995)/theme.mp3";
+    let f = Fixture::new(&[MOVIE, theme]).await;
+    f.scanner.scan_all().await.unwrap();
+    let (watched, user, _) = as_stored_kind(&f, theme, BaseItemKind::Audio, |row| {
+        row.id = guid_to_db(Uuid::new_v4());
+    })
+    .await;
+    let other = store_duplicate(&f, theme, BaseItemKind::Audio).await;
+    let playlist = link_in_playlist(&f, other).await;
+    // A fold re-points the other row's playlist entry: make that fail.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"CREATE TRIGGER "fail_fold" BEFORE UPDATE ON "LinkedChildren"
+           WHEN OLD."ChildId" = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
+        guid_to_db(other)
+    )))
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        f.scanner.scan_all().await.unwrap();
+        assert!(f.repo.retrieve_item(watched).await.unwrap().is_some());
+        assert!(
+            f.repo.retrieve_item(other).await.unwrap().is_some(),
+            "an unfolded row is not pruned"
         );
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path=?")
-            .bind(f.media.join(main).to_str().unwrap())
-            .fetch_one(f.db.pool())
+    }
+    sqlx::query(r#"DROP TRIGGER "fail_fold""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(rows_at(&f, theme).await, 1);
+    assert!(f.repo.retrieve_item(other).await.unwrap().is_none());
+    let linked: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .fetch_all(f.db.pool())
             .await
             .unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&adopted));
+    assert_eq!(linked, vec![guid_to_db(watched)]);
+    let kept: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "ItemId" FROM "UserData" WHERE "UserId" = ?1"#)
+            .bind(guid_to_db(user))
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(kept, vec![guid_to_db(watched)]);
+}
+
+/// Scans after `relative` was added: a path-scoped scan of it, or a full one.
+async fn scan_after_adding(f: &Fixture, relative: &str, scoped: bool) {
+    if scoped {
+        f.scanner
+            .scan_paths(&[f.media.join(relative).to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+    } else {
+        f.scanner.scan_all().await.unwrap();
     }
+}
+
+/// Stores a copy of the row at `relative` as `kind` under an id of its own;
+/// returns that id.
+async fn store_duplicate(f: &Fixture, relative: &str, kind: BaseItemKind) -> Uuid {
+    let mut row = f.row(relative).await;
+    let id = Uuid::new_v4();
+    row.id = guid_to_db(id);
+    stored_type_name(kind).unwrap().clone_into(&mut row.type_);
+    f.store.save_items(&[row]).await.unwrap();
+    id
+}
+
+/// How many rows are stored at `relative`.
+async fn rows_at(f: &Fixture, relative: &str) -> i64 {
+    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Path" = ?1"#)
+        .bind(f.media.join(relative).to_string_lossy().as_ref())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+}
+
+/// `user` favourited and played `item` (its guid-keyed row).
+async fn play_as(db: &Database, item: Uuid, user: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+           "PlayCount", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, 1, 1, 0, 1)"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(user))
+    .bind(item.to_string())
+    .execute(db.writer())
+    .await
+    .unwrap();
+}
+
+/// A new playlist holding `item`; returns its id.
+async fn link_in_playlist(f: &Fixture, item: Uuid) -> Uuid {
+    use ferrofin_core::FerrofinLinkedChildrenService;
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+
+    let playlist = Uuid::new_v4();
+    let list = BaseItemEntity {
+        id: guid_to_db(playlist),
+        type_: stored_type_name(BaseItemKind::Playlist).unwrap().to_owned(),
+        name: Some("list".to_owned()),
+        is_folder: true,
+        ..BaseItemEntity::default()
+    };
+    f.store.save_items(&[list]).await.unwrap();
+    FerrofinLinkedChildrenService::new(f.db.clone())
+        .upsert_linked_child(playlist, item, 0)
+        .await
+        .unwrap();
+    playlist
 }
 
 /// An extra in an extras-type subfolder is `IsInMixedFolder` when that
@@ -1610,48 +1896,65 @@ async fn seed_user(db: &Database) -> Uuid {
             "PasswordResetProviderId", "PlayDefaultAudioTrack",
             "RememberAudioSelections", "RememberSubtitleSelections",
             "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
-           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'u', 'U')"#,
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2, upper(?2))"#,
     )
     .bind(guid_to_db(user))
+    .bind(user.simple().to_string())
     .execute(db.writer())
     .await
     .unwrap();
     user
 }
 
-/// Turns the item at `relative` into the `Movie` row an older Ferrofin scan
-/// stored for it — its own id, type, `IsMovie` and presentation key —
-/// favourited by a user and in a playlist; returns (movie id, user, playlist).
-async fn as_an_older_scans_movie(f: &Fixture, relative: &str) -> (Uuid, Uuid, Uuid) {
+/// Turns the item at `relative` into the `kind` row another scan stored for
+/// it — the id that kind derives, its type and `IsMovie` — further shaped by
+/// `shape` (which may give it another id), favourited by a user and in a
+/// playlist; the extras it owned point at it. Returns (its id, user,
+/// playlist).
+async fn as_stored_kind(
+    f: &Fixture,
+    relative: &str,
+    kind: BaseItemKind,
+    shape: impl FnOnce(&mut BaseItemEntity),
+) -> (Uuid, Uuid, Uuid) {
     use ferrofin_core::FerrofinLinkedChildrenService;
-    use ferrofin_core::item_type_lookup::{derive_item_id, stored_type_name};
-    use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::LinkedChildrenService as _;
 
     let mut row = f.row(relative).await;
     let mut list = row.clone();
+    let mut owned: Vec<BaseItemEntity> =
+        sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "OwnerId" = ?1"#)
+            .bind(&row.id)
+            .fetch_all(f.db.pool())
+            .await
+            .unwrap();
     let path = row.path.clone().unwrap();
-    let movie = derive_item_id(BaseItemKind::Movie, &path).unwrap();
     f.store
         .delete_items(&[Uuid::parse_str(&row.id).unwrap()])
         .await
         .unwrap();
-    row.id = guid_to_db(movie);
-    stored_type_name(BaseItemKind::Movie)
-        .unwrap()
-        .clone_into(&mut row.type_);
-    row.is_movie = true;
-    row.series_id = None;
-    row.season_id = None;
+    row.id = guid_to_db(derive_item_id(kind, &path).unwrap());
+    stored_type_name(kind).unwrap().clone_into(&mut row.type_);
+    row.is_movie = kind == BaseItemKind::Movie;
+    if kind != BaseItemKind::Episode {
+        row.series_id = None;
+        row.season_id = None;
+    }
+    shape(&mut row);
+    let stored = Uuid::parse_str(&row.id).unwrap();
     f.store.save_items(&[row]).await.unwrap();
+    for extra in &mut owned {
+        extra.owner_id = Some(guid_to_db(stored));
+    }
+    f.store.save_items(&owned).await.unwrap();
     let user = seed_user(&f.db).await;
     sqlx::query(
         r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
            "PlayCount", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, 1, 1, 0, 1)"#,
     )
-    .bind(guid_to_db(movie))
+    .bind(guid_to_db(stored))
     .bind(guid_to_db(user))
-    .bind(movie.to_string())
+    .bind(stored.to_string())
     .execute(f.db.writer())
     .await
     .unwrap();
@@ -1667,18 +1970,75 @@ async fn as_an_older_scans_movie(f: &Fixture, relative: &str) -> (Uuid, Uuid, Uu
     list.parent_id = None;
     f.store.save_items(&[list]).await.unwrap();
     FerrofinLinkedChildrenService::new(f.db.clone())
-        .upsert_linked_child(playlist, movie, 0)
+        .upsert_linked_child(playlist, stored, 0)
         .await
         .unwrap();
-    (movie, user, playlist)
+    (stored, user, playlist)
+}
+
+/// A row's `(Id, Type, Path, OwnerId, ParentId)`.
+type IdentityRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Every row but those at `relative`, as `(Id, Type, Path, OwnerId,
+/// ParentId)` with `from` read as `to`, sorted: what a move of the item at
+/// `relative` from `from` to `to` leaves as it was.
+async fn other_rows(
+    f: &Fixture,
+    relative: &str,
+    (from, to): (Uuid, Uuid),
+) -> Vec<[Option<String>; 5]> {
+    let rows: Vec<IdentityRow> = sqlx::query_as(
+        r#"SELECT "Id", "Type", "Path", "OwnerId", "ParentId" FROM "BaseItems"
+           WHERE "Path" IS NOT ?1"#,
+    )
+    .bind(f.media.join(relative).to_string_lossy().as_ref())
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    let (from, to) = (guid_to_db(from), guid_to_db(to));
+    let moved = |id: Option<String>| id.map(|id| if id == from { to.clone() } else { id });
+    let mut rows: Vec<[Option<String>; 5]> = rows
+        .into_iter()
+        .map(|(id, kind, path, owner, parent)| {
+            [
+                moved(Some(id)),
+                Some(kind),
+                path,
+                moved(owner),
+                moved(parent),
+            ]
+        })
+        .collect();
+    rows.sort();
+    rows
 }
 
 /// After a rescan, the item at `relative` is `kind` under the id that kind
-/// derives, and still the user's favourite and in the playlist.
-async fn assert_moved(f: &Fixture, relative: &str, kind: &str, user: Uuid, playlist: Uuid) {
+/// derives, and still the user's favourite and in the playlist; the row
+/// under `from` is gone.
+async fn assert_moved(
+    f: &Fixture,
+    relative: &str,
+    kind: BaseItemKind,
+    from: Uuid,
+    (user, playlist): (Uuid, Uuid),
+) {
     let row = f.row(relative).await;
-    assert!(row.type_.ends_with(kind), "{}", row.type_);
+    assert_eq!(row.type_, stored_type_name(kind).unwrap());
     assert!(!row.is_movie);
+    let id = Uuid::parse_str(&row.id).unwrap();
+    assert_eq!(
+        id,
+        derive_item_id(kind, row.path.as_deref().unwrap()).unwrap()
+    );
+    assert_ne!(id, from);
+    assert!(f.repo.retrieve_item(from).await.unwrap().is_none());
     let kept: Vec<(String, String, bool)> = sqlx::query_as(
         r#"SELECT "ItemId", "CustomDataKey", "IsFavorite" FROM "UserData" WHERE "UserId" = ?1"#,
     )
@@ -1686,7 +2046,6 @@ async fn assert_moved(f: &Fixture, relative: &str, kind: &str, user: Uuid, playl
     .fetch_all(f.db.pool())
     .await
     .unwrap();
-    let id = Uuid::parse_str(&row.id).unwrap();
     assert_eq!(kept, vec![(row.id.clone(), id.to_string(), true)]);
     let linked: Vec<String> =
         sqlx::query_scalar(r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
@@ -1697,6 +2056,30 @@ async fn assert_moved(f: &Fixture, relative: &str, kind: &str, user: Uuid, playl
     assert_eq!(linked, vec![row.id]);
 }
 
+/// Stores the item at `relative` as `stored` (further shaped by `shape`),
+/// rescans, and checks it moved to the id `planned` derives with its user
+/// data and playlist entry, its old id gone and no other row changed.
+async fn assert_kind_change_moves(
+    f: &Fixture,
+    relative: &str,
+    (stored, planned): (BaseItemKind, BaseItemKind),
+    shape: impl FnOnce(&mut BaseItemEntity),
+) {
+    f.scanner.scan_all().await.unwrap();
+    let path = f.media.join(relative).to_string_lossy().into_owned();
+    let to = derive_item_id(planned, &path).unwrap();
+    assert_eq!(
+        f.row(relative).await.id,
+        guid_to_db(to),
+        "planned as {planned:?}"
+    );
+    let (from, user, playlist) = as_stored_kind(f, relative, stored, shape).await;
+    let others = other_rows(f, relative, (from, to)).await;
+    f.scanner.scan_all().await.unwrap();
+    assert_moved(f, relative, planned, from, (user, playlist)).await;
+    assert_eq!(other_rows(f, relative, (from, to)).await, others);
+}
+
 /// A clip an older Ferrofin scan stored as a `Movie` — and an episode of an
 /// untyped library's series it stored as one — moves to the id its new kind
 /// derives (owner decision D4), its watch state and playlist entry with it,
@@ -1704,22 +2087,167 @@ async fn assert_moved(f: &Fixture, relative: &str, kind: &str, user: Uuid, playl
 #[tokio::test]
 async fn an_older_scans_movie_keeps_its_user_data_under_its_new_kind() {
     let f = Fixture::with_type(&["Trip/Day 1.mp4"], CollectionTypeOptions::homevideos).await;
-    f.scanner.scan_all().await.unwrap();
-    let (movie, user, playlist) = as_an_older_scans_movie(&f, "Trip/Day 1.mp4").await;
-    f.scanner.scan_all().await.unwrap();
-    assert_moved(&f, "Trip/Day 1.mp4", "Entities.Video", user, playlist).await;
-    assert_ne!(f.row("Trip/Day 1.mp4").await.id, guid_to_db(movie));
-
-    let f = Fixture::untyped(&["Show/Season 1/Show S01E01.mkv"]).await;
-    f.scanner.scan_all().await.unwrap();
-    let (_, user, playlist) = as_an_older_scans_movie(&f, "Show/Season 1/Show S01E01.mkv").await;
-    f.scanner.scan_all().await.unwrap();
-    assert_moved(
+    assert_kind_change_moves(
         &f,
-        "Show/Season 1/Show S01E01.mkv",
-        ".Episode",
-        user,
-        playlist,
+        "Trip/Day 1.mp4",
+        (BaseItemKind::Movie, BaseItemKind::Video),
+        |_| {},
     )
     .await;
+
+    let f = Fixture::untyped(&["Show/Season 1/Show S01E01.mkv"]).await;
+    assert_kind_change_moves(
+        &f,
+        "Show/Season 1/Show S01E01.mkv",
+        (BaseItemKind::Movie, BaseItemKind::Episode),
+        |_| {},
+    )
+    .await;
+}
+
+/// Every video library re-keys a video whose kind changed (owner decision
+/// D9b): an `Episode` a home-video library now resolves as a `Video`, a
+/// `Movie` a TV library resolves as an `Episode`, a `MusicVideo` a movie
+/// library resolves as a `Movie` (the library's type changed).
+#[tokio::test]
+async fn a_video_whose_kind_changed_moves_in_every_video_library() {
+    let f = Fixture::with_type(&["Show/Show S01E01.mkv"], CollectionTypeOptions::homevideos).await;
+    assert_kind_change_moves(
+        &f,
+        "Show/Show S01E01.mkv",
+        (BaseItemKind::Episode, BaseItemKind::Video),
+        |_| {},
+    )
+    .await;
+
+    let f = Fixture::with_type(
+        &["Show/Season 1/Show S01E01.mkv"],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    assert_kind_change_moves(
+        &f,
+        "Show/Season 1/Show S01E01.mkv",
+        (BaseItemKind::Movie, BaseItemKind::Episode),
+        |_| {},
+    )
+    .await;
+
+    let f = Fixture::new(&["Heat (1995)/Heat.mkv"]).await;
+    assert_kind_change_moves(
+        &f,
+        "Heat (1995)/Heat.mkv",
+        (BaseItemKind::MusicVideo, BaseItemKind::Movie),
+        |_| {},
+    )
+    .await;
+}
+
+/// A home video an older scan stored as a `Movie` owns its extras there; the
+/// move takes them along, and the rescan never re-points them at the `Movie`
+/// row the move left behind.
+#[tokio::test]
+async fn a_moved_owner_keeps_its_extras() {
+    let f = Fixture::with_options(
+        &["Album/Beach.mp4", "Album/extras/trailer.mp4"],
+        CollectionTypeOptions::homevideos,
+        LibraryOptions {
+            enable_photos: false,
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    assert_kind_change_moves(
+        &f,
+        "Album/Beach.mp4",
+        (BaseItemKind::Movie, BaseItemKind::Video),
+        |_| {},
+    )
+    .await;
+    assert_eq!(
+        f.row("Album/extras/trailer.mp4").await.owner_id,
+        Some(f.row("Album/Beach.mp4").await.id)
+    );
+}
+
+/// A Jellyfin 10.11 local alternate version — a `Video` owned by its primary
+/// `Movie`, no parent, under the id the `Video` kind derives — where the
+/// movie walk plans a `Movie` moves to the `Movie` id with its user data:
+/// the data-preserving form of upstream's wrong-type delete
+/// (`LibraryManager.ResolveAlternateVersion`, `LibraryManager.cs:870-893`;
+/// owner decision D9b).
+#[tokio::test]
+async fn an_adopted_alternate_version_video_moves_to_the_planned_kind() {
+    let f = Fixture::new(&["Film/Film.mkv", "Film/Film - 4K.mkv"]).await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row("Film/Film.mkv").await.id;
+    assert_kind_change_moves(
+        &f,
+        "Film/Film - 4K.mkv",
+        (BaseItemKind::Video, BaseItemKind::Movie),
+        |row| {
+            row.owner_id = Some(primary.clone());
+            row.parent_id = None;
+            row.top_parent_id = None;
+            row.presentation_unique_key = Some(row.id.to_lowercase().replace('-', ""));
+            row.is_in_mixed_folder = false;
+        },
+    )
+    .await;
+    assert_eq!(f.row("Film/Film.mkv").await.id, primary);
+}
+
+/// A file that became an extra or stopped being one moves too (owner
+/// decision, the principle of D4/D9b), its `ExtraType` and `OwnerId` then
+/// following the planner: a `Movie` row at a path the scan now plans as a
+/// trailer extra becomes that `Trailer`, and a stored extra `Video` at a path
+/// the scan now plans as a `Movie` becomes that movie — each with its watch
+/// state and playlist entry, where upstream deletes the row and plans anew.
+#[tokio::test]
+async fn a_file_that_becomes_or_stops_being_an_extra_moves() {
+    let trailer = "Heat (1995)/Heat-trailer.mkv";
+    let f = Fixture::new(&[MOVIE, trailer]).await;
+    f.scanner.scan_all().await.unwrap();
+    let movie = f.row(MOVIE).await;
+    let planned = f.row(trailer).await;
+    assert_kind_change_moves(
+        &f,
+        trailer,
+        (BaseItemKind::Movie, BaseItemKind::Trailer),
+        |row| {
+            row.extra_type = None;
+            row.owner_id = None;
+            row.parent_id.clone_from(&movie.parent_id);
+            row.top_parent_id.clone_from(&movie.top_parent_id);
+        },
+    )
+    .await;
+    let row = f.row(trailer).await;
+    assert_eq!(
+        (row.extra_type, row.owner_id, row.parent_id),
+        (planned.extra_type, Some(movie.id.clone()), None)
+    );
+
+    let ronin = "Ronin (1998)/Ronin.mkv";
+    let f = Fixture::new(&[MOVIE, ronin]).await;
+    f.scanner.scan_all().await.unwrap();
+    let owner = f.row(MOVIE).await.id;
+    let planned = f.row(ronin).await;
+    assert_kind_change_moves(
+        &f,
+        ronin,
+        (BaseItemKind::Video, BaseItemKind::Movie),
+        |row| {
+            row.extra_type = Some(ferrofin_model::entities::ExtraType::Clip as i32);
+            row.owner_id = Some(owner);
+            row.parent_id = None;
+            row.top_parent_id = None;
+        },
+    )
+    .await;
+    let row = f.row(ronin).await;
+    assert_eq!(
+        (row.extra_type, row.owner_id, row.parent_id),
+        (None, None, planned.parent_id)
+    );
 }

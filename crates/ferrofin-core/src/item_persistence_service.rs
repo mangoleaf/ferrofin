@@ -25,7 +25,7 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
-    FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey,
+    FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
     StoredImageMetadata, StoredItemLinks,
 };
 use std::collections::HashMap;
@@ -2491,8 +2491,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .await
             .map_err(db_err)?;
         // Read off the schema, so a table added later moves too.
-        let mut references: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT m."name", p."from" FROM "sqlite_master" m
+        let mut references: Vec<RekeyReference> = sqlx::query_as(
+            r#"SELECT m."name", p."from", upper(p."on_delete") = 'CASCADE'
+               FROM "sqlite_master" m
                JOIN pragma_foreign_key_list(m."name") p
                WHERE m."type" = 'table' AND p."table" = 'BaseItems' COLLATE NOCASE
                  AND (p."to" IS NULL OR p."to" = 'Id' COLLATE NOCASE)"#,
@@ -2503,7 +2504,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         references.extend(
             REKEY_LOOSE_REFERENCES
                 .iter()
-                .map(|(table, column)| ((*table).to_owned(), (*column).to_owned())),
+                .map(|(table, column)| ((*table).to_owned(), (*column).to_owned(), false)),
         );
         let mut done = Vec::new();
         for m in moves {
@@ -2543,6 +2544,38 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         tx.commit().await.map_err(db_err)?;
         Ok(done)
+    }
+
+    async fn item_user_weights(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemUserWeight>>, ServiceError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = item_user_weights_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, (String, bool, Option<String>, i64, bool, bool)>(
+                sqlx::AssertSqlSafe(sql.as_str()),
+            );
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (id, has_user_data, last_played, play_count, edited, linked) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                let Ok(id) = Uuid::parse_str(&id) else {
+                    continue;
+                };
+                out.push(ItemUserWeight {
+                    id,
+                    has_user_data,
+                    last_played: last_played.as_deref().and_then(parse_stored_datetime),
+                    play_count,
+                    edited,
+                    linked,
+                });
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn update_file_facts(
@@ -2941,18 +2974,343 @@ const REKEY_LOOSE_REFERENCES: [(&str, &str); 5] = [
 ];
 
 /// The stored paths that may lie in a folder named after an item.
+/// One reference to a `BaseItems` row a re-key or a merge carries: its
+/// table, its column, and whether its foreign key cascades a delete (`false`
+/// for the loose references, which have none).
+type RekeyReference = (String, String, bool);
+
 const REKEY_PATH_COLUMNS: [(&str, &str); 3] = [
     ("BaseItemImageInfos", "Path"),
     ("MediaStreamInfos", "Path"),
     ("Chapters", "ImagePath"),
 ];
 
-/// One [`ItemPersistenceService::rekey_items`] move, inside the caller's
-/// transaction: `false` when the old id is not stored or the new one is.
+/// One [`ItemPersistenceService::rekey_items`] move and the merges into its
+/// target, inside the caller's transaction: `false` when the old id is not
+/// stored or the new one is (for a merge alone, `from` = `to`: when it is
+/// not stored). A stored target among the merged rows folds into `from`
+/// first, which then moves to its id.
 async fn rekey_one(
     conn: &mut sqlx::SqliteConnection,
     m: &ItemRekey,
-    references: &[(String, String)],
+    references: &[RekeyReference],
+) -> Result<bool, sqlx::Error> {
+    if m.from == m.to {
+        if !is_stored(conn, m.to).await? {
+            return Ok(false);
+        }
+    } else {
+        if m.merged.contains(&m.to) && is_stored(conn, m.from).await? {
+            merge_one(conn, (m.to, m.from), m.extra, references).await?;
+        }
+        if !move_one(conn, m, references).await? {
+            return Ok(false);
+        }
+    }
+    for &loser in m.merged.iter().filter(|&&id| id != m.to) {
+        merge_one(conn, (loser, m.to), m.extra, references).await?;
+    }
+    Ok(true)
+}
+
+/// Whether a `BaseItems` row has the id `id`.
+async fn is_stored(conn: &mut sqlx::SqliteConnection, id: Uuid) -> Result<bool, sqlx::Error> {
+    let stored: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(&mut *conn)
+            .await?;
+    Ok(stored.is_some())
+}
+
+/// Folds stored row `loser` into item `to`, inside the caller's transaction
+/// (both stand for one item at one path; [`ItemRekey::merged`]): its user
+/// data moves to `to` — its own guid-keyed row renamed — where `to` has none
+/// for that user and key, and replaces `to`'s where it was played later
+/// (then more often), as upstream keeps the best of duplicate user data
+/// (`ItemPersistenceService.cs:103-110`); every other row's reference to it
+/// (its extras' `OwnerId`, a playlist's or collection's entry, a version's
+/// `PrimaryVersionId`, …) follows, an entry the container already holds
+/// for `to` dropped. Its version link goes to `to` when `to` has none (its
+/// `PrimaryVersionId`, presentation key and version `OwnerId`); else the
+/// containers' version entries for it go. A reference the two rows held to
+/// each other leaves none to itself. What is keyed by its id without a
+/// cascading foreign key (media segments, trickplay) moves to `to` where
+/// `to` has none in that table, else goes. Then the row is deleted, its own
+/// data (streams, images, people, …) with it. A `loser` not stored is
+/// skipped.
+async fn merge_one(
+    conn: &mut sqlx::SqliteConnection,
+    (loser, to): (Uuid, Uuid),
+    extra: bool,
+    references: &[RekeyReference],
+) -> Result<(), sqlx::Error> {
+    let (from, into) = (guid_to_db(loser), guid_to_db(to));
+    let stored: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&from)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if stored.is_none() {
+        return Ok(());
+    }
+    merge_user_data(conn, loser, to).await?;
+    carry_version_link(conn, (loser, to), extra, references).await?;
+    for (table, column, cascades) in references
+        .iter()
+        .filter(|(table, ..)| !table.eq_ignore_ascii_case("UserData"))
+    {
+        let mut statements = Vec::new();
+        if column.eq_ignore_ascii_case("ItemId") {
+            // The loser's own data: a cascading key deletes it with the row;
+            // what has none moves where the target has none, else goes.
+            if *cascades {
+                continue;
+            }
+            let held = format!(r#"SELECT EXISTS (SELECT 1 FROM "{table}" WHERE "ItemId" = ?1)"#);
+            let held: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(held))
+                .bind(&into)
+                .fetch_one(&mut *conn)
+                .await?;
+            if !held {
+                statements.push(format!(
+                    r#"UPDATE OR IGNORE "{table}" SET "ItemId" = ?1 WHERE "ItemId" = ?2"#
+                ));
+            }
+            statements.push(format!(r#"DELETE FROM "{table}" WHERE "ItemId" = ?2"#));
+        } else if table.eq_ignore_ascii_case("BaseItems") {
+            statements.push(format!(
+                r#"UPDATE "BaseItems" SET "{column}" = ?1 WHERE "{column}" = ?2"#
+            ));
+        } else {
+            if column.eq_ignore_ascii_case("ChildId") {
+                // A container that already holds the target drops the loser.
+                statements.push(format!(
+                    r#"DELETE FROM "{table}" WHERE "ChildId" = ?2 AND "ParentId" IN
+                         (SELECT "ParentId" FROM "{table}" WHERE "ChildId" = ?1)"#
+                ));
+            }
+            statements.push(format!(
+                r#"UPDATE OR IGNORE "{table}" SET "{column}" = ?1 WHERE "{column}" = ?2"#
+            ));
+            statements.push(format!(r#"DELETE FROM "{table}" WHERE "{column}" = ?2"#));
+        }
+        for sql in statements {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&into)
+                .bind(&from)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    // A version keyed by the loser's presentation key follows the target.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1
+           WHERE "PresentationUniqueKey" = ?2 AND "Id" <> ?3"#,
+    )
+    .bind(to.simple().to_string())
+    .bind(loser.simple().to_string())
+    .bind(&from)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(&from)
+        .execute(&mut *conn)
+        .await?;
+    // The two rows linked to each other (one a version, an extra or an entry
+    // of the other): the kept row names itself nowhere.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "PrimaryVersionId" = NULL, "PresentationUniqueKey" = ?2
+           WHERE "Id" = ?1 AND "PrimaryVersionId" = ?1"#,
+    )
+    .bind(&into)
+    .bind(to.simple().to_string())
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "Id" = ?1 AND "OwnerId" = ?1"#)
+        .bind(&into)
+        .execute(&mut *conn)
+        .await?;
+    for table in link_tables(references) {
+        let sql = format!(r#"DELETE FROM "{table}" WHERE "ParentId" = ?1 AND "ChildId" = ?1"#);
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&into)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// [`merge_one`]'s user data: `loser`'s rows move to `to`, its guid-keyed
+/// row renamed; on a (user, key) both hold, the row played later (then more
+/// often) stays.
+async fn merge_user_data(
+    conn: &mut sqlx::SqliteConnection,
+    loser: Uuid,
+    to: Uuid,
+) -> Result<(), sqlx::Error> {
+    let (from, into) = (guid_to_db(loser), guid_to_db(to));
+    // The loser's own rows first: its guid-keyed row and one it holds under
+    // the target's guid key (a user's row for both) would meet on renaming.
+    keep_one_of_renamed_keys(conn, &from, (&loser.to_string(), &to.to_string())).await?;
+    // The key a loser's row takes: its guid-keyed row is renamed.
+    let key = r#"CASE WHEN l."CustomDataKey" = ?3 THEN ?4 ELSE l."CustomDataKey" END"#;
+    let beats = USER_DATA_BEATS;
+    for sql in [
+        // The target's rows a loser's row beats go…
+        format!(
+            r#"DELETE FROM "UserData" AS w WHERE w."ItemId" = ?2 AND EXISTS (
+                 SELECT 1 FROM "UserData" AS l WHERE l."ItemId" = ?1
+                   AND l."UserId" = w."UserId" AND {key} = w."CustomDataKey" AND {beats})"#
+        ),
+        // …the loser's rows the target's still beat go…
+        format!(
+            r#"DELETE FROM "UserData" AS l WHERE l."ItemId" = ?1 AND EXISTS (
+                 SELECT 1 FROM "UserData" AS w WHERE w."ItemId" = ?2
+                   AND w."UserId" = l."UserId" AND w."CustomDataKey" = {key})"#
+        ),
+        // …and the rest move.
+        format!(
+            r#"UPDATE "UserData" AS l SET "ItemId" = ?2, "CustomDataKey" = {key}
+               WHERE l."ItemId" = ?1"#
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&from)
+            .bind(&into)
+            .bind(loser.to_string())
+            .bind(to.to_string())
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Played later, then more often: user-data row `l` beats `w`, as upstream
+/// keeps the best of duplicate user data (`ItemPersistenceService.cs:103-110`).
+const USER_DATA_BEATS: &str = r#"(coalesce(julianday(l."LastPlayedDate"), -1)
+                      > coalesce(julianday(w."LastPlayedDate"), -1)
+                    OR (coalesce(julianday(l."LastPlayedDate"), -1)
+                          = coalesce(julianday(w."LastPlayedDate"), -1)
+                        AND l."PlayCount" > w."PlayCount"))"#;
+
+/// Before item `item`'s user-data rows keyed `old` are renamed to `new`:
+/// where a user has a row under each, the one played later (then more
+/// often) stays, so the rename meets no primary key.
+async fn keep_one_of_renamed_keys(
+    conn: &mut sqlx::SqliteConnection,
+    item: &str,
+    (old, new): (&str, &str),
+) -> Result<(), sqlx::Error> {
+    for sql in [
+        format!(
+            r#"DELETE FROM "UserData" AS w WHERE w."ItemId" = ?1 AND w."CustomDataKey" = ?3
+               AND EXISTS (SELECT 1 FROM "UserData" AS l WHERE l."ItemId" = ?1
+                 AND l."UserId" = w."UserId" AND l."CustomDataKey" = ?2 AND {USER_DATA_BEATS})"#
+        ),
+        r#"DELETE FROM "UserData" AS l WHERE l."ItemId" = ?1 AND l."CustomDataKey" = ?2
+             AND EXISTS (SELECT 1 FROM "UserData" AS w WHERE w."ItemId" = ?1
+               AND w."UserId" = l."UserId" AND w."CustomDataKey" = ?3)"#
+            .to_owned(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(item)
+            .bind(old)
+            .bind(new)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The link tables among `references`: those whose `ChildId` names an item
+/// (`LinkedChildren`).
+fn link_tables(references: &[RekeyReference]) -> impl Iterator<Item = &str> {
+    references
+        .iter()
+        .filter(|(_, column, _)| column.eq_ignore_ascii_case("ChildId"))
+        .map(|(table, ..)| table.as_str())
+}
+
+/// A row's `(PrimaryVersionId, PresentationUniqueKey, OwnerId, ExtraType)`.
+type VersionLink = (Option<String>, Option<String>, Option<String>, Option<i32>);
+
+/// [`merge_one`]'s version link: when `loser` is a version of another item
+/// (`PrimaryVersionId`) and `to` is a version of none, `to` takes its link —
+/// the primary, the presentation key and, for a version stored under its
+/// primary (`OwnerId` = `PrimaryVersionId`, no `ExtraType`), the owner — so
+/// the containers' version entries re-pointed to `to` agree with it; when
+/// `to` already is another item's version, or is an extra (`extra`), those
+/// entries for `loser` go
+/// (`ChildType` 2 and 3: local and linked alternate versions). A link
+/// between the two rows themselves is no link.
+async fn carry_version_link(
+    conn: &mut sqlx::SqliteConnection,
+    (loser, to): (Uuid, Uuid),
+    extra: bool,
+    references: &[RekeyReference],
+) -> Result<(), sqlx::Error> {
+    let (from, into) = (guid_to_db(loser), guid_to_db(to));
+    let mine = |id: &Option<String>| {
+        id.as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(&from) || id.eq_ignore_ascii_case(&into))
+    };
+    let lost: Option<VersionLink> = sqlx::query_as(
+        r#"SELECT "PrimaryVersionId", "PresentationUniqueKey", "OwnerId", "ExtraType"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(&from)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((Some(primary), key, owner, extra_type)) = lost else {
+        return Ok(());
+    };
+    if mine(&Some(primary.clone())) {
+        return Ok(());
+    }
+    let kept: Option<Option<String>> =
+        sqlx::query_scalar(r#"SELECT "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&into)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let kept = kept.flatten();
+    if !extra && (kept.is_none() || mine(&kept)) {
+        let owned_as_version = extra_type.is_none()
+            && owner
+                .as_deref()
+                .is_some_and(|owner| owner.eq_ignore_ascii_case(&primary));
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2, "PresentationUniqueKey" = ?3,
+                 "OwnerId" = CASE WHEN ?4 AND "OwnerId" IS NULL AND "ExtraType" IS NULL
+                                  THEN ?2 ELSE "OwnerId" END
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&into)
+        .bind(&primary)
+        .bind(key)
+        .bind(owned_as_version)
+        .execute(&mut *conn)
+        .await?;
+    } else {
+        for table in link_tables(references) {
+            let sql =
+                format!(r#"DELETE FROM "{table}" WHERE "ChildId" = ?1 AND "ChildType" IN (2, 3)"#);
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&from)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The move of one [`ItemPersistenceService::rekey_items`] entry, inside the
+/// caller's transaction: `false` when the old id is not stored or the new
+/// one is.
+async fn move_one(
+    conn: &mut sqlx::SqliteConnection,
+    m: &ItemRekey,
+    references: &[RekeyReference],
 ) -> Result<bool, sqlx::Error> {
     let (from, to) = (guid_to_db(m.from), guid_to_db(m.to));
     let stored: Vec<(String, bool)> =
@@ -2975,7 +3333,7 @@ async fn rekey_one(
     ] {
         sqlx::query(sql).bind(&to).execute(&mut *conn).await?;
     }
-    for (table, column) in references {
+    for (table, column, _) in references {
         let sql = format!(r#"UPDATE "{table}" SET "{column}" = ?1 WHERE "{column}" = ?2"#);
         sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&to)
@@ -3001,6 +3359,7 @@ async fn rekey_one(
     }
     // The item's own user-data row is keyed by its id as well
     // (`UserDataManager`'s guid row, lowercase hyphenated).
+    keep_one_of_renamed_keys(conn, &to, (&m.from.to_string(), &m.to.to_string())).await?;
     sqlx::query(
         r#"UPDATE "UserData" SET "CustomDataKey" = ?1
            WHERE "ItemId" = ?2 AND "CustomDataKey" = ?3"#,
@@ -3011,7 +3370,9 @@ async fn rekey_one(
     .execute(&mut *conn)
     .await?;
     // The row takes its new kind and is refreshed as one on the next pass
-    // (`DateLastRefreshed` cleared): no longer a movie.
+    // (`DateLastRefreshed` cleared). `IsMovie` is false for every kind the
+    // scan plans, a `Movie` too (upstream writes it for Live TV programs
+    // only); an older scan's `Movie` stored true.
     sqlx::query(
         r#"UPDATE "BaseItems" SET "Id" = ?1, "Type" = ?2, "IsMovie" = 0,
            "DateLastRefreshed" = NULL WHERE "Id" = ?3"#,
@@ -3721,19 +4082,20 @@ fn numbered_placeholders(n: usize) -> String {
         .join(",")
 }
 
-/// One `(Id, Type, Path, ParentId)` row of the path-scoped reads.
-type PathRow = (String, String, Option<String>, Option<String>);
+/// One `(Id, Type, Path, ParentId, ExtraType)` row of the path-scoped reads.
+type PathRow = (String, String, Option<String>, Option<String>, Option<i32>);
 
 /// [`PathRow`]s as [`ItemPathRow`]s; a row whose id does not parse is no
 /// item the scan can act on.
 fn path_rows(rows: Vec<PathRow>) -> impl Iterator<Item = ItemPathRow> {
     rows.into_iter()
-        .filter_map(|(id, item_type, path, parent)| {
+        .filter_map(|(id, item_type, path, parent, extra_type)| {
             Some(ItemPathRow {
                 id: Uuid::parse_str(&id).ok()?,
                 item_type,
                 path,
                 parent_id: parent.as_deref().and_then(|p| Uuid::parse_str(p).ok()),
+                extra_type,
             })
         })
 }
@@ -3754,9 +4116,40 @@ pub(crate) fn path_prefix_range(root: &str) -> (String, String, String) {
 /// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
 pub(crate) fn items_at_paths_sql(n: usize) -> String {
     format!(
-        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems" WHERE "Path" IN ({})"#,
+        r#"SELECT "Id", "Type", "Path", "ParentId", "ExtraType" FROM "BaseItems" WHERE "Path" IN ({})"#,
         numbered_placeholders(n)
     )
+}
+
+/// [`ItemPersistenceService::item_user_weights`] over `n` ids (binds
+/// `?1..?n`): each row's user data aggregates by the `UserData` primary key
+/// (`ItemId` first), its locked fields by theirs and its links by
+/// `IX_LinkedChildren_ChildId_ChildType`.
+pub(crate) fn item_user_weights_sql(n: usize) -> String {
+    format!(
+        r#"SELECT i."Id",
+             EXISTS (SELECT 1 FROM "UserData" u WHERE u."ItemId" = i."Id"),
+             (SELECT max(u."LastPlayedDate") FROM "UserData" u WHERE u."ItemId" = i."Id"),
+             coalesce((SELECT max(u."PlayCount") FROM "UserData" u WHERE u."ItemId" = i."Id"), 0),
+             i."IsLocked" OR EXISTS (SELECT 1 FROM "BaseItemMetadataFields" f
+                                     WHERE f."ItemId" = i."Id"),
+             EXISTS (SELECT 1 FROM "LinkedChildren" l WHERE l."ChildId" = i."Id")
+           FROM "BaseItems" i WHERE i."Id" IN ({})"#,
+        numbered_placeholders(n)
+    )
+}
+
+/// A stored `DateTime` column's text — Jellyfin's `yyyy-MM-dd HH:mm:ss.FFFFFFF`
+/// (fraction trimmed) or an RFC 3339 form — as UTC; `None` when unreadable.
+fn parse_stored_datetime(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .map(|naive| naive.and_utc())
+        .ok()
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(text)
+                .ok()
+                .map(|at| at.with_timezone(&chrono::Utc))
+        })
 }
 
 /// The rows of a library — `TopParentId` one of the `libraries` top
@@ -3796,7 +4189,7 @@ fn prune_candidate_terms(libraries: usize, top_parent: &str) -> String {
 pub(crate) fn library_items_sql(libraries: usize) -> String {
     let terms = prune_candidate_terms(libraries, r#"bi."TopParentId""#);
     format!(
-        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi WHERE {terms}"#
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId", bi."ExtraType" FROM "BaseItems" AS bi WHERE {terms}"#
     )
 }
 
@@ -3814,7 +4207,7 @@ pub(crate) fn items_under_roots_sql(libraries: usize, n: usize) -> String {
     let roots = root_terms(libraries, n);
     let terms = prune_candidate_terms(libraries, r#"+bi."TopParentId""#);
     format!(
-        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId", bi."ExtraType" FROM "BaseItems" AS bi
             WHERE {terms} AND ({roots})"#
     )
 }
@@ -3828,14 +4221,14 @@ fn owned_extra_items_sql(libraries: usize, roots: usize) -> String {
     if roots > 0 {
         let paths = root_terms(libraries, roots).replace("\"Path\"", "e.\"Path\"");
         return format!(
-            r#"SELECT e."Id", e."Type", e."Path", e."ParentId"
+            r#"SELECT e."Id", e."Type", e."Path", e."ParentId", e."ExtraType"
                 FROM "BaseItems" AS e CROSS JOIN "BaseItems" AS p
                 WHERE ({paths}) AND +e."ExtraType" IS NOT NULL
                   AND p."Id" = e."OwnerId" AND +p."TopParentId" IN ({tops})"#
         );
     }
     format!(
-        r#"SELECT e."Id", e."Type", e."Path", e."ParentId"
+        r#"SELECT e."Id", e."Type", e."Path", e."ParentId", e."ExtraType"
             FROM "BaseItems" AS p CROSS JOIN "BaseItems" AS e
             WHERE p."TopParentId" IN ({tops}) AND e."OwnerId" = p."Id"
               AND e."ExtraType" IS NOT NULL"#
@@ -3879,7 +4272,7 @@ pub(crate) fn pathless_children_sql(libraries: usize, n: usize) -> String {
     let terms = prune_candidate_terms(libraries, r#"+bi."TopParentId""#);
     let season = stored_type_name(BaseItemKind::Season).unwrap_or_default();
     format!(
-        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId", bi."ExtraType" FROM "BaseItems" AS bi
             WHERE {terms} AND +bi."Path" IS NULL AND +bi."Type" = '{season}'
               AND bi."ParentId" IN (SELECT "Id" FROM "BaseItems" WHERE {roots})"#
     )
@@ -8290,6 +8683,8 @@ mod tests {
                 to,
                 type_name: video.clone(),
                 dirs: Vec::new(),
+                merged: Vec::new(),
+                extra: false,
             },
             // The target already stored: skipped.
             ItemRekey {
@@ -8297,6 +8692,8 @@ mod tests {
                 to: series,
                 type_name: video.clone(),
                 dirs: Vec::new(),
+                merged: Vec::new(),
+                extra: false,
             },
         ];
         let done = svc.rekey_items(&moves).await.expect("rekey");
@@ -8340,6 +8737,478 @@ mod tests {
                 .is_empty(),
             "the source is gone"
         );
+    }
+
+    /// `rekey_items` folds a row standing for the same item into a stored
+    /// target (`from` = `to`): a user-data row the loser played later
+    /// replaces the target's, one the target played later stays, one the
+    /// target has none for moves (its guid key renamed); a container already
+    /// holding the target drops the loser, another re-points to the target;
+    /// the loser's extra follows; the loser is deleted, the foreign keys
+    /// whole. `item_user_weights` reads what users made of each row.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fixture: every reference a fold carries.
+    async fn rekey_items_folds_a_row_standing_for_the_same_item_into_it() {
+        use ferrofin_traits::persistence::ItemRekey;
+        let db = test_db().await;
+        let (target, loser, extra, playlist, boxset) = (
+            Uuid::from_u128(0xF001),
+            Uuid::from_u128(0xF002),
+            Uuid::from_u128(0xF003),
+            Uuid::from_u128(0xF004),
+            Uuid::from_u128(0xF005),
+        );
+        seed_item(&db, target, BaseItemKind::Movie).await;
+        seed_item(&db, loser, BaseItemKind::Video).await;
+        seed_item(&db, extra, BaseItemKind::Video).await;
+        let mut row = crate::test_support::fetch_item(&db, extra).await;
+        row.owner_id = Some(guid_to_db(loser));
+        row.extra_type = Some(1);
+        crate::test_support::save_item(&db, &row).await;
+        seed_item(&db, playlist, BaseItemKind::Playlist).await;
+        seed_item(&db, boxset, BaseItemKind::BoxSet).await;
+        let links = FerrofinLinkedChildrenService::new(db.clone());
+        for (container, child) in [(playlist, target), (playlist, loser), (boxset, loser)] {
+            links
+                .upsert_linked_child(container, child, 0)
+                .await
+                .expect("link");
+        }
+        let (first, second) = (Uuid::from_u128(0xF010), Uuid::from_u128(0xF020));
+        crate::test_support::seed_named_user(&db, first, "first").await;
+        crate::test_support::seed_named_user(&db, second, "second").await;
+        for (item, user, key, played, count) in [
+            (target, first, target.to_string(), "2020-01-01 00:00:00", 1),
+            (loser, first, loser.to_string(), "2024-01-01 00:00:00", 3),
+            (target, first, "shared".to_owned(), "2023-01-01 00:00:00", 1),
+            (loser, first, "shared".to_owned(), "2022-01-01 00:00:00", 9),
+            (loser, second, loser.to_string(), "2021-01-01 00:00:00", 2),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                   "LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?3, 0, ?4, ?5, 0, 1)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(played)
+            .bind(count)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let mut weights = svc
+            .item_user_weights(&[loser, target, Uuid::from_u128(0x99)])
+            .await
+            .expect("weights")
+            .expect("answered");
+        weights.sort_by_key(|w| w.id);
+        assert_eq!(weights.len(), 2, "an id not stored is left out");
+        assert!(weights.iter().all(|w| w.has_user_data && w.linked));
+        assert_eq!(
+            (weights[1].id, weights[1].play_count),
+            (loser, 9),
+            "the highest play count"
+        );
+        assert!(
+            weights[1].keep_rank() > weights[0].keep_rank(),
+            "played later"
+        );
+
+        let movie = crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+            .expect("type")
+            .to_owned();
+        let merge = [ItemRekey {
+            from: target,
+            to: target,
+            type_name: movie,
+            dirs: Vec::new(),
+            merged: vec![loser],
+            extra: false,
+        }];
+        assert_eq!(
+            svc.rekey_items(&merge).await.expect("merge"),
+            merge.to_vec()
+        );
+        assert!(
+            crate::test_support::fetch_item_opt(&db, loser)
+                .await
+                .is_none()
+        );
+        let mut user_data: Vec<(String, String, String, i64)> = sqlx::query_as(
+            r#"SELECT "ItemId", "UserId", "CustomDataKey", "PlayCount" FROM "UserData""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("user data");
+        user_data.sort();
+        let mut expected = vec![
+            (guid_to_db(target), guid_to_db(first), target.to_string(), 3),
+            (
+                guid_to_db(target),
+                guid_to_db(first),
+                "shared".to_owned(),
+                1,
+            ),
+            (
+                guid_to_db(target),
+                guid_to_db(second),
+                target.to_string(),
+                2,
+            ),
+        ];
+        expected.sort();
+        assert_eq!(user_data, expected);
+        for (container, children) in [(playlist, 1), (boxset, 1)] {
+            let linked: Vec<String> = sqlx::query_scalar(
+                r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1"#,
+            )
+            .bind(guid_to_db(container))
+            .fetch_all(db.pool())
+            .await
+            .expect("links");
+            assert_eq!(linked, vec![guid_to_db(target); children]);
+        }
+        assert_eq!(
+            crate::test_support::fetch_item(&db, extra).await.owner_id,
+            Some(guid_to_db(target))
+        );
+        let broken: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .expect("check");
+        assert!(broken.is_empty(), "{broken:?}");
+        assert!(
+            svc.rekey_items(&[ItemRekey {
+                to: Uuid::from_u128(0x98),
+                from: Uuid::from_u128(0x98),
+                ..merge[0].clone()
+            }])
+            .await
+            .expect("absent")
+            .is_empty(),
+            "a merge into a target not stored is not made"
+        );
+    }
+
+    /// The shape of one item row for the fold tests: (id, kind, primary
+    /// version, owner, presentation key).
+    type FoldRow = (Uuid, BaseItemKind, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+
+    /// Seeds `rows` and `links` (container, child, child type) in a fresh
+    /// database, folds `loser` into `kept` (an extra when `extra`), and
+    /// returns the database.
+    async fn fold(
+        rows: &[FoldRow],
+        links: &[(Uuid, Uuid, i32)],
+        (loser, kept): (Uuid, Uuid),
+        extra: bool,
+    ) -> ferrofin_db::Database {
+        use ferrofin_traits::persistence::ItemRekey;
+        let db = test_db().await;
+        for &(id, kind, ..) in rows {
+            seed_item(&db, id, kind).await;
+        }
+        for &(id, _, primary, owner, key) in rows {
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.primary_version_id = primary.map(guid_to_db);
+            row.owner_id = owner.map(guid_to_db);
+            row.presentation_unique_key = Some(key.unwrap_or(id).simple().to_string());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let service = FerrofinLinkedChildrenService::new(db.clone());
+        for &(container, child, child_type) in links {
+            service
+                .upsert_linked_child(container, child, child_type)
+                .await
+                .expect("link");
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let merge = ItemRekey {
+            from: kept,
+            to: kept,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: vec![loser],
+            extra,
+        };
+        assert_eq!(svc.rekey_items(&[merge]).await.expect("fold").len(), 1);
+        let broken: Vec<(String, i64, String, i64)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .expect("check");
+        assert!(broken.is_empty(), "{broken:?}");
+        db
+    }
+
+    /// `kept`'s (primary version, owner, presentation key) and the links
+    /// (container, child, child type) that remain.
+    async fn folded(
+        db: &ferrofin_db::Database,
+        kept: Uuid,
+    ) -> (
+        (Option<String>, Option<String>, Option<String>),
+        Vec<(String, String, i64)>,
+    ) {
+        let row = crate::test_support::fetch_item(db, kept).await;
+        let mut links: Vec<(String, String, i64)> =
+            sqlx::query_as(r#"SELECT "ParentId", "ChildId", "ChildType" FROM "LinkedChildren""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("links");
+        links.sort();
+        (
+            (
+                row.primary_version_id,
+                row.owner_id,
+                row.presentation_unique_key,
+            ),
+            links,
+        )
+    }
+
+    /// Two rows linked to each other fold into one that names itself
+    /// nowhere: a merged version of the kept row (merge-versions shape:
+    /// `PrimaryVersionId`, key and a linked-version entry), the kept row a
+    /// version of the merged one, and an owned version either way round.
+    #[tokio::test]
+    async fn a_fold_of_two_linked_rows_leaves_no_self_reference() {
+        let (kept, loser) = (Uuid::from_u128(0xF101), Uuid::from_u128(0xF102));
+        let own_key = Some(kept.simple().to_string());
+        for (rows, links) in [
+            (
+                [
+                    (kept, BaseItemKind::Movie, None, None, None),
+                    (loser, BaseItemKind::Video, Some(kept), None, Some(kept)),
+                ],
+                vec![(kept, loser, 3)],
+            ),
+            (
+                [
+                    (kept, BaseItemKind::Movie, Some(loser), None, Some(loser)),
+                    (loser, BaseItemKind::Video, None, None, None),
+                ],
+                vec![(loser, kept, 3)],
+            ),
+            (
+                [
+                    (kept, BaseItemKind::Movie, None, None, None),
+                    (
+                        loser,
+                        BaseItemKind::Video,
+                        Some(kept),
+                        Some(kept),
+                        Some(kept),
+                    ),
+                ],
+                vec![(kept, loser, 2)],
+            ),
+            (
+                [
+                    (
+                        kept,
+                        BaseItemKind::Movie,
+                        Some(loser),
+                        Some(loser),
+                        Some(loser),
+                    ),
+                    (loser, BaseItemKind::Video, None, None, None),
+                ],
+                vec![(loser, kept, 2)],
+            ),
+        ] {
+            let db = fold(&rows, &links, (loser, kept), false).await;
+            assert_eq!(
+                folded(&db, kept).await,
+                ((None, None, own_key.clone()), Vec::new()),
+                "{rows:?}"
+            );
+        }
+    }
+
+    /// A merged row that is another item's version hands its link to a kept
+    /// row that is none — primary, key and version owner — so the
+    /// container's entry re-pointed to the kept row agrees with it; a kept
+    /// row that is already another item's version, or an extra, keeps its
+    /// own, and the container's version entry for the merged row goes.
+    #[tokio::test]
+    async fn a_fold_carries_the_merged_rows_version_link_or_drops_its_entry() {
+        let (kept, loser, primary, other) = (
+            Uuid::from_u128(0xF201),
+            Uuid::from_u128(0xF202),
+            Uuid::from_u128(0xF203),
+            Uuid::from_u128(0xF204),
+        );
+        let base = [
+            (primary, BaseItemKind::Movie, None, None, None),
+            (other, BaseItemKind::Movie, None, None, None),
+            (
+                loser,
+                BaseItemKind::Video,
+                Some(primary),
+                Some(primary),
+                Some(primary),
+            ),
+        ];
+        let rows = [
+            base[0],
+            base[1],
+            base[2],
+            (kept, BaseItemKind::Movie, None, None, None),
+        ];
+        let db = fold(&rows, &[(primary, loser, 2)], (loser, kept), false).await;
+        let key = |id: Uuid| Some(id.simple().to_string());
+        assert_eq!(
+            folded(&db, kept).await,
+            (
+                (
+                    Some(guid_to_db(primary)),
+                    Some(guid_to_db(primary)),
+                    key(primary)
+                ),
+                vec![(guid_to_db(primary), guid_to_db(kept), 2)]
+            )
+        );
+
+        let rows = [
+            base[0],
+            base[1],
+            base[2],
+            (kept, BaseItemKind::Movie, Some(other), None, Some(other)),
+        ];
+        let db = fold(
+            &rows,
+            &[(primary, loser, 2), (other, kept, 3)],
+            (loser, kept),
+            false,
+        )
+        .await;
+        assert_eq!(
+            folded(&db, kept).await,
+            (
+                (Some(guid_to_db(other)), None, key(other)),
+                vec![(guid_to_db(other), guid_to_db(kept), 3)]
+            )
+        );
+        // An extra takes no version link: the entry goes.
+        let rows = [
+            base[0],
+            base[1],
+            base[2],
+            (kept, BaseItemKind::Video, None, None, None),
+        ];
+        let db = fold(&rows, &[(primary, loser, 2)], (loser, kept), true).await;
+        assert_eq!(
+            folded(&db, kept).await,
+            ((None, None, key(kept)), Vec::new())
+        );
+    }
+
+    /// A merged row holding two user-data rows for one user that meet on
+    /// renaming — its own guid-keyed row and one under the target's guid key
+    /// — folds without meeting the primary key: the one played later stays.
+    #[tokio::test]
+    async fn a_fold_keeps_one_of_a_users_rows_that_meet_on_renaming() {
+        let (kept, loser, user) = (
+            Uuid::from_u128(0xF401),
+            Uuid::from_u128(0xF402),
+            Uuid::from_u128(0xF410),
+        );
+        let db = test_db().await;
+        seed_item(&db, kept, BaseItemKind::Movie).await;
+        seed_item(&db, loser, BaseItemKind::Video).await;
+        crate::test_support::seed_named_user(&db, user, "user").await;
+        for (key, played, count) in [
+            (loser.to_string(), "2024-01-01 00:00:00", 1),
+            (kept.to_string(), "2020-01-01 00:00:00", 5),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                   "LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?3, 0, ?4, ?5, 0, 1)"#,
+            )
+            .bind(guid_to_db(loser))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(played)
+            .bind(count)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let merge = ferrofin_traits::persistence::ItemRekey {
+            from: kept,
+            to: kept,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: vec![loser],
+            extra: false,
+        };
+        assert_eq!(svc.rekey_items(&[merge]).await.expect("fold").len(), 1);
+        let rows: Vec<(String, String, i64)> =
+            sqlx::query_as(r#"SELECT "ItemId", "CustomDataKey", "PlayCount" FROM "UserData""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("user data");
+        assert_eq!(rows, vec![(guid_to_db(kept), kept.to_string(), 1)]);
+    }
+
+    /// What a merged row has keyed by its id without a cascading foreign key
+    /// moves to the kept row where it has none in that table (media
+    /// segments), else goes (trickplay): nothing is left orphaned.
+    #[tokio::test]
+    async fn a_fold_moves_keyed_rows_the_kept_row_lacks_and_drops_the_rest() {
+        let (kept, loser) = (Uuid::from_u128(0xF301), Uuid::from_u128(0xF302));
+        let db = test_db().await;
+        seed_item(&db, kept, BaseItemKind::Movie).await;
+        seed_item(&db, loser, BaseItemKind::Video).await;
+        sqlx::query(
+            r#"INSERT INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId",
+               "StartTicks", "Type") VALUES ('S1', 10, ?1, 'p', 0, 1)"#,
+        )
+        .bind(guid_to_db(loser))
+        .execute(db.writer())
+        .await
+        .expect("segment");
+        for item in [kept, loser] {
+            sqlx::query(
+                r#"INSERT INTO "TrickplayInfos" ("ItemId", "Width", "Height", "TileWidth",
+                   "TileHeight", "ThumbnailCount", "Interval", "Bandwidth")
+                   VALUES (?1, 320, 180, 10, 10, 1, 10000, 1)"#,
+            )
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .expect("trickplay");
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let merge = ferrofin_traits::persistence::ItemRekey {
+            from: kept,
+            to: kept,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: vec![loser],
+            extra: false,
+        };
+        assert_eq!(svc.rekey_items(&[merge]).await.expect("fold").len(), 1);
+        for (table, expected) in [("MediaSegments", 1), ("TrickplayInfos", 1)] {
+            let owners: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                r#"SELECT "ItemId" FROM "{table}""#
+            )))
+            .fetch_all(db.pool())
+            .await
+            .expect("rows");
+            assert_eq!(owners, vec![guid_to_db(kept); expected], "{table}");
+        }
     }
 
     /// A move clears what a pruned item left keyed by the new id (media
@@ -8415,6 +9284,8 @@ mod tests {
             to,
             type_name: video,
             dirs: vec![("/meta/OLD".to_owned(), "/meta/NEW".to_owned())],
+            merged: Vec::new(),
+            extra: false,
         }];
         assert_eq!(svc.rekey_items(&moves).await.expect("rekey").len(), 1);
 

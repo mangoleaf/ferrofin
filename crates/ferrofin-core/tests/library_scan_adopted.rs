@@ -300,17 +300,19 @@ async fn insert_version(
 /// Both prunes weigh exactly the rows a library read lists: an owned
 /// non-extra (Jellyfin's part or version stored under its owner) and an
 /// alternate version whose primary is in the library are never weighed —
-/// not even when the scan plans a new item at the same path (the
-/// "superseded" rule) or the version's own file is gone — while a version
-/// whose primary is in no library is listed, and pruned once its file is
-/// gone. The same for a path-scoped scan and a library scan.
+/// not even when the version's own file is gone — while a version whose
+/// primary is in no library is listed, and pruned once its file is gone. An
+/// owned `Video` at a path the scan plans as a `Movie` is not pruned either:
+/// it moves to the `Movie` id (owner decision D9b). The same for a
+/// path-scoped scan and a library scan.
 #[tokio::test]
 async fn a_version_a_library_read_does_not_list_is_never_pruned() {
     let lib = Library::new(true).await;
-    // A part Ferrofin plans as a movie of its own: its path is claimed.
+    // A version Ferrofin plans as a movie of its own: it moves to that id.
     let part_path = lib.media.join("A (2001)/A (2001) - 1080p.mkv");
     std::fs::write(&part_path, b"").expect("write");
     let part = derive_item_id(BaseItemKind::Video, &part_path.to_string_lossy()).expect("id");
+    let moved = derive_item_id(BaseItemKind::Movie, &part_path.to_string_lossy()).expect("id");
     insert_version(
         &lib.db,
         part,
@@ -359,7 +361,10 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
         .expect("scan");
     assert_eq!(scoped.removed, 1, "{scoped:?}");
     let rows = lib.rows().await;
-    assert!(rows.contains_key(&part), "an owned part is not weighed");
+    assert!(
+        rows.contains_key(&moved) && !rows.contains_key(&part),
+        "an owned Video planned as a Movie moves"
+    );
     assert!(rows.contains_key(&version), "a version of B is not weighed");
     assert!(
         !rows.contains_key(&orphan),
@@ -369,7 +374,7 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
     let full = lib.scanner.scan_all().await.expect("scan");
     assert_eq!(full.removed, 0, "{full:?}");
     let rows = lib.rows().await;
-    assert!(rows.contains_key(&part) && rows.contains_key(&version));
+    assert!(rows.contains_key(&moved) && rows.contains_key(&version));
 }
 
 /// The first scan of an adopted library saves what it plans under the
