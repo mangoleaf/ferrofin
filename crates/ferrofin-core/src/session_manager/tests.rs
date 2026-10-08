@@ -2193,7 +2193,7 @@ async fn concurrent_logins_cannot_exceed_max_active_sessions() {
     for task in tasks {
         match task.await.unwrap() {
             Ok(_) => admitted += 1,
-            Err(ServiceError::Unauthorized(msg)) => {
+            Err(ServiceError::Forbidden(msg)) => {
                 assert!(msg.contains("maximum number of sessions"), "{msg}");
             }
             Err(other) => panic!("unexpected error: {other}"),
@@ -2210,4 +2210,66 @@ async fn concurrent_logins_cannot_exceed_max_active_sessions() {
         .unwrap()
         .len();
     assert_eq!(live, 1, "and exactly one session may be live afterwards");
+}
+
+#[rstest::rstest]
+#[case(-1, 3)]
+#[case(0, 3)]
+#[case(1, 1)]
+#[case(2, 2)]
+#[tokio::test]
+async fn saved_session_limits_apply_to_new_logins(#[case] cap: i32, #[case] admitted: usize) {
+    use ferrofin_traits::library::UserManager;
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+    let user = users.create_user("session-cap").await.unwrap();
+    let uid = Uuid::parse_str(&user.id).unwrap();
+    let mut policy = ferrofin_model::users::UserPolicy {
+        max_active_sessions: cap,
+        enable_all_devices: true,
+        ..Default::default()
+    };
+    users.update_policy(uid, &policy).await.unwrap();
+    let mut request = AuthenticationRequest {
+        user_id: Some(uid),
+        app: Some("Web".into()),
+        app_version: Some("1.0".into()),
+        device_name: Some("Browser".into()),
+        ..Default::default()
+    };
+    for i in 0..3 {
+        request.device_id = Some(format!("cap-device-{i}"));
+        let result = mgr.authenticate_direct(&request).await;
+        if i < admitted {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(ServiceError::Forbidden(_))));
+        }
+    }
+    if cap > 0 {
+        request.device_id = Some("cap-device-0".into());
+        assert!(
+            matches!(
+                mgr.authenticate_direct(&request).await,
+                Err(ServiceError::Forbidden(_))
+            ),
+            "same-device login still checks the cap before replacing its session"
+        );
+    }
+    policy.max_active_sessions = 1;
+    users.update_policy(uid, &policy).await.unwrap();
+    assert_eq!(
+        mgr.get_sessions(Uuid::nil(), None, None, None, true)
+            .await
+            .unwrap()
+            .len(),
+        admitted,
+        "lowering does not evict existing sessions"
+    );
+    request.device_id = Some("one-more".into());
+    assert!(matches!(
+        mgr.authenticate_direct(&request).await,
+        Err(ServiceError::Forbidden(_))
+    ));
 }

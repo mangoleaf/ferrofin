@@ -1850,8 +1850,8 @@ impl FerrofinSessionManager {
             sessions.values().filter(|s| s.user_id == user_uuid).count()
         };
         if i64::try_from(active).unwrap_or(i64::MAX) >= user.max_active_sessions {
-            return Err(ServiceError::unauthorized(
-                "user is at their maximum number of sessions",
+            return Err(ServiceError::Forbidden(
+                "user is at their maximum number of sessions".to_owned(),
             ));
         }
         Ok(Some(gate))
