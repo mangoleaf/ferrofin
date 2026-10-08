@@ -1403,6 +1403,16 @@ pub(crate) fn scan_save_changes_row(
                         new
                     }
                 }
+                // A directory has none (D2): an older scan's stamp goes.
+                // TODO(parity, open work item): keyed on `IsFolder`, which a
+                // disc rip also is today; once rips are stored `IsFolder = 0`
+                // (PLAN_ITEM_FILE_DELETION, "found during execution") the
+                // clear must follow the path being a directory instead. A
+                // path-less virtual season is a folder upstream stamps with
+                // `UtcNow` once (`Folder.AddChild`) and keeps; Ferrofin
+                // stores none for it (and keys it differently,
+                // `SeriesMetadataService.cs:449-451`) — port both together.
+                "DateModified" if saved.is_folder => new,
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
                 // `LOCKED_DATA_SQL`: only the resolver's `VideoType` moves.
                 "Data" if stored.is_locked => {
@@ -2554,7 +2564,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                             AND ("DateModified" IS NULL
                                  OR abs(julianday(?5) - julianday("DateModified")) > ?9)
                        THEN ?8 ELSE "DateCreated" END,
-                   "DateModified" = coalesce(?5, "DateModified"),
+                   "DateModified" = CASE WHEN "IsFolder" THEN ?5
+                                         ELSE coalesce(?5, "DateModified") END,
                    "Size" = coalesce(?6, "Size"),
                    "DateLastSaved" = ?7
                WHERE "Id" = ?1
@@ -3229,7 +3240,9 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 /// - `DateLastRefreshed`, `DateLastMediaAdded`, `DateModified` and `Size` are
 ///   never cleared (`coalesce(excluded, stored)`): the scan saves them from
 ///   the stored row or its stat, and a row it could not read, or a path it
-///   could not stat, must not lose them,
+///   could not stat, must not lose them — except a folder's `DateModified`,
+///   which a directory never has (owner decision D2), so the stamp an older
+///   scan stored is cleared,
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
@@ -3272,9 +3285,15 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
             r#""IsLocked" = max("IsLocked", excluded."IsLocked"),"#,
         );
     for col in SCAN_NEVER_CLEARED_COLUMNS {
+        let kept = format!(r#"coalesce(excluded."{col}", "{col}")"#);
+        let kept = if *col == "DateModified" {
+            format!(r#"CASE WHEN excluded."IsFolder" THEN excluded."{col}" ELSE {kept} END"#)
+        } else {
+            kept
+        };
         sql = sql.replace(
             &format!(r#""{col}" = excluded."{col}""#),
-            &format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#),
+            &format!(r#""{col}" = {kept}"#),
         );
     }
     for col in LOCKED_PRESERVED_COLUMNS {
@@ -6027,10 +6046,14 @@ mod tests {
         assert!(sql.contains(r#""IsLocked" = max("IsLocked", excluded."IsLocked")"#));
         for col in super::SCAN_NEVER_CLEARED_COLUMNS {
             assert!(
-                sql.contains(&format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#)),
+                sql.contains(&format!(r#"coalesce(excluded."{col}", "{col}")"#)),
                 "never-cleared guard missing for column {col}"
             );
         }
+        // …but a folder's `DateModified` follows the save (D2).
+        assert!(sql.contains(
+            r#""DateModified" = CASE WHEN excluded."IsFolder" THEN excluded."DateModified" ELSE coalesce(excluded."DateModified", "DateModified") END"#
+        ));
         for stmt in [sql, super::UPSERT_SQL] {
             assert!(
                 stmt.contains(r#""DateLastSaved" = ?73"#),

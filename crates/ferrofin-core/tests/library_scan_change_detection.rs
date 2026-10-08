@@ -1070,13 +1070,15 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
     assert_eq!(scanner.scan_all().await.expect("rescan").unchanged, 1);
 }
 
-/// A new episode in an existing season: it is created, its season (whose
-/// directory mtime moved) is refreshed, and its sibling is left alone. The
-/// series is written only for the date of its newest episode
-/// (`UpdateDateLastMediaAdded`, which upstream's refresh of the series
-/// saves), and so its `DateLastSaved` moves.
+/// A new episode in an existing season: it is created, and its season and
+/// its sibling are left alone — the season too, though its directory's mtime
+/// moved: a directory has no `DateModified` (D2), and
+/// `BaseItem.RequiresRefresh` is false for a `MinValue` one
+/// (`BaseItem.cs:1721-1731`). The series is written only for the date of its
+/// newest episode (`UpdateDateLastMediaAdded`, which upstream's refresh of
+/// the series saves), and so its `DateLastSaved` moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
+async fn a_new_episode_leaves_its_season_and_its_siblings_alone() {
     let tmp = tempfile::tempdir().expect("tmp");
     let tv = tmp.path().join("tv");
     let season = tv.join("Show").join("Season 1");
@@ -1109,7 +1111,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         saved(season.clone(), BaseItemKind::Season).await,
     );
     // The directory mtime moves by whole seconds only on some filesystems;
-    // make the drift unambiguous.
+    // make the drift unambiguous, so the season's staying put is not luck.
     std::fs::write(season.join("Show S01E02.mkv"), b"0123").expect("new episode");
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
     std::fs::File::open(&season)
@@ -1121,8 +1123,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         scanner.scan_all().await.expect("rescan"),
         ScanOutcome {
             created: 1,
-            updated: 1,
-            unchanged: 3,
+            unchanged: 4,
             ..ScanOutcome::default()
         }
     );
@@ -1132,7 +1133,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         "its DateLastMediaAdded moved"
     );
     assert_eq!(saved(sibling, BaseItemKind::Episode).await, before.1);
-    assert_ne!(saved(season, BaseItemKind::Season).await, before.2);
+    assert_eq!(saved(season, BaseItemKind::Season).await, before.2);
 }
 
 /// A locked item: an unchanged rescan leaves it alone like any other; a

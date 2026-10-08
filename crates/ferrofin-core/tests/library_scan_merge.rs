@@ -326,10 +326,13 @@ async fn a_locked_rows_video_type_follows_the_resolver() {
     assert_eq!(fx.row(BaseItemKind::Movie, &file).await, after);
 }
 
-/// Owner decision D3: a folder's `DateModified` is its directory's mtime,
-/// stamped on every save, as upstream's `SaveInternal` does.
+/// Owner decision D2: a directory-backed item stores no `DateModified`, as
+/// upstream does — `ManagedFileSystem.GetFileSystemMetadata` fills no times
+/// for a directory, so `MetadataService` saves `DateTime.MinValue`, which
+/// `BaseItemMapper` stores as NULL. A later change to the directory leaves
+/// it unset.
 #[tokio::test]
-async fn a_folders_date_modified_is_its_directory_mtime() {
+async fn a_folder_has_no_date_modified() {
     let tmp = tempfile::tempdir().expect("tmp");
     let media = tmp.path().join("tv");
     let series = media.join("Show");
@@ -345,27 +348,33 @@ async fn a_folders_date_modified_is_its_directory_mtime() {
     }
     let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows).await;
     fx.scanner().scan_all().await.expect("scan");
-    let expected = Some(ferrofin_db::store::datetime_to_db(past.into()));
-    assert_eq!(
-        fx.raw_dates(BaseItemKind::Series, &series).await.1,
-        expected
-    );
-    assert_eq!(
-        fx.raw_dates(BaseItemKind::Season, &season).await.1,
-        expected
-    );
+    assert_eq!(fx.raw_dates(BaseItemKind::Series, &series).await.1, None);
+    assert_eq!(fx.raw_dates(BaseItemKind::Season, &season).await.1, None);
 
-    // A later change to the directory is picked up by the next save.
+    // A later change to the directory stamps nothing either, and refreshes
+    // nothing (`BaseItem.RequiresRefresh` is false for a MinValue date).
     let later = past + std::time::Duration::from_hours(24);
     std::fs::File::open(&series)
         .expect("open dir")
         .set_modified(later)
         .expect("set mtime");
-    fx.scanner().scan_all().await.expect("rescan");
-    assert_eq!(
-        fx.raw_dates(BaseItemKind::Series, &series).await.1,
-        Some(ferrofin_db::store::datetime_to_db(later.into()))
-    );
+    let rescan = fx.scanner().scan_all().await.expect("rescan");
+    assert_eq!(rescan.updated, 0, "{rescan:?}");
+    assert_eq!(fx.raw_dates(BaseItemKind::Series, &series).await.1, None);
+
+    // The directory's mtime an older Ferrofin scan stored goes on the next
+    // scan's save, and only that row is written.
+    let id = derive_item_id(BaseItemKind::Series, &series.to_string_lossy()).expect("id");
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateModified" = '2001-09-09 01:46:40' WHERE "Id" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(id))
+        .execute(fx.db.pool())
+        .await
+        .expect("an older stamp");
+    let cleared = fx.scanner().scan_all().await.expect("clearing scan");
+    assert_eq!(cleared.updated, 1, "{cleared:?}");
+    assert_eq!(fx.raw_dates(BaseItemKind::Series, &series).await.1, None);
+    let quiet = fx.scanner().scan_all().await.expect("quiet scan");
+    assert_eq!(quiet.updated, 0, "{quiet:?}");
 }
 
 /// An album's release date (MusicBrainz's `apply_release_details` writes it

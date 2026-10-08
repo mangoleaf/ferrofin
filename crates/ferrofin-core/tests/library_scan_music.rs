@@ -422,11 +422,15 @@ async fn a_new_album_fetches_only_itself() {
 }
 
 /// The library monitor's scan of a new track in an existing album (the
-/// watcher, a webhook): the album is the nearest existing item, so it — and
-/// only it — refreshes, its music pass included; its artist above it is
-/// context only: no provider is asked about it and its row is not written.
+/// watcher, a webhook): the album is the nearest existing item, so it goes
+/// through the refresh decision — and is not refreshed, though its folder's
+/// mtime moved: a directory has no `DateModified` (D2), and
+/// `BaseItem.RequiresRefresh` is false for a `MinValue` one
+/// (`BaseItem.cs:1721-1731`). So its music pass asks nothing; its artist
+/// above it is context only: no provider is asked about it and its row is
+/// not written.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_track_reported_by_the_watcher_refreshes_only_its_album() {
+async fn a_new_track_reported_by_the_watcher_refreshes_neither_its_album_nor_its_artist() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
     fx.scan().await;
@@ -447,27 +451,15 @@ async fn a_new_track_reported_by_the_watcher_refreshes_only_its_album() {
         .await
         .expect("scan");
     assert_eq!(outcome.created, 1, "the track: {outcome:?}");
-    assert_eq!(outcome.updated, 1, "its album: {outcome:?}");
+    assert_eq!(outcome.updated, 0, "its album: {outcome:?}");
     let asked = fx.music.take();
-    assert!(
-        !asked.is_empty(),
-        "the album's music refresh asked its providers"
+    assert!(asked.is_empty(), "no music provider is asked: {asked:?}");
+    let album_after = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album_after.date_last_refreshed, album.date_last_refreshed,
+        "the album is not refreshed"
     );
-    assert!(
-        asked
-            .iter()
-            .all(|l| !l.contains("/ws/2/artist") && !l.contains("artist-mb.php")),
-        "nothing about the artist: {asked:?}"
-    );
-    assert!(
-        searches(&asked).is_empty(),
-        "by the stored match: {asked:?}"
-    );
-    assert_ne!(
-        fx.row(fx.album_id()).await.date_last_refreshed,
-        album.date_last_refreshed,
-        "the album refreshed"
-    );
+    assert_eq!(album_after.date_modified, None, "a directory has none");
     let artist_after = fx.row(fx.artist_id()).await;
     assert_eq!(
         artist_after.date_last_saved, artist.date_last_saved,
@@ -1052,30 +1044,33 @@ async fn a_first_scan_searches_the_album_by_its_artists_id() {
     );
 }
 
-/// A folder change on an album left for the music pass survives a scan
-/// stopped before that pass: the walk keeps the stored `DateModified` for
-/// the music pass to write with its refresh (upstream's one `SaveInternal`,
-/// `MetadataService.cs:244-255`), so the next scan still sees the change
-/// and runs the album's providers.
+/// A refresh of an album left for the music pass survives a scan stopped
+/// before that pass: the walk leaves the album's `DateLastRefreshed` for
+/// the music pass to stamp with its refresh (upstream's one `SaveInternal`,
+/// `MetadataService.cs:244-255`), so the next scan still finds the album
+/// due and runs its providers. The album is due as never refreshed
+/// (`isFirstRefresh`); a changed folder would not make it due (a directory
+/// has no `DateModified`, D2).
 #[tokio::test(flavor = "multi_thread")]
-async fn an_album_change_survives_a_scan_cancelled_before_its_music_pass() {
+async fn an_album_refresh_survives_a_scan_cancelled_before_its_music_pass() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
     fx.scan().await;
     fx.music.take();
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Id" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(fx.album_id()))
+        .execute(fx.db.writer())
+        .await
+        .expect("never refreshed");
     let before = fx.row(fx.album_id()).await;
-    std::fs::File::open(&fx.album_dir)
-        .expect("open the album folder")
-        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
-        .expect("touch");
 
     let stopped = scan_cancelled_after_the_walk(&fx.scanner).await;
     assert!(stopped.stopped, "{stopped:?}");
     assert!(fx.music.take().is_empty(), "no music pass ran");
     assert_eq!(
-        fx.row(fx.album_id()).await.date_modified,
-        before.date_modified,
-        "the change is still to be refreshed"
+        fx.row(fx.album_id()).await.date_last_refreshed,
+        None,
+        "the refresh is still to be run"
     );
 
     fx.scan().await;
@@ -1087,8 +1082,11 @@ async fn an_album_change_survives_a_scan_cancelled_before_its_music_pass() {
         "the album's providers run: {asked:?}"
     );
     let after = fx.row(fx.album_id()).await;
-    assert_ne!(after.date_modified, before.date_modified, "written now");
-    assert!(after.date_last_refreshed > before.date_last_refreshed);
+    assert!(after.date_last_refreshed.is_some(), "stamped now");
+    assert!(
+        after.date_last_saved > before.date_last_saved,
+        "written now"
+    );
     fx.scan().await;
     assert!(fx.music.take().is_empty(), "then quiet");
 }

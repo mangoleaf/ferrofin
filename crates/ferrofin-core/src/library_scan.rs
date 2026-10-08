@@ -2153,8 +2153,7 @@ struct ItemPass<'a> {
     /// one `SaveInternal` does (`MetadataService.cs:244-255`), so a scan
     /// stopped between the two leaves it due: the `DateLastRefreshed` stamp
     /// (a first refresh stays first; owner decision D1 — a provider that
-    /// fails leaves it unstamped) and the new `DateModified` (a changed
-    /// folder stays changed, D3).
+    /// fails leaves it unstamped).
     music_pending: bool,
 }
 
@@ -4302,7 +4301,6 @@ impl LibraryScanner {
                 item.id = row.id;
                 item.entity.id = guid_to_db(row.id);
                 item.entity.type_.clone_from(&row.item_type);
-                item.entity.is_movie = false;
             }
         }
         Ok(())
@@ -4617,8 +4615,8 @@ impl LibraryScanner {
                     // divergence): the `updateType > None` half lives only
                     // in this scan's memory. The full-refresh half survives
                     // a cancel between the walk and the music pass (the
-                    // walk leaves the stamp and `DateModified` for the
-                    // music pass, `music_pending`), but an album the walk
+                    // walk leaves the stamp for the music pass,
+                    // `music_pending`), but an album the walk
                     // saved for another reason (a new local image, a moved
                     // parent) loses its children-derived tags if the scan
                     // stops before the music pass; upstream derives them in
@@ -4632,7 +4630,6 @@ impl LibraryScanner {
                         || matches!(saved, ItemSaved::Saved),
                     owns_stamp: music_pending,
                     owns_save: false,
-                    date_modified: item.entity.date_modified,
                 });
             }
             match saved {
@@ -5311,11 +5308,6 @@ impl LibraryScanner {
             settle_sort_name(&mut entity);
         }
         self.apply_parental_rating_score(&mut entity);
-        // The folder's new mtime is written with the music pass's save, not
-        // this one (see `ItemPass::music_pending`).
-        if music_pending && let Some(row) = stored_row {
-            entity.date_modified = row.date_modified;
-        }
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
             let before = state
@@ -7158,8 +7150,8 @@ impl LibraryScanner {
     /// `CriticRating` is.
     ///
     /// A season, like every kind outside those three, has no gate: its
-    /// providers run on upstream's triggers alone — a first refresh, a
-    /// changed folder (D3), the refresh interval, "Search for missing
+    /// providers run on upstream's triggers alone — a first refresh, the
+    /// refresh interval, "Search for missing
     /// metadata" or "Replace all metadata". D2 is not widened to a new kind
     /// (owner, 2026-09-24: do not widen the heuristics), and a season gate
     /// could not be like the episode's either: a season has no placeholder
@@ -9915,8 +9907,8 @@ impl LibraryScanner {
         // `std::fs::metadata` follows symlinks, matching upstream's
         // `LinkTarget` resolution. A path that cannot be stat'ed at all is
         // stamped with the scan time (upstream's `dateCreated == MinValue`
-        // guard) and carries no `DateModified`/`Size`, so a save keeps the
-        // stored ones.
+        // guard) and carries no `DateModified`/`Size`, so a save keeps a
+        // file's stored ones (a folder's `DateModified` goes, D2).
         let meta = std::fs::metadata(path).ok();
         // A FILE's `Size` is its length on every save (`MetadataService.
         // SaveInternal`, `if (!file.IsDirectory) item.Size = file.Length`); a
@@ -9926,10 +9918,13 @@ impl LibraryScanner {
             .filter(|m| !m.is_dir())
             .and_then(|m| i64::try_from(m.len()).ok());
         // Every save stamps `DateModified` with the path's mtime
-        // (`SaveInternal`: `item.DateModified = file.LastWriteTimeUtc`) — for
-        // a folder too (owner decision D3), which is what lets a folder whose
-        // directory changed be told apart from one that did not.
-        let mtime = meta.as_ref().map(|m| FileTimes::of(m).mtime);
+        // (`SaveInternal`: `item.DateModified = file.LastWriteTimeUtc`) — a
+        // FILE's: `GetFileSystemMetadata` fills no times for a directory, so
+        // its `MinValue` is stored as NULL (owner decision D2).
+        let mtime = meta
+            .as_ref()
+            .filter(|m| !m.is_dir())
+            .map(|m| FileTimes::of(m).mtime);
         let times = if is_folder {
             None
         } else {
@@ -9960,15 +9955,17 @@ impl LibraryScanner {
             // moment this scan — a library scan, a watcher or webhook event,
             // a refresh — first found it. The scan upsert's
             // `coalesce("DateCreated", excluded."DateCreated")` is what keeps
-            // the first stamp stable across rescans, whatever the rule. Its
-            // `DateModified` is the directory's mtime, which `SaveInternal`
-            // stamps on every save (D3).
+            // the first stamp stable across rescans, whatever the rule. It
+            // has no `DateModified` (D2).
             date_created: Some(match (&times, ctx.date_added) {
                 (Some(times), DateAdded::FileCreation) => creation_time_from(times).into(),
                 (_, DateAdded::Scanned) | (None, DateAdded::FileCreation) => Utc::now(),
             }),
             date_modified: mtime.map(Into::into),
             size,
+            // `BaseItem.MediaType` is `Unknown` but for what plays (each
+            // site sets its own) and is stored as such (`BaseItemMapper`).
+            media_type: Some("Unknown".to_owned()),
             ..BaseItemEntity::default()
         };
         Some((id, entity))
@@ -10576,7 +10573,6 @@ impl LibraryScanner {
         };
         let (parent, ancestors) = walk.parent(cf, ctx);
         let (id, mut entity) = self.base_item(ctx, kind, cf, parent, name, &entry.path, false)?;
-        entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         entity.production_year = year.map(i64::from);
         set_video_type(&mut entity, file_video_type(&entry.path));
@@ -10665,7 +10661,6 @@ impl LibraryScanner {
         let Some((id, mut entity)) = self.base_item(ctx, kind, cf, parent, name, dir, true) else {
             return;
         };
-        entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         set_video_type(&mut entity, video_type);
         // A rip is its own folder, never a mixed one: an undated movie or
@@ -14298,8 +14293,8 @@ fn merge_onto_stored(
 /// `UpdateFromResolvedItem`'s (`BaseItem.cs:1749-1760`, `Video.cs:
 /// 500-526`), which upstream applies whatever the item's lock or the
 /// refresh mode; `IsoType` is the resolver's on a new item only and never
-/// updated after. Stat-owned (`SaveInternal`): `DateModified` (files and
-/// folders) and `Size` (files). Probe-owned: `RunTimeTicks` of a playable
+/// updated after. Stat-owned (`SaveInternal`): `DateModified` (a file's; a
+/// folder has none, D2) and `Size` (files). Probe-owned: `RunTimeTicks` of a playable
 /// kind, `TotalBitrate` and the video `Width`/`Height` (a photo's come from
 /// its EXIF reader).
 fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_ran: bool) {
@@ -14332,7 +14327,11 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         row.series_presentation_unique_key
             .clone_from(&scanned.series_presentation_unique_key);
     }
-    if scanned.date_modified.is_some() {
+    if scanned.is_folder {
+        // A directory has no `DateModified` (D2): one an older scan stored
+        // goes on the next save.
+        row.date_modified = None;
+    } else if scanned.date_modified.is_some() {
         row.date_modified = scanned.date_modified;
     }
     if scanned.size.is_some() {
@@ -15934,8 +15933,8 @@ mod tests {
     /// quirk: a FILE row carries its creation time, mtime and length; a
     /// FOLDER row is stamped with the resolve time (upstream only fills the
     /// dates for a `FileInfo`, so directories resolve with `MinValue` →
-    /// `UtcNow`) and, per owner decision D3, its directory's mtime as
-    /// `DateModified` (`SaveInternal` stamps it on every save).
+    /// `UtcNow`) and has no `DateModified` (owner decision D2: the same
+    /// `MinValue`, stored as NULL).
     #[tokio::test]
     async fn base_item_stamps_folders_with_now_and_files_with_file_times() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -15989,10 +15988,10 @@ mod tests {
             "not the directory's own timestamp"
         );
         assert_eq!(
-            folder.date_modified,
-            Some(chrono::DateTime::<chrono::Utc>::from(past)),
-            "a folder's DateModified is its directory's mtime (D3, `SaveInternal`)"
+            folder.date_modified, None,
+            "a directory has no DateModified (D2)"
         );
+        assert_eq!(folder.media_type.as_deref(), Some("Unknown"));
         assert_eq!(folder.size, None, "a directory has no Size");
 
         let (_, episode) = scanner
@@ -22962,9 +22961,17 @@ mod tests {
     /// the dashboard's full refreshes always do; "Scan for new and updated
     /// files" does once the file changed on disk (`requiresRefresh`).
     ///
-    /// The series changes too, so its refresh finds the TMDB id the
-    /// episode's lookup goes through.
-    fn run_providers_under(choice: &str, tmp: &std::path::Path) -> super::MetadataRefreshOptions {
+    /// The series runs its providers too, so its refresh finds the TMDB id
+    /// the episode's lookup goes through: under "Scan for new and updated
+    /// files" as never refreshed (`isFirstRefresh`), since a changed folder
+    /// would not make it due (a directory has no `DateModified`, D2, and
+    /// `BaseItem.RequiresRefresh` is false for a `MinValue` one).
+    async fn run_providers_under(
+        choice: &str,
+        tmp: &std::path::Path,
+        items: &Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        persistence: &FerrofinItemPersistenceService,
+    ) -> super::MetadataRefreshOptions {
         if choice == "scan" {
             let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
             let file = tmp.join("tv/GoT/Season 01/GoT S01E01.mkv");
@@ -22974,10 +22981,23 @@ mod tests {
                 .expect("open")
                 .set_modified(later)
                 .expect("file mtime");
-            std::fs::File::open(tmp.join("tv/GoT"))
-                .expect("open series dir")
-                .set_modified(later)
-                .expect("series mtime");
+            let series_id = crate::item_type_lookup::derive_item_id(
+                BaseItemKind::Series,
+                &tmp.join("tv/GoT").to_string_lossy(),
+            )
+            .expect("series id");
+            let series = items
+                .retrieve_item(series_id)
+                .await
+                .unwrap()
+                .expect("the series");
+            persistence
+                .save_items(&[BaseItemEntity {
+                    date_last_refreshed: None,
+                    ..series
+                }])
+                .await
+                .unwrap();
         }
         dashboard(choice)
     }
@@ -23002,7 +23022,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
-        let options = run_providers_under(choice, tmp.path());
+        let options = run_providers_under(choice, tmp.path(), &items, &persistence).await;
 
         let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
@@ -23035,7 +23055,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
-        let options = run_providers_under(choice, tmp.path());
+        let options = run_providers_under(choice, tmp.path(), &items, &persistence).await;
 
         let tmdb = Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base));
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
@@ -23086,7 +23106,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
-        let options = run_providers_under(choice, tmp.path());
+        let options = run_providers_under(choice, tmp.path(), &items, &persistence).await;
 
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(items)
@@ -23281,7 +23301,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, series_id, items) =
             library_with_a_stale_series_cast_in(tmp.path(), tvdb_first_options()).await;
-        let options = run_providers_under("scan", tmp.path());
+        let options = run_providers_under("scan", tmp.path(), &items, &persistence).await;
 
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(Arc::clone(&items))
@@ -23342,7 +23362,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
-        let options = run_providers_under("scan", tmp.path());
+        let options = run_providers_under("scan", tmp.path(), &items, &persistence).await;
 
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(items)
@@ -23404,7 +23424,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (vf, persistence, people, episode_id, items) =
             library_with_a_stale_episode_cast(tmp.path()).await;
-        let options = run_providers_under("scan", tmp.path());
+        let options = run_providers_under("scan", tmp.path(), &items, &persistence).await;
 
         LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(Arc::clone(&items))
@@ -27109,8 +27129,8 @@ mod tests {
 
     // A file landing in a brand-new season folder brings its ancestor
     // hierarchy (series + season rows) with it. The series is the nearest
-    // existing item, so its subtree is validated: its other season and
-    // episode are planned and judged, but not written.
+    // existing item, so it and its subtree are validated: it, its other
+    // season and episode are planned and judged, but not written.
     #[tokio::test]
     async fn scan_paths_creates_the_new_hierarchy_around_a_changed_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -27159,13 +27179,13 @@ mod tests {
             outcome,
             super::ScanOutcome {
                 created: 2,
-                updated: 1,
-                unchanged: 2,
+                unchanged: 3,
                 ..Default::default()
             },
-            "the new episode and season are created; the series — the nearest existing item, \
-             whose folder changed — refreshes, and its other season and episode are validated \
-             unchanged"
+            "the new episode and season are created; the series — the nearest existing item — \
+             is not refreshed though its folder changed (a directory has no DateModified, D2: \
+             `BaseItem.RequiresRefresh` is false for MinValue), and its other season and \
+             episode are validated unchanged"
         );
         assert_eq!(count_type_like(&db, "%TV.Episode").await, 2);
         assert_eq!(count_type_like(&db, "%TV.Season").await, 2);

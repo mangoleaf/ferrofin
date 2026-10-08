@@ -142,6 +142,10 @@ async fn a_location_is_a_folder_its_items_hang_off() {
     );
     assert_eq!(folder.parent_id, Some(guid_to_db(lib.aggregate)));
     assert_eq!(folder.top_parent_id, Some(guid_to_db(location)));
+    // Stored as Jellyfin stores a folder: `MediaType` `Unknown`, no
+    // `DateModified` (D2).
+    assert_eq!(folder.media_type.as_deref(), Some("Unknown"));
+    assert_eq!(folder.date_modified, None);
 
     let cf = lib.row(lib.cf).await.expect("collection folder");
     let data: serde_json::Value =
@@ -160,6 +164,10 @@ async fn a_location_is_a_folder_its_items_hang_off() {
     let row = lib.row(movie).await.expect("movie");
     assert_eq!(row.top_parent_id, Some(guid_to_db(location)));
     assert_eq!(row.parent_id, Some(guid_to_db(location)));
+    // `IsMovie` is a Live TV program's flag (`IHasProgramAttributes`): a
+    // movie stores false, as Jellyfin's do.
+    assert!(!row.is_movie);
+    assert_eq!(row.media_type.as_deref(), Some("Video"));
     let mut expected = vec![
         guid_to_db(lib.cf),
         guid_to_db(location),
