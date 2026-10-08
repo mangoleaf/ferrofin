@@ -41,12 +41,15 @@ use serde::forward_to_deserialize_any;
 use serde_urlencoded::de::Error;
 
 /// A decoded query string bound as a struct: keys verbatim (already folded to
-/// the member names), values through [`Value`]. `required` names the members
-/// whose C# type is non-nullable (an empty value is then a 400).
+/// the member names), values through [`Value`]. `non_nullable` names the
+/// members whose C# type refuses an empty value, `required` those that must be
+/// present too (either is then a 400).
 pub(super) struct Pairs<'a> {
     /// The decoded pairs.
-    pub(super) pairs: form_urlencoded::Parse<'a>,
+    pub(super) input: form_urlencoded::Parse<'a>,
     /// The operation's non-nullable members.
+    pub(super) non_nullable: &'a [String],
+    /// The operation's required members.
     pub(super) required: &'a [String],
 }
 
@@ -61,14 +64,17 @@ impl<'de> de::Deserializer<'de> for Pairs<'_> {
         // Only a key's FIRST occurrence binds (`ValueProviderResult.FirstValue`),
         // so only that one is checked; a member the DTO does not model reaches
         // here unreduced, every occurrence still present.
-        if !self.required.is_empty() {
+        if !self.non_nullable.is_empty() || !self.required.is_empty() {
             let mut seen: Vec<Cow<'_, str>> = Vec::new();
-            for (key, text) in self.pairs {
+            for (key, text) in self.input {
                 if seen.iter().any(|k| k.eq_ignore_ascii_case(&key)) {
                     continue;
                 }
                 if text.trim().is_empty()
-                    && self.required.iter().any(|r| r.eq_ignore_ascii_case(&key))
+                    && self
+                        .non_nullable
+                        .iter()
+                        .any(|r| r.eq_ignore_ascii_case(&key))
                 {
                     return Err(de::Error::custom(format!(
                         "{key}: The value '{text}' is invalid."
@@ -76,8 +82,19 @@ impl<'de> de::Deserializer<'de> for Pairs<'_> {
                 }
                 seen.push(key);
             }
+            // `[Required]` (explicit, or a non-nullable `string`): absent is
+            // "The X field is required." — measured on Jellyfin 12.2.
+            if let Some(missing) = self
+                .required
+                .iter()
+                .find(|r| !seen.iter().any(|k| k.eq_ignore_ascii_case(r)))
+            {
+                return Err(de::Error::custom(format!(
+                    "{missing}: The {missing} field is required."
+                )));
+            }
         }
-        let mut map = MapDeserializer::new(self.pairs.map(|(key, text)| (key, Value { text })));
+        let mut map = MapDeserializer::new(self.input.map(|(key, text)| (key, Value { text })));
         let value = visitor.visit_map(&mut map)?;
         map.end()?;
         Ok(value)
@@ -330,8 +347,9 @@ mod tests {
 
     fn bind_with(query: &str, required: &[String]) -> Result<Q, String> {
         serde_path_to_error::deserialize(Pairs {
-            pairs: form_urlencoded::parse(query.as_bytes()),
-            required,
+            input: form_urlencoded::parse(query.as_bytes()),
+            non_nullable: required,
+            required: &[],
         })
         .map_err(|e| e.to_string())
     }
@@ -364,6 +382,37 @@ mod tests {
         assert!(error.contains("The value"), "{error}");
         assert!(bind_with("enableRedirection=true&enableRedirection=", &required).is_ok());
         assert!(bind_with("ENABLEREDIRECTION=&enableRedirection=true", &required).is_err());
+    }
+
+    #[test]
+    fn an_absent_required_member_is_rejected() {
+        // `[FromQuery, Required] string searchTerm`: absent is "The searchTerm
+        // field is required." (400), measured on Jellyfin 12.2.
+        let required = ["searchTerm".to_owned()];
+        let bind = |query: &str| -> Result<Q, String> {
+            serde_path_to_error::deserialize(Pairs {
+                input: form_urlencoded::parse(query.as_bytes()),
+                non_nullable: &required,
+                required: &required,
+            })
+            .map_err(|e| e.to_string())
+        };
+        let error = bind("limit=4").expect_err("absent");
+        assert!(
+            error.contains("The searchTerm field is required."),
+            "{error}"
+        );
+        assert!(bind("").is_err());
+        // Presence is checked in any case (member names arrive folded).
+        assert!(bind("SEARCHTERM=x").is_ok());
+        assert_eq!(
+            bind("searchTerm=x")
+                .expect("present")
+                .search_term
+                .as_deref(),
+            Some("x")
+        );
+        assert!(bind("searchTerm=").is_err(), "empty is refused too");
     }
 
     #[test]
@@ -402,7 +451,8 @@ mod tests {
 
     fn numbers(query: &str) -> Result<Numbers, String> {
         serde_path_to_error::deserialize(Pairs {
-            pairs: form_urlencoded::parse(query.as_bytes()),
+            input: form_urlencoded::parse(query.as_bytes()),
+            non_nullable: &[],
             required: &[],
         })
         .map_err(|e| e.to_string())
@@ -467,7 +517,8 @@ mod tests {
     fn enum_numbers_bind_by_csharp_value() {
         let bind = |query: &str| -> Result<F, String> {
             serde_path_to_error::deserialize(Pairs {
-                pairs: form_urlencoded::parse(query.as_bytes()),
+                input: form_urlencoded::parse(query.as_bytes()),
+                non_nullable: &[],
                 required: &[],
             })
             .map_err(|e| e.to_string())

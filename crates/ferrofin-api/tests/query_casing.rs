@@ -20,7 +20,7 @@ use tower::ServiceExt;
 /// The query parameters the oracle compared when it was written (2026-10-07).
 /// A lower count means parameters quietly stopped reaching the binder; raise
 /// this when the contract or the handlers grow.
-const MIN_PARAMS_CHECKED: usize = 723;
+const MIN_PARAMS_CHECKED: usize = 750;
 
 /// The prefix axum's query rejection puts before the failing member's path.
 const REJECTION: &str = "Failed to deserialize query string: ";
@@ -185,7 +185,16 @@ async fn every_typed_query_parameter_binds_ignoring_case() {
                     name.to_ascii_lowercase(),
                     name.to_ascii_uppercase(),
                 ] {
-                    let member = rejected_member(&router, &method, &format!("{base}?{key}=zz"))
+                    // Upstream-required members ride along, or the probe would
+                    // be refused for the missing one first.
+                    let required =
+                        ferrofin_api::test_support::required_query(&method, path, operation, name);
+                    let uri = if required.is_empty() {
+                        format!("{base}?{key}=zz")
+                    } else {
+                        format!("{base}?{key}=zz&{required}")
+                    };
+                    let member = rejected_member(&router, &method, &uri)
                         .await
                         .filter(|m| m.eq_ignore_ascii_case(name));
                     named.push((key, member));

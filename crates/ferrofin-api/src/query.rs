@@ -74,12 +74,16 @@ impl<T: QueryParameters> Query<T> {
     /// # Errors
     /// Returns an HTTP 400 query rejection when a value cannot bind to `T`.
     pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
-        Self::bind(uri, &[])
+        Self::bind(uri, &[], &[])
     }
 
-    /// Binds `uri`'s query, treating an empty value of a `required` member
-    /// (non-nullable upstream) as invalid.
-    fn bind(uri: &Uri, required: &[String]) -> Result<Self, QueryRejection> {
+    /// Binds `uri`'s query, treating an empty value of a `non_nullable` member
+    /// as invalid and an absent `required` one as missing.
+    fn bind(
+        uri: &Uri,
+        non_nullable: &[String],
+        required: &[String],
+    ) -> Result<Self, QueryRejection> {
         let fields = fields::<T>();
         let query = uri.query().unwrap_or_default();
         let normalized = normalize(query, fields, T::COLLECTIONS);
@@ -92,7 +96,11 @@ impl<T: QueryParameters> Query<T> {
         if fields.is_empty() {
             serde_path_to_error::deserialize(serde_urlencoded::Deserializer::new(pairs))
         } else {
-            serde_path_to_error::deserialize(value::Pairs { pairs, required })
+            serde_path_to_error::deserialize(value::Pairs {
+                input: pairs,
+                non_nullable,
+                required,
+            })
         }
         .map(Self)
         .map_err(QueryRejection)
@@ -106,11 +114,17 @@ impl<T: QueryParameters + Send, S: Send + Sync> FromRequestParts<S> for Query<T>
         parts: &mut Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        let required = parts
-            .extensions
-            .get::<MatchedPath>()
-            .map_or(&[][..], |route| non_nullable(&parts.method, route.as_str()));
-        std::future::ready(Self::bind(&parts.uri, required))
+        let (non_nullable, required) =
+            parts
+                .extensions
+                .get::<MatchedPath>()
+                .map_or((&[][..], &[][..]), |route| {
+                    (
+                        lookup(&NON_NULLABLE, &parts.method, route.as_str()),
+                        lookup(&REQUIRED, &parts.method, route.as_str()),
+                    )
+                });
+        std::future::ready(Self::bind(&parts.uri, non_nullable, required))
     }
 }
 
@@ -128,17 +142,37 @@ impl<T> DerefMut for Query<T> {
     }
 }
 
-/// The query members of the action at `method` + `route` (an axum route
-/// template) whose C# type is a non-nullable value type, from the generated
-/// `query/non_nullable.json` (`contracts/gen_query_nullability.py`, which reads
-/// every upstream action's own route attributes). Routes are compared by
-/// [`route_shape`]; a route upstream does not serve has none.
-fn non_nullable(method: &Method, route: &str) -> &'static [String] {
-    static TABLE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+/// A generated per-action table of query member names
+/// (`contracts/gen_query_nullability.py`, which reads every upstream action's
+/// own route attributes).
+struct RouteTable {
+    /// The generated JSON, keyed `METHOD /Upstream/{route}`.
+    json: &'static str,
+    /// Parsed on first use, keyed by [`route_shape`].
+    parsed: OnceLock<HashMap<String, Vec<String>>>,
+}
+
+/// Members whose C# type refuses an empty value (a non-nullable value type,
+/// `[Required]`, or a non-nullable `string`).
+static NON_NULLABLE: RouteTable = RouteTable {
+    json: include_str!("query/non_nullable.json"),
+    parsed: OnceLock::new(),
+};
+
+/// Members that must also be present (`[Required]`, or a non-nullable `string`
+/// without a default): absent, `CheckModel` answers "The X field is required.".
+static REQUIRED: RouteTable = RouteTable {
+    json: include_str!("query/required.json"),
+    parsed: OnceLock::new(),
+};
+
+/// The `table` members of the action at `method` + `route` (an axum route
+/// template). Routes are compared by [`route_shape`]; a route upstream does
+/// not serve has none.
+fn lookup(table: &'static RouteTable, method: &Method, route: &str) -> &'static [String] {
+    let table = table.parsed.get_or_init(|| {
         let generated: HashMap<String, Vec<String>> =
-            serde_json::from_str(include_str!("query/non_nullable.json"))
-                .expect("query/non_nullable.json is valid");
+            serde_json::from_str(table.json).expect("generated query table is valid");
         generated
             .into_iter()
             .filter_map(|(operation, names)| {
@@ -152,6 +186,12 @@ fn non_nullable(method: &Method, route: &str) -> &'static [String] {
     table
         .get(&format!("{} {}", method.as_str(), route_shape(route)))
         .map_or(&[], Vec::as_slice)
+}
+
+/// The query members upstream requires present on `method` + `route` (the
+/// table the extractor enforces), for tests that build valid requests.
+pub(crate) fn required_members(method: &Method, route: &str) -> &'static [String] {
+    lookup(&REQUIRED, method, route)
 }
 
 /// A route template with every parameter segment erased and literals
@@ -385,24 +425,31 @@ pub(crate) mod tests {
         // `GetItems`: `bool enableTotalRecordCount = true` (non-nullable);
         // `GetLatestMedia`: `int limit = 20`, `bool groupItems = true`.
         assert!(
-            super::non_nullable(&Method::GET, "/Items")
+            super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items")
                 .contains(&"enableTotalRecordCount".to_owned())
         );
-        let latest = super::non_nullable(&Method::GET, "/Items/Latest");
+        let latest = super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items/Latest");
         assert!(latest.contains(&"limit".to_owned()) && latest.contains(&"groupItems".to_owned()));
         // Obsolete actions the OpenAPI document omits, under the router's own
         // parameter names and literal case, and HEAD aliases.
         assert!(
-            super::non_nullable(&Method::GET, "/users/{user_id}/items")
+            super::lookup(&super::NON_NULLABLE, &Method::GET, "/users/{user_id}/items")
                 .contains(&"enableTotalRecordCount".to_owned())
         );
         assert!(
-            super::non_nullable(&Method::HEAD, "/Audio/{item_id}/universal")
-                .contains(&"enableRedirection".to_owned())
+            super::lookup(
+                &super::NON_NULLABLE,
+                &Method::HEAD,
+                "/Audio/{item_id}/universal"
+            )
+            .contains(&"enableRedirection".to_owned())
         );
         // A nullable member is never listed; an unknown route has none.
-        assert!(!super::non_nullable(&Method::GET, "/Items").contains(&"isFavorite".to_owned()));
-        assert!(super::non_nullable(&Method::GET, "/NotAContractRoute").is_empty());
+        assert!(
+            !super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items")
+                .contains(&"isFavorite".to_owned())
+        );
+        assert!(super::lookup(&super::NON_NULLABLE, &Method::GET, "/NotAContractRoute").is_empty());
     }
 
     #[test]

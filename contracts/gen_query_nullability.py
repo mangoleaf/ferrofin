@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate crates/ferrofin-api/src/query/non_nullable.json.
+"""Generate crates/ferrofin-api/src/query/{non_nullable,required}.json.
 
 For every upstream API action, list the query parameters that refuse an empty
 value: a NON-nullable value type (`bool enableTotalRecordCount = true`, `int
@@ -10,6 +10,11 @@ parameters ("The value '' is invalid.", 400); a nullable parameter (`bool?
 isFavorite`) just binds null. The OpenAPI document cannot tell the two apart
 (`bool? enableImages = true` also carries `default: true`), so the C# action
 signatures are the source.
+
+`required.json` lists the subset that must also be PRESENT: `[Required]`, or a
+non-nullable `string` without a default (MVC's implicit `[Required]` under
+nullable reference types). Absent, `CheckModel` answers "The X field is
+required." (400); an absent non-nullable value type binds its default.
 
 Routes come from each action's own attributes — the controller's `[Route]`
 plus every `[HttpGet|Head|Post|Put|Delete|Patch("…")]`, aliases (`Name = …`)
@@ -30,6 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "crates/ferrofin-api/src/query/non_nullable.json"
+OUT_REQUIRED = ROOT / "crates/ferrofin-api/src/query/required.json"
 TAGS = ["v10.11.8", "v12.1"]  # later wins
 VALUE_TYPES = {
     "bool", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong",
@@ -67,7 +73,8 @@ def split_params(params):
 
 
 def non_nullable(params, enums):
-    names = []
+    """(names refusing an empty value, names that must be present)."""
+    names, present = [], []
     for param in split_params(params):
         param = " ".join(param.split())
         # Only the LEADING `[...]` blocks are attributes; `[]` after a type
@@ -75,6 +82,7 @@ def non_nullable(params, enums):
         lead = re.match(r"\s*((?:\[[^\]]*\]\s*)*)", param).group(1)
         if "FromQuery" not in lead:
             continue
+        has_default = "=" in param[len(lead):]
         decl = param[len(lead):].split("=")[0].strip()
         parts = decl.split()
         if len(parts) < 2:
@@ -92,7 +100,9 @@ def non_nullable(params, enums):
             continue
         override = re.search(r'FromQuery\s*\(\s*Name\s*=\s*"([^"]+)"', lead)
         names.append(override.group(1) if override else name)
-    return names
+        if required or (nonnull_string and not has_default):
+            present.append(names[-1])
+    return names, present
 
 
 def join_route(prefix, template):
@@ -154,17 +164,20 @@ def main():
     merged = {}
     for tag in TAGS:
         merged.update(actions(repo, tag, enum_names(repo, tag)))
-    table = {f"{m} {p}": sorted(set(n), key=str.lower) for (m, p), n in merged.items() if n}
+    table = {f"{m} {p}": sorted(set(n[0]), key=str.lower) for (m, p), n in merged.items() if n[0]}
+    required = {f"{m} {p}": sorted(set(n[1]), key=str.lower) for (m, p), n in merged.items() if n[1]}
     # The server matches routes by shape (parameters erased, literals
     # case-folded); two routes of one shape must agree.
     shapes = {}
     for (m, p), n in merged.items():
         shape = (m, "/".join("{}" if "{" in s else s.lower() for s in p.split("/")))
-        if shape in shapes and sorted(shapes[shape]) != sorted(n):
+        if shape in shapes and (sorted(shapes[shape][0]), sorted(shapes[shape][1])) != (sorted(n[0]), sorted(n[1])):
             sys.exit(f"routes collide on shape {shape}: {shapes[shape]} vs {n}")
         shapes[shape] = n
     OUT.write_text(json.dumps(dict(sorted(table.items())), indent=1) + "\n")
+    OUT_REQUIRED.write_text(json.dumps(dict(sorted(required.items())), indent=1) + "\n")
     print(f"{len(table)} routes, {sum(map(len, table.values()))} parameters -> {OUT.relative_to(ROOT)}")
+    print(f"{len(required)} routes, {sum(map(len, required.values()))} parameters -> {OUT_REQUIRED.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

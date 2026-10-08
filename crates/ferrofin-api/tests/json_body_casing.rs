@@ -268,6 +268,14 @@ async fn every_json_body_member_binds_ignoring_case() {
             }
             let method = method.to_uppercase();
             let uri = concrete_path(path, operation, &spec);
+            // Upstream-required query members ride along, or the body would
+            // never be read.
+            let required = ferrofin_api::test_support::required_query(&method, path, operation, "");
+            let uri = if required.is_empty() {
+                uri
+            } else {
+                format!("{uri}?{required}")
+            };
             let wrap = |body: Value| if top_array { json!([body]) } else { body };
             let mut reached = false;
             for member in paths {
