@@ -635,6 +635,26 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `GET /Library/VirtualFolders`.
     async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError>;
 
+    /// Merges `fields` into the `Data` JSON of item `item_id`, keeping every
+    /// other key — `Data` carries `CollectionType`, `PhysicalFolderIds`,
+    /// `PhysicalLocationsList` and the rest on a `CollectionFolder`. Writes
+    /// nothing when every field already holds its value, or when there is no
+    /// such row.
+    ///
+    /// The default (a stub/fake service) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn merge_data_fields(
+        &self,
+        item_id: Uuid,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, fields);
+        Ok(())
+    }
+
     /// Records a library folder's collection type (`movies`, `tvshows`, …) in
     /// the row's `Data` blob, leaving every other column and every other key in
     /// the blob alone — a no-op when the value is already there.
@@ -819,13 +839,11 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
-    /// carry: the library itself, which is what every row Ferrofin writes
-    /// carries, and — on a database adopted from Jellyfin — the physical
-    /// folders its `PhysicalFolderIds` names, which is what Jellyfin wrote
-    /// (`BaseItem.GetTopParent`: the item's ancestor directly under the
-    /// `AggregateFolder`). An adopted row keeps the physical folder until a
-    /// scan saves it, so a library's rows are read by both until then. The
-    /// library id comes first; a native library answers it alone.
+    /// carry: the folders of its locations its `PhysicalFolderIds` names,
+    /// which is what Jellyfin and Ferrofin write (`BaseItem.GetTopParent`:
+    /// the item's ancestor directly under the `AggregateFolder`), and the
+    /// library itself, which rows an older Ferrofin scan wrote carry until a
+    /// scan saves them. The library id comes first.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then scopes the library by its own id.

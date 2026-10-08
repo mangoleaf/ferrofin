@@ -793,7 +793,8 @@ pub async fn build_app_state(
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
             .with_user_root(user_root_store.clone())
-            .with_scan_progress(scan_progress.clone()),
+            .with_scan_progress(scan_progress.clone())
+            .with_virtual_paths(virtual_paths.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -1026,6 +1027,9 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
+    // Each library location is the `Folder` row Jellyfin keeps for it, under
+    // the aggregate root, and what it holds hangs off it (owner decision D1).
+    .with_root_folder(root_folder_ids.aggregate)
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
@@ -1693,6 +1697,7 @@ pub async fn build_app_state(
         sessions: Arc::clone(&sessions),
         users: Arc::clone(&users),
         items: Arc::clone(&item_repository),
+        persistence: Arc::clone(&item_persistence_service),
     }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -2087,6 +2092,7 @@ pub async fn build_app_state(
         crate::media_encoding::MediaEncodingExtras {
             // Transcode logs resolve item/series/library names through the library.
             library: Some(me_library),
+            virtual_folders: Some(Arc::clone(&virtual_folders)),
             trickplay: Some(me_trickplay),
             sessions: Some(me_sessions),
         },
@@ -2254,6 +2260,7 @@ struct SessionLibraryAudience {
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
     items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+    persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
 }
 
 #[async_trait::async_trait]
@@ -2283,6 +2290,20 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
             return Ok(Vec::new());
         };
         self.items.visible_library_ids(&user).await
+    }
+
+    async fn library_top_parents(
+        &self,
+        libraries: &[Uuid],
+    ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        let mut tops = Vec::with_capacity(libraries.len() * 2);
+        for &library in libraries {
+            match self.persistence.library_top_parents(library).await? {
+                Some(ids) => tops.extend(ids),
+                None => tops.push(library),
+            }
+        }
+        Ok(tops)
     }
 
     async fn deliver(

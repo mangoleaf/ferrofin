@@ -1754,6 +1754,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         collection_type: &str,
     ) -> Result<(), ServiceError> {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "CollectionType".to_owned(),
+            serde_json::Value::String(collection_type.to_owned()),
+        );
+        self.merge_data_fields(item_id, &fields).await
+    }
+
+    async fn merge_data_fields(
+        &self,
+        item_id: Uuid,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ServiceError> {
         let id = guid_to_db(item_id);
         // Read on the pool first: the steady state (already recorded) must not
         // touch the single writer connection.
@@ -1766,26 +1779,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let Some(stored) = current else {
             return Ok(()); // no such row
         };
-        // Merge into whatever the blob already holds — `Data` also carries
-        // `PhysicalFolderIds`/`ViewType`/`DisplayParentId` on some rows, and
-        // replacing it wholesale would drop them.
+        // Merge into whatever the blob already holds, which replacing it
+        // wholesale would drop.
         let mut data = stored
             .as_deref()
             .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        if data
-            .get("CollectionType")
-            .and_then(serde_json::Value::as_str)
-            == Some(collection_type)
+        let Some(obj) = data.as_object_mut() else {
+            return Ok(());
+        };
+        if fields
+            .iter()
+            .all(|(key, value)| obj.get(key) == Some(value))
         {
             return Ok(());
         }
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert(
-                "CollectionType".to_owned(),
-                serde_json::Value::String(collection_type.to_owned()),
-            );
+        for (key, value) in fields {
+            obj.insert(key.clone(), value.clone());
         }
         sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
             .bind(&id)
@@ -3475,12 +3486,13 @@ pub struct SeriesKeyScope {
 /// Resolves a series' [`SeriesKeyScope`] from the configured libraries.
 ///
 /// C# `GetCollectionFolders(item)` walks up to the top-level physical folder
-/// (the series' parent directory) and returns every `CollectionFolder` whose
-/// `PhysicalLocations` contain it, compared `OrdinalIgnoreCase` — which is
-/// how one show folder shared by two libraries lands in both. A series with
-/// no path (or one under no library) falls back to its `TopParentId` library
-/// alone. The library options come from the `TopParentId` library, else the
-/// first location match.
+/// (the location the series sits in) and returns every `CollectionFolder`
+/// whose `PhysicalLocations` contain it, compared `OrdinalIgnoreCase` — which
+/// is how one show folder shared by two libraries lands in both. A series
+/// with no path (or one under no library) falls back to its `TopParentId`
+/// when that is a library (a row an older scan wrote; a location's folder is
+/// not one). The library options come from the owning library
+/// ([`owning_library`](ferrofin_model::entities_media::owning_library)).
 #[must_use]
 pub fn series_key_scope(
     folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
@@ -3495,31 +3507,21 @@ pub fn series_key_scope(
     let folder_id = |f: &ferrofin_model::entities_media::VirtualFolderInfo| {
         f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok())
     };
-    let top_parent = top_parent_id.and_then(|id| Uuid::parse_str(id).ok());
-    let parent_dir = path
-        .and_then(|p| std::path::Path::new(p).parent())
-        .and_then(std::path::Path::to_str)
-        .map(|d| d.trim_end_matches('/'));
-    let located: Vec<&ferrofin_model::entities_media::VirtualFolderInfo> = parent_dir
-        .map(|dir| {
-            folders
-                .iter()
-                .filter(|f| {
-                    f.locations
-                        .iter()
-                        .any(|loc| loc.trim_end_matches('/').eq_ignore_ascii_case(dir))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let owning = top_parent
-        .and_then(|tp| folders.iter().find(|f| folder_id(f) == Some(tp)))
-        .or_else(|| located.first().copied());
+    let owning = ferrofin_model::entities_media::owning_library(folders, top_parent_id, path);
     let options = owning.and_then(|f| f.library_options.as_ref());
-    let mut collection_folder_ids: Vec<Uuid> =
-        located.iter().filter_map(|f| folder_id(f)).collect();
+    let mut collection_folder_ids: Vec<Uuid> = path
+        .map(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(folder_id)
+        .collect();
     if collection_folder_ids.is_empty() {
-        collection_folder_ids.extend(top_parent);
+        // Only a library: a location's folder never names the key.
+        collection_folder_ids.extend(
+            top_parent_id
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|top| owning.and_then(folder_id) == Some(*top)),
+        );
     }
     let preferred_metadata_language = blank(own_language)
         .or_else(|| blank(options.and_then(|o| o.preferred_metadata_language.as_deref())))
@@ -6993,6 +6995,19 @@ mod tests {
             scope(c, Some("/elsewhere/Show"), None).collection_folder_ids,
             vec![c],
             "under no library: the TopParentId library"
+        );
+        // Below a sub-folder of the location: still that library's, as the
+        // walk up to the top-level folder finds it.
+        assert_eq!(
+            scope(a, Some("/media/anime/Shows/Show"), None).collection_folder_ids,
+            vec![c]
+        );
+        // A location's folder is the TopParentId of what it holds; it is no
+        // library, so it never stands in for one.
+        assert!(
+            scope(Uuid::from_u128(9), Some("/elsewhere/Show"), None)
+                .collection_folder_ids
+                .is_empty()
         );
     }
 

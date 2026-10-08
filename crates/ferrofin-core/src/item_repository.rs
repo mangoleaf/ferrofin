@@ -233,14 +233,12 @@ impl FerrofinItemRepository {
     /// (`PhysicalFolderIds`); the physical folders themselves hang off the
     /// AggregateFolder, so there is no relational path to follow instead.
     ///
-    /// Ferrofin's scan hangs what it saves off the collection folder itself
-    /// (`ParentId` and `TopParentId`), so on an adopted database a library's
-    /// rows carry either: a view is translated to itself AND its physical
-    /// folders ([`library_top_parents_by_view`]), never to the folders alone.
-    ///
-    /// A Ferrofin-written database keeps no `PhysicalFolderIds` and hangs items
-    /// off the collection folder directly, so every lookup here comes back
-    /// empty and the query is left exactly as it was.
+    /// Ferrofin's scan stores the same shape (a `Folder` row per location,
+    /// named by `PhysicalFolderIds`), but rows an older Ferrofin scan saved
+    /// hang off the collection folder itself (`ParentId` and `TopParentId`)
+    /// until a scan saves them again, so a library's rows carry either: a view
+    /// is translated to itself AND its physical folders
+    /// ([`library_top_parents_by_view`]), never to the folders alone.
     async fn resolve_views(
         &self,
         filter: &InternalItemsQuery,
@@ -2515,8 +2513,11 @@ impl ItemRepository for FerrofinItemRepository {
         // `AddUserToQuery` first, and once: every facet below runs the same
         // filter, so scoping here scopes all four. A filter dialog that offers a
         // genre, tag, rating or year from a library the account cannot see is
-        // offering a choice that returns nothing.
-        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        // offering a choice that returns nothing. The views are resolved as a
+        // browse resolves them (which scopes an unparented query to the
+        // user's libraries): a library's children hang off its locations'
+        // folders, so `parentId={library}` alone matches none of them.
+        let scoped = self.resolve_views(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         // Each facet runs the filter once as its own WHERE (via `append_predicates`)
         // instead of materializing the whole matching id set and binding it back as a
@@ -2547,9 +2548,9 @@ impl ItemRepository for FerrofinItemRepository {
         // `/Years` wants the years and nothing else. Going through
         // `get_query_filters_legacy` for them also ran the official-ratings
         // scan and both `ItemValues` MIN aggregates and dropped all three — but
-        // it does share that method's user scoping, which has to be applied
-        // here too.
-        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        // it does share that method's view resolution and user scoping, which
+        // have to be applied here too.
+        let scoped = self.resolve_views(filter).await?;
         self.distinct_years(scoped.as_ref().unwrap_or(filter)).await
     }
 
