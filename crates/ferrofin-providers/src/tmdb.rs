@@ -50,12 +50,16 @@ pub enum TmdbKind {
 }
 
 /// A remote image to download and persist: its [`ImageType`] and absolute URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteImage {
     /// The image type (Primary/Backdrop/…).
     pub image_type: ImageType,
     /// The absolute CDN URL of the image.
     pub url: String,
+    /// Provider-reported width; absent dimensions do not fail a minimum-width check.
+    pub width: Option<i32>,
+    /// Language used when preferring untagged backdrops.
+    pub language: Option<String>,
 }
 
 /// A TMDB search result carrying the id + image paths (movie: `title`, tv: `name`).
@@ -146,6 +150,25 @@ pub struct TmdbImage {
     pub vote_count: Option<i32>,
     /// The ISO-639-1 language of the image, if tagged.
     pub language: Option<String>,
+}
+
+impl From<TmdbImage> for RemoteImage {
+    fn from(image: TmdbImage) -> Self {
+        Self {
+            image_type: image.image_type,
+            url: image.url,
+            width: image.width,
+            language: image.language,
+        }
+    }
+}
+
+/// Ranks rich images by the same language/rating/vote preference used by the
+/// remote-image chooser, retaining dimensions for automatic acquisition.
+#[must_use]
+pub fn ordered_download_images(mut images: Vec<TmdbImage>, requested: &str) -> Vec<RemoteImage> {
+    crate::provider_manager::order_tmdb_images(&mut images, requested);
+    images.into_iter().map(RemoteImage::from).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1224,12 +1247,14 @@ impl TmdbClient {
             images.push(RemoteImage {
                 image_type: ImageType::Primary,
                 url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
+                ..Default::default()
             });
         }
         if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Backdrop,
                 url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
+                ..Default::default()
             });
         }
         images
@@ -1281,12 +1306,14 @@ impl TmdbClient {
             images.push(RemoteImage {
                 image_type: ImageType::Primary,
                 url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
+                ..Default::default()
             });
         }
         if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
             images.push(RemoteImage {
                 image_type: ImageType::Backdrop,
                 url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
+                ..Default::default()
             });
         }
         images
@@ -1413,6 +1440,7 @@ impl TmdbClient {
                 images.push(RemoteImage {
                     image_type,
                     url: cfg.image_url(image_type_size(image_type), &path),
+                    ..Default::default()
                 });
             }
         };
@@ -1575,6 +1603,17 @@ impl TmdbClient {
             .chain(map(parsed.backdrops, ImageType::Backdrop))
             .chain(map(parsed.logos, ImageType::Logo))
             .collect()
+    }
+
+    /// Every automatic acquisition candidate, preserving dimensions instead
+    /// of limiting a scan to the metadata response's single poster/backdrop.
+    pub async fn image_candidates(
+        &self,
+        kind: TmdbKind,
+        id: i64,
+        language: &str,
+    ) -> Vec<RemoteImage> {
+        ordered_download_images(self.all_images(kind, id).await, language)
     }
 
     /// Every poster TMDB has for one season — `GET
@@ -2045,6 +2084,20 @@ impl TmdbClient {
             return None;
         }
         Some(details)
+    }
+
+    /// Downloads an automatic-acquisition candidate with upstream retry/format
+    /// semantics. A 403/404 skips its URL; other failures end this provider's
+    /// current image-type pass.
+    ///
+    /// # Errors
+    /// Returns whether acquisition should skip a missing/forbidden candidate
+    /// or stop this provider's image-type pass after another download failure.
+    pub async fn download_artwork(
+        &self,
+        url: &str,
+    ) -> Result<crate::ArtworkDownload, crate::ArtworkDownloadFailure> {
+        crate::image_download::download_artwork(&self.http, url).await
     }
 
     /// Downloads an image URL's bytes, or `None` on any failure.

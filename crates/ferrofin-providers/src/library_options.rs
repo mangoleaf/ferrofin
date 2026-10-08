@@ -812,6 +812,20 @@ fn audiodb_images(type_name: &str) -> &'static [ImageType] {
     }
 }
 
+/// Supported automatic image types for one built-in fetcher, used to avoid
+/// querying a provider when all of its enabled slots are already filled.
+#[must_use]
+pub fn image_types_for_fetcher(kind: &str, name: &str) -> &'static [ImageType] {
+    match name {
+        fetcher_names::TMDB => tmdb_images(kind),
+        fetcher_names::TVDB => tvdb_images(kind),
+        fetcher_names::FANART => fanart_images(kind),
+        fetcher_names::AUDIODB => audiodb_images(kind),
+        fetcher_names::OMDB if matches!(kind, "Movie" | "Episode") => omdb_images(kind),
+        _ => &[],
+    }
+}
+
 /// The image types a library of `type_name` can carry: the union of every
 /// compiled image provider's `GetSupportedImages`, in provider-registration
 /// order, deduplicated.

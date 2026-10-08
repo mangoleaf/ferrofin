@@ -577,25 +577,6 @@ async fn download_images(
     fetch_image_files(tmdb, item_dir, item_id, images, false).await
 }
 
-/// [`download_images`] for the scan's remote image pass: with `replace`
-/// (`ReplaceAllImages`), every type but the ones in the set is downloaded
-/// afresh over the file an earlier download or an upload left
-/// (`IsReplacingImage`); the types in the set are the ones stored with the
-/// media, which are never replaced.
-async fn download_remote_images(
-    tmdb: &TmdbClient,
-    item_dir: &Path,
-    item_id: &str,
-    mut images: Vec<RemoteImage>,
-    replace: Option<&std::collections::HashSet<ImageType>>,
-) -> Vec<ItemImageInfo> {
-    let Some(with_media) = replace else {
-        return download_images(tmdb, item_dir, item_id, images).await;
-    };
-    images.retain(|image| !with_media.contains(&image.image_type));
-    fetch_image_files(tmdb, item_dir, item_id, images, true).await
-}
-
 /// The download loop of [`download_images`]; `replace` re-downloads a type
 /// whose file is already on disk (keeping it when the download fails).
 async fn fetch_image_files(
@@ -5018,7 +4999,7 @@ impl LibraryScanner {
         // they left. A photo's Primary image is the file itself; a book's is
         // the cover extracted from its archive.
         let (embedded_people, embedded_images, embedded_read) = if plan.local_metadata {
-            self.enrich_from_file(&mut entity, locked).await
+            self.enrich_from_file(&mut entity, locked, policy).await
         } else {
             (Vec::new(), Vec::new(), false)
         };
@@ -8593,6 +8574,7 @@ impl LibraryScanner {
                     vec![RemoteImage {
                         image_type: ImageType::Primary,
                         url,
+                        ..Default::default()
                     }],
                 )
                 .await;
@@ -8990,8 +8972,13 @@ impl LibraryScanner {
         // names remote fetchers — gating on it silently dropped all sidecar art.
         let mut images = discover_local_images(entity);
         // Explicit music uploads/sidecars take precedence over shared art.
-        if matches!(short, "Audio" | "MusicAlbum") {
+        if fetch != ImageFetch::All || matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
+            // Shared album references must follow the album's current cover;
+            // importing the previous reference here would block that refresh.
+            if !matches!(short, "Audio" | "MusicAlbum") {
+                keep_stored_images(&mut images, stored, &self.virtual_paths);
+            }
         }
         let fetched = self.run_ordered_artwork(
             item_id,
@@ -9004,6 +8991,11 @@ impl LibraryScanner {
             art_cache,
         );
         cut_short |= cancel.unless_cancelled(Box::pin(fetched)).await.is_none();
+        if fetch == ImageFetch::All
+            && let Some(root) = &self.metadata_dir
+        {
+            artwork::prune_old_backdrops(&root.join(&entity.id), &images);
+        }
         self.append_art_dir_images(entity, &mut images);
         // An album's Primary is stored as its shared, content-addressed cover
         // (what `finish_album_artwork` publishes after the walk). Storing the
@@ -9117,6 +9109,24 @@ impl LibraryScanner {
             match source {
                 Step::Plugin => self.apply_dynamic_images(entity, images, selected).await,
                 Step::Remote => {
+                    let types =
+                        ferrofin_providers::library_options::image_types_for_fetcher(short, name);
+                    let preferences = ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+                        policy.options,
+                        short,
+                    );
+                    if types.is_empty()
+                        || (fetch != ImageFetch::All
+                            && !types.iter().any(|kind| {
+                                images
+                                    .iter()
+                                    .filter(|image| image.image_type == *kind)
+                                    .count()
+                                    < preferences.limit(*kind)
+                            }))
+                    {
+                        continue;
+                    }
                     self.run_remote_image_providers(fetch, entity, cache, selected, images)
                         .await;
                 }
@@ -9142,6 +9152,15 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         art_cache: &mut ArtworkCache,
     ) -> Vec<ItemImageInfo> {
+        if ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            policy.options,
+            entity.type_.rsplit('.').next().unwrap_or(&entity.type_),
+        )
+        .limit(ImageType::Primary)
+            == 0
+        {
+            return Vec::new();
+        }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         // Two upstream providers under two checkbox names: a track's cover is
         // `AudioImageProvider` ("Image Extractor", `AudioImageProvider.cs:51`,
@@ -9189,26 +9208,11 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         images: &mut Vec<ItemImageInfo>,
     ) {
-        match fetch {
-            ImageFetch::None => {}
-            ImageFetch::MissingOnly => {
-                let present: std::collections::HashSet<_> =
-                    images.iter().map(|image| image.image_type).collect();
-                images.extend(
-                    self.fetch_remote_images(entity, art_cache, policy, None)
-                        .await
-                        .into_iter()
-                        .filter(|image| !present.contains(&image.image_type)),
-                );
-            }
-            ImageFetch::All => {
-                let with_media: std::collections::HashSet<ImageType> =
-                    images.iter().map(|i| i.image_type).collect();
-                let fetched = self
-                    .fetch_remote_images(entity, art_cache, policy, Some(&with_media))
-                    .await;
-                images.extend(fetched);
-            }
+        if fetch != ImageFetch::None {
+            let fetched = self
+                .fetch_remote_images(entity, art_cache, policy, fetch, images)
+                .await;
+            images.extend(fetched);
         }
     }
 
@@ -9233,8 +9237,12 @@ impl LibraryScanner {
             return;
         };
         let item_dir = meta_root.join(&entity.id);
+        let kind = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
+        let preferences =
+            ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, kind);
         let mut wanted: Vec<ImageType> = [ImageType::Primary, ImageType::Backdrop]
             .into_iter()
+            .filter(|kind| preferences.limit(*kind) > 0)
             .filter(|kind| !images.iter().any(|i| i.image_type == *kind))
             .filter(|kind| {
                 policy.replace_images
@@ -9580,9 +9588,9 @@ impl LibraryScanner {
         }
     }
 
-    /// `replace`: `ReplaceAllImages` — every type but the ones in the set is
-    /// downloaded afresh over what an earlier download or an upload left in
-    /// the item's metadata folder; `None` reuses what is there.
+    /// Resolve the selected provider's complete candidate list and acquire
+    /// eligible images up to the remaining capacity. Existing local images
+    /// occupy slots even when replacing internally downloaded artwork.
     // Each item-kind arm gathers and ranks its own provider image sets.
     #[allow(clippy::too_many_lines)]
     async fn fetch_remote_images(
@@ -9590,7 +9598,8 @@ impl LibraryScanner {
         entity: &BaseItemEntity,
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
-        replace: Option<&std::collections::HashSet<ImageType>>,
+        fetch: ImageFetch,
+        current: &[ItemImageInfo],
     ) -> Vec<ItemImageInfo> {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return Vec::new();
@@ -9623,38 +9632,37 @@ impl LibraryScanner {
             ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1));
         let item_dir = meta_root.join(&entity.id);
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
 
-        // Each branch resolves its TMDB match/fetch (cheap search) and downloads
-        // via `download_images`, which skips any image already on disk — so a
-        // re-scan re-uses files without re-downloading, while still populating the
-        // per-series id/still cache the seasons and episodes depend on.
+        // Image providers resolve recorded ids independently of metadata
+        // selection, then retain dimensions until acquisition applies limits.
         match short {
             "Movie" => {
-                let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                    return Vec::new();
-                };
-                // The movie's TMDB id as this pass settled it (its own, the
-                // metadata fetch's, or the chosen Identify result's) keys its
-                // artwork, as `TmdbMovieImageProvider` keys it; only a movie
-                // TMDB never matched is looked up by name.
-                // TODO(parity, open work item): upstream never searches by
-                // name here — with no Tmdb id it resolves the Imdb id through
-                // `/find` and otherwise returns nothing
-                // (`TmdbMovieImageProvider.cs:62-80`). Port that lookup and
-                // drop the name search.
                 let tmdb_id = cache
                     .item_provider_ids
                     .get(&entity.id)
                     .and_then(|ids| tmdb_id_in(ids));
-                let images = if !policy.image_enabled(short, fetcher_names::TMDB) {
-                    Vec::new()
-                } else if let Some(id) = tmdb_id {
-                    tmdb.images_by_id_for_language(TmdbKind::Movie, id, language.as_deref())
-                        .await
+                let images = if policy.image_enabled(short, fetcher_names::TMDB) {
+                    let id = if tmdb_id.is_some() {
+                        tmdb_id
+                    } else if let Some(imdb) = imdb_id_of(cache.item_provider_ids.get(&entity.id)) {
+                        tmdb.find_id_by_external_id(TmdbKind::Movie, "imdb_id", &imdb)
+                            .await
+                    } else {
+                        None
+                    };
+                    match id {
+                        Some(id) => {
+                            tmdb.image_candidates(
+                                TmdbKind::Movie,
+                                id,
+                                language.as_deref().unwrap_or("en"),
+                            )
+                            .await
+                        }
+                        None => Vec::new(),
+                    }
                 } else {
-                    tmdb.images_for_language(TmdbKind::Movie, name, year, language.as_deref())
-                        .await
+                    Vec::new()
                 };
                 let mut sources = vec![(fetcher_names::TMDB, images)];
                 // Rank all artwork before selecting the first of each type.
@@ -9679,7 +9687,18 @@ impl LibraryScanner {
                 append_omdb_poster(&mut images, entity, cache, policy, short);
                 sources.push((fetcher_names::OMDB, images));
                 let images = ordered_remote_images(sources, policy, short);
-                download_remote_images(tmdb, &item_dir, &entity.id, images, replace).await
+                artwork::acquire_images(
+                    tmdb,
+                    &item_dir,
+                    images,
+                    ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+                        policy.options,
+                        short,
+                    ),
+                    current,
+                    fetch == ImageFetch::All,
+                )
+                .await
             }
             "Series" => {
                 // Reuse artwork from TVDB's metadata response, then rank it
@@ -9733,11 +9752,24 @@ impl LibraryScanner {
                     sources.push((fetcher_names::FANART, images));
                 }
                 let images = ordered_remote_images(sources, policy, short);
-                download_remote_images(tmdb, &item_dir, &entity.id, images, replace).await
+                artwork::acquire_images(
+                    tmdb,
+                    &item_dir,
+                    images,
+                    ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+                        policy.options,
+                        short,
+                    ),
+                    current,
+                    fetch == ImageFetch::All,
+                )
+                .await
             }
             "Season" | "Episode" => {
-                self.fetch_tv_still_images(entity, short, cache, tmdb, &item_dir, policy, replace)
-                    .await
+                self.fetch_tv_still_images(
+                    entity, short, cache, tmdb, &item_dir, policy, fetch, current,
+                )
+                .await
             }
             _ => Vec::new(),
         }
@@ -9764,7 +9796,7 @@ impl LibraryScanner {
             return Vec::new();
         };
         cache.series_tmdb.insert(entity.id.clone(), id);
-        tmdb.images_by_id_for_language(TmdbKind::Series, id, language)
+        tmdb.image_candidates(TmdbKind::Series, id, language.unwrap_or("en"))
             .await
     }
 
@@ -9819,10 +9851,8 @@ impl LibraryScanner {
         }
     }
 
-    /// The selected season and episode image providers. Season artwork uses
-    /// the provider's image listing; an episode can reuse its metadata still
-    /// when that lookup used the same display order.
-    /// `replace` as [`fetch_remote_images`](Self::fetch_remote_images).
+    /// The selected season and episode image providers use complete image
+    /// listings, preserving candidate dimensions for the acquisition policy.
     // The pass's inputs, each used once; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_tv_still_images(
@@ -9833,13 +9863,16 @@ impl LibraryScanner {
         tmdb: &TmdbClient,
         item_dir: &Path,
         policy: FetcherPolicy<'_>,
-        replace: Option<&std::collections::HashSet<ImageType>>,
+        fetch: ImageFetch,
+        current: &[ItemImageInfo],
     ) -> Vec<ItemImageInfo> {
         let language = ferrofin_providers::tmdb::normalize_language(
             Some(&preferred_language(entity, policy)),
             Some(&policy.country_code()),
         );
 
+        let preferences =
+            ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, short);
         if short == "Season" {
             let images = if policy.image_enabled(short, fetcher_names::TMDB) {
                 match (
@@ -9851,10 +9884,7 @@ impl LibraryScanner {
                             .season_images(id, number)
                             .await
                             .into_iter()
-                            .map(|image| RemoteImage {
-                                image_type: image.image_type,
-                                url: image.url,
-                            })
+                            .map(RemoteImage::from)
                             .collect(),
                         None => Vec::new(),
                     },
@@ -9876,55 +9906,64 @@ impl LibraryScanner {
                 policy,
                 short,
             );
-            return download_remote_images(tmdb, item_dir, &entity.id, images, replace).await;
+            return artwork::acquire_images(
+                tmdb,
+                item_dir,
+                images,
+                preferences,
+                current,
+                fetch == ImageFetch::All,
+            )
+            .await;
         }
-        let tvdb_images = if policy.image_enabled(short, fetcher_names::TVDB) {
+        let television_images = if policy.image_enabled(short, fetcher_names::TVDB) {
             self.tvdb_child_images(entity, cache).await
         } else {
             Vec::new()
         };
-        let the_moviedb_still = if policy.image_enabled(short, fetcher_names::TMDB) {
+        let tmdb_images = if policy.image_enabled(short, fetcher_names::TMDB) {
             match (
-                entity.series_id.clone(),
+                entity
+                    .series_id
+                    .as_deref()
+                    .and_then(|series| series_tmdb_id_of(cache, series)),
                 entity
                     .parent_index_number
                     .and_then(|n| i32::try_from(n).ok()),
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
-                (Some(series_id), Some(season_num), Some(ep_num)) => self
-                    .season_details_cached(cache, &series_id, season_num, language.as_deref())
-                    .await
-                    .and_then(|d| episode_in_season(d, ep_num))
-                    .and_then(|ep| ep.still_url.clone()),
-                _ => None,
+                (Some(series), Some(season), Some(episode)) => {
+                    ferrofin_providers::tmdb::ordered_download_images(
+                        tmdb.episode_images(series, season, episode).await,
+                        language.as_deref().unwrap_or("en"),
+                    )
+                }
+                _ => Vec::new(),
             }
         } else {
-            None
-        };
-        let primary = |url: Option<String>| {
-            url.map(|url| RemoteImage {
-                image_type: ImageType::Primary,
-                url,
-            })
-            .into_iter()
-            .collect::<Vec<_>>()
+            Vec::new()
         };
         let mut omdb = Vec::new();
         self.load_omdb_poster(entity, cache, policy, short).await;
         append_omdb_poster(&mut omdb, entity, cache, policy, short);
         let images = ordered_remote_images(
             vec![
-                (fetcher_names::TVDB, tvdb_images),
-                (fetcher_names::TMDB, primary(the_moviedb_still)),
+                (fetcher_names::TVDB, television_images),
+                (fetcher_names::TMDB, tmdb_images),
                 (fetcher_names::OMDB, omdb),
             ],
             policy,
             short,
         );
-        if images.is_empty() {
-            return Vec::new();
-        }
-        download_remote_images(tmdb, item_dir, &entity.id, images, replace).await
+        artwork::acquire_images(
+            tmdb,
+            item_dir,
+            images,
+            preferences,
+            current,
+            fetch == ImageFetch::All,
+        )
+        .await
     }
 
     /// Image providers run independently of the library's metadata selection.
@@ -10001,6 +10040,7 @@ impl LibraryScanner {
             return vec![RemoteImage {
                 image_type: ImageType::Primary,
                 url: url.clone(),
+                ..Default::default()
             }];
         }
         let Some(client) = &self.tvdb else {
@@ -10014,10 +10054,7 @@ impl LibraryScanner {
                 .season_images(tvdb_id, order, number)
                 .await
                 .into_iter()
-                .map(|image| RemoteImage {
-                    image_type: image.image_type,
-                    url: image.url,
-                })
+                .map(RemoteImage::from)
                 .collect();
         }
         let season = entity
@@ -10034,6 +10071,7 @@ impl LibraryScanner {
                 vec![RemoteImage {
                     image_type: ImageType::Primary,
                     url,
+                    ..Default::default()
                 }]
             })
             .unwrap_or_default()
@@ -11365,9 +11403,10 @@ impl LibraryScanner {
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
+        policy: FetcherPolicy<'_>,
     ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>, bool) {
         let mut images = self.enrich_photo(entity, locked).await;
-        let (people, book_images, book_found) = self.enrich_book(entity, locked).await;
+        let (people, book_images, book_found) = self.enrich_book(entity, locked, policy).await;
         images.extend(book_images);
         (people, images, book_found)
     }
@@ -11382,6 +11421,7 @@ impl LibraryScanner {
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
+        policy: FetcherPolicy<'_>,
     ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>, bool) {
         if !entity.type_.ends_with(".Book") || locked {
             return (Vec::new(), Vec::new(), false);
@@ -11400,7 +11440,18 @@ impl LibraryScanner {
             }
             None => (Vec::new(), false),
         };
-        (people, self.extract_book_cover(entity, &path).await, found)
+        let images = if ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            policy.options,
+            "Book",
+        )
+        .limit(ImageType::Primary)
+            > 0
+        {
+            self.extract_book_cover(entity, &path).await
+        } else {
+            Vec::new()
+        };
+        (people, images, found)
     }
 
     /// Writes a book's embedded cover into its metadata art directory and
@@ -12826,7 +12877,13 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
         ImageType::Logo => "logo",
         ImageType::Thumb => "thumb",
         ImageType::Banner => "banner",
-        // Primary + anything else lands on the primary poster name.
+        ImageType::Art => "art",
+        ImageType::Disc => "disc",
+        ImageType::Box => "box",
+        ImageType::BoxRear => "boxrear",
+        ImageType::Menu => "menu",
+        ImageType::Screenshot => "screenshot",
+        ImageType::Profile => "profile",
         _ => "primary",
     }
 }
@@ -14610,10 +14667,7 @@ fn fanart_movie_id(ids: &[(String, String)]) -> Option<String> {
 
 /// Appends fanart rich images to a download list as type+URL [`RemoteImage`]s.
 fn append_fanart(images: &mut Vec<RemoteImage>, fanart: Vec<ferrofin_providers::TmdbImage>) {
-    images.extend(fanart.into_iter().map(|img| RemoteImage {
-        image_type: img.image_type,
-        url: img.url,
-    }));
+    images.extend(fanart.into_iter().map(RemoteImage::from));
 }
 
 /// Appends OMDb's poster as a `Primary` candidate, when the library enabled the
@@ -14635,6 +14689,7 @@ fn append_omdb_poster(
         images.push(RemoteImage {
             image_type: ImageType::Primary,
             url: url.clone(),
+            ..Default::default()
         });
     }
 }
@@ -15095,6 +15150,7 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
         .collect()
 }
 
+mod artwork;
 mod collections;
 mod fanout;
 mod music;
@@ -15337,6 +15393,7 @@ mod tests {
                     vec![super::RemoteImage {
                         image_type: ImageType::Primary,
                         url: "tmdb".into(),
+                        ..Default::default()
                     }],
                 ),
                 (
@@ -15344,6 +15401,7 @@ mod tests {
                     vec![super::RemoteImage {
                         image_type: ImageType::Primary,
                         url: "fanart".into(),
+                        ..Default::default()
                     }],
                 ),
             ]
@@ -17367,6 +17425,7 @@ mod tests {
         let mut images = vec![ferrofin_providers::RemoteImage {
             image_type: ferrofin_model::entities::ImageType::Primary,
             url: "https://tmdb.test/p.jpg".to_owned(),
+            ..Default::default()
         }];
         super::append_omdb_poster(
             &mut images,
@@ -17444,155 +17503,11 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Removing images preserves sidecars and non-acquired types.
     #[tokio::test]
-    async fn artwork_falls_back_after_a_failed_preferred_download() {
+    async fn removing_images_preserves_media_sidecars_and_secondary_singulars() {
         use ferrofin_model::entities::ImageType;
-        use std::collections::HashSet;
         let tmp = tempfile::tempdir().unwrap();
-        let base = spawn_art_server("", b"FALLBACK");
-        let tmdb = ferrofin_providers::TmdbClient::new();
-        let images = || {
-            vec![
-                super::RemoteImage {
-                    image_type: ImageType::Primary,
-                    url: "http://127.0.0.1:9/absent".into(),
-                },
-                super::RemoteImage {
-                    image_type: ImageType::Primary,
-                    url: format!("{base}/fallback"),
-                },
-                super::RemoteImage {
-                    image_type: ImageType::Primary,
-                    url: "http://127.0.0.1:9/unused".into(),
-                },
-            ]
-        };
-        for replace in [None, Some(HashSet::new())] {
-            let infos =
-                super::download_remote_images(&tmdb, tmp.path(), "ID", images(), replace.as_ref())
-                    .await;
-            assert_eq!(infos.len(), 1);
-            assert_eq!(std::fs::read(&infos[0].path).unwrap(), b"FALLBACK");
-        }
-        // When both providers fail, one reference to the stored image survives.
-        let infos = super::download_remote_images(
-            &tmdb,
-            tmp.path(),
-            "ID",
-            vec![images()[0].clone(), images()[2].clone()],
-            Some(&HashSet::new()),
-        )
-        .await;
-        assert_eq!(infos.len(), 1);
-        assert_eq!(std::fs::read(&infos[0].path).unwrap(), b"FALLBACK");
-    }
-
-    /// `ReplaceAllImages` re-downloads over what an earlier download or an
-    /// upload left (another extension included), never replaces a type
-    /// stored with the media, and keeps the old file when the download
-    /// fails; without it the file on disk is reused. `RemoveImages` clears
-    /// the item's metadata folder first.
-    #[tokio::test(flavor = "multi_thread")]
-    // One scenario per assertion block; splitting it would only scatter them.
-    #[allow(clippy::too_many_lines)]
-    async fn replacing_images_downloads_afresh_except_the_media_stored_types() {
-        use ferrofin_model::entities::ImageType;
-        use ferrofin_providers::tmdb::RemoteImage;
-        // An image host answering every path with the same bytes, recording
-        // each request line.
-        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let base = {
-            use std::io::{Read as _, Write as _};
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let log = Arc::clone(&requests);
-            std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut s) = stream else { break };
-                    let mut buf = [0u8; 1024];
-                    let n = s.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    log.lock()
-                        .unwrap()
-                        .push(req.lines().next().unwrap_or_default().to_owned());
-                    let _ = s.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nFRESH",
-                    );
-                }
-            });
-            format!("http://{addr}")
-        };
-        let tmdb = ferrofin_providers::TmdbClient::new();
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("ID");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("primary.png"), b"UPLOAD").unwrap();
-        std::fs::write(dir.join("backdrop.jpg"), b"OLD").unwrap();
-        let wanted = || {
-            vec![
-                RemoteImage {
-                    image_type: ImageType::Primary,
-                    url: format!("{base}/p.jpg"),
-                },
-                RemoteImage {
-                    image_type: ImageType::Backdrop,
-                    url: format!("{base}/b.jpg"),
-                },
-                RemoteImage {
-                    image_type: ImageType::Logo,
-                    // Nothing answers here: the download fails.
-                    url: "http://127.0.0.1:9/logo.png".to_owned(),
-                },
-                RemoteImage {
-                    // Shares the `primary` stem; a replace must not
-                    // overwrite the poster this pass just wrote.
-                    image_type: ImageType::Disc,
-                    url: format!("{base}/disc.png"),
-                },
-            ]
-        };
-
-        // Fill-missing reuses both files on disk (the disc aliases the
-        // primary's).
-        let infos = super::download_remote_images(&tmdb, &dir, "ID", wanted(), None).await;
-        assert_eq!(infos.len(), 3);
-        assert_eq!(std::fs::read(dir.join("primary.png")).unwrap(), b"UPLOAD");
-
-        // Replace, with the backdrop stored beside the media: the primary is
-        // downloaded afresh (the upload's other extension goes), the
-        // backdrop is left alone, the failed logo adds nothing.
-        let with_media = std::collections::HashSet::from([ImageType::Backdrop]);
-        let infos =
-            super::download_remote_images(&tmdb, &dir, "ID", wanted(), Some(&with_media)).await;
-        assert_eq!(infos.len(), 2, "{infos:?}");
-        assert_eq!(std::fs::read(dir.join("primary.jpg")).unwrap(), b"FRESH");
-        assert_eq!(
-            requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|r| r.contains("disc.png"))
-                .count(),
-            0,
-            "the disc reused the poster file this pass wrote instead of overwriting it"
-        );
-        assert!(!dir.join("primary.png").exists());
-        assert_eq!(std::fs::read(dir.join("backdrop.jpg")).unwrap(), b"OLD");
-
-        // A failed replacement keeps the image the item had.
-        std::fs::write(dir.join("logo.png"), b"KEPT").unwrap();
-        let infos = super::download_remote_images(
-            &tmdb,
-            &dir,
-            "ID",
-            wanted(),
-            Some(&std::collections::HashSet::new()),
-        )
-        .await;
-        assert_eq!(infos.len(), 4);
-        assert_eq!(std::fs::read(dir.join("logo.png")).unwrap(), b"KEPT");
-        assert_eq!(std::fs::read(dir.join("backdrop.jpg")).unwrap(), b"FRESH");
-
         // `RemoveImages`: the stored singular images and backdrops in the
         // item's metadata folder (Ferrofin's or Jellyfin's layout) go; a
         // screenshot, a second image of a singular type and an image stored
@@ -19395,6 +19310,7 @@ mod tests {
         let img = |t, u: &str| super::RemoteImage {
             image_type: t,
             url: u.to_owned(),
+            ..Default::default()
         };
         // append_fanart converts fanart's rich images to type+URL and appends
         // them after the primary provider's; dedup then keeps the first per type.
@@ -23968,6 +23884,18 @@ mod tests {
                     ("404 Not Found", "{}".to_owned())
                 } else if line.contains("/img/") {
                     ("200 OK", "image".to_owned())
+                } else if line.contains("/tv/1399/season/1/episode/1/images") {
+                    (
+                        "200 OK",
+                        if still {
+                            r#"{"stills":[{"file_path":"/tmdb-still.png","width":1920}]}"#
+                                .to_owned()
+                        } else {
+                            "{}".to_owned()
+                        },
+                    )
+                } else if line.contains("/tv/1399/images") {
+                    ("200 OK", r#"{"posters":[{"file_path":"/tmdb-poster.png","width":1000}],"backdrops":[{"file_path":"/tmdb-backdrop.png","width":1920}]}"#.to_owned())
                 } else if line.contains("/tv/1399/season/1") {
                     let still = if still {
                         r#", "still_path": "/tmdb-still.png""#
@@ -23991,9 +23919,14 @@ mod tests {
                 } else {
                     ("200 OK", "{}".to_owned())
                 };
+                let content_type = if line.contains("/img/") {
+                    "image/png"
+                } else {
+                    "application/json"
+                };
                 let _ = write!(
                     s,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
             }
@@ -24168,6 +24101,104 @@ mod tests {
                 .any(|image| image.image_type == ferrofin_model::entities::ImageType::Backdrop),
             "later providers fill missing slots"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::missing(false)]
+    #[case::explicit_replacement(true)]
+    #[tokio::test]
+    async fn acquisition_skips_full_or_disabled_providers_unless_replacing(#[case] replace: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (base, requests) = spawn_artwork_server(true);
+        let (scanner, mut cache) = artwork_fixture(&base, tmp.path(), &[], false).await;
+        let entity = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Series".to_owned()),
+                image_fetchers: vec!["TheMovieDb".to_owned()],
+                image_options: [
+                    ferrofin_model::entities::ImageType::Primary,
+                    ferrofin_model::entities::ImageType::Backdrop,
+                    ferrofin_model::entities::ImageType::Logo,
+                    ferrofin_model::entities::ImageType::Thumb,
+                ]
+                .into_iter()
+                .map(|type_| ferrofin_model::configuration::ImageOption {
+                    type_,
+                    limit: 0,
+                    min_width: 0,
+                })
+                .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        scanner
+            .run_ordered_artwork(
+                Uuid::parse_str(SERIES).unwrap(),
+                &entity,
+                &[],
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                if replace {
+                    super::ImageFetch::All
+                } else {
+                    super::ImageFetch::MissingOnly
+                },
+                false,
+                &mut images,
+                &mut cache,
+            )
+            .await;
+        assert!(images.is_empty());
+        assert_eq!(requests.lock().unwrap().len(), usize::from(replace));
+    }
+
+    #[rstest::rstest]
+    #[case::disabled(0)]
+    #[case::enabled(1)]
+    #[tokio::test]
+    async fn dynamic_images_obey_limits_but_not_remote_minimum_width(#[case] limit: i32) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _) = artwork_fixture("http://127.0.0.1:1", tmp.path(), &[], false).await;
+        let scanner = scanner.with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let row = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetchers: vec!["ArtworkPlugin".to_owned()],
+                image_options: vec![ferrofin_model::configuration::ImageOption {
+                    type_: ferrofin_model::entities::ImageType::Primary,
+                    limit,
+                    min_width: 99999,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        scanner
+            .apply_dynamic_images(
+                &row,
+                &mut images,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(images.len(), usize::try_from(limit).unwrap());
     }
 
     #[rstest::rstest]
@@ -24441,7 +24472,13 @@ mod tests {
         )
         .await;
         let images = scanner
-            .fetch_remote_images(&series, &mut cache, tvdb_policy, None)
+            .fetch_remote_images(
+                &series,
+                &mut cache,
+                tvdb_policy,
+                super::ImageFetch::MissingOnly,
+                &[],
+            )
             .await;
         assert_eq!(
             types(&images),
@@ -24456,7 +24493,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|l| l.contains("/tv/1399 ") || l.contains("/tv/1399?"))
+                .any(|l| l.contains("/tv/1399/images"))
         );
         assert_eq!(
             downloaded(&requests),
@@ -24475,7 +24512,13 @@ mod tests {
         ];
         let (scanner, mut cache) = artwork_fixture(&base, tmp.path(), &all, false).await;
         scanner
-            .fetch_remote_images(&series, &mut cache, tvdb_policy, None)
+            .fetch_remote_images(
+                &series,
+                &mut cache,
+                tvdb_policy,
+                super::ImageFetch::MissingOnly,
+                &[],
+            )
             .await;
         assert!(
             downloaded(&requests).iter().all(|f| f.starts_with("tvdb-")),
@@ -24505,7 +24548,8 @@ mod tests {
                     global: None,
                     ..Default::default()
                 },
-                None,
+                super::ImageFetch::MissingOnly,
+                &[],
             )
             .await;
         assert_eq!(
@@ -24558,7 +24602,8 @@ mod tests {
                     global: None,
                     ..Default::default()
                 },
-                None,
+                super::ImageFetch::MissingOnly,
+                &[],
             )
             .await;
         assert_eq!(images.len(), 1, "{images:?}");
@@ -24604,7 +24649,8 @@ mod tests {
                     global: None,
                     ..Default::default()
                 },
-                None,
+                super::ImageFetch::MissingOnly,
+                &[],
             )
             .await;
         assert_eq!(images.len(), 1, "{images:?}");
@@ -26274,6 +26320,62 @@ mod tests {
             fold.take(&mut temp, plugin);
             assert_eq!(temp.overview.as_deref(), Some(overview), "{preferred}");
             assert_eq!(temp.tagline.as_deref(), Some(tagline), "{preferred}");
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::disabled(0)]
+    #[case::enabled(1)]
+    #[tokio::test]
+    async fn book_cover_extraction_obeys_primary_limit(#[case] limit: i32) {
+        let tmp = tempfile::tempdir().unwrap();
+        let book = tmp.path().join("Comic.cbz");
+        std::fs::write(
+            &book,
+            [
+                80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 197, 134, 8, 141, 5, 0, 0, 0, 5, 0,
+                0, 0, 9, 0, 0, 0, 99, 111, 118, 101, 114, 46, 106, 112, 103, 99, 111, 118, 101,
+                114, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 197, 134, 8, 141, 5, 0,
+                0, 0, 5, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 99, 111,
+                118, 101, 114, 46, 106, 112, 103, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 55, 0, 0,
+                0, 44, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let (scanner, _) = artwork_fixture("http://127.0.0.1:1", tmp.path(), &[], false).await;
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Book".to_owned()),
+                image_options: vec![ferrofin_model::configuration::ImageOption {
+                    type_: ferrofin_model::entities::ImageType::Primary,
+                    limit,
+                    min_width: 99999,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut row = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Book".to_owned(),
+            path: Some(book.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let (_, images, _) = scanner
+            .enrich_from_file(
+                &mut row,
+                false,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(images.len(), usize::try_from(limit).unwrap());
+        let dest = tmp.path().join("metadata").join(SERIES).join("primary.jpg");
+        assert_eq!(dest.exists(), limit > 0);
+        if limit > 0 {
+            assert_eq!(std::fs::read(dest).unwrap(), b"cover");
         }
     }
 

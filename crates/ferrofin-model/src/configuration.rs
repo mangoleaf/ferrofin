@@ -217,7 +217,7 @@ crate::json::enums::wire_enum! {
 
 /// A single image download option for a metadata type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct ImageOption {
     /// Gets or sets the type.
     #[serde(rename = "Type")]

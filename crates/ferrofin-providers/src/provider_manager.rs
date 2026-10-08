@@ -2031,15 +2031,12 @@ impl LocalProviderManager {
     /// the missing ones ([`ImageFetch::MissingOnly`]) leaves alone. Unknown
     /// (no store, or a failed read) counts every type as present, so nothing
     /// is overwritten on a guess.
-    async fn stored_image_types(&self, item_id: Uuid) -> Option<Vec<ImageType>> {
+    async fn stored_images(&self, item_id: Uuid) -> Option<Vec<ItemImageInfo>> {
         let store = self.image_store.as_ref()?;
         match store.scan_stored_links(&[item_id]).await {
-            Ok(Some(mut links)) => Some(
-                links
-                    .remove(&item_id)
-                    .map(|l| l.images.iter().map(|i| i.image_type).collect())
-                    .unwrap_or_default(),
-            ),
+            Ok(Some(mut links)) => {
+                Some(links.remove(&item_id).map(|l| l.images).unwrap_or_default())
+            }
             Ok(None) => None,
             Err(err) => {
                 tracing::warn!(%item_id, %err, "could not read the item's images");
@@ -2362,13 +2359,14 @@ impl LocalProviderManager {
         let kind = short_kind(row);
         let library = self.library_options_for(row).await;
         let global = self.global_metadata_options_for(kind);
-        let mut filled: std::collections::HashSet<ImageType> = if fetch == ImageFetch::MissingOnly {
-            let Some(stored) = self.stored_image_types(item_id).await else {
-                return Ok(false);
-            };
-            stored.into_iter().collect()
+        let Some(stored) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        let preferences = crate::image_policy::ImageAcquisitionPolicy::new(library.as_ref(), kind);
+        let mut images = if fetch == ImageFetch::MissingOnly {
+            stored.clone()
         } else {
-            std::collections::HashSet::new()
+            Vec::new()
         };
         let remote_sources = self.image_sources_for(row);
         let mut sources: Vec<(
@@ -2409,39 +2407,174 @@ impl LocalProviderManager {
         for (name, dynamic) in sources {
             if let Some(provider) = dynamic {
                 saved |= self
-                    .refresh_plugin_images(item_id, &lookup, provider, &mut filled)
+                    .refresh_plugin_images(item_id, &lookup, provider, preferences, &mut images)
                     .await;
             } else {
+                if fetch != ImageFetch::All
+                    && remote_sources
+                        .iter()
+                        .find(|source| source.name() == name)
+                        .is_none_or(|source| {
+                            !source.supported_images().iter().any(|kind| {
+                                images
+                                    .iter()
+                                    .filter(|image| image.image_type == *kind)
+                                    .count()
+                                    < preferences.limit(*kind)
+                            })
+                        })
+                {
+                    continue;
+                }
                 let query = RemoteImageQuery {
                     provider_name: name.to_owned(),
                     include_all_languages: true,
                     include_disabled_providers: false,
                     ..Default::default()
                 };
-                let mut images: Vec<_> = self
-                    .available_images_for(row, ids, &query)
-                    .await?
-                    .into_iter()
-                    .filter_map(|image| image.url.map(|url| (image.type_, url)))
-                    .collect();
-                keep_missing_images(
-                    &mut images,
-                    Some(&filled.iter().copied().collect::<Vec<_>>()),
-                );
-                for (kind, url) in images {
-                    if !filled.contains(&kind)
-                        && self
-                            .save_image_from_url(item_id, &url, kind, None)
-                            .await
-                            .is_ok()
-                    {
-                        filled.insert(kind);
-                        saved = true;
-                    }
+                let candidates = self.available_images_for(row, ids, &query).await?;
+                saved |= self
+                    .download_candidate_images(
+                        item_id,
+                        candidates,
+                        preferences,
+                        &mut images,
+                        fetch == ImageFetch::All,
+                    )
+                    .await;
+            }
+        }
+        if saved {
+            self.persist_acquired_images(item_id, &mut images, &stored, fetch)
+                .await?;
+        }
+        Ok(saved)
+    }
+
+    async fn persist_acquired_images(
+        &self,
+        item_id: Uuid,
+        images: &mut Vec<ItemImageInfo>,
+        stored: &[ItemImageInfo],
+        fetch: ImageFetch,
+    ) -> Result<(), ServiceError> {
+        let acquired: std::collections::HashSet<_> =
+            images.iter().map(|image| image.image_type).collect();
+        if fetch == ImageFetch::All {
+            images.extend(
+                stored
+                    .iter()
+                    .filter(|image| !acquired.contains(&image.image_type))
+                    .cloned(),
+            );
+        }
+        if let Some(store) = &self.image_store {
+            store.save_item_images(item_id, images).await?;
+        }
+        if fetch == ImageFetch::All && acquired.contains(&ImageType::Backdrop) {
+            for old in stored.iter().filter(|image| {
+                image.image_type == ImageType::Backdrop
+                    && !images.iter().any(|kept| kept.path == image.path)
+            }) {
+                if let Some(root) = &self.metadata_dir
+                    && std::path::Path::new(&old.path).starts_with(root.resolve())
+                {
+                    let _ = std::fs::remove_file(&old.path);
                 }
             }
         }
-        Ok(saved)
+        Ok(())
+    }
+
+    async fn download_candidate_images(
+        &self,
+        item_id: Uuid,
+        mut candidates: Vec<RemoteImageInfo>,
+        policy: crate::image_policy::ImageAcquisitionPolicy<'_>,
+        images: &mut Vec<ItemImageInfo>,
+        replacing: bool,
+    ) -> bool {
+        let mut saved = false;
+        let mut stopped = std::collections::HashSet::new();
+        candidates.sort_by_key(|image| {
+            image.type_ == ImageType::Backdrop
+                && image
+                    .language
+                    .as_deref()
+                    .is_some_and(|language| !language.is_empty())
+        });
+        for candidate in candidates {
+            let kind = candidate.type_;
+            if stopped.contains(&kind)
+                || !policy.accepts(kind, candidate.width)
+                || images
+                    .iter()
+                    .filter(|image| image.image_type == kind)
+                    .count()
+                    >= policy.limit(kind)
+            {
+                continue;
+            }
+            let Some(url) = candidate.url else {
+                continue;
+            };
+            let download = match crate::image_download::download_artwork(&self.http, &url).await {
+                Ok(download) => download,
+                Err(crate::ArtworkDownloadFailure::Skip) => continue,
+                Err(crate::ArtworkDownloadFailure::Stop) => {
+                    stopped.insert(kind);
+                    continue;
+                }
+            };
+            if kind == ImageType::Backdrop
+                && !replacing
+                && download.content_length.is_some_and(|length| {
+                    images
+                        .iter()
+                        .filter(|image| image.image_type == kind)
+                        .any(|image| {
+                            std::fs::metadata(&image.path)
+                                .is_ok_and(|metadata| metadata.len() == length)
+                        })
+                })
+            {
+                continue;
+            }
+            match self.write_automatic_image(item_id, kind, &download.bytes, &download.content_type)
+            {
+                Ok(image) => {
+                    images.push(image);
+                    saved = true;
+                }
+                Err(err) => tracing::warn!(%err, %item_id, "failed to save acquired artwork"),
+            }
+        }
+        saved
+    }
+
+    fn write_automatic_image(
+        &self,
+        item_id: Uuid,
+        kind: ImageType,
+        bytes: &[u8],
+        mime: &str,
+    ) -> Result<ItemImageInfo, ServiceError> {
+        let index = if kind == ImageType::Backdrop {
+            let root = self
+                .metadata_dir
+                .as_ref()
+                .ok_or_else(|| Self::unwired("write_automatic_image"))?;
+            let dir = root.join(ferrofin_db::store::guid_to_db(item_id));
+            (0..i32::MAX).find(|index| {
+                let stem = image_file_stem(kind, Some(*index));
+                !["jpg", "jpeg", "png", "webp", "gif"]
+                    .iter()
+                    .any(|ext| dir.join(format!("{stem}.{ext}")).exists())
+            })
+        } else {
+            None
+        };
+        self.write_image_file(item_id, bytes, mime, kind, index)
     }
 
     async fn refresh_plugin_images(
@@ -2449,17 +2582,20 @@ impl LocalProviderManager {
         item_id: Uuid,
         lookup: &ferrofin_traits::providers::DynamicMetadataLookup,
         provider: &dyn ferrofin_traits::providers::DynamicMetadataProvider,
-        filled: &mut std::collections::HashSet<ImageType>,
+        policy: crate::image_policy::ImageAcquisitionPolicy<'_>,
+        images: &mut Vec<ItemImageInfo>,
     ) -> bool {
         let mut saved = false;
         let wanted: Vec<_> = [ImageType::Primary, ImageType::Backdrop]
             .into_iter()
-            .filter(|kind| !filled.contains(kind))
+            .filter(|kind| {
+                policy.limit(*kind) > 0 && !images.iter().any(|image| image.image_type == *kind)
+            })
             .collect();
         if wanted.is_empty() {
             return false;
         }
-        let images = match provider.images(lookup, &wanted).await {
+        let contributed = match provider.images(lookup, &wanted).await {
             Ok(images) => images,
             Err(err) => {
                 crate::rate_limit::note_request_failure();
@@ -2467,24 +2603,65 @@ impl LocalProviderManager {
                 return false;
             }
         };
-        for (kind, bytes) in images {
-            if !wanted.contains(&kind) || filled.contains(&kind) {
+        for (kind, bytes) in contributed {
+            if !wanted.contains(&kind) || images.iter().any(|image| image.image_type == kind) {
                 continue;
             }
             let Some(ext) = crate::sniff_image_ext(&bytes) else {
                 continue;
             };
             let mime = mime_types::get_mime_type(&format!("image.{ext}"));
-            if self
-                .save_image(item_id, &bytes, mime, kind, None)
-                .await
-                .is_ok()
-            {
-                filled.insert(kind);
-                saved = true;
+            match self.write_automatic_image(item_id, kind, &bytes, mime) {
+                Ok(image) => {
+                    images.push(image);
+                    saved = true;
+                }
+                Err(err) => tracing::warn!(%err, %item_id, "failed to save plugin artwork"),
             }
         }
         saved
+    }
+
+    fn write_image_file(
+        &self,
+        item_id: Uuid,
+        content: &[u8],
+        mime_type: &str,
+        image_type: ImageType,
+        image_index: Option<i32>,
+    ) -> Result<ItemImageInfo, ServiceError> {
+        let Some(meta_root) = &self.metadata_dir else {
+            return Err(Self::unwired("save_image"));
+        };
+        let ext = mime_types::to_extension(&mime_type.to_ascii_lowercase())
+            .unwrap_or(".jpg")
+            .trim_start_matches('.');
+        // The scan's art dir for this item (`{meta}/library/{db-format id}`,
+        // same stem naming): writing the upload there makes it the file the
+        // scan re-discovers on every rescan, so an uploaded image replaces the
+        // downloaded artwork durably instead of being wiped by the next scan's
+        // image rewrite.
+        let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
+        let stem = image_file_stem(image_type, image_index);
+        let dest = item_dir.join(format!("{stem}.{ext}"));
+        std::fs::create_dir_all(&item_dir).map_err(|e| {
+            ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
+        })?;
+        ferrofin_util::file_helper::atomic_write(&dest, content)
+            .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
+        for other in ["jpg", "jpeg", "png", "webp", "gif"] {
+            if other != ext {
+                let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+            }
+        }
+        Ok(ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        })
     }
 
     /// The error for an image operation on a manager built without the
@@ -2536,13 +2713,6 @@ impl LocalProviderManager {
             None => result_list.push(incoming),
         }
     }
-}
-
-/// Keeps the downloads of the image types the item lacks (`present`); an
-/// unknown set (`None`) counts every type as present, so nothing is
-/// overwritten on a guess.
-fn keep_missing_images(images: &mut Vec<(ImageType, String)>, present: Option<&[ImageType]>) {
-    images.retain(|(image_type, _)| present.is_some_and(|present| !present.contains(image_type)));
 }
 
 /// Which halves of a provider arm run: its metadata, its artwork.
@@ -3409,6 +3579,22 @@ fn order_by_language_descending(images: &mut [RemoteImageInfo], requested: &str)
     });
 }
 
+pub(crate) fn order_tmdb_images(images: &mut [TmdbImage], requested: &str) {
+    let requested = if requested.trim().is_empty() {
+        "en"
+    } else {
+        requested
+    };
+    images.sort_by(|a, b| {
+        language_rank(b.language.as_deref(), requested)
+            .cmp(&language_rank(a.language.as_deref(), requested))
+            .then_with(|| {
+                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
+            })
+            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
+    });
+}
+
 /// The TMDB id an item's external ids pin it to: its own `Tmdb` id, else an
 /// `Imdb` id (or, for series, a `Tvdb` id) resolved through TMDB's `/find` —
 /// the `TmdbMovieProvider`/`TmdbSeriesProvider.GetMetadata` precedence. `None`
@@ -3622,46 +3808,12 @@ impl ProviderManager for LocalProviderManager {
         image_type: ImageType,
         image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        let (Some(store), Some(meta_root)) = (&self.image_store, &self.metadata_dir) else {
-            return Err(Self::unwired("save_image"));
-        };
-        let ext = mime_types::to_extension(&mime_type.to_ascii_lowercase())
-            .unwrap_or(".jpg")
-            .trim_start_matches('.');
-        // The scan's art dir for this item (`{meta}/library/{db-format id}`,
-        // same stem naming): writing the upload there makes it the file the
-        // scan re-discovers on every rescan, so an uploaded image replaces the
-        // downloaded artwork durably instead of being wiped by the next scan's
-        // image rewrite.
-        let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
-        let stem = image_file_stem(image_type, image_index);
-        let dest = item_dir.join(format!("{stem}.{ext}"));
-        std::fs::create_dir_all(&item_dir).map_err(|e| {
-            ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
-        })?;
-        // Purge same-stem files of other extensions (e.g. the scan's cached
-        // `primary.jpg` when a PNG is uploaded) so this upload is the single
-        // candidate the scan finds for the stem.
-        for other in ["jpg", "jpeg", "png", "webp", "gif"] {
-            if other != ext {
-                let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
-            }
-        }
-        std::fs::write(&dest, content)
-            .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
-        store
-            .set_item_image(
-                item_id,
-                &ItemImageInfo {
-                    path: dest.to_string_lossy().into_owned(),
-                    image_type,
-                    date_modified: Utc::now(),
-                    width: 0,
-                    height: 0,
-                    blur_hash: None,
-                },
-            )
-            .await
+        let store = self
+            .image_store
+            .as_ref()
+            .ok_or_else(|| Self::unwired("save_image"))?;
+        let image = self.write_image_file(item_id, content, mime_type, image_type, image_index)?;
+        store.set_item_image(item_id, &image).await
     }
 
     async fn delete_image(
@@ -5581,28 +5733,6 @@ mod tests {
             .expect("save_metadata is an accepted no-op");
     }
 
-    /// A refresh that fills only the missing images (a first refresh short of
-    /// replacing them) downloads only the types the item lacks — never an
-    /// existing Primary — and nothing when the stored set is unknown.
-    #[test]
-    fn only_the_missing_image_types_are_downloaded() {
-        let fetched = || {
-            vec![
-                (ImageType::Primary, "p".to_owned()),
-                (ImageType::Backdrop, "b".to_owned()),
-            ]
-        };
-        let mut images = fetched();
-        super::keep_missing_images(&mut images, Some(&[ImageType::Primary]));
-        assert_eq!(images, vec![(ImageType::Backdrop, "b".to_owned())]);
-        let mut images = fetched();
-        super::keep_missing_images(&mut images, Some(&[]));
-        assert_eq!(images.len(), 2);
-        let mut images = fetched();
-        super::keep_missing_images(&mut images, None);
-        assert!(images.is_empty());
-    }
-
     /// The helpers behind `refresh_full_item`: `wants_fetch` gates on the
     /// refresh mode, `parse_ymd` reads a TMDB date.
     #[test]
@@ -5998,6 +6128,43 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::persistence::ItemPersistenceService for RecordingStore {
+        async fn save_item_images(
+            &self,
+            item_id: Uuid,
+            images: &[ItemImageInfo],
+        ) -> Result<(), ServiceError> {
+            let mut stored = self.images.lock().unwrap();
+            stored.retain(|(id, _)| *id != item_id);
+            stored.extend(images.iter().cloned().map(|image| (item_id, image)));
+            Ok(())
+        }
+        async fn scan_stored_links(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<
+            Option<HashMap<Uuid, ferrofin_traits::persistence::StoredItemLinks>>,
+            ServiceError,
+        > {
+            let stored = self.images.lock().unwrap();
+            Ok(Some(
+                item_ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            *id,
+                            ferrofin_traits::persistence::StoredItemLinks {
+                                images: stored
+                                    .iter()
+                                    .filter(|(item, _)| item == id)
+                                    .map(|(_, image)| image.clone())
+                                    .collect(),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+            ))
+        }
         async fn set_item_image(
             &self,
             item_id: Uuid,
@@ -8723,6 +8890,141 @@ mod tests {
             .unwrap();
         assert_eq!(manual.len(), 2);
     }
+    #[rstest::rstest]
+    #[case::disabled(0)]
+    #[case::two_backdrops(2)]
+    #[tokio::test]
+    async fn pathless_acquisition_obeys_limits_and_preserves_multiple_backdrops(
+        #[case] limit: i32,
+    ) {
+        use ferrofin_model::configuration::{ImageOption, LibraryOptions, TypeOptions};
+        let images = crate::mock_http::MockServer::start_typed(vec![
+            ("/first.png", "image/png", b"first".to_vec()),
+            ("/second.png", "image/png", b"second".to_vec()),
+            ("/too-small.png", "image/png", b"small".to_vec()),
+            ("/poster.png", "image/png", b"poster".to_vec()),
+        ])
+        .await;
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/movie/603/images",
+            r#"{
+            "posters":[{"file_path":"/poster.png","width":1000}],
+            "backdrops":[{"file_path":"/too-small.png","width":1279},
+                         {"file_path":"/first.png","width":1280},
+                         {"file_path":"/second.png"}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let item_id = Uuid::new_v4();
+        let library_id = Uuid::new_v4();
+        let mut movie = row("Movies.Movie", "Movie");
+        movie.id = item_id.to_string();
+        movie.top_parent_id = Some(library_id.to_string());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let ids = vec![("Tmdb".to_owned(), "603".to_owned())];
+        store
+            .stored_ids
+            .lock()
+            .unwrap()
+            .insert(item_id, ids.clone());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(
+                    crate::TmdbClient::new()
+                        .with_base_url(&server.base_url)
+                        .with_image_root(&images.base_url),
+                ),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, movie.clone())]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(store.clone(), root.path())
+            .with_virtual_folders(Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: LibraryOptions {
+                    type_options: vec![TypeOptions {
+                        type_: Some("Movie".to_owned()),
+                        image_fetchers: vec!["TheMovieDb".to_owned()],
+                        image_options: vec![
+                            ImageOption {
+                                type_: ImageType::Primary,
+                                limit: 0,
+                                min_width: 0,
+                            },
+                            ImageOption {
+                                type_: ImageType::Backdrop,
+                                limit,
+                                min_width: 1280,
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            }));
+        mgr.refresh_full_item(
+            item_id,
+            &MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::None,
+                image_refresh_mode: MetadataRefreshMode::FullRefresh,
+                replace_all_images: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let first = store.images.lock().unwrap().clone();
+        assert_eq!(first.len(), usize::try_from(limit).unwrap());
+        assert!(
+            first
+                .iter()
+                .all(|(_, image)| image.image_type == ImageType::Backdrop)
+        );
+        if limit > 0 {
+            let bytes: Vec<_> = first
+                .iter()
+                .map(|(_, image)| std::fs::read(&image.path).unwrap())
+                .collect();
+            assert_eq!(bytes, [b"first".to_vec(), b"second".to_vec()]);
+            assert!(
+                !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(*store.images.lock().unwrap(), first);
+            assert!(
+                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                first
+                    .iter()
+                    .all(|(_, image)| !std::path::Path::new(&image.path).exists()),
+                "old backdrops pruned only after new ones were acquired"
+            );
+            assert_eq!(store.images.lock().unwrap().len(), 2);
+        }
+        let manual = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    include_disabled_providers: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manual.len(),
+            4,
+            "manual selection ignores acquisition limits and dimensions"
+        );
+    }
+
     #[rstest::rstest]
     #[case("ENG", Some("en"))]
     #[case("fr", Some("fr"))]

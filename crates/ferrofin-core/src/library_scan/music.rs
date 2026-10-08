@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::Utc;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::{ImageType, MetadataField};
+use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::RemoteSearchResult;
 use ferrofin_providers::library_options::fetcher_names;
 use ferrofin_providers::metadata_merge::{
@@ -41,9 +41,8 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, download_images,
-    download_remote_images, images_changed, item_values_of, preferred_language, provider_order,
-    search_result_ids, split_pipe,
+    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, images_changed,
+    item_values_of, preferred_language, provider_order, search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -1561,12 +1560,38 @@ impl LibraryScanner {
         else {
             return None;
         };
+        let stored = match items.get_image_infos(work.id).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(%err, item_id = %work.id, "failed to read the item's images");
+                return None;
+            }
+        };
+        let preferences = ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            work.policy.options,
+            work.kind.type_name(),
+        );
+        let needs = |name| {
+            fetch.images == ImageFetch::All
+                || ferrofin_providers::library_options::image_types_for_fetcher(
+                    work.kind.type_name(),
+                    name,
+                )
+                .iter()
+                .any(|kind| {
+                    stored
+                        .iter()
+                        .filter(|image| image.image_type == *kind)
+                        .count()
+                        < preferences.limit(*kind)
+                })
+        };
         let mut found: Vec<ferrofin_providers::TmdbImage> = Vec::new();
         let mut fanart_found = Vec::new();
         match work.kind {
             MusicKind::Album => {
                 let group = valid_id(ids, "MusicBrainzReleaseGroup");
-                if fetch.audiodb_images {
+                if fetch.audiodb_images && needs(fetcher_names::AUDIODB) {
                     match (audiodb, &self.audiodb, group.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(group)) => {
@@ -1578,6 +1603,7 @@ impl LibraryScanner {
                     }
                 }
                 if fetch.fanart_images
+                    && needs(fetcher_names::FANART)
                     && let (Some(fanart), Some(group), Some(artist)) = (
                         &self.fanart,
                         group.as_deref(),
@@ -1592,7 +1618,7 @@ impl LibraryScanner {
                 }
             }
             MusicKind::Artist | MusicKind::ByNameArtist => {
-                if fetch.audiodb_images {
+                if fetch.audiodb_images && needs(fetcher_names::AUDIODB) {
                     match (audiodb, &self.audiodb, artist_key.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(id)) => {
@@ -1603,6 +1629,7 @@ impl LibraryScanner {
                     }
                 }
                 if fetch.fanart_images
+                    && needs(fetcher_names::FANART)
                     && let (Some(fanart), Some(id)) = (&self.fanart, artist_key.as_deref())
                 {
                     let fanart = fanart
@@ -1616,13 +1643,6 @@ impl LibraryScanner {
         if found.is_empty() && fanart_found.is_empty() && !fetch.dynamic_images {
             return None;
         }
-        let stored = match items.get_image_infos(work.id).await {
-            Ok(stored) => stored,
-            Err(err) => {
-                tracing::warn!(%err, item_id = %work.id, "failed to read the item's images");
-                return None;
-            }
-        };
         let mut remote: Vec<RemoteImage> = Vec::new();
         append_fanart(&mut remote, found);
         let mut fanart_remote = Vec::new();
@@ -1644,38 +1664,38 @@ impl LibraryScanner {
         let key = work.id.to_string();
         let meta_root = meta_root.resolve();
         let dir = meta_root.join(&key);
-        let mut images = stored.clone();
-        let mut filled: HashSet<ImageType> = stored
+        let mut images: Vec<_> = stored
             .iter()
             .filter(|image| {
                 fetch.images != ImageFetch::All
                     || !std::path::Path::new(&image.path).starts_with(&meta_root)
             })
-            .map(|image| image.image_type)
+            .cloned()
             .collect();
         if fetch.images == ImageFetch::None {
             return None;
         }
+        let preferences = ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            work.policy.options,
+            kind,
+        );
         for (name, candidates) in sources {
-            let mut downloaded = if let Some(candidates) = candidates {
-                let missing: Vec<_> = candidates
-                    .into_iter()
-                    .filter(|image| !filled.contains(&image.image_type))
-                    .collect();
-                if fetch.images == ImageFetch::All {
-                    download_remote_images(tmdb, &dir, &key, missing, Some(&filled)).await
-                } else {
-                    download_images(tmdb, &dir, &key, missing).await
-                }
+            if let Some(candidates) = candidates {
+                let mut downloaded = super::artwork::acquire_images(
+                    tmdb,
+                    &dir,
+                    candidates,
+                    preferences,
+                    &images,
+                    fetch.images == ImageFetch::All,
+                )
+                .await;
+                self.fill_image_metadata(&mut downloaded).await;
+                images.extend(downloaded);
             } else {
-                let mut contributed: Vec<_> = images
-                    .iter()
-                    .filter(|image| filled.contains(&image.image_type))
-                    .cloned()
-                    .collect();
                 self.apply_dynamic_images(
                     row,
-                    &mut contributed,
+                    &mut images,
                     FetcherPolicy {
                         only_image_provider: Some(name),
                         replace_images: fetch.images == ImageFetch::All,
@@ -1683,17 +1703,19 @@ impl LibraryScanner {
                     },
                 )
                 .await;
-                contributed
-                    .into_iter()
-                    .filter(|image| !filled.contains(&image.image_type))
-                    .collect()
-            };
-            self.fill_image_metadata(&mut downloaded).await;
-            let replaced: HashSet<_> = downloaded.iter().map(|image| image.image_type).collect();
-            images.retain(|image| !replaced.contains(&image.image_type));
-            filled.extend(replaced);
-            images.extend(downloaded);
+            }
         }
+        if fetch.images == ImageFetch::All {
+            super::artwork::prune_old_backdrops(&dir, &images);
+            let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
+            images.extend(
+                stored
+                    .iter()
+                    .filter(|image| !acquired.contains(&image.image_type))
+                    .cloned(),
+            );
+        }
+        self.fill_image_metadata(&mut images).await;
         images_changed(&images, Some(&stored)).then_some(images)
     }
 }

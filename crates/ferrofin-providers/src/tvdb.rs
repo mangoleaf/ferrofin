@@ -178,13 +178,7 @@ impl TvdbSeriesDetails {
     /// path.
     #[must_use]
     pub fn download_images(&self) -> Vec<RemoteImage> {
-        self.images
-            .iter()
-            .map(|i| RemoteImage {
-                image_type: i.image_type,
-                url: i.url.clone(),
-            })
-            .collect()
+        self.images.iter().cloned().map(RemoteImage::from).collect()
     }
 }
 

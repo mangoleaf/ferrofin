@@ -1695,9 +1695,13 @@ async fn a_locked_item_keeps_its_metadata_and_asks_no_provider_in_every_mode() {
         fx.scan_with(&item_refresh(mode, replace_all)).await;
         let asked = fx.tmdb.take();
         // TMDB's details (`append_to_response`) or a search by the title is
-        // the metadata provider; the bare `/movie/{id}` lookup is its image
-        // provider (`TmdbClient::images_by_id`).
-        let for_matrix = |line: &&String| line.contains("/movie/603?") || line.contains("Matrix");
+        // the metadata provider; `/movie/{id}/images` is its image
+        // provider; dimensions and all candidates are needed for acquisition limits.
+        let for_matrix = |line: &&String| {
+            line.contains("/movie/603?")
+                || line.contains("/movie/603/images?")
+                || line.contains("Matrix")
+        };
         assert!(
             !asked
                 .iter()

@@ -15,6 +15,7 @@ pub mod error;
 pub mod external_ids;
 pub mod fanart;
 mod image_download;
+pub mod image_policy;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
@@ -59,7 +60,7 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
-pub use image_download::sniff_image_ext;
+pub use image_download::{ArtworkDownload, ArtworkDownloadFailure, sniff_image_ext};
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
     AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,

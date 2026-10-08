@@ -28,6 +28,33 @@ async fn provider(
 ) -> Response {
     requests.lock().unwrap().push(uri.to_string());
     let origin = format!("http://{}", headers["host"].to_str().unwrap());
+    let image_path = uri.path().strip_prefix("/original").unwrap_or(uri.path());
+    if matches!(
+        image_path,
+        "/large.png"
+            | "/small.png"
+            | "/backdrop-one.png"
+            | "/backdrop-two.png"
+            | "/backdrop-three.png"
+            | "/backdrop-small.png"
+    ) {
+        let mut bytes = POSTER.to_vec();
+        // Valid PNGs with distinct lengths exercise the backdrop duplicate guard.
+        bytes.extend_from_slice(image_path.as_bytes());
+        if image_path == "/backdrop-two.png" {
+            bytes.push(0);
+        }
+        return ([("content-type", "image/png")], bytes).into_response();
+    }
+    if uri.path() == "/movie/603/images" {
+        return Json(json!({
+            "posters":[{"file_path":"/small.png","width":500},{"file_path":"/large.png","width":1600}],
+            "backdrops":[{"file_path":"/backdrop-small.png","width":1279},
+                         {"file_path":"/backdrop-one.png","width":1280},
+                         {"file_path":"/backdrop-two.png","width":1920},
+                         {"file_path":"/backdrop-three.png","width":3840}]
+        })).into_response();
+    }
     let artwork = match uri.path() {
         "/artwork/types" => Some(json!({"data":[{"id":7,"name":"Poster","recordType":"season"}]})),
         "/series/5/extended" => Some(
@@ -356,6 +383,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             assert_eq!(found[0]["SearchProviderName"], expected, "{found:?}");
         }
     }
+    verify_movie_image_options(&api, library, &mut options, id).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -458,4 +486,104 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         .await
         .unwrap();
     mock.abort();
+}
+
+/// Save limits, refresh through HTTP, and inspect both rows and served bytes.
+async fn verify_movie_image_options(api: &Api, library: &Value, options: &mut Value, id: &str) {
+    options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
+    options["TypeOptions"][0]["ImageFetchers"] = json!(["TheMovieDb"]);
+    for (primary, backdrops, min_width, expected) in [
+        (0, 2, 1280, "/backdrop-one.png"),
+        (1, 1, 3000, "/backdrop-three.png"),
+    ] {
+        options["TypeOptions"][0]["ImageOptions"] = json!([
+            {"Type":"Primary","Limit":primary,"MinWidth":1000},
+            {"Type":"Backdrop","Limit":backdrops,"MinWidth":min_width}
+        ]);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=true"), &Value::Null).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let images = api.get(&format!("/Items/{id}/Images")).await;
+            let images = images.as_array().unwrap();
+            if images
+                .iter()
+                .filter(|image| image["ImageType"] == "Primary")
+                .count()
+                == primary
+                && images
+                    .iter()
+                    .filter(|image| image["ImageType"] == "Backdrop")
+                    .count()
+                    == backdrops
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "wrong acquisition: {images:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut received = Vec::new();
+        for index in 0..backdrops {
+            let bytes = api
+                .client
+                .get(format!("{}/Items/{id}/Images/Backdrop/{index}", api.base))
+                .header("Authorization", &api.auth)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            received.push(bytes.to_vec());
+        }
+        let mut wanted = POSTER.to_vec();
+        wanted.extend_from_slice(expected.as_bytes());
+        let mut wanted = vec![wanted];
+        if backdrops == 2 {
+            let mut second = POSTER.to_vec();
+            second.extend_from_slice(b"/backdrop-two.png\0");
+            wanted.push(second);
+        }
+        // The HTTP indices address persisted rows; compare the acquired set.
+        received.sort();
+        wanted.sort();
+        assert_eq!(received, wanted);
+        if primary > 0 {
+            let bytes = api
+                .client
+                .get(format!("{}/Items/{id}/Images/Primary", api.base))
+                .header("Authorization", &api.auth)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let mut wanted = POSTER.to_vec();
+            wanted.extend_from_slice(b"/large.png");
+            assert_eq!(
+                bytes.as_ref(),
+                wanted,
+                "minimum width skipped the small poster"
+            );
+        }
+    }
+    let manual = api
+        .get(&format!(
+            "/Items/{id}/RemoteImages?providerName=TheMovieDb&includeAllLanguages=true"
+        ))
+        .await;
+    assert_eq!(
+        manual["Images"].as_array().unwrap().len(),
+        6,
+        "manual chooser is not capped"
+    );
 }
