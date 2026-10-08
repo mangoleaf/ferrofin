@@ -698,8 +698,17 @@ pub async fn build_app_state(
     let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::default());
     let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
         Arc::new(FerrofinActivityManager::new(db.clone()));
+    // One manager supplies peer-aware advertisement and HTTP access policy.
+    // Configuration saves update this same object through AppState.
+    let network_config = load_network_configuration(paths.as_ref()).await;
+    let discovery_enabled = network_config.auto_discovery;
+    let network = Arc::new(std::sync::RwLock::new(
+        ferrofin_networking::NetworkManager::live(network_config),
+    ));
+
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
+            .with_network(Arc::clone(&network))
             .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
             .with_profile_image_dir(metadata_root.child("users"))
@@ -1973,14 +1982,6 @@ pub async fn build_app_state(
     if let Some(task) = wasm_host.analysis_task(&plugins) {
         task_manager.register(task);
     }
-
-    // One manager supplies peer-aware advertisement and HTTP access policy.
-    // Configuration saves update this same object through AppState.
-    let network_config = load_network_configuration(paths.as_ref()).await;
-    let discovery_enabled = network_config.auto_discovery;
-    let network = Arc::new(std::sync::RwLock::new(
-        ferrofin_networking::NetworkManager::live(network_config),
-    ));
 
     // ---- host + system + auth + quick-connect -----------------------------
     let app_host = Arc::new(

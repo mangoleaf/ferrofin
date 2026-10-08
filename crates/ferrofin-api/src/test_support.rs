@@ -400,10 +400,22 @@ impl AuthService for AuthedAuthService {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
+        Ok(authenticated_user_info())
+    }
+}
+
+/// A valid ordinary test user with a cached policy. Handler-only fakes use this
+/// instead of an authenticated context with neither a user nor an API key.
+#[must_use]
+pub fn authenticated_user_info() -> AuthorizationInfo {
+    AuthorizationInfo {
+        is_authenticated: true,
+        user: Some(sample_user()),
+        user_policy: Some(Arc::new(UserPolicy {
+            enable_remote_access: true,
+            ..UserPolicy::default()
+        })),
+        ..AuthorizationInfo::default()
     }
 }
 

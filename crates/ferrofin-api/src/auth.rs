@@ -91,75 +91,120 @@ pub async fn auth_context_layer(
     Ok(next.run(Request::from_parts(parts, body)).await)
 }
 
-/// Extractor for handlers behind Jellyfin's `[Authorize]` policy.
-///
-/// Reads the [`AuthorizationInfo`] that [`auth_context_layer`] already resolved
-/// and stashed as a request extension. When the extension carries an
-/// authenticated context the extractor returns immediately — no DB, no
-/// header-parsing, nothing. Only when the extension is absent or anonymous
-/// does it fall through to [`AuthService::authenticate`], which is the old
-/// per-handler path and serves as a safety net for tests that wire
-/// `FakeAuthContext` (unauthenticated) alongside `AuthedAuthService`.
-///
-/// # Open work item: this is not yet the whole default policy
-///
-/// Upstream's default policy is `new DefaultAuthorizationRequirement()`
-/// (`ApiServiceCollectionExtensions.cs:68-72`), so `DefaultAuthorizationHandler`
-/// evaluates every `[Authorize]` route, and it carries two `context.Fail()`
-/// arms this extractor does not yet port:
-///
-/// - a caller outside the local network who lacks the `EnableRemoteAccess`
-///   **user permission** is refused (`DefaultAuthorizationHandler.cs:66-70`).
-///   Ferrofin enforces the unrelated *network*-level
-///   `NetworkConfiguration.enable_remote_access`
-///   (`ferrofin_networking::NetworkManager::should_allow_server_access`), but
-///   the per-user permission is read only into the policy DTO;
-/// - a non-administrator outside their access schedule is refused
-///   (`:81-84`). `ferrofin-core` ports the rule
-///   (`user_entity_ext::is_parental_schedule_allowed`) but applies it only at
-///   **login**, so a token minted inside the window keeps working outside it.
-///
-/// [`require_user_permission`] ports both arms for the 29 routes behind the
-/// two Live TV `UserPermissionRequirement` policies, which is where the
-/// divergence was measured. It is named here rather than left implicit because
-/// the gap is the *default* policy's, not Live TV's.
-///
-/// The un-defer path is to hoist the two arms out of
-/// [`require_user_permission`] into this extractor (which then makes them
-/// unconditional for every gated route, as C# does), resolve the caller's
-/// policy once in [`auth_context_layer`] and carry it on [`AuthorizationInfo`]
-/// so the arms cost no extra per-request read, and re-run the parity sweep —
-/// every route's status is in its blast radius, and it adds a policy read to
-/// the hottest paths in the server, so it needs the perf gate this lane cannot
-/// run. It is deliberately not bundled into a Live TV parity batch.
-/// [`RequireAdmin`] needs neither arm: `Policies.RequiresElevation` is
-/// registered as a bare `RequireClaim` policy (`:79-83`), not a
-/// `DefaultAuthorizationRequirement`, so `DefaultAuthorizationHandler` never
-/// runs for it.
+/// Resolves credentials without applying a route's authorization policy.
+async fn authenticated_info(
+    parts: &mut Parts,
+    state: &AppState,
+) -> Result<AuthorizationInfo, ApiError> {
+    if let Some(info) = parts
+        .extensions
+        .get::<AuthorizationInfo>()
+        .filter(|info| info.is_authenticated)
+    {
+        return Ok(info.clone());
+    }
+    let ctx = request_context(
+        &parts.headers,
+        parts.uri.query(),
+        Some(state.client_address(parts).to_string()),
+    );
+    let info = state.auth_service().authenticate(&ctx).await?;
+    if !info.is_authenticated {
+        return Err(ApiError::Unauthorized("invalid credentials".to_owned()));
+    }
+    Ok(info)
+}
+
+/// Applies DefaultAuthorizationHandler in upstream order. Production contexts
+/// carry a shared policy from the token cache; alternate injected auth services
+/// can resolve it through UserManager once here.
+async fn default_authorization(
+    mut info: AuthorizationInfo,
+    parts: &Parts,
+    state: &AppState,
+    validate_schedule: bool,
+) -> Result<AuthorizationInfo, ApiError> {
+    if info.is_api_key {
+        return Ok(info);
+    }
+    if info.user_id().is_nil() {
+        return Err(ApiError::Forbidden("user identity required".to_owned()));
+    }
+    if info.user_policy.is_none()
+        && let Some(user) = &info.user
+    {
+        info.user_policy = crate::handlers::users::user_policy(state, user)
+            .await?
+            .map(std::sync::Arc::new);
+    }
+    let policy = info
+        .user_policy
+        .as_ref()
+        .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
+    if policy.is_disabled {
+        return Err(ApiError::Unauthorized("account disabled".to_owned()));
+    }
+    if !state.is_in_local_network(state.client_address(parts)) && !policy.enable_remote_access {
+        return Err(ApiError::Forbidden(
+            "remote access is not permitted for this user".to_owned(),
+        ));
+    }
+    if !policy.is_administrator
+        && validate_schedule
+        && !parental_schedule_allows(&policy.access_schedules, chrono::Local::now())
+    {
+        return Err(ApiError::Forbidden(
+            "outside this user's access schedule".to_owned(),
+        ));
+    }
+    Ok(info)
+}
+
+/// Jellyfin's default policy: authenticated API key or user, with remote access
+/// and the current access schedule checked on every request.
 #[derive(Debug, Clone)]
 pub struct RequireAuth(pub AuthorizationInfo);
-
 impl FromRequestParts<AppState> for RequireAuth {
     type Rejection = ApiError;
-
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(info) = parts
-            .extensions
-            .get::<AuthorizationInfo>()
-            .filter(|i| i.is_authenticated)
-        {
-            return Ok(Self(info.clone()));
-        }
-        let ctx = request_context(
-            &parts.headers,
-            parts.uri.query(),
-            Some(state.client_address(parts).to_string()),
-        );
-        let info = state.auth_service().authenticate(&ctx).await?;
-        Ok(Self(info))
+        let info = authenticated_info(parts, state).await?;
+        Ok(Self(default_authorization(info, parts, state, true).await?))
+    }
+}
+
+/// Default authorization with the schedule exemption used by GetUserById.
+/// Remote-access restrictions still apply.
+#[derive(Debug, Clone)]
+pub struct RequireAuthIgnoringSchedule(pub AuthorizationInfo);
+impl FromRequestParts<AppState> for RequireAuthIgnoringSchedule {
+    type Rejection = ApiError;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let info = authenticated_info(parts, state).await?;
+        Ok(Self(
+            default_authorization(info, parts, state, false).await?,
+        ))
+    }
+}
+
+/// Elevation combined with a controller-level default policy, as on
+/// ConfigurationController and ItemLookupController. Unlike bare elevation,
+/// these routes also enforce the user's remote-access restriction.
+#[derive(Debug, Clone)]
+pub struct RequireAdminWithDefault(pub AuthorizationInfo);
+impl FromRequestParts<AppState> for RequireAdminWithDefault {
+    type Rejection = ApiError;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
+        Ok(Self(default_authorization(info, parts, state, true).await?))
     }
 }
 
@@ -189,12 +234,15 @@ impl FromRequestParts<AppState> for RequireAdmin {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+        let info = authenticated_info(parts, state).await?;
         if info.is_api_key {
             return Ok(Self(info));
         }
         if let Some(user) = &info.user
-            && crate::handlers::users::is_administrator(state, user).await?
+            && match &info.user_policy {
+                Some(policy) => policy.is_administrator,
+                None => crate::handlers::users::is_administrator(state, user).await?,
+            }
         {
             return Ok(Self(info));
         }
@@ -334,56 +382,18 @@ async fn require_user_permission(
     state: &AppState,
     permission: fn(&ferrofin_model::users::UserPolicy) -> bool,
 ) -> Result<(AuthorizationInfo, Option<ferrofin_model::users::UserPolicy>), ApiError> {
-    // Read the peer before `RequireAuth` borrows `parts` mutably.
-    //
-    // C# asks `_networkManager.IsInLocalNetwork(HttpContext.GetNormalizedRemoteIP())`,
-    // and `GetNormalizedRemoteIP` resolves a missing peer to loopback — i.e.
-    // local. `client_address` already defaults the same way, so this is a
-    // faithful port with no guard. That differs from
-    // [`RequireLocalAccessOrAdmin`], which deliberately reads a missing peer as
-    // *remote*; the divergence there is documented and is not copied here,
-    // because a parity extractor should not invent a second divergence. Neither
-    // choice is reachable in served traffic — the composition root installs
-    // `with_connect_info`, so the peer is missing only under synthetic test
-    // routing.
-    let is_in_local_network = state.is_in_local_network(state.client_address(parts));
-
     let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
-
-    // 1. "Api keys are unrestricted."
     if info.is_api_key {
         return Ok((info, None));
     }
-
-    // C# throws `ResourceNotFoundException` when the token's user has vanished;
-    // here an absent policy means the same thing and is refused rather than
-    // silently granted.
-    let Some(user) = &info.user else {
-        return Err(ApiError::Forbidden("user permission required".to_owned()));
-    };
-    let Some(policy) = crate::handlers::users::user_policy(state, user).await? else {
-        return Err(ApiError::Forbidden("user permission required".to_owned()));
-    };
-
-    // 2. "User cannot access remotely and user is remote" — before the admin arm.
-    if !is_in_local_network && !policy.enable_remote_access {
-        return Err(ApiError::Forbidden(
-            "remote access is not permitted for this user".to_owned(),
-        ));
-    }
-
-    // 3. "Admins can do everything."
+    let policy = info
+        .user_policy
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| ApiError::Forbidden("user permission required".to_owned()))?;
     if policy.is_administrator {
         return Ok((info, Some(policy)));
     }
-
-    // 4. The parental/access schedule, which `UserPermissionRequirement` validates.
-    if !parental_schedule_allows(&policy.access_schedules, chrono::Local::now()) {
-        return Err(ApiError::Forbidden(
-            "outside this user's access schedule".to_owned(),
-        ));
-    }
-
     // 5. The permission the policy names.
     if permission(&policy) {
         return Ok((info, Some(policy)));
@@ -517,7 +527,7 @@ impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
             .is_some()
             && state.is_in_local_network(state.client_address(parts));
         if local {
-            let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
+            let info = authenticated_info(parts, state).await?;
             return Ok(Self(info));
         }
         let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
@@ -553,11 +563,19 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
-            return Ok(Self(state.auth_service().authenticate(&ctx).await.ok()));
+            let info = state.auth_service().authenticate(&ctx).await.ok();
+            let info = match info {
+                Some(info) if info.is_api_key || !info.user_id().is_nil() => {
+                    Some(default_authorization(info, parts, state, false).await?)
+                }
+                other => other,
+            };
+            return Ok(Self(info));
         }
-        // Setup complete → require a valid token.
-        let info = state.auth_service().authenticate(&ctx).await?;
-        Ok(Self(Some(info)))
+        let info = authenticated_info(parts, state).await?;
+        Ok(Self(Some(
+            default_authorization(info, parts, state, false).await?,
+        )))
     }
 }
 
@@ -595,10 +613,19 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
-            return Ok(Self(state.auth_service().authenticate(&ctx).await.ok()));
+            let info = state.auth_service().authenticate(&ctx).await.ok();
+            let info = match info {
+                Some(info) if info.is_api_key || !info.user_id().is_nil() => {
+                    Some(default_authorization(info, parts, state, false).await?)
+                }
+                other => other,
+            };
+            return Ok(Self(info));
         }
         let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
-        Ok(Self(Some(info)))
+        Ok(Self(Some(
+            default_authorization(info, parts, state, false).await?,
+        )))
     }
 }
 

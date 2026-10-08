@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
@@ -60,7 +60,7 @@ use crate::state::AppState;
 )]
 async fn get_external_id_infos(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
     if state.library.get_item_by_id(item_id).await?.is_none() {
@@ -252,7 +252,7 @@ remote_search_handler! {
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Person` — port of `GetPersonRemoteSearchResults`.
-    fn person_remote_search(PersonLookupInfo, BaseItemKind::Person, "Person", RequireAdmin)
+    fn person_remote_search(PersonLookupInfo, BaseItemKind::Person, "Person", RequireAdminWithDefault)
 }
 remote_search_handler! {
     /// `POST /Items/RemoteSearch/Book` — port of `GetBookRemoteSearchResults`.
@@ -305,7 +305,7 @@ fn default_true() -> bool {
 )]
 async fn apply_search_criteria(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,

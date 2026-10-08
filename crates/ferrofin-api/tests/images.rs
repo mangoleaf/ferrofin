@@ -224,7 +224,7 @@ impl AuthService for OkAuth {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -246,7 +246,7 @@ impl AuthorizationContext for OkAuth {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }

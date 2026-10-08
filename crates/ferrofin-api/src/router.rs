@@ -266,14 +266,14 @@ mod tests {
 
     #[tokio::test]
     async fn real_authenticated_route_returns_401_without_token() {
-        // `/System/Info` now has a real handler behind `RequireAuth`; the fake
+        // `/System/Endpoint` now has a real handler behind `RequireAuth`; the fake
         // auth service rejects the tokenless request, so it is `401` (route
         // exists) rather than the `501` stub or a `404`.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/System/Info")
+                    .uri("/System/Endpoint")
                     .body(Body::empty())
                     .unwrap(),
             )

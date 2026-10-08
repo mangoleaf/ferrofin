@@ -587,6 +587,18 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         remote_endpoint: Some("1.2.3.4".to_owned()),
         ..AuthenticationRequest::default()
     };
+    assert!(matches!(
+        mgr.authenticate_new_session(&request).await,
+        Err(ServiceError::Forbidden(_))
+    ));
+    set_permission(
+        db.writer(),
+        &user.id,
+        PermissionKind::EnableRemoteAccess,
+        true,
+    )
+    .await
+    .unwrap();
     let result = mgr.authenticate_new_session(&request).await.unwrap();
     assert_eq!(result.session.user_id, user_id);
     assert!(

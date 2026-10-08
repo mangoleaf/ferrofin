@@ -2020,8 +2020,8 @@ async fn delete_items_stops_at_the_first_refused_id() {
 }
 
 /// An API key has no user, so `CanDelete(user)` is not asked (upstream's
-/// `user is not null && …`); a token whose user is gone is `404` on the
-/// single delete and `401` on the batch, as upstream.
+/// `user is not null && …`); a token with no user identity is refused by the
+/// default policy before either delete handler can run.
 #[tokio::test]
 async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
     let item_id = Uuid::from_u128(0xAB54);
@@ -2038,8 +2038,8 @@ async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
         assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
     }
     for (uri, expected) in [
-        (format!("/Items/{item_id}"), StatusCode::NOT_FOUND),
-        (format!("/Items?ids={item_id}"), StatusCode::UNAUTHORIZED),
+        (format!("/Items/{item_id}"), StatusCode::FORBIDDEN),
+        (format!("/Items?ids={item_id}"), StatusCode::FORBIDDEN),
     ] {
         let (state, deleted) = two_item_state(
             item_id,

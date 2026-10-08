@@ -53,7 +53,7 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::user_uuid;
@@ -510,17 +510,32 @@ async fn get_users(
 /// `GET /Users/Public` — the login-screen-visible users.
 ///
 /// Port of `UserController.GetPublicUsers`: only non-hidden, non-disabled users
-/// are returned, regardless of the startup-wizard state (Jellyfin excludes hidden
-/// and disabled users in both wizard states). The device/network narrowing the C#
-/// applies needs a network manager (deferred at this layer), so it is not applied.
+/// are returned in both wizard states. After setup, remote callers only see
+/// accounts that allow remote access, using the shared live network policy.
 #[utoipa::path(
     get,
     path = "/Users/Public",
     responses((status = 200, description = "Public users returned", body = [UserDto])),
     tag = "ferrofin"
 )]
-async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, Some(false), Some(false)).await?;
+async fn get_public_users(
+    State(state): State<AppState>,
+    parts: Parts,
+) -> Result<Json<Vec<UserDto>>, ApiError> {
+    let mut dtos = filtered_user_dtos(&state, Some(false), Some(false)).await?;
+    if state
+        .config
+        .configuration()
+        .await?
+        .is_startup_wizard_completed
+        && !state.is_in_local_network(state.client_address(&parts))
+    {
+        dtos.retain(|dto| {
+            dto.policy
+                .as_ref()
+                .is_some_and(|policy| policy.enable_remote_access)
+        });
+    }
     Ok(Json(dtos))
 }
 
@@ -568,7 +583,7 @@ async fn filtered_user_dtos(
 )]
 async fn get_user_by_id(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuthIgnoringSchedule(_auth): RequireAuthIgnoringSchedule,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;

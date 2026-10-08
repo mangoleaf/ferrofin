@@ -1,0 +1,79 @@
+{
+  "findings": [
+    "C01\u2013C04",
+    "G01\u2013G09",
+    "U01\u2013U07"
+  ],
+  "base_commit": "782ca9f28cc938bf15b5a55b425c435673d2f392",
+  "rust_version": "1.98.1",
+  "checks": {
+    "fmt": true,
+    "strict_workspace_clippy_all_targets_all_features": true,
+    "workspace_tests": {
+      "passed": 7772,
+      "skipped": 5,
+      "failed": 0
+    },
+    "doctests": {
+      "passed": 3,
+      "failed": 0
+    },
+    "per_crate_line_coverage_percent": {
+      "ferrofin-util": 96.1,
+      "ferrofin-common": 87.18,
+      "ferrofin-model": 86.86,
+      "ferrofin-drawing": 91.41,
+      "ferrofin-mediaencoding": 93.74,
+      "ferrofin-providers": 93.2,
+      "ferrofin-livetv": 93.83,
+      "ferrofin-extensions": 94.87,
+      "ferrofin-api": 87.19,
+      "ferrofin-core": 93.85
+    }
+  },
+  "native_browse_consistency": {
+    "workload": "bench/screens.js SHAPE=1",
+    "server_cpus": "8-15",
+    "client_cpus": "16-19",
+    "counts": {
+      "MovieCount": 3001,
+      "SeriesCount": 250,
+      "EpisodeCount": 7490,
+      "ArtistCount": 296,
+      "ProgramCount": 0,
+      "TrailerCount": 0,
+      "SongCount": 8000,
+      "AlbumCount": 800,
+      "MusicVideoCount": 0,
+      "BoxSetCount": 0,
+      "BookCount": 0,
+      "ItemCount": 0
+    },
+    "responses_per_build": 146,
+    "statuses_per_build": {
+      "200": 144,
+      "204": 2
+    },
+    "identical_response_shapes": true,
+    "plugins_disabled_both": true,
+    "latency_measured": false,
+    "idle_rejections_percent": [
+      83.8,
+      80.1,
+      23.7
+    ],
+    "required_idle_percent": 90,
+    "memory_measured": false,
+    "docker_available": false
+  },
+  "binaries": {
+    "before": {
+      "sha256": "15584e754010b2eb1a785133d260b0de9b280a3944cfd4cba61b700bb9bdf96f",
+      "profile": "release"
+    },
+    "after": {
+      "sha256": "db803c7501101cd6e7a68bd4e96e52a7589fb6d9aebe31c5513a3d04b30cdc24",
+      "profile": "release"
+    }
+  }
+}

@@ -17,7 +17,7 @@ use ferrofin_model::system::{LogFile, PublicSystemInfo, SystemInfo};
 use ferrofin_model::system_info_dtos::SystemStorageDto;
 use ferrofin_traits::net::RequestContext;
 
-use crate::auth::{RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
+use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::state::AppState;
@@ -35,9 +35,8 @@ fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
 
 /// `GET /System/Info` — the full system information for an authenticated client.
 ///
-/// Port of `SystemController.GetSystemInfo`. Requires a valid token (Jellyfin's
-/// `FirstTimeSetupOrIgnoreParentalControl` policy collapses to "authenticated"
-/// at this layer).
+/// Port of `SystemController.GetSystemInfo`: allows first-time setup, then
+/// enforces default authorization with its explicit schedule exemption.
 #[utoipa::path(
     get,
     path = "/System/Info",
@@ -46,7 +45,7 @@ fn context_from_parts(state: &AppState, parts: &Parts) -> RequestContext {
 )]
 async fn get_system_info(
     State(state): State<AppState>,
-    _auth: RequireAuth,
+    _auth: FirstTimeSetupOrAuth,
     parts: Parts,
 ) -> Result<Json<SystemInfo>, ApiError> {
     let ctx = context_from_parts(&state, &parts);

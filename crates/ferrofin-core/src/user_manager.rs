@@ -20,10 +20,8 @@
 //! separately).
 //!
 //! Faithful port simplifications, each flagged:
-//! - `authenticate_user` cannot consult a `NetworkManager` (no such trait exists
-//!   yet), so the C# "remote access disabled and caller not on the LAN" check is
-//!   omitted; the disabled-account, lockout, and parental-schedule checks are
-//!   preserved.
+//! - `authenticate_user` shares the configured network policy with HTTP auth,
+//!   and enforces disabled accounts, remote access, lockout and access schedules.
 //! - `get_user_dto` assembles the full [`UserDto`](ferrofin_model::dto::UserDto)
 //!   (policy + configuration) from the `Users` row and its
 //!   `Permissions`/`Preferences`/`AccessSchedules`, including the profile-image
@@ -33,7 +31,7 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -87,6 +85,7 @@ mod user_repository;
 pub struct FerrofinUserManager {
     db: Database,
     login_locks: Arc<LoginLocks>,
+    network: Option<Arc<RwLock<ferrofin_networking::NetworkManager>>>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
@@ -281,6 +280,7 @@ impl FerrofinUserManager {
         Self {
             db,
             login_locks: Arc::new(Mutex::new(HashMap::new())),
+            network: None,
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
@@ -290,6 +290,33 @@ impl FerrofinUserManager {
             profile_image_dir: None,
             image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
+        }
+    }
+
+    /// Shares the live network policy used by HTTP authorization and trusted
+    /// proxy resolution, so saved LAN definitions also govern password login.
+    #[must_use]
+    pub fn with_network(
+        mut self,
+        network: Arc<RwLock<ferrofin_networking::NetworkManager>>,
+    ) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    fn is_local_client(&self, remote: &str) -> bool {
+        static DEFAULT_NETWORK: LazyLock<ferrofin_networking::NetworkManager> =
+            LazyLock::new(|| {
+                ferrofin_networking::NetworkManager::live(
+                    ferrofin_networking::NetworkConfiguration::default(),
+                )
+            });
+        match &self.network {
+            Some(network) => network
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_in_local_network_str(remote),
+            None => DEFAULT_NETWORK.is_in_local_network_str(remote),
         }
     }
 
@@ -897,7 +924,6 @@ impl UserManager for FerrofinUserManager {
         remote_endpoint: &str,
         is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError> {
-        let _ = remote_endpoint; // No NetworkManager yet — see module docs.
         if username.trim().is_empty() {
             return Err(ServiceError::invalid_input("username must not be empty"));
         }
@@ -929,6 +955,14 @@ impl UserManager for FerrofinUserManager {
                 "The {} account is currently disabled. Please consult with your administrator.",
                 user.username
             )));
+        }
+
+        if !self.is_local_client(remote_endpoint)
+            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
+        {
+            return Err(ServiceError::Forbidden(
+                "remote access is not permitted for this user".to_owned(),
+            ));
         }
 
         if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {

@@ -173,3 +173,42 @@ async fn provider_provisioning_uses_canonical_name_and_new_user_policy() {
     assert!(policy.is_hidden);
     assert_eq!(policy.max_active_sessions, 3);
 }
+
+#[tokio::test]
+async fn password_login_uses_live_network_classification_for_remote_policy() {
+    let db = crate::test_support::test_db().await;
+    let mut config = ferrofin_networking::NetworkConfiguration::default();
+    let network = Arc::new(RwLock::new(
+        ferrofin_networking::NetworkManager::with_defaults(config.clone(), "127.0.0.1,1,lo"),
+    ));
+    let mgr = FerrofinUserManager::new(db).with_network(network.clone());
+    let user = mgr.create_user("local-only").await.unwrap();
+    let uid = Uuid::parse_str(&user.id).unwrap();
+    let mut policy = UserPolicy {
+        enable_remote_access: false,
+        ..Default::default()
+    };
+    for admin in [false, true] {
+        policy.is_administrator = admin;
+        mgr.update_policy(uid, &policy).await.unwrap();
+        assert!(
+            mgr.authenticate_user("local-only", "", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            mgr.authenticate_user("local-only", "", "203.0.113.8", true)
+                .await,
+            Err(ServiceError::Forbidden(_))
+        ));
+    }
+    config.local_network_subnets = vec!["203.0.113.0/24".into()];
+    network.write().unwrap().update_settings(&config);
+    assert!(
+        mgr.authenticate_user("local-only", "", "203.0.113.8", true)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

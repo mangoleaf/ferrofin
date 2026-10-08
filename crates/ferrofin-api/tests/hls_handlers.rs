@@ -220,7 +220,7 @@ fn ok_auth_info() -> AuthorizationInfo {
     AuthorizationInfo {
         token: Some(ferrofin_model::secret::Secret::new("token")),
         is_authenticated: true,
-        ..AuthorizationInfo::default()
+        ..ferrofin_api::test_support::authenticated_user_info()
     }
 }
 
