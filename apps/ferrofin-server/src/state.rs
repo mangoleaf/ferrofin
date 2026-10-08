@@ -1225,6 +1225,16 @@ pub async fn build_app_state(
         .with_by_name_store(by_name_store),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
+    let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+        Arc::clone(&paths) as Arc<_>;
+    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
+        Arc::new(FerrofinCollectionManager::new(
+            db.clone(),
+            Arc::clone(&library),
+            Arc::clone(&linked_children_service),
+            Arc::clone(&collection_paths),
+        ));
+    library_scanner.attach_collections(&collections);
     // The library monitor drives refreshes from two change sources: the
     // external-source webhooks (`POST /Library/{Series,Movies,Media}/{Added,
     // Updated}` — Radarr/Sonarr pokes) and the live OS filesystem watcher over
@@ -1573,15 +1583,6 @@ pub async fn build_app_state(
         task_manager.register(task);
     }
     wasm_host.subscribe_events(&event_bus, &plugins);
-    let collection_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-        Arc::clone(&paths) as Arc<_>;
-    let collections: Arc<dyn ferrofin_traits::collections::CollectionManager> =
-        Arc::new(FerrofinCollectionManager::new(
-            db.clone(),
-            Arc::clone(&library),
-            Arc::clone(&linked_children_service),
-            Arc::clone(&collection_paths),
-        ));
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> =
         Arc::new(FerrofinPlaylistManager::new(
             db.clone(),

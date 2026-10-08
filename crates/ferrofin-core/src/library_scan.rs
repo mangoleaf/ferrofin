@@ -2514,7 +2514,7 @@ impl PlanCtx<'_> {
 
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 9;
+const POST_SCAN_PASSES: u32 = 10;
 
 /// How long each closing pass of one library validation took, logged once
 /// at its end and recorded on `ferrofin_library_scan_pass_duration_seconds`.
@@ -2529,6 +2529,7 @@ struct PassTimings {
     studios: std::time::Duration,
     library_images: std::time::Duration,
     dynamic_images: std::time::Duration,
+    collections: std::time::Duration,
 }
 
 impl PassTimings {
@@ -2545,6 +2546,7 @@ impl PassTimings {
             studios,
             library_images,
             dynamic_images,
+            collections,
         ] = crate::scan_metrics::SCAN_PASSES;
         crate::scan_metrics::passes_finished(&[
             (music, self.music),
@@ -2556,6 +2558,7 @@ impl PassTimings {
             (studios, self.studios),
             (library_images, self.library_images),
             (dynamic_images, self.dynamic_images),
+            (collections, self.collections),
         ]);
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
@@ -2569,6 +2572,7 @@ impl PassTimings {
             studios_ms = ms(self.studios),
             library_images_ms = ms(self.library_images),
             dynamic_images_ms = ms(self.dynamic_images),
+            collections_ms = ms(self.collections),
             "post-scan passes complete"
         );
     }
@@ -2794,6 +2798,8 @@ pub struct LibraryScanner {
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
+    collections:
+        std::sync::OnceLock<std::sync::Weak<dyn ferrofin_traits::collections::CollectionManager>>,
     file_system: Arc<dyn FileSystem>,
     persistence: Arc<dyn ItemPersistenceService>,
     /// The per-database item-id derivation mode (see
@@ -2984,6 +2990,7 @@ impl LibraryScanner {
     ) -> Self {
         Self {
             virtual_folders,
+            collections: std::sync::OnceLock::new(),
             file_system,
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence,
@@ -3021,6 +3028,15 @@ impl LibraryScanner {
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Connects the post-scan collection manager after the library is built.
+    /// A weak reference avoids a scanner → collections → library → scanner cycle.
+    pub fn attach_collections(
+        &self,
+        collections: &Arc<dyn ferrofin_traits::collections::CollectionManager>,
+    ) {
+        let _ = self.collections.set(Arc::downgrade(collections));
     }
 
     /// Shares scan progress with the library dashboard reader.
@@ -6050,6 +6066,7 @@ impl LibraryScanner {
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`) | `CollectionFolderImageProvider` |
     /// | dynamic images | per item: no generated Primary yet, or its file changed (`HasChangedByDate`) | `BaseDynamicImageProvider.HasChanged` |
+    /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     // One straight sequence of the closing passes, each timed; a helper per
     // pass would only scatter the table above.
     #[allow(clippy::too_many_lines)]
@@ -6189,6 +6206,17 @@ impl LibraryScanner {
             }
         }
         timings.dynamic_images = started.elapsed();
+        if !self.between_passes(run, &mut done).await {
+            return false;
+        }
+        let started = std::time::Instant::now();
+        if let Err(err) = self.refresh_automatic_collections(run).await {
+            tracing::warn!(%err, "automatic collection pass failed");
+        }
+        timings.collections = started.elapsed();
+        if run.cancel.is_cancelled() {
+            return false;
+        }
         timings.log(work.music.len());
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
@@ -12708,6 +12736,13 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     if n.date_created.is_some() {
         entity.date_created = n.date_created;
     }
+    fill_provider_data(
+        entity,
+        "CollectionName",
+        n.collection_name
+            .as_ref()
+            .map(|name| serde_json::json!(name)),
+    );
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
     merge_multi_value(&mut entity.tags, &n.tags);
@@ -14855,6 +14890,7 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
         .collect()
 }
 
+mod collections;
 mod fanout;
 mod music;
 
