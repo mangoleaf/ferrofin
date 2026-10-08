@@ -99,8 +99,9 @@ struct ProviderEraseQuery {
 }
 
 /// `DELETE /MediaSegments/Provider/{providerId}` — erases every segment a provider
-/// wrote, optionally limited to one type. Backs a provider's bulk "erase
-/// timestamps" tool (e.g. Intro Skipper). Not a Jellyfin contract route; additive.
+/// wrote, optionally limited to one type. Not a Jellyfin contract route;
+/// additive. (Intro Skipper's erase goes through its own tier, `POST
+/// /Intros/EraseTimestamps`; rows removed here would be republished from it.)
 ///
 /// Elevated: a server-wide erase, as every bulk segment erase upstream is
 /// (`SkipIntroController.ResetIntroTimestamps`, `EraseSeasonAsync` are

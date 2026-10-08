@@ -4,7 +4,8 @@
 //! `BaseItemAnalyzerTask` + the I/O half of `ChromaprintAnalyzer`,
 //! GPL-3.0-only): group episodes by season, fingerprint each one's intro and
 //! credits windows, compare them within the season via [`ferrofin_chromaprint`],
-//! and write the shared regions as `Intro`/`Outro`
+//! and store the shared regions in the plugin's own segment tier
+//! ([`ferrofin_traits::intro_skipper`]), publishing them as `Intro`/`Outro`
 //! [`MediaSegmentDto`](ferrofin_model::media_segments::MediaSegmentDto)s — which is
 //! what makes jellyfin-web show the "Skip Intro" / "Skip Credits" button.
 //!
@@ -25,8 +26,8 @@ use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode as WireMode, AnalyzerAction};
-use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -42,19 +43,8 @@ use crate::{Extension, ExtensionContext};
 /// client integrations address the plugin by that id.
 const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
-/// The media-segment provider id stamped on segments this extension writes, so a
-/// re-run replaces only its own rows (never user-authored ones).
-const PROVIDER_ID: &str = "IntroSkipper";
-
 /// 100-nanosecond ticks per second (Jellyfin's `MediaSegment` time unit).
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
-
-/// Converts seconds to 100-nanosecond ticks (segment start/end are far below the
-/// `i64` range, so the truncation is intentional and lossless in practice).
-#[allow(clippy::cast_possible_truncation)]
-fn secs_to_ticks(secs: f64) -> i64 {
-    (secs * TICKS_PER_SECOND) as i64
-}
 
 /// Converts 100-nanosecond ticks to seconds (episode runtimes are well within
 /// `f64`'s exact-integer range).
@@ -179,7 +169,15 @@ impl ScheduledTask for MediaSegmentScanTask {
         }]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
-        self.detect.execute(progress).await
+        self.detect.execute(progress).await?;
+        // Upstream this task runs the plugin's `SegmentProvider`, which
+        // publishes the stored segments whatever `UpdateMediaSegments` says;
+        // detection here publishes only when it is on, so the scan publishes
+        // the rest itself.
+        if self.detect.enabled().await && !self.detect.load_config().await.update_media_segments {
+            self.detect.publish_stored().await;
+        }
+        Ok(())
     }
 }
 
@@ -627,6 +625,26 @@ impl DetectSegmentsTask {
         tracing::info!(segments = written, "intro skipper: analysis complete");
     }
 
+    /// Publishes every stored item's segments (the plugin's `SegmentProvider`
+    /// as the Media Segment Scan runs it), logging a failed item and going on.
+    async fn publish_stored(&self) {
+        let items = match self.actions.stored_item_ids().await {
+            Ok(items) => items,
+            Err(err) => {
+                tracing::error!(%err, "intro skipper: could not list stored segments to publish");
+                return;
+            }
+        };
+        for item_id in items {
+            if let Err(err) =
+                intro_store::refresh(self.actions.as_ref(), self.media_segments.as_ref(), item_id)
+                    .await
+            {
+                tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
+            }
+        }
+    }
+
     /// Whether the extension's plugin is currently enabled.
     async fn enabled(&self) -> bool {
         matches!(
@@ -708,8 +726,9 @@ impl DetectSegmentsTask {
             intros = self
                 .write_segments(
                     &best,
-                    MediaSegmentType::Intro,
+                    WireMode::Introduction,
                     f64::from(config.maximum_intro_duration),
+                    config,
                 )
                 .await;
         }
@@ -721,8 +740,9 @@ impl DetectSegmentsTask {
             credits = self
                 .write_segments(
                     &best,
-                    MediaSegmentType::Outro,
+                    WireMode::Credits,
                     f64::from(config.maximum_credits_duration),
+                    config,
                 )
                 .await;
         }
@@ -800,37 +820,51 @@ impl DetectSegmentsTask {
         best
     }
 
-    /// Writes the detected regions as segments of `seg_type`, replacing this
-    /// provider's prior segments on each item. Skips regions over `max_duration`.
+    /// Stores the detected regions as `mode` segments in the plugin's tier
+    /// (`Plugin.UpdateTimestampAsync`: a user-provided segment is never
+    /// replaced, analysed credits overlapping the intro are dropped), then
+    /// publishes each stored item to `MediaSegments` when `UpdateMediaSegments`
+    /// is on (`BaseItemAnalyzerTask` → `MediaSegmentRefreshService`). Skips
+    /// regions over `max_duration`; returns how many were stored.
     async fn write_segments(
         &self,
         regions: &HashMap<Uuid, TimeRange>,
-        seg_type: MediaSegmentType,
+        mode: WireMode,
         max_duration: f64,
+        config: &IntroSkipperConfig,
     ) -> usize {
         let mut count = 0;
         for (&item_id, range) in regions {
             if range.duration() > max_duration || range.duration() <= 0.0 {
                 continue;
             }
-            // Replace only our own prior rows for this type; leave user/other segments.
-            if let Err(err) = self
-                .media_segments
-                .delete_provider_segments(item_id, PROVIDER_ID, Some(seg_type))
+            let segment = StoredSegment {
+                item_id,
+                mode,
+                start: range.start,
+                end: range.end,
+                is_user_provided: false,
+                // TODO(intro-skipper step 4): `episode.AnalysisConfigHash`, so
+                // a config change re-analyses only what it affects.
+                config_hash: String::new(),
+            };
+            match self.actions.update_timestamp(segment).await {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(%err, %item_id, "intro skipper: storing a detected segment failed");
+                    continue;
+                }
+            }
+            if config.update_media_segments
+                && let Err(err) = intro_store::refresh(
+                    self.actions.as_ref(),
+                    self.media_segments.as_ref(),
+                    item_id,
+                )
                 .await
             {
-                tracing::debug!(%err, %item_id, "clear prior segment failed");
-            }
-            let dto = MediaSegmentDto {
-                id: Uuid::new_v4(),
-                item_id,
-                type_: seg_type,
-                start_ticks: secs_to_ticks(range.start),
-                end_ticks: secs_to_ticks(range.end),
-            };
-            match self.media_segments.create_segment(&dto, PROVIDER_ID).await {
-                Ok(_) => count += 1,
-                Err(err) => tracing::debug!(%err, %item_id, "write segment failed"),
+                tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
             }
         }
         count
@@ -977,6 +1011,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 
     #[test]
     fn default_config_round_trips_json() {
@@ -1123,8 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn ticks_round_trip_through_seconds() {
-        assert_eq!(secs_to_ticks(1.5), 15_000_000);
+    fn ticks_convert_to_seconds() {
         assert_eq!(ticks_to_secs(15_000_000), 1.5);
     }
 
@@ -1478,6 +1512,69 @@ mod tests {
         );
     }
 
+    /// `Plugin.UpdateTimestampAsync`: analysis never replaces a user-provided
+    /// segment, so a corrected intro survives the next detection run (it used
+    /// to be clobbered: both wrote the same provider's `MediaSegments` row).
+    #[tokio::test]
+    async fn a_user_provided_intro_survives_detection() {
+        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_A,
+                mode: WireMode::Introduction,
+                start: 1.0,
+                end: 2.5,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("store");
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("execute");
+        let a = intros_of(&h.segments, EP_A).await;
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].start_ticks, a[0].end_ticks), (10_000_000, 25_000_000));
+        // The other episode got the detected intro, under Jellyfin's provider id.
+        assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
+    }
+
+    /// With `UpdateMediaSegments` off, detection only stores; the Media
+    /// Segment Scan then publishes the stored segments, as upstream's
+    /// `SegmentProvider` does when that task runs it.
+    #[tokio::test]
+    async fn the_segment_scan_publishes_when_detection_does_not() {
+        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
+        let h = harness(
+            &TWO_EPISODES,
+            true,
+            r#"{"UpdateMediaSegments":false}"#,
+            true,
+        )
+        .await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let tier = h.actions.segments(EP_A).await.expect("tier");
+        assert!(
+            tier.iter().any(|s| s.mode == WireMode::Introduction),
+            "stored"
+        );
+        assert!(
+            intros_of(&h.segments, EP_A).await.is_empty(),
+            "not published yet"
+        );
+        let scan = MediaSegmentScanTask {
+            detect: Arc::new(h.task.clone()),
+        };
+        scan.execute(&TaskProgress::default()).await.expect("scan");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn a_rerun_reuses_the_fingerprint_cache() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
@@ -1545,7 +1642,12 @@ mod tests {
         let regions = HashMap::from([(EP_A, TimeRange::new(0.0, 30.0))]);
         assert_eq!(
             h.task
-                .write_segments(&regions, MediaSegmentType::Intro, 0.0)
+                .write_segments(
+                    &regions,
+                    WireMode::Introduction,
+                    0.0,
+                    &IntroSkipperConfig::default()
+                )
                 .await,
             0
         );
@@ -1553,7 +1655,12 @@ mod tests {
         let empty = HashMap::from([(EP_A, TimeRange::new(5.0, 5.0))]);
         assert_eq!(
             h.task
-                .write_segments(&empty, MediaSegmentType::Intro, 600.0)
+                .write_segments(
+                    &empty,
+                    WireMode::Introduction,
+                    600.0,
+                    &IntroSkipperConfig::default()
+                )
                 .await,
             0
         );

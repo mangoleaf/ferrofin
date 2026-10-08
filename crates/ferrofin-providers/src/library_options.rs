@@ -685,7 +685,7 @@ fn similarity_providers() -> Vec<Provider> {
             images: NO_IMAGES,
         },
         Provider {
-            name: "IntroSkipper",
+            name: "Intro Skipper",
             caps: &[Cap::MediaSegment],
             types: &["Episode", "Movie"],
             default_enabled: true,
@@ -1325,7 +1325,7 @@ mod tests {
         assert!(
             info.media_segment_providers
                 .iter()
-                .any(|o| o.name.as_deref() == Some("IntroSkipper"))
+                .any(|o| o.name.as_deref() == Some("Intro Skipper"))
         );
         assert!(!movie.supported_image_types.is_empty());
     }

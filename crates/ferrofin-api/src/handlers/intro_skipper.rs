@@ -9,12 +9,14 @@
 //! the extension in, so the routes are served here over the same managers the
 //! rest of the API uses.
 //!
-//! **Data-model mapping.** The upstream plugin keeps a private SQLite database
-//! of per-mode timestamps plus an on-disk fingerprint cache. Ferrofin has no
-//! separate plugin store: the detected boundaries live directly in the core
-//! `MediaSegments` table under the provider id `IntroSkipper`. So a
-//! "timestamp" read/write here is a `MediaSegments` read/write, and the plugin
-//! `AnalysisMode` maps onto [`MediaSegmentType`]:
+//! **Data-model mapping.** As upstream, the plugin keeps its own segment tier
+//! (detected and user-provided timestamps, season state, disabled episodes —
+//! Ferrofin-owned tables behind [`ferrofin_traits::intro_skipper`]) plus an
+//! on-disk fingerprint cache. A "timestamp" read/write here is a read/write of
+//! that tier; what clients play against is published into the core
+//! `MediaSegments` table under Jellyfin's provider id for the plugin (the MD5
+//! of `intro skipper`), with the plugin `AnalysisMode` mapped onto
+//! [`MediaSegmentType`]:
 //!
 //! | `AnalysisMode` | [`MediaSegmentType`] |
 //! |----------------|----------------------|
@@ -24,9 +26,8 @@
 //! | Recap          | `Recap`              |
 //! | Commercial     | `Commercial`         |
 //!
-//! Two routes are thinner than upstream because the backing subsystem does
-//! not exist in Ferrofin — each is documented at its handler:
-//! `Intros/RebuildDatabase` (no separate DB to rebuild) and
+//! One route is thinner than upstream because the backing subsystem does not
+//! exist in Ferrofin, documented at its handler:
 //! `FileTransformation/RegisterTransformation` (no web-asset pipeline to hook).
 
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::tasks::TaskState;
+use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
 use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -54,8 +56,6 @@ use crate::state::AppState;
 /// `ferrofin-extensions` — the upstream plugin's GUID, which the plugin's own
 /// dashboard app and client integrations hardcode).
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
-/// The media-segment provider id the extension writes its rows under.
-const PROVIDER_ID: &str = "IntroSkipper";
 /// The scheduled-task key that runs a detection pass.
 const DETECT_TASK_KEY: &str = "IntroSkipper.Detect";
 /// One second expressed in the 100-nanosecond ticks used by segment storage.
@@ -67,32 +67,6 @@ const IMPORT_STRING: &str = r#"@import url("https://cdn.jsdelivr.net/gh/intro-sk
 // ---------------------------------------------------------------------------
 // Mode ↔ segment-type ↔ name helpers
 // ---------------------------------------------------------------------------
-
-/// Parses an `AnalysisMode` (by name or numeric discriminant) into the stored
-/// [`MediaSegmentType`]. Accepts the plugin's aliases (`intro`, `outro`).
-fn mode_to_segment_type(mode: &str) -> Option<MediaSegmentType> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "introduction" | "intro" | "0" => Some(MediaSegmentType::Intro),
-        "credits" | "outro" | "1" => Some(MediaSegmentType::Outro),
-        "preview" | "2" => Some(MediaSegmentType::Preview),
-        "recap" | "3" => Some(MediaSegmentType::Recap),
-        "commercial" | "4" => Some(MediaSegmentType::Commercial),
-        _ => None,
-    }
-}
-
-/// The `AnalysisMode` name for a stored segment type (`None` for `Unknown`,
-/// which the plugin has no mode for).
-fn segment_type_mode_name(type_: MediaSegmentType) -> Option<&'static str> {
-    match type_ {
-        MediaSegmentType::Intro => Some("Introduction"),
-        MediaSegmentType::Outro => Some("Credits"),
-        MediaSegmentType::Preview => Some("Preview"),
-        MediaSegmentType::Recap => Some("Recap"),
-        MediaSegmentType::Commercial => Some("Commercial"),
-        MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => None,
-    }
-}
 
 /// Whether a stored item `type_` names an Episode or Movie — the item kinds the
 /// plugin's timestamp routes accept. The persisted value is the full CLR type
@@ -108,11 +82,6 @@ fn is_episode_or_movie(type_name: &str) -> bool {
 #[allow(clippy::cast_precision_loss)]
 fn ticks_to_secs(ticks: i64) -> f64 {
     ticks as f64 / TICKS_PER_SECOND
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn secs_to_ticks(secs: f64) -> i64 {
-    (secs * TICKS_PER_SECOND) as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +146,7 @@ struct EpisodeVisualization {
     name: String,
 }
 
-/// Query for `POST /MediaSegmentsApi/{itemId}` — the owning provider id.
+/// Query for `POST /MediaSegmentsApi/{itemId}` (`[Required] string providerId`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSegmentQuery {
@@ -201,7 +170,8 @@ struct SegmentInput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EraseQuery {
-    mode: Option<String>,
+    #[serde(default)]
+    mode: Option<AnalysisMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +192,43 @@ async fn skip_hide_delay(state: &AppState) -> u64 {
                 .and_then(serde_json::Value::as_u64)
         })
         .unwrap_or(8)
+}
+
+/// The plugin's `UpdateMediaSegments` setting (default on): whether a change to
+/// its segment tier is published to `MediaSegments` right away.
+async fn update_media_segments(state: &AppState) -> bool {
+    let bytes = state
+        .plugins
+        .get_plugin_configuration(INTRO_SKIPPER_ID)
+        .await
+        .unwrap_or_default();
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("UpdateMediaSegments")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+/// Publishes `items`' segments when `UpdateMediaSegments` is on
+/// (`MediaSegmentRefreshService.RefreshAsync`, `suppressErrors: true`: a
+/// failure is logged and the request still succeeds — the tier already
+/// changed, and the next refresh repairs the published rows).
+async fn publish(state: &AppState, items: &[Uuid]) {
+    if update_media_segments(state).await {
+        for &item_id in items {
+            if let Err(err) = intro_store::refresh(
+                state.intro_skipper.as_ref(),
+                state.media_segments.as_ref(),
+                item_id,
+            )
+            .await
+            {
+                tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
+            }
+        }
+    }
 }
 
 /// The extension's version string (falls back to `0.0.0.0` if unknown).
@@ -257,26 +264,20 @@ async fn season_episodes(
     Ok(state.library.get_item_list(&query).await?)
 }
 
-/// Reads an item's stored segments and folds them into a [`TimeStamps`].
+/// The item's timestamps from the plugin's tier, one per mode — the
+/// earliest-starting (`Plugin.GetTimestampsAsync`).
 async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, ApiError> {
-    let segments = state
-        .media_segments
-        .get_segments(item_id, None, false)
-        .await?;
+    let segments = state.intro_skipper.segments(item_id).await?;
     let mut ts = TimeStamps::default();
-    for s in segments {
-        let seg = Segment::output(
-            item_id,
-            ticks_to_secs(s.start_ticks),
-            ticks_to_secs(s.end_ticks),
-        );
-        match s.type_ {
-            MediaSegmentType::Intro => ts.introduction = Some(seg),
-            MediaSegmentType::Outro => ts.credits = Some(seg),
-            MediaSegmentType::Recap => ts.recap = Some(seg),
-            MediaSegmentType::Preview => ts.preview = Some(seg),
-            MediaSegmentType::Commercial => ts.commercial = Some(seg),
-            MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => {}
+    for (mode, s) in intro_store::timestamps(&segments) {
+        let seg = Segment::output(item_id, s.start, s.end);
+        match mode {
+            AnalysisMode::Introduction => ts.introduction = Some(seg),
+            AnalysisMode::Credits => ts.credits = Some(seg),
+            AnalysisMode::Recap => ts.recap = Some(seg),
+            AnalysisMode::Preview => ts.preview = Some(seg),
+            AnalysisMode::Commercial => ts.commercial = Some(seg),
+            AnalysisMode::Unrecognized(_) => {}
         }
     }
     Ok(ts)
@@ -306,35 +307,32 @@ async fn update_timestamps(
         )));
     }
 
+    // `UpdateTimestampsAsync`: each valid (`End > 0`) mode is stored as
+    // user-provided — analysis never replaces it — then published.
     let modes = [
-        (timestamps.introduction, MediaSegmentType::Intro),
-        (timestamps.credits, MediaSegmentType::Outro),
-        (timestamps.recap, MediaSegmentType::Recap),
-        (timestamps.preview, MediaSegmentType::Preview),
-        (timestamps.commercial, MediaSegmentType::Commercial),
+        (AnalysisMode::Introduction, timestamps.introduction),
+        (AnalysisMode::Credits, timestamps.credits),
+        (AnalysisMode::Recap, timestamps.recap),
+        (AnalysisMode::Preview, timestamps.preview),
+        (AnalysisMode::Commercial, timestamps.commercial),
     ];
-    for (segment, type_) in modes {
-        let Some(seg) = segment else { continue };
-        if seg.end <= 0.0 {
+    for (mode, segment) in modes {
+        let Some(seg) = segment.filter(|s| s.end > 0.0) else {
             continue;
-        }
-        // Replace only this provider+type's rows, leaving other providers intact.
-        state
-            .media_segments
-            .delete_provider_segments(id, PROVIDER_ID, Some(type_))
-            .await?;
-        let dto = MediaSegmentDto {
-            id: Uuid::nil(),
-            item_id: id,
-            type_,
-            start_ticks: secs_to_ticks(seg.start),
-            end_ticks: secs_to_ticks(seg.end),
         };
         state
-            .media_segments
-            .create_segment(&dto, PROVIDER_ID)
+            .intro_skipper
+            .update_timestamp(StoredSegment {
+                item_id: id,
+                mode,
+                start: seg.start,
+                end: seg.end,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
             .await?;
     }
+    publish(&state, &[id]).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -362,52 +360,59 @@ async fn get_skippable_segments(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(id): Path<Uuid>,
-) -> Result<Json<HashMap<String, Segment>>, ApiError> {
-    let segments = state.media_segments.get_segments(id, None, false).await?;
-    let mut out = HashMap::new();
-    for s in segments {
-        if let Some(name) = segment_type_mode_name(s.type_) {
-            out.insert(
-                name.to_owned(),
-                Segment::output(id, ticks_to_secs(s.start_ticks), ticks_to_secs(s.end_ticks)),
-            );
-        }
-    }
+) -> Result<Json<std::collections::BTreeMap<AnalysisMode, Segment>>, ApiError> {
+    let segments = state.intro_skipper.segments(id).await?;
+    let out = intro_store::timestamps(&segments)
+        .into_iter()
+        .map(|(mode, s)| (mode, Segment::output(id, s.start, s.end)))
+        .collect();
     Ok(Json(out))
 }
 
 /// `POST /Intros/EraseTimestamps` — erase every stored segment of one mode.
 ///
-/// Port of `SkipIntroController.ResetIntroTimestamps`. `eraseCache` is accepted
-/// for contract compatibility but Ferrofin keeps no fingerprint cache to clear.
+/// Port of `SkipIntroController.ResetIntroTimestamps`: `[FromQuery]
+/// AnalysisMode mode` is non-nullable, so an absent one is `Introduction` and
+/// an undefined one a 400. One deliberate divergence: upstream leaves the
+/// mode's published `MediaSegments` rows until the next analysis republishes,
+/// so an erased intro keeps showing its skip button; here they go too (when
+/// `UpdateMediaSegments` is on).
+/// TODO(intro-skipper step 2): `eraseCache` (the mode's fingerprint files).
 async fn erase_timestamps(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<EraseQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let mode = query
-        .mode
-        .as_deref()
-        .and_then(mode_to_segment_type)
-        .ok_or_else(|| ApiError::BadRequest("missing or invalid 'mode'".to_owned()))?;
-    state
-        .media_segments
-        .delete_all_provider_segments(PROVIDER_ID, Some(mode))
-        .await?;
+    let mode = query.mode.unwrap_or(AnalysisMode::Introduction);
+    let Some(kind) = intro_store::segment_type(mode) else {
+        return Err(ApiError::BadRequest(format!(
+            "mode: The value '{}' is invalid.",
+            mode.value()
+        )));
+    };
+    state.intro_skipper.delete_mode(mode).await?;
+    if update_media_segments(&state).await {
+        state
+            .media_segments
+            .delete_all_provider_segments(&intro_store::provider_id(), Some(kind))
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /Intros/RebuildDatabase` — a no-op success in Ferrofin.
+/// `POST /Intros/RebuildDatabase` — rebuild the plugin's tier.
 ///
-/// The upstream plugin rebuilds its private SQLite index here. Ferrofin stores
-/// segments directly in the core `MediaSegments` table (there is no separate
-/// index to rebuild), so this reports success without work.
-// ponytail: no separate plugin DB in Ferrofin; nothing to rebuild.
+/// Port of `IntroSkipperDbContext.RebuildDatabaseAsync`: upstream backs up its
+/// rows, recreates its database and restores only valid segments (`End > 0`).
+/// Ferrofin's tables are migration-managed, so the observable effect is the
+/// prune of invalid segments. Not published, as upstream does not refresh.
 async fn rebuild_database(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-) -> StatusCode {
-    StatusCode::NO_CONTENT
+) -> Result<StatusCode, ApiError> {
+    let pruned = state.intro_skipper.prune_invalid().await?;
+    tracing::info!(pruned, "intro skipper: database rebuilt");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +428,16 @@ async fn segment_editor_metadata(
 }
 
 /// `POST /MediaSegmentsApi/{itemId}` — create/replace a segment for an item.
+///
+/// Port of `SegmentEditorController.CreateSegmentAsync`: the segment is stored
+/// as user-provided in the plugin's tier (`UpdateTimestampAsync`), then
+/// `MediaSegmentEditorService.CreateOrReplaceSegmentAsync` writes it under the
+/// plugin's provider id — replacing the item's other segments of that type
+/// (any provider), or, for a Commercial, skipping an identical one. The
+/// `providerId` query is `[Required]` (400 when absent) but not used for the
+/// write. Upstream serialises concurrent edits of one item with a per-item
+/// lock; Ferrofin does not, so two simultaneous POSTs of one type can both
+/// publish (the next refresh collapses them).
 async fn create_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -430,10 +445,48 @@ async fn create_segment(
     Query(query): Query<CreateSegmentQuery>,
     JsonBody(segment): JsonBody<SegmentInput>,
 ) -> Result<StatusCode, ApiError> {
+    if query.provider_id.is_none() {
+        return Err(ApiError::BadRequest("providerId is required".to_owned()));
+    }
     if state.library.get_item_by_id(item_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
-    let provider = query.provider_id.as_deref().unwrap_or(PROVIDER_ID);
+    let Some(mode) = intro_store::segment_mode(segment.type_) else {
+        return Err(ApiError::BadRequest(format!(
+            "segment type {:?} has no analysis mode",
+            segment.type_
+        )));
+    };
+    state
+        .intro_skipper
+        .update_timestamp(StoredSegment {
+            item_id,
+            mode,
+            start: ticks_to_secs(segment.start_ticks),
+            end: ticks_to_secs(segment.end_ticks),
+            is_user_provided: true,
+            config_hash: String::new(),
+        })
+        .await?;
+    let existing = state
+        .media_segments
+        .get_segments(item_id, Some(&[segment.type_]), false)
+        .await?;
+    if segment.type_ == MediaSegmentType::Commercial {
+        if existing
+            .iter()
+            .any(|e| e.start_ticks == segment.start_ticks && e.end_ticks == segment.end_ticks)
+        {
+            return Ok(StatusCode::OK);
+        }
+    } else {
+        for e in existing {
+            // Upstream logs a failed delete and carries on with the others.
+            if let Err(err) = state.media_segments.delete_segment(e.id).await {
+                tracing::warn!(%err, segment_id = %e.id, "intro skipper: could not delete a replaced segment");
+            }
+        }
+    }
     let dto = MediaSegmentDto {
         id: Uuid::nil(),
         item_id,
@@ -441,20 +494,93 @@ async fn create_segment(
         start_ticks: segment.start_ticks,
         end_ticks: segment.end_ticks,
     };
-    state.media_segments.create_segment(&dto, provider).await?;
+    state
+        .media_segments
+        .create_segment(&dto, &intro_store::provider_id())
+        .await?;
     Ok(StatusCode::OK)
 }
 
-/// `DELETE /MediaSegmentsApi/{segmentId}` — delete one segment by id.
+/// Query for `DELETE /MediaSegmentsApi/{segmentId}` (both `[Required]`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteSegmentQuery {
+    #[serde(default)]
+    item_id: Option<Uuid>,
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+}
+
+/// `DELETE /MediaSegmentsApi/{segmentId}` — delete one segment.
 ///
-/// (The canonical route param is `itemId`; the value here is the segment id.
-/// The `itemId`/`type` query params are accepted for contract compatibility.)
+/// Port of `SegmentEditorController.DeleteSegmentAsync`: the matching row of
+/// the plugin's tier goes first (by type, and by the published segment's
+/// bounds when it exists; a Commercial needs them), then the published
+/// segment.
+/// TODO(intro-skipper step 4): `RemoveEpisodeIdAsync` (the season state's
+/// analysed-episode list), so the episode is re-analysed.
 async fn delete_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(segment_id): Path<Uuid>,
+    Query(query): Query<DeleteSegmentQuery>,
 ) -> Result<StatusCode, ApiError> {
-    state.media_segments.delete_segment(segment_id).await?;
+    let (Some(item_id), Some(type_)) = (query.item_id, query.type_) else {
+        return Err(ApiError::BadRequest(
+            "itemId and type are required".to_owned(),
+        ));
+    };
+    let mode = match type_.to_ascii_lowercase().as_str() {
+        "intro" => AnalysisMode::Introduction,
+        "recap" => AnalysisMode::Recap,
+        "preview" => AnalysisMode::Preview,
+        "outro" | "credits" => AnalysisMode::Credits,
+        "commercial" => AnalysisMode::Commercial,
+        _ => {
+            return Err(ApiError::BadRequest(format!(
+                "Unknown segment type '{type_}'"
+            )));
+        }
+    };
+    let existing = state
+        .media_segments
+        .get_segments(item_id, None, false)
+        .await?
+        .into_iter()
+        .find(|s| s.id == segment_id);
+    let range = existing
+        .as_ref()
+        .map(|s| (ticks_to_secs(s.start_ticks), ticks_to_secs(s.end_ticks)));
+    if range.is_none() && mode == AnalysisMode::Commercial {
+        return Err(ApiError::NotFound(format!("segment {segment_id}")));
+    }
+    // The tier row goes first; if the published delete then fails, it is put
+    // back (with its user-provided flag), as upstream rolls back.
+    let removed: Vec<StoredSegment> = state
+        .intro_skipper
+        .segments(item_id)
+        .await?
+        .into_iter()
+        .filter(|s| {
+            s.mode == mode
+                && range.is_none_or(|(start, end)| {
+                    (s.start - start).abs() <= intro_store::SEGMENT_COMPARISON_EPSILON
+                        && (s.end - end).abs() <= intro_store::SEGMENT_COMPARISON_EPSILON
+                })
+        })
+        .collect();
+    state
+        .intro_skipper
+        .delete_timestamp(item_id, mode, range)
+        .await?;
+    if let Err(err) = state.media_segments.delete_segment(segment_id).await {
+        for segment in removed {
+            if let Err(restore) = state.intro_skipper.update_timestamp(segment).await {
+                tracing::error!(%restore, %item_id, "intro skipper: could not restore a segment after a failed delete");
+            }
+        }
+        return Err(err.into());
+    }
     Ok(StatusCode::OK)
 }
 
@@ -725,14 +851,16 @@ async fn erase_season(
             "season {season_id} has no episodes"
         )));
     }
-    for episode in episodes {
-        if let Ok(eid) = Uuid::parse_str(&episode.id) {
-            state
-                .media_segments
-                .delete_provider_segments(eid, PROVIDER_ID, None)
-                .await?;
-        }
-    }
+    // Every segment of the season's episodes goes, user-provided too, then
+    // the (now empty) set is republished.
+    // TODO(intro-skipper step 2): `eraseCache`; step 4: clear the season
+    // state's analysed-episode lists.
+    let ids: Vec<Uuid> = episodes
+        .iter()
+        .filter_map(|e| Uuid::parse_str(&e.id).ok())
+        .collect();
+    state.intro_skipper.delete_items(&ids).await?;
+    publish(&state, &ids).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -945,6 +1073,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 crate::query::query_parameters! {
     CreateSegmentQuery {} => [];
+    DeleteSegmentQuery {} => [];
     EraseQuery {} => [];
 }
 
@@ -952,11 +1081,9 @@ crate::query::query_parameters! {
 mod tests {
     use super::{
         IMPORT_STRING, episode_visualizations, find_skip_duration_span, inject_import,
-        mode_to_segment_type, secs_to_ticks, segment_type_mode_name, ticks_to_secs,
-        update_duration_value,
+        ticks_to_secs, update_duration_value,
     };
     use ferrofin_db::entities::base_items::BaseItemEntity;
-    use ferrofin_model::media_segments::MediaSegmentType;
     use uuid::Uuid;
 
     #[test]
@@ -995,31 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_round_trips_through_segment_type() {
-        for (name, type_) in [
-            ("Introduction", MediaSegmentType::Intro),
-            ("Credits", MediaSegmentType::Outro),
-            ("Preview", MediaSegmentType::Preview),
-            ("Recap", MediaSegmentType::Recap),
-            ("Commercial", MediaSegmentType::Commercial),
-        ] {
-            assert_eq!(mode_to_segment_type(name), Some(type_));
-            assert_eq!(segment_type_mode_name(type_), Some(name));
-        }
-        // Aliases + numeric discriminants the plugin accepts.
-        assert_eq!(mode_to_segment_type("intro"), Some(MediaSegmentType::Intro));
-        assert_eq!(mode_to_segment_type("outro"), Some(MediaSegmentType::Outro));
-        assert_eq!(
-            mode_to_segment_type("4"),
-            Some(MediaSegmentType::Commercial)
-        );
-        assert_eq!(mode_to_segment_type("nonsense"), None);
-        assert_eq!(segment_type_mode_name(MediaSegmentType::Unknown), None);
-    }
-
-    #[test]
-    fn ticks_seconds_round_trip() {
-        assert_eq!(secs_to_ticks(1.5), 15_000_000);
+    fn ticks_convert_to_seconds() {
         assert!((ticks_to_secs(15_000_000) - 1.5).abs() < f64::EPSILON);
     }
 

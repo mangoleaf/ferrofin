@@ -418,7 +418,7 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
     let item = Uuid::new_v4();
     // Two IntroSkipper rows (Intro + Outro) and one other-provider row.
     seg.rows.lock().unwrap().push((
-        "IntroSkipper".to_owned(),
+        ferrofin_traits::intro_skipper::provider_id(),
         MediaSegmentDto {
             id: Uuid::new_v4(),
             item_id: item,
@@ -428,7 +428,7 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
         },
     ));
     seg.rows.lock().unwrap().push((
-        "IntroSkipper".to_owned(),
+        ferrofin_traits::intro_skipper::provider_id(),
         MediaSegmentDto {
             id: Uuid::new_v4(),
             item_id: item,
@@ -448,15 +448,32 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
         },
     ));
 
+    let other = Uuid::from_u128(0x54);
+    app.intro_skipper
+        .update_timestamp(stored(other, Mode::Introduction, 0.0, 30.0))
+        .await
+        .unwrap();
+    app.intro_skipper
+        .update_timestamp(stored(other, Mode::Credits, 900.0, 960.0))
+        .await
+        .unwrap();
+    // `[FromQuery] AnalysisMode mode` is non-nullable: absent is Introduction.
+    let (status, _) = send(app.clone(), "POST", "/Intros/EraseTimestamps", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left = app.intro_skipper.segments(other).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].mode, Mode::Credits);
+    let (status, _) = send(app.clone(), "POST", "/Intros/EraseTimestamps?mode=99", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = send(app, "POST", "/Intros/EraseTimestamps?mode=Introduction", "").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let rows = seg.rows.lock().unwrap();
     // The IntroSkipper Intro row is gone; the Outro and the other provider stay.
     assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .all(|(p, s)| !(p == "IntroSkipper" && s.type_ == MediaSegmentType::Intro))
-    );
+    assert!(rows.iter().all(
+        |(p, s)| !(*p == ferrofin_traits::intro_skipper::provider_id()
+            && s.type_ == MediaSegmentType::Intro)
+    ));
 }
 
 #[tokio::test]
@@ -505,6 +522,105 @@ async fn no_op_success_routes() {
         let (status, _) = send(app.clone(), method, uri, body).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
     }
+}
+
+fn stored(
+    item: Uuid,
+    mode: Mode,
+    start: f64,
+    end: f64,
+) -> ferrofin_traits::intro_skipper::StoredSegment {
+    ferrofin_traits::intro_skipper::StoredSegment {
+        item_id: item,
+        mode,
+        start,
+        end,
+        is_user_provided: false,
+        config_hash: String::new(),
+    }
+}
+
+/// `GET Episode/{id}/IntroSkipperSegments` reads the plugin's tier
+/// (`GetTimestampsAsync`: the earliest per mode) and keys the dictionary by the
+/// `AnalysisMode` names, as STJ writes enum dictionary keys.
+#[tokio::test]
+async fn skippable_segments_come_from_the_tier_keyed_by_mode_name() {
+    let (_seg, app) = state();
+    let item = Uuid::from_u128(0x51);
+    for segment in [
+        stored(item, Mode::Introduction, 40.0, 70.0),
+        stored(item, Mode::Commercial, 600.0, 630.0),
+        stored(item, Mode::Commercial, 300.0, 330.0),
+    ] {
+        app.intro_skipper.update_timestamp(segment).await.unwrap();
+    }
+    let (status, body) = send(
+        app,
+        "GET",
+        &format!("/Episode/{item}/IntroSkipperSegments"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["Introduction"]["Start"], 40.0);
+    assert_eq!(json["Commercial"]["Start"], 300.0, "the earliest of a mode");
+    assert_eq!(json.as_object().unwrap().len(), 2);
+}
+
+/// `RebuildDatabaseAsync` keeps only valid segments; the editor's create needs
+/// `providerId`, its delete `itemId` + `type`; a Commercial delete without a
+/// published match is a 404.
+#[tokio::test]
+async fn editor_and_rebuild_routes_validate_like_upstream() {
+    let (_seg, app) = state();
+    let item = Uuid::from_u128(0x52);
+    app.intro_skipper
+        .update_timestamp(stored(item, Mode::Recap, 0.0, 0.0))
+        .await
+        .unwrap();
+    let (status, _) = send(app.clone(), "POST", "/Intros/RebuildDatabase", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(app.intro_skipper.segments(item).await.unwrap().is_empty());
+
+    let body = r#"{"Type":"Intro","StartTicks":0,"EndTicks":10}"#;
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        &format!("/MediaSegmentsApi/{item}"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "providerId is [Required]");
+    let segment = Uuid::from_u128(0x53);
+    let (status, _) = send(
+        app.clone(),
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "itemId and type are [Required]"
+    );
+    let (status, _) = send(
+        app.clone(),
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}?itemId={item}&type=commercial"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        app,
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}?itemId={item}&type=bogus"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// Upstream binds `UpdateAnalyzerActionsRequest` through the MVC binder: an
