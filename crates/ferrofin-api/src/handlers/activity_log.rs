@@ -70,47 +70,70 @@ struct GetLogEntriesQuery {
     )]
     severity: Option<LogLevel>,
     /// Comma-delimited sort keys (`SortBy=Name,Type`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::present_string"
+    )]
     sort_by: Option<String>,
     /// Comma-delimited sort directions.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::present_string"
+    )]
     sort_order: Option<String>,
 }
 
-/// Parses one activity-log sort key name (case-insensitive).
-fn parse_sort_key(value: &str) -> Option<ActivityLogSortBy> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "datecreated" | "date" => Some(ActivityLogSortBy::DateCreated),
-        "loglevel" | "severity" => Some(ActivityLogSortBy::LogLevel),
-        "id" => Some(ActivityLogSortBy::Id),
-        _ => None,
-    }
+/// Binds one `[FromQuery] T[]` member the way `ArrayModelBinder` +
+/// `EnumTypeModelBinder` do: each value (repeated keys arrive comma-joined) is
+/// an enum name in any case or its C# value; an empty, unknown or undefined one
+/// is a 400.
+///
+/// One divergence: upstream binds a single `sortBy=Name,Type` with
+/// `Enum.Parse`'s bitwise OR (`Type`), contradicting its own documented
+/// `SortBy=Name,Type` format; here it is the documented two keys.
+fn parse_enum_array<T: serde::de::DeserializeOwned>(
+    key: &str,
+    raw: Option<&str>,
+) -> Result<Vec<T>, ApiError> {
+    raw.map_or_else(
+        || Ok(Vec::new()),
+        |raw| {
+            raw.split(',')
+                .map(|value| {
+                    T::deserialize(crate::query::value::Value::nullable(value)).map_err(|_| {
+                        ApiError::BadRequest(format!("{key}: The value '{value}' is not valid."))
+                    })
+                })
+                .collect()
+        },
+    )
 }
 
-/// Parses one sort-direction token (case-insensitive); defaults to ascending.
-fn parse_sort_dir(value: Option<&str>) -> SortOrder {
-    match value.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(v) if v == "descending" || v == "desc" => SortOrder::Descending,
-        _ => SortOrder::Ascending,
-    }
-}
-
-/// Zips the comma-delimited sort keys with their (positionally matched)
-/// directions, mirroring `RequestHelpers.GetOrderBy`.
+/// `RequestHelpers.GetOrderBy`: each key takes the order at its index, the
+/// rest the FIRST requested order (ascending when none). Extra orders are
+/// ignored (upstream indexes past its array and fails the request).
 fn build_order_by(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
-) -> Vec<(ActivityLogSortBy, SortOrder)> {
-    let keys: Vec<&str> = sort_by.map(|s| s.split(',').collect()).unwrap_or_default();
-    let dirs: Vec<&str> = sort_order
-        .map(|s| s.split(',').collect())
-        .unwrap_or_default();
-    keys.iter()
-        .enumerate()
-        .filter_map(|(i, k)| {
-            parse_sort_key(k).map(|key| (key, parse_sort_dir(dirs.get(i).copied())))
+) -> Result<Vec<(ActivityLogSortBy, SortOrder)>, ApiError> {
+    let keys: Vec<ActivityLogSortBy> = parse_enum_array("sortBy", sort_by)?;
+    let orders = parse_enum_array::<ferrofin_model::dto::SortOrder>("sortOrder", sort_order)?
+        .into_iter()
+        .map(|order| match order {
+            ferrofin_model::dto::SortOrder::Ascending => Ok(SortOrder::Ascending),
+            ferrofin_model::dto::SortOrder::Descending => Ok(SortOrder::Descending),
+            // `EnumTypeModelBinder` refuses a value no member has.
+            ferrofin_model::dto::SortOrder::Unrecognized(value) => Err(ApiError::BadRequest(
+                format!("sortOrder: The value '{value}' is invalid."),
+            )),
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let fallback = orders.first().copied().unwrap_or(SortOrder::Ascending);
+    Ok(keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| (key, orders.get(i).copied().unwrap_or(fallback)))
+        .collect())
 }
 
 /// `GET /System/ActivityLog/Entries` — a page of activity-log entries.
@@ -133,7 +156,7 @@ async fn get_log_entries(
     _auth: RequireAdmin,
     Query(query): Query<GetLogEntriesQuery>,
 ) -> Result<Json<QueryResult<ActivityLogEntry>>, ApiError> {
-    let order_by = build_order_by(query.sort_by.as_deref(), query.sort_order.as_deref());
+    let order_by = build_order_by(query.sort_by.as_deref(), query.sort_order.as_deref())?;
     let manager_query = ActivityLogQuery {
         start_index: query.start_index,
         limit: query.limit,

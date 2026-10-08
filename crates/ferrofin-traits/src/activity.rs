@@ -14,15 +14,26 @@ use uuid::Uuid;
 use crate::error::ServiceError;
 
 /// The sort key for an activity-log query (port of
-/// `Jellyfin.Data.Enums.ActivityLogSortBy`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Jellyfin.Data.Enums.ActivityLogSortBy`; the serde names are the C# member
+/// names, misspelt `Overiew` included, and the C# values come from Jellyfin's
+/// reflection inventory when a query binds one by number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
 pub enum ActivityLogSortBy {
-    /// Sort by the entry timestamp (`DateCreated`).
+    /// Sort by name (C# 0).
+    Name,
+    /// Sort by overview (C# `Overiew` = 1).
+    #[serde(rename = "Overiew")]
+    Overview,
+    /// Sort by short overview (C# 2).
+    ShortOverview,
+    /// Sort by type (C# 3).
+    Type,
+    /// Sort by the entry timestamp (C# 5).
     DateCreated,
-    /// Sort by log severity.
-    LogLevel,
-    /// Sort by the surrogate id.
-    Id,
+    /// Sort by the joined username (C# 6).
+    Username,
+    /// Sort by log severity (C# 7).
+    LogSeverity,
 }
 
 /// The sort direction for an activity-log query.

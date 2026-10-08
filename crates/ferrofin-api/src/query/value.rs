@@ -18,7 +18,12 @@
 //! * integers and floats are trimmed before parsing (`NumberStyles.Integer`
 //!   / `Float` allow surrounding whitespace);
 //! * an enum name matches ignoring case, and its underlying number binds too
-//!   (`EnumConverter` → `Enum.Parse(…, true)`).
+//!   (`EnumConverter` → `Enum.Parse(…, true)`) — by its C# value, from Jellyfin's
+//!   reflection inventory, never serde's variant index. A number no member has
+//!   is a 400, as `EnumTypeModelBinder` refuses an undefined value;
+//! * an integer also takes hex as `0x…`, `#…` or `&h…` (`BaseNumberConverter`,
+//!   then `Convert.ToInt32(text, 16)`, which takes a `+` and a second `0x` and
+//!   reads `0xFFFFFFFF` as -1); floats take none (all measured on 12.2).
 //!
 //! A NULLABLE enum member goes through Jellyfin's `NullableEnumModelBinder`,
 //! which binds an unconvertible value to null instead of failing; that needs
@@ -27,6 +32,8 @@
 //! type, so a rejection is the same 400 as before.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde::de::value::{MapDeserializer, StrDeserializer, U32Deserializer};
 use serde::de::{self, IntoDeserializer, Visitor};
@@ -104,8 +111,53 @@ impl IntoDeserializer<'_, Error> for Value<'_> {
     }
 }
 
-/// `deserialize_<number>` for [`Value`]: trimmed, then parsed.
-macro_rules! parse_number {
+/// `BaseNumberConverter`'s hex forms: the digits after `#`, `0x` or `&h`
+/// (either case), if `text` has one of them.
+fn hex_digits(text: &str) -> Option<&str> {
+    if let Some(rest) = text.strip_prefix('#') {
+        return Some(rest);
+    }
+    let prefix = text.get(..2)?;
+    (prefix.eq_ignore_ascii_case("0x") || prefix.eq_ignore_ascii_case("&h")).then(|| &text[2..])
+}
+
+/// `ParseNumbers.StringToInt` at radix 16: an optional `+` (a `-` is refused),
+/// then an optional `0x`, then the digits.
+fn radix16_digits(text: &str) -> Option<&str> {
+    let text = text.strip_prefix('+').unwrap_or(text);
+    let text = match text.get(..2) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("0x") => &text[2..],
+        _ => text,
+    };
+    // `from_str_radix` would take a sign of its own.
+    (!text.starts_with(['+', '-'])).then_some(text)
+}
+
+/// `deserialize_<integer>` for [`Value`]: trimmed, then parsed as decimal or
+/// (with a hex prefix) as the same-width unsigned value reinterpreted, as
+/// `Convert.ToInt32(text, 16)` reads `FFFFFFFF` as -1.
+macro_rules! parse_integer {
+    ($($method:ident => $visit:ident: $ty:ty as $unsigned:ty),* $(,)?) => {$(
+        #[allow(clippy::cast_possible_wrap)]
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+            let text = self.text.trim();
+            let parsed = match hex_digits(text) {
+                Some(rest) => match radix16_digits(rest) {
+                    Some(digits) => <$unsigned>::from_str_radix(digits, 16).map(|n| n as $ty),
+                    None => return Err(de::Error::custom(format!("invalid hex number `{text}`"))),
+                },
+                None => text.parse::<$ty>(),
+            };
+            match parsed {
+                Ok(n) => visitor.$visit(n),
+                Err(e) => Err(de::Error::custom(e)),
+            }
+        }
+    )*};
+}
+
+/// `deserialize_<float>` for [`Value`]: trimmed, then parsed (no hex).
+macro_rules! parse_float {
     ($($method:ident => $visit:ident: $ty:ty),* $(,)?) => {$(
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
             match self.text.trim().parse::<$ty>() {
@@ -114,6 +166,37 @@ macro_rules! parse_number {
             }
         }
     )*};
+}
+
+/// Jellyfin's enums by name: each member's C# value (the 12.2 reflection
+/// inventory, the same fixture the model's wire enums are checked against).
+fn csharp_enums() -> &'static HashMap<String, Vec<(String, i64)>> {
+    static ENUMS: OnceLock<HashMap<String, Vec<(String, i64)>>> = OnceLock::new();
+    ENUMS.get_or_init(|| {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            name: String,
+            members: serde_json::Map<String, serde_json::Value>,
+        }
+        // A malformed row would silently fall back to declaration order, which
+        // is wrong for a gapped enum, so the fixture must parse whole (the
+        // `query_enums_bind_every_inventory_value` test runs this).
+        include_str!("../../tests/data/json-binding/jellyfin-12.2-enums.jsonl")
+            .lines()
+            .map(|line| {
+                let row: Row = serde_json::from_str(line).expect("enum inventory row");
+                let members = row
+                    .members
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let value = value.as_i64().expect("enum inventory value");
+                        (name, value)
+                    })
+                    .collect();
+                (row.name, members)
+            })
+            .collect()
+    })
 }
 
 impl<'de> de::Deserializer<'de> for Value<'_> {
@@ -153,17 +236,20 @@ impl<'de> de::Deserializer<'de> for Value<'_> {
         }
     }
 
-    parse_number! {
-        deserialize_i8 => visit_i8: i8,
-        deserialize_i16 => visit_i16: i16,
-        deserialize_i32 => visit_i32: i32,
-        deserialize_i64 => visit_i64: i64,
-        deserialize_i128 => visit_i128: i128,
-        deserialize_u8 => visit_u8: u8,
-        deserialize_u16 => visit_u16: u16,
-        deserialize_u32 => visit_u32: u32,
-        deserialize_u64 => visit_u64: u64,
-        deserialize_u128 => visit_u128: u128,
+    parse_integer! {
+        deserialize_i8 => visit_i8: i8 as u8,
+        deserialize_i16 => visit_i16: i16 as u16,
+        deserialize_i32 => visit_i32: i32 as u32,
+        deserialize_i64 => visit_i64: i64 as u64,
+        deserialize_i128 => visit_i128: i128 as u128,
+        deserialize_u8 => visit_u8: u8 as u8,
+        deserialize_u16 => visit_u16: u16 as u16,
+        deserialize_u32 => visit_u32: u32 as u32,
+        deserialize_u64 => visit_u64: u64 as u64,
+        deserialize_u128 => visit_u128: u128 as u128,
+    }
+
+    parse_float! {
         deserialize_f32 => visit_f32: f32,
         deserialize_f64 => visit_f64: f64,
     }
@@ -172,15 +258,30 @@ impl<'de> de::Deserializer<'de> for Value<'_> {
     /// included); an unknown name keeps the client's spelling for the error.
     fn deserialize_enum<V: Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
         let text = self.text.trim();
-        // `Enum.Parse` also takes the underlying number; for a derived enum
-        // that is the declaration index (wire enums parse numbers themselves).
-        if let Ok(index) = text.parse::<u32>() {
-            return visitor.visit_enum(U32Deserializer::<Error>::new(index));
+        // `Enum.Parse` also takes the underlying number (wire enums parse
+        // numbers themselves). A Jellyfin enum binds the member with that C#
+        // value; an enum outside the inventory has its values in declaration
+        // order, so the index is the value.
+        if let Ok(number) = text.parse::<i64>() {
+            let Some(members) = csharp_enums().get(name) else {
+                return match u32::try_from(number) {
+                    Ok(index) => visitor.visit_enum(U32Deserializer::<Error>::new(index)),
+                    Err(_) => Err(de::Error::custom(format!("The value '{text}' is invalid."))),
+                };
+            };
+            let member = members
+                .iter()
+                .find(|(_, value)| *value == number)
+                .and_then(|(member, _)| variants.iter().find(|v| v.eq_ignore_ascii_case(member)));
+            return match member {
+                Some(variant) => visitor.visit_enum(StrDeserializer::<Error>::new(variant)),
+                None => Err(de::Error::custom(format!("The value '{text}' is invalid."))),
+            };
         }
         let name = variants
             .iter()
@@ -288,6 +389,135 @@ mod tests {
                 (None, None, None, None)
             );
         }
+    }
+
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    #[serde(default)]
+    struct Numbers {
+        int: Option<i32>,
+        long: Option<i64>,
+        byte: Option<u8>,
+        float: Option<f64>,
+    }
+
+    fn numbers(query: &str) -> Result<Numbers, String> {
+        serde_path_to_error::deserialize(Pairs {
+            pairs: form_urlencoded::parse(query.as_bytes()),
+            required: &[],
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn integers_take_base_number_converter_hex() {
+        // Measured on Jellyfin 12.2 (`?limit=0x2`, `%232`, `%26h2` all page 2).
+        for (query, int) in [
+            ("int=0x10", 16),
+            ("int=0X10", 16),
+            ("int=%2310", 16),
+            ("int=%26h10", 16),
+            ("int=%26H1f", 31),
+            ("int=%20%200x2%20", 2),
+            ("int=0xFFFFFFFF", -1),
+            ("int=0x7FFFFFFF", i32::MAX),
+            // `ParseNumbers.StringToInt` skips a `+` and a second `0x`.
+            ("int=0x%2B2", 2),
+            ("int=0x0x2", 2),
+            ("int=%230x2", 2),
+            ("int=%23%2B2", 2),
+            ("int=%26h0X2", 2),
+        ] {
+            assert_eq!(numbers(query).expect(query).int, Some(int), "{query}");
+        }
+        assert_eq!(numbers("long=0xFFFFFFFF").unwrap().long, Some(0xFFFF_FFFF));
+        assert_eq!(numbers("byte=0xff").unwrap().byte, Some(255));
+        for query in [
+            "int=0x",
+            "int=0xg",
+            "int=0x-1",
+            "int=0x%2B-1",
+            "int=%2B0x2",
+            "int=0x%202",
+            "int=0x100000000",
+            "float=0x1",
+            "float=%26h2",
+            "int=1.0",
+        ] {
+            assert!(numbers(query).is_err(), "{query}");
+        }
+    }
+
+    /// Named after a Jellyfin enum whose C# values skip 0 and 6.
+    #[allow(clippy::enum_variant_names)]
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename = "ItemFilter")]
+    enum Filter {
+        IsFolder,
+        IsNotFolder,
+        IsResumable,
+    }
+
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    #[serde(default)]
+    struct F {
+        filter: Option<Filter>,
+    }
+
+    #[test]
+    fn enum_numbers_bind_by_csharp_value() {
+        let bind = |query: &str| -> Result<F, String> {
+            serde_path_to_error::deserialize(Pairs {
+                pairs: form_urlencoded::parse(query.as_bytes()),
+                required: &[],
+            })
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(bind("filter=1").unwrap().filter, Some(Filter::IsFolder));
+        assert_eq!(
+            bind("filter=%2B2").unwrap().filter,
+            Some(Filter::IsNotFolder)
+        );
+        assert_eq!(bind("filter=7").unwrap().filter, Some(Filter::IsResumable));
+        // `EnumTypeModelBinder`: a value no member has, or a negative one.
+        for query in ["filter=0", "filter=6", "filter=-1", "filter=0x1"] {
+            assert!(bind(query).is_err(), "{query}");
+        }
+        // An enum outside the inventory keeps declaration order.
+        assert_eq!(
+            bind_with("sort=1", &[]).unwrap().sort,
+            Some(Sort::DateCreated)
+        );
+    }
+
+    /// Every serde-derived enum a contract query member reaches binds each C#
+    /// value to the member of that name (the wire enums are checked by the
+    /// model's reflection test).
+    #[test]
+    fn query_enums_bind_every_inventory_value() {
+        fn check<T: serde::de::DeserializeOwned + std::fmt::Debug + PartialEq>(name: &str) {
+            let members = &super::csharp_enums()[name];
+            assert!(!members.is_empty(), "{name}");
+            for (member, value) in members {
+                let by_value = T::deserialize(super::Value::nullable(value.to_string()));
+                let by_name = T::deserialize(super::Value::nullable(member.clone()))
+                    .unwrap_or_else(|e| panic!("{name}.{member}: {e}"));
+                assert_eq!(by_value.ok(), Some(by_name), "{name}.{member} = {value}");
+            }
+        }
+        check::<ferrofin_model::querying::ItemFilter>("ItemFilter");
+        check::<ferrofin_model::drawing::ImageFormat>("ImageFormat");
+        check::<ferrofin_model::entities::SeriesStatus>("SeriesStatus");
+        check::<ferrofin_model::entities::CollectionTypeOptions>("CollectionTypeOptions");
+        check::<ferrofin_model::session::PlayCommand>("PlayCommand");
+        check::<ferrofin_traits::activity::ActivityLogSortBy>("ActivityLogSortBy");
+        let lines = include_str!("../../tests/data/json-binding/jellyfin-12.2-enums.jsonl")
+            .lines()
+            .count();
+        assert_eq!(
+            super::csharp_enums().len(),
+            lines,
+            "every inventory row parses"
+        );
     }
 
     #[test]
