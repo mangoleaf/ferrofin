@@ -186,6 +186,16 @@ struct CreateSegmentQuery {
     provider_id: Option<String>,
 }
 
+/// Query identifying the plugin-owned source timestamp behind a served segment.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteSegmentQuery {
+    #[serde(default)]
+    item_id: Option<Uuid>,
+    #[serde(default, rename = "type")]
+    type_: Option<String>,
+}
+
 /// Request body for `POST /MediaSegmentsApi/{itemId}` — a segment to create. The
 /// item id comes from the path, and `Id` is server-assigned, so both default;
 /// only `Type`/`StartTicks`/`EndTicks` are meaningful.
@@ -262,7 +272,7 @@ async fn season_episodes(
 async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, ApiError> {
     let segments = state
         .media_segments
-        .get_segments(item_id, None, false)
+        .get_producer_segments(item_id, PROVIDER_ID)
         .await?;
     let mut ts = TimeStamps::default();
     for s in segments {
@@ -319,11 +329,6 @@ async fn update_timestamps(
         if seg.end <= 0.0 {
             continue;
         }
-        // Replace only this provider+type's rows, leaving other providers intact.
-        state
-            .media_segments
-            .delete_provider_segments(id, PROVIDER_ID, Some(type_))
-            .await?;
         let dto = MediaSegmentDto {
             id: Uuid::nil(),
             item_id: id,
@@ -333,7 +338,7 @@ async fn update_timestamps(
         };
         state
             .media_segments
-            .create_segment(&dto, PROVIDER_ID)
+            .replace_producer_segments(id, PROVIDER_ID, Some(type_), &[dto])
             .await?;
     }
 
@@ -364,7 +369,10 @@ async fn get_skippable_segments(
     RequireAuth(_auth): RequireAuth,
     Path(id): Path<Uuid>,
 ) -> Result<Json<HashMap<String, Segment>>, ApiError> {
-    let segments = state.media_segments.get_segments(id, None, false).await?;
+    let segments = state
+        .media_segments
+        .get_producer_segments(id, PROVIDER_ID)
+        .await?;
     let mut out = HashMap::new();
     for s in segments {
         if let Some(name) = segment_type_mode_name(s.type_) {
@@ -393,7 +401,7 @@ async fn erase_timestamps(
         .ok_or_else(|| ApiError::BadRequest("missing or invalid 'mode'".to_owned()))?;
     state
         .media_segments
-        .delete_all_provider_segments(PROVIDER_ID, Some(mode))
+        .delete_all_producer_segments(PROVIDER_ID, Some(mode))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -442,20 +450,45 @@ async fn create_segment(
         start_ticks: segment.start_ticks,
         end_ticks: segment.end_ticks,
     };
-    state.media_segments.create_segment(&dto, provider).await?;
+    state
+        .media_segments
+        .create_producer_segment(&dto, provider)
+        .await?;
     Ok(StatusCode::OK)
 }
 
 /// `DELETE /MediaSegmentsApi/{segmentId}` — delete one segment by id.
 ///
 /// (The canonical route param is `itemId`; the value here is the segment id.
-/// The `itemId`/`type` query params are accepted for contract compatibility.)
+/// Supplied `itemId`/`type` query params also remove the plugin-owned timestamp.)
 async fn delete_segment(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(segment_id): Path<Uuid>,
+    Query(query): Query<DeleteSegmentQuery>,
 ) -> Result<StatusCode, ApiError> {
-    state.media_segments.delete_segment(segment_id).await?;
+    if let (Some(item_id), Some(type_name)) = (query.item_id, query.type_) {
+        let type_ = mode_to_segment_type(&type_name)
+            .ok_or_else(|| ApiError::BadRequest(format!("unknown segment type {type_name}")))?;
+        if type_ == MediaSegmentType::Commercial
+            && !state
+                .media_segments
+                .get_segments(item_id, None, false)
+                .await?
+                .iter()
+                .any(|segment| segment.id == segment_id)
+        {
+            return Err(ApiError::NotFound(format!(
+                "commercial segment {segment_id}"
+            )));
+        }
+        state
+            .media_segments
+            .delete_producer_segment(item_id, PROVIDER_ID, segment_id, type_)
+            .await?;
+    } else {
+        state.media_segments.delete_segment(segment_id).await?;
+    }
     Ok(StatusCode::OK)
 }
 
@@ -727,7 +760,7 @@ async fn erase_season(
         if let Ok(eid) = Uuid::parse_str(&episode.id) {
             state
                 .media_segments
-                .delete_provider_segments(eid, PROVIDER_ID, None)
+                .replace_producer_segments(eid, PROVIDER_ID, None, &[])
                 .await?;
         }
     }
@@ -1015,6 +1048,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 crate::query::query_parameters! {
     CreateSegmentQuery {} => [];
+    DeleteSegmentQuery {} => [];
     EraseQuery {} => [];
 }
 

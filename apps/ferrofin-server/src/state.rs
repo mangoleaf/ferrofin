@@ -1540,7 +1540,8 @@ pub async fn build_app_state(
     );
     library_scanner.attach_subtitle_downloader(Arc::clone(&subtitle_downloader));
     let media_segments: Arc<dyn ferrofin_traits::media_segments::MediaSegmentManager> = Arc::new(
-        FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
+        FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library))
+            .with_virtual_folders(Arc::clone(&virtual_folders)),
     );
 
     // Wire the curated extensions' background tasks now that their collaborators
@@ -1589,14 +1590,21 @@ pub async fn build_app_state(
         cache_dir: cache_root.child("extensions"),
         merge_versions: Arc::clone(&merge_versions),
     };
-    // "Media Segment Scan" (Library category): upstream registers this one in
-    // the core task set, independent of any plugin, so the dashboard lists it
-    // even with every extension disabled. It goes in FIRST on purpose: the
-    // Intro Skipper extension registers a richer pass under the same upstream
-    // key (its season-level fingerprinting is what actually produces
-    // segments), and registration replaces by key — so whenever that extension
-    // is loaded it wins, and this core registration is what remains when it is
-    // not.
+    // Register actual loaded producers before the core task runs. Season/analyzer
+    // work remains in each producer's own pass; this registry replays its cache.
+    for extension in &extensions {
+        for provider in extension.media_segment_providers(&extension_cx) {
+            media_segments.register_segment_provider(provider);
+        }
+    }
+    for candidate in wasm_host.media_segment_provider_candidates(&plugins) {
+        media_segments
+            .adopt_loaded_segment_provider(candidate)
+            .await?;
+    }
+    for provider in wasm_host.media_segment_providers(&plugins) {
+        media_segments.register_segment_provider(provider);
+    }
     task_manager.register(Arc::new(
         ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
             Arc::clone(&library),

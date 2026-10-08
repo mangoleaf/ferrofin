@@ -545,11 +545,99 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         assert_eq!(image.as_ref(), POSTER);
     }
     verify_local_reader_order(&api, tmp.path()).await;
+    verify_media_segment_library_options(&api, id).await;
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
         .unwrap();
     mock.abort();
+}
+
+/// Production registry, persisted producer output, live library saves and player filtering.
+async fn verify_media_segment_library_options(api: &Api, item: &str) {
+    let available = api
+        .get("/Libraries/AvailableOptions?libraryContentType=movies")
+        .await;
+    assert!(
+        available["MediaSegmentProviders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider["Name"] == "Intro Skipper"
+                && provider["DefaultEnabled"] == true)
+    );
+    let folders = api.get("/Library/VirtualFolders").await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Movies")
+        .unwrap();
+    let library = &folder["ItemId"];
+    let mut options = folder["LibraryOptions"].clone();
+    api.post(
+        &format!("/MediaSegmentsApi/{item}"),
+        &json!({"Type":"Intro", "StartTicks":0, "EndTicks":10_000_000}),
+    )
+    .await;
+    api.post(
+        &format!("/MediaSegmentsApi/{item}?providerId=wasm:unloaded"),
+        &json!({"Type":"Outro", "StartTicks":20_000_000, "EndTicks":30_000_000}),
+    )
+    .await;
+    for disabled in [true, false, true, false] {
+        options["DisabledMediaSegmentProviders"] = if disabled {
+            json!(["iNtRo SkIpPeR"])
+        } else {
+            json!([])
+        };
+        options["MediaSegmentProviderOrder"] = json!(["Intro Skipper"]);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        let started = Instant::now();
+        let served = api.get(&format!("/MediaSegments/{item}")).await;
+        println!(
+            "L27 disabled={disabled}: segment GET {} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        assert_eq!(
+            served["Items"].as_array().unwrap().len(),
+            usize::from(!disabled),
+            "{served}"
+        );
+        assert!(
+            api.get(&format!("/Episode/{item}/Timestamps")).await["Introduction"].is_object(),
+            "management access preserves hidden detections"
+        );
+    }
+    // The always-present core extraction task now invokes the registered provider.
+    let tasks = api.get("/ScheduledTasks").await;
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["Key"] == "TaskExtractMediaSegments")
+        .unwrap();
+    let task_id = task["Id"].as_str().unwrap();
+    let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
+    api.post(&format!("/ScheduledTasks/Running/{task_id}"), &Value::Null)
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = api.get(&format!("/ScheduledTasks/{task_id}")).await;
+        if task["State"] == "Idle" && task["LastExecutionResult"]["EndTimeUtc"] != previous {
+            assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+            break;
+        }
+        assert!(Instant::now() < deadline, "media segment task: {task}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let served = api.get(&format!("/MediaSegments/{item}")).await;
+    assert_eq!(served["Items"].as_array().unwrap().len(), 1);
+    assert_eq!(served["Items"][0]["Type"], "Intro");
 }
 
 /// Save limits, refresh through HTTP, and inspect both rows and served bytes.

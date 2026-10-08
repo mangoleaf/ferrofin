@@ -69,6 +69,15 @@ pub const INSTANCES_PER_PLUGIN: usize = 64;
 /// making `FERROFIN_WASM_CALL_TIMEOUT_SECS` map 1:1 onto ticks.
 pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The guest analysis result plus a host-only live-policy observation.
+#[derive(Debug)]
+pub struct ScanMediaOutcome {
+    /// Guest success or its orderly/host error.
+    pub result: Result<(), String>,
+    /// A live library/plugin gate suppressed at least one output write during the call.
+    pub policy_skipped: bool,
+}
+
 /// A command sent to a plugin's runtime thread.
 pub enum Command {
     /// Run the guest task with the given id and reply with its outcome.
@@ -103,7 +112,7 @@ pub enum Command {
         /// Fresh configuration JSON to snapshot before the call.
         config: String,
         /// Receives the guest's outcome (or the host/trap error text).
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        reply: tokio::sync::oneshot::Sender<Result<ScanMediaOutcome, String>>,
     },
     /// Ask the guest for remote-artwork candidates for one item.
     RemoteImages {
@@ -179,6 +188,7 @@ impl InstanceSpec {
             plugin_name: self.plugin_name.clone(),
             plugin_id: self.plugin_id.clone(),
             config_json,
+            segment_policy_skipped: false,
             limits: StoreLimitsBuilder::new()
                 .memory_size(self.memory_limit_bytes)
                 .memories(MEMORIES_PER_PLUGIN)
@@ -290,7 +300,7 @@ impl RuntimeHandle {
         &self,
         item: crate::bindings::types::ItemSummary,
         config: String,
-    ) -> Result<(), String> {
+    ) -> Result<ScanMediaOutcome, String> {
         if self.is_dead() {
             return Err(format!(
                 "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
@@ -637,17 +647,24 @@ fn dispatch_scan(
     instance: &Plugin,
     item: &crate::bindings::types::ItemSummary,
     config: String,
-    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    reply: tokio::sync::oneshot::Sender<Result<ScanMediaOutcome, String>>,
 ) -> bool {
     store.data_mut().config_json = config;
+    store.data_mut().segment_policy_skipped = false;
     store.set_epoch_deadline(spec.timeout_ticks);
     match instance.call_scan_media(&mut *store, item) {
         Ok(outcome) => {
-            let _ = reply.send(outcome);
+            let _ = reply.send(Ok(ScanMediaOutcome {
+                result: outcome,
+                policy_skipped: store.data().segment_policy_skipped,
+            }));
             false
         }
         Err(trap) => {
-            let _ = reply.send(Err(format!("plugin call failed: {trap:#}")));
+            let _ = reply.send(Ok(ScanMediaOutcome {
+                result: Err(format!("plugin call failed: {trap:#}")),
+                policy_skipped: store.data().segment_policy_skipped,
+            }));
             true
         }
     }

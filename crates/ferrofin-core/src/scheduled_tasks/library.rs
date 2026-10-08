@@ -15,10 +15,8 @@
 //! - [`MediaSegmentExtractionTask`] — `MediaSegmentExtractionTask`
 //!   (`TaskExtractMediaSegments`)
 //!
-//! The Intro Skipper extension registers its own richer task under that last
-//! key when it is loaded (its season-level fingerprint pass produces the
-//! segments); this one is the always-present core registration upstream has,
-//! so the dashboard shows the task even with every extension disabled.
+//! The media-segment task runs the registered providers; season fingerprinting
+//! and guest analysis retain their own producer passes and persistent output.
 //!
 //! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s
 //! are dropped (a queued run is cancelled by aborting its tokio task).
@@ -1394,28 +1392,8 @@ impl ScheduledTask for TrickplayImagesTask {
 /// `RunSegmentPluginProviders`. (`source_types` is set for parity and is inert
 /// on both sides: upstream's repository never filters on it either.)
 ///
-/// Accepted divergence: upstream catches a *provider's* failure inside
-/// `RunSegmentPluginProviders`, but lets the surrounding failures (clearing an
-/// item's segments, deciding which providers support it) abort the whole task.
-/// Here any error from that call is logged against the item and the scan moves
-/// on, matching the sibling library tasks — one bad item cannot cost the pass.
-///
-/// When this body runs at all: the Intro Skipper extension registers its own
-/// task under this key and replaces this registration whenever the extension is
-/// **loaded** — which is not the same as enabled, since a plugin disabled in the
-/// dashboard still owns the key and its task self-gates. So this is what a
-/// server started with `disable_extensions` runs, and there it walks the library
-/// and runs zero providers: exactly what upstream does on an install with no
-/// media-segment plugin.
-///
-/// **What runs there in Ferrofin.** Ferrofin has no per-item segment-provider
-/// registry: its producers are the Intro Skipper extension (a season-level
-/// fingerprint pass, which claims this same upstream task key while it is
-/// loaded and does the real detection) and WASM analyzer plugins (their own
-/// analysis pass). So on a server with those disabled this task walks the
-/// library and runs zero providers — exactly what upstream does on an install
-/// with no media-segment plugin, and it stops `GET /ScheduledTasks` from
-/// hiding a task every Jellyfin advertises. Nothing here fabricates segments.
+/// Provider extraction failures are contained by the manager. A backend failure
+/// for one item is logged by this task so the remaining library can be processed.
 pub struct MediaSegmentExtractionTask {
     library: Arc<dyn LibraryManager>,
     media_segments: Arc<dyn MediaSegmentManager>,

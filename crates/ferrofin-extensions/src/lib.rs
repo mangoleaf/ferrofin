@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use ferrofin_core::{FerrofinTaskManager, PluginConfigPage, RegisteredPlugin, ScheduledTask};
 use ferrofin_traits::library::LibraryManager;
-use ferrofin_traits::media_segments::MediaSegmentManager;
+use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::merge_versions::MergeVersionsManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use uuid::Uuid;
@@ -65,6 +65,13 @@ pub trait Extension: Send + Sync {
     /// plugin in the dashboard (served via `GET /web/ConfigurationPage`).
     /// Defaults to none.
     fn config_pages(&self) -> Vec<PluginConfigPage> {
+        Vec::new()
+    }
+    /// Providers backed by this actual loaded extension.
+    fn media_segment_providers(
+        &self,
+        _cx: &ExtensionContext,
+    ) -> Vec<Arc<dyn MediaSegmentProvider>> {
         Vec::new()
     }
     /// The background tasks this extension contributes.

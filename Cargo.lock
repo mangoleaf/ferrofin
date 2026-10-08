@@ -1616,6 +1616,7 @@ dependencies = [
  "ferrofin-common",
  "ferrofin-db",
  "ferrofin-model",
+ "ferrofin-util",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

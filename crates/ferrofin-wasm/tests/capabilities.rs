@@ -872,3 +872,210 @@ async fn write_family_caps_ownership_and_plumbing() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn loaded_producer_uses_display_name_library_gate_and_registered_namespace() {
+    use ferrofin_traits::library::VirtualFolderManager;
+    use ferrofin_traits::media_segments::media_segment_provider_id;
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let item = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let media = tmp.path().join("media");
+    let library = common::persisted_movie_library(&db, &media, item).await;
+    let folders = Arc::new(ferrofin_core::FerrofinVirtualFolderManager::new(
+        tmp.path().join("views"),
+    ));
+    let mut options = ferrofin_model::configuration::LibraryOptions {
+        path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+            path: media.to_string_lossy().into_owned(),
+        }],
+        disabled_media_segment_providers: vec!["LOADED DETECTOR".to_owned()],
+        ..Default::default()
+    };
+    folders
+        .add_virtual_folder("Movies", None, &options)
+        .await
+        .unwrap();
+    let manager = Arc::new(
+        ferrofin_core::FerrofinMediaSegmentManager::new(db.clone(), library.clone())
+            .with_virtual_folders(folders.clone()),
+    );
+    let plugin_id = Uuid::new_v4();
+    let namespace = format!("wasm:{plugin_id}");
+    let state = tmp.path().join(format!("{plugin_id}.state.json"));
+    let output = vec![MediaSegment {
+        segment_type: "Intro".to_owned(),
+        start_ticks: 0,
+        end_ticks: 100,
+    }];
+    let call = |cx, state: std::path::PathBuf, namespace: String, output: Vec<MediaSegment>| {
+        tokio::task::spawn_blocking(move || {
+            ferrofin_wasm::capabilities::write_media_segments_from_plugin(
+                &cx,
+                "Loaded Detector",
+                &namespace,
+                Some(&state),
+                &item.to_string(),
+                &output,
+            )
+        })
+    };
+    let skipped = call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        output.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        skipped,
+        ferrofin_wasm::capabilities::SegmentWriteOutcome::PolicySkipped
+    );
+    assert!(!manager.has_segments(item).await.unwrap());
+    assert!(manager.registered_segment_providers().is_empty());
+    options.disabled_media_segment_providers.clear();
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        output.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        manager.registered_segment_providers()[0].name,
+        "Loaded Detector"
+    );
+    assert_eq!(
+        manager.registered_segment_providers()[0].id,
+        media_segment_provider_id("Loaded Detector")
+    );
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap().len(),
+        1
+    );
+    assert!(
+        tmp.path()
+            .join(format!("{plugin_id}.segments/{item}.json"))
+            .is_file()
+    );
+    manager
+        .create_segment(
+            &ferrofin_model::media_segments::MediaSegmentDto {
+                item_id: item,
+                type_: MediaSegmentType::Outro,
+                start_ticks: 200,
+                end_ticks: 300,
+                ..Default::default()
+            },
+            "wasm:unloaded",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap().len(),
+        1
+    );
+    assert_eq!(manager.run_segment_providers(item, true).await.unwrap(), 1);
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap()[0].end_ticks,
+        100
+    );
+    options.disabled_media_segment_providers = vec!["loaded detector".to_owned()];
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        manager
+            .get_segments(item, None, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        manager.get_segments(item, None, false).await.unwrap()[0].end_ticks,
+        100,
+        "disabled writes preserve previous producer output"
+    );
+    options.disabled_media_segment_providers.clear();
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    let mut cx = collaborators(library, manager.clone());
+    cx.plugins = Arc::new(common::DisabledStub(b"{}".to_vec()));
+    call(cx, state, namespace, Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap()[0].end_ticks,
+        100,
+        "global plugin disable still gates a direct host write"
+    );
+}
+
+#[test]
+fn concurrent_guest_and_host_state_writes_preserve_policy_pending_and_independent_keys() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    let pending = serde_json::to_vec(&[Uuid::new_v4()]).unwrap();
+    set_state(
+        Some(&path),
+        "host:segment-policy-pending",
+        Some(pending.clone()),
+    )
+    .unwrap();
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for writer in 0..4 {
+            let barrier = &barrier;
+            let path = &path;
+            scope.spawn(move || {
+                let key = if writer == 0 {
+                    "host:scan-watermark".to_owned()
+                } else {
+                    format!("guest:{writer}")
+                };
+                for value in 0..30 {
+                    barrier.wait();
+                    set_state(Some(path), &key, Some(value.to_string().into_bytes())).unwrap();
+                }
+            });
+        }
+    });
+    assert_eq!(
+        get_state(Some(&path), "host:segment-policy-pending"),
+        Some(pending)
+    );
+    assert_eq!(
+        get_state(Some(&path), "host:scan-watermark"),
+        Some(b"29".to_vec())
+    );
+    for writer in 1..4 {
+        assert_eq!(
+            get_state(Some(&path), &format!("guest:{writer}")),
+            Some(b"29".to_vec())
+        );
+    }
+}
