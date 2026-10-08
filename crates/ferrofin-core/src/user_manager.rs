@@ -74,6 +74,8 @@ const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 
 type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
 
+mod user_repository;
+
 /// The concrete user manager.
 ///
 /// Holds the registered [`AuthenticationManager`] providers by shared reference
@@ -144,6 +146,80 @@ impl FerrofinUserManager {
             *entry = Arc::downgrade(&lock);
             lock
         }
+    }
+
+    /// Enabled providers selected by the saved ID; an unknown ID fails closed.
+    async fn authentication_providers_for(
+        &self,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<&dyn AuthenticationManager>, ServiceError> {
+        let wanted = user
+            .map(|u| u.authentication_provider_id.as_str())
+            .filter(|id| !id.is_empty());
+        let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
+        for provider in &self.providers {
+            if provider.is_enabled().await?
+                && wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id))
+            {
+                candidates.push(provider.as_ref());
+            }
+        }
+        if candidates.is_empty() {
+            candidates.push(&self.invalid_provider);
+        }
+        Ok(candidates)
+    }
+
+    /// Providers may update an existing user or provision one under a canonical
+    /// username. Reload their changes before evaluating the resulting policy.
+    async fn authenticate_with_providers(
+        &self,
+        username: &str,
+        password: &str,
+        user: Option<UserEntity>,
+    ) -> Result<(Option<UserEntity>, bool), ServiceError> {
+        for provider in self.authentication_providers_for(user.as_ref()).await? {
+            let result = match provider
+                .authenticate(username, password, user.as_ref())
+                .await
+            {
+                Ok(result) => result,
+                Err(ServiceError::Unauthorized(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let id = provider_id(provider.name());
+            let mut resolved = if let Some(user) = &user {
+                self.fetch_user(
+                    Uuid::parse_str(&user.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?,
+                )
+                .await?
+            } else if id != DEFAULT_AUTH_PROVIDER_ID {
+                self.get_user_by_name(&result.username).await?
+            } else {
+                None
+            };
+            if user.is_none()
+                && let Some(new_user) = &resolved
+                && let Some(policy) = provider.new_user_policy()
+            {
+                let uid = Uuid::parse_str(&new_user.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                self.update_policy(uid, &policy).await?;
+                resolved = self.fetch_user(uid).await?;
+            }
+            if let Some(user) = &mut resolved
+                && !user.authentication_provider_id.eq_ignore_ascii_case(id)
+            {
+                user_repository::set_authentication_provider(self.db.writer(), &user.id, id)
+                    .await
+                    .map_err(db_err)?;
+                id.clone_into(&mut user.authentication_provider_id);
+                self.auth_cache.clear();
+            }
+            return Ok((resolved, true));
+        }
+        Ok((user, false))
     }
 
     /// Records a failed login: increments the invalid-attempt counter, locks the
@@ -779,6 +855,8 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        let login_lock = self.login_lock(&guid_to_db(user_id));
+        let _login_guard = login_lock.lock().await;
         let user = self.require_user(user_id).await?;
 
         if new_password.trim().is_empty()
@@ -789,10 +867,15 @@ impl UserManager for FerrofinUserManager {
             ));
         }
 
-        // The C# providers mutate the user's `Password` in place; our
-        // `AuthenticationManager::change_password` is a no-op by design, so the
-        // built-in default's hash formatter produces the stored value and this
-        // manager owns the write (see `auth_providers`).
+        let candidates = self.authentication_providers_for(Some(&user)).await?;
+        let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
+        provider.change_password(&user, new_password).await?;
+        if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
+            self.auth_cache.clear();
+            return Ok(());
+        }
+        // The built-in provider supplies the hash while this manager owns its
+        // database write. External providers own their credential store.
         let hash = self.default_provider.format_password_hash(new_password)?;
         sqlx::query(
             r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
@@ -827,41 +910,9 @@ impl UserManager for FerrofinUserManager {
         let _login_guard = login_lock.lock().await;
         let user = self.get_user_by_name(username).await?;
 
-        // Select the candidate providers (C# `GetAuthenticationProviders(user)`):
-        // when the user names a specific provider, only the matching enabled one
-        // is tried; if none matches, the always-rejecting fallback stands in.
-        let wanted = user
-            .as_ref()
-            .map(|u| u.authentication_provider_id.as_str())
-            .filter(|id| !id.is_empty());
-        let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
-        for provider in &self.providers {
-            if !provider.is_enabled().await? {
-                continue;
-            }
-            if wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id)) {
-                candidates.push(provider.as_ref());
-            }
-        }
-        if candidates.is_empty() {
-            candidates.push(&self.invalid_provider);
-        }
-
-        // Try each candidate in turn (C# `AuthenticateLocalUser`).
-        let mut success = false;
-        for provider in candidates {
-            match provider
-                .authenticate(username, password, user.as_ref())
-                .await
-            {
-                Ok(_) => {
-                    success = true;
-                    break;
-                }
-                Err(ServiceError::Unauthorized(_)) => {}
-                Err(other) => return Err(other),
-            }
-        }
+        let (user, success) = self
+            .authenticate_with_providers(username, password, user)
+            .await?;
 
         let Some(mut user) = user else {
             // No such user: an auth failure regardless of provider result. Security
@@ -2420,3 +2471,7 @@ mod tests {
         assert_eq!(providers[0].id.as_deref(), Some(DEFAULT_AUTH_PROVIDER_ID));
     }
 }
+
+#[cfg(test)]
+#[path = "user_manager/provider_tests.rs"]
+mod provider_tests;
