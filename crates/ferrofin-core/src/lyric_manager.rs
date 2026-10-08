@@ -183,31 +183,39 @@ impl FerrofinLyricManager {
         )
     }
 
-    /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns
-    /// `media_path` — the flag that decides whether the media folder is a save
-    /// target at all. Defaults to `false` (the upstream default) when no
-    /// virtual-folder seam is attached or the lookup fails.
-    async fn save_with_media(&self, media_path: &Path) -> bool {
+    /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns the
+    /// item. Older collection-folder ids take precedence; adopted physical
+    /// parent ids use the innermost matching location, as the shared library
+    /// resolver does for metadata. Options are read afresh for every save.
+    async fn save_with_media(&self, item: &BaseItemEntity) -> bool {
         let Some(folders) = &self.virtual_folders else {
             return false;
         };
         let Ok(folders) = folders.get_virtual_folders().await else {
             return false;
         };
-        folders
-            .iter()
-            .find(|f| f.locations.iter().any(|loc| media_path.starts_with(loc)))
-            .and_then(|f| f.library_options.as_ref())
-            .is_some_and(|o| o.save_lyrics_with_media)
+        ferrofin_model::entities_media::owning_library(
+            &folders,
+            item.top_parent_id.as_deref(),
+            item.path.as_deref(),
+        )
+        .and_then(|f| f.library_options.as_ref())
+        .is_some_and(|o| o.save_lyrics_with_media)
     }
 
     /// The save-path list for a lyric, in `TrySaveLyric` order: the media folder
     /// only when the library opts in, then always the internal metadata folder.
     /// The file name is the media base name plus the lowercased lyric format.
-    async fn save_targets(&self, item_id: Uuid, media_path: &Path, format: &str) -> Vec<PathBuf> {
+    async fn save_targets(
+        &self,
+        item_id: Uuid,
+        item: &BaseItemEntity,
+        media_path: &Path,
+        format: &str,
+    ) -> Vec<PathBuf> {
         let name = sidecar_file_name(media_path, &normalise_format(format));
         let mut targets = Vec::new();
-        if self.save_with_media(media_path).await
+        if self.save_with_media(item).await
             && let Some(folder) = media_path.parent()
         {
             targets.push(folder.join(&name));
@@ -455,7 +463,16 @@ impl LyricManager for FerrofinLyricManager {
         item_id: Uuid,
         lyric_id: &str,
     ) -> Result<Option<LyricDto>, ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
+        let item = self
+            .item(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("item has no media path for lyrics"))?;
+        let Some(path) = item
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+        else {
             return Err(ServiceError::not_found("item has no media path for lyrics"));
         };
 
@@ -469,7 +486,9 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
 
-        let targets = self.save_targets(item_id, &path, &response.format).await;
+        let targets = self
+            .save_targets(item_id, &item, path, &response.format)
+            .await;
         Self::try_save_to_files(&targets, &response.text)?;
         Ok(Some(dto))
     }
@@ -489,7 +508,16 @@ impl LyricManager for FerrofinLyricManager {
         format: &str,
         lyrics: &str,
     ) -> Result<Option<LyricDto>, ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
+        let item = self
+            .item(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("item has no media path for lyrics"))?;
+        let Some(path) = item
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+        else {
             return Err(ServiceError::not_found("item has no media path for lyrics"));
         };
         // `SaveLyricAsync` parses FIRST and returns null — the controller's
@@ -497,7 +525,7 @@ impl LyricManager for FerrofinLyricManager {
         let Some(dto) = parse_by_format(format, lyrics) else {
             return Ok(None);
         };
-        let targets = self.save_targets(item_id, &path, format).await;
+        let targets = self.save_targets(item_id, &item, path, format).await;
         Self::try_save_to_files(&targets, lyrics)?;
         Ok(Some(dto))
     }
@@ -1322,6 +1350,115 @@ mod tests {
             "[00:01.00]hi"
         );
         assert!(!metadata_sidecar(meta.path(), item_id, "song", "lrc").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One live off/on/root/fallback sequence.
+    async fn save_lyrics_uses_live_innermost_library_options_and_falls_back() {
+        let db = test_support::test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("music");
+        let inner = root.join("nested");
+        std::fs::create_dir_all(&inner).unwrap();
+        let media = inner.join("song.flac");
+        std::fs::write(&media, b"flac").unwrap();
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        // Adopted rows name a physical root, not either collection folder.
+        let mut audio = test_support::fetch_item(&db, item_id).await;
+        audio.top_parent_id = Some(guid_to_db(Uuid::new_v4()));
+        test_support::save_item(&db, &audio).await;
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        let mut options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: inner.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder(
+                "A outer",
+                Some(CollectionTypeOptions::music),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: root.to_string_lossy().into_owned(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        folders
+            .add_virtual_folder("Z inner", Some(CollectionTypeOptions::music), &options)
+            .await
+            .unwrap();
+        let current = Arc::new(std::sync::RwLock::new(tmp.path().join("metadata-a")));
+        let source = Arc::clone(&current);
+        let mgr = manager_over(&db, Vec::new())
+            .with_virtual_folders(folders.clone())
+            .with_metadata_path(ferrofin_util::directory_path::DirectoryPath::live(
+                move || source.read().unwrap().clone(),
+            ));
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]internal")
+            .await
+            .unwrap();
+        let first = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
+        assert!(first.is_file());
+        assert!(!media.with_extension("lrc").exists());
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = true;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]adjacent")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(media.with_extension("lrc")).unwrap(),
+            "[00:01.00]adjacent"
+        );
+        assert!(
+            !first.exists(),
+            "the writable media target ends the fallback list"
+        );
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = false;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        *current.write().unwrap() = tmp.path().join("metadata-b");
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]new root")
+            .await
+            .unwrap();
+        let replacement = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
+        assert!(replacement.is_file());
+        assert!(!first.exists());
+        assert_eq!(
+            mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
+            "new root"
+        );
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = true;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        // A directory reliably blocks the media filename even in elevated tests.
+        std::fs::create_dir(media.with_extension("lrc")).unwrap();
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]fallback")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(replacement).unwrap(),
+            "[00:01.00]fallback"
+        );
+        assert_eq!(
+            mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
+            "fallback"
+        );
     }
 
     #[tokio::test]
