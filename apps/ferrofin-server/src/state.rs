@@ -1140,6 +1140,16 @@ pub async fn build_app_state(
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().metadata_options.clone()
     })
+    .with_metadata_locale({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || {
+            let config = config_mgr.snapshot_shared();
+            (
+                config.preferred_metadata_language.clone(),
+                config.metadata_country_code.clone(),
+            )
+        }
+    })
     .with_scan_fanout({
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().library_scan_fanout_concurrency

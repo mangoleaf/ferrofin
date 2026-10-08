@@ -12,22 +12,12 @@
 //! `Authorization: Bearer <token>`.
 //!
 //! Faithful port notes (the C# is the oracle):
-//! - Translations: v4 returns a base `name`/`overview` plus per-language
-//!   translations; this port maps the base fields of a series and an
-//!   episode. A season record has no base overview, so the season provider
-//!   reads its translation in the item's metadata language
-//!   ([`TvdbSeasonDetails::translated_overview`], `IsMatch`).
-//!   TODO(parity, open work item — NOT an accepted divergence): port the
-//!   plugin's translation chain for the series and the episode — the
-//!   name/overview translation in the item's metadata language, then each
-//!   configured `FallbackLanguages` entry, then the base field only under
-//!   `FallbackToOriginalLanguage` (`TvdbSdkExtensions.
-//!   GetTranslatedNamedOrDefault`/`GetTranslatedOverviewOrDefault`,
-//!   `TvdbUtils.ReturnOriginalLanguageOrDefault`, `TvdbSeriesProvider.cs:
-//!   445-446`) — with the plugin's settings page (`FallbackLanguages`,
-//!   `FallbackToOriginalLanguage`, `ImportSeasonName`), which Ferrofin does
-//!   not expose yet, so their defaults hold everywhere, the season
-//!   provider's included.
+//! - Translations: series and episodes keep their name/overview translations.
+//!   The scanner selects the configured metadata language, excluding name
+//!   aliases, under the plugin defaults: no fallback languages and no original
+//!   language fallback. The separate plugin configuration page remains an open
+//!   settings work item; it is not implemented by these library preferences.
+//!   Seasons select their translated overview through `IsMatch` too.
 //! - Episode ordering: TVDB has multiple orderings (`official` = aired, `dvd`,
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
@@ -116,6 +106,10 @@ pub struct TvdbSeriesDetails {
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// First aired date (`YYYY-MM-DD`).
     pub premiere_date: Option<String>,
     /// Production year, derived from `firstAired`.
@@ -156,6 +150,18 @@ pub struct TvdbSeriesDetails {
 }
 
 impl TvdbSeriesDetails {
+    /// Applies the metadata language with the plugin's default empty fallback
+    /// list and `FallbackToOriginalLanguage=false`. Alias names are excluded.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+
     /// The artwork as plain type+URL [`RemoteImage`] pairs for the scan-download
     /// path.
     #[must_use]
@@ -187,6 +193,10 @@ pub struct TvdbEpisodeDetails {
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// Aired date (`YYYY-MM-DD`).
     pub aired: Option<String>,
     /// Production year, derived from `aired`.
@@ -195,6 +205,34 @@ pub struct TvdbEpisodeDetails {
     pub image_url: Option<String>,
     /// Cast + crew credited on the episode.
     pub people: Vec<TvdbPerson>,
+}
+
+impl TvdbEpisodeDetails {
+    /// Applies the metadata language with the plugin's default fallback rules.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+}
+
+fn translated_text(
+    translations: &[TvdbTranslation],
+    language: &str,
+    three_letter_names: &[String],
+    exclude_aliases: bool,
+) -> Option<String> {
+    translations
+        .iter()
+        .find(|translation| {
+            (!exclude_aliases || !translation.is_alias)
+                && translation_matches(&translation.language, language, three_letter_names)
+        })
+        .and_then(|translation| translation.text.clone())
 }
 
 /// Mapped season metadata (`/seasons/{id}/extended?meta=translations`, the
@@ -388,6 +426,7 @@ struct ArtworkWire {
 
 #[derive(Debug, Deserialize)]
 struct SeriesExtendedWire {
+    translations: Option<TranslationsWire>,
     lists: Option<Vec<ListWire>>,
     seasons: Option<Vec<SeasonRefWire>>,
     name: Option<String>,
@@ -468,6 +507,7 @@ struct ListWire {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EpisodeExtendedWire {
+    translations: Option<TranslationsWire>,
     remote_ids: Option<Vec<RemoteIdWire>>,
     airs_before_episode: Option<i64>,
     airs_after_season: Option<i64>,
@@ -803,6 +843,9 @@ impl TvdbClient {
             )
             .await?;
         let production_year = wire.aired.as_deref().and_then(year_of);
+        let (names, overviews) = wire.translations.map_or((None, None), |t| {
+            (t.name_translations, t.overview_translations)
+        });
         Some(TvdbEpisodeDetails {
             tvdb_id: episode_id,
             imdb_id: wire
@@ -821,6 +864,8 @@ impl TvdbClient {
             airs_before_season: wire.airs_before_season,
             name: wire.name,
             overview: wire.overview,
+            name_translations: translations_of(names, |t| t.name),
+            overview_translations: translations_of(overviews, |t| t.overview),
             aired: wire.aired,
             production_year,
             image_url: wire.image,
@@ -1037,6 +1082,9 @@ fn map_characters(characters: Option<Vec<CharacterWire>>) -> Vec<TvdbPerson> {
 /// content rating (country match then USA fallback), networks, remote ids, and
 /// artwork. Pure — the oracle for the mapping tests.
 fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> TvdbSeriesDetails {
+    let (names, overviews) = wire.translations.map_or((None, None), |t| {
+        (t.name_translations, t.overview_translations)
+    });
     let production_year = wire.first_aired.as_deref().and_then(year_of);
     // `lastAired` is the end date only for series that have ended.
     let end_date = wire
@@ -1107,6 +1155,8 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         tvdb_id,
         name: wire.name,
         overview: wire.overview,
+        name_translations: translations_of(names, |t| t.name),
+        overview_translations: translations_of(overviews, |t| t.overview),
         premiere_date: wire.first_aired,
         production_year,
         end_date,
@@ -1163,6 +1213,57 @@ fn remote_id_to_string(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_and_episode_localization_exclude_aliases_and_do_not_fall_back_to_base_text() {
+        let names = vec![
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Alias".into()),
+                is_alias: true,
+            },
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Deutsch".into()),
+                is_alias: false,
+            },
+            TvdbTranslation {
+                language: "eng".into(),
+                text: Some("English".into()),
+                is_alias: false,
+            },
+        ];
+        let overviews = vec![TvdbTranslation {
+            language: "deu".into(),
+            text: Some("Beschreibung".into()),
+            is_alias: false,
+        }];
+        let mut series = TvdbSeriesDetails {
+            name: Some("Base name".into()),
+            overview: Some("Base overview".into()),
+            name_translations: names.clone(),
+            overview_translations: overviews.clone(),
+            ..Default::default()
+        };
+        let mut episode = TvdbEpisodeDetails {
+            name: Some("Base episode".into()),
+            overview: Some("Base synopsis".into()),
+            name_translations: names,
+            overview_translations: overviews,
+            ..Default::default()
+        };
+        let codes = ["deu".to_owned(), "ger".to_owned()];
+        series.localize("de", &codes);
+        episode.localize("de", &codes);
+        assert_eq!(series.name.as_deref(), Some("Deutsch"));
+        assert_eq!(episode.name, series.name);
+        assert_eq!(series.overview.as_deref(), Some("Beschreibung"));
+        assert_eq!(episode.overview, series.overview);
+        series.localize("fr", &["fra".into()]);
+        episode.localize("fr", &["fra".into()]);
+        assert_eq!((series.name, series.overview), (None, None));
+        assert_eq!((episode.name, episode.overview), (None, None));
+    }
 
     fn series_fixture() -> SeriesExtendedWire {
         serde_json::from_str(

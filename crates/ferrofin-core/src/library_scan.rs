@@ -80,6 +80,10 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// Parent metadata overrides read once per scan, without retaining rows.
+    locale_parents: HashMap<String, LocaleParent>,
+    /// Lookup locales already resolved by this pass's metadata providers.
+    resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
     track_albums: HashMap<Uuid, Uuid>,
     /// Album → immutable shared cover, including dimensions and blurhash.
@@ -88,13 +92,13 @@ struct ArtworkCache {
     albums_needing_backfill: std::collections::HashSet<Uuid>,
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
-    /// (series item id, season number) → the season's TMDB details, fetched
-    /// once per scan. `/tv/{id}/season/{n}` carries the season poster, every
+    /// (series item id, season number, language) → TMDB details, fetched
+    /// once per scan and locale. `/tv/{id}/season/{n}` carries the season poster, every
     /// episode's still URL, AND every episode's name/overview, so the metadata
     /// pass and the image pass share this one response instead of each paying
     /// for it. A miss — and a failed request — is recorded too, so neither is
     /// re-requested once per episode.
-    season_details: std::collections::HashMap<(String, i32), SeasonLookup>,
+    season_details: std::collections::HashMap<(String, i32, Option<String>), SeasonLookup>,
     /// Series item id → the matched TVDB series details (when the TVDB
     /// provider answered for the series). Its `tvdb_id` lets episodes
     /// resolve, and its artwork is reused by the image pass instead of
@@ -115,6 +119,13 @@ struct ArtworkCache {
     /// dimensions and a blurhash are functions of the file alone, so two rows
     /// sharing one `folder.jpg` share the answer.
     stored_images: std::collections::HashMap<String, StoredImageMetadata>,
+}
+
+#[derive(Clone, Default)]
+struct LocaleParent {
+    parent: Option<String>,
+    language: Option<String>,
+    country: Option<String>,
 }
 
 /// One season's `/tv/{id}/season/{n}` lookup, as the scan cached it.
@@ -263,10 +274,8 @@ fn own_language(value: Option<&str>) -> Option<String> {
 }
 
 /// The language `row`'s providers are judged by
-/// (`GetPreferredMetadataLanguage`): its own, else the library's, else `en`
-/// — with the same open work item as
-/// [`ResolverGuesses::metadata_language`] (the parents and the server
-/// configuration).
+/// (`GetPreferredMetadataLanguage`): its own, else the resolved ancestor,
+/// library and server locale carried by the request's policy.
 fn preferred_language(row: &BaseItemEntity, policy: FetcherPolicy<'_>) -> String {
     own_language(row.preferred_metadata_language.as_deref())
         .unwrap_or_else(|| policy.metadata_language())
@@ -674,6 +683,11 @@ async fn fetch_image_files(
 #[derive(Clone, Copy, Default)]
 struct FetcherPolicy<'a> {
     options: Option<&'a LibraryOptionsModel>,
+    collection_folder: Option<Uuid>,
+    /// Server language/country read once for this scan, below library values.
+    locale: Option<&'a (String, String)>,
+    /// The item's resolved locale, when the image pass shares metadata's lookup.
+    effective_locale: Option<&'a (String, String)>,
     /// The server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
     /// library saved no `TypeOptions` entry for.
@@ -744,13 +758,16 @@ impl<'a> FetcherPolicy<'a> {
         )
     }
 
-    /// The library's preferred metadata language, lowercased. Jellyfin's own
-    /// default is `en`, which is what a library with no saved value gets.
+    /// The library's preferred metadata language, falling back to the server.
     fn metadata_language(self) -> String {
+        if let Some(locale) = self.effective_locale {
+            return locale.0.to_lowercase();
+        }
         self.options
             .and_then(|o| o.preferred_metadata_language.as_deref())
             .map(str::trim)
             .filter(|l| !l.is_empty())
+            .or_else(|| self.locale.map(|locale| locale.0.as_str()))
             .unwrap_or("en")
             .to_lowercase()
     }
@@ -758,10 +775,14 @@ impl<'a> FetcherPolicy<'a> {
     /// The library's metadata country code, lowercased (Jellyfin defaults to
     /// `US`). OMDb's certificate is only taken for the US.
     fn country_code(self) -> String {
+        if let Some(locale) = self.effective_locale {
+            return locale.1.to_lowercase();
+        }
         self.options
             .and_then(|o| o.metadata_country_code.as_deref())
             .map(str::trim)
             .filter(|c| !c.is_empty())
+            .or_else(|| self.locale.map(|locale| locale.1.as_str()))
             .unwrap_or("US")
             .to_lowercase()
     }
@@ -810,7 +831,9 @@ fn fetcher_policies<'a>(
                 id,
                 FetcherPolicy {
                     options: f.library_options.as_ref(),
+                    collection_folder: Some(id),
                     global,
+                    ..Default::default()
                 },
             ))
         })
@@ -2888,6 +2911,8 @@ pub struct LibraryScanner {
     /// library (a by-name artist). `None` (unit tests) gates nothing
     /// server-wide.
     metadata_options: Option<ServerMetadataOptions>,
+    /// Live language/country fallback for libraries without explicit values.
+    metadata_locale: Option<MetadataLocaleReader>,
     /// Reads the `metadata` named configuration (`GetMetadataConfiguration()`),
     /// live: how a new item's "date added" is stamped ([`DateAdded`]).
     /// `None` (unit tests) keeps upstream's default, the file creation date.
@@ -2898,6 +2923,8 @@ pub struct LibraryScanner {
 /// ([`LibraryScanner::with_metadata_options`]).
 type ServerMetadataOptions =
     Arc<dyn Fn() -> Vec<ferrofin_model::configuration::MetadataOptions> + Send + Sync>;
+
+type MetadataLocaleReader = Arc<dyn Fn() -> (String, String) + Send + Sync>;
 
 /// A live reader of the `metadata` named configuration
 /// ([`LibraryScanner::with_metadata_configuration`]).
@@ -2988,6 +3015,7 @@ impl LibraryScanner {
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             root_folder: None,
             metadata_options: None,
+            metadata_locale: None,
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
         }
@@ -3063,6 +3091,25 @@ impl LibraryScanner {
             .as_ref()
             .map(|read| read())
             .unwrap_or_default()
+    }
+
+    /// Reads the server metadata language and country at scan time. Library
+    /// values take precedence; saving server settings takes effect without a
+    /// restart. The pair is `(PreferredMetadataLanguage, MetadataCountryCode)`.
+    #[must_use]
+    pub fn with_metadata_locale(
+        mut self,
+        read: impl Fn() -> (String, String) + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_locale = Some(Arc::new(read));
+        self
+    }
+
+    fn server_metadata_locale(&self) -> (String, String) {
+        self.metadata_locale.as_ref().map_or_else(
+            || (self.default_metadata_language.clone(), "US".to_owned()),
+            |read| read(),
+        )
     }
 
     /// Reads the dashboard's library fanout ceiling for folder and probe work.
@@ -4287,13 +4334,20 @@ impl LibraryScanner {
         // Read once per scan: the server-wide options gate a kind a library
         // saved no checkboxes for, and an item in no library.
         let server_options = self.server_metadata_options();
-        let fetcher_policies = fetcher_policies(folders, Some(&server_options));
+        let server_locale = self.server_metadata_locale();
+        let mut fetcher_policies = fetcher_policies(folders, Some(&server_options));
+        for policy in fetcher_policies.values_mut() {
+            policy.locale = Some(&server_locale);
+        }
         let refresh = RefreshContext {
             scope,
             policies: &fetcher_policies,
             outside: FetcherPolicy {
                 options: None,
+                collection_folder: None,
                 global: Some(&server_options),
+                locale: Some(&server_locale),
+                effective_locale: None,
             },
             locked: &locked_items,
             externals: self.external_probe_seam(),
@@ -4630,9 +4684,11 @@ impl LibraryScanner {
         cache.series_tvdb.retain(|id, _| !keys.contains(id));
         cache
             .season_details
-            .retain(|(series, _), _| !keys.contains(series));
+            .retain(|(series, _, _), _| !keys.contains(series));
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
+        cache.locale_parents.retain(|id, _| !keys.contains(id));
+        cache.resolved_locales.retain(|id, _| !keys.contains(id));
         let albums: Vec<Uuid> = touched
             .iter()
             .filter(|id| cache.album_covers.remove(id).is_some())
@@ -7461,6 +7517,24 @@ impl LibraryScanner {
         if sources.is_empty() {
             return RemoteMetadata::default();
         }
+        let mut lookup = lookup.clone();
+        match self
+            .resolve_metadata_locale(entity, &lookup, policy, cache)
+            .await
+        {
+            Ok(locale) => {
+                cache
+                    .resolved_locales
+                    .insert(entity.id.clone(), locale.clone());
+                lookup.locale = Some(locale);
+            }
+            Err(err) => {
+                tracing::warn!(%err, item_id = entity.id, "could not resolve metadata locale");
+                ferrofin_providers::rate_limit::note_request_failure();
+                return RemoteMetadata::default();
+            }
+        }
+        let lookup = &lookup;
         let preferred_language = lookup.metadata_language(policy);
         let mut fold = RemoteFold::new(known_ids, &preferred_language);
         let row = entity.clone();
@@ -7495,6 +7569,67 @@ impl LibraryScanner {
             }
         }
         fold.result
+    }
+
+    /// `BaseItem.GetPreferredMetadataLanguage/CountryCode`: own override,
+    /// nearest parent, collection folder, library options, then server defaults.
+    async fn resolve_metadata_locale(
+        &self,
+        row: &BaseItemEntity,
+        lookup: &ResolverGuesses,
+        policy: FetcherPolicy<'_>,
+        cache: &mut ArtworkCache,
+    ) -> Result<(String, String), ServiceError> {
+        let mut language = lookup.own_language.clone();
+        let mut country = lookup.own_country.clone();
+        let mut next = row.parent_id.clone();
+        let mut visited = std::collections::HashSet::new();
+        while let Some(id) = next.filter(|_| language.is_none() || country.is_none()) {
+            if !visited.insert(id.clone()) {
+                break;
+            }
+            let parent = self.locale_parent(&id, cache).await?;
+            language = language.or(parent.language);
+            country = country.or(parent.country);
+            next = parent.parent;
+        }
+        if let Some(id) = policy.collection_folder
+            && (language.is_none() || country.is_none())
+        {
+            let collection = self.locale_parent(&guid_to_db(id), cache).await?;
+            language = language.or(collection.language);
+            country = country.or(collection.country);
+        }
+        Ok((
+            language.unwrap_or_else(|| policy.metadata_language()),
+            country
+                .unwrap_or_else(|| policy.country_code())
+                .to_ascii_uppercase(),
+        ))
+    }
+
+    async fn locale_parent(
+        &self,
+        id: &str,
+        cache: &mut ArtworkCache,
+    ) -> Result<LocaleParent, ServiceError> {
+        if let Some(parent) = cache.locale_parents.get(id) {
+            return Ok(parent.clone());
+        }
+        let parent = if let Some(items) = &self.item_repository
+            && let Some(id) = parse_id(id)
+            && let Some(row) = items.retrieve_item(id).await?
+        {
+            LocaleParent {
+                parent: row.parent_id,
+                language: own_language(row.preferred_metadata_language.as_deref()),
+                country: own_language(row.preferred_metadata_country_code.as_deref()),
+            }
+        } else {
+            LocaleParent::default()
+        };
+        cache.locale_parents.insert(id.to_owned(), parent.clone());
+        Ok(parent)
     }
 
     /// The photo embedded-information pass — port of `Emby.Photos.PhotoProvider`.
@@ -7654,8 +7789,8 @@ impl LibraryScanner {
             }
             _ => None,
         }?;
-        let english = policy.metadata_language() == "en";
-        let us = policy.country_code() == "us";
+        let english = language_subtag(&lookup.metadata_language(policy)) == "en";
+        let us = lookup.metadata_country(policy).eq_ignore_ascii_case("US");
         let mut answer = RemoteAnswer::for_row(row, Some("en"));
         apply_omdb(&mut answer.item, &item, english, us);
         if let Some(poster) = item.poster.as_deref().filter(|p| p.starts_with("http")) {
@@ -7721,13 +7856,15 @@ impl LibraryScanner {
         // `TmdbSeriesProvider.GetMetadata`) before any search by name.
         let pinned = match pinned {
             Some(id) => Some(id),
-            None => Self::find_tmdb_id(tmdb, kind, known_ids).await,
+            None => {
+                Self::find_tmdb_id(tmdb, kind, known_ids, lookup.tmdb_language().as_deref()).await
+            }
         };
         let tmdb_id = if let Some(id) = pinned {
             id
         } else {
             let name = lookup.name(row)?;
-            tmdb.search(kind, name.as_str(), year, None)
+            tmdb.search(kind, name.as_str(), year, lookup.tmdb_language().as_deref())
                 .await
                 .into_iter()
                 .next()
@@ -7740,16 +7877,15 @@ impl LibraryScanner {
         if matches!(kind, TmdbKind::Series) {
             cache.series_tmdb.insert(row.id.clone(), tmdb_id);
         }
-        let details = tmdb.details(kind, tmdb_id, None).await?;
-        // Upstream's answer claims `ResultLanguage = info.MetadataLanguage`
-        // (`TmdbMovieProvider.cs:212`, `TmdbSeriesProvider.cs:235`), which
-        // always matches the preferred language — as an answer that names no
-        // language does, so none is named here. Ferrofin's scan asks TMDB in
-        // no language at all (`details(.., None)`: TMDb's default, en-US).
-        // TODO(parity, open work item — NOT an accepted divergence): ask in
-        // the item's preferred metadata language and country, as upstream
-        // passes `info.MetadataLanguage`/`MetadataCountryCode` to every
-        // TmdbClientManager call.
+        let details = tmdb
+            .details_for_locale(
+                kind,
+                tmdb_id,
+                lookup.tmdb_language().as_deref(),
+                Some(&lookup.metadata_country(FetcherPolicy::default())),
+            )
+            .await?;
+        // TMDB answers in the resolved lookup language; no fallback marker.
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_details(&mut answer.item, &details);
         // The external ids it answers with: the matched TMDB id, the IMDb id
@@ -7793,6 +7929,7 @@ impl LibraryScanner {
         tmdb: &TmdbClient,
         kind: TmdbKind,
         known_ids: &[(String, String)],
+        language: Option<&str>,
     ) -> Option<i64> {
         let id_of = |provider: &str| {
             known_ids
@@ -7801,14 +7938,20 @@ impl LibraryScanner {
                 .map(|(_, value)| value.trim().to_owned())
         };
         if let Some(imdb) = id_of("Imdb")
-            && let Some(id) = tmdb.find_id_by_external_id(kind, "imdb_id", &imdb).await
+            && let Some(id) = tmdb
+                .find_by_external_id(kind, "imdb_id", &imdb, language)
+                .await
+                .and_then(|hits| hits.first().map(|hit| hit.tmdb_id))
         {
             return Some(id);
         }
         if kind == TmdbKind::Series
             && let Some(tvdb) = id_of("Tvdb")
         {
-            return tmdb.find_id_by_external_id(kind, "tvdb_id", &tvdb).await;
+            return tmdb
+                .find_by_external_id(kind, "tvdb_id", &tvdb, language)
+                .await
+                .and_then(|hits| hits.first().map(|hit| hit.tmdb_id));
         }
         None
     }
@@ -7839,7 +7982,7 @@ impl LibraryScanner {
             return None;
         };
         let ep = self
-            .season_details_cached(cache, &series_id, season)
+            .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
             .await
             .and_then(|d| episode_in_season(d, number))?
             .clone();
@@ -7849,7 +7992,15 @@ impl LibraryScanner {
         // (`TmdbEpisodeProvider` asks `GetEpisodeAsync` with
         // `credits,images,external_ids,videos` appended).
         let extras = match (&self.tmdb, series_tmdb_id_of(cache, &series_id)) {
-            (Some(tmdb), Some(id)) => tmdb.episode_extras(id, season, number).await,
+            (Some(tmdb), Some(id)) => {
+                tmdb.episode_extras_for_language(
+                    id,
+                    season,
+                    number,
+                    lookup.tmdb_language().as_deref(),
+                )
+                .await
+            }
             _ => None,
         };
         // The season listed the episode, so TMDB answered. Its credits are
@@ -7937,16 +8088,9 @@ impl LibraryScanner {
             return None;
         };
         let details = self
-            .season_details_cached(cache, &series_id, number)
+            .season_details_cached(cache, &series_id, number, lookup.tmdb_language().as_deref())
             .await?;
         let import_season_name = tmdb.import_season_name().await;
-        // Upstream asks in `info.MetadataLanguage` and claims it as the
-        // `ResultLanguage` (`:43-46`). The scan asks TMDB in no language
-        // (en-US) and, like the other TMDB arms, names none: a library of
-        // another language gets TMDB's English season overview, counted as
-        // preferred. TODO(parity, open work item — NOT an accepted
-        // divergence): the localisation TODO in `fetch_tmdb_metadata` covers
-        // this request too (kept out of the season port, owner 2026-10-04).
         Some(RemoteAnswer::of_result(
             row,
             ferrofin_providers::season::tmdb_answer(details, number, import_season_name),
@@ -7971,9 +8115,8 @@ impl LibraryScanner {
     /// documented at [`fetch_tvdb_metadata`](Self::fetch_tvdb_metadata)).
     ///
     /// The plugin's settings (`FallbackLanguages`, `ImportSeasonName`) keep
-    /// their defaults: the TVDB localisation TODO in the
-    /// `ferrofin_providers::tvdb` module doc, which also covers the series'
-    /// and episodes' translations.
+    /// their defaults; their separate plugin configuration page is an open
+    /// settings work item, as recorded in `ferrofin_providers::tvdb`.
     ///
     /// TODO(parity, open work item — NOT an accepted divergence): the plugin
     /// orders by the series' `DisplayOrder` (`info.SeriesDisplayOrder`,
@@ -8027,6 +8170,28 @@ impl LibraryScanner {
             &fallback
         };
         ferrofin_providers::tvdb::three_letter_language_names(localization.get_cultures(), language)
+    }
+
+    fn three_letter_country(&self, country: &str) -> String {
+        let fallback;
+        let localization = if let Some(localization) = &self.localization {
+            localization.as_ref()
+        } else {
+            fallback = crate::localization_manager::LocalizationManager::new("");
+            &fallback
+        };
+        localization
+            .get_countries()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .two_letter_iso_region_name
+                    .eq_ignore_ascii_case(country)
+                    || entry
+                        .three_letter_iso_region_name
+                        .eq_ignore_ascii_case(country)
+            })
+            .map_or_else(String::new, |entry| entry.three_letter_iso_region_name)
     }
 
     /// The TheTVDB provider — port of the TVDB plugin's `TvdbSeriesProvider`
@@ -8111,17 +8276,11 @@ impl LibraryScanner {
                     let year = lookup.year(row);
                     pick_series_hit(tvdb.search(&name, year).await, year)?.tvdb_id
                 };
-                let details = tvdb.series_details(tvdb_id, METADATA_COUNTRY).await?;
-                // Upstream's answer claims `result.ResultLanguage =
-                // info.MetadataLanguage` (`TvdbSeriesProvider.cs:448`), which
-                // always matches — as no language does. Ferrofin maps TVDB's
-                // base-language name and overview.
-                // TODO(parity, open work item — NOT an accepted divergence):
-                // translate them to the item's metadata language through the
-                // plugin's chain (`GetTranslatedNamedOrDefault`/
-                // `GetTranslatedOverviewOrDefault`, `FallbackLanguages`, then
-                // `ReturnOriginalLanguageOrDefault`, `TvdbSeriesProvider.cs:
-                // 445-446`); the port is described in the `tvdb.rs` module doc.
+                let country =
+                    self.three_letter_country(&lookup.metadata_country(FetcherPolicy::default()));
+                let mut details = tvdb.series_details(tvdb_id, &country).await?;
+                let language = lookup.metadata_language(FetcherPolicy::default());
+                details.localize(&language, &self.three_letter_language_names(&language));
                 let mut answer = RemoteAnswer::for_row(row, None);
                 apply_tvdb_series(&mut answer.item, &details);
                 // `TvdbSeriesProvider` `ResetPeople`s before mapping the
@@ -8170,7 +8329,7 @@ impl LibraryScanner {
                     .get(&series_id)
                     .map(|d| d.tvdb_id)
                     .or_else(|| recorded_provider_id(cache, &series_id, "Tvdb"))?;
-                let ep = tvdb
+                let mut ep = tvdb
                     .episode_by_number(
                         tvdb_id,
                         ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
@@ -8178,6 +8337,8 @@ impl LibraryScanner {
                         number,
                     )
                     .await?;
+                let language = lookup.metadata_language(FetcherPolicy::default());
+                ep.localize(&language, &self.three_letter_language_names(&language));
                 if let Some(url) = &ep.image_url {
                     cache.episode_tvdb_still.insert(row.id.clone(), url.clone());
                 }
@@ -8726,7 +8887,7 @@ impl LibraryScanner {
         // it wrote before the cancel are picked up from the art dir below.
         let fetched =
             self.run_remote_image_providers(fetch, entity, art_cache, policy, &mut images);
-        cut_short |= cancel.unless_cancelled(fetched).await.is_none();
+        cut_short |= cancel.unless_cancelled(Box::pin(fetched)).await.is_none();
         self.append_art_dir_images(entity, &mut images);
         // An album's Primary is stored as its shared, content-addressed cover
         // (what `finish_album_artwork` publishes after the walk). Storing the
@@ -9231,6 +9392,32 @@ impl LibraryScanner {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return Vec::new();
         };
+        let locale = if let Some(locale) = cache.resolved_locales.get(&entity.id) {
+            locale.clone()
+        } else {
+            let lookup = ResolverGuesses {
+                own_language: own_language(entity.preferred_metadata_language.as_deref()),
+                own_country: own_language(entity.preferred_metadata_country_code.as_deref()),
+                ..Default::default()
+            };
+            match self
+                .resolve_metadata_locale(entity, &lookup, policy, cache)
+                .await
+            {
+                Ok(locale) => locale,
+                Err(err) => {
+                    tracing::warn!(%err, item_id = entity.id, "could not resolve artwork locale");
+                    ferrofin_providers::rate_limit::note_request_failure();
+                    return Vec::new();
+                }
+            }
+        };
+        let policy = FetcherPolicy {
+            effective_locale: Some(&locale),
+            ..policy
+        };
+        let language =
+            ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1));
         let item_dir = meta_root.join(&entity.id);
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
@@ -9260,9 +9447,11 @@ impl LibraryScanner {
                 let images = if !policy.image_enabled(short, fetcher_names::TMDB) {
                     Vec::new()
                 } else if let Some(id) = tmdb_id {
-                    tmdb.images_by_id(TmdbKind::Movie, id).await
+                    tmdb.images_by_id_for_language(TmdbKind::Movie, id, language.as_deref())
+                        .await
                 } else {
-                    tmdb.images_for(TmdbKind::Movie, name, year).await
+                    tmdb.images_for_language(TmdbKind::Movie, name, year, language.as_deref())
+                        .await
                 };
                 let mut sources = vec![(fetcher_names::TMDB, images)];
                 // Rank all artwork before selecting the first of each type.
@@ -9275,6 +9464,10 @@ impl LibraryScanner {
                         .and_then(|ids| fanart_movie_id(ids))
                 {
                     let mut images = Vec::new();
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&policy.metadata_language());
                     append_fanart(&mut images, fanart.movie_images(&id).await);
                     sources.push((fetcher_names::FANART, images));
                 }
@@ -9307,7 +9500,7 @@ impl LibraryScanner {
                         .unwrap_or_default(),
                 )];
                 let images = if policy.image_enabled(short, fetcher_names::TMDB) {
-                    Self::series_tmdb_images(tmdb, entity, cache).await
+                    Self::series_tmdb_images(tmdb, entity, cache, language.as_deref()).await
                 } else {
                     Vec::new()
                 };
@@ -9316,6 +9509,10 @@ impl LibraryScanner {
                     && let (Some(fanart), Some(tvdb_id)) = (&self.fanart, tvdb_id)
                 {
                     let mut images = Vec::new();
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&policy.metadata_language());
                     append_fanart(
                         &mut images,
                         fanart.series_images(&tvdb_id.to_string()).await,
@@ -9342,6 +9539,7 @@ impl LibraryScanner {
         tmdb: &TmdbClient,
         entity: &BaseItemEntity,
         cache: &mut ArtworkCache,
+        language: Option<&str>,
     ) -> Vec<RemoteImage> {
         let known = cache.series_tmdb.get(&entity.id).copied().or_else(|| {
             cache
@@ -9353,7 +9551,8 @@ impl LibraryScanner {
             return Vec::new();
         };
         cache.series_tmdb.insert(entity.id.clone(), id);
-        tmdb.images_by_id(TmdbKind::Series, id).await
+        tmdb.images_by_id_for_language(TmdbKind::Series, id, language)
+            .await
     }
 
     /// The `/tv/{id}/season/{n}` response for one season, fetched at most once
@@ -9377,14 +9576,15 @@ impl LibraryScanner {
         cache: &'a mut ArtworkCache,
         series_id: &str,
         season: i32,
+        language: Option<&str>,
     ) -> Option<&'a ferrofin_providers::tmdb::SeasonDetails> {
-        let key = (series_id.to_owned(), season);
+        let key = (series_id.to_owned(), season, language.map(str::to_owned));
         if !cache.season_details.contains_key(&key) {
             let tmdb = self.tmdb.as_ref()?;
             // No series match yet → no request to make, and no miss to record.
             let tmdb_id = series_tmdb_id_of(cache, series_id)?;
             let (details, failures) = ferrofin_providers::rate_limit::count_request_failures(
-                tmdb.season_details(tmdb_id, season),
+                tmdb.season_details_for_language(tmdb_id, season, language),
             )
             .await;
             let lookup = match details {
@@ -9426,6 +9626,11 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         replace: Option<&std::collections::HashSet<ImageType>>,
     ) -> Vec<ItemImageInfo> {
+        let language = ferrofin_providers::tmdb::normalize_language(
+            Some(&preferred_language(entity, policy)),
+            Some(&policy.country_code()),
+        );
+
         if short == "Season" {
             // Season posters are TMDB's.
             // TODO(parity, open work item): TheTVDB's and fanart.tv's season
@@ -9442,7 +9647,7 @@ impl LibraryScanner {
                 return Vec::new();
             };
             let poster = self
-                .season_details_cached(cache, &series_id, season_num)
+                .season_details_cached(cache, &series_id, season_num, language.as_deref())
                 .await
                 .and_then(|d| d.poster.clone());
             let images = poster
@@ -9475,7 +9680,7 @@ impl LibraryScanner {
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
                 (Some(series_id), Some(season_num), Some(ep_num)) => self
-                    .season_details_cached(cache, &series_id, season_num)
+                    .season_details_cached(cache, &series_id, season_num, language.as_deref())
                     .await
                     .and_then(|d| episode_in_season(d, ep_num))
                     .and_then(|ep| ep.still_url.clone()),
@@ -10348,7 +10553,7 @@ impl LibraryScanner {
         };
         let scope = series_key_scope(
             folders,
-            &self.default_metadata_language,
+            &self.server_metadata_locale().0,
             series.top_parent_id.as_deref(),
             series.path.as_deref(),
             series.preferred_metadata_language.as_deref(),
@@ -12492,6 +12697,10 @@ struct ResolverGuesses {
     /// "Preferred metadata language"), the first step of the lookup info's
     /// `MetadataLanguage` ([`metadata_language`](Self::metadata_language)).
     own_language: Option<String>,
+    /// The metadata editor's country override.
+    own_country: Option<String>,
+    /// Resolved lookup locale, shared by every provider in this refresh.
+    locale: Option<(String, String)>,
 }
 
 impl ResolverGuesses {
@@ -12557,6 +12766,12 @@ impl ResolverGuesses {
                     .and_then(|s| s.preferred_metadata_language.as_deref())
                     .or(entity.preferred_metadata_language.as_deref()),
             ),
+            own_country: own_language(
+                stored
+                    .and_then(|s| s.preferred_metadata_country_code.as_deref())
+                    .or(entity.preferred_metadata_country_code.as_deref()),
+            ),
+            locale: None,
         }
     }
 
@@ -12598,20 +12813,31 @@ impl ResolverGuesses {
     }
 
     /// The lookup info's `MetadataLanguage`: `GetPreferredMetadataLanguage()`
-    /// (`BaseItem.cs:1771-1800`) — the item's own, else its library's, else
-    /// Jellyfin's default `en` ([`FetcherPolicy::metadata_language`]).
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence): upstream
-    /// asks the item's parents (an episode's series and season) and its
-    /// collection folders before the library options, and the server
-    /// configuration's `PreferredMetadataLanguage` after them; the scan has
-    /// neither an ancestor's row nor the server configuration at hand here.
-    /// Thread both through, as `provider_manager`'s
-    /// `preferred_metadata_language` reads them.
+    /// (`BaseItem.cs:1771-1800`), resolved before the provider fold by
+    /// `resolve_metadata_locale`. Standalone lookups use their own override,
+    /// library preference and server fallback in that order.
     fn metadata_language(&self, policy: FetcherPolicy<'_>) -> String {
-        self.own_language
-            .clone()
+        self.locale
+            .as_ref()
+            .map(|locale| locale.0.clone())
+            .or_else(|| self.own_language.clone())
             .unwrap_or_else(|| policy.metadata_language())
+    }
+
+    fn metadata_country(&self, policy: FetcherPolicy<'_>) -> String {
+        self.locale
+            .as_ref()
+            .map(|locale| locale.1.clone())
+            .or_else(|| self.own_country.clone())
+            .unwrap_or_else(|| policy.country_code())
+            .to_ascii_uppercase()
+    }
+
+    fn tmdb_language(&self) -> Option<String> {
+        ferrofin_providers::tmdb::normalize_language(
+            Some(&self.metadata_language(FetcherPolicy::default())),
+            Some(&self.metadata_country(FetcherPolicy::default())),
+        )
     }
 
     /// The year a fetcher searches by.
@@ -13653,13 +13879,6 @@ fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
         })
         .collect()
 }
-
-/// The three-letter country code TVDB content ratings are resolved against
-/// (USA fallback is built into [`TvdbClient::series_details`]). Jellyfin uses the
-/// server's metadata country; Ferrofin fixes it to USA for now.
-// ponytail: fixed to "usa" — thread the server metadata-country setting through
-// if per-region ratings matter.
-const METADATA_COUNTRY: &str = "usa";
 
 /// Fills a provider-owned serialized property without reserializing a no-op.
 fn fill_provider_data(entity: &mut BaseItemEntity, key: &str, value: Option<serde_json::Value>) {
@@ -15745,6 +15964,7 @@ mod tests {
         let policy = super::FetcherPolicy {
             options: Some(&library),
             global: None,
+            ..Default::default()
         };
         assert_eq!(own.metadata_language(policy), "de");
         let none = super::ResolverGuesses::take(&mut BaseItemEntity::default(), None, false);
@@ -15753,6 +15973,115 @@ mod tests {
             none.metadata_language(super::FetcherPolicy::default()),
             "en"
         );
+    }
+
+    #[tokio::test]
+    // One persisted hierarchy exercises all five precedence levels.
+    #[allow(clippy::too_many_lines)]
+    async fn metadata_locale_resolves_parents_collection_library_and_server_in_order() {
+        use super::{ArtworkCache, FetcherPolicy, ResolverGuesses};
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let parent = uuid::Uuid::from_u128(71);
+        let collection = uuid::Uuid::from_u128(72);
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(parent),
+                    type_: "MediaBrowser.Controller.Entities.Folder".into(),
+                    preferred_metadata_language: Some("de".into()),
+                    preferred_metadata_country_code: Some("AT".into()),
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(collection),
+                    type_: "MediaBrowser.Controller.Entities.CollectionFolder".into(),
+                    preferred_metadata_language: Some("it".into()),
+                    preferred_metadata_country_code: Some("IT".into()),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let vf = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(Arc::new(crate::FerrofinItemRepository::new(
+                db,
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            )));
+        let options = LibraryOptions {
+            preferred_metadata_language: Some("fr".into()),
+            metadata_country_code: Some("FR".into()),
+            ..Default::default()
+        };
+        let server = ("ja".to_owned(), "JP".to_owned());
+        let policy = FetcherPolicy {
+            options: Some(&options),
+            locale: Some(&server),
+            collection_folder: Some(collection),
+            ..Default::default()
+        };
+        let row = BaseItemEntity {
+            parent_id: Some(ferrofin_db::store::guid_to_db(parent)),
+            ..Default::default()
+        };
+        let mut cache = ArtworkCache::default();
+        let own = ResolverGuesses {
+            own_language: Some("pt".into()),
+            own_country: Some("BR".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &own, policy, &mut cache)
+                .await
+                .unwrap(),
+            ("pt".into(), "BR".into())
+        );
+        let lookup = ResolverGuesses::default();
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                .await
+                .unwrap(),
+            ("de".into(), "AT".into())
+        );
+        let row = BaseItemEntity::default();
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                .await
+                .unwrap(),
+            ("it".into(), "IT".into())
+        );
+        let policy = FetcherPolicy {
+            collection_folder: None,
+            ..policy
+        };
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                .await
+                .unwrap(),
+            ("fr".into(), "FR".into())
+        );
+        let blank = LibraryOptions {
+            preferred_metadata_language: Some(String::new()),
+            metadata_country_code: Some(String::new()),
+            ..Default::default()
+        };
+        for options in [None, Some(&blank)] {
+            let policy = FetcherPolicy { options, ..policy };
+            assert_eq!(
+                scanner
+                    .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                    .await
+                    .unwrap(),
+                ("ja".into(), "JP".into())
+            );
+        }
     }
 
     /// `MatchesPreferredLanguage`: the language subtags compare, and an
@@ -15892,7 +16221,11 @@ mod tests {
             options: Option<&'a LibraryOptions>,
             global: Option<&'a [MetadataOptions]>,
         ) -> super::FetcherPolicy<'a> {
-            super::FetcherPolicy { options, global }
+            super::FetcherPolicy {
+                options,
+                global,
+                ..Default::default()
+            }
         }
         assert!(!super::FetcherPolicy::default().tvdb_leads("Series"));
         assert!(!super::FetcherPolicy::default().tvdb_leads("Episode"));
@@ -15976,6 +16309,7 @@ mod tests {
         let season_saved = super::FetcherPolicy {
             options: Some(&season_tvdb_first),
             global: None,
+            ..Default::default()
         };
         assert_eq!(
             scanner.remote_sources(season_saved, "Season", None),
@@ -15991,6 +16325,7 @@ mod tests {
         let saved = super::FetcherPolicy {
             options: Some(&tvdb_first),
             global: None,
+            ..Default::default()
         };
         assert_eq!(
             scanner.remote_sources(saved, "Series", None),
@@ -16013,6 +16348,7 @@ mod tests {
         let unticked = super::FetcherPolicy {
             options: Some(&unticked),
             global: None,
+            ..Default::default()
         };
         assert_eq!(
             scanner.remote_sources(unticked, "Series", None),
@@ -16049,6 +16385,7 @@ mod tests {
         super::FetcherPolicy {
             options: Some(options),
             global: None,
+            ..Default::default()
         }
     }
 
@@ -16253,6 +16590,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&options),
                     global: None,
+                    ..Default::default()
                 },
                 None,
                 &own,
@@ -16287,6 +16625,7 @@ mod tests {
         let policy = super::FetcherPolicy {
             options: Some(&options),
             global: None,
+            ..Default::default()
         };
         assert_eq!(policy.metadata_language(), "de");
         assert_eq!(policy.country_code(), "de");
@@ -16327,6 +16666,8 @@ mod tests {
         let outside = super::FetcherPolicy {
             options: None,
             global: Some(&server),
+
+            ..Default::default()
         };
         let planned = |library: uuid::Uuid| super::Planned {
             id: uuid::Uuid::new_v4(),
@@ -16421,6 +16762,8 @@ mod tests {
             super::FetcherPolicy {
                 options: Some(&options),
                 global: None,
+
+                ..Default::default()
             },
             "Movie",
         );
@@ -18044,6 +18387,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&options),
                     global: None,
+                    ..Default::default()
                 },
                 true,
             )
@@ -18599,6 +18943,7 @@ mod tests {
                 super::FetcherPolicy {
                     options,
                     global: None,
+                    ..Default::default()
                 },
                 None,
                 &[],
@@ -18846,7 +19191,7 @@ mod tests {
         };
         let mut cache = super::ArtworkCache::default();
 
-        let images = LibraryScanner::series_tmdb_images(&tmdb, &series, &mut cache).await;
+        let images = LibraryScanner::series_tmdb_images(&tmdb, &series, &mut cache, None).await;
 
         assert!(images.is_empty());
         assert_eq!(
@@ -18931,6 +19276,7 @@ mod tests {
         let tvdb_policy = super::FetcherPolicy {
             options: Some(&tvdb_first),
             global: None,
+            ..Default::default()
         };
         let trailers = Some(r#"{"RemoteTrailers":[{"Url":"https://y/t","Name":"T"}]}"#.to_owned());
         let series = |overview: Option<&str>, data: Option<String>| BaseItemEntity {
@@ -19165,7 +19511,7 @@ mod tests {
             .expect("the second episode");
         // The image pass asks for the same season.
         let poster = scanner
-            .season_details_cached(&mut cache, "SERIES", 1)
+            .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
             .await
             .and_then(|d| d.poster.clone());
 
@@ -19173,6 +19519,19 @@ mod tests {
         assert_eq!(second.item.name.as_deref(), Some("The Kingsroad"));
         assert!(poster.is_some());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(
+                scanner
+                    .season_details_cached(&mut cache, "SERIES", 1, Some("fr"))
+                    .await
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a second language gets its own cached answer"
+        );
     }
 
     /// The scan's save for one item, as the loop runs it: the resolver's
@@ -21411,7 +21770,7 @@ mod tests {
         let (scanner, mut cache, _ep) = tmdb_episode_fixture(&base, tmp.path()).await;
         for _ in 0..2 {
             let (found, failures) = ferrofin_providers::rate_limit::count_request_failures(
-                Box::pin(scanner.season_details_cached(&mut cache, "SERIES", 1)),
+                Box::pin(scanner.season_details_cached(&mut cache, "SERIES", 1, None)),
             )
             .await;
             assert!(found.is_none());
@@ -21419,7 +21778,7 @@ mod tests {
         }
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(matches!(
-            cache.season_details.get(&("SERIES".to_owned(), 1)),
+            cache.season_details.get(&("SERIES".to_owned(), 1, None)),
             Some(super::SeasonLookup::Failed)
         ));
     }
@@ -21436,7 +21795,7 @@ mod tests {
 
         assert!(
             scanner
-                .season_details_cached(&mut cache, "SERIES", 1)
+                .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
                 .await
                 .is_none(),
             "a non-2xx season response is a miss"
@@ -21445,7 +21804,7 @@ mod tests {
         // fetch spends another request.
         assert!(
             scanner
-                .season_details_cached(&mut cache, "SERIES", 1)
+                .season_details_cached(&mut cache, "SERIES", 1, Some("en"))
                 .await
                 .is_none()
         );
@@ -21558,6 +21917,53 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[tokio::test]
+    async fn library_locale_selects_tvdb_translations_and_country_ratings() {
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"Base title","overview":"Base text",
+          "contentRatings":[{"country":"usa","name":"TV-MA"},{"country":"deu","name":"12"}],
+          "translations":{"nameTranslations":[
+            {"language":"deu","name":"An alias","isAlias":true},{"language":"deu","name":"Deutsch"}],
+            "overviewTranslations":[{"language":"deu","overview":"Beschreibung"}]}}}"#;
+        let base = spawn_tvdb_server(None, Some(DETAILS));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_base_url(&base),
+        ));
+        let mut series = BaseItemEntity {
+            id: "SERIES".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            preferred_metadata_language: Some("de".into()),
+            metadata_country_code: Some("DE".into()),
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Series".into()),
+                metadata_fetchers: vec!["TheTVDB".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fetched = scanner
+            .fetch_remote_metadata(
+                &mut series,
+                &mut cache,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                None,
+                &[("Tvdb".into(), "121361".into())],
+                &super::ResolverGuesses::default(),
+            )
+            .await;
+        assert!(fetched.answered);
+        assert_eq!(series.name.as_deref(), Some("Deutsch"));
+        assert_eq!(series.overview.as_deref(), Some("Beschreibung"));
+        assert_eq!(series.official_rating.as_deref(), Some("12"));
+    }
+
     /// Every provider the library runs for a series answers, one after the
     /// other (`ExecuteRemoteProviders`, `MetadataService.cs:968-1023`): a
     /// TVDB hit is no longer authoritative, TheMovieDb still runs after it.
@@ -21572,7 +21978,7 @@ mod tests {
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
         // TVDB's overview, and the TMDB id TVDB links the series to; no
         // community rating (TVDB supplies none).
-        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.",
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.","translations":{"nameTranslations":[{"language":"eng","name":"GoT"}],"overviewTranslations":[{"language":"eng","overview":"From TVDB."}]},
             "remoteIds":[{"id":"1399","sourceName":"TheMovieDB.com"}]}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
         let (the_moviedb, _season_hits, tmdb_requests) =
@@ -21604,6 +22010,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&tvdb_first),
                     global: None,
+                    ..Default::default()
                 },
                 None,
                 &[],
@@ -21707,7 +22114,7 @@ mod tests {
     async fn the_identify_results_fetcher_runs_first_then_the_others() {
         use ferrofin_db::entities::base_items::BaseItemEntity;
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
-        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.",
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.","translations":{"nameTranslations":[{"language":"eng","name":"GoT"}],"overviewTranslations":[{"language":"eng","overview":"From TVDB."}]},
             "genres":[{"name":"Drama"}]}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
         let (the_moviedb, _season_hits, tmdb_requests) =
@@ -21728,6 +22135,7 @@ mod tests {
         let tvdb_policy = super::FetcherPolicy {
             options: Some(&tvdb_first),
             global: None,
+            ..Default::default()
         };
         let mut by_default = series();
         let result = scanner
@@ -22169,7 +22577,7 @@ mod tests {
     #[tokio::test]
     async fn replacing_a_tvdb_first_series_whose_tvdb_credits_nobody_saves_tmdbs_cast() {
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
-        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.",
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.","translations":{"nameTranslations":[{"language":"eng","name":"GoT"}],"overviewTranslations":[{"language":"eng","overview":"From TVDB."}]},
             "episodes":[{"id":5,"seasonNumber":1,"number":1}],"characters":[]}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
         let (the_moviedb, _season_hits, _all) = spawn_tmdb_server_with_series(
@@ -22214,7 +22622,7 @@ mod tests {
     #[tokio::test]
     async fn a_tvdb_first_series_takes_what_tvdb_lacks_from_tmdb() {
         const SEARCH: &str = r#"{"data":[{"tvdb_id":"121361","name":"GoT","year":"2011"}]}"#;
-        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.",
+        const DETAILS: &str = r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.","translations":{"nameTranslations":[{"language":"eng","name":"GoT"}],"overviewTranslations":[{"language":"eng","overview":"From TVDB."}]},
             "episodes":[{"id":5,"seasonNumber":1,"number":1}],
             "characters":[{"personName":"Peter Dinklage","peopleType":"Actor"}]}}"#;
         let the_tvdb = spawn_tvdb_server(Some(SEARCH), Some(DETAILS));
@@ -22331,7 +22739,7 @@ mod tests {
             ),
             (
                 "/series/121361/extended",
-                r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.",
+                r#"{"data":{"id":121361,"name":"GoT","overview":"From TVDB.","translations":{"nameTranslations":[{"language":"eng","name":"GoT"}],"overviewTranslations":[{"language":"eng","overview":"From TVDB."}]},
                     "genres":[{"name":"Drama"}]}}"#,
             ),
             (
@@ -23059,6 +23467,7 @@ mod tests {
         let tvdb_policy = super::FetcherPolicy {
             options: Some(&tvdb_first),
             global: None,
+            ..Default::default()
         };
 
         // TheTVDB first, with a poster and a banner: TheMovieDb is asked for
@@ -23138,6 +23547,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&both),
                     global: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -23190,6 +23600,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&options),
                     global: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -23235,6 +23646,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&options),
                     global: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -23439,6 +23851,7 @@ mod tests {
                 super::FetcherPolicy {
                     options: Some(&tvdb_first),
                     global: None,
+                    ..Default::default()
                 },
                 None,
                 &[],

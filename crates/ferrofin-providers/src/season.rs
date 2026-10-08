@@ -26,15 +26,8 @@
 //! Language: upstream asks TheMovieDb in the lookup's `MetadataLanguage` and
 //! claims it as the answer's `ResultLanguage` (`:43-46`); TheTVDB's season
 //! answer names none, its overview being the translation in that language.
-//! So neither is ever a language fallback in the fold. Ferrofin's TMDB
-//! client asks in no language (TMDb's default, en-US) and names none either,
-//! so in a library of another language a season's TheMovieDb overview is
-//! English and still counts as the preferred one.
-//! TODO(parity, open work item — NOT an accepted divergence): the TMDB
-//! localisation item at the scan's `fetch_tmdb_metadata` (ask every
-//! `TmdbClientManager` call in the item's language and country) covers the
-//! season request too; the owner kept it out of the season port
-//! (2026-10-04).
+//! So neither is ever a language fallback in the fold. The scanner and the
+//! single-season refresh pass the resolved metadata language to TMDB.
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 

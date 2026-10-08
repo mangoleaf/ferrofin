@@ -756,29 +756,54 @@ fn crew_person_type(job: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// Extracts the US content certification from a movie's `release_dates` or a
-/// series' `content_ratings`, preferring the US entry.
-fn us_certification(
+/// Requested-country certification, with Jellyfin's US fallback and prefix.
+fn certification(
     kind: TmdbKind,
     release_dates: Option<ReleaseDatesResults>,
     content_ratings: Option<ContentRatingResults>,
+    country: Option<&str>,
 ) -> Option<String> {
-    match kind {
-        TmdbKind::Movie => {
-            let results = release_dates?.results;
-            let us = results
-                .iter()
-                .find(|c| c.iso_3166_1.as_deref() == Some("US"))?;
-            us.release_dates
-                .iter()
-                .find_map(|r| r.certification.clone().filter(|c| !c.is_empty()))
-        }
+    let country = country.filter(|c| !c.is_empty()).unwrap_or("US");
+    let ratings: Vec<(String, String)> = match kind {
+        TmdbKind::Movie => release_dates?
+            .results
+            .into_iter()
+            .filter_map(|entry| {
+                let rating = entry
+                    .release_dates
+                    .into_iter()
+                    .find_map(|r| r.certification.filter(|c| !c.trim().is_empty()))?;
+                Some((entry.iso_3166_1?, rating))
+            })
+            .collect(),
         TmdbKind::Series => content_ratings?
             .results
             .into_iter()
-            .find(|c| c.iso_3166_1.as_deref() == Some("US"))
-            .and_then(|c| c.rating.filter(|r| !r.is_empty())),
+            .filter_map(|entry| {
+                Some((
+                    entry.iso_3166_1?,
+                    entry.rating.filter(|r| !r.trim().is_empty())?,
+                ))
+            })
+            .collect(),
+    };
+    if let Some((_, rating)) = ratings
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(country))
+    {
+        let prefix = if country.eq_ignore_ascii_case("US") {
+            String::new()
+        } else if country.eq_ignore_ascii_case("DE") {
+            "FSK-".to_owned()
+        } else {
+            format!("{country}-")
+        };
+        return Some(format!("{prefix}{rating}"));
     }
+    ratings
+        .into_iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case("US"))
+        .map(|(_, rating)| rating)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1133,6 +1158,17 @@ impl TmdbClient {
         name: &str,
         year: Option<i32>,
     ) -> Vec<RemoteImage> {
+        self.images_for_language(kind, name, year, None).await
+    }
+
+    /// Finds title artwork using a resolved metadata language.
+    pub async fn images_for_language(
+        &self,
+        kind: TmdbKind,
+        name: &str,
+        year: Option<i32>,
+        language: Option<&str>,
+    ) -> Vec<RemoteImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1160,7 +1196,10 @@ impl TmdbClient {
         }
 
         tracing::debug!(provider = "tmdb", query = name, ?year, "tmdb image search");
-        let resp = match req.send_limited(&self.limiter).await {
+        let resp = match with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+        {
             Ok(resp) => resp,
             // The limiter strips URLs from transport errors to protect API keys.
             Err(e) => {
@@ -1205,16 +1244,27 @@ impl TmdbClient {
     /// identified as another title gets that title's artwork. Empty on a miss
     /// or any failure.
     pub async fn images_by_id(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<RemoteImage> {
+        self.images_by_id_for_language(kind, tmdb_id, None).await
+    }
+
+    /// Reads the title's preferred poster/backdrop in the metadata language.
+    pub async fn images_by_id_for_language(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        language: Option<&str>,
+    ) -> Vec<RemoteImage> {
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
         let path = match kind {
             TmdbKind::Movie => "movie",
             TmdbKind::Series => "tv",
         };
-        let Ok(resp) = self
+        let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key)])
+            .query(&[("api_key", key)]);
+        let Ok(resp) = with_language(req, language)
             .send_limited(&self.limiter)
             .await
         else {
@@ -1254,19 +1304,28 @@ impl TmdbClient {
     /// season's own `poster_path` and no season video, so only the two the
     /// season provider maps are appended.
     pub async fn season_details(&self, tmdb_id: i64, season_number: i32) -> Option<SeasonDetails> {
+        self.season_details_for_language(tmdb_id, season_number, None)
+            .await
+    }
+
+    /// Fetches a season and its episodes in the resolved metadata language.
+    pub async fn season_details_for_language(
+        &self,
+        tmdb_id: i64,
+        season_number: i32,
+        language: Option<&str>,
+    ) -> Option<SeasonDetails> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
         let url = format!("{}/tv/{tmdb_id}/season/{season_number}", self.base_url);
-        let resp = self
-            .http
-            .get(url)
-            .query(&[
-                ("api_key", key),
-                ("append_to_response", "credits,external_ids"),
-            ])
+        let req = self.http.get(url).query(&[
+            ("api_key", key),
+            ("append_to_response", "credits,external_ids"),
+        ]);
+        let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
             .ok()?;
@@ -1611,6 +1670,18 @@ impl TmdbClient {
         season: i32,
         episode: i32,
     ) -> Option<EpisodeExtras> {
+        self.episode_extras_for_language(series, season, episode, None)
+            .await
+    }
+
+    /// Episode credits and trailers in the resolved metadata language.
+    pub async fn episode_extras_for_language(
+        &self,
+        series: i64,
+        season: i32,
+        episode: i32,
+        language: Option<&str>,
+    ) -> Option<EpisodeExtras> {
         #[derive(Deserialize)]
         struct Response {
             external_ids: Option<ExternalIds>,
@@ -1619,7 +1690,7 @@ impl TmdbClient {
         }
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
-        let resp = self
+        let req = self
             .http
             .get(format!(
                 "{}/tv/{series}/season/{season}/episode/{episode}",
@@ -1628,7 +1699,8 @@ impl TmdbClient {
             .query(&[
                 ("api_key", key),
                 ("append_to_response", "external_ids,videos,credits"),
-            ])
+            ]);
+        let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
             .ok()?;
@@ -1734,6 +1806,18 @@ impl TmdbClient {
         tmdb_id: i64,
         language: Option<&str>,
     ) -> Option<TmdbDetails> {
+        self.details_for_locale(kind, tmdb_id, language, None).await
+    }
+
+    /// Fetches localized metadata and selects the requested country's rating,
+    /// falling back to the US rating when no local certification is available.
+    pub async fn details_for_locale(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        language: Option<&str>,
+        country: Option<&str>,
+    ) -> Option<TmdbDetails> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1813,7 +1897,7 @@ impl TmdbClient {
             genres: d.genres.into_iter().filter_map(|g| g.name).collect(),
             studios: resolve_studios(d.networks, d.production_companies),
             community_rating: d.vote_average.filter(|v| *v > 0.0),
-            official_rating: us_certification(kind, d.release_dates, d.content_ratings),
+            official_rating: certification(kind, d.release_dates, d.content_ratings, country),
             production_year: year_from(premiere.as_deref()),
             premiere_date: premiere,
             runtime_minutes: match kind {
@@ -2501,7 +2585,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            us_certification(TmdbKind::Movie, Some(rd), None).as_deref(),
+            certification(TmdbKind::Movie, Some(rd), None, None).as_deref(),
             Some("R")
         );
         let cr = ContentRatingResults {
@@ -2511,10 +2595,42 @@ mod tests {
             }],
         };
         assert_eq!(
-            us_certification(TmdbKind::Series, None, Some(cr)).as_deref(),
+            certification(TmdbKind::Series, None, Some(cr), None).as_deref(),
             Some("TV-MA")
         );
-        assert_eq!(us_certification(TmdbKind::Movie, None, None), None);
+        assert_eq!(certification(TmdbKind::Movie, None, None, None), None);
+    }
+
+    #[rstest::rstest]
+    #[case("US", "R")]
+    #[case("DE", "FSK-12")]
+    #[case("de", "FSK-12")]
+    #[case("GB", "GB-15")]
+    #[case("FR", "R")]
+    fn certifications_use_country_prefixes_and_us_fallback(
+        #[case] country: &str,
+        #[case] expected: &str,
+    ) {
+        let releases = serde_json::from_value(serde_json::json!({"results":[
+            {"iso_3166_1":"DE","release_dates":[{"certification":""},{"certification":"12"}]},
+            {"iso_3166_1":"US","release_dates":[{"certification":"R"}]},
+            {"iso_3166_1":"GB","release_dates":[{"certification":"15"}]}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Movie, Some(releases), None, Some(country)).as_deref(),
+            Some(expected)
+        );
+        let ratings = serde_json::from_value(serde_json::json!({"results":[
+            {"iso_3166_1":"DE","rating":"12"},
+            {"iso_3166_1":"US","rating":"R"},
+            {"iso_3166_1":"GB","rating":"15"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            certification(TmdbKind::Series, None, Some(ratings), Some(country)).as_deref(),
+            Some(expected)
+        );
     }
 
     #[test]

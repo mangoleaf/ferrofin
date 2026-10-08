@@ -702,6 +702,8 @@ impl LibraryScanner {
             policy: FetcherPolicy {
                 options: None,
                 global: Some(&server),
+
+                ..Default::default()
             },
             aggregate: full_refresh(&plan, &request),
             owns_stamp: true,
@@ -756,6 +758,27 @@ impl LibraryScanner {
         let Some(stored) = items.retrieve_item(work.id).await? else {
             return Ok(Some(false));
         };
+        let lookup = super::ResolverGuesses {
+            own_language: super::own_language(stored.preferred_metadata_language.as_deref()),
+            own_country: super::own_language(stored.preferred_metadata_country_code.as_deref()),
+            ..Default::default()
+        };
+        let locale = self
+            .resolve_metadata_locale(
+                &stored,
+                &lookup,
+                work.policy,
+                &mut super::ArtworkCache::default(),
+            )
+            .await?;
+        let resolved_work = MusicRefresh {
+            policy: FetcherPolicy {
+                effective_locale: Some(&locale),
+                ..work.policy
+            },
+            ..*work
+        };
+        let work = &resolved_work;
         let options = work.request.options;
         let fetch = self.music_fetch(work.kind, &work.plan, work.policy, stored.is_locked);
         // The fields the user locked keep their stored values through the
@@ -1553,6 +1576,10 @@ impl LibraryScanner {
                         valid_id(ids, "MusicBrainzAlbumArtist"),
                     )
                 {
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&work.policy.metadata_language());
                     fanart_found.extend(fanart.album_images(&artist, group).await);
                 }
             }
@@ -1570,6 +1597,10 @@ impl LibraryScanner {
                 if fetch.fanart_images
                     && let (Some(fanart), Some(id)) = (&self.fanart, artist_key.as_deref())
                 {
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&work.policy.metadata_language());
                     fanart_found.extend(fanart.artist_images(id).await);
                 }
             }
@@ -1855,6 +1886,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&audiodb_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &[]),
@@ -1868,6 +1901,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&musicbrainz_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, Some(&chosen(AUDIODB)), &[]),
@@ -1904,6 +1939,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&plugin_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &named),
@@ -1917,6 +1954,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&between),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &named),
@@ -1943,6 +1982,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&names_it),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &unnamed),

@@ -111,7 +111,15 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         //    as an accepted divergence in suite/parity/classifications.json
         //    under `POST /Items/RemoteSearch/Movie`, with the measurement.)
         if let Some(tmdb_id) = provider_id_of(ids, "Tmdb").and_then(parse_numeric_provider_id)
-            && let Some(details) = self.tmdb.details(self.kind, tmdb_id, language).await
+            && let Some(details) = self
+                .tmdb
+                .details_for_locale(
+                    self.kind,
+                    tmdb_id,
+                    language,
+                    search_info.metadata_country_code.as_deref(),
+                )
+                .await
         {
             return Ok(vec![self.pinned_result(tmdb_id, details)]);
         }
@@ -1606,6 +1614,7 @@ impl LocalProviderManager {
     /// then a title search) and fetches one season's details — the shared
     /// first half of the season/episode refresh arms. `None` when the series
     /// has no TMDB match or the season fetch fails.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_season(
         &self,
         tmdb: &Arc<TmdbClient>,
@@ -1613,13 +1622,15 @@ impl LocalProviderManager {
         series_name: &str,
         series_year: Option<i32>,
         season_number: i32,
+        language: Option<&str>,
     ) -> Option<crate::tmdb::SeasonDetails> {
         let stored = match series_id {
             Some(id) => self.stored_provider_ids(id).await,
             None => Vec::new(),
         };
         let tmdb_id = Self::series_tmdb_id(tmdb, &stored, series_name, series_year).await?;
-        tmdb.season_details(tmdb_id, season_number).await
+        tmdb.season_details_for_language(tmdb_id, season_number, language)
+            .await
     }
 
     /// The parent series' TMDB id: its stored ids first (`Tmdb`, else `Imdb`
@@ -1782,9 +1793,8 @@ impl LocalProviderManager {
     /// ([`BUILT_IN_METADATA_FETCHERS`]) — breaks a tie;
     /// identifying runs the chosen result's provider first (`:876-882`).
     /// Neither names a `ResultLanguage` here, so the fold's language
-    /// fallback (`:977-999`) never applies to a season — TheMovieDb's season
-    /// request carries no language yet, so its overview is English (the TMDB
-    /// localisation TODO, see [`crate::season`]). The ids an answer brings
+    /// fallback (`:977-999`) never applies to a season: its request carries
+    /// the resolved metadata language. The ids an answer brings
     /// are not looked up by: TheTVDB reads the season's id from its series
     /// under the scan's `IsAutomated` (see [`crate::season::tvdb_season`]).
     ///
@@ -1818,9 +1828,17 @@ impl LocalProviderManager {
         if let Some(prefer) = prefer {
             sources.sort_by_key(|name| !name.eq_ignore_ascii_case(prefer));
         }
+        let language = crate::tmdb::normalize_language(
+            Some(&self.preferred_metadata_language(row).await),
+            Some(&self.preferred_metadata_country_code(row).await),
+        );
         let wants_tmdb = fetch.images || sources.contains(&fetcher_names::TMDB);
         let details = match tmdb {
-            Some((client, id)) if wants_tmdb => client.season_details(id, season_number).await,
+            Some((client, id)) if wants_tmdb => {
+                client
+                    .season_details_for_language(id, season_number, language.as_deref())
+                    .await
+            }
             _ => None,
         };
         let mut fetched = Fetched::default();
@@ -1902,6 +1920,7 @@ impl LocalProviderManager {
         tmdb: &Arc<TmdbClient>,
         target: RefreshTarget,
         fetch: Fetch,
+        language: Option<&str>,
     ) -> Option<Fetched> {
         let RefreshTarget::Episode {
             series_id,
@@ -1914,7 +1933,14 @@ impl LocalProviderManager {
             return None;
         };
         let season = self
-            .fetch_season(tmdb, series_id, &series_name, series_year, season_number)
+            .fetch_season(
+                tmdb,
+                series_id,
+                &series_name,
+                series_year,
+                season_number,
+                language,
+            )
             .await?;
         let episode = season
             .episodes
@@ -1951,6 +1977,7 @@ impl LocalProviderManager {
         provider_ids: &[(String, String)],
         chosen_name: Option<&str>,
         fetch: Fetch,
+        language: Option<&str>,
     ) -> Option<Fetched> {
         let tmdb_id =
             provider_id_of_pairs(provider_ids, "Tmdb").and_then(parse_numeric_provider_id);
@@ -1964,7 +1991,9 @@ impl LocalProviderManager {
             // The season arm runs every season provider; `refresh_item`
             // routes it to `fetch_season_providers`.
             RefreshTarget::Season { .. } => None,
-            episode @ RefreshTarget::Episode { .. } => self.fetch_tv(tmdb, episode, fetch).await,
+            episode @ RefreshTarget::Episode { .. } => {
+                self.fetch_tv(tmdb, episode, fetch, language).await
+            }
         }
     }
 
@@ -2149,12 +2178,17 @@ impl LocalProviderManager {
             }
             Some(target) => match &self.tmdb {
                 Some(tmdb) => {
+                    let language = crate::tmdb::normalize_language(
+                        Some(&self.preferred_metadata_language(&stored).await),
+                        Some(&self.preferred_metadata_country_code(&stored).await),
+                    );
                     crate::rate_limit::count_request_failures(self.fetch_target(
                         tmdb,
                         target,
                         &stored_ids,
                         chosen_name,
                         fetch,
+                        language.as_deref(),
                     ))
                     .await
                 }
@@ -2568,6 +2602,49 @@ impl LocalProviderManager {
             return lang;
         }
         self.server_language()
+    }
+
+    async fn preferred_metadata_country_code(&self, entity: &BaseItemEntity) -> String {
+        let usable = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(lang) = usable(entity.preferred_metadata_country_code.as_deref()) {
+            return lang;
+        }
+        if let Some(items) = &self.items
+            && let Ok(id) = Uuid::parse_str(&entity.id)
+            && let Ok(Some(chain)) = items.get_ancestor_chain(id).await
+            && let Some(lang) = chain
+                .iter()
+                .find_map(|a| usable(a.preferred_metadata_country_code.as_deref()))
+        {
+            return lang;
+        }
+        if let Some(folders) = &self.virtual_folders
+            && let Some(path) = entity.path.as_deref()
+            && let Ok(list) = folders.get_virtual_folders().await
+            && let Some(lang) = list
+                .iter()
+                .find(|f| {
+                    f.locations
+                        .iter()
+                        .any(|loc| !loc.is_empty() && path.starts_with(loc.as_str()))
+                })
+                .and_then(|f| f.library_options.as_ref())
+                .and_then(|o| usable(o.metadata_country_code.as_deref()))
+        {
+            return lang;
+        }
+        if let Some(lang) = self
+            .library_options_for(entity)
+            .await
+            .and_then(|o| usable(o.metadata_country_code.as_deref()))
+        {
+            return lang;
+        }
+        self.server_country()
     }
 
     /// The remote image providers that `Supports(item)` for `entity`'s kind,
