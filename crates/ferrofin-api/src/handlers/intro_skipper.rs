@@ -864,6 +864,98 @@ async fn erase_season(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The episode ids a JSON array carries, in Jellyfin's `"N"` form.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+struct GuidList(#[serde(with = "ferrofin_model::json::guid::vec")] Vec<Uuid>);
+
+/// `GET /Intros/DisabledEpisodes/{SeasonId}` — the season's episodes excluded
+/// from media-segment output.
+///
+/// Port of `VisualizationController.GetDisabledEpisodes` →
+/// `Plugin.GetMediaSegmentExcludedEpisodeIdsAsync` (no existence check: an
+/// unknown season has none).
+async fn get_disabled_episodes(
+    State(state): State<AppState>,
+    RequireAdmin(_auth): RequireAdmin,
+    Path(season_id): Path<Uuid>,
+) -> Result<Json<GuidList>, ApiError> {
+    let mut ids: Vec<Uuid> = state
+        .intro_skipper
+        .excluded_episodes(season_id)
+        .await?
+        .into_iter()
+        .collect();
+    ids.sort_unstable();
+    Ok(Json(GuidList(ids)))
+}
+
+/// The body of `POST /Intros/DisabledEpisodes/Update`
+/// (`UpdateEpisodeMediaSegmentRequest`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateEpisodeMediaSegmentRequest {
+    /// The season.
+    #[serde(default, with = "ferrofin_model::json::guid")]
+    season_id: Uuid,
+    /// The episode.
+    #[serde(default, with = "ferrofin_model::json::guid")]
+    episode_id: Uuid,
+    /// Exclude (`true`) or include it again.
+    #[serde(default)]
+    disabled: bool,
+}
+
+/// `POST /Intros/DisabledEpisodes/Update` — exclude or re-include an episode's
+/// media-segment output.
+///
+/// Port of `VisualizationController.UpdateDisabledEpisode`: 404 unless the
+/// episode belongs to the season (`IsEpisodeInSeason`'s library arm: an
+/// `Episode` whose `SeasonId` is it); the flag is stored, then the episode's
+/// published segments are removed or republished
+/// (`RemoveIntroSkipperSegmentsAsync` / `RefreshAsync` — not gated on
+/// `UpdateMediaSegments` upstream either). The stored segments stay, so
+/// re-including restores them without re-analysis.
+async fn update_disabled_episode(
+    State(state): State<AppState>,
+    RequireAdmin(_auth): RequireAdmin,
+    JsonBody(request): JsonBody<UpdateEpisodeMediaSegmentRequest>,
+) -> Result<StatusCode, ApiError> {
+    let in_season = state
+        .library
+        .get_item_by_id(request.episode_id)
+        .await?
+        .is_some_and(|item| {
+            item.type_.rsplit('.').next() == Some("Episode")
+                && item
+                    .season_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok())
+                    == Some(request.season_id)
+        });
+    if !in_season {
+        return Err(ApiError::NotFound(format!(
+            "episode {} in season {}",
+            request.episode_id, request.season_id
+        )));
+    }
+    state
+        .intro_skipper
+        .set_excluded(request.season_id, request.episode_id, request.disabled)
+        .await?;
+    if request.disabled {
+        intro_store::remove_published(state.media_segments.as_ref(), request.episode_id).await?;
+    } else {
+        intro_store::refresh(
+            state.intro_skipper.as_ref(),
+            state.media_segments.as_ref(),
+            request.episode_id,
+        )
+        .await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /Intros/AnalyzerActions/{SeasonId}` — the per-mode analyzer actions for
 /// a season.
 ///
@@ -1055,6 +1147,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Intros/AnalyzerActions/UpdateSeason",
             post(update_analyzer_actions),
+        )
+        .route(
+            "/Intros/DisabledEpisodes/{SeasonId}",
+            get(get_disabled_episodes),
+        )
+        .route(
+            "/Intros/DisabledEpisodes/Update",
+            post(update_disabled_episode),
         )
         .route(
             "/Intros/Show/{SeriesId}/{SeasonId}",

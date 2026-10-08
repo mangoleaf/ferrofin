@@ -568,6 +568,47 @@ async fn skippable_segments_come_from_the_tier_keyed_by_mode_name() {
     assert_eq!(json.as_object().unwrap().len(), 2);
 }
 
+/// `GET Intros/DisabledEpisodes/{SeasonId}` lists the season's excluded
+/// episodes as `"N"`-form GUIDs (an unknown season has none).
+#[tokio::test]
+async fn disabled_episodes_list_the_seasons_exclusions() {
+    let (_seg, app) = state();
+    let (season, a, b) = (
+        Uuid::from_u128(0x60),
+        Uuid::from_u128(0x61),
+        Uuid::from_u128(0x62),
+    );
+    app.intro_skipper
+        .set_excluded(season, b, true)
+        .await
+        .unwrap();
+    app.intro_skipper
+        .set_excluded(season, a, true)
+        .await
+        .unwrap();
+    app.intro_skipper
+        .set_excluded(Uuid::from_u128(0x63), a, true)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        app.clone(),
+        "GET",
+        &format!("/Intros/DisabledEpisodes/{season}"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, format!(r#"["{}","{}"]"#, a.simple(), b.simple()));
+    let (_, body) = send(
+        app,
+        "GET",
+        &format!("/Intros/DisabledEpisodes/{}", Uuid::from_u128(0x64)),
+        "",
+    )
+    .await;
+    assert_eq!(body, "[]");
+}
+
 /// `RebuildDatabaseAsync` keeps only valid segments; the editor's create needs
 /// `providerId`, its delete `itemId` + `type`; a Commercial delete without a
 /// published match is a 404.
@@ -734,6 +775,8 @@ async fn plugin_routes_are_elevated_as_upstream() {
             "POST",
             "/FileTransformation/RegisterTransformation".to_owned(),
         ),
+        ("GET", format!("/Intros/DisabledEpisodes/{id}")),
+        ("POST", "/Intros/DisabledEpisodes/Update".to_owned()),
     ] {
         let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
