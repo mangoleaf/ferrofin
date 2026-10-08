@@ -62,6 +62,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 #[derive(Default)]
 struct RecordingProbe {
     probed: Mutex<Vec<String>>,
+    metadata: Mutex<Option<ferrofin_model::media_info::MediaInfo>>,
 }
 
 impl RecordingProbe {
@@ -134,6 +135,24 @@ impl MediaEncoder for RecordingProbe {
             media_streams: streams,
             ..MediaSourceInfo::default()
         })
+    }
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<ferrofin_model::media_info::MediaInfo, ServiceError> {
+        let source = self.get_media_info(request).await?;
+        let mut info = self
+            .metadata
+            .lock()
+            .expect("metadata")
+            .clone()
+            .unwrap_or_default();
+        info.media_source = MediaSourceInfo {
+            name: info.media_source.name,
+            container: info.media_source.container,
+            ..source
+        };
+        Ok(info)
     }
     async fn extract_audio_image(
         &self,
@@ -275,6 +294,7 @@ impl Tmdb {
 /// scanner with the probe, TMDB and the item repository wired.
 struct Fixture {
     db: Database,
+    vf: Arc<dyn VirtualFolderManager>,
     scanner: LibraryScanner,
     probe: Arc<RecordingProbe>,
     tmdb: Tmdb,
@@ -325,19 +345,23 @@ impl Fixture {
         ));
         let probe = Arc::new(RecordingProbe::default());
         let tmdb = Tmdb::spawn();
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_items(items)
-            .with_probe(
-                Arc::clone(&probe) as Arc<dyn MediaEncoder>,
-                Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
-                    as Arc<dyn MediaStreamRepository>,
-                Arc::new(FerrofinChapterRepository::new(db.clone())),
-            )
-            .with_metadata(
-                Arc::new(TmdbClient::new().with_base_url(&tmdb.base)),
-                root.join("metadata"),
-            )
-            .with_progress_every(0);
+        let scanner = LibraryScanner::new(
+            Arc::clone(&vf),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence,
+        )
+        .with_items(items)
+        .with_probe(
+            Arc::clone(&probe) as Arc<dyn MediaEncoder>,
+            Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
+                as Arc<dyn MediaStreamRepository>,
+            Arc::new(FerrofinChapterRepository::new(db.clone())),
+        )
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&tmdb.base)),
+            root.join("metadata"),
+        )
+        .with_progress_every(0);
         let scanner = match omdb {
             Some(base) => scanner.with_omdb(Arc::new(
                 ferrofin_providers::OmdbClient::new("key").with_base_url(base),
@@ -347,6 +371,7 @@ impl Fixture {
         count_writes(&db).await;
         Self {
             db,
+            vf,
             scanner,
             probe,
             tmdb,
@@ -2758,4 +2783,76 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
                 .unwrap();
         assert_eq!(rows, vec![(guid_to_db(id), Some(primary.clone()))]);
     }
+}
+
+/// An NFO wins initial discovery. On Search for missing metadata the prober
+/// first changes the stored title, which the fill-only NFO merge then keeps.
+/// A Name lock still preserves the user's title on a changed-file scan.
+#[tokio::test]
+async fn embedded_title_obeys_refresh_merge_and_name_locks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(tmp.path(), 0).await;
+    let mut options = fixture
+        .vf
+        .get_virtual_folders()
+        .await
+        .unwrap()
+        .remove(0)
+        .library_options
+        .unwrap();
+    options.enable_embedded_titles = true;
+    options.type_options = vec![ferrofin_model::configuration::TypeOptions {
+        type_: Some("Movie".to_owned()),
+        ..Default::default()
+    }];
+    fixture
+        .vf
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    let mut info = ferrofin_model::media_info::MediaInfo::default();
+    info.media_source.name = Some("Embedded".to_owned());
+    info.media_source.container = Some("matroska".to_owned());
+    *fixture.probe.metadata.lock().unwrap() = Some(info);
+    std::fs::write(
+        fixture.heat.with_extension("nfo"),
+        "<movie><title>NFO title</title></movie>",
+    )
+    .unwrap();
+    fixture.scan().await;
+    let names = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT Name FROM BaseItems WHERE Type LIKE '%Movie' ORDER BY Path",
+        )
+        .fetch_all(fixture.db.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(names().await, ["NFO title", "Embedded"]);
+    fixture
+        .set(&fixture.matrix, "Name", Some("Edited".to_owned()))
+        .await;
+    touch(&fixture.matrix, 5);
+    fixture
+        .scan_with(&MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(names().await, ["Embedded", "Embedded"]);
+    fixture
+        .set(&fixture.matrix, "Name", Some("Locked".to_owned()))
+        .await;
+    sqlx::query("INSERT INTO BaseItemMetadataFields (Id, ItemId) VALUES (?1, ?2)")
+        .bind(ferrofin_db::enums::metadata_field::to_i32(
+            ferrofin_model::entities::MetadataField::Name,
+        ))
+        .bind(Fixture::id(&fixture.matrix))
+        .execute(fixture.db.writer())
+        .await
+        .unwrap();
+    touch(&fixture.matrix, 10);
+    fixture.scan().await;
+    assert_eq!(names().await, ["Embedded", "Locked"]);
 }

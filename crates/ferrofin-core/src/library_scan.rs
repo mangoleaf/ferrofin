@@ -4888,15 +4888,54 @@ impl LibraryScanner {
             .refresh
             .request_for(item, !matches!(stored, Stored::New));
         let options = request.options;
-        // Probe first so the item row is saved already carrying its duration and
-        // size (the streams themselves are saved after, since they FK the row).
+        let cancel = state.refresh.cancel;
+        let Some(probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
+            return Ok(ItemSaved::Cancelled);
+        };
+        let probe_ran = probe.info.is_some();
+        let mut failures = u32::from(probe.failed);
+        let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
+        let video_info = probe.info.as_ref().filter(|_| !probe.is_audio);
+        let embedded_series_name = video_info
+            .filter(|_| {
+                !locked
+                    && options.metadata_refresh_mode != MetadataRefreshMode::None
+                    && embedded_episode_info_enabled(stored_row.unwrap_or(&item.entity), policy)
+            })
+            .and_then(|info| info.show_name.as_ref())
+            .filter(|name| !name.is_empty());
         let mut entity = item.entity.clone();
+        let mut video_base = stored_row.filter(|_| video_info.is_some()).cloned();
+        let embedded_title = if let Some(info) = video_info {
+            let base = video_base.as_mut().unwrap_or(&mut entity);
+            apply_video_metadata(base, info, policy, locked, locked_fields, options);
+            embedded_video_title(info, base, policy, locked, locked_fields).map(str::to_owned)
+        } else {
+            None
+        };
+        let metadata_stored = video_base.as_ref().or(stored_row);
         // The providers fill a row that starts WITHOUT the resolver's
         // path guesses (upstream's `temp` starts empty), so every value
         // they leave on it is one they supplied. The guesses ride along
         // as lookup info and fill only what is still empty at the end.
-        let mut guesses =
-            ResolverGuesses::take(&mut entity, stored_row, options.replace_all_metadata);
+        let mut guesses = ResolverGuesses::take(
+            &mut entity,
+            metadata_stored,
+            options.replace_all_metadata && video_info.is_none(),
+        );
+        if let Some(title) = &embedded_title {
+            entity.name = Some(title.clone());
+        }
+        if let Some(name) = embedded_series_name {
+            entity.series_name = Some(name.clone());
+        }
+        if video_info.is_some_and(|info| info.index_number.is_some()) {
+            entity.index_number = guesses.index_number;
+        }
+        if video_info.is_some_and(|info| info.parent_index_number.is_some()) {
+            entity.parent_index_number = guesses.parent_index_number;
+        }
+        let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio);
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
         // `ApplySearchResult` (`MetadataService.cs:272-293`) hands a season or
@@ -4916,16 +4955,6 @@ impl LibraryScanner {
         {
             guesses.pin_search(result.name.as_deref(), result.production_year);
         }
-        let cancel = state.refresh.cancel;
-        // The waits before anything is written race the cancellation, so a
-        // hung ffprobe (a cold NFS mount) or provider cannot keep a cancelled
-        // scan alive, and the item stays all-or-nothing.
-        let Some(probe) = cancel.unless_cancelled(state.probes.take(index)).await else {
-            return Ok(ItemSaved::Cancelled);
-        };
-        let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio);
-        let probe_ran = probe.info.is_some();
-        let mut failures = u32::from(probe.failed);
         let tag_provider_ids = rows.provider_ids.clone();
         // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
         // metadata reader, which runs before any remote fetch. It fills
@@ -5053,10 +5082,6 @@ impl LibraryScanner {
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
         // refresh), never as the row rebuilt from disk.
-        // The fields the user locked keep their stored values through the
-        // merge (`MergeData(temp, metadata, item.LockedFields, …)`). Unknown
-        // links (a failed read) lock every field rather than risk one.
-        let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
         // The NFO's `<lockedfields>` join the item's set (when this
         // window's links could not be read the union is skipped: the pass
         // fails closed, every field treated as locked):
@@ -5158,7 +5183,8 @@ impl LibraryScanner {
             // `BeforeMetadataRefresh` only when a metadata mode runs and
             // there are providers to run, or the refresh is a first or a
             // required one.
-            before_refresh: options.metadata_refresh_mode != MetadataRefreshMode::None
+            before_refresh: video_base.is_none()
+                && options.metadata_refresh_mode != MetadataRefreshMode::None
                 && (plan.probe
                     || plan.local_metadata
                     || plan.remote_metadata
@@ -5173,7 +5199,7 @@ impl LibraryScanner {
             // backfill's answers fill what is still empty.
             Some(local_row) => {
                 let refreshed = saved_row(
-                    stored_row,
+                    metadata_stored,
                     &guesses,
                     local_row,
                     SaveFacts {
@@ -5192,7 +5218,7 @@ impl LibraryScanner {
                     },
                 )
             }
-            None => saved_row(stored_row, &guesses, &entity, facts),
+            None => saved_row(metadata_stored, &guesses, &entity, facts),
         };
         if ferrofin_providers::season::apply_zero_display_name(
             &mut entity,
@@ -5201,9 +5227,13 @@ impl LibraryScanner {
         ) {
             settle_sort_name(&mut entity);
         }
-        // FindExtras corrects filename-derived names even on existing extras;
-        // an explicit Name field lock is the only opt-out upstream.
-        if entity.owner_id.is_some() && !locked_fields.contains(&MetadataField::Name) {
+        // FindExtras names extras from their files before refresh; a prober
+        // that ran can then apply a permitted embedded title. Quiet scans
+        // still correct the name from the file unless the Name field is locked.
+        if entity.owner_id.is_some()
+            && embedded_title.is_none()
+            && !locked_fields.contains(&MetadataField::Name)
+        {
             entity.name.clone_from(&item.entity.name);
             settle_sort_name(&mut entity);
         }
@@ -6963,14 +6993,30 @@ impl LibraryScanner {
         });
         let facts = Self::file_facts(item, stored, links, refresh.externals.as_ref(), policy);
         let backfill = stored.is_some_and(|row| self.wants_backfill(row, policy));
-        crate::refresh_plan::plan_item_refresh(
+        let mut plan = crate::refresh_plan::plan_item_refresh(
             state.as_ref(),
             &facts,
             refresh.request_for(item, exists),
             policy.options,
             refresh.now,
             backfill,
-        )
+        );
+        if refresh
+            .request_for(item, exists)
+            .options
+            .metadata_refresh_mode
+            != MetadataRefreshMode::None
+            && (plan.probe
+                || plan.local_metadata
+                || plan.remote_metadata
+                || plan.is_first_refresh
+                || plan.requires_refresh)
+            && !state.is_some_and(|state| state.is_locked)
+            && embedded_episode_info_enabled(stored.unwrap_or(&item.entity), policy)
+        {
+            plan.probe = true;
+        }
+        plan
     }
 
     /// What the filesystem says about `item` now, for its refresh plan: the
@@ -7123,6 +7169,10 @@ impl LibraryScanner {
             return ProbeRows::default();
         };
         let source = &probed.media_source;
+        if !media_is_audio && let Some(container) = source.container.as_deref() {
+            entity.data =
+                crate::item_data::set_data_field(entity.data.as_deref(), "Container", container);
+        }
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
         // A file's stat'ed length outranks the probe's: `SaveInternal` stamps
         // `Size = file.Length` after every provider ran. Only a directory
@@ -12610,11 +12660,11 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     }
     // `<episode>`/`<season>` (`EpisodeNfoParser`, `SeasonNfoParser`): the
     // numbers the user pinned outrank the ones read off the file name.
-    if entity.index_number.is_none() {
-        entity.index_number = n.index_number.map(i64::from);
+    if let Some(number) = n.index_number {
+        entity.index_number = Some(i64::from(number));
     }
-    if entity.parent_index_number.is_none() {
-        entity.parent_index_number = n.parent_index_number.map(i64::from);
+    if let Some(number) = n.parent_index_number {
+        entity.parent_index_number = Some(i64::from(number));
     }
     if entity.overview.is_none() {
         entity.overview.clone_from(&n.overview);
@@ -13199,15 +13249,8 @@ fn before_metadata_refresh(row: &mut BaseItemEntity, replace_all: bool, season_i
             }
         }
         Some(BaseItemKind::Episode) if !row.is_locked => {
-            // TODO(parity): `Episode.BeforeMetadataRefresh` (`Episode.cs:
-            // 334-367`) first probes an `.mp4` episode when the library has
-            // `EnableEmbeddedEpisodeInfos` and takes the file's season and
-            // episode numbers (when positive) and show name from its tags.
-            // To port: in `scan_item`, for an unlocked episode whose
-            // container is mp4 and whose library policy has the option on,
-            // make the probe run (or reuse the pass's probe) before the save,
-            // carry the probed `ParentIndexNumber`/`IndexNumber`/`ShowName`
-            // into [`SaveFacts`], and apply them here ahead of the path.
+            // Embedded episode info is applied by `apply_video_metadata`
+            // before this path fallback; the probe and lookup share that row.
             if let Some(path) = path.as_deref() {
                 fill_episode_numbers_from_path(row, path, replace_all, season_index);
             }
@@ -13278,6 +13321,83 @@ fn fill_episode_numbers_from_path(
     }
     if row.parent_index_number.is_none() {
         row.parent_index_number = season_index;
+    }
+}
+
+/// `Episode.BeforeMetadataRefresh` checks the stored container for exactly mp4.
+/// A normal ffprobe `mov,mp4,...` value does not satisfy that upstream check.
+fn embedded_episode_info_enabled(row: &BaseItemEntity, policy: FetcherPolicy<'_>) -> bool {
+    row.type_.ends_with(".Episode")
+        && policy
+            .options
+            .is_some_and(|o| o.enable_embedded_episode_infos)
+        && crate::item_data::read_data_string(
+            &crate::item_data::parse_data(row.data.as_deref()),
+            "Container",
+        )
+        .is_some_and(|container| container.eq_ignore_ascii_case("mp4"))
+}
+
+fn embedded_video_title<'a>(
+    info: &'a MediaInfo,
+    row: &BaseItemEntity,
+    policy: FetcherPolicy<'_>,
+    locked: bool,
+    fields: &[MetadataField],
+) -> Option<&'a str> {
+    if locked
+        || fields.contains(&MetadataField::Name)
+        || !policy.options.is_some_and(|o| {
+            o.enable_embedded_titles
+                && (row.extra_type.is_none() || o.enable_embedded_extras_titles)
+        })
+    {
+        return None;
+    }
+    info.media_source
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+}
+
+/// The video prober updates the real item before the metadata providers merge.
+/// Titles require the two library switches; episode pre-refresh reads positive
+/// numbers before path parsing, then the normal prober fills missing numbers
+/// (or replaces them under ReplaceAllMetadata), independent of that switch.
+fn apply_video_metadata(
+    row: &mut BaseItemEntity,
+    info: &MediaInfo,
+    policy: FetcherPolicy<'_>,
+    locked: bool,
+    fields: &[MetadataField],
+    options: &MetadataRefreshOptions,
+) {
+    if options.metadata_refresh_mode != MetadataRefreshMode::None {
+        if !locked && embedded_episode_info_enabled(row, policy) {
+            if let Some(number) = info.index_number.filter(|number| *number > 0) {
+                row.index_number = Some(i64::from(number));
+            }
+            if let Some(number) = info.parent_index_number.filter(|number| *number > 0) {
+                row.parent_index_number = Some(i64::from(number));
+            }
+            if let Some(name) = info.show_name.as_ref().filter(|name| !name.is_empty()) {
+                row.series_name = Some(name.clone());
+            }
+        }
+        before_metadata_refresh(row, options.replace_all_metadata, row.parent_index_number);
+    }
+    if let Some(title) = embedded_video_title(info, row, policy, locked, fields) {
+        row.name = Some(title.to_owned());
+    }
+    for (field, tagged) in [
+        (&mut row.index_number, info.index_number),
+        (&mut row.parent_index_number, info.parent_index_number),
+    ] {
+        if let Some(value) = tagged
+            && (field.is_none() || options.replace_all_metadata)
+        {
+            *field = Some(i64::from(value));
+        }
     }
 }
 
@@ -13556,6 +13676,14 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         crate::item_data::with_resolved_video_type(row.data.as_deref(), scanned.data.as_deref())
     {
         row.data = Some(data);
+    }
+    if probe_ran
+        && let Some(container) = crate::item_data::read_data_string(
+            &crate::item_data::parse_data(scanned.data.as_deref()),
+            "Container",
+        )
+    {
+        row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
     row.id.clone_from(&scanned.id);
     row.type_.clone_from(&scanned.type_);
@@ -14735,6 +14863,107 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::off(false, false, false, false, false, false)]
+    #[case::ordinary(true, false, false, false, false, true)]
+    #[case::extras_only(false, true, true, false, false, false)]
+    #[case::extra_without_switch(true, false, true, false, false, false)]
+    #[case::extra_with_switch(true, true, true, false, false, true)]
+    #[case::locked(true, true, false, true, false, false)]
+    #[case::name_locked(true, true, false, false, true, false)]
+    fn embedded_title_checks_library_and_locks(
+        #[case] titles: bool,
+        #[case] extras: bool,
+        #[case] is_extra: bool,
+        #[case] locked: bool,
+        #[case] name_locked: bool,
+        #[case] expected: bool,
+    ) {
+        let options = ferrofin_model::configuration::LibraryOptions {
+            enable_embedded_titles: titles,
+            enable_embedded_extras_titles: extras,
+            ..Default::default()
+        };
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            extra_type: is_extra.then_some(1),
+            ..Default::default()
+        };
+        let mut info = ferrofin_model::media_info::MediaInfo::default();
+        info.media_source.name = Some("Embedded".to_owned());
+        let fields = if name_locked {
+            vec![ferrofin_model::entities::MetadataField::Name]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            super::embedded_video_title(
+                &info,
+                &row,
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                locked,
+                &fields
+            ),
+            expected.then_some("Embedded")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::off(false, "mp4", false, false, (1, 1))]
+    #[case::on(true, "mp4", false, false, (5, 2))]
+    #[case::mixed_case(true, "MP4", false, false, (5, 2))]
+    #[case::ffprobe_formats(true, "mov,mp4,m4a,3gp,3g2,mj2", false, false, (1, 1))]
+    #[case::locked(true, "mp4", true, false, (1, 1))]
+    #[case::replace_all(false, "mp4", false, true, (5, 2))]
+    fn embedded_episode_info_obeys_the_exact_container_gate(
+        #[case] enabled: bool,
+        #[case] container: &str,
+        #[case] locked: bool,
+        #[case] replace: bool,
+        #[case] expected: (i64, i64),
+    ) {
+        let options = ferrofin_model::configuration::LibraryOptions {
+            enable_embedded_episode_infos: enabled,
+            ..Default::default()
+        };
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+            path: Some("/tv/Show/Season 1/Show S01E01.mp4".to_owned()),
+            index_number: Some(1),
+            parent_index_number: Some(1),
+            is_locked: locked,
+            data: Some(serde_json::json!({"Container":container}).to_string()),
+            ..Default::default()
+        };
+        let info = ferrofin_model::media_info::MediaInfo {
+            index_number: Some(5),
+            parent_index_number: Some(2),
+            ..Default::default()
+        };
+        let refresh = ferrofin_traits::providers::MetadataRefreshOptions {
+            metadata_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+            replace_all_metadata: replace,
+            ..Default::default()
+        };
+        super::apply_video_metadata(
+            &mut row,
+            &info,
+            super::FetcherPolicy {
+                options: Some(&options),
+                ..Default::default()
+            },
+            locked,
+            &[],
+            &refresh,
+        );
+        assert_eq!(
+            (row.index_number, row.parent_index_number),
+            (Some(expected.0), Some(expected.1))
+        );
+    }
+
     use super::LibraryScanner;
     use crate::file_system::FerrofinFileSystem;
     use crate::item_persistence_service::FerrofinItemPersistenceService;
@@ -15491,6 +15720,24 @@ mod tests {
         assert_eq!(
             super::nfo_candidates("/tv/Series/S01E01.mkv", false, NfoItemKind::Episode),
             vec![std::path::PathBuf::from("/tv/Series/S01E01.nfo")]
+        );
+    }
+
+    #[test]
+    fn episode_nfo_numbers_override_embedded_probe_numbers() {
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            index_number: Some(5),
+            parent_index_number: Some(2),
+            ..Default::default()
+        };
+        let mut nfo = NfoBaseItem::new(NfoItemKind::Episode);
+        nfo.index_number = Some(3);
+        nfo.parent_index_number = Some(1);
+        super::apply_nfo(&mut row, &nfo);
+        assert_eq!(
+            (row.index_number, row.parent_index_number),
+            (Some(3), Some(1))
         );
     }
 
