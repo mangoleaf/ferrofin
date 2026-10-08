@@ -29,12 +29,14 @@ use chrono::Utc;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, KeyframeDataEntity};
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
+#[cfg(test)]
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 #[cfg(test)]
 use ferrofin_model::dto::MediaSourceInfo;
 #[cfg(test)]
 use ferrofin_model::entities_media::MediaStream;
+#[cfg(test)]
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::chapters::ChapterManager;
@@ -76,23 +78,6 @@ fn interval_hours(hours: i64) -> TaskTriggerInfo {
         interval_ticks: Some(hours * 3600 * TICKS_PER_SECOND),
         ..TaskTriggerInfo::default()
     }
-}
-
-/// The library options that apply to an item path: the first virtual folder
-/// with a location the path lives under. Mirrors the C#
-/// `ILibraryManager.GetLibraryOptions(item)` resolution.
-fn options_for_path<'a>(
-    folders: &'a [VirtualFolderInfo],
-    path: &str,
-) -> Option<&'a LibraryOptions> {
-    folders
-        .iter()
-        .find(|f| {
-            f.locations
-                .iter()
-                .any(|loc| Path::new(path).starts_with(loc))
-        })
-        .and_then(|f| f.library_options.as_ref())
 }
 
 /// Fetches one page of items for a query.
@@ -1229,13 +1214,14 @@ impl ScheduledTask for TrickplayImagesTask {
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let query = InternalItemsQuery {
             media_types: vec![MediaType::Video],
+            source_types: vec![SourceType::Library],
+            include_owned_items: true,
             is_virtual_item: Some(false),
             is_folder: Some(false),
             recursive: true,
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
-        let folders = self.folders.get_virtual_folders().await?;
         let mut done = 0i32;
         let mut start_index = 0i32;
         while start_index < total {
@@ -1245,14 +1231,20 @@ impl ScheduledTask for TrickplayImagesTask {
             }
             for item in &items {
                 done += 1;
-                // C# `GetLibraryOptions(video)`: the containing library's
-                // options, or a default (extraction off) when none contains it.
-                let options = item
-                    .path
-                    .as_deref()
-                    .and_then(|path| options_for_path(&folders, path))
-                    .cloned()
-                    .unwrap_or_default();
+                // The pin declares SourceTypes but never consumes it in query
+                // translation. Retain physical Video kinds, including channel
+                // VOD rows; the manager checks live-stream completion.
+                if !crate::trickplay_manager::is_library_video(item) {
+                    continue;
+                }
+                let folders = self.folders.get_virtual_folders().await?;
+                let options = ferrofin_model::entities_media::owning_library(
+                    &folders,
+                    item.top_parent_id.as_deref(),
+                    item.path.as_deref(),
+                )
+                .and_then(|folder| folder.library_options.clone())
+                .unwrap_or_default();
                 if let Ok(item_id) = Uuid::parse_str(&item.id)
                     && let Err(e) = self
                         .trickplay
@@ -1421,23 +1413,6 @@ mod tests {
         assert_eq!(parse_lufs("no summary here"), None);
         assert_eq!(parse_lufs("    I: not-a-number LUFS"), None);
         assert_eq!(parse_lufs("I: -21.0 LUFS"), None);
-    }
-
-    #[test]
-    fn options_for_path_matches_the_containing_location() {
-        let folders = vec![VirtualFolderInfo {
-            name: Some("Music".into()),
-            locations: vec!["/media/music".into()],
-            library_options: Some(LibraryOptions {
-                enable_lufs_scan: true,
-                ..LibraryOptions::default()
-            }),
-            ..VirtualFolderInfo::default()
-        }];
-        assert!(
-            options_for_path(&folders, "/media/music/a/b.flac").is_some_and(|o| o.enable_lufs_scan)
-        );
-        assert!(options_for_path(&folders, "/media/movies/x.mkv").is_none());
     }
 
     // -- fakes --------------------------------------------------------------
@@ -1742,6 +1717,7 @@ mod tests {
     struct FakeTrickplay {
         /// `(item, library option "extraction enabled")` per refresh call.
         refreshed: Mutex<Vec<(Uuid, bool)>>,
+        after_refresh: Option<(Arc<dyn VirtualFolderManager>, String, LibraryOptions)>,
     }
 
     #[async_trait]
@@ -1756,6 +1732,9 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((item_id, library_options.enable_trickplay_image_extraction));
+            if let Some((folders, name, options)) = &self.after_refresh {
+                folders.update_library_options(name, options).await?;
+            }
             Ok(())
         }
         async fn get_trickplay_resolutions(
@@ -2390,6 +2369,145 @@ mod tests {
         let mut refreshed = trickplay.refreshed.lock().expect("lock").clone();
         refreshed.sort();
         assert_eq!(refreshed, vec![(v1, true), (v2, false)]);
+    }
+
+    async fn trickplay_nested_libraries(
+        db: &Database,
+        directory: &Path,
+    ) -> (
+        Arc<crate::FerrofinVirtualFolderManager>,
+        LibraryOptions,
+        Uuid,
+        Uuid,
+    ) {
+        use ferrofin_model::configuration::MediaPathInfo;
+        let folders = Arc::new(
+            crate::FerrofinVirtualFolderManager::new(directory.join("libraries")).with_item_store(
+                Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+            ),
+        );
+        let broad = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: directory.join("media").to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        let deep = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: directory.join("media/deep").to_string_lossy().into_owned(),
+            }],
+            enable_trickplay_image_extraction: true,
+            ..Default::default()
+        };
+        std::fs::create_dir_all(directory.join("media/deep")).unwrap();
+        folders
+            .add_virtual_folder("Broad", Some(CollectionTypeOptions::movies), &broad)
+            .await
+            .unwrap();
+        folders
+            .add_virtual_folder("Deep", Some(CollectionTypeOptions::movies), &deep)
+            .await
+            .unwrap();
+        let configured = folders.get_virtual_folders().await.unwrap();
+        let id = |name| {
+            configured
+                .iter()
+                .find(|folder| folder.name.as_deref() == Some(name))
+                .and_then(|folder| folder.item_id.as_deref())
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap()
+        };
+        (folders, deep, id("Broad"), id("Deep"))
+    }
+
+    #[tokio::test]
+    async fn trickplay_task_uses_physical_owner_and_deepest_path_and_includes_owned_videos() {
+        let db = test_db().await;
+        let temp = tempfile::tempdir().unwrap();
+        let (folders, _, broad, _) = trickplay_nested_libraries(&db, temp.path()).await;
+        let parent_video = Uuid::from_u128(0xC300);
+        let extra_video = Uuid::from_u128(0xC301);
+        let physical = Uuid::from_u128(0xC302);
+        let channel = Uuid::from_u128(0xC303);
+        for (id, name) in [
+            (parent_video, "Owner"),
+            (extra_video, "Owned"),
+            (physical, "Physical"),
+            (channel, "Channel"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut entity = crate::test_support::fetch_item(&db, id).await;
+            entity.media_type = Some("Video".to_owned());
+            entity.path = Some(
+                temp.path()
+                    .join(format!("media/deep/{name}.mkv"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if id == extra_video {
+                entity.owner_id = Some(guid_to_db(parent_video));
+            }
+            if id == physical {
+                entity.top_parent_id = Some(guid_to_db(broad));
+            }
+            if id == channel {
+                entity.channel_id = Some(Uuid::new_v4().to_string());
+            }
+            crate::test_support::save_item(&db, &entity).await;
+        }
+        let manager = Arc::new(FakeTrickplay::default());
+        let task = TrickplayImagesTask::new(library_manager_over(db), folders, manager.clone());
+        task.execute(&TaskProgress::default()).await.unwrap();
+        let mut calls = manager.refreshed.lock().unwrap().clone();
+        calls.sort();
+        let mut expected = vec![
+            (parent_video, true),
+            (extra_video, true),
+            (physical, false),
+            (channel, true),
+        ];
+        expected.sort();
+        assert_eq!(
+            calls, expected,
+            "source library videos use physical ownership before deepest paths and include extra_video extras"
+        );
+    }
+
+    #[tokio::test]
+    async fn trickplay_task_rereads_saved_options_between_items() {
+        let db = test_db().await;
+        let temp = tempfile::tempdir().unwrap();
+        let (folders, mut options, _, deep) = trickplay_nested_libraries(&db, temp.path()).await;
+        for (id, name) in [
+            (Uuid::from_u128(0xC310), "A"),
+            (Uuid::from_u128(0xC311), "B"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut entity = crate::test_support::fetch_item(&db, id).await;
+            entity.media_type = Some("Video".to_owned());
+            entity.top_parent_id = Some(guid_to_db(deep));
+            entity.path = Some(
+                temp.path()
+                    .join(format!("media/deep/{name}.mkv"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            crate::test_support::save_item(&db, &entity).await;
+        }
+        options.enable_trickplay_image_extraction = false;
+        let manager = Arc::new(FakeTrickplay {
+            after_refresh: Some((folders.clone(), "Deep".to_owned(), options)),
+            ..Default::default()
+        });
+        let task = TrickplayImagesTask::new(library_manager_over(db), folders, manager.clone());
+        task.execute(&TaskProgress::default()).await.unwrap();
+        let calls = manager.refreshed.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1);
+        assert!(
+            !calls[1].1,
+            "a saved disable reaches the next item in the same task"
+        );
     }
 
     // -- Media Segment Scan --------------------------------------------------
