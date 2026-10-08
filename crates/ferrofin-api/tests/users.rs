@@ -113,6 +113,7 @@ impl AuthService for AdminAuth {
 struct MemUsers {
     /// Records the last (user_id, new_password) passed to `change_password`.
     changed_password: Mutex<Option<(Uuid, String)>>,
+    fail_password_change: std::sync::atomic::AtomicBool,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
@@ -178,6 +179,12 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        if self
+            .fail_password_change
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ServiceError::backend("password store unavailable"));
+        }
         *self.changed_password.lock().unwrap() = Some((user_id, new_password.to_owned()));
         Ok(())
     }
@@ -1568,7 +1575,7 @@ async fn update_policy_records_and_guards_last_admin() {
 }
 
 #[tokio::test]
-async fn forgot_password_unknown_user_reports_contact_admin() {
+async fn forgot_password_unknown_user_returns_the_uniform_pin_response() {
     // An unknown username must not disclose account existence, and touches no
     // filesystem (the user lookup returns `None` before a pin is issued).
     let router = create_router(state(
@@ -1589,58 +1596,138 @@ async fn forgot_password_unknown_user_reports_contact_admin() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["Action"], "ContactAdmin");
+    let body = body_json(response).await;
+    assert_eq!(body["Action"], "PinCode");
+    assert!(body["PinExpirationDate"].is_string());
+    assert!(!std::path::Path::new(body["PinFile"].as_str().unwrap()).exists());
 }
 
-#[tokio::test]
-async fn forgot_password_known_user_issues_and_redeems_pin() {
-    let users = Arc::new(MemUsers::default());
-    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
-
-    // 1) Request a pin for a known user → PinCode + a real pin file.
-    let response = router
+async fn recovery_request(
+    router: &axum::Router,
+    path: &str,
+    body: serde_json::Value,
+    peer: &str,
+) -> axum::response::Response {
+    router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/Users/ForgotPassword")
+                .uri(path)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "EnteredUsername": "bob" }).to_string(),
+                .extension(axum::extract::ConnectInfo(
+                    peer.parse::<std::net::SocketAddr>().unwrap(),
                 ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once() {
+    use std::sync::atomic::Ordering;
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let start = "/Users/ForgotPassword";
+    let redeem = "/Users/ForgotPassword/Pin";
+    let local = "127.0.0.1:4321";
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        "203.0.113.8:4321",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let remote = body_json(response).await;
+    assert_eq!(remote["Action"], "PinCode");
+    assert!(!std::path::Path::new(remote["PinFile"].as_str().unwrap()).exists());
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        local,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["Action"], "PinCode");
-    let pin_file = body["PinFile"].as_str().expect("pin file path").to_owned();
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&pin_file).unwrap()).unwrap();
-    let pin = record["Pin"].as_str().unwrap().to_owned();
-
-    // 2) Redeem the pin → success, bob reset, password set to the pin, file gone.
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Users/ForgotPassword/Pin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::json!({ "Pin": pin }).to_string()))
-                .unwrap(),
+    assert_eq!(body["PinFile"], remote["PinFile"]);
+    let file = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    record["Pin"] = serde_json::json!("A1-B2-C3-D4");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let wrong = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"a1-b2-c3-d4"}),
+        local,
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    users.fail_password_change.store(true, Ordering::SeqCst);
+    let failed = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(file.exists(), "failed password update preserves recovery");
+    users.fail_password_change.store(false, Ordering::SeqCst);
+    // Two concurrent redemption attempts must produce exactly one reset.
+    let (first, second) = tokio::join!(
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
+        ),
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["Success"], true);
-    assert_eq!(body["UsersReset"][0], "bob");
-
+    );
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
     let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
-    assert_eq!(pw, pin);
-    assert!(!std::path::Path::new(&pin_file).exists());
+    assert_eq!(
+        pw, "A1B2C3D4",
+        "the exact entered form becomes the password"
+    );
+    assert!(!file.exists());
+    // A matched file for a deleted user also remains recoverable after failure.
+    record["UserName"] = serde_json::json!("deleted");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let missing = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    record["ExpirationDate"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let expired = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    assert!(!file.exists());
 }
 
 #[tokio::test]

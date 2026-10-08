@@ -63,8 +63,8 @@ use crate::user_entity_ext::{
 };
 
 /// The C# type name of the default password-reset provider, stored on
-/// `User.PasswordResetProviderId` for a freshly created user. The reset-provider
-/// subsystem itself is deferred; only the id is needed to match upstream rows.
+/// `User.PasswordResetProviderId` for a freshly created user. The built-in
+/// recovery workflow is served by the API and is the only registered choice.
 pub const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 
@@ -993,8 +993,8 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
-        // Only the built-in default reset provider is ported; the reset flow
-        // itself is deferred, but its identity is surfaced so clients can list it.
+        // Unknown saved IDs fall back to this sole registered provider, just
+        // as UserManager.GetPasswordResetProviders does upstream.
         Ok(vec![NameIdPair {
             name: Some("Default Password Reset Provider".to_owned()),
             id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),

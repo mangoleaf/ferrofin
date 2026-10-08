@@ -1416,7 +1416,7 @@ impl ServerApplicationPaths for FakePaths {
         // A process-unique temp root so path-backed handlers (e.g. Backup) have a
         // real, writable directory to operate in during tests.
         std::env::temp_dir()
-            .join("ferrofin-api-test-data")
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
     }
