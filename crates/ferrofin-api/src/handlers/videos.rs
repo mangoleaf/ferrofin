@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::items::resolve_user_opt;
+use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{serve_static_file, stream_path};
 use crate::state::AppState;
@@ -115,9 +115,15 @@ async fn get_additional_parts(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // Honour the userId filter for parity (resolving a bad user is a 404); the
     // resolved user is otherwise unused since no parts are attached.
-    let _user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    if state.library.get_item_by_id(item_id).await?.is_none() {
-        return Err(ApiError::NotFound(format!("item {item_id}")));
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    if item_id.is_nil() {
+        state
+            .library
+            .get_user_root_folder()
+            .await?
+            .ok_or_else(|| ApiError::NotFound("user root folder".into()))?;
+    } else {
+        require_visible_item(&state, item_id, user.as_ref()).await?;
     }
     Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())))
 }
@@ -149,10 +155,20 @@ struct MergeVersionsQuery {
 )]
 async fn merge_versions(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Query(query): Query<MergeVersionsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let ids = parse_csv_uuids(Some(&query.ids))?;
+    let mut ids = Vec::new();
+    for id in parse_csv_uuids(Some(&query.ids))? {
+        if state
+            .library
+            .get_item_by_id_for_user(id, auth.user.as_ref())
+            .await?
+            .is_some_and(|item| is_video(&item))
+        {
+            ids.push(id);
+        }
+    }
     if ids.len() < 2 {
         return Err(ApiError::BadRequest(
             "please supply at least two videos to merge".to_owned(),
@@ -183,9 +199,13 @@ async fn merge_versions(
 )]
 async fn delete_alternate_sources(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    let item = require_visible_item(&state, item_id, auth.user.as_ref()).await?;
+    if !is_video(&item) {
+        return Err(ApiError::NotFound(format!("video {item_id}")));
+    }
     state.library.remove_alternate_sources(item_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -209,13 +229,13 @@ async fn delete_alternate_sources(
 )]
 async fn get_download(
     State(state): State<AppState>,
-    RequireDownload(_auth, policy): RequireDownload,
+    RequireDownload(auth, policy): RequireDownload,
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let item = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // The controller's CanDownload(user) check follows the policy check.
@@ -291,6 +311,14 @@ fn attachment_disposition(filename: &str) -> String {
         }
     }
     format!("attachment; filename={plain}; filename*=UTF-8''{star}")
+}
+
+/// Whether the stored type is Video or one of its concrete subclasses.
+pub(crate) fn is_video(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    matches!(
+        item.type_.rsplit('.').next().unwrap_or(&item.type_),
+        "Video" | "Movie" | "Episode" | "MusicVideo" | "Trailer"
+    )
 }
 
 /// Registers this controller's real routes onto `router`.

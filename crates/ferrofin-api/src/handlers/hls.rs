@@ -615,9 +615,16 @@ async fn stop_encoding_process(
 /// `application/octet-stream`). A missing item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
+    auth: Result<crate::auth::AuthenticatedIdentity, ApiError>,
     Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
 ) -> Result<Response, ApiError> {
-    if state.library.get_item_by_id(video_id).await?.is_none() {
+    let user = auth.ok().and_then(|auth| auth.0.user);
+    if state
+        .library
+        .get_item_by_id_for_user(video_id, user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("video {video_id}")));
     }
     let extracted = state

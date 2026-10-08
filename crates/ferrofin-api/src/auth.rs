@@ -115,6 +115,21 @@ async fn authenticated_info(
     Ok(info)
 }
 
+/// Authenticated identity without a route authorization policy. Public routes
+/// use `Result<AuthenticatedIdentity, ApiError>` to retain an optional caller
+/// for visibility checks even when remote access or schedules deny other routes.
+#[derive(Debug, Clone)]
+pub struct AuthenticatedIdentity(pub AuthorizationInfo);
+impl FromRequestParts<AppState> for AuthenticatedIdentity {
+    type Rejection = ApiError;
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(authenticated_info(parts, state).await?))
+    }
+}
+
 /// Applies DefaultAuthorizationHandler in upstream order. Production contexts
 /// carry a shared policy from the token cache; alternate injected auth services
 /// can resolve it through UserManager once here.

@@ -39,10 +39,14 @@ use crate::state::AppState;
 /// every route in `LyricsController` performs first: a non-audio id is a `404`
 /// on all six routes, not an accepted target for a lyric write. `Audio` covers
 /// its `AudioBook` subclass, so both kinds pass.
-async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+async fn require_item(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
     let is_audio = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .is_some_and(|item| {
             let short = item.type_.rsplit('.').next().unwrap_or(&item.type_);
@@ -70,10 +74,10 @@ async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
 )]
 async fn get_lyrics(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<LyricDto>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     match state.lyrics.get_lyrics(item_id).await? {
         Some(dto) => Ok(Json(dto)),
         None => Err(ApiError::NotFound(format!("lyrics for item {item_id}"))),
@@ -110,12 +114,12 @@ struct UploadLyricsQuery {
 )]
 async fn upload_lyrics(
     State(state): State<AppState>,
-    RequireLyricManagement(_auth): RequireLyricManagement,
+    RequireLyricManagement(auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
     Query(query): Query<UploadLyricsQuery>,
     body: String,
 ) -> Result<Json<LyricDto>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     if body.is_empty() {
         return Err(ApiError::BadRequest("no lyrics uploaded".to_owned()));
     }
@@ -155,10 +159,10 @@ async fn upload_lyrics(
 )]
 async fn delete_lyrics(
     State(state): State<AppState>,
-    RequireLyricManagement(_auth): RequireLyricManagement,
+    RequireLyricManagement(auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     state.lyrics.delete_lyrics(item_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -179,10 +183,10 @@ async fn delete_lyrics(
 )]
 async fn search_remote_lyrics(
     State(state): State<AppState>,
-    RequireLyricManagement(_auth): RequireLyricManagement,
+    RequireLyricManagement(auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<RemoteLyricInfoDto>>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let results = state.lyrics.search_lyrics(item_id).await?;
     Ok(Json(results))
 }
@@ -207,10 +211,10 @@ async fn search_remote_lyrics(
 )]
 async fn download_remote_lyrics(
     State(state): State<AppState>,
-    RequireLyricManagement(_auth): RequireLyricManagement,
+    RequireLyricManagement(auth): RequireLyricManagement,
     Path((item_id, lyric_id)): Path<(Uuid, String)>,
 ) -> Result<Json<LyricDto>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     match state.lyrics.download_lyrics(item_id, &lyric_id).await? {
         Some(dto) => {
             queue_high_priority_refresh(&state, item_id).await?;

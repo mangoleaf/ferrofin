@@ -156,7 +156,7 @@ async fn instant_mix_from_item(
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     let entity = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     if let Some(kind) = require_kind

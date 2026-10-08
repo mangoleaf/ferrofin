@@ -499,6 +499,20 @@ impl FerrofinVirtualFolderManager {
         }
     }
 
+    /// Reads options for access checks without writing an adoption sidecar or
+    /// provisioning library rows. Missing/unreadable options use upstream defaults.
+    pub(crate) async fn read_options(folder_path: &Path) -> LibraryOptions {
+        if let Ok(bytes) = tokio::fs::read(folder_path.join(OPTIONS_FILE)).await {
+            return serde_json::from_slice(&bytes).unwrap_or_default();
+        }
+        let Ok(xml) = tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await
+        else {
+            return LibraryOptions::default();
+        };
+        crate::config_import::import_over(&LibraryOptions::default(), &xml, "LibraryOptions", &[])
+            .unwrap_or_default()
+    }
+
     /// Imports a Jellyfin `options.xml` beside a missing `options.json` and
     /// persists the result as `options.json`. `None` when there is no XML; the
     /// default (and a warning) when the XML cannot be read or converted, so one

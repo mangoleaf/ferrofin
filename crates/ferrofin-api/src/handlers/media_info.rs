@@ -25,7 +25,9 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
-use crate::handlers::items::{effective_user_id, resolve_user, user_uuid};
+use crate::handlers::items::{
+    effective_user_id, require_visible_item, resolve_user_opt, user_uuid,
+};
 use crate::state::AppState;
 
 /// The server's transcode capabilities, fed to the [`StreamBuilder`] so it knows
@@ -152,8 +154,12 @@ async fn playback_info(
     stream_selection: StreamSelection,
     flags: PlaybackFlags,
 ) -> Result<PlaybackInfoResponse, ApiError> {
-    let user = resolve_user(state, auth, user_id).await?;
-    let resolved_user_id = user_uuid(&user)?;
+    let user = resolve_user_opt(state, auth, user_id).await?;
+    require_visible_item(state, item_id, user.as_ref()).await?;
+    let resolved_user_id = match &user {
+        Some(user) => user_uuid(user)?,
+        None => effective_user_id(state, auth, user_id).await?,
+    };
     let mut media_sources = state
         .media_sources
         .get_playback_media_sources(item_id, resolved_user_id, true, true)
@@ -184,20 +190,10 @@ async fn playback_info(
     // direct-play or must transcode (e.g. h264 video but AC3 audio a browser can't
     // decode). Without this every source claimed direct-play, so incompatible-audio
     // files played video-only. No profile (the GET form) keeps the static sources.
-    if let Some(profile) = profile {
-        let policy = if resolved_user_id == auth.user_id() {
-            auth.user_policy.clone()
-        } else {
-            None
-        };
-        let policy = match policy {
-            Some(policy) => policy,
-            None => std::sync::Arc::new(
-                crate::handlers::users::user_policy(state, &user)
-                    .await?
-                    .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?,
-            ),
-        };
+    if let Some(profile) = profile
+        && !media_sources.is_empty()
+    {
+        let policy = playback_policy(state, auth, user.as_ref(), resolved_user_id).await?;
         let max_streaming_bitrate =
             playback_bitrate_limit(state, auth, &policy, max_streaming_bitrate).await?;
         // Use the item's media type rather than the presence of a video stream:
@@ -263,6 +259,33 @@ async fn playback_info(
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// Resolves the user policy required by upstream device-profile negotiation.
+async fn playback_policy(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    user: Option<&ferrofin_db::entities::users::UserEntity>,
+    resolved_user_id: Uuid,
+) -> Result<std::sync::Arc<ferrofin_model::users::UserPolicy>, ApiError> {
+    // SetDeviceSpecificData resolves a user even when the controller's
+    // initial visibility lookup allowed a userless/API-key request.
+    let user = user.ok_or_else(|| {
+        if resolved_user_id.is_nil() {
+            ApiError::BadRequest("Guid can't be empty".to_owned())
+        } else {
+            ApiError::NotFound(format!("user {resolved_user_id}"))
+        }
+    })?;
+    if resolved_user_id == auth.user_id()
+        && let Some(policy) = &auth.user_policy
+    {
+        return Ok(std::sync::Arc::clone(policy));
+    }
+    crate::handlers::users::user_policy(state, user)
+        .await?
+        .map(std::sync::Arc::new)
+        .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))
 }
 
 /// MediaInfoHelper.GetMaxBitrate: a positive user override replaces the server
@@ -704,6 +727,8 @@ async fn get_playback_info(
 #[serde(rename_all = "PascalCase")]
 #[cfg_attr(test, derive(serde::Serialize))]
 struct PlaybackInfoBody {
+    #[serde(default, with = "ferrofin_model::json::guid::option")]
+    user_id: Option<Uuid>,
     #[serde(default)]
     device_profile: Option<DeviceProfile>,
     // Track pickers post quoted indexes; the shared body binder reads them.
@@ -788,7 +813,7 @@ async fn post_playback_info(
             &state,
             &auth,
             item_id,
-            query.user_id,
+            query.user_id.or(body.user_id),
             body.device_profile.as_ref(),
             body.max_streaming_bitrate,
             stream_selection,

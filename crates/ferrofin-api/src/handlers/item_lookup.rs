@@ -60,10 +60,15 @@ use crate::state::AppState;
 )]
 async fn get_external_id_infos(
     State(state): State<AppState>,
-    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
+    RequireAdminWithDefault(auth): RequireAdminWithDefault,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     let infos = state.providers.get_external_id_infos(item_id).await?;
@@ -305,12 +310,16 @@ fn default_true() -> bool {
 )]
 async fn apply_search_criteria(
     State(state): State<AppState>,
-    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
+    RequireAdminWithDefault(auth): RequireAdminWithDefault,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let Some(item) = state.library.get_item_by_id(item_id).await? else {
+    let Some(item) = state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+    else {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     };
     tracing::info!(

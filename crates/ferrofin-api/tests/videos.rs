@@ -328,8 +328,24 @@ impl ferrofin_traits::merge_versions::MergeVersionsManager for FakeMergeVersions
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Movie", "Movie")))
+        Ok((id == ITEM_ID || id == Uuid::from_u128(0x00A1_0002))
+            .then(|| minimal_base_item(id, "A Movie", "Movie")))
     }
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
         self.merged.lock().unwrap().push(ids.to_vec());
