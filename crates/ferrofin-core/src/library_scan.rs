@@ -18,6 +18,7 @@
 //! `.await`), then an **async persist**. The filesystem seam is synchronous, so
 //! the whole walk fits the sync pass.
 
+use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2771,6 +2772,7 @@ const LIBRARY_COLLAGE_SOURCES: i32 = 8;
 
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
+    metadata_savers: Option<Arc<dyn ferrofin_traits::providers::ProviderManager>>,
     /// Live library counts, shared with dashboard readers.
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
@@ -2958,6 +2960,29 @@ impl std::fmt::Debug for LibraryScanner {
 }
 
 impl LibraryScanner {
+    /// Runs registered metadata savers after the complete item has been persisted.
+    #[must_use]
+    pub fn with_metadata_savers(
+        mut self,
+        providers: Arc<dyn ferrofin_traits::providers::ProviderManager>,
+    ) -> Self {
+        self.metadata_savers = Some(providers);
+        self
+    }
+
+    async fn save_metadata_sidecars(
+        &self,
+        id: Uuid,
+        update: ferrofin_traits::providers::ItemUpdateType,
+    ) {
+        if update != ferrofin_traits::providers::ItemUpdateType::None
+            && let Some(providers) = &self.metadata_savers
+            && let Err(error) = providers.save_metadata(id, update).await
+        {
+            tracing::warn!(%id, %error, "metadata saver failed after refresh");
+        }
+    }
+
     /// Builds a scanner over the library + filesystem + item-store seams.
     #[must_use]
     pub fn new(
@@ -2967,6 +2992,7 @@ impl LibraryScanner {
     ) -> Self {
         Self {
             virtual_folders,
+            metadata_savers: None,
             collections: std::sync::OnceLock::new(),
             file_system,
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
@@ -5505,6 +5531,19 @@ impl LibraryScanner {
         {
             tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
         }
+        self.save_metadata_sidecars(
+            item.id,
+            if has_remote_metadata || options.force_save || options.replace_all_metadata {
+                ItemUpdateType::MetadataDownload
+            } else if images_changed {
+                ItemUpdateType::ImageUpdate
+            } else if probe_ran || local.found || embedded_found {
+                ItemUpdateType::MetadataImport
+            } else {
+                ItemUpdateType::None
+            },
+        )
+        .await;
         Ok(ItemSaved::Saved)
     }
 

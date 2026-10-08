@@ -384,6 +384,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         }
     }
     verify_movie_image_options(&api, library, &mut options, id).await;
+    verify_nfo_savers(&api, library, &mut options, id, &media).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -675,4 +676,132 @@ async fn await_book(api: &Api, name: &str) -> Value {
         assert!(Instant::now() < deadline, "expected {name}: {result}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Selected savers run after refresh and edit; errors do not undo the edit.
+#[allow(clippy::too_many_lines)]
+async fn verify_nfo_savers(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    let nfo = media.join("movie.nfo");
+    options["TypeOptions"][0]["MetadataFetchers"] = json!(["TheMovieDb"]);
+    options["TypeOptions"][0]["ImageFetchers"] = json!([]);
+    options["MetadataSavers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let original = std::fs::read_to_string(&nfo).unwrap();
+    let item_url = format!("/Items/{id}");
+    let mut body = api.get(&item_url).await;
+    body["Name"] = json!("Saver disabled");
+    api.post(&item_url, &body).await;
+    assert_eq!(std::fs::read_to_string(&nfo).unwrap(), original);
+    options["MetadataSavers"] = json!(["nfo"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    std::fs::remove_file(&nfo).unwrap();
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"),&Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let saved = loop {
+        if let Ok(xml) = std::fs::read_to_string(&nfo)
+            && xml.contains("<title>Locale es-AR</title>")
+        {
+            break xml;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic refresh did not save NFO"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(saved.contains("<tmdbid>603</tmdbid>"));
+    assert!(saved.contains("<fileinfo>"));
+    assert!(saved.contains("<art>"));
+    std::fs::write(
+        &nfo,
+        saved.replace(
+            "</movie>",
+            "<custom><nested>keep me</nested></custom><genre>stale</genre></movie>",
+        ),
+    )
+    .unwrap();
+    let mut body = api.get(&item_url).await;
+    body["Name"] = json!("Saved edit");
+    body["Genres"] = json!([]);
+    body["LockData"] = json!(true);
+    body["ProviderIds"] = json!({"Tmdb":"603","Imdb":"tt0133093","Custom":"changed"});
+    api.post(&item_url, &body).await;
+    let saved = std::fs::read_to_string(&nfo).unwrap();
+    assert!(saved.contains("<title>Saved edit</title>"));
+    assert!(saved.contains("<nested>keep me</nested>"));
+    assert!(saved.contains("<customid>changed</customid>"));
+    assert!(saved.contains("<lockdata>true</lockdata>"));
+    assert!(!saved.contains("stale"));
+    // Selecting no saver suppresses writes even when the legacy flag is on.
+    options["MetadataSavers"] = json!([]);
+    options["SaveLocalMetadata"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    body["Name"] = json!("Disabled again");
+    api.post(&item_url, &body).await;
+    assert_eq!(std::fs::read_to_string(&nfo).unwrap(), saved);
+    // Without an explicit list, an edit updates an existing sidecar only.
+    options["MetadataSavers"] = Value::Null;
+    options["SaveLocalMetadata"] = json!(false);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    body["Name"] = json!("Legacy existing");
+    api.post(&item_url, &body).await;
+    assert!(
+        std::fs::read_to_string(&nfo)
+            .unwrap()
+            .contains("<title>Legacy existing</title>")
+    );
+    std::fs::remove_file(&nfo).unwrap();
+    body["Name"] = json!("Legacy absent");
+    api.post(&item_url, &body).await;
+    assert!(!nfo.exists());
+    options["MetadataSavers"] = json!(["Nfo"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    api.post(
+        "/System/Configuration/xbmcmetadata",
+        &json!({"SaveImagePathsInNfo":false}),
+    )
+    .await;
+    api.post(&item_url, &body).await;
+    assert!(!std::fs::read_to_string(&nfo).unwrap().contains("<art>"));
+    std::fs::remove_file(&nfo).unwrap();
+    std::fs::create_dir(&nfo).unwrap();
+    body["Name"] = json!("Edit survives saver failure");
+    api.post(&item_url, &body).await;
+    assert_eq!(
+        api.get(&item_url).await["Name"],
+        "Edit survives saver failure"
+    );
+    std::fs::remove_dir(&nfo).unwrap();
+    options["MetadataSavers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
 }

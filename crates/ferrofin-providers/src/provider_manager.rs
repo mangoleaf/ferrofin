@@ -1094,6 +1094,7 @@ pub trait RemoteSearchProvider: Send + Sync {
 /// manager would.
 #[derive(Default, Clone)]
 pub struct LocalProviderManager {
+    nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
     /// (name, supported kinds), surfaced in library options.
@@ -1188,6 +1189,7 @@ impl std::fmt::Debug for LocalProviderManager {
                 "remote_search_providers",
                 &self.remote_search_providers.len(),
             )
+            .field("has_nfo_saver", &self.nfo_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
             .field("has_tmdb", &self.tmdb.is_some())
@@ -1212,6 +1214,13 @@ impl std::fmt::Debug for LocalProviderManager {
 }
 
 impl LocalProviderManager {
+    /// Attaches the registered automatic NFO saver.
+    #[must_use]
+    pub fn with_nfo_saver(mut self, saver: Arc<crate::nfo_save::NfoSaver>) -> Self {
+        self.nfo_saver = Some(saver);
+        self
+    }
+
     /// Attaches named plugin image implementations to automatic item refresh.
     /// These dynamic providers do not appear in the remote-image chooser.
     #[must_use]
@@ -1232,6 +1241,7 @@ impl LocalProviderManager {
     #[must_use]
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
+            nfo_saver: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
             dynamic_image_providers: Vec::new(),
@@ -2339,13 +2349,21 @@ impl LocalProviderManager {
         }
         // What changed: the row's metadata beats an image save, which beats
         // nothing — the closest single value to the C# `ItemUpdateType` flags.
-        Ok(if metadata_changed || ids_changed {
+        let update = if metadata_changed
+            || ids_changed
+            || request.force_save
+            || request.options.replace_all_metadata
+        {
             ItemUpdateType::MetadataDownload
         } else if image_saved {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
-        })
+        };
+        if decision.save {
+            self.save_metadata(item_id, update).await?;
+        }
+        Ok(update)
     }
 
     /// Remote and dynamic image providers share one ordered acquisition pass.
@@ -3813,7 +3831,9 @@ impl ProviderManager for LocalProviderManager {
             .as_ref()
             .ok_or_else(|| Self::unwired("save_image"))?;
         let image = self.write_image_file(item_id, content, mime_type, image_type, image_index)?;
-        store.set_item_image(item_id, &image).await
+        store.set_item_image(item_id, &image).await?;
+        self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
+            .await
     }
 
     async fn delete_image(
@@ -3843,7 +3863,8 @@ impl ProviderManager for LocalProviderManager {
             }
             let _ = std::fs::remove_file(&path);
         }
-        Ok(())
+        self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
+            .await
     }
 
     async fn get_available_remote_images(
@@ -3886,14 +3907,16 @@ impl ProviderManager for LocalProviderManager {
 
     async fn save_metadata(
         &self,
-        _item_id: Uuid,
-        _update_type: ItemUpdateType,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
-        // The DB-side persistence already happened in the caller (e.g.
-        // `save_image_from_url` → `set_item_image`). The remaining C# work is
-        // writing metadata savers (NFO/images to the media folder), which Ferrofin
-        // defers — so this is a successful no-op rather than a hard failure, and
-        // the image-download / metadata-edit flows complete.
+        // ProviderManager.SaveMetadataAsync logs saver failures; metadata has
+        // already been committed and an unwritable sidecar must not undo it.
+        if let Some(saver) = &self.nfo_saver
+            && let Err(error) = saver.save(item_id, update_type).await
+        {
+            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
         Ok(())
     }
 
@@ -5725,12 +5748,11 @@ mod tests {
             .expect_err("save_image unwired");
         assert!(save_bytes.to_string().contains("save_image"));
 
-        // `save_metadata` is an accepted no-op (the DB write happens in the
-        // caller), so the image-download / metadata-edit flows complete rather
-        // than 500.
+        // This bare test manager has no registered saver. Production attaches
+        // NfoSaver at the composition root.
         mgr.save_metadata(id, ItemUpdateType::MetadataDownload)
             .await
-            .expect("save_metadata is an accepted no-op");
+            .expect("no registered saver");
     }
 
     /// The helpers behind `refresh_full_item`: `wants_fetch` gates on the

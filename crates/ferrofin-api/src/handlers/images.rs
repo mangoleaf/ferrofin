@@ -1424,6 +1424,13 @@ async fn update_item_image_index(
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)
         .await?;
+    state
+        .providers
+        .save_metadata(
+            item_id,
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

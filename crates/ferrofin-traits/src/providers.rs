@@ -176,6 +176,8 @@ pub enum ItemUpdateType {
     /// Nothing changed.
     #[default]
     None,
+    /// Metadata was imported from a local reader or media probe.
+    MetadataImport,
     /// Only metadata was downloaded/updated.
     MetadataDownload,
     /// Metadata was edited (locally or imported).

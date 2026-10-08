@@ -28,6 +28,7 @@ pub mod metrics;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;
+pub mod nfo_save;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;

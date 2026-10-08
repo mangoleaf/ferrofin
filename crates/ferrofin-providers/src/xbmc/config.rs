@@ -4,8 +4,8 @@
 //!
 //! Upstream this type lives in `MediaBrowser.Model.Configuration` and is fetched
 //! via `IConfigurationManager.GetConfiguration<XbmcMetadataOptions>("xbmcmetadata")`.
-//! It is server-side configuration plumbing not present in `ferrofin-model`, so it
-//! is re-created here for the parsers.
+//! The parser uses this reduced view of the model configuration; the automatic
+//! saver reads the full saved `XbmcMetadataOptions` at runtime.
 
 /// The default release-date format the parsers use for `aired`/`premiered`/
 /// `releasedate`/`formed`/`enddate` tags.
@@ -18,8 +18,7 @@ pub const DEFAULT_RELEASE_DATE_FORMAT: &str = "yyyy-MM-dd";
 /// Port of `MediaBrowser.Model.Configuration.XbmcMetadataOptions`, reduced to the
 /// fields the parsers actually consult (`UserId`, `ReleaseDateFormat`). The
 /// save-time flags (`SaveImagePathsInNfo`, `EnablePathSubstitution`,
-/// `EnableExtraThumbsDuplication`) belong to the (deferred) NFO savers and are
-/// omitted.
+/// `EnableExtraThumbsDuplication`) are read separately by the automatic saver.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NfoConfiguration {
     /// The user whose watched/playcount state `watched`/`playcount`/`lastplayed`

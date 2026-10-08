@@ -901,6 +901,17 @@ pub async fn build_app_state(
     // consumes `providers` before this point.
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
+            .with_nfo_saver(Arc::new(
+                ferrofin_providers::nfo_save::NfoSaver::new(
+                    Arc::clone(&item_repository),
+                    Arc::clone(&item_persistence_service),
+                    Arc::clone(&people_repository),
+                    Arc::clone(&media_stream_repository),
+                    Arc::clone(&virtual_folders),
+                    Arc::clone(&config_trait),
+                )
+                .with_users(Arc::clone(&users), Arc::clone(&user_data)),
+            ))
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -1070,6 +1081,7 @@ pub async fn build_app_state(
         Arc::clone(&file_system),
         Arc::clone(&item_persistence_service),
     )
+    .with_metadata_savers(Arc::clone(&providers))
     .with_id_derivation(id_derivation)
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).

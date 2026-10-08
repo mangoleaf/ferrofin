@@ -5,18 +5,12 @@
 //! `BaseNfoSaver` and the per-kind savers (`MovieNfoSaver`, `EpisodeNfoSaver`,
 //! `SeriesNfoSaver`, `SeasonNfoSaver`, `AlbumNfoSaver`, `ArtistNfoSaver`).
 //!
-//! Only the pure serialization is ported here: the C# `SaveAsync` /
-//! `SaveToFileAsync` filesystem pipeline (byte-for-byte compare, hidden-attribute
-//! handling, atomic replace), the media-stream (`AddMediaInfo`) block — which
-//! needs `IHasMediaSources`, absent from [`NfoBaseItem`] — the image-path block
-//! (`SaveImagePathsInNfo`, off by default in First-Light), the user-data block
-//! (needs a user store), and the `AddCustomTags` merge of an existing file are
-//! deferred. What remains is the round-trip oracle: [`save_movie`] et al. produce
-//! the same tags [`super::fetch_movie`] et al. read back.
-//!
-//! The album/artist savers write child tracks/albums; [`NfoBaseItem`] carries no
-//! child collection, so those savers emit only the parent tags (the child loops
-//! become no-ops), which is faithful for a childless item.
+//! Pure item serialization is shared with the automatic sidecar writer in
+//! [`crate::nfo_save`]. Its runtime supplement adds streams, artwork, selected
+//! user data and custom tags from an existing document.
+
+mod runtime;
+pub(crate) use runtime::{DocumentExtras, complete_document};
 
 use std::fmt::Write as _;
 
@@ -161,10 +155,8 @@ fn format_date(date: DateTime<Utc>, fmt: &str) -> String {
 
 /// Converts the .NET release-date format to a chrono `strftime` string.
 ///
-/// The NFO configuration only ever carries `"yyyy-MM-dd"` (see
-/// [`super::config::NfoConfiguration::release_date_format`]), which the parser
-/// reads back with `try_read_date_time_exact`'s `yyyy-MM-dd` path; the single
-/// mapped format is therefore the only one the round trip needs.
+/// TODO(parity): port custom .NET release-date patterns for both reader and
+/// writer. The existing round-trip implementation supports the default only.
 fn release_date_strftime(_format: &str) -> &'static str {
     "%Y-%m-%d"
 }
@@ -485,8 +477,7 @@ fn add_common_nodes(
         }
     }
 
-    // Image paths (SaveImagePathsInNfo) and user data are deferred (off in
-    // First-Light); the parser has no target for either.
+    // The runtime supplement appends artwork and the selected user data.
 
     // C# `if (item is not MusicAlbum && item is not MusicArtist)` — the music
     // kinds get their credits from their own savers, not `<actor>` blocks.
@@ -556,7 +547,9 @@ fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo]) {
         if let Some(order) = person.sort_order {
             writer.element("sortorder", &order.to_string());
         }
-        // Image path (saveImagePath) is deferred.
+        if let Some(path) = person.image_url.as_deref().filter(|path| !path.is_empty()) {
+            writer.element("thumb", path);
+        }
 
         writer.end_element("actor");
     }

@@ -121,7 +121,22 @@ pub(crate) async fn update_item(
             child.is_locked = item.is_locked;
         }
         state.library.update_items(&descendants, None).await?;
+        for child in &descendants {
+            if let Ok(id) = Uuid::parse_str(&child.id) {
+                state
+                    .providers
+                    .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+                    .await?;
+            }
+        }
     }
+    state
+        .providers
+        .save_metadata(
+            item_id,
+            ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -496,6 +511,12 @@ async fn cascade_to_children(
         cascade_onto(child, locked, official_rating, custom_rating, &tags);
     }
     state.library.update_items(&children, None).await?;
+    for id in ids {
+        state
+            .providers
+            .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .await?;
+    }
     Ok(())
 }
 

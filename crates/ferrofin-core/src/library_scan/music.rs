@@ -22,6 +22,7 @@
 //! Identify refreshes it with the request's options
 //! ([`refresh_by_name_artist`](LibraryScanner::refresh_by_name_artist)).
 
+use ferrofin_traits::providers::ItemUpdateType;
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
@@ -1004,6 +1005,7 @@ impl LibraryScanner {
         if ids_changed {
             self.persistence.replace_provider_ids(work.id, &ids).await?;
         }
+        let saved_images = images.is_some();
         if let Some(images) = images {
             self.persistence.save_item_images(work.id, &images).await?;
         }
@@ -1013,6 +1015,17 @@ impl LibraryScanner {
         self.persistence
             .save_items(std::slice::from_ref(&row))
             .await?;
+        self.save_metadata_sidecars(
+            work.id,
+            if answered || work.request.force_save || work.request.options.replace_all_metadata {
+                ItemUpdateType::MetadataDownload
+            } else if saved_images {
+                ItemUpdateType::ImageUpdate
+            } else {
+                ItemUpdateType::MetadataImport
+            },
+        )
+        .await;
         Ok(Some(true))
     }
 
