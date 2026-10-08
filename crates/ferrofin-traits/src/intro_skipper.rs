@@ -302,6 +302,62 @@ pub trait IntroSkipperStore: Send + Sync {
 
 fn _assert_object_safe_intro_skipper_store(_: &dyn IntroSkipperStore) {}
 
+/// The plugin's analysis runtime: its one-pass-at-a-time lock
+/// (`ScheduledTaskSemaphore`), on-demand season rescans and the detection
+/// cache — implemented by the Intro Skipper extension, so the routes reach
+/// them without depending on it.
+#[async_trait]
+pub trait IntroSkipperAnalysis: Send + Sync {
+    /// Whether an analysis pass is running (any of them: the scheduled
+    /// detection, the Media Segment Scan or a rescan).
+    fn is_running(&self) -> bool;
+
+    /// Starts, in the background, erasing the season (or movie) — segments
+    /// and cache — then analysing only it (`VisualizationController.ScanSeason`).
+    /// `false` when a pass is already running.
+    async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError>;
+
+    /// Deletes cached analysis data of `items` (every item when `None`) for
+    /// `mode` (every mode when `None`) — the plugin's `DeleteForItem` /
+    /// `DeleteByMode`; how many entries went.
+    async fn erase_cache(
+        &self,
+        items: Option<&[Uuid]>,
+        mode: Option<AnalysisMode>,
+    ) -> Result<u64, ServiceError>;
+}
+
+fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}
+
+/// An [`IntroSkipperAnalysis`] with nothing behind it: the default of a state
+/// built without the extension (tests), never the server's — it is never
+/// running, and a rescan or cache erase is a backend error.
+#[derive(Debug, Default)]
+pub struct DetachedIntroSkipperAnalysis;
+
+#[async_trait]
+impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
+    fn is_running(&self) -> bool {
+        false
+    }
+
+    async fn rescan(&self, _season_id: Uuid) -> Result<bool, ServiceError> {
+        Err(ServiceError::backend(
+            "the intro skipper extension is not attached",
+        ))
+    }
+
+    async fn erase_cache(
+        &self,
+        _items: Option<&[Uuid]>,
+        _mode: Option<AnalysisMode>,
+    ) -> Result<u64, ServiceError> {
+        Err(ServiceError::backend(
+            "the intro skipper extension is not attached",
+        ))
+    }
+}
+
 /// The [`InMemoryIntroSkipperStore`] state.
 #[derive(Debug, Default)]
 struct Memory {

@@ -41,7 +41,6 @@ use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
-use ferrofin_model::tasks::TaskState;
 use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
 use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
@@ -56,8 +55,6 @@ use crate::state::AppState;
 /// `ferrofin-extensions` — the upstream plugin's GUID, which the plugin's own
 /// dashboard app and client integrations hardcode).
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
-/// The scheduled-task key that runs a detection pass.
-const DETECT_TASK_KEY: &str = "IntroSkipper.Detect";
 /// One second expressed in the 100-nanosecond ticks used by segment storage.
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
@@ -172,6 +169,17 @@ struct SegmentInput {
 struct EraseQuery {
     #[serde(default)]
     mode: Option<AnalysisMode>,
+    /// Also erase the cached fingerprints (`bool eraseCache = false`).
+    #[serde(default)]
+    erase_cache: Option<bool>,
+}
+
+/// Query for the season/movie erase: `bool eraseCache = false`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EraseSeasonQuery {
+    #[serde(default)]
+    erase_cache: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -240,15 +248,6 @@ async fn plugin_version(state: &AppState) -> String {
         .ok()
         .flatten()
         .map_or_else(|| "0.0.0.0".to_owned(), |d| d.version)
-}
-
-/// Whether a detection pass is currently running.
-async fn scan_running(state: &AppState) -> Result<bool, ApiError> {
-    Ok(state
-        .tasks
-        .get_task(&ferrofin_traits::tasks::task_id_for_key(DETECT_TASK_KEY))
-        .await?
-        .is_some_and(|t| t.state == TaskState::Running))
 }
 
 /// The episodes directly under a season (empty if the season has none).
@@ -377,7 +376,8 @@ async fn get_skippable_segments(
 /// mode's published `MediaSegments` rows until the next analysis republishes,
 /// so an erased intro keeps showing its skip button; here they go too (when
 /// `UpdateMediaSegments` is on).
-/// TODO(intro-skipper step 2): `eraseCache` (the mode's fingerprint files).
+/// `eraseCache` also erases the mode's cached fingerprints (Introduction and
+/// Credits only, as upstream).
 async fn erase_timestamps(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -391,6 +391,14 @@ async fn erase_timestamps(
         )));
     };
     state.intro_skipper.delete_mode(mode).await?;
+    if query.erase_cache == Some(true)
+        && matches!(mode, AnalysisMode::Introduction | AnalysisMode::Credits)
+    {
+        state
+            .intro_skipper_analysis
+            .erase_cache(None, Some(mode))
+            .await?;
+    }
     if update_media_segments(&state).await {
         state
             .media_segments
@@ -794,13 +802,15 @@ async fn support_bundle(
 // Visualization controller
 // ---------------------------------------------------------------------------
 
-/// `GET /Intros/ScanStatus` — whether a detection pass is running.
+/// `GET /Intros/ScanStatus` — whether an analysis pass is running
+/// (`ScheduledTaskSemaphore.IsBusy`: the scheduled detection, the Media
+/// Segment Scan or a season rescan).
 async fn scan_status(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> Result<Json<ScanStatusResponse>, ApiError> {
     Ok(Json(ScanStatusResponse {
-        is_running: scan_running(&state).await?,
+        is_running: state.intro_skipper_analysis.is_running(),
     }))
 }
 
@@ -844,6 +854,7 @@ async fn erase_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<EraseSeasonQuery>,
 ) -> Result<StatusCode, ApiError> {
     let episodes = season_episodes(&state, season_id).await?;
     if episodes.is_empty() {
@@ -851,16 +862,50 @@ async fn erase_season(
             "season {season_id} has no episodes"
         )));
     }
-    // Every segment of the season's episodes goes, user-provided too, then
-    // the (now empty) set is republished.
-    // TODO(intro-skipper step 2): `eraseCache`; step 4: clear the season
-    // state's analysed-episode lists.
     let ids: Vec<Uuid> = episodes
         .iter()
         .filter_map(|e| Uuid::parse_str(&e.id).ok())
         .collect();
-    state.intro_skipper.delete_items(&ids).await?;
-    publish(&state, &ids).await;
+    erase_items(&state, &ids, query.erase_cache == Some(true)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `EraseSeasonAsync`'s body: every segment of `ids` goes, user-provided too,
+/// the cache with them when asked, then the (now empty) set is republished.
+/// TODO(intro-skipper step 4): clear the season state's analysed-episode lists.
+async fn erase_items(state: &AppState, ids: &[Uuid], erase_cache: bool) -> Result<(), ApiError> {
+    state.intro_skipper.delete_items(ids).await?;
+    if erase_cache {
+        state
+            .intro_skipper_analysis
+            .erase_cache(Some(ids), None)
+            .await?;
+    }
+    publish(state, ids).await;
+    Ok(())
+}
+
+/// `DELETE /Intros/Show/{MovieId}` — erase a movie's Intro Skipper segments.
+///
+/// Not an upstream route: the plugin's dashboard erases a movie with this
+/// single-id form, which upstream never serves (its button fails). Owner
+/// decision D9 serves it: `EraseSeasonAsync` with the movie as the one item,
+/// as the plugin queues a movie under its own id. 404 unless the id is a Movie.
+async fn erase_movie(
+    State(state): State<AppState>,
+    RequireAdmin(_auth): RequireAdmin,
+    Path(movie_id): Path<Uuid>,
+    Query(query): Query<EraseSeasonQuery>,
+) -> Result<StatusCode, ApiError> {
+    let is_movie = state
+        .library
+        .get_item_by_id(movie_id)
+        .await?
+        .is_some_and(|item| item.type_.rsplit('.').next() == Some("Movie"));
+    if !is_movie {
+        return Err(ApiError::NotFound(format!("movie {movie_id}")));
+    }
+    erase_items(&state, &[movie_id], query.erase_cache == Some(true)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1017,27 +1062,23 @@ async fn update_analyzer_actions(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /Intros/ScanSeason/{SeriesId}/{SeasonId}` — start a detection pass.
+/// `POST /Intros/ScanSeason/{SeriesId}/{SeasonId}` — rescan one season.
 ///
-/// Port of `VisualizationController.ScanSeason`: 409 if a scan is already
-/// running, else start the detection task and return 202. Ferrofin's detection
-/// task scans the whole library rather than a single season.
-// ponytail: detection task is library-wide; per-season scoping needs task params.
+/// Port of `VisualizationController.ScanSeason`: 409 when a pass is already
+/// running; otherwise, in the background, the season's segments and cache are
+/// erased and only that season is analysed again (202).
 async fn scan_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path((_series_id, _season_id)): Path<(Uuid, Uuid)>,
+    Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    if scan_running(&state).await? {
-        return Err(ApiError::Conflict(
-            "a scan is already in progress".to_owned(),
-        ));
+    if state.intro_skipper_analysis.rescan(season_id).await? {
+        Ok(StatusCode::ACCEPTED)
+    } else {
+        Err(ApiError::Conflict(
+            "A scan is already in progress.".to_owned(),
+        ))
     }
-    state
-        .tasks
-        .start_task(&ferrofin_traits::tasks::task_id_for_key(DETECT_TASK_KEY))
-        .await?;
-    Ok(StatusCode::ACCEPTED)
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,6 +1201,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Intros/Show/{SeriesId}/{SeasonId}",
             get(get_season_episodes).delete(erase_season),
         )
+        .route("/Intros/Show/{MovieId}", axum::routing::delete(erase_movie))
         .route(
             "/Intros/ScanSeason/{SeriesId}/{SeasonId}",
             post(scan_season),
@@ -1174,6 +1216,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 crate::query::query_parameters! {
     CreateSegmentQuery {} => [];
     DeleteSegmentQuery {} => [];
+    EraseSeasonQuery {} => [];
     EraseQuery {} => [];
 }
 

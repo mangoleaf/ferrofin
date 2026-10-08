@@ -343,73 +343,92 @@ fn state() -> (Arc<MemSegments>, AppState) {
     (seg, app)
 }
 
+/// One recorded cache erase: the items (all when `None`) and the mode.
+type CacheErase = (Option<Vec<Uuid>>, Option<Mode>);
+
+/// An analysis runtime that records what the routes ask of it.
+#[derive(Default)]
+struct FakeAnalysis {
+    running: std::sync::atomic::AtomicBool,
+    rescans: Mutex<Vec<Uuid>>,
+    erased: Mutex<Vec<CacheErase>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
+    fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError> {
+        if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.rescans.lock().unwrap().push(season_id);
+        Ok(true)
+    }
+    async fn erase_cache(
+        &self,
+        items: Option<&[Uuid]>,
+        mode: Option<Mode>,
+    ) -> Result<u64, ServiceError> {
+        self.erased
+            .lock()
+            .unwrap()
+            .push((items.map(<[Uuid]>::to_vec), mode));
+        Ok(0)
+    }
+}
+
+fn with_analysis(analysis: &Arc<FakeAnalysis>) -> AppState {
+    let (_seg, app) = state();
+    app.with_intro_skipper_analysis(Arc::clone(analysis) as _)
+}
+
+/// `ScanStatus` is the plugin's `ScheduledTaskSemaphore.IsBusy`, and
+/// `ScanSeason` takes it: 202 and a rescan of that season, or 409 while a pass
+/// runs.
 #[tokio::test]
-async fn scan_status_reports_idle_and_running() {
-    let (_seg, idle) = state();
-    let (status, body) = send(idle, "GET", "/Intros/ScanStatus", "").await;
+async fn scan_season_takes_the_scan_lock_and_status_reports_it() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    let (status, body) = send(with_analysis(&analysis), "GET", "/Intros/ScanStatus", "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, r#"{"isRunning":false}"#);
 
-    let busy = build_app(
-        Arc::new(MemSegments::default()),
-        Arc::new(MemTasks {
-            running: true,
-            started: Mutex::new(Vec::new()),
-        }),
-        Arc::new(MemConfig::default()),
-    );
-    let (_status, body) = send(busy, "GET", "/Intros/ScanStatus", "").await;
+    let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
+    let uri = format!("/Intros/ScanSeason/{series}/{season}");
+    let (status, _) = send(with_analysis(&analysis), "POST", &uri, "").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(analysis.rescans.lock().unwrap().as_slice(), [season]);
+
+    let (_, body) = send(with_analysis(&analysis), "GET", "/Intros/ScanStatus", "").await;
     assert_eq!(body, r#"{"isRunning":true}"#);
+    let (status, _) = send(with_analysis(&analysis), "POST", &uri, "").await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
+/// `eraseCache` erases the mode's cached fingerprints — only for
+/// Introduction and Credits, as upstream.
 #[tokio::test]
-async fn scan_season_starts_task_or_conflicts() {
-    // Idle → 202 and the detection task is started.
-    let started = Arc::new(MemTasks {
-        running: false,
-        started: Mutex::new(Vec::new()),
-    });
-    let app = build_app(
-        Arc::new(MemSegments::default()),
-        started.clone(),
-        Arc::new(MemConfig::default()),
-    );
-    let series = Uuid::new_v4();
-    let season = Uuid::new_v4();
-    let (status, _) = send(
-        app,
-        "POST",
-        &format!("/Intros/ScanSeason/{series}/{season}"),
-        "",
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    // The handler addresses the task by its WIRE id (`ScheduledTaskWorker.Id`),
-    // not by its key — that is what `ITaskManager`'s lookup takes.
+async fn erase_timestamps_erases_the_cache_when_asked() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    for query in [
+        "mode=Credits&eraseCache=true",
+        "mode=Recap&eraseCache=true",
+        "mode=Introduction",
+    ] {
+        let (status, _) = send(
+            with_analysis(&analysis),
+            "POST",
+            &format!("/Intros/EraseTimestamps?{query}"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{query}");
+    }
     assert_eq!(
-        started.started.lock().unwrap().as_slice(),
-        [ferrofin_traits::tasks::task_id_for_key(
-            "IntroSkipper.Detect"
-        )]
+        analysis.erased.lock().unwrap().as_slice(),
+        [(None, Some(Mode::Credits))]
     );
-
-    // Already running → 409.
-    let busy = build_app(
-        Arc::new(MemSegments::default()),
-        Arc::new(MemTasks {
-            running: true,
-            started: Mutex::new(Vec::new()),
-        }),
-        Arc::new(MemConfig::default()),
-    );
-    let (status, _) = send(
-        busy,
-        "POST",
-        &format!("/Intros/ScanSeason/{series}/{season}"),
-        "",
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -777,6 +796,7 @@ async fn plugin_routes_are_elevated_as_upstream() {
         ),
         ("GET", format!("/Intros/DisabledEpisodes/{id}")),
         ("POST", "/Intros/DisabledEpisodes/Update".to_owned()),
+        ("DELETE", format!("/Intros/Show/{id}")),
     ] {
         let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");

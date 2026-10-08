@@ -1838,6 +1838,7 @@ mod tests {
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
+            intro_skipper_running: Arc::default(),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

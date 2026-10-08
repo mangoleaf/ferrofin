@@ -1477,7 +1477,9 @@ pub async fn build_app_state(
         cache_dir: config.cache_dir.join("extensions"),
         merge_versions: Arc::clone(&merge_versions),
         intro_skipper: Arc::clone(&intro_skipper),
+        intro_skipper_running: Arc::default(),
     };
+    let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     // "Media Segment Scan" (Library category): upstream registers this one in
     // the core task set, independent of any plugin, so the dashboard lists it
     // even with every extension disabled. It goes in FIRST on purpose: the
@@ -2144,7 +2146,8 @@ pub async fn build_app_state(
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
     let state = state
         .with_library_monitor(library_monitor)
-        .with_intro_skipper_store(intro_skipper);
+        .with_intro_skipper_store(intro_skipper)
+        .with_intro_skipper_analysis(intro_skipper_analysis);
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time

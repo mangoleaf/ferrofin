@@ -49,8 +49,12 @@ pub struct ExtensionContext {
     /// Bulk merge/split of duplicate versions — the Merge Versions extension's
     /// service, shared by its scheduled tasks and the `/MergeVersions/*` routes.
     pub merge_versions: Arc<dyn MergeVersionsManager>,
-    /// The Intro Skipper's per-season analyzer actions, which detection honours.
+    /// The Intro Skipper's own store (segments, season state, disabled
+    /// episodes), which detection writes and honours.
     pub intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    /// The Intro Skipper's one-pass-at-a-time latch, shared by its scheduled
+    /// tasks and the routes' analysis handle.
+    pub intro_skipper_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -174,6 +178,7 @@ mod tests {
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
+            intro_skipper_running: Arc::default(),
         }
     }
 

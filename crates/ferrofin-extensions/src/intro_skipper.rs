@@ -27,7 +27,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode as WireMode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
+use ferrofin_traits::intro_skipper::{self as intro_store, IntroSkipperAnalysis, StoredSegment};
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -119,19 +119,62 @@ impl Extension for IntroSkipperExtension {
     }
 
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
-        let detect = Arc::new(DetectSegmentsTask {
-            library: Arc::clone(&cx.library),
-            media_segments: Arc::clone(&cx.media_segments),
-            plugins: Arc::clone(&cx.plugins),
-            fingerprinter: cx.fingerprinter.clone(),
-            cache_dir: cx.cache_dir.join("introskipper"),
-            running: Arc::new(AtomicBool::new(false)),
-            actions: Arc::clone(&cx.intro_skipper),
-        });
+        let detect = Arc::new(detector(cx));
         vec![
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
             Arc::new(MediaSegmentScanTask { detect }),
         ]
+    }
+}
+
+/// The detection pass over `cx`. Every instance shares the context's latch, so
+/// the scheduled tasks and the routes' [`analysis`] handle run one pass at a
+/// time between them (the plugin's `ScheduledTaskSemaphore`).
+fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
+    DetectSegmentsTask {
+        library: Arc::clone(&cx.library),
+        media_segments: Arc::clone(&cx.media_segments),
+        plugins: Arc::clone(&cx.plugins),
+        fingerprinter: cx.fingerprinter.clone(),
+        cache_dir: cx.cache_dir.join("introskipper"),
+        running: Arc::clone(&cx.intro_skipper_running),
+        actions: Arc::clone(&cx.intro_skipper),
+    }
+}
+
+/// The Intro Skipper's analysis runtime for the plugin routes (`ScanSeason`,
+/// `ScanStatus`, `eraseCache`).
+#[must_use]
+pub fn analysis(cx: &ExtensionContext) -> Arc<dyn IntroSkipperAnalysis> {
+    Arc::new(detector(cx))
+}
+
+#[async_trait]
+impl IntroSkipperAnalysis for DetectSegmentsTask {
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        // Background, not bound to the request, as upstream's `Task.Run`.
+        let task = self.clone();
+        tokio::spawn(async move {
+            let _release = ReleaseOnDrop(Arc::clone(&task.running));
+            tracing::info!(%season_id, "intro skipper: rescanning a season");
+            task.rescan_season(season_id).await;
+        });
+        Ok(true)
+    }
+
+    async fn erase_cache(
+        &self,
+        items: Option<&[Uuid]>,
+        mode: Option<WireMode>,
+    ) -> Result<u64, ServiceError> {
+        self.erase_cache_files(items, mode).await
     }
 }
 
@@ -643,6 +686,112 @@ impl DetectSegmentsTask {
                 tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
             }
         }
+    }
+
+    /// `ScanSeason`'s background body: `EraseSeasonAsync(eraseCache: true)`
+    /// (segments, cache, republish), then `AnalyzeItemsAsync([seasonId])`.
+    async fn rescan_season(&self, season_id: Uuid) {
+        let config = self.load_config().await;
+        let seasons = match self.episodes_by_season().await {
+            Ok(seasons) => seasons,
+            Err(err) => {
+                tracing::error!(%err, %season_id, "intro skipper: could not enumerate the season to rescan");
+                return;
+            }
+        };
+        let Some(episodes) = seasons
+            .into_iter()
+            .find(|(key, _)| Uuid::parse_str(key).ok() == Some(season_id))
+            .map(|(_, episodes)| episodes)
+        else {
+            tracing::info!(%season_id, "intro skipper: the season to rescan has no episodes");
+            return;
+        };
+        let ids: Vec<Uuid> = episodes.iter().map(|e| e.id).collect();
+        if let Err(err) = self.actions.delete_items(&ids).await {
+            tracing::error!(%err, %season_id, "intro skipper: could not erase the season to rescan");
+            return;
+        }
+        if let Err(err) = self.erase_cache_files(Some(&ids), None).await {
+            tracing::warn!(%err, %season_id, "intro skipper: could not erase the season's cache");
+        }
+        if config.update_media_segments {
+            for &item_id in &ids {
+                if let Err(err) = intro_store::refresh(
+                    self.actions.as_ref(),
+                    self.media_segments.as_ref(),
+                    item_id,
+                )
+                .await
+                {
+                    tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
+                }
+            }
+        }
+        let Some(fingerprinter) = self.fingerprinter.clone() else {
+            tracing::warn!("intro skipper: no Chromaprint backend to rescan with");
+            return;
+        };
+        let actions = match self.actions.analyzer_actions(season_id).await {
+            Ok(actions) => actions,
+            Err(err) => {
+                tracing::error!(%err, %season_id, "intro skipper: could not read the season's analyzer actions");
+                return;
+            }
+        };
+        let written = self
+            .analyze_season(Some(&actions), &episodes, &config, fingerprinter.as_ref())
+            .await;
+        tracing::info!(%season_id, segments = written, "intro skipper: season rescanned");
+    }
+
+    /// Deletes fingerprint files (`{item}.{mode tag}.{start}-{end}.fp`) of
+    /// `items` (all when `None`) for `mode` (all when `None`). Like the
+    /// plugin's `DeleteByMode`, a mode other than Introduction or Credits has
+    /// no cache to erase.
+    async fn erase_cache_files(
+        &self,
+        items: Option<&[Uuid]>,
+        mode: Option<WireMode>,
+    ) -> Result<u64, ServiceError> {
+        let tags: Option<&[&str]> = match mode {
+            None => None,
+            Some(WireMode::Introduction) => Some(&["intro"]),
+            // `credits` is the tag of the orphaned v1 cache (see `mode_tag`).
+            Some(WireMode::Credits) => Some(&["credits2", "credits"]),
+            Some(_) => return Ok(0),
+        };
+        let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(ServiceError::backend(err.to_string())),
+        };
+        let mut removed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| ServiceError::backend(err.to_string()))?
+        {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "fp") {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let mut parts = name.splitn(3, '.');
+            let (Some(item), Some(tag)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let item_matches =
+                items.is_none_or(|items| Uuid::parse_str(item).is_ok_and(|id| items.contains(&id)));
+            let tag_matches = tags.is_none_or(|tags| tags.contains(&tag));
+            if item_matches && tag_matches && tokio::fs::remove_file(entry.path()).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Whether the extension's plugin is currently enabled.
@@ -1573,6 +1722,110 @@ mod tests {
         scan.execute(&TaskProgress::default()).await.expect("scan");
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
         assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
+    }
+
+    /// The cache files a detection run left behind for `id`.
+    fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
+        std::fs::read_dir(&h.task.cache_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(&id.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `DeleteForItem` / `DeleteByMode`: by item, by mode (Introduction and
+    /// Credits only), or everything.
+    #[tokio::test]
+    async fn erase_cache_deletes_by_item_and_mode() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let before_a = cache_files(&h, EP_A);
+        assert!(
+            before_a.iter().any(|f| f.contains(".intro.")),
+            "{before_a:?}"
+        );
+        assert_eq!(
+            h.task
+                .erase_cache(Some(&[EP_A]), Some(WireMode::Introduction))
+                .await
+                .expect("erase"),
+            1
+        );
+        let after_a = cache_files(&h, EP_A);
+        assert!(!after_a.iter().any(|f| f.contains(".intro.")));
+        assert_eq!(after_a.len(), before_a.len() - 1, "the credits print stays");
+        assert_eq!(
+            h.task
+                .erase_cache(None, Some(WireMode::Recap))
+                .await
+                .expect("recap"),
+            0
+        );
+        h.task.erase_cache(None, None).await.expect("all");
+        assert!(cache_files(&h, EP_A).is_empty() && cache_files(&h, EP_B).is_empty());
+    }
+
+    /// `ScanSeason`: the season is erased (segments + cache) and analysed again
+    /// in the background under the scan lock; a second request while it runs
+    /// is refused.
+    #[tokio::test]
+    async fn a_rescan_erases_then_reanalyses_the_season() {
+        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let calls = h.calls.load(Ordering::SeqCst);
+        // A user edit is erased too: the rescan starts the season over.
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_A,
+                mode: WireMode::Recap,
+                start: 0.0,
+                end: 5.0,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("store");
+        h.task.running.store(true, Ordering::SeqCst);
+        assert!(!h.task.rescan(SEASON).await.expect("busy"));
+        h.task.running.store(false, Ordering::SeqCst);
+        assert!(h.task.rescan(SEASON).await.expect("started"));
+        for _ in 0..200 {
+            if !h.task.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !h.task.is_running(),
+            "the rescan finished and released the lock"
+        );
+        assert!(
+            h.calls.load(Ordering::SeqCst) > calls,
+            "the erased cache was re-fingerprinted"
+        );
+        let modes: Vec<_> = h
+            .actions
+            .segments(EP_A)
+            .await
+            .expect("tier")
+            .iter()
+            .map(|s| s.mode)
+            .collect();
+        assert!(
+            modes.contains(&WireMode::Introduction) && !modes.contains(&WireMode::Recap),
+            "{modes:?}"
+        );
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
     }
 
     #[tokio::test]
