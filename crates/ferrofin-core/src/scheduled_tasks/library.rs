@@ -254,6 +254,9 @@ impl FfmpegRunner for TokioFfmpegRunner {
 #[must_use]
 pub fn parse_lufs(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            continue;
+        }
         let mut parts = line.split_whitespace();
         if parts.next() == Some("I:")
             && let Some(value) = parts.next()
@@ -311,10 +314,17 @@ impl AudioNormalizationTask {
                 .iter()
                 .map(|s| (*s).to_owned()),
         );
-        let stderr = self
+        let stderr = match self
             .runner
             .run_stderr(&self.encoder.encoder_path(), &args)
-            .await?;
+            .await
+        {
+            Ok(stderr) => stderr,
+            Err(error) => {
+                tracing::warn!(%error, "failed to start audio normalization analysis");
+                return Ok(None);
+            }
+        };
         let lufs = parse_lufs(&stderr);
         if lufs.is_none() {
             tracing::warn!("failed to find LUFS value in ffmpeg output");
@@ -353,6 +363,7 @@ impl AudioNormalizationTask {
         let total = albums.len().max(1);
         for (index, album) in albums.iter().enumerate() {
             if album.lufs.is_none()
+                && album.normalization_gain.is_none()
                 && let Ok(album_id) = Uuid::parse_str(&album.id)
             {
                 let tracks = self
@@ -364,8 +375,12 @@ impl AudioNormalizationTask {
                         ..InternalItemsQuery::default()
                     })
                     .await?;
-                let track_paths: Vec<String> =
-                    tracks.iter().filter_map(|t| t.path.clone()).collect();
+                let track_paths: Vec<String> = tracks
+                    .iter()
+                    .filter_map(|track| track.path.as_deref())
+                    .filter(|path| crate::media_info_resolver::is_file_protocol(path))
+                    .map(str::to_owned)
+                    .collect();
                 // Album gain is useless for single-track albums (upstream skip).
                 if track_paths.len() > 1 {
                     tracing::info!(
@@ -441,6 +456,7 @@ impl AudioNormalizationTask {
             if track.lufs.is_none()
                 && track.normalization_gain.is_none()
                 && let Some(path) = track.path.clone()
+                && crate::media_info_resolver::is_file_protocol(&path)
                 && let Some(lufs) = self.measure(vec!["-i".to_owned(), path]).await?
             {
                 self.save_lufs(&track.id, lufs).await?;
@@ -1523,15 +1539,17 @@ mod tests {
 
     #[test]
     fn parse_lufs_finds_the_integrated_summary_line() {
-        let stderr = "\
-[Parsed_ebur128_0 @ 0x1] Summary:\n\
-\n\
-  Integrated loudness:\n\
-    I:         -23.1 LUFS\n\
-    Threshold: -33.6 LUFS\n";
+        let stderr = concat!(
+            "[Parsed_ebur128_0 @ 0x1] Summary:\n",
+            "\n",
+            "  Integrated loudness:\n",
+            "    I:         -23.1 LUFS\n",
+            "    Threshold: -33.6 LUFS\n",
+        );
         assert_eq!(parse_lufs(stderr), Some(-23.1));
         assert_eq!(parse_lufs("no summary here"), None);
         assert_eq!(parse_lufs("    I: not-a-number LUFS"), None);
+        assert_eq!(parse_lufs("I: -21.0 LUFS"), None);
     }
 
     #[test]
@@ -2079,6 +2097,270 @@ mod tests {
         let calls = runner.calls.lock().expect("lock");
         assert_eq!(calls.len(), 3);
         assert!(calls[0].iter().any(|a| a == "concat"));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn normalization_analysis_follows_saved_flags_and_preserves_embedded_gain() {
+        use ferrofin_model::configuration::MediaPathInfo;
+        use ferrofin_traits::persistence::ItemPersistenceService;
+        struct LocalConcatRunner(Arc<FakeRunner>);
+        #[async_trait]
+        impl FfmpegRunner for LocalConcatRunner {
+            async fn run_stderr(
+                &self,
+                program: &str,
+                args: &[String],
+            ) -> Result<String, ServiceError> {
+                if args.iter().any(|argument| argument == "concat") {
+                    let input = args.iter().position(|argument| argument == "-i").unwrap() + 1;
+                    let list = std::fs::read_to_string(&args[input]).unwrap();
+                    assert_eq!(list.lines().count(), 2);
+                    assert!(
+                        !list.contains("https://"),
+                        "remote tracks must not enter album analysis"
+                    );
+                }
+                self.0.run_stderr(program, args).await
+            }
+        }
+        let db = test_db().await;
+        let temp = tempfile::tempdir().unwrap();
+        let media = temp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let folders = Arc::new(
+            crate::FerrofinVirtualFolderManager::new(temp.path().join("libraries"))
+                .with_item_store(Arc::new(crate::FerrofinItemPersistenceService::new(
+                    db.clone(),
+                ))),
+        );
+        let mut options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: media.to_string_lossy().into_owned(),
+            }],
+            enable_lufs_scan: false,
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder("Music", Some(CollectionTypeOptions::music), &options)
+            .await
+            .unwrap();
+        let folder = Uuid::parse_str(
+            folders.get_virtual_folders().await.unwrap()[0]
+                .item_id
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let album_id = Uuid::new_v4();
+        let gain_track = Uuid::new_v4();
+        let fresh_track = Uuid::new_v4();
+        let remote_track = Uuid::new_v4();
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let mut album = BaseItemEntity {
+            id: guid_to_db(album_id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::MusicAlbum)
+                .unwrap()
+                .to_owned(),
+            name: Some("Album".to_owned()),
+            normalization_gain: Some(-3.0),
+            ..Default::default()
+        };
+        persistence.save_items(&[album.clone()]).await.unwrap();
+        add_ancestor(&db, album_id, folder).await;
+        for (id, file, gain) in [
+            (gain_track, "gain.flac", Some(-2.0)),
+            (fresh_track, "fresh.flac", None),
+            (remote_track, "remote.flac", None),
+        ] {
+            let path = if id == remote_track {
+                "https://example.invalid/remote.flac".to_owned()
+            } else {
+                let path = media.join(file);
+                std::fs::write(&path, b"audio").unwrap();
+                path.to_string_lossy().into_owned()
+            };
+            persistence
+                .save_items(&[BaseItemEntity {
+                    id: guid_to_db(id),
+                    type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Audio)
+                        .unwrap()
+                        .to_owned(),
+                    path: Some(path),
+                    normalization_gain: gain,
+                    ..Default::default()
+                }])
+                .await
+                .unwrap();
+            add_ancestor(&db, id, album_id).await;
+            add_ancestor(&db, id, folder).await;
+        }
+        let runner = Arc::new(FakeRunner {
+            stderr: "    I: -21.5 LUFS\n".to_owned(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let task = AudioNormalizationTask::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            folders.clone(),
+            Arc::new(FakeEncoder {
+                fail_extract: false,
+            }),
+            Arc::new(LocalConcatRunner(runner.clone())),
+            Arc::new(crate::FerrofinServerApplicationPaths::new(
+                temp.path().join("data"),
+                temp.path().join("logs"),
+                temp.path().join("config"),
+                temp.path().join("cache"),
+                temp.path().join("web"),
+            )),
+        );
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert!(runner.calls.lock().unwrap().is_empty());
+        options.enable_lufs_scan = true;
+        folders
+            .update_library_options("Music", &options)
+            .await
+            .unwrap();
+        task.execute(&TaskProgress::default()).await.unwrap();
+        let rows = library_manager_over(db.clone());
+        assert_eq!(
+            rows.get_item_by_id(album_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .normalization_gain,
+            Some(-3.0)
+        );
+        assert_eq!(
+            rows.get_item_by_id(album_id).await.unwrap().unwrap().lufs,
+            None
+        );
+        assert_eq!(
+            rows.get_item_by_id(gain_track).await.unwrap().unwrap().lufs,
+            None
+        );
+        assert_eq!(
+            rows.get_item_by_id(fresh_track)
+                .await
+                .unwrap()
+                .unwrap()
+                .lufs,
+            Some(-21.5)
+        );
+        assert_eq!(
+            rows.get_item_by_id(remote_track)
+                .await
+                .unwrap()
+                .unwrap()
+                .lufs,
+            None
+        );
+        assert_eq!(
+            runner.calls.lock().unwrap().len(),
+            1,
+            "only the unmeasured local track is eligible"
+        );
+        // Remove the embedded album gain: two local tracks now make album gain
+        // useful, while the remote URL must never enter its concat list.
+        album.normalization_gain = None;
+        persistence.save_items(&[album]).await.unwrap();
+        options.enable_lufs_scan = false;
+        folders
+            .update_library_options("Music", &options)
+            .await
+            .unwrap();
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(
+            runner.calls.lock().unwrap().len(),
+            1,
+            "saved disable prevents later album work"
+        );
+        options.enable_lufs_scan = true;
+        folders
+            .update_library_options("Music", &options)
+            .await
+            .unwrap();
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(
+            rows.get_item_by_id(album_id).await.unwrap().unwrap().lufs,
+            Some(-21.5)
+        );
+        assert_eq!(runner.calls.lock().unwrap().len(), 2);
+        let concat = runner.calls.lock().unwrap()[1].clone();
+        assert!(concat.iter().any(|arg| arg == "concat"));
+        task.execute(&TaskProgress::default()).await.unwrap();
+        assert_eq!(
+            runner.calls.lock().unwrap().len(),
+            2,
+            "stored LUFS prevents repeat measurement"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalization_spawn_failure_does_not_abort_later_tracks() {
+        struct FailOnce(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl FfmpegRunner for FailOnce {
+            async fn run_stderr(&self, _: &str, _: &[String]) -> Result<String, ServiceError> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(ServiceError::backend("fixture failed to start ffmpeg"))
+                } else {
+                    Ok("    I: -24.0 LUFS\n".to_owned())
+                }
+            }
+        }
+        let db = test_db().await;
+        let temp = tempfile::tempdir().unwrap();
+        let folder = Uuid::new_v4();
+        seed_item(&db, folder, BaseItemKind::Folder).await;
+        let tracks = [Uuid::new_v4(), Uuid::new_v4()];
+        for track in tracks {
+            seed_item(&db, track, BaseItemKind::Audio).await;
+            let path = temp.path().join(format!("{track}.flac"));
+            std::fs::write(&path, b"audio").unwrap();
+            set_path(&db, track, &path.to_string_lossy()).await;
+            add_ancestor(&db, track, folder).await;
+        }
+        let runner = Arc::new(FailOnce(std::sync::atomic::AtomicUsize::new(0)));
+        let library = library_manager_over(db.clone());
+        let task = AudioNormalizationTask::new(
+            db,
+            library.clone(),
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_lufs_scan: true,
+                    ..Default::default()
+                },
+                Some(folder),
+                &temp.path().to_string_lossy(),
+            )),
+            Arc::new(FakeEncoder {
+                fail_extract: false,
+            }),
+            runner.clone(),
+            Arc::new(crate::FerrofinServerApplicationPaths::new(
+                temp.path().join("data"),
+                temp.path().join("logs"),
+                temp.path().join("config"),
+                temp.path().join("cache"),
+                temp.path().join("web"),
+            )),
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.unwrap();
+        assert_eq!(runner.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let mut measured = 0;
+        for track in tracks {
+            measured += usize::from(
+                library.get_item_by_id(track).await.unwrap().unwrap().lufs == Some(-24.0),
+            );
+        }
+        assert_eq!(
+            measured, 1,
+            "the later track is measured after the failed spawn"
+        );
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
