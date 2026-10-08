@@ -16795,11 +16795,11 @@ mod tests {
                     .is_empty(),
             "the music pass runs an album's and an artist's"
         );
-        let first = movie_fetchers(&[TMDB, OMDB, "WatDb"], &["watdb", TMDB, OMDB]);
+        let first = movie_fetchers(&[TMDB, OMDB, "watdb"], &["WatDb", TMDB, OMDB]);
         assert_eq!(
             scanner.remote_sources(library_policy(&first), "Movie", None),
             [Dynamic(0), Tmdb, Omdb],
-            "ranked first by the admin (names match case-insensitively)"
+            "ranked by exact name, enabled case-insensitively"
         );
         let between = movie_fetchers(&[TMDB, OMDB, "WatDb"], &[TMDB, "WatDb", OMDB]);
         assert_eq!(

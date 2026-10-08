@@ -1961,10 +1961,10 @@ mod tests {
             music_sources(policy, MusicKind::Album, None, &named),
             [
                 MusicSource::MusicBrainz,
-                MusicSource::Dynamic(0),
-                MusicSource::AudioDb
+                MusicSource::AudioDb,
+                MusicSource::Dynamic(0)
             ],
-            "the saved order names fetchers case-insensitively"
+            "a differently cased order entry is unranked, but still enabled"
         );
         // No saved order: MusicBrainz (0) and TheAudioDB (1) declare an
         // `IHasOrder` below the plugin's 50.

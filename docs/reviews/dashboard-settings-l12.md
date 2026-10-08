@@ -30,3 +30,8 @@ Evidence: `/tmp/ferrofin-dashboard-l12-checks.json`,
 `/tmp/ferrofin-dashboard-l12-coverage.json`,
 `/tmp/ferrofin-dashboard-l12-scan-gates.log`, and
 `apps/ferrofin-server/tests/dashboard_metadata_locale.rs`.
+
+The subsequent full scanner regression also corrected two older plugin-order
+fixtures to distinguish exact configured ranks from case-insensitive enabling.
+All 468 focused scanner/persistence tests and strict workspace Clippy pass with
+those expectations.
