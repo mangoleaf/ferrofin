@@ -34,6 +34,10 @@ struct Library {
 
 impl Library {
     async fn new(files: &[&str]) -> Self {
+        Self::of_type(files, CollectionTypeOptions::movies).await
+    }
+
+    async fn of_type(files: &[&str], collection_type: CollectionTypeOptions) -> Self {
         let tmp = tempfile::tempdir().expect("tmp");
         let media = tmp.path().join("movies");
         for file in files {
@@ -60,7 +64,7 @@ impl Library {
         );
         vf.add_virtual_folder(
             "Movies",
-            Some(CollectionTypeOptions::movies),
+            Some(collection_type),
             &LibraryOptions {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
@@ -497,4 +501,102 @@ async fn removing_the_last_library_prunes_its_media_on_the_next_scan() {
     assert!(lib.row(movie).await.is_none());
     assert!(lib.row(lib.location()).await.is_none());
     assert!(lib.media.join("Heat/Heat.mkv").is_file());
+}
+
+/// Disabling photos invalidates the previously resolved photo rows as well as
+/// stopping discovery. It never removes source files or video catalog entries.
+#[tokio::test]
+async fn a_photo_toggle_removes_existing_photos_and_rediscovers_them_when_enabled() {
+    let lib = Library::of_type(
+        &["Album/A.jpg", "B.jpg", "clip.mkv"],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    let photo = derive_item_id(
+        BaseItemKind::Photo,
+        &lib.media.join("Album/A.jpg").to_string_lossy(),
+    )
+    .unwrap();
+    let album = derive_item_id(
+        BaseItemKind::PhotoAlbum,
+        &lib.media.join("Album").to_string_lossy(),
+    )
+    .unwrap();
+    let movie = derive_item_id(
+        BaseItemKind::Movie,
+        &lib.media.join("clip.mkv").to_string_lossy(),
+    )
+    .unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert!(lib.row(photo).await.is_some());
+    assert!(lib.row(album).await.is_some());
+    let mut options = lib
+        .vf
+        .get_virtual_folders()
+        .await
+        .unwrap()
+        .remove(0)
+        .library_options
+        .unwrap();
+    options.enable_photos = false;
+    lib.vf
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    std::fs::write(lib.media.join("C.jpg"), b"").unwrap();
+    let extra = derive_item_id(
+        BaseItemKind::Photo,
+        &lib.media.join("C.jpg").to_string_lossy(),
+    )
+    .unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert!(lib.row(photo).await.is_none());
+    assert!(lib.row(album).await.is_none());
+    assert!(lib.row(extra).await.is_none());
+    assert!(lib.row(movie).await.is_some());
+    for path in ["Album/A.jpg", "B.jpg", "C.jpg", "clip.mkv"] {
+        assert!(lib.media.join(path).is_file());
+    }
+    options.enable_photos = true;
+    lib.vf
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert!(lib.row(photo).await.is_some());
+    assert!(lib.row(album).await.is_some());
+    assert!(lib.row(extra).await.is_some());
+    assert!(lib.row(movie).await.is_some());
+}
+
+#[tokio::test]
+async fn disabling_photos_does_not_prune_an_unreachable_location() {
+    let lib = Library::of_type(&["Album/A.jpg"], CollectionTypeOptions::homevideos).await;
+    lib.scanner.scan_all().await.unwrap();
+    let photo = derive_item_id(
+        BaseItemKind::Photo,
+        &lib.media.join("Album/A.jpg").to_string_lossy(),
+    )
+    .unwrap();
+    let mut options = lib
+        .vf
+        .get_virtual_folders()
+        .await
+        .unwrap()
+        .remove(0)
+        .library_options
+        .unwrap();
+    options.enable_photos = false;
+    lib.vf
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    let offline = lib.media.with_file_name("offline");
+    std::fs::rename(&lib.media, &offline).unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert!(lib.row(photo).await.is_some());
+    std::fs::rename(&offline, &lib.media).unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert!(lib.row(photo).await.is_none());
+    assert!(lib.media.join("Album/A.jpg").is_file());
 }

@@ -6416,7 +6416,8 @@ impl LibraryScanner {
     /// the row — one of the physical folders the collection folder names
     /// ([`ItemPersistenceService::library_top_parents`]); both are read. The
     /// library's own folders are never removed ([`LibraryFolders`]), nor is
-    /// a row whose own file or folder is still on disk, whatever its kind
+    /// a row whose own file or folder is still on disk, unless discovery
+    /// explicitly excludes it or the home-video photo option is disabled
     /// ([`Self::still_on_disk`]).
     ///
     /// A path-scoped scan plans only its roots' subtrees, so only the rows
@@ -6516,8 +6517,24 @@ impl LibraryScanner {
                 continue;
             };
             let own = LibraryFolders::of(&top_parents, &folder.locations);
+            // PhotoResolver/PhotoAlbumResolver stop resolving existing photos
+            // too when the home-video option is disabled. Their source files
+            // remaining on disk must not preserve catalog rows after a scan.
+            let photos_disabled = folder.collection_type == Some(CollectionTypeOptions::homevideos)
+                && folder
+                    .library_options
+                    .as_ref()
+                    .is_some_and(|options| !options.enable_photos);
+            let keep_row = |row: &ItemPathRow| {
+                !(photos_disabled
+                    && matches!(
+                        item_type_lookup::kind_from_type_name(&row.item_type),
+                        Some(BaseItemKind::Photo | BaseItemKind::PhotoAlbum)
+                    ))
+                    && keep_on_disk(row.path.as_deref())
+            };
             let Some((ids, paths)) = self
-                .stale_rows(cf, &existing, &live, &keep_on_disk, &listed, &own)
+                .stale_rows(cf, &existing, &live, &keep_row, &listed, &own)
                 .await
             else {
                 continue;
@@ -6584,7 +6601,7 @@ impl LibraryScanner {
         cf: Uuid,
         existing: &[ItemPathRow],
         live: &std::collections::HashSet<Uuid>,
-        keep_on_disk: &(dyn Fn(Option<&str>) -> bool + Sync),
+        keep_on_disk: &(dyn Fn(&ItemPathRow) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
     ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
@@ -6614,7 +6631,7 @@ impl LibraryScanner {
             .iter()
             .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = keep_on_disk(row.path.as_deref());
+                let keep = keep_on_disk(row);
                 if keep {
                     if planner_resolves(&row.item_type) {
                         kept_on_disk += 1;
