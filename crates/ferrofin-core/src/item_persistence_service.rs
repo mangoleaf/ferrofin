@@ -2996,6 +2996,66 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        index: usize,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::entities::ImageType;
+        if !matches!(
+            image.image_type,
+            ImageType::Backdrop | ImageType::Screenshot
+        ) {
+            return self.set_item_image(item_id, image).await;
+        }
+        let item = guid_to_db(item_id);
+        let kind = image_type_to_disc(image.image_type);
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2 ORDER BY rowid"#,
+        ).bind(&item).bind(kind).fetch_all(&mut *tx).await.map_err(db_err)?;
+        if let Some(id) = rows.get(index) {
+            // UPDATE preserves both identity and insertion order of this slot.
+            sqlx::query(
+                r#"UPDATE "BaseItemImageInfos" SET "Path" = ?2, "Width" = ?3,
+                "Height" = ?4, "Blurhash" = ?5, "DateModified" = ?6 WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(&item)
+            .bind(kind)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn delete_item_image(
         &self,
         item_id: Uuid,
@@ -4125,6 +4185,86 @@ mod tests {
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
     };
+
+    #[tokio::test]
+    async fn indexed_images_preserve_insertion_order_and_replacement_identity() {
+        use chrono::Utc;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        store
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(item),
+                type_: "MediaBrowser.Controller.Entities.Movie".into(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        // Reverse GUID order exposes a reader that confuses UUID sorting with slots.
+        for (id, path) in [(2_u128, "first.png"), (1, "second.png")] {
+            sqlx::query(r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height") VALUES (?1,?2,2,?3,0,0)"#)
+                .bind(guid_to_db(Uuid::from_u128(id))).bind(guid_to_db(item)).bind(path)
+                .execute(db.writer()).await.unwrap();
+        }
+        let repo = crate::test_support::item_repository_over(db.clone());
+        assert_eq!(
+            repo.get_image_infos(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["first.png", "second.png"]
+        );
+        let image = |path: &str| ItemImageInfo {
+            path: path.into(),
+            image_type: ImageType::Backdrop,
+            date_modified: Utc::now(),
+            width: 3,
+            height: 4,
+            blur_hash: Some("hash".into()),
+        };
+        store
+            .set_item_image_at_index(item, &image("new-first.png"), 0)
+            .await
+            .unwrap();
+        store
+            .set_item_image_at_index(item, &image("third.png"), 2)
+            .await
+            .unwrap();
+        let images = repo.get_image_infos(item).await.unwrap();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["new-first.png", "second.png", "third.png"]
+        );
+        assert_eq!((images[0].width, images[0].height), (3, 4));
+        let first_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId"=?1 AND "Path"='new-first.png'"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(first_id, guid_to_db(Uuid::from_u128(2)));
+        repo.swap_item_images(item, ImageType::Backdrop, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_image_infos(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["third.png", "second.png", "new-first.png"]
+        );
+    }
 
     #[tokio::test]
     async fn retention_delete_resolves_keys_across_chunks_and_existing_placeholders() {

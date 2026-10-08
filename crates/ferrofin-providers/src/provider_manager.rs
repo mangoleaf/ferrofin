@@ -1095,6 +1095,7 @@ pub trait RemoteSearchProvider: Send + Sync {
 #[derive(Default, Clone)]
 pub struct LocalProviderManager {
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
+    image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
     /// (name, supported kinds), surfaced in library options.
@@ -1190,6 +1191,7 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.remote_search_providers.len(),
             )
             .field("has_nfo_saver", &self.nfo_saver.is_some())
+            .field("has_image_saver", &self.image_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
             .field("has_tmdb", &self.tmdb.is_some())
@@ -1214,6 +1216,13 @@ impl std::fmt::Debug for LocalProviderManager {
 }
 
 impl LocalProviderManager {
+    /// Attaches the shared writer for configured media-adjacent artwork.
+    #[must_use]
+    pub fn with_image_saver(mut self, saver: Arc<crate::image_save::ImageFileSaver>) -> Self {
+        self.image_saver = Some(saver);
+        self
+    }
+
     /// Attaches the registered automatic NFO saver.
     #[must_use]
     pub fn with_nfo_saver(mut self, saver: Arc<crate::nfo_save::NfoSaver>) -> Self {
@@ -1242,6 +1251,7 @@ impl LocalProviderManager {
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
             nfo_saver: None,
+            image_saver: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
             dynamic_image_providers: Vec::new(),
@@ -2486,9 +2496,17 @@ impl LocalProviderManager {
                     .cloned(),
             );
         }
+        let published = if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
+            && let Some(row) = items.retrieve_item(item_id).await?
+        {
+            saver.save_all(&row, images, stored).await
+        } else {
+            Ok(())
+        };
         if let Some(store) = &self.image_store {
             store.save_item_images(item_id, images).await?;
         }
+        published?;
         if fetch == ImageFetch::All && acquired.contains(&ImageType::Backdrop) {
             for old in stored.iter().filter(|image| {
                 image.image_type == ImageType::Backdrop
@@ -3830,8 +3848,39 @@ impl ProviderManager for LocalProviderManager {
             .image_store
             .as_ref()
             .ok_or_else(|| Self::unwired("save_image"))?;
-        let image = self.write_image_file(item_id, content, mime_type, image_type, image_index)?;
-        store.set_item_image(item_id, &image).await?;
+        let current = if let Some(items) = &self.items {
+            items.get_image_infos(item_id).await?
+        } else {
+            Vec::new()
+        };
+        let multiple = matches!(image_type, ImageType::Backdrop | ImageType::Screenshot);
+        let index = if multiple {
+            image_index
+                .and_then(|index| usize::try_from(index).ok())
+                .unwrap_or_else(|| {
+                    current
+                        .iter()
+                        .filter(|old| old.image_type == image_type)
+                        .count()
+                })
+        } else {
+            0
+        };
+        let write_index = multiple.then(|| i32::try_from(index).unwrap_or(i32::MAX));
+        let mut image =
+            self.write_image_file(item_id, content, mime_type, image_type, write_index)?;
+        if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
+            && let Some(row) = items.retrieve_item(item_id).await?
+        {
+            image = saver.save(&row, image, index, &current).await?;
+        }
+        if multiple && self.items.is_some() {
+            store
+                .set_item_image_at_index(item_id, &image, index)
+                .await?;
+        } else {
+            store.set_item_image(item_id, &image).await?;
+        }
         self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
             .await
     }

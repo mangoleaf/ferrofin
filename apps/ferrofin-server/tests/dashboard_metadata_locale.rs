@@ -385,6 +385,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     }
     verify_movie_image_options(&api, library, &mut options, id).await;
     verify_nfo_savers(&api, library, &mut options, id, &media).await;
+    verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -799,6 +800,177 @@ async fn verify_nfo_savers(
     );
     std::fs::remove_dir(&nfo).unwrap();
     options["MetadataSavers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+}
+
+async fn upload_artwork(api: &Api, id: &str, kind: &str) {
+    let response = api
+        .client
+        .post(format!("{}/Items/{id}/Images/{kind}", api.base))
+        .header("Authorization", &api.auth)
+        .header("Content-Type", "image/png")
+        .body("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==")
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "artwork upload: {status}: {}",
+        response.text().await.unwrap()
+    );
+}
+
+// Keep the live option transitions and their disk assertions in one scenario.
+#[allow(clippy::too_many_lines)]
+async fn verify_artwork_destinations(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    options["SaveLocalMetadata"] = json!(false);
+    options["TypeOptions"][0]["ImageFetchers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    upload_artwork(api, id, "Primary").await;
+    assert!(!media.join("folder.png").exists());
+    options["SaveLocalMetadata"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    upload_artwork(api, id, "Primary").await;
+    assert_eq!(std::fs::read(media.join("folder.png")).unwrap(), POSTER);
+    // ImageSaver retains existing local art even during replacement refresh.
+    // Remove it to exercise a genuinely new automatic acquisition.
+    std::fs::remove_file(media.join("folder.png")).unwrap();
+    options["TypeOptions"][0]["ImageFetchers"] = json!(["TheMovieDb"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=true"),&Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::fs::read(media.join("folder.png")).is_ok_and(|bytes| bytes.ends_with(b"/large.png"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "automatic artwork not saved beside media"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    options["TypeOptions"][0]["ImageFetchers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let mut config = api.get("/System/Configuration").await;
+    config["ImageSavingConvention"] = json!("Compatible");
+    api.post("/System/Configuration", &config).await;
+    upload_artwork(api, id, "Primary").await;
+    assert_eq!(std::fs::read(media.join("poster.png")).unwrap(), POSTER);
+    assert!(!media.join("folder.png").exists());
+    api.post(
+        "/System/Configuration/xbmcmetadata",
+        &json!({"EnableExtraThumbsDuplication":true}),
+    )
+    .await;
+    upload_artwork(api, id, "Backdrop/0").await;
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert_eq!(std::fs::read(media.join("fanart.png")).unwrap(), POSTER);
+    assert_eq!(
+        std::fs::read(media.join("extrafanart/fanart1.png")).unwrap(),
+        POSTER
+    );
+    assert_eq!(
+        std::fs::read(media.join("extrathumbs/thumb1.png")).unwrap(),
+        POSTER
+    );
+    assert_eq!(
+        api.get(&format!("/Items/{id}/Images"))
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .count(),
+        2
+    );
+    let image_paths = api.get(&format!("/Items/{id}/Images")).await;
+    let backdrops: Vec<_> = image_paths
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|image| image["ImageType"] == "Backdrop")
+        .collect();
+    assert_eq!(
+        backdrops[0]["Path"],
+        media.join("fanart.png").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        backdrops[1]["Path"],
+        media
+            .join("extrafanart/fanart1.png")
+            .to_string_lossy()
+            .as_ref()
+    );
+    upload_artwork(api, id, "Backdrop/0").await;
+    let image_paths = api.get(&format!("/Items/{id}/Images")).await;
+    let backdrops: Vec<_> = image_paths
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|image| image["ImageType"] == "Backdrop")
+        .collect();
+    assert_eq!(
+        backdrops[0]["Path"],
+        media.join("fanart.png").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        backdrops[1]["Path"],
+        media
+            .join("extrafanart/fanart1.png")
+            .to_string_lossy()
+            .as_ref()
+    );
+    std::fs::remove_file(media.join("poster.png")).unwrap();
+    std::fs::create_dir(media.join("poster.png")).unwrap();
+    upload_artwork(api, id, "Primary").await;
+    let served = api
+        .client
+        .get(format!(
+            "{}/Items/{id}/Images/Primary?format=Original",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(served.as_ref(), POSTER);
+    std::fs::remove_dir(media.join("poster.png")).unwrap();
+    config["ImageSavingConvention"] = json!("Legacy");
+    api.post("/System/Configuration", &config).await;
+    options["SaveLocalMetadata"] = json!(false);
     api.post(
         "/Library/VirtualFolders/LibraryOptions",
         &json!({"Id":library,"LibraryOptions":options}),

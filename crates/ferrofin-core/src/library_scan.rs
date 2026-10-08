@@ -2773,6 +2773,7 @@ const LIBRARY_COLLAGE_SOURCES: i32 = 8;
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
     metadata_savers: Option<Arc<dyn ferrofin_traits::providers::ProviderManager>>,
+    image_saver: Option<Arc<ferrofin_providers::image_save::ImageFileSaver>>,
     /// Live library counts, shared with dashboard readers.
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
@@ -2960,6 +2961,46 @@ impl std::fmt::Debug for LibraryScanner {
 }
 
 impl LibraryScanner {
+    /// Attaches the shared writer for media-adjacent artwork destinations.
+    #[must_use]
+    pub fn with_image_saver(
+        mut self,
+        saver: Arc<ferrofin_providers::image_save::ImageFileSaver>,
+    ) -> Self {
+        self.image_saver = Some(saver);
+        self
+    }
+
+    async fn publish_media_artwork(
+        &self,
+        row: &BaseItemEntity,
+        images: &mut [ItemImageInfo],
+        previous: &[ItemImageInfo],
+    ) -> u32 {
+        if let Some(saver) = &self.image_saver
+            && let Err(error) = saver.save_all(row, images, previous).await
+        {
+            tracing::warn!(%error, item_id=%row.id, "could not apply artwork destination");
+            return 1;
+        }
+        0
+    }
+
+    /// Publish the selected destinations before measuring their image metadata.
+    async fn finish_artwork(
+        &self,
+        row: &BaseItemEntity,
+        images: &mut [ItemImageInfo],
+        previous: Option<&[ItemImageInfo]>,
+    ) -> bool {
+        let failed = self
+            .publish_media_artwork(row, images, previous.unwrap_or_default())
+            .await
+            > 0;
+        self.fill_image_metadata(images).await;
+        failed
+    }
+
     /// Runs registered metadata savers after the complete item has been persisted.
     #[must_use]
     pub fn with_metadata_savers(
@@ -2993,6 +3034,7 @@ impl LibraryScanner {
         Self {
             virtual_folders,
             metadata_savers: None,
+            image_saver: None,
             collections: std::sync::OnceLock::new(),
             file_system,
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
@@ -8889,14 +8931,35 @@ impl LibraryScanner {
         };
         self.fill_image_metadata(std::slice::from_mut(&mut cover))
             .await;
-        existing.retain(|i| i.image_type != ImageType::Primary);
-        existing.push(cover.clone());
-        if let Err(err) = self
-            .persistence
-            .save_item_images(album_uuid, &existing)
-            .await
+        let mut album_cover = cover.clone();
+        if let Some(saver) = &self.image_saver
+            && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
         {
-            tracing::warn!(%err, album = %album_uuid, "failed to inherit album cover");
+            match saver.save(&row, album_cover.clone(), 0, &existing).await {
+                Ok(saved) => album_cover = saved,
+                Err(error) => {
+                    tracing::warn!(%error, item_id=%album_uuid, "could not publish album artwork");
+                }
+            }
+        }
+        let album_changed =
+            existing.iter().find(|i| i.image_type == ImageType::Primary) != Some(&album_cover);
+        existing.retain(|i| i.image_type != ImageType::Primary);
+        existing.push(album_cover);
+        if album_changed {
+            if let Err(err) = self
+                .persistence
+                .save_item_images(album_uuid, &existing)
+                .await
+            {
+                tracing::warn!(%err, album = %album_uuid, "failed to inherit album cover");
+            } else {
+                self.save_metadata_sidecars(
+                    album_uuid,
+                    ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+                )
+                .await;
+            }
         }
         let shared_root = self
             .metadata_dir
@@ -9001,7 +9064,7 @@ impl LibraryScanner {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
             adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-            self.fill_image_metadata(&mut images).await;
+            cut_short |= self.finish_artwork(entity, &mut images, stored).await;
             return (Some(images), cut_short);
         }
         // "Local Images" is the media-adjacent discovery (poster.jpg next to the
@@ -9057,7 +9120,7 @@ impl LibraryScanner {
             art_cache.albums_needing_backfill.insert(*album);
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
-        self.fill_image_metadata(&mut images).await;
+        cut_short |= self.finish_artwork(entity, &mut images, stored).await;
         for image in &images {
             art_cache.stored_images.insert(
                 image.path.clone(),
@@ -24939,9 +25002,12 @@ mod tests {
 
     // A track's embedded cover becomes its Primary image, stored in the
     // metadata dir (never next to the user's media), and the album inherits it.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn embedded_cover_art_lands_on_the_track_and_its_album() {
+    async fn embedded_cover_art_lands_on_the_track_and_its_album(#[case] save_local: bool) {
         use crate::item_persistence_service::FerrofinItemPersistenceService;
         use crate::item_repository::FerrofinItemRepository;
         use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
@@ -24971,6 +25037,8 @@ mod tests {
                         .unwrap()
                         .to_owned(),
                     name: Some("Kind of Blue".into()),
+                    path: Some(tmp.path().to_string_lossy().into_owned()),
+                    is_folder: true,
                     ..Default::default()
                 },
                 BaseItemEntity {
@@ -24994,7 +25062,38 @@ mod tests {
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
                 .with_item_store(persistence.clone()),
         );
+        vf.add_virtual_folder(
+            "Music",
+            Some(CollectionTypeOptions::music),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tmp.path().to_string_lossy().into_owned(),
+                }],
+                save_local_metadata: save_local,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            tmp.path(),
+            tmp.path().join("log"),
+            tmp.path().join("server-config"),
+            tmp.path().join("cache"),
+            tmp.path().join("web"),
+        ));
+        let configuration = Arc::new(
+            crate::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .unwrap(),
+        );
         let meta = tmp.path().join("metadata");
+        let saver = Arc::new(ferrofin_providers::image_save::ImageFileSaver::new(
+            items.clone(),
+            vf.clone(),
+            configuration,
+            meta.clone().into(),
+        ));
         let scanner =
             LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
                 .with_probe(
@@ -25005,7 +25104,8 @@ mod tests {
                     )),
                 )
                 .with_items(Arc::clone(&items))
-                .with_metadata_dir(meta.clone());
+                .with_metadata_dir(meta.clone())
+                .with_image_saver(saver);
 
         // The probe's stream rows: an audio stream plus the attached picture.
         let streams = vec![
@@ -25056,7 +25156,22 @@ mod tests {
                 .unwrap()
                 .to_str()
                 .unwrap(),
-            "2864716a6e437019a72d7dada2f071b83b2113cf85005475a5d228b6a73cf54a.jpg"
+            if save_local {
+                "folder.jpg"
+            } else {
+                "2864716a6e437019a72d7dada2f071b83b2113cf85005475a5d228b6a73cf54a.jpg"
+            }
+        );
+
+        assert!(
+            stored.is_file(),
+            "the track retains its internal embedded cover"
+        );
+        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        assert_eq!(
+            items.get_image_infos(album_id).await.unwrap(),
+            album_images,
+            "an unchanged inherited cover keeps its destination and mtime"
         );
 
         // A track with no image stream extracts nothing.

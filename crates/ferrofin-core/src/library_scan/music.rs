@@ -933,7 +933,7 @@ impl LibraryScanner {
         settle_sort_name(&mut row);
 
         // The remote image providers, keyed by the ids just settled.
-        let (images, image_failures) = if fetch.any_images() {
+        let (mut images, mut image_failures) = if fetch.any_images() {
             let artist_key = answer
                 .artist_id
                 .clone()
@@ -955,6 +955,11 @@ impl LibraryScanner {
         } else {
             (None, 0)
         };
+
+        if let Some(images) = &mut images {
+            let previous = items.get_image_infos(work.id).await?;
+            image_failures += self.publish_media_artwork(&row, images, &previous).await;
+        }
 
         // `RefreshMetadata`'s tail: the stamp and `SaveInternal`.
         let row_changed = row != stored;

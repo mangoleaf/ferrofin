@@ -16,6 +16,7 @@ pub mod external_ids;
 pub mod fanart;
 mod image_download;
 pub mod image_policy;
+pub mod image_save;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;

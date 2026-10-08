@@ -2323,12 +2323,11 @@ impl ItemRepository for FerrofinItemRepository {
     }
 
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
-        // Order by image type then id so a multi-image type (e.g. Backdrop) is
-        // returned in a stable order the index-based routes can address, matching
-        // the C# `BaseItem.ImageInfos` insertion order.
+        // Within each type use insertion order, as BaseItem.ImageInfos does.
+        // Random GUID order changes a newly appended backdrop's public index.
         let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
             r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
-                ORDER BY "ImageType", "Id""#,
+                ORDER BY "ImageType", rowid"#,
         )
         .bind(guid_to_db(item_id))
         .fetch_all(self.db.pool())
@@ -2358,7 +2357,7 @@ impl ItemRepository for FerrofinItemRepository {
         let disc = image_type_to_disc(image_type);
         let rows = sqlx::query_as::<_, BaseItemImageInfoEntity>(
             r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2
-                ORDER BY "Id""#,
+                ORDER BY rowid"#,
         )
         .bind(guid_to_db(item_id))
         .bind(disc)

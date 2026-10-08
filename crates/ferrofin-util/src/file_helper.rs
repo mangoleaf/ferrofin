@@ -18,8 +18,28 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     atomic_replace_with(path, |file| file.write_all(contents))
 }
 
+/// Replaces media-adjacent artwork atomically with ordinary file permissions.
+///
+/// New files honor the process umask. Existing files retain their permissions,
+/// clearing the read-only owner flag as ImageSaver does before replacement.
+///
+/// # Errors
+/// Returns a filesystem error without truncating the destination.
+pub fn atomic_write_media(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    atomic_replace_with_permissions(path, false, |file| file.write_all(contents))
+}
+
 fn atomic_replace_with(
     path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    atomic_replace_with_permissions(path, true, write)
+}
+
+fn atomic_replace_with_permissions(
+    path: &Path,
+    private: bool,
     write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
 ) -> io::Result<()> {
     let parent = path
@@ -33,10 +53,30 @@ fn atomic_replace_with(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        if private {
+            options.mode(0o600);
+        }
     }
     let mut file = options.open(&temporary)?;
     let result = (|| {
+        if !private
+            && let Ok(metadata) = std::fs::metadata(path)
+            && metadata.is_file()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(
+                    metadata.permissions().mode() | 0o200,
+                ))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(false);
+                file.set_permissions(permissions)?;
+            }
+        }
         write(&mut file)?;
         file.sync_all()?;
         drop(file);
@@ -90,6 +130,30 @@ pub fn ensure_writable_dir<P: AsRef<Path>>(dir: P) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+
+    #[cfg(unix)]
+    #[test]
+    fn media_writes_honor_umask_and_preserve_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir().join(format!("ferrofin-media-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = dir.join("ordinary");
+        std::fs::write(&expected, b"ordinary").unwrap();
+        let path = dir.join("artwork");
+        atomic_write_media(&path, b"new artwork").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            std::fs::metadata(&expected).unwrap().permissions().mode()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        atomic_write_media(&path, b"replacement").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn atomic_write_preserves_previous_file_when_a_write_fails() {

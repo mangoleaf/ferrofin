@@ -899,8 +899,15 @@ pub async fn build_app_state(
     // resolves `LibraryOptions.PreferredMetadataLanguage` through it, and the
     // remote-search path resolves the library's metadata downloaders. Nothing
     // consumes `providers` before this point.
+    let image_saver = Arc::new(ferrofin_providers::image_save::ImageFileSaver::new(
+        Arc::clone(&item_repository),
+        Arc::clone(&virtual_folders),
+        Arc::clone(&config_trait),
+        metadata_library.clone(),
+    ));
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
+            .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::new(
                 ferrofin_providers::nfo_save::NfoSaver::new(
                     Arc::clone(&item_repository),
@@ -1082,6 +1089,7 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
     )
     .with_metadata_savers(Arc::clone(&providers))
+    .with_image_saver(image_saver)
     .with_id_derivation(id_derivation)
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).

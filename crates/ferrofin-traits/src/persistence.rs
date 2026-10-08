@@ -1165,6 +1165,21 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Replaces a multiple-image slot or appends beyond the current last slot.
+    /// Single-image types retain the ordinary replacement operation.
+    ///
+    /// # Errors
+    /// Returns a storage failure. Hosts supporting indexed artwork override this
+    /// compatibility adapter; single-image stores use `set_item_image`.
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        _index: usize,
+    ) -> Result<(), ServiceError> {
+        self.set_item_image(item_id, image).await
+    }
+
     /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
     /// the removed rows so the caller can delete the files
     /// (`ImageController.DeleteItemImage`). `index` is reserved for per-index
