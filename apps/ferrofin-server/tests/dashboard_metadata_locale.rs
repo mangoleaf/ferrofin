@@ -481,6 +481,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             .unwrap();
         assert_eq!(image.as_ref(), POSTER);
     }
+    verify_local_reader_order(&api, tmp.path()).await;
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
@@ -586,4 +587,92 @@ async fn verify_movie_image_options(api: &Api, library: &Value, options: &mut Va
         6,
         "manual chooser is not capped"
     );
+}
+
+/// Competing local sources change the scanned title when their saved order changes.
+async fn verify_local_reader_order(api: &Api, root: &std::path::Path) {
+    let books = root.join("books");
+    std::fs::create_dir_all(&books).unwrap();
+    std::fs::write(
+        books.join("Ordered.cbz"),
+        b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    )
+    .unwrap();
+    std::fs::write(
+        books.join("Ordered.xml"),
+        "<ComicInfo><Title>Comic</Title></ComicInfo>",
+    )
+    .unwrap();
+    std::fs::write(books.join("Ordered.opf"), r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Sidecar</dc:title></metadata></package>"#).unwrap();
+    let available = api
+        .get("/Libraries/AvailableOptions?libraryContentType=books&isNewLibrary=true")
+        .await;
+    let names: Vec<_> = available["MetadataReaders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reader| reader["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["Comic Provider", "EPUB Metadata", "Open Packaging Format"]
+    );
+    let mut options = json!({"PathInfos":[{"Path":books}],"EnableRealtimeMonitor":false,
+        "LocalMetadataReaderOrder":["Open Packaging Format","Comic Provider"],
+        "TypeOptions":[{"Type":"Book","MetadataFetchers":[],"ImageFetchers":[]}]});
+    api.post(
+        "/Library/VirtualFolders?name=Books&collectionType=books&refreshLibrary=false",
+        &json!({"LibraryOptions":options}),
+    )
+    .await;
+    api.post("/Library/Refresh", &Value::Null).await;
+    let book = await_book(api, "Sidecar").await;
+    let id = book["Id"].as_str().unwrap();
+    let folders = api.get("/Library/VirtualFolders").await;
+    let library = &folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Books")
+        .unwrap()["ItemId"];
+    let mut server = api.get("/System/Configuration").await;
+    server["MetadataOptions"] =
+        serde_json::to_value([ferrofin_model::configuration::MetadataOptions {
+            item_type: Some("Book".to_owned()),
+            local_metadata_reader_order: vec!["Open Packaging Format".to_owned()],
+            ..Default::default()
+        }])
+        .unwrap();
+    api.post("/System/Configuration", &server).await;
+    for (order, expected) in [
+        (json!(["Comic Provider", "Open Packaging Format"]), "Comic"),
+        (Value::Null, "Sidecar"),
+        (json!([]), "Comic"),
+    ] {
+        options["LocalMetadataReaderOrder"] = order;
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"), &Value::Null).await;
+        assert_eq!(await_book(api, expected).await["Id"], id);
+    }
+}
+
+async fn await_book(api: &Api, name: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let result = api.get("/Items?recursive=true&includeItemTypes=Book").await;
+        if let Some(book) = result["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|book| book["Name"] == name)
+        {
+            return book.clone();
+        }
+        assert!(Instant::now() < deadline, "expected {name}: {result}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

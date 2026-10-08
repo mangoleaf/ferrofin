@@ -11431,7 +11431,14 @@ impl LibraryScanner {
         };
         let read = {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || ferrofin_providers::read_book_metadata(&path)).await
+            let readers = ferrofin_providers::books::book_metadata_readers(
+                policy.options,
+                policy.global_for("Book"),
+            );
+            tokio::task::spawn_blocking(move || {
+                ferrofin_providers::books::read_book_metadata_with_readers(&path, &readers)
+            })
+            .await
         };
         let (people, found) = match read.ok().flatten() {
             Some(book) => {

@@ -129,6 +129,23 @@ pub fn image_fetcher_rank(
 /// plugin's metadata source rank by it.
 pub const DEFAULT_ORDER: i32 = 50;
 
+/// The configured local-reader position: a saved library order (even empty)
+/// takes precedence over the server's per-item-type order. Names match exactly,
+/// as `ProviderManager.GetConfiguredOrder` uses `Array.IndexOf`.
+#[must_use]
+pub fn local_metadata_reader_rank(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+    name: &str,
+) -> usize {
+    let order = options
+        .and_then(|library| library.local_metadata_reader_order.as_deref())
+        .unwrap_or_else(|| {
+            global.map_or(&[], |global| global.local_metadata_reader_order.as_slice())
+        });
+    configured_order(order, name)
+}
+
 /// `GetDefaultOrder` of built-in metadata fetcher `name` for item type `kind`
 /// (`ProviderManager.cs:630-640`): its `IHasOrder.Order`, else
 /// [`DEFAULT_ORDER`]. Upstream master `96bca6f0bd`: `TmdbMovieProvider`,
@@ -300,6 +317,13 @@ pub mod fetcher_names {
     /// calling itself that would start ticked in a new library.
     pub const SCREEN_GRABBER: &str = "Screen Grabber";
 
+    /// Comic archive comments and ComicInfo XML local reader.
+    pub const COMIC: &str = "Comic Provider";
+    /// Embedded EPUB OPF metadata reader.
+    pub const EPUB: &str = "EPUB Metadata";
+    /// Sidecar OPF metadata reader.
+    pub const OPF: &str = "Open Packaging Format";
+
     /// Every built-in fetcher name — the reserved set a dynamically
     /// registered (WASM) provider name must not collide with: a plugin
     /// declaring `"TheMovieDb"` would ride TMDB's checkbox/order and
@@ -317,6 +341,9 @@ pub mod fetcher_names {
         EMBEDDED_IMAGES,
         AUDIO_IMAGES,
         SCREEN_GRABBER,
+        COMIC,
+        EPUB,
+        OPF,
     ];
 }
 
@@ -503,7 +530,7 @@ fn providers() -> Vec<Provider> {
 
 /// The providers that read from the library's own files.
 fn local_providers() -> Vec<Provider> {
-    vec![Provider {
+    let mut providers = vec![Provider {
         name: "Nfo",
         caps: &[Cap::LocalMetadata, Cap::MetadataSaver, Cap::LocalImage],
         types: &[
@@ -513,11 +540,29 @@ fn local_providers() -> Vec<Provider> {
             "Episode",
             "MusicVideo",
             "BoxSet",
+            "MusicAlbum",
+            "MusicArtist",
         ],
         default_enabled: true,
         compiled: true,
         images: NO_IMAGES,
-    }]
+    }];
+    providers.extend(
+        [
+            fetcher_names::COMIC,
+            fetcher_names::EPUB,
+            fetcher_names::OPF,
+        ]
+        .map(|name| Provider {
+            name,
+            caps: &[Cap::LocalMetadata],
+            types: &["Book"],
+            default_enabled: true,
+            compiled: true,
+            images: NO_IMAGES,
+        }),
+    );
+    providers
 }
 
 /// The providers that fetch from an external service.
@@ -898,6 +943,9 @@ pub fn library_options_info(
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
+            .filter(|p| {
+                cap != Cap::LocalMetadata || item_types.iter().any(|kind| p.applies_to(kind))
+            })
             // The saver/reader lists are not per-type, so the saver rule sees
             // the whole request (C# `IsSaverEnabledByDefault(name, itemTypes,
             // isNewLibrary)`: no saver in a new library, else the server's
@@ -1319,6 +1367,31 @@ mod tests {
             assert!(ticked(&existing, kind, false), "{kind} metadata, existing");
             assert!(ticked(&existing, kind, true), "{kind} images, existing");
         }
+    }
+
+    #[test]
+    fn books_advertise_the_three_configurable_local_readers() {
+        let options = library_options_info(&["Book".to_owned()], true, &[], &[]);
+        let names: Vec<_> = options
+            .metadata_readers
+            .iter()
+            .map(|reader| reader.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Comic Provider", "EPUB Metadata", "Open Packaging Format"]
+        );
+        let movies = library_options_info(&["Movie".to_owned()], true, &[], &[]);
+        assert_eq!(movies.metadata_readers.len(), 1);
+        assert_eq!(movies.metadata_readers[0].name.as_deref(), Some("Nfo"));
+        let music = library_options_info(
+            &["MusicAlbum".to_owned(), "MusicArtist".to_owned()],
+            true,
+            &[],
+            &[],
+        );
+        assert_eq!(music.metadata_readers.len(), 1);
+        assert_eq!(music.metadata_readers[0].name.as_deref(), Some("Nfo"));
     }
 
     #[test]
