@@ -86,6 +86,11 @@ pub struct FerrofinLibraryManager {
     /// repository (not the `ChapterManager`) is held because the manager is
     /// built on top of this manager — taking it here would be a cycle.
     chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
+    /// Playlist and collection membership, which a merge re-points from each
+    /// merged item to the primary (`RerouteLinkedChildReferencesAsync`). Set
+    /// by the composition root; `None` (unit tests) leaves membership as it
+    /// is.
+    linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
     /// The `UserRootFolder` provisioner (`GetUserRootFolder()`), set by the
     /// composition root. `None` (unit tests) falls back to resolving an
     /// already-persisted root row.
@@ -974,6 +979,7 @@ impl FerrofinLibraryManager {
             scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
             scan_tracker: None,
             chapters: None,
+            linked_children: None,
             user_root: None,
             years: None,
             by_name: None,
@@ -1174,6 +1180,17 @@ impl FerrofinLibraryManager {
             *slot = self.items.retrieve_item(id).await?;
         }
         Ok(())
+    }
+
+    /// Attaches the linked-children seam a merge re-points playlist and
+    /// collection entries through.
+    #[must_use]
+    pub fn with_linked_children(
+        mut self,
+        linked_children: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>,
+    ) -> Self {
+        self.linked_children = Some(linked_children);
+        self
     }
 
     /// Attaches the chapter seam so chapter thumbnails can be served (their
@@ -1644,16 +1661,34 @@ impl LibraryManager for FerrofinLibraryManager {
             ));
         }
 
-        // Pick the primary. C# prefers an item that already owns multiple sources
-        // and is itself not an alternate; Ferrofin does not model `MediaSourceCount`,
-        // so it falls back to C#'s secondary ordering: a plain video file outranks
-        // a special type, then the widest default video stream wins. The item's own
-        // `Width` column stands in for the default video stream width.
+        // Pick the primary (`VideosController.MergeVersions`): the first item,
+        // in id order, that already has several sources and is itself no
+        // version (`MediaSourceCount > 1 && !PrimaryVersionId.HasValue`) —
+        // a video with versions, local or merged, which here is a row that
+        // points at it — else the widest default video stream, the first of
+        // equals (`ThenByDescending(...).First()`). The item's own `Width`
+        // column stands in for the default video stream width; the
+        // `Video3DFormat`/`VideoType` demotion before it is not modeled.
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let with_versions = self.items.get_items_by_primary_version_batch(&ids).await?;
+        let has_versions = |item: &BaseItemEntity| {
+            Uuid::parse_str(&item.id).is_ok_and(|id| with_versions.contains_key(&id))
+        };
         let primary_index = items
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.width.unwrap_or(0).cmp(&b.width.unwrap_or(0)))
-            .map_or(0, |(i, _)| i);
+            .position(|item| item.primary_version_id.is_none() && has_versions(item))
+            .unwrap_or_else(|| {
+                let mut best = 0;
+                for (index, item) in items.iter().enumerate().skip(1) {
+                    if item.width.unwrap_or(0) > items[best].width.unwrap_or(0) {
+                        best = index;
+                    }
+                }
+                best
+            });
         let primary_id = items[primary_index].id.clone();
 
         // Link every non-primary item to the primary by pointer, and ensure the
@@ -1662,6 +1697,7 @@ impl LibraryManager for FerrofinLibraryManager {
         // and a full-row save would write their other columns back stale.
         let primary_uuid = Uuid::parse_str(&primary_id)
             .map_err(|_| ServiceError::invalid_input("malformed item id"))?;
+        let merging: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
         for item in &items {
             let Ok(id) = Uuid::parse_str(&item.id) else {
                 continue;
@@ -1670,10 +1706,29 @@ impl LibraryManager for FerrofinLibraryManager {
                 if item.primary_version_id.is_some() {
                     self.persistence.set_primary_version_id(id, None).await?;
                 }
-            } else if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
+                continue;
+            }
+            if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
                 self.persistence
                     .set_primary_version_id(id, Some(primary_uuid))
                     .await?;
+            }
+            // Its playlist and collection entries now name the primary
+            // (`RerouteLinkedChildReferencesAsync`, `LinkedChildrenService.
+            // RerouteLinkedChildren`: a parent already listing the primary
+            // drops the entry instead).
+            if let Some(linked) = &self.linked_children {
+                linked.reroute_linked_children(id, primary_uuid).await?;
+            }
+            // Its own merged versions move to the primary
+            // (`alternateVersionsOfPrimary.Add(linkedItem)`, `:238-250`), so
+            // no version is left behind a version.
+            for version in self.items.get_merged_version_ids(id).await? {
+                if version != primary_uuid && !merging.contains(&version) {
+                    self.persistence
+                        .set_primary_version_id(version, Some(primary_uuid))
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -1684,22 +1739,27 @@ impl LibraryManager for FerrofinLibraryManager {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
 
-        // Resolve the group's primary: either this item (no pointer) or the item it
-        // points at (C# hops to `PrimaryVersionId` when the item has no alternates).
-        let primary_id = match item.primary_version_id.as_deref() {
-            Some(pid) => Uuid::parse_str(pid)
-                .map_err(|_| ServiceError::invalid_input("malformed PrimaryVersionId"))?,
-            None => item_id,
-        };
+        // `VideosController.DeleteAlternateSources`: an item with no merged
+        // versions of its own that is itself a version stands for its
+        // primary's group.
+        let mut primary_id = item_id;
+        let mut merged = self.items.get_merged_version_ids(item_id).await?;
+        if merged.is_empty()
+            && let Some(pid) = item.primary_version_id.as_deref()
+        {
+            primary_id = Uuid::parse_str(pid)
+                .map_err(|_| ServiceError::invalid_input("malformed PrimaryVersionId"))?;
+            merged = self.items.get_merged_version_ids(primary_id).await?;
+        }
 
-        // Clear the pointer on every alternate that references the primary, then on
-        // the primary itself, so each becomes a standalone version again. Targeted
-        // single-column writes — a full-row save of the loaded copies would revert
-        // any column another writer changed since the load.
-        for alt in self.items.get_items_by_primary_version(primary_id).await? {
-            let Ok(id) = Uuid::parse_str(&alt.id) else {
-                continue;
-            };
+        // Clear the pointer of every merged version
+        // (`GetLinkedAlternateVersions`), then the primary's own, so each
+        // becomes a standalone version again. Only merged versions split:
+        // the files the scan grouped with the primary (its local versions)
+        // stay in the group. Targeted single-column writes — a full-row save
+        // of the loaded copies would revert any column another writer
+        // changed since the load.
+        for id in merged {
             self.persistence.set_primary_version_id(id, None).await?;
         }
         if let Some(primary) = self.items.retrieve_item(primary_id).await?

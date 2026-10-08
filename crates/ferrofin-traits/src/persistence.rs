@@ -356,6 +356,37 @@ pub trait ItemRepository: Send + Sync {
         Ok(map)
     }
 
+    /// The merged versions of `primary_id` — what
+    /// `LibraryManager.GetLinkedAlternateVersions` lists and
+    /// `DELETE /Videos/{id}/AlternateSources` splits: the children of its
+    /// `LinkedAlternateVersion` (3) rows, and the rows that point at it
+    /// (`PrimaryVersionId`) without being a local version of it — not owned
+    /// by it (`OwnerId`, no `ExtraType`) and no `LocalAlternateVersion` (2)
+    /// row under it (a merge Ferrofin modelled by the pointer alone). Never
+    /// a local version: those are the scan's.
+    ///
+    /// The default reads the pointers alone (for stub/fake repositories).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        let primary = primary_id.hyphenated().to_string();
+        Ok(self
+            .get_items_by_primary_version(primary_id)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.extra_type.is_some()
+                    || !row
+                        .owner_id
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(&primary))
+            })
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect())
+    }
+
     /// Returns every `(item_id, value)` pair stored under `provider_key` in
     /// `BaseItemProviders`.
     ///
@@ -624,6 +655,43 @@ pub trait ItemPersistenceService: Send + Sync {
         item_id: Uuid,
         primary_version_id: Option<Uuid>,
     ) -> Result<(), ServiceError>;
+
+    /// Writes each primary video's local alternate versions — the files the
+    /// resolver grouped with it (`Video.LocalAlternateVersions`), as stored
+    /// ids in the resolver's order — the way upstream's save of a video does
+    /// (`ItemPersistenceService.SaveItems`, `ItemPersistenceService.cs:651-780`).
+    /// Per [`LocalVersionGroup`]:
+    ///
+    /// - each listed version gets a `LinkedChildren` row under the primary
+    ///   (`ChildType` 2, `LocalAlternateVersion`), first and in order; the
+    ///   pair's linked (3) row gives way to it (local outranks linked within
+    ///   the primary's own list, `:688-692`). A video is never its own
+    ///   version, and a version not stored is skipped (`:705-714`);
+    /// - each listed version whose `PrimaryVersionId` is not the primary is
+    ///   pointed at it (`PrimaryVersionId`, and `PresentationUniqueKey` = the
+    ///   primary's "N" id) — except the one the primary itself points at
+    ///   (`:731`);
+    /// - a version row of the primary the scanner made and no longer lists
+    ///   goes: its child is owned by the primary (`OwnerId`, no `ExtraType`)
+    ///   while the group is known, or is in `released`. Upstream also
+    ///   deletes such an owned child (`:758-781`); here the row stays for the
+    ///   scan's prune to judge (owner decision D9b). A released child still
+    ///   pointing at the primary and no longer owned by it points at nothing
+    ///   again. Every other version row (a merge's) is left alone, and rows
+    ///   under other parents are never touched.
+    ///
+    /// Reads the groups in batches, and writes — targeted columns and the
+    /// primaries' version rows only — just for the groups that differ. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
+        let _ = groups;
+        Ok(())
+    }
 
     /// Points an item's `ParentId` at `parent_id` without touching any other
     /// column, and without a write at all when it already does.
@@ -1646,6 +1714,22 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// One primary video's local alternate versions, as a scan resolved them
+/// ([`ItemPersistenceService::sync_local_versions`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalVersionGroup {
+    /// The primary video.
+    pub primary: Uuid,
+    /// Its local versions, in the resolver's order — `None` when the scan
+    /// does not know the group (it was cancelled before the primary, or did
+    /// not plan it): then only `released` is acted on, and every other row
+    /// stays as it is.
+    pub versions: Option<Vec<Uuid>>,
+    /// The versions the scan took out of the group: owned by the primary
+    /// before the scan's save, and no longer.
+    pub released: Vec<Uuid>,
 }
 
 /// One stored item to move to a new identity

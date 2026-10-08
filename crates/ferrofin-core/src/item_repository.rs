@@ -2227,6 +2227,31 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(rows)
     }
 
+    async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        // `IX_LinkedChildren_ParentId_ChildType` for the rows, a
+        // `PrimaryVersionId` scan for the pointers (as
+        // `get_items_by_primary_version`).
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildType" = 3
+               UNION
+               SELECT b."Id" FROM "BaseItems" b
+               WHERE b."PrimaryVersionId" = ?1 AND b."Id" <> ?2
+                 AND NOT (b."OwnerId" IS NOT NULL AND b."OwnerId" = ?1 AND b."ExtraType" IS NULL)
+                 AND NOT EXISTS (SELECT 1 FROM "LinkedChildren" l
+                                 WHERE l."ParentId" = ?1 AND l."ChildId" = b."Id"
+                                   AND l."ChildType" = 2)"#,
+        )
+        .bind(guid_to_db(primary_id))
+        .bind(PLACEHOLDER_ID)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
     async fn get_items_by_primary_version_batch(
         &self,
         primary_ids: &[Uuid],

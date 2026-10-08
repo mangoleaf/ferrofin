@@ -86,6 +86,13 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
             "dropped dead LinkedChildren/ExtraIds keys from serialized item data"
         );
     }
+    let retyped = retype_merged_version_links(db).await?;
+    if retyped > 0 {
+        tracing::info!(
+            rows = retyped,
+            "re-typed merged version links as linked alternate versions"
+        );
+    }
     Ok(())
 }
 
@@ -499,8 +506,10 @@ async fn dedupe_paths(
 
 /// Ferrofin modelled a version group by `PrimaryVersionId` alone; 12.0 reads
 /// versions from `LinkedChildren`. Write the missing rows for every existing
-/// group: local (2) when the two files share a directory, linked (3) otherwise.
-/// Rows already present (an adopted 12.0 database) are left alone.
+/// group: local (2) for a version owned by its primary (how upstream's
+/// scanner stores one), linked (3) — a merge, wherever the files are —
+/// otherwise ([`alternate_version_child_type`]). Rows already present (an
+/// adopted 12.0 database) are left alone.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -756,6 +765,53 @@ pub async fn strip_embedded_linked_children(db: &Database) -> Result<u64, Servic
     .rows_affected();
     done(db, KEY).await?;
     Ok(updated)
+}
+
+/// Ferrofin wrote a merge's version link as `LocalAlternateVersion` (2) when
+/// the two files shared a directory; `VideosController.MergeVersions` writes
+/// every merge as `LinkedAlternateVersion` (3) — it adds a
+/// `LinkedAlternateVersion`, which `ItemPersistenceService.SaveItems` writes
+/// as such. A Jellyfin 12.x database does hold type-2 rows — its scanner's
+/// local versions, and the Merge Versions plugin's merges, which it stores
+/// as owned local versions — and those are kept: a type-2 row stays when its
+/// child is owned by the parent (`OwnerId`, no `ExtraType`) or is listed in
+/// the parent's `LocalAlternateVersions` (a 10.11 adoption's local versions,
+/// whose owner `fix_owner_id_relationships` clears). Every other one is
+/// Ferrofin's merge and becomes type 3. Runs once per database, native ones
+/// included, after the passes that read version links.
+///
+/// Returns the number of rows re-typed.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the update fails.
+pub async fn retype_merged_version_links(db: &Database) -> Result<u64, ServiceError> {
+    const KEY: &str = "merged_version_links_linked_v121";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let retyped = sqlx::query(
+        r#"UPDATE "LinkedChildren" SET "ChildType" = ?2
+           WHERE "ChildType" = ?1
+             AND NOT EXISTS (
+               SELECT 1 FROM "BaseItems" c
+               WHERE c."Id" = "LinkedChildren"."ChildId"
+                 AND c."OwnerId" = "LinkedChildren"."ParentId" AND c."ExtraType" IS NULL)
+             AND NOT EXISTS (
+               SELECT 1 FROM "BaseItems" p, "BaseItems" c,
+                    json_each(CASE WHEN json_valid(p."Data") THEN p."Data" ELSE '{}' END,
+                              '$.LocalAlternateVersions') v
+               WHERE p."Id" = "LinkedChildren"."ParentId"
+                 AND c."Id" = "LinkedChildren"."ChildId"
+                 AND v."value" = c."Path")"#,
+    )
+    .bind(LOCAL_ALTERNATE_VERSION)
+    .bind(LINKED_ALTERNATE_VERSION)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    done(db, KEY).await?;
+    Ok(retyped)
 }
 
 /// `MergeDuplicateMusicArtists` (12.0): `MusicArtist` rows whose names differ
@@ -1163,6 +1219,63 @@ mod tests {
         .expect("row")
     }
 
+    /// Ferrofin's same-folder merges were written as local (2) links: the
+    /// repair re-types them linked (3), as upstream writes every merge, and
+    /// leaves a scanner-owned local version and a 10.11 adoption's listed
+    /// one alone. A second run is a no-op.
+    #[tokio::test]
+    async fn merged_version_links_are_retyped_once() {
+        let db = test_db().await;
+        let [primary, merged, owned, listed, extra] =
+            [0x51, 0x52, 0x53, 0x54, 0x55].map(Uuid::from_u128);
+        for id in [primary, merged, owned, listed, extra] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        set_path(&db, listed, "/m/Movie/Movie - 720p.mkv").await;
+        set_data(
+            &db,
+            primary,
+            r#"{"LocalAlternateVersions":["/m/Movie/Movie - 720p.mkv"]}"#,
+        )
+        .await;
+        for (id, extra_type) in [(owned, None), (extra, Some(1))] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "ExtraType" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(primary))
+            .bind(extra_type)
+            .execute(db.writer())
+            .await
+            .expect("owner");
+        }
+        for (order, child) in [merged, owned, listed, extra].into_iter().enumerate() {
+            let order = i64::try_from(order).expect("order");
+            link(&db, primary, child, LOCAL_ALTERNATE_VERSION, order).await;
+        }
+
+        assert_eq!(retype_merged_version_links(&db).await.expect("retype"), 2);
+        let types: Vec<(String, i64)> = links(&db)
+            .await
+            .into_iter()
+            .map(|(_, child, child_type, _)| (child, child_type))
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                (guid_to_db(merged), LINKED_ALTERNATE_VERSION),
+                (guid_to_db(owned), LOCAL_ALTERNATE_VERSION),
+                (guid_to_db(listed), LOCAL_ALTERNATE_VERSION),
+                (guid_to_db(extra), LINKED_ALTERNATE_VERSION),
+            ]
+        );
+
+        // A merge row written after the repair is not its to touch again.
+        link(&db, merged, owned, LOCAL_ALTERNATE_VERSION, 0).await;
+        assert_eq!(retype_merged_version_links(&db).await.expect("again"), 0);
+        assert_eq!(links(&db).await.len(), 5);
+    }
+
     /// 12.1 `RepairAlternateVersionLinks`: children take their primary from
     /// `LinkedChildren` (chains resolve to the root, Local beats Linked), a
     /// self-link is ignored, a loop keeps its lowest id, a primary that is
@@ -1431,19 +1544,28 @@ mod tests {
     #[tokio::test]
     async fn version_links_are_backfilled_from_primary_version_id_once() {
         let db = test_db().await;
-        let (primary, local, linked, already) = (
+        let (primary, local, merged, linked, already) = (
+            Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             Uuid::new_v4(),
         );
-        for id in [primary, local, linked, already] {
+        for id in [primary, local, merged, linked, already] {
             seed_item(&db, id, BaseItemKind::Movie).await;
         }
         set_path(&db, primary, "/m/film/film 1080p.mkv").await;
         set_path(&db, local, "/m/film/film 2160p.mkv").await;
+        // A merge in the same folder is still a merge.
+        set_path(&db, merged, "/m/film/film 720p.mkv").await;
         set_path(&db, linked, "/m/other/film.mkv").await;
-        for id in [local, linked, already] {
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(local))
+            .bind(guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("owner");
+        for id in [local, merged, linked, already] {
             sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
                 .bind(guid_to_db(id))
                 .bind(guid_to_db(primary))
@@ -1465,7 +1587,7 @@ mod tests {
             backfill_alternate_version_links(&db)
                 .await
                 .expect("backfill"),
-            2
+            3
         );
         let mut got: Vec<(String, i64)> = links(&db)
             .await
@@ -1476,6 +1598,7 @@ mod tests {
         let mut want = vec![
             (guid_to_db(already), 3),
             (guid_to_db(local), 2),
+            (guid_to_db(merged), 3),
             (guid_to_db(linked), 3),
         ];
         want.sort();

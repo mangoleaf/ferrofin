@@ -60,7 +60,7 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
     ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, ItemUserWeight,
-    MediaStreamRepository, StoredImageMetadata, StoredItemLinks,
+    LocalVersionGroup, MediaStreamRepository, StoredImageMetadata, StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
@@ -1799,6 +1799,10 @@ struct RefreshContext<'a> {
     date_added: DateAdded,
     /// Stops the scan.
     cancel: &'a ScanCancel,
+    /// The local groups the walk resolved ([`PlanOutput::local_versions`]):
+    /// an owned version outside them keeps its stored owner
+    /// ([`keep_unplanned_version_owner`]).
+    version_groups: &'a VersionGroups,
 }
 
 impl<'a> RefreshContext<'a> {
@@ -1809,6 +1813,8 @@ impl<'a> RefreshContext<'a> {
             std::sync::LazyLock::new(HashMap::new);
         static NO_LOCKS: std::sync::LazyLock<std::collections::HashSet<Uuid>> =
             std::sync::LazyLock::new(std::collections::HashSet::new);
+        static NO_GROUPS: std::sync::LazyLock<VersionGroups> =
+            std::sync::LazyLock::new(VersionGroups::default);
         Self {
             request: RefreshRequest {
                 options: run.options,
@@ -1827,6 +1833,7 @@ impl<'a> RefreshContext<'a> {
             superseded: std::collections::HashSet::new(),
             date_added: DateAdded::default(),
             cancel: run.cancel,
+            version_groups: &NO_GROUPS,
         }
     }
 
@@ -2441,6 +2448,82 @@ fn trimmed_dir(dir: &str) -> &str {
     }
 }
 
+/// The owner of `row` when it is an owned row that is no extra — a local
+/// alternate or a stacked part of that owner.
+fn version_owner(row: &BaseItemEntity) -> Option<Uuid> {
+    row.extra_type
+        .is_none()
+        .then(|| Uuid::parse_str(row.owner_id.as_deref()?).ok())
+        .flatten()
+}
+
+/// The local groups a walk resolved whole ([`PlanOutput::local_versions`],
+/// as ids — [`LibraryScanner::version_group_ids`]).
+#[derive(Debug, Default)]
+struct VersionGroups {
+    /// Each group's primary.
+    primaries: std::collections::HashSet<Uuid>,
+    /// Every member of a group: its primary and its versions.
+    members: std::collections::HashSet<Uuid>,
+}
+
+impl VersionGroups {
+    fn of(groups: &[(Uuid, Vec<Uuid>)]) -> Self {
+        Self {
+            primaries: groups.iter().map(|(primary, _)| *primary).collect(),
+            members: groups
+                .iter()
+                .flat_map(|(primary, versions)| std::iter::once(primary).chain(versions))
+                .copied()
+                .collect(),
+        }
+    }
+}
+
+/// The primary whose local group a stored row `id` was in — owned by it and
+/// no extra (`OwnerId`: a local alternate or a stacked part) — when the scan
+/// plans it owned by another or by none: the walk took it out of that group
+/// ([`LibraryScanner::sync_local_version_groups`]). That is known when the
+/// walk resolved the old group whole (its primary is one of `groups`), or
+/// placed the row in a group of its own resolving (it is a member of one —
+/// the primary promoted when the old primary's file went, and the versions
+/// that moved with it). For any other row the scan has no opinion on its
+/// membership.
+fn released_from(
+    id: Uuid,
+    stored: &BaseItemEntity,
+    planned: &BaseItemEntity,
+    groups: &VersionGroups,
+) -> Option<Uuid> {
+    let was = version_owner(stored)
+        .filter(|owner| groups.primaries.contains(owner) || groups.members.contains(&id))?;
+    (version_owner(planned) != Some(was)).then_some(was)
+}
+
+/// Keeps a stored owned version's owner when the scan has no opinion on it:
+/// the walk planned row `id` with no owner, the row is in none of the groups
+/// the walk resolved, and its stored owner heads none of them either. Such a
+/// row is a local version or part this scan's walk does not group yet — an
+/// owned Episode version of a 12.x database, which the TV walk plans on its
+/// own — and clearing its owner would show it as an item of its own. A row
+/// the walk did group (a primary promoted over a deleted one) never keeps
+/// its old owner: the prune of that owner follows `OwnerId`.
+fn keep_unplanned_version_owner(
+    id: Uuid,
+    row: &mut BaseItemEntity,
+    stored: Option<&BaseItemEntity>,
+    groups: &VersionGroups,
+) {
+    if row.owner_id.is_some() || row.extra_type.is_some() || groups.members.contains(&id) {
+        return;
+    }
+    if let Some(stored) = stored
+        && version_owner(stored).is_some_and(|owner| !groups.primaries.contains(&owner))
+    {
+        row.owner_id.clone_from(&stored.owner_id);
+    }
+}
+
 /// What a plan pass resolved.
 #[derive(Default)]
 struct PlanOutput {
@@ -2457,10 +2540,17 @@ struct PlanOutput {
     /// Each resolved primary video's local alternate versions, by path in
     /// the resolver's order (`Video.LocalAlternateVersions`, which
     /// `ItemPersistenceService.SaveItems` turns into the primary's
-    /// `LinkedChildren` rows, `ItemPersistenceService.cs:651-780`).
-    // TODO(parity, open work item): nothing fills or writes it yet — the
-    // movie walk's version groups (PLAN_ITEM_FILE_DELETION step 12 S4) and
-    // `sync_local_versions` (S3) are the port.
+    /// `LinkedChildren` rows, `ItemPersistenceService.cs:651-780`), written
+    /// by [`LibraryScanner::sync_local_version_groups`]. A primary listed
+    /// here — with no versions too — is one whose group the walk resolved
+    /// whole: an owned version of it the walk no longer groups with it is
+    /// released ([`released_from`]); an owned version of any other keeps its
+    /// owner ([`keep_unplanned_version_owner`]).
+    // TODO(parity, open work item): nothing fills it yet. The movie walk
+    // (PLAN_ITEM_FILE_DELETION step 12 S4) and the TV walk (S8) must emit an
+    // entry — an empty one for a video with no versions — for EVERY video
+    // they plan in a library whose rules group versions, so a group that
+    // dissolved (its versions renamed apart) releases them.
     local_versions: Vec<(Uuid, Vec<String>)>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
@@ -2794,6 +2884,11 @@ pub struct LibraryScanner {
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
+    /// Local groups a test adds to every library scan's plan, standing in for
+    /// the version groups the movie walk does not resolve yet
+    /// (PLAN_ITEM_FILE_DELETION step 12 S4).
+    #[cfg(test)]
+    test_local_versions: Vec<(Uuid, Vec<String>)>,
     /// Optional ffprobe seam. When present, each leaf media file is probed during
     /// the scan so its duration/size and per-stream codec info are persisted —
     /// which is what lets the web client choose direct play (and the transcoder
@@ -2979,6 +3074,8 @@ impl LibraryScanner {
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
+            #[cfg(test)]
+            test_local_versions: Vec::new(),
             media_encoder: None,
             media_streams: None,
             probe_concurrency: default_probe_concurrency(),
@@ -3699,6 +3796,9 @@ impl LibraryScanner {
                 ..ScanOutcome::default()
             });
         }
+        #[cfg(test)]
+        plan.local_versions
+            .extend(self.test_local_versions.iter().cloned());
         let mut result = self.run_scan(&folders, &all_folders, plan, None, run).await;
         if let Ok(outcome) = &mut result {
             outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
@@ -4456,16 +4556,6 @@ impl LibraryScanner {
             inaccessible,
             date_added,
         } = plan;
-        if !local_versions.is_empty() {
-            tracing::debug!(
-                primaries = local_versions.len(),
-                alternates = local_versions
-                    .iter()
-                    .map(|(_, paths)| paths.len())
-                    .sum::<usize>(),
-                "planned local alternate versions"
-            );
-        }
         if let Some(first) = unlisted.first() {
             tracing::warn!(
                 count = unlisted.len(),
@@ -4589,7 +4679,10 @@ impl LibraryScanner {
         // saved no checkboxes for, and an item in no library.
         let server_options = self.server_metadata_options();
         let fetcher_policies = fetcher_policies(folders, Some(&server_options));
+        let resolved_groups = self.version_group_ids(&planned, &local_versions);
+        let version_groups = VersionGroups::of(&resolved_groups);
         let refresh = RefreshContext {
+            version_groups: &version_groups,
             scope,
             policies: &fetcher_policies,
             outside: FetcherPolicy {
@@ -4616,6 +4709,10 @@ impl LibraryScanner {
             served: Served::new(),
             outside: refresh.outside,
         };
+        // The versions the walk took out of a local group, by the primary
+        // that owned them ([`released_from`]). A stop still unlinks them: the
+        // next scan reads them saved unowned, and could no longer tell.
+        let mut released: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             let touched = Box::pin(self.serve_lane_between_items(
@@ -4644,6 +4741,7 @@ impl LibraryScanner {
             // after the window read, whose planning stops at a cancel: a
             // read that takes seconds never delays the stop by an item.
             if run.cancel.is_cancelled() {
+                self.sync_local_version_groups(&[], &released).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &moved_away),
@@ -4700,6 +4798,10 @@ impl LibraryScanner {
                 }
                 continue;
             }
+            let released_by = match stored {
+                Stored::Existing(row) => released_from(item.id, row, &item.entity, &version_groups),
+                _ => None,
+            };
             // A locked item's metadata and cast are user-owned: no NFO or
             // remote provider runs for it (`RefreshWithProviders` returns on
             // `IsLocked`), and its people are left alone. The scan-upsert's
@@ -4788,10 +4890,14 @@ impl LibraryScanner {
                         items_added.pop();
                     }
                     let at = "inside an item, before any write";
+                    self.sync_local_version_groups(&[], &released).await;
                     return Ok(self
                         .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
                         .await);
                 }
+            }
+            if let Some(owner) = released_by {
+                released.entry(owner).or_default().push(item.id);
             }
             // The independent timer samples these counters once per second.
             if let Some(tracking) = run.tracking
@@ -4807,6 +4913,7 @@ impl LibraryScanner {
         // A cancellation that landed during the last item skips the pruning
         // and the closing passes, as one between items does.
         if run.cancel.is_cancelled() {
+            self.sync_local_version_groups(&[], &released).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &moved_away),
@@ -4816,6 +4923,10 @@ impl LibraryScanner {
             return Ok(stop.await);
         }
         probes.abort();
+        // After every row is saved, so each version is stored, and before
+        // the prune, whose delete follows `OwnerId`.
+        self.sync_local_version_groups(&resolved_groups, &released)
+            .await;
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -4847,6 +4958,96 @@ impl LibraryScanner {
             run.report(100.0);
         }
         Ok(outcome)
+    }
+
+    /// Each resolved primary's local alternate versions as ids
+    /// ([`PlanOutput::local_versions`]). A version's id is derived from its
+    /// path with the PRIMARY's kind: a local alternate takes its primary's
+    /// type (`LibraryManager.ResolveAlternateVersion`,
+    /// `LibraryManager.cs:865-922`). A primary the scan does not plan (its
+    /// move was not made) is left out: it keeps its stored group until the
+    /// scan that plans it.
+    fn version_group_ids(
+        &self,
+        planned: &[Planned],
+        local_versions: &[(Uuid, Vec<String>)],
+    ) -> Vec<(Uuid, Vec<Uuid>)> {
+        if local_versions.is_empty() {
+            return Vec::new();
+        }
+        let primaries: std::collections::HashSet<Uuid> =
+            local_versions.iter().map(|(id, _)| *id).collect();
+        let kinds: HashMap<Uuid, BaseItemKind> = planned
+            .iter()
+            .filter(|p| primaries.contains(&p.id))
+            .filter_map(|p| {
+                Some((
+                    p.id,
+                    item_type_lookup::kind_from_type_name(&p.entity.type_)?,
+                ))
+            })
+            .collect();
+        local_versions
+            .iter()
+            .filter_map(|(primary, paths)| {
+                let kind = *kinds.get(primary)?;
+                let ids = paths
+                    .iter()
+                    .filter_map(|path| {
+                        item_type_lookup::derive_item_id_with(&self.id_derivation, kind, path)
+                    })
+                    .collect();
+                Some((*primary, ids))
+            })
+            .collect()
+    }
+
+    /// Writes each resolved group's local alternate versions under its
+    /// primary ([`ItemPersistenceService::sync_local_versions`]) — what
+    /// upstream's save of the primary does (`ItemPersistenceService.cs:
+    /// 651-780`) — once the walk has saved every row, and before the prune.
+    /// A primary the walk took versions from (`released`, by the primary
+    /// that owned them) is synced too, so their links go; one whose group
+    /// this call does not carry — a stopped walk passes no groups, and an
+    /// old primary whose file went is in none — has only those links cut
+    /// ([`LocalVersionGroup::versions`] `None`), its other versions kept.
+    /// One call, read in batches. Best-effort, as the pruning is: a failure
+    /// is logged and the next scan writes the groups.
+    async fn sync_local_version_groups(
+        &self,
+        resolved: &[(Uuid, Vec<Uuid>)],
+        released: &HashMap<Uuid, Vec<Uuid>>,
+    ) {
+        if resolved.is_empty() && released.is_empty() {
+            return;
+        }
+        let gone = |primary: &Uuid| released.get(primary).cloned().unwrap_or_default();
+        let mut groups: Vec<LocalVersionGroup> = resolved
+            .iter()
+            .map(|(primary, versions)| LocalVersionGroup {
+                primary: *primary,
+                versions: Some(versions.clone()),
+                released: gone(primary),
+            })
+            .collect();
+        let known: std::collections::HashSet<Uuid> = groups.iter().map(|g| g.primary).collect();
+        let mut owners: Vec<&Uuid> = released
+            .keys()
+            .filter(|owner| !known.contains(owner))
+            .collect();
+        owners.sort_unstable();
+        groups.extend(owners.into_iter().map(|owner| LocalVersionGroup {
+            primary: *owner,
+            versions: None,
+            released: gone(owner),
+        }));
+        if let Err(err) = self.persistence.sync_local_versions(&groups).await {
+            tracing::warn!(
+                %err,
+                groups = groups.len(),
+                "could not write the local alternate versions; the next scan retries"
+            );
+        }
     }
 
     /// Drops rows whose files vanished or whose paths were confirmed excluded, so deleted
@@ -5447,6 +5648,12 @@ impl LibraryScanner {
             }
             None => saved_row(stored_row, &guesses, &entity, facts),
         };
+        keep_unplanned_version_owner(
+            item.id,
+            &mut entity,
+            stored_row,
+            state.refresh.version_groups,
+        );
         settle_extra_name(&mut entity, &item.entity, locked_fields);
         self.apply_parental_rating_score(&mut entity);
         let chosen_ids_differ = identified.is_some_and(|result| {
@@ -15914,6 +16121,310 @@ mod tests {
         );
     }
 
+    /// A row the scan plans owned by another owner, or by none, was released
+    /// from the group its stored owner heads — when the walk resolved that
+    /// group, or placed the row in a group it resolved; an extra never was in
+    /// one. The overlay keeps the owner of a version the walk grouped in
+    /// none of its groups.
+    #[test]
+    fn released_from_reads_the_stored_and_planned_owners() {
+        let (owner, other, item) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let row = |owner: Option<uuid::Uuid>, extra: Option<i32>| BaseItemEntity {
+            owner_id: owner.map(ferrofin_db::store::guid_to_db),
+            extra_type: extra,
+            ..BaseItemEntity::default()
+        };
+        let headed = super::VersionGroups::of(&[(owner, Vec::new())]);
+        let promoted = super::VersionGroups::of(&[(item, Vec::new())]);
+        let moved = super::VersionGroups::of(&[(other, vec![item])]);
+        let none = super::VersionGroups::default();
+        let stored = row(Some(owner), None);
+        let released = |planned: &BaseItemEntity, groups: &super::VersionGroups| {
+            super::released_from(item, &stored, planned, groups)
+        };
+        assert_eq!(released(&row(Some(owner), None), &headed), None);
+        assert_eq!(released(&row(None, None), &headed), Some(owner));
+        assert_eq!(released(&row(Some(other), None), &headed), Some(owner));
+        assert_eq!(released(&row(None, None), &promoted), Some(owner));
+        assert_eq!(released(&row(Some(other), None), &moved), Some(owner));
+        assert_eq!(released(&row(None, None), &none), None);
+        assert_eq!(
+            super::released_from(item, &row(Some(owner), Some(1)), &row(None, None), &headed),
+            None
+        );
+        assert_eq!(
+            super::released_from(item, &row(None, None), &row(None, None), &headed),
+            None
+        );
+
+        let kept = |groups: &super::VersionGroups, stored: &BaseItemEntity| {
+            let mut saved = row(None, None);
+            super::keep_unplanned_version_owner(item, &mut saved, Some(stored), groups);
+            saved.owner_id
+        };
+        assert_eq!(kept(&none, &stored), stored.owner_id);
+        assert_eq!(kept(&headed, &stored), None);
+        assert_eq!(kept(&promoted, &stored), None);
+        assert_eq!(kept(&moved, &stored), None);
+        assert_eq!(kept(&none, &row(Some(owner), Some(1))), None);
+    }
+
+    /// After the walk, each planned primary's local versions are written
+    /// under it — their ids derived with the primary's kind — and a version
+    /// a later walk released from the group is unlinked. A stopped walk
+    /// (no groups) unlinks only what it released: the group's other version
+    /// keeps its link.
+    #[tokio::test]
+    async fn local_version_groups_are_written_after_the_walk() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, derive_item_id, stored_type_name};
+        use crate::linked_children_service::FerrofinLinkedChildrenService;
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_traits::persistence::{ItemRepository as _, LinkedChildrenService as _};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone());
+        let paths = [
+            "/m/Movie/Movie - 4K.mkv",
+            "/m/Movie/Movie - 1080p.mkv",
+            "/m/Movie/Movie - 720p.mkv",
+        ];
+        let [primary, kept, released] =
+            paths.map(|path| derive_item_id(BaseItemKind::Movie, path).expect("id"));
+        let row = |id: Uuid, path: &str, owner: Option<Uuid>| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Movie)
+                .expect("type")
+                .to_owned(),
+            path: Some(path.to_owned()),
+            owner_id: owner.map(guid_to_db),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(&[
+                row(primary, paths[0], None),
+                row(kept, paths[1], Some(primary)),
+                row(released, paths[2], Some(primary)),
+            ])
+            .await
+            .expect("save");
+        let planned = [super::Planned {
+            id: primary,
+            entity: row(primary, paths[0], None),
+            ancestors: Vec::new(),
+        }];
+        let links = FerrofinLinkedChildrenService::new(db.clone());
+        let items = FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()));
+        let points_at = |row: Option<BaseItemEntity>| {
+            row.expect("row")
+                .primary_version_id
+                .and_then(|p| Uuid::parse_str(&p).ok())
+        };
+
+        let groups = scanner.version_group_ids(
+            &planned,
+            &[(primary, vec![paths[1].to_owned(), paths[2].to_owned()])],
+        );
+        assert_eq!(groups, vec![(primary, vec![kept, released])]);
+        scanner
+            .sync_local_version_groups(&groups, &HashMap::new())
+            .await;
+        assert_eq!(
+            links
+                .get_linked_children_ids(primary, Some(2))
+                .await
+                .expect("links"),
+            vec![kept, released]
+        );
+        for version in [kept, released] {
+            assert_eq!(
+                points_at(items.retrieve_item(version).await.expect("read")),
+                Some(primary)
+            );
+        }
+
+        // A walk saved one of them unowned, then stopped: released.
+        persistence
+            .save_items(&[row(released, paths[2], None)])
+            .await
+            .expect("save");
+        scanner
+            .sync_local_version_groups(&[], &HashMap::from([(primary, vec![released])]))
+            .await;
+        assert_eq!(
+            links
+                .get_linked_children_ids(primary, None)
+                .await
+                .expect("links"),
+            vec![kept]
+        );
+        assert_eq!(
+            points_at(items.retrieve_item(released).await.expect("read")),
+            None
+        );
+        assert_eq!(
+            points_at(items.retrieve_item(kept).await.expect("read")),
+            Some(primary)
+        );
+    }
+
+    /// The primary's file is deleted and the walk promotes one of its
+    /// versions: V (1080p) heads the group with W (720p). Neither keeps the
+    /// old primary P as its owner — the prune of P follows `OwnerId` — so
+    /// both survive P's removal with their user data, V points at nothing
+    /// and W points at V.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_promoted_over_a_deleted_primary_survives_its_prune() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, derive_item_id};
+        use crate::linked_children_service::FerrofinLinkedChildrenService;
+        use crate::test_support::{
+            fetch_item, fetch_item_opt, save_item, seed_user, seed_user_data,
+        };
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::{LinkedChildrenService as _, LocalVersionGroup};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("movies").join("Movie");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let path = |name: &str| folder.join(name).to_string_lossy().into_owned();
+        let (p_path, v_path, w_path) = (
+            path("Movie - 2160p.mkv"),
+            path("Movie - 1080p.mkv"),
+            path("Movie - 720p.mkv"),
+        );
+        for file in [&v_path, &w_path] {
+            std::fs::write(file, b"").expect("write");
+        }
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tmp.path().join("movies").to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let mut scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        scanner.scan_all().await.expect("first scan");
+        let id = |path: &str| derive_item_id(BaseItemKind::Movie, path).expect("id");
+        let (p, v, w) = (id(&p_path), id(&v_path), id(&w_path));
+
+        // The stored group as a scan before the deletion left it: P primary,
+        // V and W its owned local versions.
+        let mut primary = fetch_item(&db, v).await;
+        primary.id = guid_to_db(p);
+        primary.path = Some(p_path.clone());
+        save_item(&db, &primary).await;
+        for version in [v, w] {
+            let mut row = fetch_item(&db, version).await;
+            row.owner_id = Some(guid_to_db(p));
+            row.primary_version_id = Some(guid_to_db(p));
+            save_item(&db, &row).await;
+        }
+        persistence
+            .sync_local_versions(&[LocalVersionGroup {
+                primary: p,
+                versions: Some(vec![v, w]),
+                released: Vec::new(),
+            }])
+            .await
+            .expect("group");
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        for version in [v, w] {
+            seed_user_data(&db, user, version, true, None).await;
+        }
+
+        // P's file is gone: the walk resolves V as the primary, W its version.
+        scanner.test_local_versions = vec![(v, vec![w_path.clone()])];
+        scanner.scan_all().await.expect("second scan");
+
+        assert!(fetch_item_opt(&db, p).await.is_none(), "P is pruned");
+        let promoted = fetch_item(&db, v).await;
+        assert_eq!(
+            (promoted.owner_id, promoted.primary_version_id),
+            (None, None)
+        );
+        let version = fetch_item(&db, w).await;
+        assert_eq!(version.owner_id, None);
+        assert_eq!(version.primary_version_id, Some(guid_to_db(v)));
+        assert_eq!(
+            FerrofinLinkedChildrenService::new(db.clone())
+                .get_linked_children_ids(v, Some(2))
+                .await
+                .expect("links"),
+            vec![w]
+        );
+        for version in [v, w] {
+            assert!(played(&db, tmp.path(), user, version).await, "{version}");
+        }
+    }
+
+    /// Whether `user`'s stored user data marks `item` played.
+    async fn played(
+        db: &ferrofin_db::Database,
+        dir: &std::path::Path,
+        user: uuid::Uuid,
+        item: uuid::Uuid,
+    ) -> bool {
+        use ferrofin_traits::library::UserDataManager as _;
+        let paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+            dir,
+            dir.join("log"),
+            dir.join("config"),
+            dir.join("cache"),
+            dir.join("web"),
+        ));
+        let config = crate::configuration_manager::FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("config");
+        crate::user_data_manager::FerrofinUserDataManager::new(
+            db.clone(),
+            std::sync::Arc::new(config),
+        )
+        .get_user_data_dto(item, user)
+        .await
+        .expect("user data")
+        .is_some_and(|data| data.played)
+    }
+
     /// `AlbumMetadataService` groups the songs' artists with
     /// `StringComparer.OrdinalIgnoreCase`, which folds one char to one char and
     /// leaves the non-1:1 mappings alone. `str::to_lowercase` (the full Unicode
@@ -21523,6 +22034,7 @@ mod tests {
             superseded: std::collections::HashSet::new(),
             date_added: super::DateAdded::default(),
             cancel: &super::ScanCancel::new(),
+            version_groups: &super::VersionGroups::default(),
         };
         let at = |path: &str| super::Planned {
             id: uuid::Uuid::nil(),

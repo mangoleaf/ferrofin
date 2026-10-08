@@ -1158,6 +1158,8 @@ pub async fn build_app_state(
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
         .with_chapters(Arc::clone(&chapter_repository))
+        // A merge re-points playlist and collection entries to the primary.
+        .with_linked_children(Arc::clone(&linked_children_service))
         // `Items/Root` creates the root on first use; `/Years/{year}` creates
         // the year on first use — both as Jellyfin does.
         .with_user_root(user_root_store)

@@ -26,7 +26,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    StoredImageMetadata, StoredItemLinks,
+    LocalVersionGroup, StoredImageMetadata, StoredItemLinks,
 };
 use std::collections::HashMap;
 
@@ -1607,10 +1607,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .map_err(db_err)?;
         // 12.0 keeps the version link in `LinkedChildren` too — that is what
         // `GetLocalAlternateVersionIds` / `GetLinkedAlternateVersions` read —
-        // so the pointer and the row move together (C# `MergeVersions` +
-        // `RefreshMetadataForVersions`): linking writes a
-        // Local(2)/LinkedAlternateVersion(3) row under the primary, unlinking
-        // removes the item's version rows.
+        // so the pointer and the row move together: linking is a merge
+        // (`VideosController.MergeVersions` adds a `LinkedAlternateVersion`,
+        // which the save writes as a type-3 row wherever the files are),
+        // unlinking removes the item's version rows. Local (type-2) rows are
+        // the scan's ([`ItemPersistenceService::sync_local_versions`]).
         sqlx::query(
             r#"DELETE FROM "LinkedChildren" WHERE "ChildId" = ?1 AND "ChildType" IN (2, 3)"#,
         )
@@ -1619,7 +1620,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .await
         .map_err(db_err)?;
         if let Some(primary) = primary_version_id {
-            let child_type = alternate_version_child_type(&mut tx, item_id, primary).await?;
             sqlx::query(
                 r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
                    VALUES (?1,
@@ -1629,12 +1629,75 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             )
             .bind(guid_to_db(primary))
             .bind(guid_to_db(item_id))
-            .bind(child_type)
+            .bind(LINKED_ALTERNATE_VERSION)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        // Decided on a reader first, in batches, so groups that already
+        // stand as the resolver left them — every one on a rescan — take no
+        // writer lock and no read per group.
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        let decided = local_version_writes(&mut conn, groups)
+            .await
+            .map_err(db_err)?;
+        drop(conn);
+        for (group, writes) in groups.iter().zip(&decided) {
+            for version in &writes.missing {
+                tracing::warn!(
+                    item_id = %group.primary,
+                    version = %version,
+                    "skipping a local alternate version that is not stored"
+                );
+            }
+        }
+        let pending: Vec<LocalVersionGroup> = groups
+            .iter()
+            .zip(&decided)
+            .filter(|(_, writes)| !writes.is_empty())
+            .map(|(group, _)| group.clone())
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Decided again under the writer: a merge or a refresh may have
+        // written between the read and here.
+        let decided = local_version_writes(&mut tx, &pending)
+            .await
+            .map_err(db_err)?;
+        // Releases first, so a demote decided from the same read is never
+        // undone by one.
+        for writes in &decided {
+            for &version in &writes.release {
+                point_version_at(&mut tx, version, None)
+                    .await
+                    .map_err(db_err)?;
+            }
+        }
+        for (group, writes) in pending.iter().zip(&decided) {
+            apply_local_version_writes(&mut tx, group.primary, writes)
+                .await
+                .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        for (group, writes) in pending.iter().zip(&decided) {
+            tracing::debug!(
+                item_id = %group.primary,
+                rows = writes.rows.as_ref().map(Vec::len),
+                demoted = writes.demote.len(),
+                released = writes.release.len(),
+                "synced local alternate versions"
+            );
+        }
         Ok(())
     }
 
@@ -3404,37 +3467,353 @@ async fn move_one(
     Ok(true)
 }
 
-/// Which `LinkedChildren.ChildType` a version link gets: `LocalAlternateVersion`
-/// (2) when the two files share a directory — what 12.0's scanner writes for
-/// same-folder versions (`Video.RefreshMetadataForVersions`) — else
-/// `LinkedAlternateVersion` (3), what a manual merge writes
-/// (`VideosController.MergeVersions`).
+/// `LinkedChildren.ChildType` of a file-based version
+/// (`LinkedChildType.LocalAlternateVersion`).
+const LOCAL_ALTERNATE_VERSION: i64 = 2;
+
+/// `LinkedChildren.ChildType` of a merged version
+/// (`LinkedChildType.LinkedAlternateVersion`).
+const LINKED_ALTERNATE_VERSION: i64 = 3;
+
+/// Whether a `LinkedChildren` row is a version row: a local or a linked
+/// alternate version.
+fn is_version_link(child_type: i64) -> bool {
+    matches!(
+        child_type,
+        LOCAL_ALTERNATE_VERSION | LINKED_ALTERNATE_VERSION
+    )
+}
+
+/// A row's version state, as [`local_version_writes`] reads it.
+struct VersionState {
+    /// `OwnerId` of an owned row that is no extra — a stacked part or a local
+    /// alternate of that owner.
+    owner: Option<Uuid>,
+    /// `PrimaryVersionId`.
+    primary: Option<Uuid>,
+}
+
+/// What [`ItemPersistenceService::sync_local_versions`] writes for one
+/// group — nothing ([`is_empty`](Self::is_empty)) when the stored rows
+/// already agree.
+#[derive(Debug, Default)]
+struct LocalVersionWrites {
+    /// The primary's version rows as they are to stand — `(ChildId,
+    /// ChildType, SortOrder)` — when they differ from the stored ones.
+    rows: Option<Vec<(Uuid, i64, i64)>>,
+    /// Versions to point at the primary.
+    demote: Vec<Uuid>,
+    /// Released versions to point at nothing.
+    release: Vec<Uuid>,
+    /// Listed versions that are not stored (skipped, as upstream does).
+    missing: Vec<Uuid>,
+}
+
+impl LocalVersionWrites {
+    fn is_empty(&self) -> bool {
+        self.rows.is_none() && self.demote.is_empty() && self.release.is_empty()
+    }
+}
+
+/// Every `LinkedChildren` row under each of `parents`, by parent:
+/// `(ChildId, ChildType, SortOrder)` in `SortOrder` order.
+async fn links_under(
+    conn: &mut sqlx::SqliteConnection,
+    parents: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<(Uuid, i64, i64)>>, sqlx::Error> {
+    let mut links: HashMap<Uuid, Vec<(Uuid, i64, i64)>> = HashMap::new();
+    for chunk in parents.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = format!(
+            r#"SELECT "ParentId", "ChildId", "ChildType", "SortOrder" FROM "LinkedChildren"
+               WHERE "ParentId" IN ({}) ORDER BY "ParentId", "SortOrder""#,
+            numbered_placeholders(chunk.len())
+        );
+        let mut query = sqlx::query_as::<_, (String, String, i64, i64)>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        for (parent, child, child_type, sort) in query.fetch_all(&mut *conn).await? {
+            if let (Ok(parent), Ok(child)) = (Uuid::parse_str(&parent), Uuid::parse_str(&child)) {
+                links
+                    .entry(parent)
+                    .or_default()
+                    .push((child, child_type, sort));
+            }
+        }
+    }
+    Ok(links)
+}
+
+/// The version state of each stored row of `ids`.
+async fn version_states(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, VersionState>, sqlx::Error> {
+    let parse = |id: Option<String>| id.and_then(|id| Uuid::parse_str(&id).ok());
+    let mut states = HashMap::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = format!(
+            r#"SELECT "Id", "OwnerId", "ExtraType", "PrimaryVersionId"
+               FROM "BaseItems" WHERE "Id" IN ({})"#,
+            numbered_placeholders(chunk.len())
+        );
+        let mut query = sqlx::query_as::<_, (String, Option<String>, Option<i32>, Option<String>)>(
+            sqlx::AssertSqlSafe(sql),
+        );
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        for (id, owner, extra, primary) in query.fetch_all(&mut *conn).await? {
+            let Ok(id) = Uuid::parse_str(&id) else {
+                continue;
+            };
+            let state = VersionState {
+                owner: parse(owner).filter(|_| extra.is_none()),
+                primary: parse(primary),
+            };
+            states.insert(id, state);
+        }
+    }
+    Ok(states)
+}
+
+/// Decides [`ItemPersistenceService::sync_local_versions`] for each of
+/// `groups`, in order, from the rows as stored — two batched reads for all
+/// of them: the rows under the primaries, and the version state of every
+/// row they name.
+async fn local_version_writes(
+    conn: &mut sqlx::SqliteConnection,
+    groups: &[LocalVersionGroup],
+) -> Result<Vec<LocalVersionWrites>, sqlx::Error> {
+    let primaries: Vec<Uuid> = groups.iter().map(|g| g.primary).collect();
+    let links = links_under(conn, &primaries).await?;
+    let mut ids: Vec<Uuid> = groups
+        .iter()
+        .flat_map(|g| {
+            std::iter::once(g.primary)
+                .chain(g.versions.iter().flatten().copied())
+                .chain(g.released.iter().copied())
+        })
+        .chain(links.values().flatten().map(|(child, ..)| *child))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let states = version_states(conn, &ids).await?;
+    let mut writes: Vec<LocalVersionWrites> = groups
+        .iter()
+        .map(|group| {
+            let own = links.get(&group.primary).map_or(&[][..], Vec::as_slice);
+            group_writes(group, own, &states)
+        })
+        .collect();
+    // All of them decide from one read: a version that moved from one
+    // primary to another in the same scan is released by the old group and
+    // demoted by the new one. The new group's list wins.
+    let listed: std::collections::HashSet<Uuid> = groups
+        .iter()
+        .flat_map(|g| g.versions.iter().flatten().copied())
+        .collect();
+    for w in &mut writes {
+        w.release.retain(|id| !listed.contains(id));
+    }
+    Ok(writes)
+}
+
+/// One group's [`local_version_writes`] — the version part of upstream's
+/// `UpdateOrInsertItems` for a saved video (`ItemPersistenceService.cs:
+/// 651-780`), over the primary's stored rows `own` and the rows' `states`:
+///
+/// - the listed versions take `ChildType` 2 rows under the primary, first
+///   and in order; a version listed twice and a version not stored
+///   (`:705-714`) are left out, and so is the primary itself (upstream
+///   writes that row but never points the video at itself, `:730`, and
+///   `RepairAlternateVersionLinks` skips a self-link). Local outranks linked within the
+///   primary's list (`:688-692`): the pair's type-3 row becomes the type-2
+///   one. Rows under other parents are never touched — only upstream's
+///   one-shot `RepairAlternateVersionLinks` ranks across parents;
+/// - upstream rewrites all of a saved video's version rows from its
+///   `LocalAlternateVersions` and `LinkedAlternateVersions`; a scan here
+///   knows only the first, so a row the scanner did not make — a merge's
+///   (type 3; type 2 where Ferrofin once wrote a same-folder merge so,
+///   until `retype_merged_version_links` re-types it) — is kept behind the
+///   listed ones. The type alone is not trusted: the scanner's rows are
+///   those whose child the primary owns (`OwnerId`, no extra) while the
+///   group is known, and those in `released`; one of them no longer listed
+///   goes (`:758-781`). Upstream also deletes such an owned child; here the
+///   row stays for the scan's prune to judge (owner decision D9b);
+/// - each listed version not yet pointing at the primary is demoted
+///   (`:727-756`): `PrimaryVersionId` = the primary and
+///   `PresentationUniqueKey` = its "N" id — except the one the primary
+///   itself points at (`:731`), which would hide the whole group;
+/// - a released version still pointing at the primary and no longer owned
+///   by it points at nothing again, with its own id as its key.
+fn group_writes(
+    group: &LocalVersionGroup,
+    own: &[(Uuid, i64, i64)],
+    states: &HashMap<Uuid, VersionState>,
+) -> LocalVersionWrites {
+    let mut writes = LocalVersionWrites::default();
+    let primary = group.primary;
+    let Some(head) = states.get(&primary) else {
+        return writes;
+    };
+    let mut seen = std::collections::HashSet::from([primary]);
+    let (listed, missing): (Vec<Uuid>, Vec<Uuid>) = group
+        .versions
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| seen.insert(*v))
+        .partition(|v| states.contains_key(v));
+    writes.missing = missing;
+    let is_listed = |id: &Uuid| listed.contains(id);
+    let owned = |id: &Uuid| states.get(id).is_some_and(|s| s.owner == Some(primary));
+    let released: Vec<Uuid> = group
+        .released
+        .iter()
+        .copied()
+        .filter(|id| *id != primary && !is_listed(id))
+        .collect();
+    let scanners = |id: &Uuid| released.contains(id) || (group.versions.is_some() && owned(id));
+
+    let wanted: Vec<(Uuid, i64)> = listed
+        .iter()
+        .map(|&v| (v, LOCAL_ALTERNATE_VERSION))
+        .chain(
+            own.iter()
+                .filter(|(child, child_type, _)| {
+                    is_version_link(*child_type)
+                        && *child != primary
+                        && !is_listed(child)
+                        && !scanners(child)
+                })
+                .map(|(child, child_type, _)| (*child, *child_type)),
+        )
+        .collect();
+    writes.rows = renumbered_version_rows(wanted, own);
+    writes.demote = listed
+        .iter()
+        .copied()
+        .filter(|v| Some(*v) != head.primary)
+        .filter(|v| states.get(v).is_some_and(|s| s.primary != Some(primary)))
+        .collect();
+    writes.release = released
+        .into_iter()
+        .filter(|id| {
+            states
+                .get(id)
+                .is_some_and(|s| s.primary == Some(primary) && s.owner != Some(primary))
+        })
+        .collect();
+    writes
+}
+
+/// `wanted` — a primary's version rows in order, `(ChildId, ChildType)` —
+/// numbered from 0 around the `SortOrder`s its other rows hold (the key is
+/// `(ParentId, SortOrder)`), or `None` when that is how its version rows
+/// among `own` already stand.
+fn renumbered_version_rows(
+    wanted: Vec<(Uuid, i64)>,
+    own: &[(Uuid, i64, i64)],
+) -> Option<Vec<(Uuid, i64, i64)>> {
+    let taken: std::collections::HashSet<i64> = own
+        .iter()
+        .filter(|(_, child_type, _)| !is_version_link(*child_type))
+        .map(|(.., sort)| *sort)
+        .collect();
+    let mut sorts = (0..).filter(|sort| !taken.contains(sort));
+    let wanted: Vec<(Uuid, i64, i64)> = wanted
+        .into_iter()
+        .zip(&mut sorts)
+        .map(|((child, child_type), sort)| (child, child_type, sort))
+        .collect();
+    let stored = own
+        .iter()
+        .filter(|(_, child_type, _)| is_version_link(*child_type));
+    (!wanted.iter().eq(stored)).then_some(wanted)
+}
+
+/// Points version `id` at primary `to` — or at nothing — with the
+/// presentation key `Video.CreatePresentationUniqueKey` gives it: the
+/// primary's "N" id, else its own.
+async fn point_version_at(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    to: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2, "PresentationUniqueKey" = ?3
+           WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(to.map(guid_to_db))
+    .bind(to.unwrap_or(id).as_simple().to_string())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Writes what [`local_version_writes`] decided for `primary` but its
+/// releases (which the caller writes first, for every group), inside the
+/// caller's transaction: single columns and the primary's version rows
+/// only, so a merge or a refresh's other columns stay as they are.
+async fn apply_local_version_writes(
+    conn: &mut sqlx::SqliteConnection,
+    primary: Uuid,
+    writes: &LocalVersionWrites,
+) -> Result<(), sqlx::Error> {
+    let parent = guid_to_db(primary);
+    if let Some(rows) = &writes.rows {
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildType" IN (2, 3)"#,
+        )
+        .bind(&parent)
+        .execute(&mut *conn)
+        .await?;
+        for (child, child_type, sort) in rows {
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, ?2, ?3, ?4)"#,
+            )
+            .bind(&parent)
+            .bind(sort)
+            .bind(guid_to_db(*child))
+            .bind(child_type)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    for &version in &writes.demote {
+        point_version_at(conn, version, Some(primary)).await?;
+    }
+    Ok(())
+}
+
+/// Which `LinkedChildren.ChildType` the version link of a stored
+/// `PrimaryVersionId` pointer gets: `LocalAlternateVersion` (2) when the
+/// version is owned by its primary (`OwnerId`, no `ExtraType`) — the shape
+/// upstream's scanner stores a local alternate in
+/// (`LibraryManager.ResolveAlternateVersion`) — else `LinkedAlternateVersion`
+/// (3), what a merge writes wherever the files are
+/// (`VideosController.MergeVersions` → `LinkedAlternateVersions`).
 pub(crate) async fn alternate_version_child_type(
     conn: &mut sqlx::SqliteConnection,
     item_id: Uuid,
     primary_id: Uuid,
 ) -> Result<i64, ServiceError> {
-    let paths: Vec<(String, Option<String>)> =
-        sqlx::query_as(r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
-            .bind(guid_to_db(item_id))
-            .bind(guid_to_db(primary_id))
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(db_err)?;
-    let dir = |id: Uuid| {
-        paths
-            .iter()
-            .find(|(i, _)| *i == guid_to_db(id))
-            .and_then(|(_, p)| p.as_deref())
-            .map(|p| {
-                std::path::Path::new(p)
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-            })
-    };
-    Ok(match (dir(item_id), dir(primary_id)) {
-        (Some(Some(a)), Some(Some(b))) if a == b => 2,
-        _ => 3,
+    let owned: Option<i64> = sqlx::query_scalar(
+        r#"SELECT 1 FROM "BaseItems"
+           WHERE "Id" = ?1 AND "OwnerId" = ?2 AND "ExtraType" IS NULL"#,
+    )
+    .bind(guid_to_db(item_id))
+    .bind(guid_to_db(primary_id))
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    Ok(if owned.is_some() {
+        LOCAL_ALTERNATE_VERSION
+    } else {
+        LINKED_ALTERNATE_VERSION
     })
 }
 

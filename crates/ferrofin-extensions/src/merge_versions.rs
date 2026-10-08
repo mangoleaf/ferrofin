@@ -334,6 +334,11 @@ impl MergeVersionsService {
             .await?;
         Ok(items
             .into_iter()
+            // Upstream's query keeps owned rows out (`TranslateQuery`'s
+            // `OwnerId == null || ExtraType != null`): a stacked part or a
+            // local alternate belongs to its primary's file group, which the
+            // scan writes, and is never merged on its own.
+            .filter(|item| !is_owned_version(item))
             .filter(|item| !in_excluded_location(&excluded, item.path.as_deref()))
             .filter(|item| {
                 kind != BaseItemKind::Movie || !in_inactive_library(&folders, item.path.as_deref())
@@ -346,14 +351,22 @@ impl MergeVersionsService {
     /// `PrimaryVersionId` pointer up and every row pointing at it down, to
     /// fixpoint. Merging into an already-merged item thus re-groups the whole
     /// family instead of nesting groups.
+    ///
+    /// An owned row (a stacked part or a local alternate,
+    /// [`is_owned_version`]) is never a member — upstream's
+    /// `GetAllAlternateVersions` lists linked versions only — but the
+    /// members it is a version of are returned as the second set: a video
+    /// with local versions has `MediaSourceCount > 1`, which the primary
+    /// choice reads.
     async fn expand_group(
         &self,
         seed: &[BaseItemEntity],
-    ) -> Result<HashMap<String, BaseItemEntity>, ServiceError> {
+    ) -> Result<(HashMap<String, BaseItemEntity>, HashSet<String>), ServiceError> {
         let mut group: HashMap<String, BaseItemEntity> = HashMap::new();
+        let mut local: HashSet<String> = HashSet::new();
         let mut pending: VecDeque<BaseItemEntity> = seed.iter().cloned().collect();
         while let Some(item) = pending.pop_front() {
-            if group.contains_key(&item.id) {
+            if group.contains_key(&item.id) || is_owned_version(&item) {
                 continue;
             }
             if let Some(pid) = item.primary_version_id.as_deref()
@@ -365,14 +378,16 @@ impl MergeVersionsService {
             }
             if let Ok(id) = Uuid::parse_str(&item.id) {
                 for alt in self.items.get_items_by_primary_version(id).await? {
-                    if !group.contains_key(&alt.id) {
+                    if is_owned_version(&alt) {
+                        local.insert(item.id.clone());
+                    } else if !group.contains_key(&alt.id) {
                         pending.push_back(alt);
                     }
                 }
             }
             group.insert(item.id.clone(), item);
         }
-        Ok(group)
+        Ok((group, local))
     }
 
     /// Merges one duplicate group — port of the upstream private
@@ -399,13 +414,14 @@ impl MergeVersionsService {
                 items.push(row);
             }
         }
+        items.retain(|item| !is_owned_version(item));
         items.sort_by(|a, b| a.id.cmp(&b.id));
         items.dedup_by(|a, b| a.id == b.id);
         if items.len() < 2 {
             return Ok(());
         }
 
-        let mut group = self.expand_group(&items).await?;
+        let (mut group, local) = self.expand_group(&items).await?;
         if let Some((scope, folders)) = scope {
             let foreign: Vec<BaseItemEntity> = group
                 .values()
@@ -442,9 +458,10 @@ impl MergeVersionsService {
         // `MediaSourceCount > 1 && !PrimaryVersionId.HasValue` probe — else
         // the widest (`Video3DFormat`/`VideoType` demotion is not modeled).
         let owns_alternates = |item: &BaseItemEntity| {
-            group
-                .values()
-                .any(|other| other.primary_version_id.as_deref() == Some(item.id.as_str()))
+            local.contains(&item.id)
+                || group
+                    .values()
+                    .any(|other| other.primary_version_id.as_deref() == Some(item.id.as_str()))
         };
         let primary = items
             .iter()
@@ -817,6 +834,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
             .map(|y| y.to_string())
             .unwrap_or_default()
     )
+}
+
+/// Whether `item` is an owned row that is no extra — a stacked part or a
+/// local alternate version, which belongs to its owner's file group. The
+/// general item query keeps these out (`BaseItemRepository.TranslateQuery`:
+/// `OwnerId == null || ExtraType != null`), so upstream never merges or
+/// splits one.
+fn is_owned_version(item: &BaseItemEntity) -> bool {
+    item.owner_id.is_some() && item.extra_type.is_none()
 }
 
 /// Whether `path` sits under any of the excluded locations — the upstream
@@ -1516,6 +1542,62 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// A local alternate (owned by its primary, as the scan stores it) is
+    /// its primary's file group, never a merge member: upstream's movie
+    /// query leaves owned rows out. Its primary still counts as a video with
+    /// several sources (`MediaSourceCount > 1`), so it heads the merge though
+    /// the copy merged into it is wider.
+    #[tokio::test]
+    async fn merge_movies_leaves_owned_versions_alone() {
+        let db = test_db().await;
+        let primary = Uuid::from_u128(0x441);
+        let local = Uuid::from_u128(0x442);
+        let copy = Uuid::from_u128(0x443);
+        let lonely = Uuid::from_u128(0x444);
+        let lonely_local = Uuid::from_u128(0x445);
+        seed(&db, primary, BaseItemKind::Movie, None, 1920).await;
+        seed(&db, copy, BaseItemKind::Movie, None, 2560).await;
+        seed(&db, lonely, BaseItemKind::Movie, None, 1920).await;
+        for (id, owner) in [(local, primary), (lonely_local, lonely)] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Movie).to_owned(),
+                    width: Some(3840),
+                    owner_id: Some(owner.to_string()),
+                    primary_version_id: Some(owner.to_string()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed local version");
+        }
+        set_provider_id(&db, primary, "Tmdb", "603").await;
+        set_provider_id(&db, local, "Tmdb", "603").await;
+        set_provider_id(&db, copy, "Tmdb", "603").await;
+        set_provider_id(&db, lonely, "Tmdb", "604").await;
+        set_provider_id(&db, lonely_local, "Tmdb", "604").await;
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        let points_at = |row: Option<String>| row.and_then(|p| Uuid::parse_str(&p).ok());
+        assert_eq!(primary_of(&db, &svc, primary).await, None);
+        assert_eq!(points_at(primary_of(&db, &svc, copy).await), Some(primary));
+        // The local versions keep their primary; a primary whose only other
+        // copy is its own local version has nothing to merge.
+        assert_eq!(points_at(primary_of(&db, &svc, local).await), Some(primary));
+        assert_eq!(primary_of(&db, &svc, lonely).await, None);
+        assert_eq!(
+            points_at(primary_of(&db, &svc, lonely_local).await),
+            Some(lonely)
+        );
+
+        // Splitting every movie splits the merge, not the local versions.
+        svc.split_movies(None).await.expect("split movies");
+        assert_eq!(primary_of(&db, &svc, copy).await, None);
+        assert_eq!(points_at(primary_of(&db, &svc, local).await), Some(primary));
     }
 
     #[tokio::test]
