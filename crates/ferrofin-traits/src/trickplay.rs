@@ -4,7 +4,7 @@
 //!
 //! Port rules applied:
 //! - The C# `Video` / `BaseItem` receivers become [`uuid::Uuid`] identity
-//!   arguments; the `LibraryOptions` argument (impl-resolved) is dropped.
+//!   arguments; callers supply the resolved `LibraryOptions` for refreshes.
 //! - Stored trickplay metadata is a persistence concern, so it surfaces as the
 //!   [`TrickplayInfoEntity`](ferrofin_db::entities::playback::TrickplayInfoEntity)
 //!   row (the C# `TrickplayInfo` EF entity). Maps keyed by width use `i32`
@@ -47,6 +47,23 @@ pub trait TrickplayManager: Send + Sync {
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError>;
+
+    /// Refreshes from the scan's current row before its final save.
+    /// `Some(streams)` is a completed fresh probe, including an empty result;
+    /// `None` uses persisted streams when the probe did not supply new context.
+    /// The default preserves identity-only implementations of the seam.
+    async fn refresh_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &ferrofin_db::entities::base_items::BaseItemEntity,
+        streams: Option<&[ferrofin_db::entities::base_items::MediaStreamInfoEntity]>,
+        replace: bool,
+        library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (entity, streams);
+        self.refresh_trickplay_data(item_id, replace, library_options)
+            .await
+    }
 
     /// Gets the available trickplay resolutions for an item, keyed by the width
     /// of a single thumbnail.

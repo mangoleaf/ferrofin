@@ -2907,6 +2907,8 @@ pub struct LibraryScanner {
     /// live: how a new item's "date added" is stamped ([`DateAdded`]).
     /// `None` (unit tests) keeps upstream's default, the file creation date.
     metadata_configuration: Option<MetadataConfigurationReader>,
+    /// Post-refresh TrickplayProvider and its live global scan timing.
+    trickplay: Option<trickplay::ScanTrickplay>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -3073,6 +3075,7 @@ impl LibraryScanner {
             metadata_options: None,
             metadata_locale: None,
             metadata_configuration: None,
+            trickplay: None,
             subtitle_downloader: std::sync::OnceLock::new(),
             chapter_image_extractor: std::sync::OnceLock::new(),
         }
@@ -3107,6 +3110,25 @@ impl LibraryScanner {
         downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) {
         let _ = self.subtitle_downloader.set(downloader);
+    }
+
+    /// Connects scan-time trickplay and reads Blocking/NonBlocking timing live.
+    /// The library's ExtractTrickplayImagesDuringLibraryScan flag selects jobs;
+    /// its extraction flag and destination remain the manager's responsibility.
+    #[must_use]
+    pub fn with_trickplay(
+        mut self,
+        manager: Arc<dyn ferrofin_traits::trickplay::TrickplayManager>,
+        behavior: impl Fn() -> ferrofin_model::configuration::TrickplayScanBehavior
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.trickplay = Some(trickplay::ScanTrickplay {
+            manager,
+            behavior: Arc::new(behavior),
+        });
+        self
     }
 
     /// Shares per-video chapter reconciliation with the scheduled task. The
@@ -5489,6 +5511,33 @@ impl LibraryScanner {
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
         }
+        // Existing items can run from fresh probe values before their final
+        // save: Blocking keeps the metadata Etag unchanged until extraction
+        // finishes. New items must first exist for the trickplay row's FK.
+        if stored_row.is_some()
+            && trickplay::selected(&entity, stored_row, plan, options, policy.options, locked)
+            && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
+        {
+            let trickplay_ok = provider
+                .refresh(
+                    item.id,
+                    &entity,
+                    probe_ran.then_some(rows.streams.as_slice()),
+                    library.clone(),
+                    options,
+                    cancel,
+                )
+                .await;
+            if cancel.is_cancelled() {
+                return Ok(ItemSaved::Cancelled);
+            }
+            if !trickplay_ok {
+                return Ok(ItemSaved::Cancelled);
+            }
+        }
+        let new_trickplay = stored_row.is_none()
+            && self.trickplay.is_some()
+            && trickplay::selected(&entity, stored_row, plan, options, policy.options, locked);
         // `DateLastRefreshed` records a refresh that completed with no
         // provider failure (a provider that found nothing still completes);
         // a failed one keeps the stored stamp, so it is retried.
@@ -5496,7 +5545,7 @@ impl LibraryScanner {
         // the scan start would give every item of a scan the same
         // `DateLastSaved`, and so the same Etag.
         let now = Utc::now();
-        if decision.stamp_refreshed && !music_pending {
+        if decision.stamp_refreshed && !music_pending && !new_trickplay {
             entity.date_last_refreshed = Some(now);
         }
         // A new item's first refresh saves it right after creating it
@@ -5586,19 +5635,31 @@ impl LibraryScanner {
             cancel,
         )
         .await?;
-        // TODO(parity, open work item — NOT an accepted divergence): upstream's
-        // `TrickplayProvider` (`MediaBrowser.Providers/Trickplay/
-        // TrickplayProvider.cs:95-118`, a forced custom provider) runs here
-        // for a video whose custom providers run, when its library has
-        // `ExtractTrickplayImagesDuringLibraryScan`, replacing the tiles when
-        // `options.regenerate_trickplay` in a `FullRefresh`. The scan does not
-        // run it — trickplay comes only from the scheduled task — so a folder
-        // refresh's `RegenerateTrickplay` reaches these options and stops
-        // here. Un-defer path: give the scanner the `TrickplayManager`
-        // (`refresh_trickplay_data(item, replace, library_options)` is the
-        // per-item seam) and honour `TrickplayOptions.ScanBehavior` with a
-        // bound on concurrent extractions, so a first scan does not start one
-        // ffmpeg per video.
+        // A new video needs its first item save for the trickplay FK. Finish
+        // its metadata refresh stamp only after the custom provider returns;
+        // ordinary custom-provider errors still complete; cancellation stops it.
+        if new_trickplay && let (Some(provider), Some(library)) = (&self.trickplay, policy.options)
+        {
+            let finished = provider
+                .refresh(
+                    item.id,
+                    &entity,
+                    probe_ran.then_some(rows.streams.as_slice()),
+                    library.clone(),
+                    options,
+                    cancel,
+                )
+                .await;
+            if !finished || cancel.is_cancelled() {
+                return Ok(ItemSaved::Cancelled);
+            }
+            if decision.stamp_refreshed && !music_pending {
+                entity.date_last_refreshed = Some(Utc::now());
+                self.persistence
+                    .save_scanned_items(std::slice::from_ref(&entity))
+                    .await?;
+            }
+        }
         if let Some(images) = artwork.filter(|_| images_changed)
             && let Err(err) = self.persistence.save_item_images(item.id, &images).await
         {
@@ -15379,6 +15440,7 @@ mod artwork;
 mod collections;
 mod fanout;
 mod music;
+mod trickplay;
 
 #[cfg(test)]
 mod plan_paths_tests;

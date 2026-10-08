@@ -1097,6 +1097,10 @@ pub async fn build_app_state(
     )
     .with_metadata_savers(Arc::clone(&providers))
     .with_image_saver(image_saver)
+    .with_trickplay(Arc::clone(&trickplay), {
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().trickplay_options.scan_behavior
+    })
     .with_id_derivation(id_derivation)
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).
