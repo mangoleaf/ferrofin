@@ -278,16 +278,19 @@ fn parity_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
         "/tmdb/movie/901" => json!({"id":901,"title":"Mapped movie","original_title":"Original movie","original_language":"ja",
             "overview":"Mapped overview", "videos":{"results":[{"site":"YouTube","type":"Trailer","key":"mapped","name":"Trailer"}]}, "production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"mapped keyword"}]},
             "belongs_to_collection":{"id":99,"name":"Mapped collection"},"poster_path":"/mapped-tmdb.png","credits":{"cast":[],"crew":[]}}),
+        "/tmdb/movie/901/images" => json!({"posters":[{"file_path":"/mapped-tmdb.png","width":640,"height":960}],"backdrops":[],"logos":[]}),
         "/fanart/movies/901" => json!({"movieposter":[{"url":art("mapped-fanart"),"lang":"en"}]}),
         "/tvdb/login" => json!({"data":{"token":"test"}}),
         "/tvdb/search/remoteid/tt123456" | "/tvdb/search/remoteid/777" => json!({"data":[{"series":{"id":42}}]}),
         "/tvdb/series/42/extended" => json!({"data":{"id":42,"name":"Mapped series","overview":"TVDB series overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped series"}],"overviewTranslations":[{"language":"eng","overview":"TVDB series overview"}]},
             "averageRuntime":42,"slug":"mapped-series","lists":[{"id":9,"isOfficial":true}],
             "remoteIds":[{"sourceName":"IMDB","id":"tt123456"}],
             "artworks":[{"type":2,"image":art("mapped-tvdb")}]
         }}),
         "/tvdb/series/42/episodes/official" => json!({"data":{"episodes":[{"id":43,"seasonNumber":1,"number":1}]}}),
         "/tvdb/episodes/43/extended" => json!({"data":{"id":43,"name":"Mapped episode","overview":"TVDB episode overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped episode"}],"overviewTranslations":[{"language":"eng","overview":"TVDB episode overview"}]},
             "airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,
             "remoteIds":[{"sourceName":"IMDB","id":"tt123457"}],"characters":[]}}),
         "/fanart/tv/42" => json!({"tvposter":[{"url":art("mapped-series-fanart"),"lang":"en"}]}),
@@ -327,6 +330,37 @@ fn omdb_answer(target: &str) -> Option<String> {
     None
 }
 
+/// Movie detail and image-list replies are separate provider requests.
+fn movie_answer(id: &str) -> Option<String> {
+    if let Some(id) = id.strip_suffix("/images") {
+        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+        let posters = if *title == "Alpha" {
+            json!([{"file_path":"/alpha-poster.png","width":640,"height":960}])
+        } else {
+            json!([])
+        };
+        return Some(json!({"posters":posters,"backdrops":[],"logos":[]}).to_string());
+    }
+    let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+    // Alpha alone has artwork and a cast member: the artwork and person
+    // requests of every row are then Alpha's (or nobody's).
+    let (poster, cast) = if *title == "Alpha" {
+        (
+            r#""poster_path": "/alpha-poster.png","#,
+            r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
+                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
+        )
+    } else {
+        ("", "[]")
+    };
+    Some(format!(
+        r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
+                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
+                "release_dates": {{"results": []}}}}"#,
+        trailer(title)
+    ))
+}
+
 /// The stand-in's answer to `target` (path + query), `None` for a 404.
 fn answer(target: &str) -> Option<String> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -347,24 +381,7 @@ fn answer(target: &str) -> Option<String> {
         return Some(format!(r#"{{"results": [{}]}}"#, hits.join(",")));
     }
     if let Some(id) = path.strip_prefix("/tmdb/movie/") {
-        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
-        // Alpha alone has artwork and a cast member: the artwork and person
-        // requests of every row are then Alpha's (or nobody's).
-        let (poster, cast) = if *title == "Alpha" {
-            (
-                r#""poster_path": "/alpha-poster.png","#,
-                r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
-                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
-            )
-        } else {
-            ("", "[]")
-        };
-        return Some(format!(
-            r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
-                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
-                "release_dates": {{"results": []}}}}"#,
-            trailer(title)
-        ));
+        return movie_answer(id);
     }
     if path == "/tmdb/person/501" {
         return Some(
@@ -379,6 +396,9 @@ fn answer(target: &str) -> Option<String> {
         let mut parts = rest.split('/');
         let id = parts.next()?;
         let (title, _) = SHOWS.iter().find(|(_, s)| s.to_string() == id)?;
+        if rest.ends_with("/images") {
+            return Some(json!({"posters":[],"backdrops":[],"logos":[],"stills":[]}).to_string());
+        }
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
@@ -2171,13 +2191,12 @@ async fn rows(h: &Harness) {
         "row 5: {added:?}"
     );
     // The episode is created; its season is the nearest existing item and
-    // goes through the decision (its folder's mtime moved: D3); the sibling
-    // episode is saved, now in a mixed folder (a second episode beside it,
-    // `ResolveVideos`' count); the series and the location's folder are
-    // context only.
+    // goes through the decision (its folder's mtime moved: D3). Pinned
+    // EpisodeResolver does not set IsInMixedFolder when a sibling appears;
+    // the existing episode, series and location are otherwise unchanged.
     assert_eq!(added.item("watcher", "created"), 1.0, "row 5: {added:?}");
-    assert_eq!(added.item("watcher", "updated"), 2.0, "row 5: {added:?}");
-    assert_eq!(added.item("watcher", "unchanged"), 2.0, "row 5: {added:?}");
+    assert_eq!(added.item("watcher", "updated"), 1.0, "row 5: {added:?}");
+    assert_eq!(added.item("watcher", "unchanged"), 3.0, "row 5: {added:?}");
     assert_eq!(added.outcome("removed"), 0.0, "row 5: {added:?}");
     assert_eq!(
         added.probes.get("ok").copied(),
@@ -2201,7 +2220,6 @@ async fn rows(h: &Harness) {
     let mut expected = vec![
         lantern_series.clone(),
         lantern_season.clone(),
-        m.key(&m.lantern_e2.with_file_name("Lantern - S01E01.mkv")),
         m.key(&m.lantern_e2),
     ];
     expected.sort_unstable();
@@ -2229,10 +2247,10 @@ async fn rows(h: &Harness) {
     // The season goes through the decision again (its folder changed):
     // `requiresRefresh` runs its one ticked season provider, TheMovieDb's,
     // which asks for the season once — nothing else is asked for. The
-    // sibling, alone again, leaves its mixed folder and is saved.
+    // existing sibling keeps its resolver state and is not saved again.
     assert_eq!(
         removed.item("watcher", "updated"),
-        2.0,
+        1.0,
         "row 6: {removed:?}"
     );
     assert_eq!(removed.outcome("created"), 0.0, "row 6: {removed:?}");
@@ -2916,13 +2934,15 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
     assert!(
         seen.requests
             .iter()
-            .any(|r| r.contains("/image/mapped-fanart.png"))
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+        "{seen:?}"
     );
     assert!(
         !seen
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb"))
+            .any(|r| r.contains("/image/mapped-fanart.png")),
+        "{seen:?}"
     );
     let id = h.id(&movie).await;
     let dto = h.item(&id).await;
@@ -2941,8 +2961,9 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         !quiet.writes.contains_key("BaseItemImageInfos"),
         "{quiet:?}"
     );
-    // An explicit library order overrides the default on image replacement.
-    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["TheMovieDb", "FanArt"]);
+    // Movie providers default to TMDB before FanArt (pinned intrinsic order).
+    // An explicit reversed library order overrides that on replacement.
+    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["FanArt", "TheMovieDb"]);
     h.post(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
@@ -2956,7 +2977,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         reordered
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+            .any(|r| r.contains("/image/mapped-fanart.png")),
         "{reordered:?}"
     );
 
