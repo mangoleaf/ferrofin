@@ -1060,14 +1060,24 @@ async fn sync_play_returns_501_when_manager_unwired() {
 
 /// Authenticates as [`USER_ID`] with a chosen stored `SyncPlayAccess` value, so
 /// the policy table can be driven from a test.
-struct PolicyAuth(i32);
+struct PolicyAuth {
+    access: i32,
+    admin: bool,
+    api_key: bool,
+}
 
 impl PolicyAuth {
     fn info(&self) -> AuthorizationInfo {
         let mut user = user_entity(USER_ID, "alice");
-        user.sync_play_access = self.0;
+        user.sync_play_access = self.access;
         AuthorizationInfo {
-            user: Some(user),
+            user: (!self.api_key).then_some(user),
+            is_api_key: self.api_key,
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                is_administrator: self.admin,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
             ..authed_info()
         }
     }
@@ -1149,9 +1159,22 @@ impl SyncPlayManager for GatedSyncPlay {
 /// A state whose caller has `access` and whose SyncPlay membership is `active`,
 /// plus the "the manager was reached" flag.
 fn policy_state(access: i32, active: bool) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
+    policy_state_as(access, active, false, false)
+}
+
+fn policy_state_as(
+    access: i32,
+    active: bool,
+    admin: bool,
+    api_key: bool,
+) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
     let (sessions, user_data) = recording();
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let auth = Arc::new(PolicyAuth(access));
+    let auth = Arc::new(PolicyAuth {
+        access,
+        admin,
+        api_key,
+    });
     let state = AppState::new(
         Arc::new(OkLibrary),
         Arc::new(OkUsers),
@@ -1999,4 +2022,41 @@ async fn session_mutations_refuse_an_uncontrollable_target_before_writing() {
             && calls.capabilities.is_none()
             && calls.now_viewing.is_none()
     );
+}
+
+#[tokio::test]
+async fn sync_play_inherits_admin_override_but_api_keys_have_no_user() {
+    for access in [CREATE_AND_JOIN, JOIN_ONLY, NO_SYNC_PLAY] {
+        for (method, uri, body, allowed) in [
+            (
+                "POST",
+                "/SyncPlay/New",
+                r#"{"GroupName":"g"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/SyncPlay/Join",
+                r#"{"GroupId":"00000000-0000-0000-0000-000000000001"}"#,
+                StatusCode::NO_CONTENT,
+            ),
+            ("GET", "/SyncPlay/List", "", StatusCode::OK),
+            ("POST", "/SyncPlay/Leave", "", StatusCode::NO_CONTENT),
+        ] {
+            for api_key in [false, true] {
+                let (app, reached) = policy_state_as(access, false, !api_key, api_key);
+                let (status, _) = send(app, method, uri, Body::from(body)).await;
+                assert_eq!(
+                    status,
+                    if api_key {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        allowed
+                    },
+                    "{access} {api_key} {uri}"
+                );
+                assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), !api_key);
+            }
+        }
+    }
 }
