@@ -982,6 +982,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_selection_and_legacy_block_precedence_apply_to_admins_too() {
+        let f = Fixture::new().await;
+        let channel = f.item(62, BaseItemKind::Channel, None, None).await;
+        let other = Uuid::from_u128(64).to_string();
+        let mut movie = f.item(63, BaseItemKind::Movie, None, None).await;
+        movie.channel_id = Some(channel.id.clone());
+        f.save(&movie).await;
+        for admin in [false, true] {
+            set_permission(
+                f.db.pool(),
+                &f.user.id,
+                PermissionKind::IsAdministrator,
+                admin,
+            )
+            .await
+            .expect("admin");
+            for (all, selected, blocked, expected) in [
+                (true, false, None, true),
+                (false, false, None, false),
+                (false, true, None, true),
+                (true, true, Some(&channel.id), false),
+                (false, false, Some(&other), true),
+            ] {
+                set_permission(
+                    f.db.pool(),
+                    &f.user.id,
+                    PermissionKind::EnableAllChannels,
+                    all,
+                )
+                .await
+                .expect("channels");
+                let enabled = if selected {
+                    vec![channel.id.as_str()]
+                } else {
+                    vec![]
+                };
+                f.pref(PreferenceKind::EnabledChannels, &enabled).await;
+                f.pref(
+                    PreferenceKind::BlockedChannels,
+                    &blocked.map(String::as_str).into_iter().collect::<Vec<_>>(),
+                )
+                .await;
+                assert_eq!(
+                    f.visible(&channel).await,
+                    expected,
+                    "channel: admin={admin}, all={all}"
+                );
+                assert_eq!(
+                    f.visible(&movie).await,
+                    expected,
+                    "content: admin={admin}, all={all}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn live_tv_program_channel_id_is_not_a_plugin_channel_reference() {
         let f = Fixture::new().await;
         let mut program = f.item(65, BaseItemKind::LiveTvProgram, None, None).await;
