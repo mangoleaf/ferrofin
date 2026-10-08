@@ -1844,6 +1844,10 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     // Saved policy can change the effective codecs on an otherwise identical
     // URL. Do not serve a previous encoder job after a permission change.
     request.playback_permissions.hash(&mut hasher);
+    // ForceRemoteSourceTranscoding changes these negotiated vetoes. A new
+    // encoding request must not reuse a copied stream with the same session.
+    request.allow_video_stream_copy.hash(&mut hasher);
+    request.allow_audio_stream_copy.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
     // subtitled and non-subtitled transcode of the same item would collide. The
     // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
@@ -4348,6 +4352,7 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-maxrate 1000000"), "re-encode caps: {args}");
         assert!(args.contains("-b:a 128000"), "audio bitrate: {args}");
+        let encoded_playlist = plan.playlist_path.clone();
 
         // A copy-eligible request (8 Mbps cap above the 6 Mbps source): both
         // streams copy, the bitrates are still the GetStreamingState values
@@ -4371,6 +4376,10 @@ mod tests {
             "copy has no bitrate args: {args}"
         );
         assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
+        assert_ne!(
+            plan.playlist_path, encoded_playlist,
+            "copy vetoes must separate encoded and copied output"
+        );
         assert_eq!(
             plan.min_segments, 3,
             "3s segments → 3 (StreamState.MinSegments)"
