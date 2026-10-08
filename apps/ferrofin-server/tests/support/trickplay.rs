@@ -172,7 +172,7 @@ impl Fixture {
         let id = uuid::Uuid::parse_str(&self.movie).unwrap().to_string();
         self.tmp
             .path()
-            .join("data/trickplay")
+            .join("data/data/trickplay")
             .join(&id[..2])
             .join(id)
     }

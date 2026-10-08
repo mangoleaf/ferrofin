@@ -121,8 +121,8 @@ pub trait TrickplayManager: Send + Sync {
     /// Port of `GetTrickplayTilePathAsync`. Returns `None` when the item has no
     /// stored info for `width`; the returned path is not guaranteed to exist on
     /// disk (the caller checks before serving, mirroring the C# `File.Exists`
-    /// gate). The C# `saveWithMedia` flag (a per-library option) is not modeled
-    /// at this seam, so the internal trickplay directory layout is always used.
+    /// gate). The implementation resolves the item's live library setting to
+    /// choose its internal or media-adjacent trickplay directory.
     async fn get_trickplay_tile_path(
         &self,
         item_id: Uuid,

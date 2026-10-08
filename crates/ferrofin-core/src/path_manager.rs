@@ -90,12 +90,19 @@ impl PathManager for FerrofinPathManager {
             // Alongside the media file: {containing-folder}/{stem}.trickplay
             let media = std::path::Path::new(media_path);
             let folder = media.parent().unwrap_or_else(|| std::path::Path::new(""));
-            let stem = media.file_stem().map_or_else(
+            let name = media.file_name().map_or_else(
                 || std::ffi::OsString::from("trickplay"),
                 std::borrow::ToOwned::to_owned,
             );
-            let mut file = PathBuf::from(stem);
-            file.set_extension("trickplay");
+            let mut file = PathBuf::from(&name);
+            // Path.ChangeExtension replaces a leading dot as the extension
+            // separator too; Rust treats a lone leading-dot name as a stem.
+            let bytes = name.as_encoded_bytes();
+            if bytes.first() == Some(&b'.') && !bytes[1..].contains(&b'.') {
+                file.set_file_name(".trickplay");
+            } else {
+                file.set_extension("trickplay");
+            }
             return folder.join(file).to_string_lossy().into_owned();
         }
         let hyphenated = id_hyphenated(item_id);
@@ -252,6 +259,43 @@ mod tests {
 
         let with_media = m.trickplay_directory(id, "/media/movie.mkv", true);
         assert_eq!(with_media, "/media/movie.trickplay");
+        assert_eq!(
+            m.trickplay_directory(id, "/media/Movie.Name.mkv", true),
+            "/media/Movie.Name.trickplay"
+        );
+        assert_eq!(
+            m.trickplay_directory(id, "/media/Movie.Other.mkv", true),
+            "/media/Movie.Other.trickplay"
+        );
+    }
+
+    #[test]
+    fn trickplay_sidecar_extension_matches_dotnet_for_leaf_names() {
+        let (_tmp, manager) = manager();
+        let id = Uuid::from_u128(0x4c32);
+        for (media, expected) in [
+            ("/media/.mkv", "/media/.trickplay"),
+            ("/media/.hidden", "/media/.trickplay"),
+            ("/media/.媒体", "/media/.trickplay"),
+            ("/media/.hidden.mkv", "/media/.hidden.trickplay"),
+            ("/media/..mkv", "/media/..trickplay"),
+            ("/media/Movie.Name.mkv", "/media/Movie.Name.trickplay"),
+            ("/media/Movie.Other.mkv", "/media/Movie.Other.trickplay"),
+            ("/media/movie", "/media/movie.trickplay"),
+            ("/media/movie.", "/media/movie.trickplay"),
+            ("/media/.hidden.", "/media/.hidden.trickplay"),
+        ] {
+            assert_eq!(
+                manager.trickplay_directory(id, media, true),
+                expected,
+                "{media}"
+            );
+            assert_eq!(
+                manager.trickplay_directory(id, media, false),
+                manager.trickplay_directory(id, "/media/ordinary.mkv", false),
+                "the internal GUID layout does not depend on the leaf filename"
+            );
+        }
     }
 
     #[test]

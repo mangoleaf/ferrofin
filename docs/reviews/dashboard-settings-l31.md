@@ -68,3 +68,9 @@ Evidence: `/tmp/ferrofin-dashboard-l31-checks.json`,
 `/tmp/ferrofin-dashboard-l31-native-{before,after,reference}.json`.
 
 Target after validation: 23.86 GiB; host free space: 671.44 GiB.
+
+L32 revalidation repaired the shared HTTP fixture’s internal data root and added
+a successful cleanup control after removal of the injected database error.
+All four trickplay HTTP tests now pass with discovery demonstrably reached;
+see `dashboard-settings-l32.md`. The earlier held-manager unit evidence remains
+valid, while this replaces the earlier error-injection fixture evidence.

@@ -127,6 +127,13 @@ async fn blocking_custom_provider_service_error_still_updates_the_refresh_stamp(
         .execute(db.writer())
         .await
         .unwrap();
+    let etag = fixture.refresh("FullRefresh", false).await;
+    fixture.wait_etag(&etag).await;
+    assert!(
+        !grid.exists(),
+        "without the trigger, the same discovery succeeds and disabled cleanup removes the grid"
+    );
+    assert_eq!(fixture.extractions(), 0);
     fixture.finish().await;
 }
 
@@ -202,5 +209,68 @@ async fn scan_extraction_flag_and_live_timing_change_refresh_completion_without_
         3,
         "FullRefresh regeneration is forced even with automatic extraction disabled"
     );
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidecar_destination_and_migration_follow_live_options_and_preserve_dotted_media_names() {
+    let mut fixture = Fixture::start_with_name("Movie.Name.mkv").await;
+    fixture.options["EnableTrickplayImageExtraction"] = json!(true);
+    fixture.save_options().await;
+    fixture.run_task("RefreshTrickplayImages").await;
+    fixture.wait_tile(2).await;
+    let tile = "2 - 1x1/0.jpg";
+    let original = std::fs::read(fixture.internal_root().join(tile)).unwrap();
+    for sidecar in [true, false] {
+        fixture.options["SaveTrickplayWithMedia"] = json!(sidecar);
+        fixture.save_options().await;
+        assert_eq!(
+            fixture.tile(2).await.status(),
+            404,
+            "lookup switches immediately before migration moves files"
+        );
+        fixture.run_task("MoveTrickplayImages").await;
+        fixture.wait_tile(2).await;
+        let (selected, old) = if sidecar {
+            (fixture.sidecar_root(), fixture.internal_root())
+        } else {
+            (fixture.internal_root(), fixture.sidecar_root())
+        };
+        assert_eq!(std::fs::read(selected.join(tile)).unwrap(), original);
+        assert!(!old.exists());
+        assert_eq!(
+            fixture.extractions(),
+            1,
+            "migration keeps encoded tiles instead of regenerating"
+        );
+    }
+    fixture.options["SaveTrickplayWithMedia"] = json!(true);
+    fixture.options["EnableTrickplayImageExtraction"] = json!(false);
+    fixture.save_options().await;
+    fixture.run_task("MoveTrickplayImages").await;
+    assert!(
+        fixture.internal_root().join(tile).is_file(),
+        "disabled extraction prevents migration"
+    );
+    fixture.options["EnableTrickplayImageExtraction"] = json!(true);
+    fixture.save_options().await;
+    fixture.run_task("MoveTrickplayImages").await;
+    assert!(fixture.sidecar_root().join(tile).is_file());
+    assert!(
+        !fixture.media.join("Movie.trickplay").exists(),
+        "the entire dotted basename is preserved"
+    );
+    std::fs::remove_dir_all(fixture.sidecar_root()).unwrap();
+    std::fs::write(fixture.sidecar_root(), b"blocked destination").unwrap();
+    fixture.run_task("RefreshTrickplayImages").await;
+    assert_eq!(
+        std::fs::read(fixture.sidecar_root()).unwrap(),
+        b"blocked destination"
+    );
+    assert!(
+        !fixture.internal_root().exists(),
+        "a failed sidecar write cannot silently choose internal storage"
+    );
+    assert_eq!(fixture.tile(2).await.status(), 404);
     fixture.finish().await;
 }

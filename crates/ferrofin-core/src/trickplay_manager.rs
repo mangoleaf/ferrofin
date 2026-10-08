@@ -11,11 +11,9 @@
 //! into the [`PathManager`] trickplay layout, and persist the info row.
 //!
 //! Departures from the C# (documented per the port rules):
-//! - The per-library `EnableTrickplayImageExtraction` gate is honoured (an
-//!   item in a library with it off has its tiles and rows pruned, as in C#),
-//!   but `SaveTrickplayWithMedia` only feeds the "user-managed, leave alone"
-//!   guard: tiles are always generated into the **internal**
-//!   (non-save-with-media) layout, matching [`Self::get_trickplay_tile_path`].
+//! - Per-library extraction and storage settings govern generation, tile
+//!   lookup and migration. Disabled extraction preserves media-adjacent files
+//!   as user-managed unless an explicit replacement was requested.
 //! - Eligibility reads the resolved/stored video type, placeholder and shortcut
 //!   facts, live DVR captures/channel livestreams, runtime and any media streams
 //!   before discovery, pruning or generation (`CanGenerateTrickplay`).
@@ -48,6 +46,7 @@ use uuid::Uuid;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
@@ -77,6 +76,7 @@ pub struct FerrofinTrickplayManager {
     frame_extractor: Arc<dyn TrickplayFrameExtractor>,
     image_encoder: Arc<dyn ImageEncoder>,
     live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
+    virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -101,8 +101,8 @@ impl Drop for TemporaryTrickplayDirectory {
 }
 
 /// The per-width refresh context shared by [`FerrofinTrickplayManager`] helpers:
-/// the item identity, its media path, its stored video width, and the resolved
-/// internal trickplay directory.
+/// the item identity, its media path, its stored video width, and the selected
+/// trickplay directory.
 struct WidthRefreshContext<'a> {
     /// The item being refreshed.
     item_id: Uuid,
@@ -115,7 +115,7 @@ struct WidthRefreshContext<'a> {
     /// needs the codec, and a hardware scaler takes fixed pixel dimensions, so
     /// an anamorphic source has to be un-stretched from its aspect ratio.
     video_stream: Option<MediaStream>,
-    /// The internal trickplay directory for the item.
+    /// The selected trickplay directory for the item.
     trickplay_dir: &'a str,
 }
 
@@ -178,7 +178,29 @@ impl FerrofinTrickplayManager {
             frame_extractor,
             image_encoder,
             live_tv: None,
+            virtual_folders: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Connects the live library-options reader before the server starts.
+    pub fn attach_virtual_folders(&self, folders: Arc<dyn VirtualFolderManager>) {
+        let _ = self.virtual_folders.set(folders);
+    }
+
+    async fn library_options(
+        &self,
+        entity: &BaseItemEntity,
+    ) -> Result<Option<LibraryOptions>, ServiceError> {
+        let Some(folders) = self.virtual_folders.get() else {
+            return Ok(None);
+        };
+        let folders = folders.get_virtual_folders().await?;
+        Ok(ferrofin_model::entities_media::owning_library(
+            &folders,
+            entity.top_parent_id.as_deref(),
+            entity.path.as_deref(),
+        )
+        .and_then(|library| library.library_options.clone()))
     }
 
     /// Fetches all stored trickplay rows for an item, keyed by tile width.
@@ -705,13 +727,9 @@ impl FerrofinTrickplayManager {
     /// Moves this item's generated trickplay tiles to the location the
     /// configuration dictates.
     ///
-    /// Port of `MoveGeneratedTrickplayDataAsync`. Ferrofin has no per-library
-    /// `SaveTrickplayWithMedia` option (see `ferrofin-providers`'
-    /// `LibraryOptions`), so the configured location is always the **internal**
-    /// data-dir layout: any tiles found in a media-adjacent `.trickplay` folder
-    /// are moved into the internal directory (media wins over an already
-    /// populated internal folder, as in the C#), and the emptied `.trickplay`
-    /// parent folder is removed.
+    /// Port of `MoveGeneratedTrickplayDataAsync`: reads the owning library's
+    /// current extraction flag and destination on every task invocation.
+    /// Moves either way and removes the emptied source container.
     ///
     /// This is an inherent method (not on the [`TrickplayManager`] trait),
     /// consumed by the "Migrate Trickplay Image Location" scheduled task.
@@ -721,9 +739,36 @@ impl FerrofinTrickplayManager {
     /// Returns [`ServiceError`] when the item lookup, configuration read, or a
     /// filesystem move fails.
     pub async fn move_generated_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        self.move_trickplay_data(item_id, false).await
+    }
+
+    /// The source migration task selects physical Video kinds, including owned
+    /// extras and complete channel VOD. SourceTypes is declared but not consumed
+    /// by the pinned query. Keep its other filters outside the public manager.
+    pub(crate) async fn move_generated_library_trickplay_data(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        self.move_trickplay_data(item_id, true).await
+    }
+
+    async fn move_trickplay_data(
+        &self,
+        item_id: Uuid,
+        library_only: bool,
+    ) -> Result<(), ServiceError> {
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
+        if library_only && !is_library_video(&entity) {
+            return Ok(());
+        }
+        let Some(library) = self.library_options(&entity).await? else {
+            return Ok(());
+        };
+        if !library.enable_trickplay_image_extraction {
+            return Ok(());
+        }
         let options = self.trickplay_options().await?;
         let streams = self.media_streams(item_id).await?;
         let Some(media_path) = Self::can_generate_trickplay(
@@ -734,32 +779,30 @@ impl FerrofinTrickplayManager {
         ) else {
             return Ok(());
         };
-
         let local_root = self
             .path_manager
             .trickplay_directory(item_id, &media_path, false);
         let media_root = self
             .path_manager
             .trickplay_directory(item_id, &media_path, true);
-
+        let (source_root, destination_root) = if library.save_trickplay_with_media {
+            (&local_root, &media_root)
+        } else {
+            (&media_root, &local_root)
+        };
         for info in self.resolutions_for(item_id).await?.values() {
             let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
-            let media_dir = Path::new(&media_root).join(&sub);
-            let local_dir = Path::new(&local_root).join(&sub);
-            if !media_dir.is_dir() {
-                continue;
-            }
-            // Mirror the C# guard: move when the media-adjacent folder has
-            // files and the internal one is either absent or itself populated
-            // (the move replaces it).
-            let local_exists = local_dir.exists();
-            if has_tiles(&media_dir) && (!local_exists || has_tiles(&local_dir)) {
-                move_content(&media_dir, &local_dir)?;
-                tracing::info!(
-                    item = %item_id,
-                    to = %local_dir.display(),
-                    "moved trickplay images"
-                );
+            let source = Path::new(source_root).join(&sub);
+            let destination = Path::new(destination_root).join(&sub);
+            // Match the source's enumerated-file guard, including a populated
+            // destination that receives matching-file overwrites, while an
+            // existing empty destination remains untouched.
+            if source.is_dir()
+                && has_files(&source)?
+                && (!destination.is_dir() || has_files(&destination)?)
+            {
+                move_content(&source, &destination)?;
+                tracing::info!(item = %item_id, to = %destination.display(), "moved trickplay images");
             }
         }
         Ok(())
@@ -796,9 +839,11 @@ impl FerrofinTrickplayManager {
             .await?;
         }
 
-        let trickplay_dir = self
-            .path_manager
-            .trickplay_directory(item_id, &media_path, false);
+        let trickplay_dir = self.path_manager.trickplay_directory(
+            item_id,
+            &media_path,
+            library_options.save_trickplay_with_media,
+        );
 
         let enabled = library_options.enable_trickplay_image_extraction;
         // When extraction is disabled and files live next to media, treat them
@@ -1097,16 +1142,26 @@ impl TrickplayManager for FerrofinTrickplayManager {
         width: i32,
         index: i32,
     ) -> Result<Option<String>, ServiceError> {
-        // Port of C# `GetTrickplayTilePathAsync`: locate the resolution, then
-        // build `{trickplay-dir}/{width} - {tw}x{th}/{index}.jpg`. The C#
-        // `saveWithMedia` flag (a per-library option) is not modeled at this
-        // seam, so the internal (non-save-with-media) directory is used; the
-        // media path it ignores is passed empty.
+        // Resolve the library live, so toggling the option affects HTTP tile
+        // reads immediately. Existing data is moved by the migration task.
         let resolutions = self.resolutions_for(item_id).await?;
         let Some(info) = resolutions.get(&width) else {
             return Ok(None);
         };
-        let base = self.path_manager.trickplay_directory(item_id, "", false);
+        let entity = self.items.retrieve_item(item_id).await?;
+        let library = if let Some(entity) = entity.as_ref() {
+            self.library_options(entity).await?
+        } else {
+            None
+        };
+        let base = self.path_manager.trickplay_directory(
+            item_id,
+            entity
+                .as_ref()
+                .and_then(|row| row.path.as_deref())
+                .unwrap_or_default(),
+            library.is_some_and(|options| options.save_trickplay_with_media),
+        );
         let subdir = format!("{} - {}x{}", width, info.tile_width, info.tile_height);
         let path = std::path::Path::new(&base)
             .join(subdir)
@@ -1302,15 +1357,77 @@ fn move_dir(src: &Path, dst: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// ManagedFileSystem.MoveDirectory: rename when possible; otherwise copy flat
+/// source files with overwrite, preserving other populated destination files.
+fn move_migration_directory(src: &Path, dst: &Path) -> Result<(), ServiceError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ServiceError::backend(format!("cannot create migration parent: {error}"))
+        })?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst).map_err(|error| {
+        ServiceError::backend(format!("cannot create migration destination: {error}"))
+    })?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|error| ServiceError::backend(format!("cannot read migration source: {error}")))?
+    {
+        let entry = entry.map_err(|error| {
+            ServiceError::backend(format!("cannot list migration source: {error}"))
+        })?;
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).map_err(|error| {
+                ServiceError::backend(format!("cannot copy migrated tile: {error}"))
+            })?;
+        }
+    }
+    std::fs::remove_dir_all(src).map_err(|error| {
+        ServiceError::backend(format!("cannot remove migration source: {error}"))
+    })?;
+    Ok(())
+}
+
+/// Migration checks any file, whereas discovery checks specifically JPEGs.
+fn has_files(directory: &Path) -> Result<bool, ServiceError> {
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        ServiceError::backend(format!("cannot read migration directory: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ServiceError::backend(format!("cannot list migration directory: {error}"))
+        })?;
+        if entry.path().is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Port of the C# `MoveContent`: moves `src` into `dst`, then removes `src`'s
 /// now-empty parent folder (the `.trickplay` container) when nothing is left in
 /// it.
 fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
-    move_dir(src, dst)?;
-    if let Some(parent) = src.parent()
-        && std::fs::read_dir(parent).is_ok_and(|mut d| d.next().is_none())
-    {
-        let _ = std::fs::remove_dir(parent);
+    move_migration_directory(src, dst)?;
+    if let Some(parent) = src.parent() {
+        let entries = std::fs::read_dir(parent).map_err(|error| {
+            ServiceError::backend(format!("cannot read migration source parent: {error}"))
+        })?;
+        let mut has_directories = false;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ServiceError::backend(format!("cannot list migration source parent: {error}"))
+            })?;
+            has_directories |= entry.path().is_dir();
+        }
+        // The source enumerates directories, then attempts a nonrecursive
+        // deletion. Remaining ordinary files cause its reported cleanup error.
+        if !has_directories {
+            std::fs::remove_dir(parent).map_err(|error| {
+                ServiceError::backend(format!("cannot remove migration source parent: {error}"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -1470,7 +1587,7 @@ mod tests {
     /// The full manager fixture: temp app paths, real path manager / item
     /// repository / `image`-crate encoder, fake config + extractor.
     struct Rig {
-        _tmp: tempfile::TempDir,
+        temp_dir: tempfile::TempDir,
         mgr: FerrofinTrickplayManager,
         extractor: Arc<FakeExtractor>,
         pm: Arc<dyn PathManager>,
@@ -1499,7 +1616,7 @@ mod tests {
             Arc::new(ImageCrateEncoder::new()),
         );
         Rig {
-            _tmp: tmp,
+            temp_dir: tmp,
             mgr,
             extractor,
             pm,
@@ -1536,7 +1653,7 @@ mod tests {
         runtime_ticks: Option<i64>,
         video_width: Option<i64>,
     ) -> String {
-        seed_item(db, id, BaseItemKind::Movie).await;
+        crate::test_support::seed_video_item(db, id, BaseItemKind::Movie).await;
         let media_path = rig.media_dir.join(format!("{id}.mkv"));
         std::fs::write(&media_path, b"not really a video").expect("media file");
         let path_str = media_path.to_string_lossy().into_owned();
@@ -2119,6 +2236,8 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders);
 
         // A stored row plus tiles living media-adjacent (`{stem}.trickplay`).
         let mut row = info(item, 320);
@@ -2148,6 +2267,8 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders);
 
         // Row + internal tiles only: nothing to move, nothing destroyed.
         let mut row = info(item, 320);
@@ -2460,6 +2581,318 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    async fn configured_library(
+        rig: &Rig,
+        save_with_media: bool,
+    ) -> (Arc<crate::FerrofinVirtualFolderManager>, LibraryOptions) {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            rig.temp_dir.path().join("views"),
+        ));
+        let options = LibraryOptions {
+            path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                path: rig.media_dir.to_string_lossy().into_owned(),
+            }],
+            enable_trickplay_image_extraction: true,
+            save_trickplay_with_media: save_with_media,
+            ..LibraryOptions::default()
+        };
+        folders
+            .add_virtual_folder(
+                "Movies",
+                Some(ferrofin_model::entities::CollectionTypeOptions::movies),
+                &options,
+            )
+            .await
+            .unwrap();
+        (folders, options)
+    }
+
+    #[tokio::test]
+    async fn sidecar_generation_and_http_lookup_honor_the_library_destination_without_fallback() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, mut options) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert!(sidecar.join("320 - 2x2/0.jpg").is_file());
+        assert!(!internal.exists());
+        assert_eq!(
+            r.mgr.get_trickplay_tile_path(item, 320, 0).await.unwrap(),
+            Some(
+                sidecar
+                    .join("320 - 2x2/0.jpg")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        let original = std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap();
+        options.enable_trickplay_image_extraction = false;
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(r.extractor.calls(), 1, "disabled sidecars are user-managed");
+        assert_eq!(
+            std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap(),
+            original
+        );
+        r.mgr
+            .refresh_trickplay_data(item, true, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            2,
+            "forced replacement still uses the selected sidecar"
+        );
+        std::fs::remove_dir_all(&sidecar).unwrap();
+        std::fs::write(&sidecar, b"blocked output destination").unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, true, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"blocked output destination"
+        );
+        assert!(
+            !internal.exists(),
+            "a failed sidecar write does not choose internal storage"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty(),
+            "failed writing cannot leave a manifest pointing at absent tiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_destination_changes_move_both_ways_and_disabled_extraction_prevents_migration() {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, mut options) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders.clone());
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let original = std::fs::read(internal.join("320 - 2x2/0.jpg")).unwrap();
+        for save in [true, false] {
+            options.save_trickplay_with_media = save;
+            folders
+                .update_library_options("Movies", &options)
+                .await
+                .unwrap();
+            let selected = if save { &sidecar } else { &internal };
+            let old = if save { &internal } else { &sidecar };
+            let tile = selected.join("320 - 2x2/0.jpg");
+            assert_eq!(
+                r.mgr.get_trickplay_tile_path(item, 320, 0).await.unwrap(),
+                Some(tile.to_string_lossy().into_owned()),
+                "HTTP lookup reads the new option live"
+            );
+            assert!(
+                !tile.exists(),
+                "changing the checkbox alone does not relocate data"
+            );
+            r.mgr.move_generated_trickplay_data(item).await.unwrap();
+            assert_eq!(std::fs::read(&tile).unwrap(), original);
+            assert!(
+                !old.exists(),
+                "empty source container is cleaned after migration"
+            );
+            assert_eq!(
+                r.extractor.calls(),
+                1,
+                "migration reuses tiles instead of re-encoding"
+            );
+        }
+        options.enable_trickplay_image_extraction = false;
+        options.save_trickplay_with_media = true;
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert!(internal.join("320 - 2x2/0.jpg").is_file());
+        assert!(
+            !sidecar.exists(),
+            "disabled extraction leaves generated data in place during migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_overwrites_matching_tiles_preserves_other_files_and_skips_empty_destination()
+    {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::write(internal.join("0.jpg"), b"source").unwrap();
+        std::fs::create_dir_all(&sidecar).unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert!(
+            internal.join("0.jpg").exists(),
+            "an existing empty destination is skipped by the pinned guard"
+        );
+        std::fs::write(sidecar.join("0.jpg"), b"old collision").unwrap();
+        std::fs::write(sidecar.join("extra.jpg"), b"preserved destination file").unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert_eq!(std::fs::read(sidecar.join("0.jpg")).unwrap(), b"source");
+        assert_eq!(
+            std::fs::read(sidecar.join("extra.jpg")).unwrap(),
+            b"preserved destination file"
+        );
+        assert!(!internal.exists());
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_reports_a_file_blocking_the_selected_destination_and_retains_the_source() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::write(internal.join("0.jpg"), b"source tiles").unwrap();
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, b"destination blocker").unwrap();
+        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert_eq!(
+            std::fs::read(internal.join("0.jpg")).unwrap(),
+            b"source tiles"
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"destination blocker");
+        assert_eq!(r.extractor.calls(), 0);
+        assert_eq!(
+            r.mgr.get_trickplay_resolutions(item).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_reports_source_container_cleanup_errors_after_moving_tiles() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        std::fs::create_dir_all(internal.join("320 - 2x2")).unwrap();
+        std::fs::write(internal.join("320 - 2x2/0.jpg"), b"source tiles").unwrap();
+        std::fs::write(internal.join("retained.txt"), b"ordinary source file").unwrap();
+        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert_eq!(
+            std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap(),
+            b"source tiles"
+        );
+        assert!(!internal.join("320 - 2x2").exists());
+        assert_eq!(
+            std::fs::read(internal.join("retained.txt")).unwrap(),
+            b"ordinary source file"
+        );
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_task_selects_physical_videos_and_preserves_owned_extras_and_channel_vod() {
+        use crate::scheduled_tasks::{ScheduledTask as _, TaskProgress};
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let owner = Uuid::new_v4();
+        seed_item(&db, owner, BaseItemKind::Movie).await;
+        let mut cases = Vec::new();
+        for (label, eligible) in [
+            ("owned", true),
+            ("missing_media", true),
+            ("channel", true),
+            ("virtual", false),
+            ("folder", false),
+            ("audio", false),
+        ] {
+            let item = Uuid::new_v4();
+            let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+            let mut entity = crate::test_support::fetch_item(&db, item).await;
+            match label {
+                "owned" => entity.owner_id = Some(guid_to_db(owner)),
+                "missing_media" => std::fs::remove_file(&media).unwrap(),
+                "channel" => entity.channel_id = Some(Uuid::new_v4().to_string()),
+                "virtual" => entity.is_virtual_item = true,
+                "folder" => entity.is_folder = true,
+                "audio" => entity.media_type = Some("Audio".to_owned()),
+                _ => unreachable!(),
+            }
+            crate::test_support::save_item(&db, &entity).await;
+            let mut row = info(item, 320);
+            row.tile_width = 2;
+            row.tile_height = 2;
+            r.mgr.save_trickplay_info(&row).await.unwrap();
+            let internal =
+                PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            let sidecar =
+                PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+            std::fs::create_dir_all(&internal).unwrap();
+            std::fs::write(internal.join("0.jpg"), label.as_bytes()).unwrap();
+            cases.push((label, internal, sidecar, eligible));
+        }
+        let task = crate::scheduled_tasks::maintenance::MoveTrickplayImagesTask::new(Arc::new(
+            r.mgr.clone(),
+        ));
+        task.execute(&TaskProgress::default()).await.unwrap();
+        for (label, internal, sidecar, eligible) in cases {
+            assert_eq!(sidecar.join("0.jpg").exists(), eligible, "{label}");
+            assert_eq!(internal.join("0.jpg").exists(), !eligible, "{label}");
+            let selected = if eligible { sidecar } else { internal };
+            assert_eq!(
+                std::fs::read(selected.join("0.jpg")).unwrap(),
+                label.as_bytes()
+            );
+        }
+        assert_eq!(r.extractor.calls(), 0);
     }
 
     #[tokio::test]
