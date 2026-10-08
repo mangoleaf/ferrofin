@@ -778,3 +778,39 @@ async fn current_web_library_options_survive_creation_and_update() {
         );
     }
 }
+
+/// FakeLibrary panics if a scan is queued: a default/false rename must neither
+/// index newly added files nor replace metadata through a background refresh.
+#[tokio::test]
+async fn rename_without_refresh_does_not_queue_a_scan() {
+    for refresh in ["", "&refreshLibrary=false"] {
+        let (state, vf) = working_state();
+        ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+            &*vf,
+            "Old",
+            None,
+            &ferrofin_model::configuration::LibraryOptions::default(),
+        )
+        .await
+        .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/Library/VirtualFolders/Name?name=Old&newName=New{refresh}"
+                    ))
+                    .header("X-Emby-Token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let folders = ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+            .await
+            .unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name.as_deref(), Some("New"));
+    }
+}
