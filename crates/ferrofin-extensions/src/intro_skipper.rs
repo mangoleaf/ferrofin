@@ -24,6 +24,7 @@ use ferrofin_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episo
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::intro_skipper::{AnalysisMode as WireMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
@@ -135,6 +136,7 @@ impl Extension for IntroSkipperExtension {
             fingerprinter: cx.fingerprinter.clone(),
             cache_dir: cx.cache_dir.join("introskipper"),
             running: Arc::new(AtomicBool::new(false)),
+            actions: Arc::clone(&cx.intro_skipper),
         });
         vec![
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
@@ -479,6 +481,8 @@ struct DetectSegmentsTask {
     /// `true` while an analysis pass is running, so a second trigger is a no-op
     /// instead of a duplicate concurrent pass.
     running: Arc<AtomicBool>,
+    /// The per-season analyzer actions (`POST /Intros/AnalyzerActions/UpdateSeason`).
+    actions: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
 }
 
 #[allow(clippy::unnecessary_literal_bound)]
@@ -562,8 +566,8 @@ impl DetectSegmentsTask {
         // Only seasons with a comparable pair do work; drive progress off those
         // so the percentage tracks the fingerprinting rather than the skipped
         // singletons.
-        let analyzable: Vec<&Vec<Episode>> =
-            seasons.values().filter(|eps| eps.len() >= 2).collect();
+        let analyzable: Vec<(&String, &Vec<Episode>)> =
+            seasons.iter().filter(|(_, eps)| eps.len() >= 2).collect();
         let total = analyzable.len();
         tracing::info!(
             seasons = seasons.len(),
@@ -571,7 +575,9 @@ impl DetectSegmentsTask {
             "intro skipper: analysis started"
         );
         let mut written = 0usize;
-        for (idx, episodes) in analyzable.into_iter().enumerate() {
+        let mut unreadable = 0usize;
+        let mut first_error = None;
+        for (idx, (season_id, episodes)) in analyzable.into_iter().enumerate() {
             // Log + report BEFORE the season's fingerprinting (the slow part), so
             // a stall shows up as the last "analyzing season N" line with silence
             // after — pinpointing which season's media reads wedged.
@@ -584,9 +590,38 @@ impl DetectSegmentsTask {
                 segments = written,
                 "intro skipper: analyzing season"
             );
+            // A season id that is no GUID has no stored actions.
+            let actions = match Uuid::parse_str(season_id) {
+                Ok(season) => match self.actions.analyzer_actions(season).await {
+                    Ok(actions) => Some(actions),
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                        None
+                    }
+                },
+                Err(_) => Some(HashMap::new()),
+            };
+            unreadable += usize::from(actions.is_none());
             written += self
-                .analyze_season(episodes, config, fingerprinter.as_ref())
+                .analyze_season(actions.as_ref(), episodes, config, fingerprinter.as_ref())
                 .await;
+        }
+        if unreadable > 0 {
+            tracing::warn!(
+                seasons = unreadable,
+                err = %first_error.map(|e| e.to_string()).unwrap_or_default(),
+                "intro skipper: seasons skipped, their analyzer actions could not be read"
+            );
+        }
+        // `CleanCacheTask` → `CleanSeasonStateAsync`: drop the actions of
+        // seasons that no longer have episodes, so a season re-created under
+        // the same id does not inherit them.
+        let live: Vec<Uuid> = seasons
+            .keys()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect();
+        if let Err(err) = self.actions.retain_seasons(&live).await {
+            tracing::warn!(%err, "intro skipper: could not drop stale analyzer actions");
         }
         progress.report(100.0);
         tracing::info!(segments = written, "intro skipper: analysis complete");
@@ -637,12 +672,35 @@ impl DetectSegmentsTask {
     /// returning how many segments were written.
     async fn analyze_season(
         &self,
+        actions: Option<&HashMap<WireMode, AnalyzerAction>>,
         episodes: &[Episode],
         config: &IntroSkipperConfig,
         fingerprinter: &dyn Fingerprinter,
     ) -> usize {
+        // `BaseItemAnalyzerTask.AnalyzeItemsAsync`: a mode whose per-season
+        // action is `None` is not analysed for the season. Upstream throws on a
+        // failed read; the season is skipped (and counted by the caller), never
+        // analysed against a `None` it could not see.
+        // TODO: `Chapter`/`BlackFrame`/`Chromaprint` pick which analyzer leads
+        // upstream's chain (`BaseItemAnalyzerTask.cs:392-412`); Ferrofin has
+        // only the Chromaprint analyzer, so every non-`None` action runs it.
+        // Un-defer by porting `ChapterAnalyzer` + `BlackFrameAnalyzer` and
+        // building the chain from the action here.
+        let Some(actions) = actions else {
+            return 0;
+        };
+        let skip = |mode: WireMode| {
+            let none = actions.get(&mode) == Some(&AnalyzerAction::None);
+            if none {
+                tracing::debug!(
+                    ?mode,
+                    "intro skipper: mode skipped by the season's analyzer action"
+                );
+            }
+            none
+        };
         let mut intros = 0;
-        if config.scan_introduction {
+        if config.scan_introduction && !skip(WireMode::Introduction) {
             let mut best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Introduction)
                 .await;
@@ -656,7 +714,7 @@ impl DetectSegmentsTask {
                 .await;
         }
         let mut credits = 0;
-        if config.scan_credits {
+        if config.scan_credits && !skip(WireMode::Credits) {
             let best = self
                 .detect(episodes, config, fingerprinter, AnalysisMode::Credits)
                 .await;
@@ -1169,9 +1227,13 @@ mod tests {
         (a, b)
     }
 
+    /// The season every harness episode belongs to.
+    const SEASON: Uuid = Uuid::from_u128(0x5ea5_0001);
+
     struct Harness {
         task: DetectSegmentsTask,
         segments: Arc<dyn MediaSegmentManager>,
+        actions: Arc<ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore>,
         calls: Arc<AtomicUsize>,
         _cache: tempfile::TempDir,
     }
@@ -1216,7 +1278,7 @@ mod tests {
                 path: Some((*path).to_owned()),
                 #[allow(clippy::cast_possible_truncation)]
                 run_time_ticks: Some((secs * TICKS_PER_SECOND) as i64),
-                season_id: Some("season-1".to_owned()),
+                season_id: Some(SEASON.to_string()),
                 ..BaseItemEntity::default()
             })
             .collect();
@@ -1246,6 +1308,8 @@ mod tests {
         });
 
         let cache = tempfile::tempdir().expect("cache dir");
+        let actions =
+            Arc::new(ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default());
         Harness {
             task: DetectSegmentsTask {
                 library,
@@ -1257,8 +1321,11 @@ mod tests {
                 fingerprinter,
                 cache_dir: cache.path().join("introskipper"),
                 running: Arc::new(AtomicBool::new(false)),
+                actions: Arc::clone(&actions)
+                    as Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
             },
             segments,
+            actions,
             calls,
             _cache: cache,
         }
@@ -1354,6 +1421,61 @@ mod tests {
                 "segment must be non-empty"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_season_whose_intro_action_is_none_is_not_analysed() {
+        use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
+        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.actions
+            .set_analyzer_actions(
+                SEASON,
+                &[(AnalysisMode::Introduction, AnalyzerAction::None)],
+            )
+            .await
+            .expect("store");
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("execute");
+        for id in [EP_A, EP_B] {
+            assert!(intros_of(&h.segments, id).await.is_empty(), "episode {id}");
+        }
+        // Any other action analyses as before, and a season with no episodes
+        // left loses its actions on the run (`CleanSeasonStateAsync`).
+        h.actions
+            .set_analyzer_actions(
+                SEASON,
+                &[(AnalysisMode::Introduction, AnalyzerAction::Chromaprint)],
+            )
+            .await
+            .expect("store");
+        let gone = Uuid::from_u128(0x5ea5_0002);
+        h.actions
+            .set_analyzer_actions(gone, &[(AnalysisMode::Credits, AnalyzerAction::None)])
+            .await
+            .expect("store");
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("execute");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        assert!(
+            h.actions
+                .analyzer_actions(gone)
+                .await
+                .expect("read")
+                .is_empty()
+        );
+        assert_eq!(
+            h.actions
+                .analyzer_actions(SEASON)
+                .await
+                .expect("read")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

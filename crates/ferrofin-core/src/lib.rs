@@ -181,6 +181,7 @@ pub mod event_manager;
 pub mod external_data_manager;
 mod extra_owners_repository;
 pub mod file_system;
+pub mod intro_skipper_repository;
 pub mod item_count_service;
 pub mod item_data;
 mod item_deletion;

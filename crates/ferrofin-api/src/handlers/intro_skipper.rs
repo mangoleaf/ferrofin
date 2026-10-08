@@ -24,11 +24,9 @@
 //! | Recap          | `Recap`              |
 //! | Commercial     | `Commercial`         |
 //!
-//! Three routes are thinner than upstream because the backing subsystem does
+//! Two routes are thinner than upstream because the backing subsystem does
 //! not exist in Ferrofin — each is documented at its handler:
-//! `Intros/RebuildDatabase` (no separate DB to rebuild),
-//! `Intros/AnalyzerActions/UpdateSeason` (no per-season analyzer-action store;
-//! detection runs off the global config) and
+//! `Intros/RebuildDatabase` (no separate DB to rebuild) and
 //! `FileTransformation/RegisterTransformation` (no web-asset pipeline to hook).
 
 use std::collections::HashMap;
@@ -40,6 +38,7 @@ use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::tasks::TaskState;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -737,79 +736,28 @@ async fn erase_season(
 /// `GET /Intros/AnalyzerActions/{SeasonId}` — the per-mode analyzer actions for
 /// a season.
 ///
-/// Ferrofin runs detection off the global extension config and keeps no
-/// per-season analyzer-action overrides, so every mode reports `Default`
-/// (meaning "use the configured analyzer"). 404 when the season id is unknown.
+/// Port of `VisualizationController.GetAnalyzerAction` →
+/// `Plugin.GetAllAnalyzerActionsAsync`: every mode in declaration order, the
+/// stored action or `Default`. Elevated, as the whole controller is upstream.
+/// 404 when the season id is unknown (upstream checks its queue of analysable
+/// seasons; Ferrofin checks the library).
 async fn get_analyzer_actions(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(season_id): Path<Uuid>,
-) -> Result<Json<HashMap<String, String>>, ApiError> {
+) -> Result<Json<std::collections::BTreeMap<AnalysisMode, AnalyzerAction>>, ApiError> {
+    require_elevation(&state, &auth).await?;
     if state.library.get_item_by_id(season_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("season {season_id}")));
     }
-    let actions = ["Introduction", "Credits", "Recap", "Preview", "Commercial"]
-        .into_iter()
-        .map(|m| (m.to_owned(), "Default".to_owned()))
-        .collect();
-    Ok(Json(actions))
+    let stored = state.intro_skipper.analyzer_actions(season_id).await?;
+    Ok(Json(
+        AnalysisMode::ALL
+            .into_iter()
+            .map(|mode| (mode, stored.get(&mode).copied().unwrap_or_default()))
+            .collect(),
+    ))
 }
-
-/// The analysis an analyzer action applies to. Port of `IntroSkipper.Data.AnalysisMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AnalysisMode {
-    /// The intro.
-    Introduction,
-    /// The end credits.
-    Credits,
-    /// The next-episode preview.
-    Preview,
-    /// The previously-on recap.
-    Recap,
-    /// A commercial break.
-    Commercial,
-    /// An unnamed underlying integer accepted by JsonStringEnumConverter.
-    Unrecognized(i32),
-}
-
-/// How a season's analysis runs. Port of `IntroSkipper.Data.AnalyzerAction`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnalyzerAction {
-    /// The configured default.
-    Default,
-    /// Chapter names.
-    Chapter,
-    /// Audio fingerprints.
-    Chromaprint,
-    /// Black frames.
-    BlackFrame,
-    /// No analysis.
-    None,
-    /// An unnamed underlying integer accepted by JsonStringEnumConverter.
-    Unrecognized(i32),
-}
-
-// These extension enums are absent from Jellyfin's core assembly reflection
-// inventory. Discriminants are copied from IntroSkipper/Data/{AnalysisMode,
-// AnalyzerAction}.cs; values and map keys share the core enum converter.
-macro_rules! analyzer_enum {
-    ($name:ident { $($variant:ident = $value:literal),* $(,)? }) => {
-        impl ferrofin_model::json::enums::JsonEnum for $name {
-            fn from_discriminant(value: i32) -> Self {
-                match value { $($value => Self::$variant,)* other => Self::Unrecognized(other) }
-            }
-            fn members() -> &'static [(&'static str, i32)] { &[$((stringify!($variant), $value)),*] }
-            fn json_default() -> Option<i32> { None }
-        }
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                ferrofin_model::json::enums::deserialize(d)
-            }
-        }
-    };
-}
-analyzer_enum!(AnalysisMode { Introduction=0, Credits=1, Preview=2, Recap=3, Commercial=4 });
-analyzer_enum!(AnalyzerAction { Default=0, Chapter=1, Chromaprint=2, BlackFrame=3, None=4 });
 
 /// The body of `POST /Intros/AnalyzerActions/UpdateSeason`. Port of
 /// `IntroSkipper.Data.UpdateAnalyzerActionsRequest`, bound by the MVC binder
@@ -820,30 +768,32 @@ analyzer_enum!(AnalyzerAction { Default=0, Chapter=1, Chromaprint=2, BlackFrame=
 struct UpdateAnalyzerActionsRequest {
     /// The season. `null` is the empty id, as Jellyfin's `JsonGuidConverter` reads it.
     #[serde(default, with = "ferrofin_model::json::guid")]
-    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
     id: Uuid,
     /// The action per analysis mode.
     #[serde(default)]
-    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
     analyzer_actions: HashMap<AnalysisMode, AnalyzerAction>,
 }
 
-/// `POST /Intros/AnalyzerActions/UpdateSeason` — accept per-season analyzer
+/// `POST /Intros/AnalyzerActions/UpdateSeason` — store per-season analyzer
 /// actions.
 ///
-/// Binds the body as upstream does, then reports success without storing it:
-/// Ferrofin's detection uses the global config only.
-///
-/// TODO(F10): upstream persists the actions (`Plugin.SetAnalyzerActionAsync`)
-/// and detection honours them per season. The open work item is finding F10 of
-/// `brain/plans/PLAN_JSON_BODY_CASE_INSENSITIVE.md`: add a per-season store, read
-/// it in detection and in `GetAnalyzerActions`.
+/// Port of `VisualizationController.UpdateAnalyzerActions` →
+/// `Plugin.SetAnalyzerActionAsync`: each named mode's action is replaced, the
+/// others kept; detection honours them (a mode set to `None` is not analysed
+/// for the season). Elevated, as the whole controller is upstream.
 async fn update_analyzer_actions(
-    State(_state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
-    JsonBody(_request): JsonBody<UpdateAnalyzerActionsRequest>,
-) -> StatusCode {
-    StatusCode::NO_CONTENT
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    JsonBody(request): JsonBody<UpdateAnalyzerActionsRequest>,
+) -> Result<StatusCode, ApiError> {
+    require_elevation(&state, &auth).await?;
+    let actions: Vec<(AnalysisMode, AnalyzerAction)> =
+        request.analyzer_actions.into_iter().collect();
+    state
+        .intro_skipper
+        .set_analyzer_actions(request.id, &actions)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /Intros/ScanSeason/{SeriesId}/{SeasonId}` — start a detection pass.

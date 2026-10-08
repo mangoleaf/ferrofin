@@ -1466,6 +1466,9 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
         ),
     );
+    let intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore> = Arc::new(
+        ferrofin_core::intro_skipper_repository::FerrofinIntroSkipperStore::new(db.clone()),
+    );
     let extension_cx = ferrofin_extensions::ExtensionContext {
         library: Arc::clone(&library),
         media_segments: Arc::clone(&media_segments),
@@ -1473,6 +1476,7 @@ pub async fn build_app_state(
         fingerprinter,
         cache_dir: config.cache_dir.join("extensions"),
         merge_versions: Arc::clone(&merge_versions),
+        intro_skipper: Arc::clone(&intro_skipper),
     };
     // "Media Segment Scan" (Library category): upstream registers this one in
     // the core task set, independent of any plugin, so the dashboard lists it
@@ -2138,7 +2142,9 @@ pub async fn build_app_state(
 
     // Replace the `NoopLibraryMonitor` default with the webhook-driven monitor
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
-    let state = state.with_library_monitor(library_monitor);
+    let state = state
+        .with_library_monitor(library_monitor)
+        .with_intro_skipper_store(intro_skipper);
 
     // ---- plugin manager (Tier 1: compile-time plugins) --------------------
     // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time

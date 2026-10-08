@@ -1835,6 +1835,9 @@ mod tests {
             fingerprinter: None,
             cache_dir: std::env::temp_dir(),
             merge_versions: svc,
+            intro_skipper: Arc::new(
+                ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

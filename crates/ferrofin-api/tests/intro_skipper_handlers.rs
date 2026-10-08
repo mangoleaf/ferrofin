@@ -19,6 +19,7 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction as Action};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::tasks::{TaskInfo, TaskState};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
@@ -494,14 +495,7 @@ async fn plugin_metadata_and_support_bundle() {
 #[tokio::test]
 async fn no_op_success_routes() {
     let (_seg, app) = state();
-    for (method, uri, body) in [
-        ("POST", "/Intros/RebuildDatabase", ""),
-        (
-            "POST",
-            "/Intros/AnalyzerActions/UpdateSeason",
-            r#"{"Id":"00000000-0000-0000-0000-000000000000","AnalyzerActions":{}}"#,
-        ),
-    ] {
+    for (method, uri, body) in [("POST", "/Intros/RebuildDatabase", "")] {
         let (status, _) = send(app.clone(), method, uri, body).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
     }
@@ -511,8 +505,37 @@ async fn no_op_success_routes() {
 /// object only, names and enum values (keys too) ignoring case.
 #[tokio::test]
 async fn analyzer_actions_bind_like_the_mvc_binder() {
-    let (_seg, app) = state();
+    let tasks = || {
+        Arc::new(MemTasks {
+            running: false,
+            started: Mutex::new(Vec::new()),
+        })
+    };
     let uri = "/Intros/AnalyzerActions/UpdateSeason";
+    // `VisualizationController` is `RequiresElevation`: a plain user is
+    // refused on both routes.
+    let user_app = build_app_as(
+        Arc::new(MemSegments::default()),
+        tasks(),
+        Arc::new(MemConfig::default()),
+        Arc::new(AuthedAuthService),
+    );
+    let (status, _) = send(user_app.clone(), "POST", uri, r#"{"AnalyzerActions":{}}"#).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        user_app,
+        "GET",
+        &format!("/Intros/AnalyzerActions/{}", Uuid::nil()),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let app = build_app_as(
+        Arc::new(MemSegments::default()),
+        tasks(),
+        Arc::new(MemConfig::default()),
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    );
     for body in [
         r#"{"id":"00000000-0000-0000-0000-000000000000","analyzerActions":{"introduction":"chromaprint","Credits":"None"}}"#,
         r#"{"Id":"00000000-0000-0000-0000-000000000000","AnalyzerActions":{"Recap":"BlackFrame"}}"#,
@@ -528,6 +551,20 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
         let (status, _) = send(app.clone(), "POST", uri, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
+    // `SetAnalyzerActionAsync`: each named mode is replaced, the rest kept.
+    let nil = app
+        .intro_skipper
+        .analyzer_actions(Uuid::nil())
+        .await
+        .unwrap();
+    assert_eq!(nil.len(), 3);
+    assert_eq!(nil[&Mode::Introduction], Action::Chromaprint);
+    assert_eq!(nil[&Mode::Credits], Action::None);
+    assert_eq!(nil[&Mode::Recap], Action::BlackFrame);
+    let ui = Uuid::parse_str("28c3ad34d0306759137254e7c81d74e0").unwrap();
+    let ui = app.intro_skipper.analyzer_actions(ui).await.unwrap();
+    assert_eq!(ui[&Mode::Preview], Action::Chapter);
+    assert_eq!(ui[&Mode::Commercial], Action::None);
 }
 
 /// `POST /FileTransformation/RegisterTransformation` registers a callback that
