@@ -104,6 +104,31 @@ impl SubtitleDownloader {
         options: &LibraryOptions,
         cancel: &ScanCancel,
     ) {
+        self.download_missing_using_streams_locked(video, options, cancel, None)
+            .await;
+    }
+
+    /// Scan downloads consider embedded streams before the library's display
+    /// filter, as FFProbeVideoInfo.AddExternalSubtitlesAsync does. External
+    /// streams are still read afresh for every language.
+    pub(crate) async fn download_missing_from_probe_locked(
+        &self,
+        video: &BaseItemEntity,
+        options: &LibraryOptions,
+        cancel: &ScanCancel,
+        probed: &[MediaStreamInfoEntity],
+    ) {
+        self.download_missing_using_streams_locked(video, options, cancel, Some(probed))
+            .await;
+    }
+
+    async fn download_missing_using_streams_locked(
+        &self,
+        video: &BaseItemEntity,
+        options: &LibraryOptions,
+        cancel: &ScanCancel,
+        probed: Option<&[MediaStreamInfoEntity]>,
+    ) {
         let Some(languages) = options.subtitle_download_languages.as_ref() else {
             return;
         };
@@ -149,7 +174,7 @@ impl SubtitleDownloader {
             };
             // Only reads and network requests can be dropped on cancellation.
             let fetched = cancel
-                .unless_cancelled(self.fetch_missing(manager.as_ref(), &request, options))
+                .unless_cancelled(self.fetch_missing(manager.as_ref(), &request, options, probed))
                 .await;
             match fetched {
                 None => break,
@@ -171,8 +196,9 @@ impl SubtitleDownloader {
         manager: &dyn SubtitleManager,
         request: &SubtitleSearchRequest,
         options: &LibraryOptions,
+        probed: Option<&[MediaStreamInfoEntity]>,
     ) -> Result<Option<ferrofin_traits::subtitles::SubtitleResponse>, ServiceError> {
-        let streams = self
+        let mut streams = self
             .streams
             .get_media_streams(&MediaStreamQuery {
                 item_id: request.item_id,
@@ -180,6 +206,13 @@ impl SubtitleDownloader {
                 index: None,
             })
             .await?;
+        if let Some(probed) = probed {
+            // Preserve external rows attached since the probe began, including
+            // earlier languages in this download pass. Only the embedded
+            // eligibility snapshot replaces the filtered persisted rows.
+            streams.retain(|s| s.is_external);
+            streams.extend(probed.iter().filter(|s| !s.is_external).cloned());
+        }
         if !needs_language(&streams, &request.language, options) {
             return Ok(None);
         }
@@ -380,6 +413,78 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[rstest::rstest]
+    #[case::hidden_text("subrip", false, 0)]
+    #[case::hidden_image_downloads("hdmv_pgs_subtitle", false, 1)]
+    #[case::hidden_image_satisfies_skip("hdmv_pgs_subtitle", true, 0)]
+    #[tokio::test]
+    async fn scan_download_eligibility_uses_embedded_streams_before_display_filter(
+        #[case] codec: &str,
+        #[case] skip_embedded: bool,
+        #[case] expected_searches: usize,
+    ) {
+        let mut h = harness().await;
+        h.options.allow_embedded_subtitles =
+            ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone;
+        h.options.skip_subtitles_if_embedded_subtitles_present = skip_embedded;
+        let id = Uuid::parse_str(&h.video.id).unwrap();
+        h.downloader
+            .streams
+            .save_media_streams(id, &[stream(1, "")])
+            .await
+            .unwrap();
+        let mut hidden = stream(2, "ENG");
+        hidden.codec = Some(codec.to_owned());
+        let probed = vec![stream(1, ""), hidden];
+        let cancel = ScanCancel::new();
+        let _guard = h.downloader.lock(&cancel).await.unwrap();
+        h.downloader
+            .download_missing_from_probe_locked(&h.video, &h.options, &cancel, &probed)
+            .await;
+        assert_eq!(
+            h.provider.searches.load(Ordering::SeqCst),
+            expected_searches
+        );
+        let persisted = h
+            .downloader
+            .streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id: id,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            persisted
+                .iter()
+                .all(|s| s.is_external || s.stream_type != 2),
+            "hidden embedded rows must stay out of persistence"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_download_eligibility_keeps_external_streams_newer_than_probe() {
+        let h = harness().await;
+        let id = Uuid::parse_str(&h.video.id).unwrap();
+        let mut attached = stream(2, "eng");
+        attached.is_external = true;
+        attached.codec = Some("subrip".to_owned());
+        h.downloader
+            .streams
+            .save_media_streams(id, &[attached])
+            .await
+            .unwrap();
+        // The stale probe had no sidecar. A live external row must still satisfy
+        // this language when the raw embedded snapshot is used for eligibility.
+        let cancel = ScanCancel::new();
+        let _guard = h.downloader.lock(&cancel).await.unwrap();
+        h.downloader
+            .download_missing_from_probe_locked(&h.video, &h.options, &cancel, &[stream(1, "")])
+            .await;
+        assert_eq!(h.provider.searches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

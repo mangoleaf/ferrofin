@@ -4997,7 +4997,7 @@ impl LibraryScanner {
         if video_info.is_some_and(|info| info.parent_index_number.is_some()) {
             entity.parent_index_number = guesses.parent_index_number;
         }
-        let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio);
+        let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
         // `ApplySearchResult` (`MetadataService.cs:272-293`) hands a season or
@@ -5551,8 +5551,19 @@ impl LibraryScanner {
             )
             && let (Some(downloader), Some(options)) = (subtitle_downloader, policy.options)
         {
+            // Upstream downloads before applying AllowEmbeddedSubtitles. A
+            // hidden embedded stream still satisfies its language during this
+            // scan; the downloader also reads newly attached external streams
+            // before each language rather than trusting the probe snapshot.
+            let unfiltered = probe.info.as_ref().map_or_else(Vec::new, |info| {
+                info.media_source
+                    .media_streams
+                    .iter()
+                    .map(|s| stream_dto_to_entity(&entity.id, s))
+                    .collect::<Vec<_>>()
+            });
             downloader
-                .download_missing_locked(&entity, options, cancel)
+                .download_missing_from_probe_locked(&entity, options, cancel, &unfiltered)
                 .await;
         }
         // TODO(parity, open work item — NOT an accepted divergence): upstream's
@@ -5846,7 +5857,12 @@ impl LibraryScanner {
         probe: &ProbeRows,
         subtitles: Option<&crate::subtitle_downloader::SubtitleDownloader>,
     ) -> Result<(), ServiceError> {
-        if let (false, Some(repo)) = (probe.streams.is_empty(), &self.media_streams) {
+        // A successful video probe can lose every stream to the configured
+        // subtitle filter. It must clear the old rows rather than keep them.
+        if let (true, Some(repo)) = (
+            !probe.streams.is_empty() || probe.save_attachments,
+            &self.media_streams,
+        ) {
             if let Some(subtitles) = subtitles {
                 subtitles
                     .save_probed_streams(item_id, &probe.streams)
@@ -7251,7 +7267,9 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         probed: Option<&MediaInfo>,
         media_is_audio: bool,
+        policy: FetcherPolicy<'_>,
     ) -> ProbeRows {
+        use ferrofin_model::configuration::EmbeddedSubtitleOptions;
         let Some(probed) = probed else {
             return ProbeRows::default();
         };
@@ -7296,9 +7314,29 @@ impl LibraryScanner {
         } else {
             Vec::new()
         };
+        let allowed = policy
+            .options
+            .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
+                o.allow_embedded_subtitles
+            });
+        // FFProbeVideoInfo filters after numbering the combined external and
+        // embedded streams. Keep those indexes, including holes left by a
+        // removed subtitle, and leave the audio prober and all externals alone.
         let streams = source
             .media_streams
             .iter()
+            .filter(|s| {
+                media_is_audio
+                    || s.stream_type != ferrofin_model::entities::MediaStreamType::Subtitle
+                    || s.is_external
+                    || match allowed {
+                        EmbeddedSubtitleOptions::AllowText => s.is_text_subtitle_stream(),
+                        EmbeddedSubtitleOptions::AllowImage => !s.is_text_subtitle_stream(),
+                        EmbeddedSubtitleOptions::AllowNone => false,
+                        EmbeddedSubtitleOptions::AllowAll
+                        | EmbeddedSubtitleOptions::Unrecognized(_) => true,
+                    }
+            })
             .map(|s| stream_dto_to_entity(&entity.id, s))
             .collect();
         let chapters = source
@@ -21494,6 +21532,164 @@ mod tests {
         assert_ne!(saved.sort_name.as_deref(), Some("heat"));
     }
 
+    /// The filter is video-only and uses the existing text/image classifier,
+    /// including upstream's treatment of an absent embedded codec as non-text.
+    #[rstest::rstest]
+    #[case::all(ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowAll, &[0, 1, 2, 3, 4, 5, 6, 7, 8])]
+    #[case::text(ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowText, &[0, 1, 2, 5, 6, 8])]
+    #[case::image(ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowImage, &[0, 1, 3, 4, 5, 6, 7])]
+    #[case::none(ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone, &[0, 1, 5, 6])]
+    #[case::unnamed(ferrofin_model::configuration::EmbeddedSubtitleOptions::Unrecognized(99), &[0, 1, 2, 3, 4, 5, 6, 7, 8])]
+    fn embedded_subtitle_policy_preserves_external_streams_and_original_indexes(
+        #[case] allowed: ferrofin_model::configuration::EmbeddedSubtitleOptions,
+        #[case] expected: &[i64],
+    ) {
+        use ferrofin_model::entities::MediaStreamType;
+        use ferrofin_model::entities_media::MediaStream;
+        use ferrofin_model::media_info::MediaInfo;
+        let mut info = MediaInfo::default();
+        let subtitle = |index, codec: Option<&str>, external| MediaStream {
+            index,
+            stream_type: MediaStreamType::Subtitle,
+            codec: codec.map(str::to_owned),
+            is_external: external,
+            ..Default::default()
+        };
+        info.media_source.media_streams = vec![
+            subtitle(0, Some("hdmv_pgs_subtitle"), true),
+            MediaStream {
+                index: 1,
+                stream_type: MediaStreamType::Video,
+                ..Default::default()
+            },
+            subtitle(2, Some("subrip"), false),
+            subtitle(3, Some("hdmv_pgs_subtitle"), false),
+            subtitle(4, None, false),
+            subtitle(5, Some("ass"), true),
+            MediaStream {
+                index: 6,
+                stream_type: MediaStreamType::Audio,
+                ..Default::default()
+            },
+            subtitle(7, Some("dvdsub"), false),
+            subtitle(8, Some("microdvd"), false),
+        ];
+        let options = ferrofin_model::configuration::LibraryOptions {
+            allow_embedded_subtitles: allowed,
+            ..Default::default()
+        };
+        let policy = super::FetcherPolicy {
+            options: Some(&options),
+            ..Default::default()
+        };
+        let mut row = planned_movie();
+        let rows = super::LibraryScanner::apply_probe(&mut row, Some(&info), false, policy);
+        assert_eq!(
+            rows.streams
+                .iter()
+                .map(|stream| stream.stream_index)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let audio = super::LibraryScanner::apply_probe(&mut row, Some(&info), true, policy);
+        assert_eq!(
+            audio.streams.len(),
+            9,
+            "the video-only setting does not filter audio probing"
+        );
+        let defaults = super::LibraryScanner::apply_probe(
+            &mut row,
+            Some(&info),
+            false,
+            super::FetcherPolicy::default(),
+        );
+        assert_eq!(
+            defaults.streams.len(),
+            9,
+            "an item without library options allows all embedded subtitles"
+        );
+        assert!(
+            super::LibraryScanner::apply_probe(&mut row, None, false, policy)
+                .streams
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn filtering_every_probed_stream_clears_previous_stream_rows() {
+        use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+        use ferrofin_model::configuration::{EmbeddedSubtitleOptions, LibraryOptions};
+        use ferrofin_model::entities::MediaStreamType;
+        use ferrofin_model::entities_media::MediaStream;
+        use ferrofin_model::media_info::MediaInfo;
+        use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let id = uuid::Uuid::new_v4();
+        let mut row = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            parent_id: None,
+            ..planned_movie()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        let streams = Arc::new(crate::FerrofinMediaStreamRepository::new(db));
+        streams
+            .save_media_streams(
+                id,
+                &[MediaStreamInfoEntity {
+                    stream_type: 2,
+                    codec: Some("subrip".to_owned()),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+        let mut scanner =
+            LibraryScanner::new(folders, Arc::new(FerrofinFileSystem::new()), persistence);
+        scanner.media_streams = Some(streams.clone());
+        let query = MediaStreamQuery {
+            item_id: id,
+            stream_type: None,
+            index: None,
+        };
+        scanner
+            .persist_probe_rows(id, &super::ProbeRows::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            streams.get_media_streams(&query).await.unwrap().len(),
+            1,
+            "an absent/failed probe keeps the previous rows"
+        );
+        let mut info = MediaInfo::default();
+        info.media_source.media_streams = vec![MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            codec: Some("subrip".to_owned()),
+            ..Default::default()
+        }];
+        let options = LibraryOptions {
+            allow_embedded_subtitles: EmbeddedSubtitleOptions::AllowNone,
+            ..Default::default()
+        };
+        let rows = LibraryScanner::apply_probe(
+            &mut row,
+            Some(&info),
+            false,
+            super::FetcherPolicy {
+                options: Some(&options),
+                ..Default::default()
+            },
+        );
+        assert!(rows.streams.is_empty());
+        scanner.persist_probe_rows(id, &rows, None).await.unwrap();
+        assert!(streams.get_media_streams(&query).await.unwrap().is_empty());
+    }
+
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
     /// `Width`/`Height` are its first video stream's, else 0 — so a re-probe
     /// that finds no video stream replaces what an earlier probe stored. A
@@ -21514,7 +21710,12 @@ mod tests {
                 Some(&stored),
                 &planned_movie(),
                 |e, _| {
-                    super::LibraryScanner::apply_probe(e, Some(&info), audio);
+                    super::LibraryScanner::apply_probe(
+                        e,
+                        Some(&info),
+                        audio,
+                        super::FetcherPolicy::default(),
+                    );
                 },
                 false,
                 true,
@@ -21882,7 +22083,12 @@ mod tests {
         let saved = save_new(
             &f::track(),
             |e| {
-                super::LibraryScanner::apply_probe(e, Some(&f::track_tags()), true);
+                super::LibraryScanner::apply_probe(
+                    e,
+                    Some(&f::track_tags()),
+                    true,
+                    super::FetcherPolicy::default(),
+                );
             },
             true,
         );
@@ -22049,7 +22255,12 @@ mod tests {
             ..planned.clone()
         };
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         let saved = save_as(Some(&stored), &planned, probe, false, true);
         assert_eq!(
@@ -22094,7 +22305,12 @@ mod tests {
     #[test]
     fn a_legacy_folder_name_album_is_replaced_by_a_later_album_tag() {
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         for planned in [equivalence_fixtures::track(), planned_disc_track()] {
             let legacy = BaseItemEntity {
@@ -22120,7 +22336,12 @@ mod tests {
         let first = save_as(None, &planned, |_, _| {}, false, false);
         assert_eq!(first.album, None);
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         let second = save_as(Some(&first), &planned, probe, false, true);
         assert_eq!(second.album.as_deref(), Some("Tag Album"));
@@ -22131,7 +22352,12 @@ mod tests {
     #[test]
     fn a_user_album_that_differs_from_the_folder_is_never_replaced() {
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         for planned in [equivalence_fixtures::track(), planned_disc_track()] {
             let edited = BaseItemEntity {
@@ -22150,7 +22376,12 @@ mod tests {
     fn a_stored_tracks_artists_and_genres_are_only_filled_by_its_tags() {
         let planned = equivalence_fixtures::track();
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         let edited = BaseItemEntity {
             artists: Some("Edited Artist".into()),
@@ -22223,7 +22454,12 @@ mod tests {
     #[test]
     fn a_new_track_takes_its_tags() {
         let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
-            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+            super::LibraryScanner::apply_probe(
+                e,
+                Some(&tags()),
+                true,
+                super::FetcherPolicy::default(),
+            );
         };
         let saved = save_as(None, &equivalence_fixtures::track(), probe, false, true);
         assert_eq!(saved.album.as_deref(), Some("Tag Album"));

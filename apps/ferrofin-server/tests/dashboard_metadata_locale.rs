@@ -179,11 +179,27 @@ libswscale      7.  5.100
 libswresample   4. 12.100
 EOF
 else
+for input in "$@"; do
+case "$input" in
+*.srt)
+cat <<'EOF'
+{{"streams":[{{"index":0,"codec_type":"subtitle","codec_name":"subrip"}}],"format":{{"format_name":"srt"}}}}
+EOF
+exit 0
+;;
+esac
+done
+if [ -f "{}/embedded-subtitles.json" ]; then
+cat "{}/embedded-subtitles.json"
+exit 0
+fi
 cat <<'EOF'
 {{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64}}],"format":{{"format_name":"matroska,webm","duration":"60.0","size":"1024","bit_rate":"1000"}}}}
 EOF
 fi
-"#
+"#,
+        root.display(),
+        root.display()
     );
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -390,6 +406,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_nfo_savers(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
+    verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
     // L13: both physical and path-less seasons use the selected TVDB image
     // provider with all metadata downloaders disabled. Manual selection still
     // lists images before enabling automatic acquisition.
@@ -1061,4 +1078,75 @@ async fn verify_similarity_selection(
         before + 1,
         "disabled provider/cache still ran"
     );
+}
+
+/// Each saved mode changes the next real refresh, preserves external subtitles,
+/// and retains the merged stream indexes rather than closing gaps after filtering.
+async fn verify_embedded_subtitle_options(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+    root: &std::path::Path,
+) {
+    let snapshot = root.join("embedded-subtitles.json");
+    std::fs::write(&snapshot, json!({
+        "streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":64},
+            {"index":1,"codec_type":"subtitle","codec_name":"subrip","tags":{"language":"eng"}},
+            {"index":2,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle"},
+            {"index":3,"codec_type":"subtitle"}
+        ],
+        "format":{"format_name":"matroska,webm","duration":"60.0","size":"1024","bit_rate":"1000"}
+    }).to_string()).unwrap();
+    let external = media.join("Locale.eng.srt");
+    std::fs::write(&external, "1\n00:00:00,000 --> 00:00:01,000\nExternal\n").unwrap();
+    let path = format!("/Items/{id}?fields=MediaSources,MediaStreams,Etag");
+    let mut edited = api.get(&path).await;
+    edited["LockData"] = json!(false);
+    api.post(&format!("/Items/{id}"), &edited).await;
+    for (mode, expected) in [
+        ("AllowAll", vec![0, 1, 2, 3]),
+        ("AllowText", vec![0, 1, 2]),
+        ("AllowImage", vec![0, 1, 3]),
+        ("AllowNone", vec![0, 1]),
+        ("AllowAll", vec![0, 1, 2, 3]),
+    ] {
+        options["AllowEmbeddedSubtitles"] = json!(mode);
+        api.post(
+            "/Library/VirtualFolders/LibraryOptions",
+            &json!({"Id":library,"LibraryOptions":options}),
+        )
+        .await;
+        let previous = api.get(&path).await["Etag"].clone();
+        api.post(
+            &format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None"),
+            &Value::Null,
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let details = api.get(&path).await;
+            let streams = details["MediaStreams"].as_array().unwrap();
+            let indexes = streams
+                .iter()
+                .map(|s| s["Index"].as_i64().unwrap())
+                .collect::<Vec<_>>();
+            if indexes == expected && details["Etag"] != previous {
+                assert_eq!(streams[0]["IsExternal"], true, "{mode}: {details}");
+                assert_eq!(streams[0]["Path"], external.to_string_lossy().as_ref());
+                assert_eq!(streams[1]["Type"], "Video");
+                assert_eq!(details["HasSubtitles"], true);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{mode}: expected indexes {expected:?}, got {details}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    std::fs::remove_file(snapshot).unwrap();
+    std::fs::remove_file(external).unwrap();
 }
