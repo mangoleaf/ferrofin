@@ -1848,6 +1848,10 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     // encoding request must not reuse a copied stream with the same session.
     request.allow_video_stream_copy.hash(&mut hasher);
     request.allow_audio_stream_copy.hash(&mut hasher);
+    // A newly negotiated internet bitrate limit changes the encoded output,
+    // even when a client retains its playback session and codec selection.
+    request.video_bitrate.hash(&mut hasher);
+    request.audio_bitrate.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
     // subtitled and non-subtitled transcode of the same item would collide. The
     // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
@@ -2203,6 +2207,29 @@ mod tests {
             query_string: "?x=1".to_owned(),
             ..HlsStreamRequest::default()
         }
+    }
+
+    #[tokio::test]
+    async fn renegotiated_bitrate_caps_change_encoding_and_cached_output() {
+        let mut video = video_stream("h264");
+        video.bit_rate = Some(8_000_000);
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        req.video_bitrate = Some(2_000_000);
+        req.audio_bitrate = Some(128_000);
+        let first = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        req.video_bitrate = Some(500_000);
+        let limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(limited.state.output_video_bitrate, Some(500_000));
+        assert!(limited.arguments.join(" ").contains("-maxrate 500000"));
+        assert_ne!(first.playlist_path, limited.playlist_path);
+        req.audio_bitrate = Some(64_000);
+        let audio_limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
+        assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
+        assert_ne!(limited.playlist_path, audio_limited.playlist_path);
     }
 
     #[tokio::test]

@@ -198,6 +198,8 @@ async fn playback_info(
                     .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?,
             ),
         };
+        let max_streaming_bitrate =
+            playback_bitrate_limit(state, auth, &policy, max_streaming_bitrate).await?;
         // Use the item's media type rather than the presence of a video stream:
         // audio files can have cover-art video streams, and video probes may be empty.
         let media_type = state
@@ -261,6 +263,53 @@ async fn playback_info(
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// MediaInfoHelper.GetMaxBitrate: a positive user override replaces the server
+/// cap, then the remote cap is combined with the client's request. Profile
+/// defaults remain the StreamBuilder's fallback when no explicit limit exists.
+async fn playback_bitrate_limit(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    policy: &ferrofin_model::users::UserPolicy,
+    client_limit: Option<i32>,
+) -> Result<Option<i32>, ApiError> {
+    // Authorization's endpoint is normalized through KnownProxies for each
+    // request; never read X-Forwarded-For directly or use the proxy's LAN IP.
+    let is_local = auth
+        .remote_endpoint
+        .as_deref()
+        .and_then(|ip| ip.parse().ok())
+        .is_some_and(|ip| state.is_in_local_network(ip));
+    let server_limit = if policy.remote_client_bitrate_limit > 0 || is_local {
+        0
+    } else {
+        state
+            .config
+            .configuration()
+            .await?
+            .remote_client_bitrate_limit
+    };
+    Ok(remote_bitrate_limit(
+        client_limit,
+        policy.remote_client_bitrate_limit,
+        server_limit,
+        is_local,
+    ))
+}
+
+fn remote_bitrate_limit(
+    client: Option<i32>,
+    user: i32,
+    server: i32,
+    is_local: bool,
+) -> Option<i32> {
+    let limit = if user > 0 { user } else { server };
+    if is_local || limit <= 0 {
+        client
+    } else {
+        Some(client.unwrap_or(limit).min(limit))
+    }
 }
 
 /// The HLS segment container to transcode into, constrained to Jellyfin's
@@ -1175,6 +1224,35 @@ mod tests {
         assert_eq!(hls_segment_container(Some("ts"), &h264), "ts");
         assert_eq!(hls_segment_container(Some("mkv"), &h264), "ts");
         assert_eq!(hls_segment_container(None, &h264), "ts");
+    }
+
+    #[test]
+    fn remote_bitrate_limit_matches_user_override_and_lan_rules() {
+        for (client, user, server, local, expected) in [
+            (Some(8_000_000), 0, 1_000_000, false, Some(1_000_000)),
+            (
+                Some(8_000_000),
+                2_000_000,
+                1_000_000,
+                false,
+                Some(2_000_000),
+            ),
+            (Some(500_000), 2_000_000, 1_000_000, false, Some(500_000)),
+            (None, 2_000_000, 1_000_000, false, Some(2_000_000)),
+            (None, -1, 1_000_000, false, Some(1_000_000)),
+            (None, 0, 0, false, None),
+            (Some(8_000_000), 0, -1, false, Some(8_000_000)),
+            (Some(8_000_000), 1_000_000, 500_000, true, Some(8_000_000)),
+            (None, 1_000_000, 500_000, true, None),
+            // Upstream preserves explicit client zero/negative values.
+            (Some(0), 1_000_000, 0, false, Some(0)),
+            (Some(-1), 1_000_000, 0, false, Some(-1)),
+        ] {
+            assert_eq!(
+                super::remote_bitrate_limit(client, user, server, local),
+                expected
+            );
+        }
     }
 
     #[test]
