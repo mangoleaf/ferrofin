@@ -241,7 +241,27 @@ async fn get_download(
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
+    let source = state
+        .media_sources
+        .get_static_media_sources(item_id, true, None)
+        .await?
+        .into_iter()
+        .find(|s| s.path.is_some())
+        .ok_or_else(|| ApiError::NotFound(format!("no direct stream for item {item_id}")))?;
+    // `Video.CanDownload` (`Video.cs:444-452`): a DVD or Blu-ray rip — a
+    // folder — never downloads; `GetDownload` throws `ArgumentException`
+    // (a `400`, `LibraryController.cs:686-699`).
+    if matches!(
+        source.video_type,
+        Some(
+            ferrofin_model::entities::VideoType::Dvd | ferrofin_model::entities::VideoType::BluRay
+        )
+    ) {
+        return Err(ApiError::BadRequest(
+            "Item does not support downloading".to_owned(),
+        ));
+    }
+    let path = source.path.unwrap_or_default();
     // The controller's CanDownload(user) check follows the policy check.
     // Administrators pass the policy, but an explicitly disabled download
     // permission still fails this per-item check. API keys have no user policy.

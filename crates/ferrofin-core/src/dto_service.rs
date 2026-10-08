@@ -68,7 +68,7 @@ use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType};
 use ferrofin_model::dto::{
     BaseItemDto, BaseItemPerson, ItemCounts, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
 };
-use ferrofin_model::entities::{ExtraType, ImageType, LocationType, VideoType};
+use ferrofin_model::entities::{ExtraType, ImageType, LocationType};
 use ferrofin_model::querying::ItemFields;
 use uuid::Uuid;
 
@@ -2398,7 +2398,16 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::CanDownload) {
             // C# `CanDownload()` is false by default and only true for playable media;
             // a by-name item is not a folder but still isn't downloadable.
-            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv;
+            // `Video.CanDownload` (`Video.cs:444-452`): never a DVD or
+            // Blu-ray rip, whose path is a folder.
+            let disc = kinds::is_video(kind)
+                && matches!(
+                    crate::item_data::video_format(item.data.as_deref()).video_type,
+                    ferrofin_model::entities::VideoType::Dvd
+                        | ferrofin_model::entities::VideoType::BluRay
+                );
+            let file_downloadable =
+                !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv && !disc;
             dto.can_download =
                 Some(file_downloadable && perms.is_none_or(|p| p.enable_content_downloading));
         }
@@ -2743,7 +2752,12 @@ impl FerrofinDtoService {
 
         // Video extras.
         if kinds::is_video(kind) {
-            dto.video_type = Some(VideoType::VideoFile);
+            // `dto.VideoType = video.VideoType; dto.Video3DFormat = …;
+            // dto.IsoType = …` (DtoService.cs:1409-1411), read off `Data`.
+            let format = crate::item_data::video_format(item.data.as_deref());
+            dto.video_type = Some(format.video_type);
+            dto.video3d_format = format.video3d_format;
+            dto.iso_type = format.iso_type;
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
@@ -5341,6 +5355,60 @@ mod tests {
             .unwrap();
         assert_eq!(dtos[0].part_count, Some(3));
         assert_eq!(dtos[1].part_count, None);
+    }
+
+    /// A video's DTO carries its own `VideoType`, `IsoType` and
+    /// `Video3DFormat` (`DtoService.cs:1409-1411`) — `VideoFile` where its
+    /// `Data` names none.
+    #[tokio::test]
+    async fn a_videos_dto_reports_its_format() {
+        use ferrofin_model::entities::{IsoType, Video3DFormat, VideoType};
+        let db = test_db().await;
+        let mut ids = Vec::new();
+        for data in [
+            r#"{"VideoType":"Dvd"}"#,
+            r#"{"VideoType":"Iso","IsoType":"Dvd","Video3DFormat":"MVC"}"#,
+            r#"{"AdditionalParts":[]}"#,
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "M", data).await;
+            ids.push(fetch_item(&db, id).await);
+        }
+        let dtos = service(db.clone())
+            .get_base_item_dtos(
+                &ids,
+                &DtoOptions {
+                    fields: vec![ItemFields::CanDownload],
+                    ..DtoOptions::default()
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        // `Video.CanDownload` (`Video.cs:444-452`): a rip never downloads;
+        // a disc image or a file does.
+        assert_eq!(
+            dtos.iter().map(|d| d.can_download).collect::<Vec<_>>(),
+            [Some(false), Some(true), Some(true)]
+        );
+        let formats: Vec<_> = dtos
+            .iter()
+            .map(|d| (d.video_type, d.iso_type, d.video3d_format))
+            .collect();
+        assert_eq!(
+            formats,
+            [
+                (Some(VideoType::Dvd), None, None),
+                (
+                    Some(VideoType::Iso),
+                    Some(IsoType::Dvd),
+                    Some(Video3DFormat::Mvc)
+                ),
+                (Some(VideoType::VideoFile), None, None),
+            ]
+        );
     }
 
     /// `MediaSources` lists every version of a video, the queried one first

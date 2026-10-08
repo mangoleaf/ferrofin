@@ -2261,20 +2261,49 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::ImageType;
 
+    /// The spans exported in this test process, through one global
+    /// subscriber (installed once). A thread-local `set_default` loses the
+    /// `library_scan` root now and then: sqlx-sqlite hands `Span::current()`
+    /// to its connection's worker thread with every command (sqlx-sqlite
+    /// `connection/worker.rs:144-145,439`), and when that thread drops the
+    /// last handle of the `library_scan_pass` span, tracing-subscriber's
+    /// registry releases the parent through THAT thread's default dispatcher
+    /// (`registry/sharded.rs:501-511`) — none there, so the root's count
+    /// never reaches zero and it never closes. A process-wide default (what
+    /// the server installs) is every thread's.
+    fn exported_spans() -> &'static (
+        opentelemetry_sdk::trace::SdkTracerProvider,
+        opentelemetry_sdk::trace::InMemorySpanExporter,
+    ) {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        static SPANS: std::sync::OnceLock<(SdkTracerProvider, InMemorySpanExporter)> =
+            std::sync::OnceLock::new();
+        SPANS.get_or_init(|| {
+            let exporter = InMemorySpanExporter::default();
+            let provider = SdkTracerProvider::builder()
+                .with_sampler(Sampler::AlwaysOn)
+                .with_simple_exporter(exporter.clone())
+                .build();
+            let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("ferrofin"));
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                .expect("the test process's only global subscriber");
+            (provider, exporter)
+        })
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn queue_library_scan_exports_a_library_scan_span_tagged_with_trigger() {
         // End-to-end span-coverage smoke: an `api`-triggered scan (empty library,
         // so it finishes fast) exports a `library_scan` root span carrying
-        // `trigger`. current-thread + set_default keeps the spawned scan on the
-        // scoped subscriber so the `.instrument()`ed span is captured.
+        // `trigger`.
         use crate::file_system::FerrofinFileSystem;
         use crate::library_scan::LibraryScanner;
         use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
         use ferrofin_traits::library::VirtualFolderManager;
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider};
-        use tracing_subscriber::layer::SubscriberExt as _;
 
+        let (provider, exporter) = exported_spans();
         let db = test_db().await;
         let tmp = tempfile::tempdir().unwrap();
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
@@ -2290,14 +2319,6 @@ mod tests {
         ));
         let mgr = manager(&db).with_scanner(scanner);
 
-        let exporter = InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_sampler(Sampler::AlwaysOn)
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("ferrofin"));
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
-
         mgr.queue_library_scan().await.expect("queued");
         // Wait for completion rather than assuming the scan finishes within 50 ms.
         // On this current-thread runtime, the worker closes its span before this
@@ -2305,17 +2326,24 @@ mod tests {
         until_idle(&mgr).await;
         provider.force_flush().expect("flush");
 
+        // Another test of this process may have scanned too (one process
+        // runs them all under `cargo test`): any `library_scan` root of an
+        // `api` scan will do.
         let spans = exporter.get_finished_spans().expect("spans");
-        let span = spans
+        let triggers: Vec<String> = spans
             .iter()
-            .find(|s| s.name == "library_scan")
-            .expect("library_scan span exported");
-        let trigger = span
-            .attributes
-            .iter()
-            .find(|kv| kv.key.as_str() == "trigger")
-            .map(|kv| kv.value.to_string());
-        assert_eq!(trigger.as_deref(), Some("api"));
+            .filter(|s| s.name == "library_scan")
+            .filter_map(|s| {
+                s.attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == "trigger")
+                    .map(|kv| kv.value.to_string())
+            })
+            .collect();
+        assert!(
+            triggers.iter().any(|t| t == "api"),
+            "a library_scan span tagged trigger=api is exported: {triggers:?}"
+        );
     }
 
     /// One run a [`GatedRunner`] made.

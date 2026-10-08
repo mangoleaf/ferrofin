@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 ///
 /// The collator reads ICU4X's baked root data; a build without it compares
 /// ordinally rather than failing the scan.
-pub(crate) fn culture_cmp(a: &str, b: &str) -> Ordering {
+pub fn culture_cmp(a: &str, b: &str) -> Ordering {
     static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> = OnceLock::new();
     COLLATOR
         .get_or_init(|| {

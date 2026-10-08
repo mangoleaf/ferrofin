@@ -586,21 +586,28 @@ fn file_stem(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The folder a video lives in (`Video.ContainingFolderPath`, `Video.cs:
-/// 201-219`): the parent directory of a file — of the first part for a
-/// stacked one — and the path itself for a disc folder.
-fn containing_folder_path(video: &BaseItemEntity) -> String {
+/// The folder an item lives in — `BaseItem.ContainingFolderPath`
+/// (`BaseItem.cs:292-303`) with `Video`'s override (`Video.cs:201-219`): a
+/// folder's own path; for a video, the parent directory of a file — of the
+/// first part for a stacked one, so a multi-disc set's is the set's folder —
+/// and the path itself for a disc rip that is no placeholder
+/// ([`crate::item_data::is_disc_folder`]).
+pub(crate) fn containing_folder_path(video: &BaseItemEntity) -> String {
     let path = video.path.as_deref().unwrap_or_default();
-    let data = crate::item_data::parse_data(video.data.as_deref());
-    let stacked = data
-        .get(ADDITIONAL_PARTS)
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|parts| !parts.is_empty());
-    let disc = matches!(
-        crate::item_data::read_data_string(&data, "VideoType").as_deref(),
-        Some("Dvd" | "BluRay")
-    );
-    if !stacked && (disc || video.is_folder) {
+    if video.is_folder {
+        return path.to_owned();
+    }
+    // Only a disc rip (a cheap text test first) can name its own folder;
+    // only then is the blob read for a stack.
+    if crate::item_data::is_disc_folder(video.data.as_deref())
+        && !video.data.as_deref().is_some_and(|text| {
+            text.contains(ADDITIONAL_PARTS)
+                && crate::item_data::parse_data(Some(text))
+                    .get(ADDITIONAL_PARTS)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|parts| !parts.is_empty())
+        })
+    {
         return path.to_owned();
     }
     std::path::Path::new(path)
@@ -665,12 +672,39 @@ fn label_after(display: &[char], prefix: &[char]) -> Option<String> {
 /// after the whole file name. A source with no file is named after the
 /// item.
 ///
-/// The `3D`/`Bluray`/`DVD`/`ISO` terms upstream appends read
-/// `Video3DFormat`, `VideoType` and `IsoType`; every source here is built as
-/// a 2D `VideoFile` ([`crate::media_source_manager`]), for which upstream
-/// appends none either.
+/// The name is followed by the terms the video's `Data` calls for, joined
+/// by `/` ([`disc_terms`]): `3D`, then `Bluray`/`DVD` for a disc or a disc
+/// image, `ISO` for an image of unknown kind (`BaseItem.cs:1340-1375`).
 #[must_use]
 pub fn media_source_name(
+    queried_folder: Option<&str>,
+    item: &BaseItemEntity,
+    common_prefix: Option<&str>,
+) -> String {
+    media_source_name_of(
+        queried_folder,
+        item,
+        common_prefix,
+        crate::item_data::video_format(item.data.as_deref()),
+    )
+}
+
+/// [`media_source_name`] for a video whose [`crate::item_data::VideoFormat`]
+/// the caller has read already.
+pub(crate) fn media_source_name_of(
+    queried_folder: Option<&str>,
+    item: &BaseItemEntity,
+    common_prefix: Option<&str>,
+    format: crate::item_data::VideoFormat,
+) -> String {
+    let mut terms = vec![source_label(queried_folder, item, common_prefix)];
+    terms.extend(disc_terms(format).iter().map(|t| (*t).to_owned()));
+    terms.join("/")
+}
+
+/// The first term of [`media_source_name`]: the label the file name gives,
+/// else the item's name.
+fn source_label(
     queried_folder: Option<&str>,
     item: &BaseItemEntity,
     common_prefix: Option<&str>,
@@ -693,6 +727,26 @@ pub fn media_source_name(
         }
     }
     display.into_iter().collect()
+}
+
+/// The terms `GetMediaSourceName` appends for a `Video` (`BaseItem.cs:
+/// 1340-1375`), from its [`crate::item_data::VideoFormat`]: `3D` when it
+/// has a `Video3DFormat`; then `Bluray` for a Blu-ray and `DVD` for a DVD;
+/// for a disc image (`VideoType.Iso`) the same by its `IsoType`, or `ISO`
+/// when it has none. A `VideoFile` adds nothing.
+fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
+    use ferrofin_model::entities::{IsoType, VideoType};
+    let mut terms = Vec::new();
+    if format.video3d_format.is_some() {
+        terms.push("3D");
+    }
+    match (format.video_type, format.iso_type) {
+        (VideoType::BluRay, _) | (VideoType::Iso, Some(IsoType::BluRay)) => terms.push("Bluray"),
+        (VideoType::Dvd, _) | (VideoType::Iso, Some(IsoType::Dvd)) => terms.push("DVD"),
+        (VideoType::Iso, None) => terms.push("ISO"),
+        (VideoType::VideoFile, _) => {}
+    }
+    terms
 }
 
 /// The prefix the media source items' file names share, or `None` when

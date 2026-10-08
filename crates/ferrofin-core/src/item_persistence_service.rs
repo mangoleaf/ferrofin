@@ -1181,10 +1181,15 @@ impl FerrofinItemPersistenceService {
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
     /// columns in the same order: [`written_columns`]'s, then the save time.
+    ///
+    /// The scan's variants also bind `?74`, whether the row's path is a
+    /// directory ([`crate::item_data::path_is_directory`]), which clears a
+    /// stored `DateModified` (D2); `scan` says which statement `sql` is.
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
         sql: &'static str,
+        scan: bool,
     ) -> Result<(), ServiceError> {
         let mut query = sqlx::query(sql);
         for (_, value) in written_columns(item) {
@@ -1195,11 +1200,11 @@ impl FerrofinItemPersistenceService {
                 Column::Bool(v) => query.bind(v),
             };
         }
-        query
-            .bind(datetime_to_db(chrono::Utc::now()))
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
+        query = query.bind(datetime_to_db(chrono::Utc::now()));
+        if scan {
+            query = query.bind(crate::item_data::path_is_directory(item));
+        }
+        query.execute(self.db.writer()).await.map_err(db_err)?;
         Ok(())
     }
 }
@@ -1419,16 +1424,14 @@ pub(crate) fn scan_save_changes_row(
                         new
                     }
                 }
-                // A directory has none (D2): an older scan's stamp goes.
-                // TODO(parity, open work item): keyed on `IsFolder`, which a
-                // disc rip also is today; once rips are stored `IsFolder = 0`
-                // (PLAN_ITEM_FILE_DELETION, "found during execution") the
-                // clear must follow the path being a directory instead. A
-                // path-less virtual season is a folder upstream stamps with
-                // `UtcNow` once (`Folder.AddChild`) and keeps; Ferrofin
-                // stores none for it (and keys it differently,
+                // A directory has none (D2): an older scan's stamp goes —
+                // a folder's, or a disc rip's (a `Video`, not a folder,
+                // whose path is the rip's directory). TODO(parity, open work
+                // item): a path-less virtual season is a folder upstream
+                // stamps with `UtcNow` once (`Folder.AddChild`) and keeps;
+                // Ferrofin stores none for it (and keys it differently,
                 // `SeriesMetadataService.cs:449-451`) — port both together.
-                "DateModified" if saved.is_folder => new,
+                "DateModified" if crate::item_data::path_is_directory(saved) => new,
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
                 // `locked_data_sql`: only the resolver's video fields move.
                 "Data" if stored.is_locked => {
@@ -1564,7 +1567,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
 
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
-            self.upsert_item(item, UPSERT_SQL).await?;
+            self.upsert_item(item, UPSERT_SQL, false).await?;
         }
         // `ItemUpdated`. An item the caller also reported as ADDED is folded back
         // out of the updated bucket by the notifier, so the library manager's
@@ -1577,7 +1580,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
 
     async fn save_scanned_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
-            self.upsert_item(item, scan_upsert_sql()).await?;
+            self.upsert_item(item, scan_upsert_sql(), true).await?;
         }
         Ok(())
     }
@@ -1587,7 +1590,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         items: &[BaseItemEntity],
     ) -> Result<(), ServiceError> {
         for item in items {
-            self.upsert_item(item, scan_upsert_date_created_sql())
+            self.upsert_item(item, scan_upsert_date_created_sql(), true)
                 .await?;
         }
         Ok(())
@@ -2260,6 +2263,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 changed.push(image);
             }
         }
+        // Every reader lists an item's images by type, then by `Id`
+        // ([`image_rows`]): new rows take fresh ids handed out ascending, so
+        // the images a save adds list in the order it was given them.
+        // Upstream draws a random id per row on every save
+        // (`MapImageToEntity`, `BaseItemMapper.cs:450-463`), which shuffles
+        // a list of backdrops.
+        let mut fresh: Vec<String> = changed.iter().map(|_| guid_to_db(Uuid::new_v4())).collect();
+        fresh.sort_unstable_by(|a, b| b.cmp(a));
         for image in changed {
             // A changed file's metadata updates its own row; a new path/type
             // gets a new row. The other images remain untouched.
@@ -2269,7 +2280,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
                 })
                 .map_or_else(
-                    || guid_to_db(Uuid::new_v4()),
+                    || fresh.pop().unwrap_or_else(|| guid_to_db(Uuid::new_v4())),
                     |index| stored.swap_remove(index).id,
                 );
             sqlx::query(
@@ -2664,7 +2675,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                             AND ("DateModified" IS NULL
                                  OR abs(julianday(?5) - julianday("DateModified")) > ?9)
                        THEN ?8 ELSE "DateCreated" END,
-                   "DateModified" = CASE WHEN "IsFolder" THEN ?5
+                   "DateModified" = CASE WHEN ?10 THEN ?5
                                          ELSE coalesce(?5, "DateModified") END,
                    "Size" = coalesce(?6, "Size"),
                    "DateLastSaved" = ?7
@@ -2682,6 +2693,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .bind(datetime_to_db(chrono::Utc::now()))
         .bind(opt_datetime_to_db(date_if_changed))
         .bind(tolerance)
+        .bind(crate::item_data::path_is_directory(item))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -4183,9 +4195,10 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 /// - `DateLastRefreshed`, `DateLastMediaAdded`, `DateModified` and `Size` are
 ///   never cleared (`coalesce(excluded, stored)`): the scan saves them from
 ///   the stored row or its stat, and a row it could not read, or a path it
-///   could not stat, must not lose them — except a folder's `DateModified`,
-///   which a directory never has (owner decision D2), so the stamp an older
-///   scan stored is cleared,
+///   could not stat, must not lose them — except the `DateModified` of a
+///   row whose path is a directory (a folder's, a disc rip's; bound as
+///   `?74`, [`crate::item_data::path_is_directory`]), which a directory never
+///   has (owner decision D2), so the stamp an older scan stored is cleared,
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
@@ -4230,7 +4243,7 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
     for col in SCAN_NEVER_CLEARED_COLUMNS {
         let kept = format!(r#"coalesce(excluded."{col}", "{col}")"#);
         let kept = if *col == "DateModified" {
-            format!(r#"CASE WHEN excluded."IsFolder" THEN excluded."{col}" ELSE {kept} END"#)
+            format!(r#"CASE WHEN ?74 THEN excluded."{col}" ELSE {kept} END"#)
         } else {
             kept
         };
@@ -5098,7 +5111,9 @@ async fn provider_id_sets(
     Ok(sets)
 }
 
-/// The image rows of `ids`, each item's in stored order.
+/// The image rows of `ids`, each item's in the order every reader lists
+/// them — by type, then by `Id` — as upstream's `Include(e => e.Images!.
+/// OrderBy(i => i.Id))` does (`BaseItemRepository.QueryBuilding.cs:272-275`).
 async fn image_rows(
     conn: &mut sqlx::SqliteConnection,
     ids: &[Uuid],
@@ -5114,7 +5129,8 @@ async fn image_rows(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" IN ({marks}) ORDER BY rowid"#
+            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" IN ({marks})
+               ORDER BY "ItemId", "ImageType", "Id""#
         );
         let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(sql));
         for id in chunk {
@@ -5297,8 +5313,8 @@ async fn plan_owned_copies(
                 copy.provider_ids = Some(theirs);
             }
             let theirs = images.get(&owner_id).cloned().unwrap_or_default();
-            // In stored order: `ImageInfos` is a list, and reordering a
-            // primary's backdrops reorders its versions'.
+            // In listed order ([`image_rows`]): `ImageInfos` is a list,
+            // and reordering a primary's backdrops reorders its versions'.
             let mine: Vec<_> = images
                 .get(&id)
                 .into_iter()
@@ -5422,13 +5438,18 @@ async fn write_owned_relations(
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for image in images {
+        // Fresh ids (upstream's `MapImageToEntity` draws a new one per save),
+        // handed out in ascending order so the copy lists in the primary's
+        // order: every reader orders an item's images by `Id`.
+        let mut ids: Vec<String> = images.iter().map(|_| guid_to_db(Uuid::new_v4())).collect();
+        ids.sort_unstable();
+        for (image, id) in images.iter().zip(ids) {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                    ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             )
-            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(id)
             .bind(&row.id)
             .bind(image.image_type)
             .bind(&image.path)
@@ -7377,6 +7398,41 @@ mod tests {
         assert!(image_writes(&db).await.is_empty());
     }
 
+    /// The images a save adds list in the order it was given them: every
+    /// reader orders an item's images by type, then `Id`, and the new rows'
+    /// ids ascend in list order (a random id per row shuffled backdrops).
+    #[tokio::test]
+    async fn added_images_list_in_the_order_saved() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let backdrop = |path: &str| ItemImageInfo {
+            path: path.to_owned(),
+            image_type: ImageType::Backdrop,
+            date_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let paths = ["/d.jpg", "/a.jpg", "/c.jpg", "/b.jpg"];
+        let images: Vec<ItemImageInfo> = paths.iter().map(|p| backdrop(p)).collect();
+        for n in 0..16u128 {
+            let item = Uuid::from_u128(0x5100 + n);
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            svc.save_item_images(item, &images).await.unwrap();
+            let listed: Vec<String> = sqlx::query_scalar(
+                r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1
+                   ORDER BY "ImageType", "Id""#,
+            )
+            .bind(guid_to_db(item))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(listed, paths);
+        }
+    }
+
     #[tokio::test]
     async fn scan_stored_links_reads_images_ancestors_and_external_streams() {
         let db = test_db().await;
@@ -7472,9 +7528,9 @@ mod tests {
                 "never-cleared guard missing for column {col}"
             );
         }
-        // …but a folder's `DateModified` follows the save (D2).
+        // …but a directory's `DateModified` follows the save (D2).
         assert!(sql.contains(
-            r#""DateModified" = CASE WHEN excluded."IsFolder" THEN excluded."DateModified" ELSE coalesce(excluded."DateModified", "DateModified") END"#
+            r#""DateModified" = CASE WHEN ?74 THEN excluded."DateModified" ELSE coalesce(excluded."DateModified", "DateModified") END"#
         ));
         for stmt in [sql, super::UPSERT_SQL] {
             assert!(

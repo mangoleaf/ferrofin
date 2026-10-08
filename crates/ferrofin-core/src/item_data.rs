@@ -406,6 +406,78 @@ pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// A video's format as its `Data` stores it: `Video.VideoType` (the
+/// `VideoFile` default when the blob names none), `IsoType` and
+/// `Video3DFormat`, each serialized by name (`BaseItemMapper` keeps them in
+/// the blob, not in a column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoFormat {
+    /// `Video.VideoType`.
+    pub video_type: ferrofin_model::entities::VideoType,
+    /// `Video.IsoType`, for a disc image.
+    pub iso_type: Option<ferrofin_model::entities::IsoType>,
+    /// `Video.Video3DFormat`, for a 3D video.
+    pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
+}
+
+/// The [`VideoFormat`] `data` stores. The text is read first: a blob naming
+/// no disc, image or 3D format — nearly every video's — is not parsed.
+#[must_use]
+pub fn video_format(data: Option<&str>) -> VideoFormat {
+    let plain = VideoFormat {
+        video_type: ferrofin_model::entities::VideoType::VideoFile,
+        iso_type: None,
+        video3d_format: None,
+    };
+    let Some(text) = data.filter(|t| {
+        ["Video3DFormat", "\"BluRay\"", "\"Dvd\"", "\"Iso\""]
+            .iter()
+            .any(|needle| t.contains(needle))
+    }) else {
+        return plain;
+    };
+    let data = parse_data(Some(text));
+    let field = |key: &str| data.get(key).cloned().filter(|v| !v.is_null());
+    VideoFormat {
+        video_type: field("VideoType")
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or(plain.video_type),
+        iso_type: field("IsoType").and_then(|v| serde_json::from_value(v).ok()),
+        video3d_format: field("Video3DFormat").and_then(|v| serde_json::from_value(v).ok()),
+    }
+}
+
+/// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
+/// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
+/// the case `Video.ContainingFolderPath` (`Video.cs:201-219`) and
+/// `MovieNfoSaver.GetMovieSavePaths` treat the path itself as the folder.
+/// The text is read first, so a blob naming neither type is not parsed.
+#[must_use]
+pub fn is_disc_folder(data: Option<&str>) -> bool {
+    let Some(text) = data.filter(|t| t.contains("\"Dvd\"") || t.contains("\"BluRay\"")) else {
+        return false;
+    };
+    let data = parse_data(Some(text));
+    matches!(
+        read_data_string(&data, "VideoType").as_deref(),
+        Some("Dvd" | "BluRay")
+    ) && !data
+        .get("IsPlaceHolder")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether `item`'s path names a directory: a folder's, or a disc rip's
+/// ([`is_disc_folder`]) — a `Video`, which upstream never stores as a folder
+/// (`BaseItem.IsFolder`, `BaseItem.cs:803`), whose path is the rip's
+/// directory all the same. A directory has no `DateModified` (owner
+/// decision D2: `GetFileSystemMetadata` fills no times for one, and its
+/// `MinValue` is stored as `NULL`).
+#[must_use]
+pub fn path_is_directory(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    item.is_folder || is_disc_folder(item.data.as_deref())
+}
+
 /// Reads one `Data` field as a string.
 #[must_use]
 pub fn read_data_string(data: &Map<String, Value>, key: &str) -> Option<String> {
@@ -1280,5 +1352,29 @@ mod tests {
             json,
             r#"{"Path":"/m/x.mkv","Type":"Manual","ItemId":"d37ecb9d75b0c0a8e9ecb0a864ec670e"}"#
         );
+    }
+
+    /// A disc rip's path is a directory though the row is no folder; a
+    /// `.disc` placeholder's, an image's and a file's are not.
+    #[rstest::rstest]
+    #[case::folder(true, None, true)]
+    #[case::dvd_rip(false, Some(r#"{"VideoType":"Dvd"}"#), true)]
+    #[case::bluray_rip(false, Some(r#"{"VideoType": "BluRay"}"#), true)]
+    #[case::placeholder(false, Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#), false)]
+    #[case::iso(false, Some(r#"{"VideoType":"Iso","IsoType":"Dvd"}"#), false)]
+    #[case::file(false, Some(r#"{"VideoType":"VideoFile"}"#), false)]
+    #[case::unreadable(false, Some(r#"{"VideoType":"Dvd""#), false)]
+    #[case::no_data(false, None, false)]
+    fn a_disc_rips_path_is_a_directory(
+        #[case] is_folder: bool,
+        #[case] data: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            is_folder,
+            data: data.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(super::path_is_directory(&item), expected);
     }
 }

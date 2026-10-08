@@ -976,10 +976,21 @@ fn default_probe_concurrency() -> usize {
 /// This is the *deciding* half of the probe — exactly the eligibility test the
 /// inline probe applied — split out so the whole plan can be classified up
 /// front, before any ffprobe runs.
+///
+/// TODO(parity, open work item): a disc rip's `Video` (its path a
+/// directory, [`crate::item_data::path_is_directory`]) is not probed.
+/// Upstream probes a DVD through its title set's `.vob` files and a Blu-ray
+/// through its playlist (`FFProbeVideoInfo.ProbeVideo`, `FFProbeVideoInfo.
+/// cs:89-140`) and stores the size of what it probed (`:208-211`); the
+/// request here carries a path only, which ffprobe cannot open for a
+/// directory. Port path: carry the row's `VideoType`/`IsoType` into the
+/// request (as `VideoProbeInput` does), port `GetPrimaryPlaylistVobFiles`
+/// and the Blu-ray playlist probe in the encoder, then drop the directory
+/// gate here.
 fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
     let is_audio = entity.media_type.as_deref() == Some("Audio");
     let is_media = is_audio || entity.media_type.as_deref() == Some("Video");
-    if entity.is_folder || !is_media {
+    if crate::item_data::path_is_directory(entity) || !is_media {
         return None;
     }
     Some(MediaInfoRequest {
@@ -2420,6 +2431,13 @@ struct PlanCtx<'a> {
     superseded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// What each disc rip and multi-disc set takes in whole
+    /// ([`PlanOutput::rip_folds`]).
+    rip_folds: std::cell::RefCell<Vec<RipFold>>,
+    /// Listings a look-ahead took ([`LibraryScanner::multi_disc_movie`]):
+    /// the walk's own [`LibraryScanner::list`] of the folder takes one
+    /// instead of listing it again.
+    prelisted: std::cell::RefCell<HashMap<String, Vec<FileSystemEntryInfo>>>,
     /// Each resolved primary's local alternate version paths
     /// ([`PlanOutput::local_versions`]).
     local_versions: std::cell::RefCell<Vec<(Uuid, Vec<String>)>>,
@@ -2467,6 +2485,8 @@ impl<'a> PlanCtx<'a> {
             excluded: std::cell::RefCell::new(Vec::new()),
             superseded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
+            rip_folds: std::cell::RefCell::new(Vec::new()),
+            prelisted: std::cell::RefCell::new(HashMap::new()),
             local_versions: std::cell::RefCell::new(Vec::new()),
             direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             episode_folders_mixed: std::cell::RefCell::new(HashMap::new()),
@@ -2614,6 +2634,10 @@ struct PlanOutput {
     /// item whose owner the scan does not plan points at
     /// ([`LibraryScanner::reuse_stored_extra_ids`]).
     owner_paths: HashMap<Uuid, String>,
+    /// What each disc rip and multi-disc set takes in whole: rows older
+    /// scans stored there fold into its video or are pruned
+    /// ([`LibraryScanner::fold_rip_contents`]).
+    rip_folds: Vec<RipFold>,
     /// Each resolved primary video's local alternate versions, by path in
     /// the resolver's order (`Video.LocalAlternateVersions`, which
     /// `ItemPersistenceService.SaveItems` turns into the primary's
@@ -3873,6 +3897,7 @@ impl LibraryScanner {
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
+            plan.rip_folds.extend(part.rip_folds);
             plan.local_versions.extend(part.local_versions);
             plan.excluded.extend(part.excluded);
             plan.superseded.extend(part.superseded);
@@ -4527,6 +4552,132 @@ impl LibraryScanner {
         Ok((done, folds))
     }
 
+    /// Settles the rows older scans stored inside the disc rips and
+    /// multi-disc sets this scan resolved (`rip_folds`, [`RipFold`]), before
+    /// the prune:
+    ///
+    /// - a video row (no extra) inside the disc — a `.vob` an older scan
+    ///   planned on its own, a set's disc it resolved as a rip of its own —
+    ///   folds into the rip's video ([`ItemPersistenceService::rekey_items`]),
+    ///   its user data with it. Upstream drops those rows and their user
+    ///   data (`Folder.ValidateChildrenInternal2`; a set's other disc has no
+    ///   row, `Video.RefreshMetadataForOwnedVideo` deleting a part whose
+    ///   path `File.Exists` does not find, `Video.cs:650-661`); Ferrofin keeps
+    ///   the watch history, as the re-key does for a kind change (owner
+    ///   decision D9b's principle) — the best of each user's rows stays
+    ///   ([`ItemRekey::merged`]);
+    /// - a row under what the folder swallows (another subfolder, a loose
+    ///   video or audio file no extra rule gives the video) is pruned, as
+    ///   upstream, and named in one warning per rip first.
+    ///
+    /// A row a library this scan does not plan also holds
+    /// ([`held_by_unscanned`]) is left to that library. A video not stored
+    /// yet takes no fold: its rows stay out of the prune (returned as not
+    /// made) for the next scan, by which it is stored. One read of the rows
+    /// under the rips per library. Returns the folds made and those not made.
+    async fn fold_rip_contents(
+        &self,
+        planned: &[Planned],
+        rip_folds: &[RipFold],
+        folders: &[VirtualFolderInfo],
+        key_folders: &[VirtualFolderInfo],
+    ) -> Result<(Vec<ItemRekey>, Vec<ItemRekey>), ServiceError> {
+        /// How many swallowed paths one warning names (the count names all).
+        const SWALLOWED_PATHS_LOGGED: usize = 5;
+        let planned_by_id: HashMap<Uuid, &Planned> = planned.iter().map(|p| (p.id, p)).collect();
+        let rips: Vec<&RipFold> = rip_folds
+            .iter()
+            .filter(|fold| planned_by_id.contains_key(&fold.owner))
+            .filter(|fold| !fold.disc.is_empty() || !fold.swallowed.is_empty())
+            .collect();
+        if rips.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut libraries: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for fold in &rips {
+            libraries
+                .entry(fold.cf)
+                .or_default()
+                .extend(fold.disc.iter().chain(&fold.swallowed).cloned());
+        }
+        let mut rows: Vec<ItemPathRow> = Vec::new();
+        for (cf, roots) in libraries {
+            let Some(top_parents) = self.library_top_parents(cf).await else {
+                continue;
+            };
+            if let Some(found) = self
+                .persistence
+                .items_in_scope(&top_parents, &roots)
+                .await?
+            {
+                rows.extend(found);
+            }
+        }
+        let under =
+            |path: &str, roots: &[String]| roots.iter().any(|root| path_is_under(path, root));
+        let mut folds: Vec<ItemRekey> = Vec::new();
+        for fold in rips {
+            let candidates = rows.iter().filter(|row| {
+                !planned_by_id.contains_key(&row.id)
+                    && row
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| !held_by_unscanned(path, folders, key_folders))
+            });
+            let mut merged: Vec<Uuid> = Vec::new();
+            let mut swallowed: Vec<&str> = Vec::new();
+            for row in candidates {
+                let Some(path) = row.path.as_deref() else {
+                    continue;
+                };
+                if under(path, &fold.disc) {
+                    if row.extra_type.is_none() && is_rekeyable_video(&row.item_type) {
+                        merged.push(row.id);
+                    }
+                } else if under(path, &fold.swallowed) {
+                    swallowed.push(path);
+                }
+            }
+            if !swallowed.is_empty() {
+                swallowed.sort_unstable();
+                swallowed.dedup();
+                tracing::warn!(
+                    item_id = %fold.owner,
+                    path = %fold.dir,
+                    swallowed = swallowed.len(),
+                    first = ?&swallowed[..swallowed.len().min(SWALLOWED_PATHS_LOGGED)],
+                    "a disc rip's folder holds other media, which no longer resolves; removing its items"
+                );
+            }
+            merged.sort_unstable();
+            merged.dedup();
+            if !merged.is_empty() {
+                folds.push(ItemRekey {
+                    from: fold.owner,
+                    to: fold.owner,
+                    type_name: planned_by_id[&fold.owner].entity.type_.clone(),
+                    dirs: Vec::new(),
+                    merged,
+                    extra: false,
+                });
+            }
+        }
+        if folds.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let done = self
+            .persistence
+            .rekey_items(&folds)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "could not fold older rows into their disc rips");
+                Vec::new()
+            });
+        let made: std::collections::HashSet<Uuid> = done.iter().map(|m| m.to).collect();
+        folds.retain(|m| !made.contains(&m.to));
+        Ok((done, folds))
+    }
+
     /// What users made of the stored rows `ids`
     /// ([`ItemPersistenceService::item_user_weights`]), by id: one batched
     /// read, none for no ids; a store that cannot answer weighs nothing.
@@ -4587,6 +4738,7 @@ impl LibraryScanner {
             excluded,
             superseded,
             owner_paths,
+            rip_folds,
             local_versions,
             mut unlisted,
             inaccessible,
@@ -4644,6 +4796,11 @@ impl LibraryScanner {
             .await?;
         unmoved.extend(unfolded.iter().flat_map(|m| m.merged.iter().copied()));
         // A fold's rows are gone (`moved_away` below), its extra not new.
+        moved.extend(folded);
+        let (folded, unfolded) = self
+            .fold_rip_contents(&planned, &rip_folds, folders, key_folders)
+            .await?;
+        unmoved.extend(unfolded.iter().flat_map(|m| m.merged.iter().copied()));
         moved.extend(folded);
         let options = run.options;
         if let Some(touched) = run.touched {
@@ -5004,7 +5161,7 @@ impl LibraryScanner {
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
-            folders,
+            (folders, key_folders),
             &planned,
             scope,
             &unlisted,
@@ -5172,13 +5329,14 @@ impl LibraryScanner {
 
     /// Drops rows whose files vanished or whose paths were confirmed excluded, so deleted
     /// media stops being listed and served — within `scope`'s roots on a
-    /// path-scoped scan. Best-effort: a failure does not fail the scan. An
+    /// path-scoped scan. `folders` are the libraries scanned and every
+    /// configured one ([`Self::prune_deleted`]). Best-effort: a failure does not fail the scan. An
     /// item's own refresh removes nothing (upstream's `RefreshSingleItem`
     /// deletes no item), and nothing at or under a directory that failed to
     /// list (`unlisted`) is removed.
     async fn prune_after_scan(
         &self,
-        folders: &[VirtualFolderInfo],
+        folders: (&[VirtualFolderInfo], &[VirtualFolderInfo]),
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
@@ -7069,10 +7227,12 @@ impl LibraryScanner {
     /// Returns the deleted item ids per library, feeding the scan-end
     /// `LibraryChanged` push. The children-derived columns of the folders
     /// they leave behind are derived again by the folder aggregate pass,
-    /// which covers every folder the scan planned.
+    /// which covers every folder the scan planned. `folders` pairs the
+    /// libraries this scan plans with every configured one: an excluded or
+    /// taken-in-whole path a library not scanned also holds removes no row.
     async fn prune_deleted(
         &self,
-        folders: &[VirtualFolderInfo],
+        (folders, key_folders): (&[VirtualFolderInfo], &[VirtualFolderInfo]),
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
@@ -7094,11 +7254,17 @@ impl LibraryScanner {
             .collect();
         let superseded: std::collections::HashSet<&str> =
             superseded.iter().map(|dir| trimmed_dir(dir)).collect();
+        // What this scan's planner excludes or takes in whole is its word
+        // only for its own libraries: a row a library this scan does not
+        // plan also holds ([`held_by_unscanned`]) is that library's, kept
+        // while its file is (a library whose location is inside a disc rip
+        // another library resolves, say).
         let keep_on_disk = |row: &ItemPathRow| {
             let path = row.path.as_deref();
             !path.is_some_and(|path| {
-                excluded.covers(path)
-                    || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type))
+                (excluded.covers(path)
+                    || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type)))
+                    && !held_by_unscanned(path, folders, key_folders)
             }) && self.still_on_disk(path, &planned_paths)
         };
         // A row whose move to its new kind's id failed keeps the old one:
@@ -10326,6 +10492,7 @@ impl LibraryScanner {
             excluded: ctx.excluded.into_inner(),
             superseded: ctx.superseded.into_inner(),
             owner_paths: ctx.owner_paths.into_inner(),
+            rip_folds: ctx.rip_folds.into_inner(),
             local_versions: ctx.local_versions.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
@@ -10378,6 +10545,11 @@ impl LibraryScanner {
     /// library location that lists empty as inaccessible
     /// ([`PlanOutput::inaccessible`]).
     fn list(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
+        // A look-ahead listed it this pass (and recorded what a listing
+        // records): taken once, as listed.
+        if let Some(entries) = ctx.prelisted.borrow_mut().remove(dir) {
+            return entries;
+        }
         match self.file_system.try_get_file_system_entries(dir) {
             Ok(entries) => {
                 // Availability is measured before exclusions: a mounted
@@ -10458,10 +10630,13 @@ impl LibraryScanner {
             .as_ref()
             .filter(|m| !m.is_dir())
             .map(|m| FileTimes::of(m).mtime);
+        // A directory's dates are the folder's rule below, whether the item
+        // is a folder or a disc rip's `Video` (`IsFolder = 0`) at the rip's
+        // directory.
         let times = if is_folder {
             None
         } else {
-            meta.as_ref().map(FileTimes::of)
+            meta.as_ref().filter(|m| !m.is_dir()).map(FileTimes::of)
         };
         let entity = BaseItemEntity {
             id: guid_to_db(id),
@@ -10742,7 +10917,8 @@ impl LibraryScanner {
     /// The recursive walk behind [`Self::plan_movies`]: emits movie rows,
     /// collects extras for post-resolution, and records each directory's
     /// movies for extras ownership.
-    #[allow(clippy::too_many_arguments)]
+    // One resolver pass over a folder, in `FindMovie`'s order.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn collect_movie_plan(
         &self,
         dir: &str,
@@ -10782,7 +10958,18 @@ impl LibraryScanner {
             && album.is_none()
             && let Some(video_type) = self.disc_video_type(&entries, ctx)
         {
-            self.plan_disc_movie(dir, cf, video_type, walk, ctx, out);
+            self.plan_disc_movie(
+                dir,
+                root,
+                cf,
+                video_type,
+                walk,
+                entries,
+                ctx,
+                out,
+                extras,
+                movies_by_dir,
+            );
             return;
         }
         // `FindExtras` counts every file of an extras folder (listed above).
@@ -10822,6 +11009,30 @@ impl LibraryScanner {
             None if extras_folder || per_file => Vec::new(),
             None => folder_videos(&entries, extras_root, naming, walk),
         };
+        // A folder its files make no video of (`result.Items` holds no
+        // extra) may be one movie on several discs held in its subfolders
+        // (`FindMovie`, `MovieResolver.cs:497-500`).
+        if dir != root
+            && !extras_folder
+            && album.is_none()
+            && movie.is_none()
+            && videos.iter().all(|video| video.extra_type.is_some())
+            && let Some(set) = self.multi_disc_movie(&entries, ctx)
+        {
+            self.plan_multi_disc_movie(
+                dir,
+                root,
+                cf,
+                &set,
+                walk,
+                entries,
+                ctx,
+                out,
+                extras,
+                movies_by_dir,
+            );
+            return;
+        }
         // A video in its own folder is not in a mixed folder; one at the
         // library root always is (`IsTopParent`); elsewhere `ResolveVideos`
         // decides, and a lone video owns the folder's extras.
@@ -11312,57 +11523,183 @@ impl LibraryScanner {
         }
     }
 
-    /// The disc structure `dir` holds, if any: a `VIDEO_TS` subfolder with
-    /// `.vob` files is a DVD rip, a `BDMV` subfolder a Blu-ray rip. Port of
-    /// `IsDvdDirectory` / `IsBluRayDirectory`.
+    /// The disc rip `dir` is, if any — `FindMovie`'s folder-rip search
+    /// (`MovieResolver.cs:420-470`) over `entries`, `dir`'s listing, in
+    /// order, the first match winning: a `VIDEO_TS` subfolder holding `.vob`
+    /// files ([`Self::is_dvd_directory`]) or a `VIDEO_TS.IFO` file
+    /// ([`is_dvd_file`]) is a DVD, a `BDMV` subfolder a Blu-ray
+    /// ([`is_blu_ray_directory`]). An extras-named subfolder is skipped.
     fn disc_video_type(
         &self,
         entries: &[FileSystemEntryInfo],
         ctx: &PlanCtx<'_>,
     ) -> Option<VideoType> {
         for entry in entries {
-            if entry.type_ != FileSystemEntryType::Directory {
-                continue;
-            }
-            let name = file_stem(&entry.path);
-            if name.eq_ignore_ascii_case("BDMV") {
-                return Some(VideoType::BluRay);
-            }
-            if name.eq_ignore_ascii_case("VIDEO_TS")
-                && self.list(&entry.path, ctx).iter().any(|f| {
-                    f.type_ != FileSystemEntryType::Directory
-                        && std::path::Path::new(&f.path)
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("vob"))
-                })
-            {
+            if entry.type_ == FileSystemEntryType::Directory {
+                if is_extras_dir(entry, ctx.naming) {
+                    continue;
+                }
+                if self.is_dvd_directory(entry, ctx, false) {
+                    return Some(VideoType::Dvd);
+                }
+                if is_blu_ray_directory(entry) {
+                    return Some(VideoType::BluRay);
+                }
+            } else if is_dvd_file(entry) {
                 return Some(VideoType::Dvd);
             }
         }
         None
     }
 
-    /// TODO(parity, open work item): the row is stored `IsFolder = 1`, where
-    /// upstream's `Video` never is a folder (`BaseItem.cs:803`); `is_folder`
-    /// also drives the folder-style dates, the probe gate and the
-    /// containing-folder logic, so the fix splits those first. See
-    /// `brain/plans/PLAN_ITEM_FILE_DELETION.md` ("Disc-rip video rows").
+    /// `dir`'s entries for a look-ahead whose folder the walk may descend
+    /// into next ([`Self::multi_disc_movie`]): listed once, kept for the
+    /// walk's own [`Self::list`] of it ([`PlanCtx::prelisted`]).
+    fn prelist(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
+        if let Some(entries) = ctx.prelisted.borrow().get(dir) {
+            return entries.clone();
+        }
+        let entries = self.list(dir, ctx);
+        ctx.prelisted
+            .borrow_mut()
+            .insert(dir.to_owned(), entries.clone());
+        entries
+    }
+
+    /// Whether `entry` is a DVD's `VIDEO_TS` folder: so named (any case) and
+    /// holding a `.vob` file (`IsDvdDirectory`, `BaseVideoResolver.cs:
+    /// 259-268`). A look-ahead (`prelist`) keeps the listing for the walk.
+    fn is_dvd_directory(
+        &self,
+        entry: &FileSystemEntryInfo,
+        ctx: &PlanCtx<'_>,
+        prelist: bool,
+    ) -> bool {
+        let listing = |dir: &str| {
+            if prelist {
+                self.prelist(dir, ctx)
+            } else {
+                self.list(dir, ctx)
+            }
+        };
+        entry.type_ == FileSystemEntryType::Directory
+            && entry.name.eq_ignore_ascii_case("video_ts")
+            && listing(&entry.path).iter().any(|f| {
+                f.type_ != FileSystemEntryType::Directory
+                    && Path::new(&f.path)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("vob"))
+            })
+    }
+
+    /// The one movie a folder of disc folders is — port of `GetMultiDiscMovie`
+    /// (`MovieResolver.cs:511-582`), which `FindMovie` asks of a folder its
+    /// files make no video of that has subfolders (`:497-500`; `entries` is
+    /// its listing): of its non-extras subfolders, those that are a disc
+    /// ([`Self::disc_folder_type`]), in the culture's order (`.Order()`),
+    /// all of one `VideoType`, which `StackResolver.ResolveDirectories`
+    /// stacks into exactly one stack. The movie's path is the first disc
+    /// folder, its other parts the rest of them, its name the stack's.
     ///
-    /// Emits the single video row (`walk`'s kind) for a disc-rip folder (the folder itself is
-    /// the item, as upstream resolves it).
+    /// Only a folder a stacking rule names can join a stack (the resolver
+    /// skips any other), and a stack takes two: without two such
+    /// subfolders the answer is known without listing them.
+    fn multi_disc_movie(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        ctx: &PlanCtx<'_>,
+    ) -> Option<MultiDiscMovie> {
+        let naming = ctx.naming;
+        let candidates: Vec<&FileSystemEntryInfo> = entries
+            .iter()
+            .filter(|e| e.type_ == FileSystemEntryType::Directory && !is_extras_dir(e, naming))
+            .collect();
+        let stackable = candidates
+            .iter()
+            .filter(|e| {
+                naming
+                    .video_file_stacking_rules
+                    .iter()
+                    .any(|rule| rule.match_input(&e.name).is_some())
+            })
+            .count();
+        if stackable < 2 {
+            return None;
+        }
+        let mut video_types = Vec::new();
+        let mut discs: Vec<(String, Vec<FileSystemEntryInfo>)> = candidates
+            .into_iter()
+            .filter_map(|folder| {
+                let listing = self.prelist(&folder.path, ctx);
+                let video_type = self.disc_folder_type(&listing, ctx)?;
+                video_types.push(video_type);
+                Some((folder.path.clone(), listing))
+            })
+            .collect();
+        let video_type = *video_types.first()?;
+        if video_types.iter().any(|t| *t != video_type) {
+            return None;
+        }
+        discs.sort_by(|a, b| ferrofin_naming::culture_cmp(&a.0, &b.0));
+        let paths: Vec<String> = discs.iter().map(|(path, _)| path.clone()).collect();
+        let stacks = ferrofin_naming::video::stack_resolver::resolve_directories(&paths, naming);
+        let [stack] = stacks.as_slice() else {
+            return None;
+        };
+        Some(MultiDiscMovie {
+            name: stack.name.clone(),
+            video_type,
+            discs,
+        })
+    }
+
+    /// The disc a folder `GetMultiDiscMovie` weighs is, by its listing
+    /// `entries` (`MovieResolver.cs:516-547`): a DVD when a subfolder is a DVD
+    /// folder, else a Blu-ray when one is a `BDMV` folder, else a DVD when it
+    /// holds `VIDEO_TS.IFO`.
+    fn disc_folder_type(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        ctx: &PlanCtx<'_>,
+    ) -> Option<VideoType> {
+        if entries.iter().any(|e| self.is_dvd_directory(e, ctx, true)) {
+            Some(VideoType::Dvd)
+        } else if entries.iter().any(is_blu_ray_directory) {
+            Some(VideoType::BluRay)
+        } else if entries.iter().any(is_dvd_file) {
+            Some(VideoType::Dvd)
+        } else {
+            None
+        }
+    }
+
+    /// Emits the single video row (`walk`'s kind) for a disc-rip folder
+    /// `dir`, listed as `entries`: the folder itself is the item
+    /// (`FindMovie`, `MovieResolver.cs:420-470`), named after it (the
+    /// resolver's `EnsureName`), a `Video` like any — not a folder
+    /// (`BaseItem.IsFolder`, `BaseItem.cs:803`) though its path is a
+    /// directory, which dates it as one ([`Self::base_item`]). It owns the
+    /// extras of its folder ([`Self::plan_rip_folder`]).
+    #[allow(clippy::too_many_arguments)]
     fn plan_disc_movie(
         &self,
         dir: &str,
+        root: &str,
         cf: Uuid,
         video_type: VideoType,
         walk: MovieWalk,
+        entries: Vec<FileSystemEntryInfo>,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
+        extras: &mut Vec<MovieExtra>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) {
         let kind = walk.kind;
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
         let (parent, ancestors) = walk.parent(cf, ctx);
-        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, parent, name, dir, true) else {
+        let Some((id, mut entity)) =
+            self.base_item(ctx, kind, cf, parent, name.clone(), dir, false)
+        else {
             return;
         };
         entity.media_type = Some("Video".to_owned());
@@ -11371,7 +11708,7 @@ impl LibraryScanner {
         // music video takes the folder name's year ([`settle_mixed_folder`]).
         settle_mixed_folder(&mut entity, false, dir, ctx.naming);
         // A video with no parts or versions (`FindMovie`'s rip arm,
-        // `MovieResolver.cs:422-458`).
+        // `MovieResolver.cs:420-470`).
         set_resolved_lists(&mut entity, &[], &[]);
         if ctx.scope.keeps(dir) {
             ctx.local_versions.borrow_mut().push((id, Vec::new()));
@@ -11384,6 +11721,219 @@ impl LibraryScanner {
                 ancestors,
             },
         );
+        let rip = RipFolder {
+            dir,
+            root,
+            cf,
+            walk,
+            owner: (id, &name, dir),
+            discs: &[],
+        };
+        self.plan_rip_folder(&rip, entries, ctx, out, extras, movies_by_dir);
+    }
+
+    /// Plans the movie `set`, the multi-disc movie `GetMultiDiscMovie` made
+    /// of `dir` (listed as `entries`; [`Self::multi_disc_movie`]): a video of
+    /// `walk`'s kind at the first disc folder, carrying the others as its
+    /// `AdditionalParts` (`MovieResolver.cs:571-579`), named after the
+    /// stack and, undated, after a year in its name or its set folder's — a
+    /// stacked video's `ContainingFolderPath` (`Video.cs:205-208`). It is in
+    /// no mixed folder, and hangs where the set folder would.
+    ///
+    /// Its other discs get no rows, as upstream: the refresh creates a part
+    /// only for a path `FileSystem.FileExists` finds (`Video.
+    /// RefreshMetadataForOwnedVideo`, `Video.cs:650-661`), never a directory,
+    /// so `GetAdditionalParts` lists none. A row an older scan stored at one
+    /// (the disc it resolved on its own) folds into the movie, its user data
+    /// with it ([`PlanOutput::rip_folds`], [`LibraryScanner::fold_rip_contents`]).
+    ///
+    /// The set folder and its disc folders are taken in whole: any other
+    /// media row an older scan planned at one is reconciled away
+    /// ([`PlanCtx::superseded`]). The movie is planned when the scope keeps
+    /// any of its discs. The set owns the extras of its folder
+    /// ([`Self::plan_rip_folder`]).
+    #[allow(clippy::too_many_arguments)]
+    fn plan_multi_disc_movie(
+        &self,
+        dir: &str,
+        root: &str,
+        cf: Uuid,
+        set: &MultiDiscMovie,
+        walk: MovieWalk,
+        entries: Vec<FileSystemEntryInfo>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+        extras: &mut Vec<MovieExtra>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) {
+        let disc_paths: Vec<String> = set.discs.iter().map(|(path, _)| path.clone()).collect();
+        let Some((first, parts)) = disc_paths.split_first() else {
+            return;
+        };
+        for folder in std::iter::once(dir).chain(disc_paths.iter().map(String::as_str)) {
+            if ctx.scope.keeps(folder) {
+                ctx.superseded.borrow_mut().push(folder.to_owned());
+            }
+        }
+        let kept = disc_paths.iter().any(|path| ctx.scope.keeps(path));
+        let (parent, ancestors) = walk.parent(cf, ctx);
+        let Some((id, mut primary)) =
+            self.base_item(ctx, walk.kind, cf, parent, set.name.clone(), first, false)
+        else {
+            return;
+        };
+        if kept {
+            primary.media_type = Some("Video".to_owned());
+            // `GetMultiDiscMovie` sets no 3D format (`MovieResolver.cs:571-579`).
+            write_video_type(&mut primary, set.video_type);
+            settle_mixed_folder(&mut primary, false, dir, ctx.naming);
+            set_resolved_lists(&mut primary, parts, &[]);
+            ctx.local_versions.borrow_mut().push((id, Vec::new()));
+            out.push(Planned {
+                id,
+                entity: primary,
+                ancestors,
+            });
+        }
+        let rip = RipFolder {
+            dir,
+            root,
+            cf,
+            walk,
+            owner: (id, &set.name, first),
+            discs: &set.discs,
+        };
+        self.plan_rip_folder(&rip, entries, ctx, out, extras, movies_by_dir);
+    }
+
+    /// What resolves in the folder of a disc rip or a multi-disc set, `rip`,
+    /// listed as `entries`: the video owns its extras — `FindExtras` searches
+    /// its `ContainingFolderPath` (the rip's folder, a set's folder;
+    /// `Video.cs:201-219`) and the extras folders in it
+    /// (`BaseItem.SearchesContainingFolderForExtras`, `LibraryManager.cs:
+    /// 3445-3480`), those it names or whose folder is the owner's
+    /// ([`extra_matches_owner`]) — and nothing else below the folder
+    /// resolves, the video being no folder. What a row older scans stored
+    /// there becomes is the [`RipFold`] this records: inside the disc (a
+    /// `.vob` planned on its own, a set's disc) it folds into the video;
+    /// anything else the folder swallows is pruned.
+    fn plan_rip_folder(
+        &self,
+        rip: &RipFolder<'_>,
+        entries: Vec<FileSystemEntryInfo>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+        extras: &mut Vec<MovieExtra>,
+        movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
+    ) {
+        let naming = ctx.naming;
+        let (owner, owner_name, owner_path) = rip.owner;
+        movies_by_dir
+            .entry(rip.dir.to_owned())
+            .or_default()
+            .push((owner, owner_name.to_owned()));
+        ctx.owner_paths
+            .borrow_mut()
+            .insert(owner, owner_path.to_owned());
+        // `FindExtras` takes an extra only for an owner it names, or in the
+        // owner's folder: the owner is resolved as a folder (a rip's path is
+        // one, `LibraryManager.cs:3446-3447`), so a set's — the first disc —
+        // is no extra's parent folder, and an extra beside the discs must be
+        // named after it (`ExtraResolver.TryGetExtraTypeForOwner`,
+        // `ExtraResolver.cs:59-94`).
+        let owner_info =
+            video_resolver::resolve(Some(owner_path), true, naming, true, Some(rip.dir));
+        let takes = |extra: &MovieExtra| {
+            let rule = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                &extra.path,
+                naming,
+                Some(rip.root),
+            )
+            .rule;
+            owner_info.as_ref().zip(rule).is_some_and(|(owner, rule)| {
+                extra_matches_owner(&extra.path, rule.rule_type, owner, naming)
+            })
+        };
+        let folder = MovieFolder {
+            dir: rip.dir,
+            cf: rip.cf,
+            extras_root: rip.root,
+            extras_folder: false,
+            extras_folder_mixed: false,
+            untyped: matches!(
+                rip.walk.collection_type,
+                None | Some(CollectionTypeOptions::mixed)
+            ),
+            own_folder: true,
+            has_movie_files: false,
+            mixed: false,
+            walk: rip.walk,
+            groups: VideoGroups::of(Vec::new(), naming),
+        };
+        let mut found: Vec<MovieExtra> = Vec::new();
+        let mut fold = RipFold {
+            owner,
+            cf: rip.cf,
+            dir: rip.dir.to_owned(),
+            disc: Vec::new(),
+            swallowed: Vec::new(),
+        };
+        for entry in entries {
+            if entry.type_ == FileSystemEntryType::Directory && is_extras_dir(&entry, naming) {
+                if ctx.scope.visits(&entry.path) {
+                    self.collect_movie_plan(
+                        &entry.path,
+                        rip.root,
+                        rip.cf,
+                        rip.walk,
+                        ctx,
+                        out,
+                        &mut found,
+                        movies_by_dir,
+                    );
+                }
+                continue;
+            }
+            if let Some((disc, listing)) = rip.discs.iter().find(|(disc, _)| *disc == entry.path) {
+                // A set's disc: its row (a part has none) and what it holds.
+                ctx.excluded
+                    .borrow_mut()
+                    .extend(listing.iter().map(|e| e.path.clone()));
+                fold.disc.push(disc.clone());
+                continue;
+            }
+            if entry.type_ != FileSystemEntryType::Directory
+                && let Some(extra) = movie_walk_extra(&entry, &folder, naming)
+            {
+                found.push(extra);
+                continue;
+            }
+            let media = entry.type_ == FileSystemEntryType::Directory
+                || video_resolver::is_video_file(&entry.path, naming)
+                || is_audio_file(&entry.path, naming)
+                || is_disc_structure(&entry);
+            if !media {
+                continue;
+            }
+            ctx.excluded.borrow_mut().push(entry.path.clone());
+            if rip.discs.is_empty() && is_disc_structure(&entry) {
+                fold.disc.push(entry.path);
+            } else {
+                fold.swallowed.push(entry.path);
+            }
+        }
+        for extra in found {
+            if takes(&extra) {
+                extras.push(extra);
+            } else {
+                // No extra of the video's, and nothing else resolves here.
+                ctx.excluded.borrow_mut().push(extra.path.clone());
+                fold.swallowed.push(extra.path);
+            }
+        }
+        if ctx.scope.keeps(owner_path) {
+            ctx.rip_folds.borrow_mut().push(fold);
+        }
     }
 
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
@@ -13168,10 +13718,52 @@ fn file_video_type(path: &str) -> VideoType {
     }
 }
 
+/// Writes `video_type` (and, for an image, its `IsoType`) and the path's 3D
+/// format ([`set_3d_format`]) into the row's `Data`, as a resolver does for
+/// every video it makes (`BaseVideoResolver.ResolveVideo`,
+/// `BaseVideoResolver.cs:120-135`; `MovieResolver.cs:310-312,437-463`).
+fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
+    write_video_type(entity, video_type);
+    set_3d_format(entity);
+}
+
+/// `BaseVideoResolver.Set3DFormat` (`BaseVideoResolver.cs:201-250`): the 3D
+/// format `Format3DParser` reads in the row's path — a file's, or a disc
+/// rip's folder — stored as `Video3DFormat` in `Data`, where Jellyfin keeps
+/// it (`BaseItemMapper`, no column). A 3D format no rule names, or none,
+/// writes nothing.
+fn set_3d_format(entity: &mut BaseItemEntity) {
+    let Some(path) = entity.path.as_deref() else {
+        return;
+    };
+    let parsed = ferrofin_naming::video::format_3d_parser::parse(path, &PATH_NAMING);
+    if !parsed.is_3d {
+        return;
+    }
+    let format = match parsed
+        .format_3d
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("fsbs") => "FullSideBySide",
+        Some("ftab") => "FullTopAndBottom",
+        Some("hsbs" | "sbs" | "sbs3d") => "HalfSideBySide",
+        Some("htab" | "tab") => "HalfTopAndBottom",
+        Some("mvc") => "MVC",
+        _ => return,
+    };
+    if let Some(data) =
+        crate::item_data::set_data_field(entity.data.as_deref(), "Video3DFormat", format)
+    {
+        entity.data = Some(data);
+    }
+}
+
 /// Writes `video_type` (and, for an image, its `IsoType`) into the row's `Data`
 /// blob — where Jellyfin keeps them, and what the `videoTypes` browse filter
 /// matches on. `IsoType` follows upstream's path-substring heuristic.
-fn set_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
+fn write_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
     let name = match video_type {
         VideoType::VideoFile => "VideoFile",
         VideoType::Iso => "Iso",
@@ -13853,6 +14445,87 @@ fn set_resolved_lists(entity: &mut BaseItemEntity, parts: &[String], versions: &
     }
 }
 
+/// A multi-disc movie `GetMultiDiscMovie` made of a folder
+/// ([`LibraryScanner::multi_disc_movie`]).
+struct MultiDiscMovie {
+    /// The stack's name, the movie's.
+    name: String,
+    /// The `VideoType` every disc shares.
+    video_type: VideoType,
+    /// The disc folders in order — the movie's path first, then its
+    /// `AdditionalParts` — each with its listing.
+    discs: Vec<(String, Vec<FileSystemEntryInfo>)>,
+}
+
+/// The folder of a disc rip or a multi-disc set the movie walk resolved
+/// ([`LibraryScanner::plan_rip_folder`]).
+struct RipFolder<'a> {
+    /// The folder: the rip's own, or the set's.
+    dir: &'a str,
+    /// The library root the walk classifies extras under.
+    root: &'a str,
+    /// The library's collection folder.
+    cf: Uuid,
+    /// The walk it was resolved in.
+    walk: MovieWalk,
+    /// The video's id, name and path, which owns the folder's extras.
+    owner: (Uuid, &'a str, &'a str),
+    /// A set's disc folders with their listings; none for a rip.
+    discs: &'a [(String, Vec<FileSystemEntryInfo>)],
+}
+
+/// What a disc rip or a multi-disc set the movie walk resolved takes in
+/// whole ([`LibraryScanner::fold_rip_contents`]).
+#[derive(Debug, Clone)]
+struct RipFold {
+    /// The video.
+    owner: Uuid,
+    /// Its library's collection folder.
+    cf: Uuid,
+    /// The rip's folder, or the set's.
+    dir: String,
+    /// The disc's own content — a rip's disc structure, a set's disc
+    /// folders: a video row older scans stored at or under one folds into
+    /// the video.
+    disc: Vec<String>,
+    /// What else the folder holds that no longer resolves (another
+    /// subfolder, a loose video or audio file no extra rule gives the
+    /// video): its rows are pruned.
+    swallowed: Vec<String>,
+}
+
+/// Whether `entry`, in a disc rip's folder, is part of the disc: a DVD's
+/// `VIDEO_TS`/`AUDIO_TS` folder or its `.vob`/`.ifo`/`.bup` files (a rip
+/// laid out without `VIDEO_TS`), a Blu-ray's `BDMV`/`CERTIFICATE` folder.
+fn is_disc_structure(entry: &FileSystemEntryInfo) -> bool {
+    if entry.type_ == FileSystemEntryType::Directory {
+        ["video_ts", "audio_ts", "bdmv", "certificate"]
+            .iter()
+            .any(|name| entry.name.eq_ignore_ascii_case(name))
+    } else {
+        Path::new(&entry.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                ["vob", "ifo", "bup"]
+                    .iter()
+                    .any(|d| e.eq_ignore_ascii_case(d))
+            })
+    }
+}
+
+/// Whether `entry` is a Blu-ray's `BDMV` folder (`IsBluRayDirectory`,
+/// `BaseVideoResolver.cs:284-287`).
+fn is_blu_ray_directory(entry: &FileSystemEntryInfo) -> bool {
+    entry.type_ == FileSystemEntryType::Directory && entry.name.eq_ignore_ascii_case("bdmv")
+}
+
+/// Whether `entry` is a DVD's `VIDEO_TS.IFO` file (`IsDvdFile`,
+/// `BaseVideoResolver.cs:274-277`).
+fn is_dvd_file(entry: &FileSystemEntryInfo) -> bool {
+    entry.type_ != FileSystemEntryType::Directory && entry.name.eq_ignore_ascii_case("video_ts.ifo")
+}
+
 /// An extra the movie walk found, before its owner is known.
 struct MovieExtra {
     /// The extra's file.
@@ -14101,7 +14774,11 @@ fn extra_matches_owner(
     }
     let extra = video_resolver::clean_date_time(&file_stem(path), naming);
     let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
-    let owner_file = trimmed(&file_stem(&owner.path), &naming.video_flag_delimiters);
+    // `VideoFileInfo.FileNameWithoutExtension`: a folder's whole name.
+    let owner_file = trimmed(
+        owner.file_name_without_extension(),
+        &naming.video_flag_delimiters,
+    );
     let owner_name = trimmed(&owner.name, &naming.video_flag_delimiters);
     if (!owner_file.is_empty() && extra_name.starts_with(&owner_file))
         || (!owner_name.is_empty()
@@ -14256,11 +14933,8 @@ fn video_nfo_candidates(entity: &BaseItemEntity, path: &Path, is_movie: bool) ->
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let disc = !placeholder && matches!(video_type, Some("Dvd" | "BluRay"));
-    let containing = if disc || entity.is_folder {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    let containing = PathBuf::from(crate::video_versions::containing_folder_path(entity));
+    let containing = containing.as_path();
     let mut candidates = Vec::new();
     if video_type == Some("Dvd") && !placeholder {
         candidates.push(containing.join("VIDEO_TS").join("VIDEO_TS.nfo"));
@@ -14893,11 +15567,10 @@ fn before_metadata_refresh(row: &mut BaseItemEntity, replace_all: bool, season_i
 /// `FileNameWithoutExtension` overrides for them).
 fn names_its_own_folder(row: &BaseItemEntity) -> bool {
     row.is_folder
-        || crate::item_data::read_data_string(
-            &crate::item_data::parse_data(row.data.as_deref()),
-            "VideoType",
+        || matches!(
+            crate::item_data::video_format(row.data.as_deref()).video_type,
+            VideoType::BluRay | VideoType::Dvd
         )
-        .is_some_and(|video_type| video_type == "BluRay" || video_type == "Dvd")
 }
 
 /// `LibraryManager.FillMissingEpisodeNumbersFromPath` (`LibraryManager.cs:
@@ -15262,9 +15935,9 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         row.series_presentation_unique_key
             .clone_from(&scanned.series_presentation_unique_key);
     }
-    if scanned.is_folder {
-        // A directory has no `DateModified` (D2): one an older scan stored
-        // goes on the next save.
+    if crate::item_data::path_is_directory(scanned) {
+        // A directory — a folder's, a disc rip's — has no `DateModified`
+        // (D2): one an older scan stored goes on the next save.
         row.date_modified = None;
     } else if scanned.date_modified.is_some() {
         row.date_modified = scanned.date_modified;
@@ -16432,19 +17105,23 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
     };
     let kind = image_item_kind(&entity.type_);
 
-    let containing = if entity.is_folder {
-        Some(path.to_owned())
-    } else {
-        std::path::Path::new(path)
-            .parent()
-            .and_then(|p| p.to_str())
-            .map(ToOwned::to_owned)
-    };
+    // `ContainingFolderPath`: a folder's own path, a disc rip's too, a
+    // stacked video's first part's folder, else the file's.
+    let containing = Some(crate::video_versions::containing_folder_path(entity))
+        .filter(|folder| !folder.is_empty());
 
     let mut item = ImageItem::new(kind);
     item.name = entity.name.clone().unwrap_or_default();
     item.path = Some(path.to_owned());
-    item.file_name_without_extension = Some(file_stem(path));
+    // `FileNameWithoutExtension`: a folder's and a disc rip's whole name
+    // (`Folder.cs:119-130`, `Video.cs:223-236`).
+    item.file_name_without_extension = Some(if names_its_own_folder(entity) {
+        Path::new(path)
+            .file_name()
+            .map_or_else(|| file_stem(path), |n| n.to_string_lossy().into_owned())
+    } else {
+        file_stem(path)
+    });
     item.containing_folder_path = containing;
 
     let dir = FsDirectoryService::new();
@@ -17541,6 +18218,32 @@ mod tests {
         let expected: Vec<std::path::PathBuf> =
             expected.iter().map(std::path::PathBuf::from).collect();
         assert_eq!(super::nfo_candidates(&entity, nfo_kind), expected);
+    }
+
+    /// A multi-disc movie's NFO lives in its set's folder: its
+    /// `ContainingFolderPath` is the first disc's parent (`IsStacked`,
+    /// `Video.cs:205-208`), which `GetMovieSavePaths` searches.
+    #[test]
+    fn a_multi_disc_movies_nfo_is_in_its_set_folder() {
+        let entity = BaseItemEntity {
+            path: Some("/m/Set/Set - Disc 1".to_owned()),
+            data: Some(
+                r#"{"VideoType":"Dvd","AdditionalParts":["/m/Set/Set - Disc 2"]}"#.to_owned(),
+            ),
+            ..BaseItemEntity::default()
+        };
+        let expected: Vec<std::path::PathBuf> = [
+            "/m/Set/VIDEO_TS/VIDEO_TS.nfo",
+            "/m/Set/movie.nfo",
+            "/m/Set/Set.nfo",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+        assert_eq!(
+            super::nfo_candidates(&entity, ferrofin_providers::xbmc::item::NfoItemKind::Movie),
+            expected
+        );
     }
 
     // apply_nfo fills only empty fields (mirrors apply_details) and pipe-joins the sets.
@@ -29609,6 +30312,35 @@ mod tests {
             Some(2005)
         );
         assert!(super::pick_series_hit(Vec::new(), Some(1963)).is_none());
+    }
+
+    /// `Set3DFormat` (`BaseVideoResolver.cs:201-250`) maps the 3D format
+    /// `Format3DParser` reads in the path to `Video3DFormat`, kept in `Data`;
+    /// a 2D path stores none (cases from upstream `Format3DTests`).
+    #[rstest::rstest]
+    #[case::hsbs("/m/Super movie.3d.hsbs.mkv", Some("HalfSideBySide"))]
+    #[case::sbs("/m/Super movie.3d.sbs.mkv", Some("HalfSideBySide"))]
+    #[case::htab("/m/Super movie.3d.htab.mkv", Some("HalfTopAndBottom"))]
+    #[case::tab("/m/Super movie.3d.tab.mkv", Some("HalfTopAndBottom"))]
+    #[case::fsbs("/m/Super movie [fsbs].mkv", Some("FullSideBySide"))]
+    #[case::ftab("/m/Super movie [ftab].mkv", Some("FullTopAndBottom"))]
+    #[case::mvc("/m/Super movie [mvc].mkv", Some("MVC"))]
+    #[case::rip_folder("/m/Avatar (2009) 3D HSBS", Some("HalfSideBySide"))]
+    #[case::two_d("/m/Super movie.mkv", None)]
+    #[case::three_d_alone("/m/Super movie.3d.mkv", None)]
+    fn a_videos_3d_format_comes_from_its_path(#[case] path: &str, #[case] expected: Option<&str>) {
+        use ferrofin_model::entities::VideoType;
+        let mut entity = BaseItemEntity {
+            path: Some(path.to_owned()),
+            ..Default::default()
+        };
+        super::set_video_type(&mut entity, VideoType::VideoFile);
+        let data = crate::item_data::parse_data(entity.data.as_deref());
+        assert_eq!(
+            data.get("Video3DFormat")
+                .and_then(serde_json::Value::as_str),
+            expected
+        );
     }
 
     #[test]

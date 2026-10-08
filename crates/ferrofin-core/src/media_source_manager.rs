@@ -25,7 +25,7 @@ use ferrofin_db::entities::base_items::{
     AttachmentStreamInfoEntity, BaseItemEntity, MediaStreamInfoEntity,
 };
 use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
-use ferrofin_model::entities::{MediaStreamType, VideoType};
+use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
 use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use uuid::Uuid;
@@ -382,10 +382,12 @@ impl FerrofinMediaSourceManager {
         streams: Vec<MediaStream>,
         attachments: Vec<MediaAttachment>,
     ) -> MediaSourceInfo {
-        // A video item's source reports `VideoType.VideoFile` (Jellyfin's
-        // `Video.VideoType` default); audio/other sources leave it unset.
-        let video_type =
-            (item.media_type.as_deref() == Some("Video")).then_some(VideoType::VideoFile);
+        // A video item's source reports its `VideoType`, `IsoType` and
+        // `Video3DFormat` (`BaseItem.GetVersionInfo`, `BaseItem.cs:1231-1237`),
+        // read off `Data` — `VideoFile` when it names none, `Video.VideoType`'s
+        // default; audio/other sources leave them unset.
+        let format = (item.media_type.as_deref() == Some("Video"))
+            .then(|| crate::item_data::video_format(item.data.as_deref()));
 
         // Default audio stream index: the audio stream marked default, else the
         // first audio stream (mirrors `MediaSourceInfo.DefaultAudioStreamIndex`
@@ -413,7 +415,12 @@ impl FerrofinMediaSourceManager {
             // A lone source's name (`BaseItem.GetMediaSourceName` with no
             // common prefix); a version group renames its sources
             // (`VersionRows::media_sources`).
-            name: Some(crate::video_versions::media_source_name(None, item, None)),
+            name: Some(match format {
+                Some(format) => {
+                    crate::video_versions::media_source_name_of(None, item, None, format)
+                }
+                None => crate::video_versions::media_source_name(None, item, None),
+            }),
             container: container_of(item),
             size: item.size,
             run_time_ticks: item.run_time_ticks,
@@ -424,7 +431,9 @@ impl FerrofinMediaSourceManager {
             supports_direct_play: true,
             supports_direct_stream: true,
             supports_transcoding: true,
-            video_type,
+            video_type: format.map(|f| f.video_type),
+            iso_type: format.and_then(|f| f.iso_type),
+            video3d_format: format.and_then(|f| f.video3d_format),
             default_audio_stream_index,
             e_tag: Some(source_etag(item)),
             // `BaseItem.GetVersionInfo` seeds the source bitrate from the item's
@@ -1293,6 +1302,7 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_db::store::guid_to_db;
     use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::entities::{IsoType, Video3DFormat, VideoType};
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
     #[test]
@@ -2497,6 +2507,47 @@ mod tests {
             id.simple().to_string(),
             "no user, no reordering"
         );
+    }
+
+    /// `GetVersionInfo` reports the video's own `VideoType`, `IsoType` and
+    /// `Video3DFormat` (`BaseItem.cs:1231-1237`), and names the source after
+    /// them (`/DVD`, `/Bluray`, `/3D`).
+    #[rstest::rstest]
+    #[case::dvd(r#"{"VideoType":"Dvd"}"#, VideoType::Dvd, None, None, "Rip/DVD")]
+    #[case::iso(
+        r#"{"VideoType":"Iso","IsoType":"BluRay"}"#,
+        VideoType::Iso,
+        Some(IsoType::BluRay),
+        None,
+        "Rip/Bluray"
+    )]
+    #[case::three_d(
+        r#"{"VideoType":"VideoFile","Video3DFormat":"HalfSideBySide"}"#,
+        VideoType::VideoFile,
+        None,
+        Some(Video3DFormat::HalfSideBySide),
+        "Rip/3D"
+    )]
+    #[case::none(r"{}", VideoType::VideoFile, None, None, "Rip")]
+    fn static_source_reports_the_videos_format(
+        #[case] data: &str,
+        #[case] video_type: VideoType,
+        #[case] iso_type: Option<IsoType>,
+        #[case] video3d_format: Option<Video3DFormat>,
+        #[case] name: &str,
+    ) {
+        let item = BaseItemEntity {
+            id: "item-1".to_owned(),
+            path: Some("/media/Rip".to_owned()),
+            media_type: Some("Video".to_owned()),
+            data: Some(data.to_owned()),
+            ..Default::default()
+        };
+        let source = FerrofinMediaSourceManager::static_source(&item, Vec::new(), Vec::new());
+        assert_eq!(source.video_type, Some(video_type));
+        assert_eq!(source.iso_type, iso_type);
+        assert_eq!(source.video3d_format, video3d_format);
+        assert_eq!(source.name.as_deref(), Some(name));
     }
 
     #[test]

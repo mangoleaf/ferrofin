@@ -121,6 +121,16 @@ const MOVIES: &[&str] = &[
     "Dune (2021)/BDMV/index.bdmv",
     "Dune (2021)/BDMV/STREAM/00001.m2ts",
     "Dune (2021)/trailers/Dune Trailer.mkv",
+    "Jaws (1975)/VIDEO_TS.IFO",
+    "Jaws (1975)/VTS_01_1.VOB",
+    "Jaws (1975)/Jaws (1975)-trailer.mkv",
+    "Sound of Music/Sound of Music (1965) (Disc 01)/VIDEO_TS/VTS_01_1.VOB",
+    "Sound of Music/Sound of Music (1965) (Disc 02)/VIDEO_TS/VTS_01_1.VOB",
+    // No extra of the set's: its owner folder is the first disc, and the
+    // name is not the set's (`ExtraResolver.cs:71,85-91`).
+    "Sound of Music/trailers/Sound of Music Trailer.mkv",
+    // Named after the set's title and year: its trailer.
+    "Sound of Music/Sound of Music (1965)-trailer.mkv",
     "Collections/Alien/Aliens (1986).mkv",
     "Collections/Alien/Alien 3 (1992).mkv",
     "Soundtrack/score.mp3",
@@ -242,14 +252,17 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
 }
 
 /// What the invariant compares for one planned item: its id, its ancestor
-/// closure, and its row (presentation keys included) — with a folder's
-/// `DateCreated` cleared, which the planner stamps with the clock.
+/// closure, and its row (presentation keys included) — with a directory's
+/// (a folder's, a disc rip's) `DateCreated` cleared, which the planner
+/// stamps with the clock.
 fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
     items
         .into_iter()
         .map(|p| {
             let mut entity = p.entity;
-            if entity.is_folder {
+            // A directory — a folder's, a disc rip's — is stamped with the
+            // resolve time.
+            if crate::item_data::path_is_directory(&entity) {
                 entity.date_created = None;
             }
             (p.id, p.ancestors, entity)
@@ -261,15 +274,26 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
 /// build it: the items at, under or above a path, the path-less virtual
 /// seasons those items sit in, and the rest of a kept video's local group —
 /// its primary, stacked parts and alternate versions, linked by `OwnerId`
-/// (no extra), which a scoped plan plans whole.
+/// (no extra), which a scoped plan plans whole — and a multi-disc movie
+/// one of whose `AdditionalParts` disc folders (which have no rows) is.
 fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Planned> {
+    let kept = |path: &str| {
+        exact == Some(path)
+            || paths
+                .iter()
+                .any(|c| path_is_under(path, c) || path_is_under(c, path))
+    };
     let by_path = |p: &Planned| {
-        p.entity.path.as_deref().is_some_and(|path| {
-            exact == Some(path)
-                || paths
-                    .iter()
-                    .any(|c| path_is_under(path, c) || path_is_under(c, path))
-        })
+        p.entity.path.as_deref().is_some_and(kept)
+            || crate::item_data::parse_data(p.entity.data.as_deref())
+                .get("AdditionalParts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|part| crate::item_data::path_is_directory(&p.entity) && kept(part))
+                })
     };
     let parents: std::collections::HashSet<String> = full
         .iter()
@@ -346,6 +370,8 @@ fn assert_group_shapes(full: &[Planned]) {
 /// inside of a disc rip, and paths that do not exist — planning that one
 /// path, through the libraries a path-scoped scan walks for it
 /// (`affected_libraries`), yields exactly the full plan filtered to it.
+// The fixture's path list is one table.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn plan_paths_matches_the_filtered_full_plan() {
     let tmp = tempfile::tempdir().unwrap();
@@ -400,6 +426,10 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "movies/Dune (2021)/BDMV/STREAM/00001.m2ts",
         "movies/Dune (2021)/BDMV",
         "movies/Dune (2021)/trailers",
+        "movies/Jaws (1975)/VTS_01_1.VOB",
+        "movies/Sound of Music",
+        "movies/Sound of Music/Sound of Music (1965) (Disc 02)/VIDEO_TS/VTS_01_1.VOB",
+        "movies/Sound of Music/trailers",
         "movies/Gone (2000).mkv",
         "tv",
         "tv/",

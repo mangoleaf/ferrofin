@@ -649,3 +649,80 @@ fn the_version_being_resumed_leads_a_primarys_sources() {
         "a completed version stays put"
     );
 }
+
+/// `GetMediaSourceName`'s `Video` terms (`BaseItem.cs:1340-1375`): `3D` for
+/// a `Video3DFormat`, then `Bluray`/`DVD` for a disc — or a disc image of
+/// that `IsoType` — and `ISO` for an image of no known kind, each joined to
+/// the name with `/`. A `VideoFile` adds nothing.
+#[rstest]
+#[case::video_file(
+    "/m/Heat (1995)/Heat (1995).mkv",
+    r#"{"VideoType":"VideoFile"}"#,
+    "Heat (1995)"
+)]
+#[case::no_video_type("/m/Heat (1995)/Heat (1995).mkv", r"{}", "Heat (1995)")]
+#[case::dvd("/m/Alien (1979)", r#"{"VideoType":"Dvd"}"#, "Alien (1979)/DVD")]
+#[case::bluray(
+    "/m/Avatar (2009)",
+    r#"{"VideoType":"BluRay"}"#,
+    "Avatar (2009)/Bluray"
+)]
+#[case::iso_dvd("/m/Film.iso", r#"{"VideoType":"Iso","IsoType":"Dvd"}"#, "Film/DVD")]
+#[case::iso_bluray(
+    "/m/Film.iso",
+    r#"{"VideoType":"Iso","IsoType":"BluRay"}"#,
+    "Film/Bluray"
+)]
+#[case::iso_unknown("/m/Film.iso", r#"{"VideoType":"Iso"}"#, "Film/ISO")]
+#[case::iso_null_kind("/m/Film.iso", r#"{"VideoType":"Iso","IsoType":null}"#, "Film/ISO")]
+#[case::three_d(
+    "/m/Film.3D.mkv",
+    r#"{"VideoType":"VideoFile","Video3DFormat":"HalfSideBySide"}"#,
+    "Film.3D/3D"
+)]
+#[case::three_d_bluray(
+    "/m/Film",
+    r#"{"VideoType":"BluRay","Video3DFormat":"MVC"}"#,
+    "Film/3D/Bluray"
+)]
+fn get_media_source_name_names_the_disc(
+    #[case] path: &str,
+    #[case] data: &str,
+    #[case] expected: &str,
+) {
+    let mut item = video(path);
+    item.data = Some(data.to_owned());
+    assert_eq!(media_source_name(None, &item, None), expected);
+}
+
+/// `Video.ContainingFolderPath` (`Video.cs:201-219`): a stacked video's is its
+/// first part's folder — a multi-disc set's folder — a disc rip's its own
+/// path, a `.disc` placeholder's and a file's their folder.
+#[rstest]
+#[case::file("/m/Heat/Heat.mkv", false, r#"{"VideoType":"VideoFile"}"#, "/m/Heat")]
+#[case::dvd_rip("/m/Alien", false, r#"{"VideoType":"Dvd"}"#, "/m/Alien")]
+#[case::bluray_rip("/m/Avatar", false, r#"{"VideoType":"BluRay"}"#, "/m/Avatar")]
+#[case::placeholder(
+    "/m/Alien/Alien.disc",
+    false,
+    r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#,
+    "/m/Alien"
+)]
+#[case::multi_disc(
+    "/m/Set/Set - Disc 1",
+    false,
+    r#"{"VideoType":"Dvd","AdditionalParts":["/m/Set/Set - Disc 2"]}"#,
+    "/m/Set"
+)]
+#[case::folder("/m/Show", true, r"{}", "/m/Show")]
+fn containing_folder_path_follows_the_video_type(
+    #[case] path: &str,
+    #[case] is_folder: bool,
+    #[case] data: &str,
+    #[case] expected: &str,
+) {
+    let mut item = video(path);
+    item.is_folder = is_folder;
+    item.data = Some(data.to_owned());
+    assert_eq!(containing_folder_path(&item), expected);
+}
