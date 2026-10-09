@@ -165,6 +165,18 @@ async fn live_folder_view_flag_name_and_secure_root_browse() {
     let beyond = get(&router, token, &format!("{parent}&startIndex=99&limit=1")).await;
     assert_eq!(beyond["TotalRecordCount"], 3);
     assert!(names(&beyond).is_empty());
+    let root_page = get(&router, token, &parent).await;
+    let requested_root = root_page["Items"][0]["Id"].as_str().unwrap();
+    let requested_name = root_page["Items"][0]["Name"].as_str().unwrap();
+    for recursive in [false, true] {
+        let explicit = get(&router, token, &format!("/Items?userId={admin}&parentId={id}&recursive={recursive}&ids={requested_root}&sortBy=SortName")).await;
+        assert_eq!(
+            names(&explicit),
+            [requested_name],
+            "explicit IDs bypass the Folders view builder after the controller clears Parent"
+        );
+        assert_eq!(explicit["TotalRecordCount"], 1);
+    }
     settings["UICulture"] = json!("fr");
     post(&router, token, "/System/Configuration", settings.clone()).await;
     let localized = get(&router, token, &view_path).await;

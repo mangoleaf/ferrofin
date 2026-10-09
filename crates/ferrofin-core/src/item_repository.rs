@@ -34,9 +34,10 @@ use ferrofin_traits::options::ItemImageInfo;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 use ferrofin_traits::persistence::{
-    ItemRepository, ItemTypeLookup, ItemWithCounts, PlaylistAccessColumns, PlaylistItemsWithAccess,
+    FolderChild, ItemRepository, ItemTypeLookup, ItemWithCounts, PlaylistAccessColumns,
+    PlaylistItemsWithAccess,
 };
 
 use crate::aggregate_folder::RootFolderIds;
@@ -50,6 +51,14 @@ use crate::translate_query::{
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use crate::virtual_paths::VirtualPathExpander;
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
+
+#[derive(sqlx::FromRow)]
+struct FolderChildRow {
+    #[sqlx(flatten)]
+    item: BaseItemEntity,
+    #[sqlx(rename = "_FolderLinked")]
+    linked: bool,
+}
 
 /// The concrete item repository.
 ///
@@ -75,6 +84,84 @@ impl std::fmt::Debug for FerrofinItemRepository {
     }
 }
 
+/// Resolves the pinned DescendantQueryHelper root sets once per logical query.
+/// Source first-visit roles matter: a physical link owner discovered before a
+/// later back-link never becomes a new closure root. Leaves are not loaded here.
+pub(crate) async fn resolve_descendant_query(
+    db: &Database,
+    filter: &InternalItemsQuery,
+) -> Result<Option<InternalItemsQuery>, ServiceError> {
+    let Some(parent) = filter.descendant_of_id else {
+        return Ok(None);
+    };
+    if filter
+        .descendant_roots
+        .as_ref()
+        .is_some_and(|roots| roots.parent_id == parent)
+    {
+        return Ok(None);
+    }
+    let mut roots = DescendantQueryRoots {
+        parent_id: parent,
+        closure_roots: vec![parent],
+        link_roots: vec![parent],
+    };
+    let mut visited = std::collections::HashSet::from([parent]);
+    let mut frontier = vec![parent];
+    while !frontier.is_empty() {
+        let discovered = discover_linked_roots(db, &frontier).await?;
+        frontier.clear();
+        for (id, linked_folder) in discovered {
+            let id =
+                Uuid::parse_str(&id).map_err(|error| ServiceError::backend(error.to_string()))?;
+            if visited.insert(id) {
+                frontier.push(id);
+                roots.link_roots.push(id);
+                if linked_folder {
+                    roots.closure_roots.push(id);
+                }
+            }
+        }
+    }
+    let mut resolved = filter.clone();
+    resolved.descendant_roots = Some(roots);
+    Ok(Some(resolved))
+}
+
+/// One batched frontier query; all link kinds qualify, and only actual folders
+/// become new roots. Canonical JSON IDs avoid a bind per leaf or a variable cap.
+async fn discover_linked_roots(
+    db: &Database,
+    frontier: &[Uuid],
+) -> Result<Vec<(String, bool)>, ServiceError> {
+    sqlx::query_as(
+        r#"WITH frontier("Id") AS (SELECT value FROM json_each(?1)),
+        closure_direct("Id") AS (
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN frontier f ON f."Id" = a."ParentItemId"
+        ), closure_descendants("Id") AS (
+            SELECT "Id" FROM closure_direct
+            UNION
+            SELECT a."ItemId" FROM "AncestorIds" a
+            JOIN closure_direct d ON d."Id" = a."ParentItemId"
+        ), candidates("Id", "LinkedFolder") AS (
+            SELECT child."Id", 1 FROM "LinkedChildren" link
+            JOIN frontier f ON f."Id" = link."ParentId"
+            JOIN "BaseItems" child ON child."Id" = link."ChildId"
+            WHERE child."IsFolder"
+            UNION ALL
+            SELECT owner."Id", 0 FROM "LinkedChildren" link
+            JOIN closure_descendants d ON d."Id" = link."ParentId"
+            JOIN "BaseItems" owner ON owner."Id" = link."ParentId"
+            WHERE owner."IsFolder"
+        ) SELECT "Id", MAX("LinkedFolder") FROM candidates GROUP BY "Id""#,
+    )
+    .bind(serde_json::json!(to_guid_strings(frontier)).to_string())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 /// The columns [`FerrofinItemRepository::top_parent_ids_for_query`] reads to
 /// resolve one view.
 #[derive(Clone, sqlx::FromRow)]
@@ -95,6 +182,9 @@ struct ViewRow {
     /// Where `GetTopParent` lands for a followed pointer.
     #[sqlx(rename = "TopParentId")]
     top_parent_id: Option<String>,
+    /// Persisted link presence, independent of a stale serialized Data array.
+    #[sqlx(rename = "_HasLinkedChildren")]
+    has_linked_children: bool,
 }
 
 impl FerrofinItemRepository {
@@ -617,8 +707,15 @@ impl FerrofinItemRepository {
     /// is translated to itself AND its physical folders
     /// ([`library_top_parents_by_view`]), never to the folders alone.
     async fn query_view_row(db: &Database, id: Uuid) -> Result<Option<ViewRow>, ServiceError> {
-        sqlx::query_as(r#"SELECT "Type", "ParentId", "Path", "Data", "TopParentId" FROM "BaseItems" WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id)).fetch_optional(db.pool()).await.map_err(db_err)
+        sqlx::query_as(
+            r#"SELECT "Type", "ParentId", "Path", "Data", "TopParentId",
+            EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1) AS "_HasLinkedChildren"
+            FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     async fn query_parent_row(
@@ -653,10 +750,46 @@ impl FerrofinItemRepository {
     ) -> Result<Option<InternalItemsQuery>, ServiceError> {
         let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
         let prepared = preferences.as_ref().unwrap_or(filter);
+        let linked = Self::linked_container_scope(prepared, parent);
+        let prepared = linked.as_ref().unwrap_or(prepared);
+        let descendants = resolve_descendant_query(&self.db, prepared).await?;
+        let prepared = descendants.as_ref().unwrap_or(prepared);
+        if linked.is_some() {
+            // AddUserToQuery still grants the user's libraries after Parent is
+            // cleared; DescendantOfId is not one of its confinement guards.
+            return Ok(Some(
+                scope_to_user_libraries_prepared(&self.db, prepared)
+                    .await?
+                    .unwrap_or_else(|| prepared.clone()),
+            ));
+        }
         Ok(self
             .resolve_views_prepared(prepared, parent)
             .await?
+            .or(descendants)
             .or(preferences))
+    }
+
+    /// LibraryManager.SetTopParentIdsOrAncestors selects the descendant
+    /// helper only for a linked BoxSet/Playlist, then clears the parent scope.
+    fn linked_container_scope(
+        filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
+    ) -> Option<InternalItemsQuery> {
+        if !filter.recursive || filter.physical_children_only || filter.parent_id.is_nil() {
+            return None;
+        }
+        let parent = parent?;
+        let kind = crate::item_type_lookup::kind_from_type_name(&parent.type_name);
+        if !parent.has_linked_children
+            || !matches!(kind, Some(BaseItemKind::BoxSet | BaseItemKind::Playlist))
+        {
+            return None;
+        }
+        let mut resolved = filter.clone();
+        resolved.descendant_of_id = Some(filter.parent_id);
+        resolved.set_parent(None);
+        Some(resolved)
     }
 
     async fn resolve_views_prepared(
@@ -865,6 +998,7 @@ impl FerrofinItemRepository {
             path,
             data,
             top_parent_id,
+            ..
         }) = row
         else {
             return Ok(None);
@@ -2752,7 +2886,7 @@ impl ItemRepository for FerrofinItemRepository {
         // C# `ItemsController.GetItems` does NOT query when the parent is the
         // user root and the request is neither recursive nor id-scoped — see
         // [`Self::user_root_children`].
-        if let Some(children) = self.user_root_children(filter).await? {
+        if let Some(children) = Box::pin(self.user_root_children(filter)).await? {
             let total = i32::try_from(children.len()).unwrap_or(i32::MAX);
             // `new QueryResult<BaseItem>(itemsArray)`: the total is the array's
             // own length, and the controller echoes the REQUESTED `startIndex`
@@ -2820,6 +2954,40 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         self.fetch_rows(filter, QueryShape::FullRows).await
+    }
+
+    async fn get_folder_children(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<FolderChild>, ServiceError> {
+        // Resolve only the physical view membership. User-specific access is
+        // checked together by the Folder's visibility evaluator afterwards.
+        let scope = InternalItemsQuery {
+            parent_id: query.parent_id,
+            parent_type: query.parent_type,
+            group_by_presentation_unique_key: false,
+            ..InternalItemsQuery::default()
+        };
+        let resolved = self.resolve_views(&scope).await?;
+        let scope = resolved.as_ref().unwrap_or(&scope);
+        let mut builder = crate::translate_query::build_folder_children_query(
+            scope.parent_id,
+            &scope.parent_physical_folder_ids,
+            query.user.is_some(),
+        );
+        builder
+            .build_query_as::<FolderChildRow>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| FolderChild {
+                        item: row.item,
+                        linked: row.linked,
+                    })
+                    .collect()
+            })
     }
 
     async fn get_item_id_clean_names(
@@ -3414,6 +3582,255 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    #[tokio::test]
+    async fn plain_folder_children_keep_physical_order_then_every_link_kind() {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let folder = Uuid::new_v4();
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Folder", None).await;
+        let mut ids = Vec::new();
+        for (name, physical) in [
+            ("Zulu physical", true),
+            ("Bravo physical", true),
+            ("Alpha shortcut", false),
+            ("Charlie local alternate", false),
+            ("Delta linked alternate", false),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut row = repository.retrieve_item(id).await.unwrap().unwrap();
+            row.sort_name = Some(name.to_lowercase());
+            if physical {
+                row.parent_id = Some(guid_to_db(folder));
+            } else if name == "Charlie local alternate" {
+                // An existing alternate is hidden by the cached physical
+                // query, then restored by its all-kind linked membership.
+                row.parent_id = Some(guid_to_db(folder));
+                row.primary_version_id = Some(guid_to_db(ids[0]));
+            }
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[row])
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let links = crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone());
+        // Link order differs from SortName; physical duplication must neither
+        // move the child nor cause its access to become linked-only.
+        for (index, kind) in [(0, 0), (2, 1), (4, 3), (3, 2)] {
+            links
+                .upsert_linked_child(folder, ids[index], kind)
+                .await
+                .unwrap();
+        }
+        let query = InternalItemsQuery {
+            parent_id: folder,
+            user: Some(seed_user_with_defaults(&db, Uuid::new_v4()).await),
+            limit: Some(1),
+            start_index: Some(99),
+            include_item_types: vec![BaseItemKind::Audio],
+            ..Default::default()
+        };
+        let rows = repository.get_folder_children(&query).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|child| child.item.name.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Bravo physical",
+                "Zulu physical",
+                "Alpha shortcut",
+                "Delta linked alternate",
+                "Charlie local alternate"
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|child| child.linked).collect::<Vec<_>>(),
+            [false, false, true, true, true]
+        );
+        let no_user = InternalItemsQuery {
+            user: None,
+            ..query
+        };
+        let rows = repository.get_folder_children(&no_user).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|child| !child.linked));
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one query fixture verifies substitution before sorting, adjacency, counts and paging"
+    )]
+    async fn collection_collapse_substitutes_before_count_order_page_and_letter_filters() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let db = test_db().await;
+        let repository = repo(&db);
+        let library = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Library",
+            None,
+        )
+        .await;
+        let member = Uuid::new_v4();
+        let series = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let set = Uuid::new_v4();
+        let second_set = Uuid::new_v4();
+        let shortcut_set = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+        for (id, kind, name) in [
+            (member, BaseItemKind::Movie, "Zulu movie"),
+            (series, BaseItemKind::Series, "Series"),
+            (other, BaseItemKind::Movie, "Bravo movie"),
+            (set, BaseItemKind::BoxSet, "Alpha set"),
+            (second_set, BaseItemKind::BoxSet, "Charlie set"),
+            (shortcut_set, BaseItemKind::BoxSet, "Shortcut set"),
+            (orphan, BaseItemKind::BoxSet, "Orphan set"),
+        ] {
+            seed_top_parented_item(&db, id, kind, name, library).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ? WHERE "Id" = ?"#)
+                .bind(name.to_lowercase())
+                .bind(guid_to_db(id))
+                .execute(db.writer())
+                .await
+                .unwrap();
+            set_clean_name(&db, id, name).await;
+        }
+        // Collections can live outside the candidate library and still replace members.
+        for collection in [set, second_set, shortcut_set] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "TopParentId" = NULL WHERE "Id" = ?"#)
+                .bind(guid_to_db(collection))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        for (parent, child, kind, order) in [
+            (set, member, 0, 0),
+            (second_set, member, 0, 0),
+            (set, series, 0, 1),
+            (shortcut_set, other, 1, 0),
+        ] {
+            sqlx::query(r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder") VALUES (?, ?, ?, ?)"#)
+                .bind(guid_to_db(parent)).bind(guid_to_db(child)).bind(kind).bind(order).execute(db.writer()).await.unwrap();
+        }
+        let query = InternalItemsQuery {
+            top_parent_ids: vec![library],
+            include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Series],
+            collapse_box_set_items: Some(true),
+            collapse_box_set_item_types: vec![BaseItemKind::Movie],
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|item| item.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(repository.get_items(&query).await.unwrap()),
+            ["Alpha set", "Bravo movie", "Charlie set", "Series"]
+        );
+        let page = InternalItemsQuery {
+            start_index: Some(1),
+            limit: Some(2),
+            ..query.clone()
+        };
+        let result = repository.get_items(&page).await.unwrap();
+        assert_eq!(result.total_record_count, 4);
+        assert_eq!(names(result), ["Bravo movie", "Charlie set"]);
+        let beyond = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(99),
+                limit: Some(1),
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(beyond.total_record_count, 4);
+        assert!(beyond.items.is_empty());
+        let alpha = InternalItemsQuery {
+            name_starts_with: Some("A".into()),
+            ..query.clone()
+        };
+        assert_eq!(
+            names(repository.get_items(&alpha).await.unwrap()),
+            ["Alpha set"],
+            "recursive letter filter selects the collection name, not member name"
+        );
+        assert_eq!(repository.get_item_ids(&alpha).await.unwrap(), [set]);
+        let clean = repository.get_item_id_clean_names(&alpha).await.unwrap();
+        assert_eq!(
+            clean,
+            [(
+                guid_to_db(set),
+                Some(crate::text_util::get_clean_value("Alpha set"))
+            )]
+        );
+        let bounds = InternalItemsQuery {
+            name_starts_with_or_greater: Some("B".into()),
+            name_less_than: Some("D".into()),
+            ..query.clone()
+        };
+        assert_eq!(
+            names(repository.get_items(&bounds).await.unwrap()),
+            ["Bravo movie", "Charlie set"]
+        );
+        let typed_with_set = InternalItemsQuery {
+            include_item_types: Vec::new(),
+            ..query.clone()
+        };
+        assert!(
+            names(repository.get_items(&typed_with_set).await.unwrap())
+                .contains(&"Orphan set".to_owned()),
+            "typed collapse preserves noncollapsible BoxSet candidates"
+        );
+        let all = InternalItemsQuery {
+            include_item_types: Vec::new(),
+            collapse_box_set_item_types: Vec::new(),
+            ..query.clone()
+        };
+        assert_eq!(
+            names(repository.get_items(&all).await.unwrap()),
+            ["Alpha set", "Bravo movie", "Charlie set"],
+            "empty type set collapses every linked type and omits standalone candidate BoxSets"
+        );
+        let mut literal_set = repository.retrieve_item(set).await.unwrap().unwrap();
+        literal_set.sort_name = Some("alpha%set".into());
+        crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[literal_set])
+            .await
+            .unwrap();
+        assert!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    name_starts_with: Some("Alpha_".into()),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "letter filtering must not treat '_' as a wildcard"
+        );
+        assert_eq!(
+            repository
+                .get_item_ids(&InternalItemsQuery {
+                    name_starts_with: Some("Alpha%".into()),
+                    ..query
+                })
+                .await
+                .unwrap(),
+            [set]
+        );
+    }
+
     #[rstest::rstest]
     #[case("own")]
     #[case("series")]
@@ -3868,11 +4285,20 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case("Élodie", "él", true)]
-    #[case("ΟΣ", "οσ", true)]
-    #[case("𐐀 Star", "𐐨", true)]
+    // Pinned EF SQLite lowercases the bound with .NET ToLowerInvariant, but
+    // SQLite lower(SortName) changes ASCII only. The EF oracle confirms these.
+    #[case("Élodie", "él", false)]
+    #[case("ΟΣ", "οσ", false)]
+    #[case("𐐀 Star", "𐐨", false)]
     #[case("ı", "I", false)]
     #[case("ß", "ss", false)]
+    #[case("élodie", "ÉL", true)]
+    #[case("οσ", "ΟΣ", true)]
+    #[case("𐐨 Star", "𐐀", true)]
+    #[case("a%b", "a%", true)]
+    #[case("axb", "a%", false)]
+    #[case("a_b", "a_", true)]
+    #[case("axb", "a_", false)]
     #[tokio::test]
     async fn unicode_name_prefix(
         #[case] stored: &str,
@@ -3897,6 +4323,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.iter().any(|row| row.id == guid_to_db(id)), matches);
+    }
+
+    /// Independent EF SQLite 10.0.11 measurements of the pinned expressions,
+    /// including post-collapse names, literal prefixes, nulls and range bounds.
+    #[tokio::test]
+    async fn repository_name_ranges_match_the_measured_ef_sqlite_oracle() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dashboard_name_range_reference.json"
+        ))
+        .unwrap();
+        let db = test_db().await;
+        let repository = repo(&db);
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        let cases = reference["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 83);
+        for case in cases {
+            let person = Uuid::new_v4();
+            let child = Uuid::new_v4();
+            let collection = Uuid::new_v4();
+            for (id, kind, name) in [
+                (person, BaseItemKind::Person, "Person"),
+                (child, BaseItemKind::Movie, "Unrelated child name"),
+                (collection, BaseItemKind::BoxSet, "Collection"),
+            ] {
+                seed_named_item(&db, id, kind, name).await;
+                sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ? WHERE "Id" = ?"#)
+                    .bind(if id == child {
+                        Some("child-name-must-not-control-collection-filter")
+                    } else {
+                        case["Stored"].as_str()
+                    })
+                    .bind(guid_to_db(id))
+                    .execute(db.writer())
+                    .await
+                    .unwrap();
+            }
+            links
+                .upsert_linked_child(collection, child, 0)
+                .await
+                .unwrap();
+            let string = |key: &str| case[key].as_str().map(str::to_owned);
+            for (shape, id, expected_id, kind, collapse) in [
+                ("ordinary", person, person, BaseItemKind::Person, false),
+                (
+                    "collapsed-all",
+                    child,
+                    collection,
+                    BaseItemKind::Movie,
+                    true,
+                ),
+            ] {
+                let result = repository
+                    .get_items(&InternalItemsQuery {
+                        item_ids: vec![id],
+                        include_item_types: vec![kind],
+                        collapse_box_set_items: Some(collapse),
+                        // A full singleton page also executes the count query.
+                        limit: Some(1),
+                        name_starts_with: string("prefix"),
+                        name_starts_with_or_greater: string("greater"),
+                        name_less_than: string("less"),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let matches = case[shape].as_bool().unwrap();
+                assert_eq!(
+                    result.items.len(),
+                    usize::from(matches),
+                    "{} {shape}",
+                    case["Name"]
+                );
+                assert_eq!(result.total_record_count, i32::from(matches));
+                if matches {
+                    assert_eq!(result.items[0].id, guid_to_db(expected_id));
+                }
+            }
+        }
     }
 
     #[rstest::rstest]
@@ -3924,6 +4429,497 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, guid_to_db(id));
+    }
+
+    /// Fixtures persist the actual folder flag and ancestor rows. Raw ParentId
+    /// alone intentionally does not make a recursive descendant.
+    async fn seed_linked_descendant_item(
+        db: &Database,
+        id: Uuid,
+        kind: BaseItemKind,
+        name: &str,
+        parent: Option<Uuid>,
+        ancestors: &[Uuid],
+    ) {
+        if matches!(
+            kind,
+            BaseItemKind::Folder
+                | BaseItemKind::BoxSet
+                | BaseItemKind::Playlist
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+        ) {
+            seed_folder_item(db, id, kind, name, parent).await;
+        } else if let Some(parent) = parent {
+            seed_child_item(db, id, kind, name, parent).await;
+        } else {
+            seed_named_item(db, id, kind, name).await;
+        }
+        let mut row = crate::test_support::fetch_item(db, id).await;
+        row.sort_name = Some(lower_invariant(name));
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        persistence.save_items(&[row]).await.unwrap();
+        persistence.set_ancestors(id, ancestors).await.unwrap();
+    }
+
+    async fn seed_descendant_link(db: &Database, parent: Uuid, child: Uuid, kind: i32) {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        crate::FerrofinLinkedChildrenService::new(db.clone())
+            .upsert_linked_child(parent, child, kind)
+            .await
+            .unwrap();
+    }
+
+    async fn linked_descendant_names(
+        repository: &FerrofinItemRepository,
+        query: &InternalItemsQuery,
+    ) -> Vec<String> {
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repository.get_item_list(query),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut names: Vec<String> = rows.into_iter().filter_map(|row| row.name).collect();
+        names.sort();
+        names
+    }
+
+    fn linked_descendant_query(parent: Uuid) -> InternalItemsQuery {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        InternalItemsQuery {
+            parent_id: parent,
+            recursive: true,
+            group_by_presentation_unique_key: false,
+            collapse_box_set_items: Some(false),
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(BaseItemKind::BoxSet)]
+    #[case(BaseItemKind::Playlist)]
+    #[tokio::test]
+    async fn linked_container_descendants_filter_count_and_page_after_membership(
+        #[case] kind: BaseItemKind,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let [root, movie, series, season, episode, physical, orphan] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, item_kind, name, parent, ancestors) in [
+            (root, kind, "Collection", None, vec![]),
+            (movie, BaseItemKind::Movie, "Alpha Movie", None, vec![]),
+            (series, BaseItemKind::Series, "Bravo Series", None, vec![]),
+            (
+                season,
+                BaseItemKind::Season,
+                "Season",
+                Some(series),
+                vec![series],
+            ),
+            (
+                episode,
+                BaseItemKind::Episode,
+                "Charlie Episode",
+                Some(season),
+                vec![series, season],
+            ),
+            (
+                physical,
+                BaseItemKind::Movie,
+                "Delta Physical",
+                Some(root),
+                vec![root],
+            ),
+            (
+                orphan,
+                BaseItemKind::Movie,
+                "Orphan Parent Only",
+                Some(root),
+                vec![],
+            ),
+        ] {
+            seed_linked_descendant_item(&db, id, item_kind, name, parent, &ancestors).await;
+        }
+        seed_descendant_link(&db, root, movie, 0).await;
+        seed_descendant_link(&db, root, series, 1).await;
+        // Duplicate physical + linked membership remains one returned row.
+        seed_descendant_link(&db, root, physical, 3).await;
+        let query = InternalItemsQuery {
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::Episode,
+            ],
+            limit: Some(1),
+            ..linked_descendant_query(root)
+        };
+        let first = repository.get_items(&query).await.unwrap();
+        assert_eq!(first.total_record_count, 4);
+        assert_eq!(first.items[0].id, guid_to_db(movie));
+        let second = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(2),
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.total_record_count, 4);
+        assert_eq!(second.items[0].id, guid_to_db(episode));
+        let filtered = repository
+            .get_items(&InternalItemsQuery {
+                name_starts_with: Some("delta".to_owned()),
+                ..query
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.total_record_count, 1);
+        assert_eq!(filtered.items[0].id, guid_to_db(physical));
+        let ids = repository
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Episode],
+                ..linked_descendant_query(root)
+            })
+            .await
+            .unwrap();
+        assert_eq!(ids, [episode]);
+    }
+
+    #[tokio::test]
+    async fn linked_container_cycles_all_child_kinds_and_nonfolder_boundaries() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let [root, nested, movie, video, alternate, extra] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, kind, name, parent, ancestors) in [
+            (root, BaseItemKind::BoxSet, "Root", None, vec![]),
+            (nested, BaseItemKind::Playlist, "Nested", None, vec![]),
+            (movie, BaseItemKind::Movie, "Alpha Movie", None, vec![]),
+            (video, BaseItemKind::Video, "Bravo Video", None, vec![]),
+            (
+                alternate,
+                BaseItemKind::Movie,
+                "Hidden Alternate",
+                None,
+                vec![],
+            ),
+            (
+                extra,
+                BaseItemKind::Video,
+                "Hidden Owned Extra",
+                Some(movie),
+                vec![movie],
+            ),
+        ] {
+            seed_linked_descendant_item(&db, id, kind, name, parent, &ancestors).await;
+        }
+        for (parent, child, kind) in [
+            (root, nested, 2),
+            (nested, root, 1),
+            (nested, movie, 3),
+            (root, video, 0),
+            (movie, alternate, 2),
+        ] {
+            seed_descendant_link(&db, parent, child, kind).await;
+        }
+        assert_eq!(
+            linked_descendant_names(&repository, &linked_descendant_query(root)).await,
+            ["Alpha Movie", "Bravo Video", "Nested"]
+        );
+        let derived = repository
+            .resolve_views(&linked_descendant_query(root))
+            .await
+            .unwrap()
+            .unwrap();
+        let roots = derived.descendant_roots.as_ref().unwrap();
+        assert_eq!(roots.closure_roots.len(), 2);
+        assert_eq!(roots.link_roots.len(), 2);
+        assert!(!roots.link_roots.contains(&movie));
+        assert_eq!(derived.parent_id, Uuid::nil());
+        assert!(derived.parent_type.is_none());
+    }
+
+    /// The source keeps first-visit roles even with sparse adopted ancestry:
+    /// a physical owner later linked back never gains its uncovered closure.
+    #[tokio::test]
+    async fn linked_container_physical_owners_keep_first_visit_closure_roles() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let [root, bridge, owner, marker, later, member, uncovered] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, kind, name, parent, ancestors) in [
+            (root, BaseItemKind::BoxSet, "Root", None, vec![]),
+            (
+                bridge,
+                BaseItemKind::Folder,
+                "Bridge",
+                Some(root),
+                vec![root],
+            ),
+            (
+                owner,
+                BaseItemKind::Folder,
+                "Owner",
+                Some(bridge),
+                vec![bridge],
+            ),
+            (marker, BaseItemKind::Movie, "Marker", None, vec![]),
+            (later, BaseItemKind::Playlist, "Later", None, vec![]),
+            (member, BaseItemKind::Movie, "Member", None, vec![]),
+            (
+                uncovered,
+                BaseItemKind::Movie,
+                "Uncovered Physical",
+                Some(owner),
+                vec![owner],
+            ),
+        ] {
+            seed_linked_descendant_item(&db, id, kind, name, parent, &ancestors).await;
+        }
+        for (parent, child, kind) in [
+            (root, marker, 0),
+            (owner, later, 0),
+            (owner, member, 0),
+            (later, owner, 0),
+        ] {
+            seed_descendant_link(&db, parent, child, kind).await;
+        }
+        assert_eq!(
+            linked_descendant_names(&repository, &linked_descendant_query(root)).await,
+            ["Bridge", "Later", "Marker", "Member", "Owner"]
+        );
+        let query = repository
+            .resolve_views(&linked_descendant_query(root))
+            .await
+            .unwrap()
+            .unwrap();
+        let roots = query.descendant_roots.unwrap();
+        assert!(roots.link_roots.contains(&owner));
+        assert!(!roots.closure_roots.contains(&owner));
+        assert!(roots.closure_roots.contains(&later));
+    }
+
+    #[rstest::rstest]
+    #[case(BaseItemKind::BoxSet)]
+    #[case(BaseItemKind::Playlist)]
+    #[tokio::test]
+    async fn linked_container_empty_missing_and_physical_only_scopes_stay_narrow(
+        #[case] kind: BaseItemKind,
+    ) {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let [root, physical, orphan, linked, ordinary, ordinary_child] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, item_kind, name, parent, ancestors) in [
+            (root, kind, "Root", None, vec![]),
+            (
+                physical,
+                BaseItemKind::Movie,
+                "Physical",
+                Some(root),
+                vec![root],
+            ),
+            (
+                orphan,
+                BaseItemKind::Movie,
+                "Parent Only",
+                Some(root),
+                vec![],
+            ),
+            (linked, BaseItemKind::Movie, "Linked", None, vec![]),
+            (ordinary, BaseItemKind::Folder, "Ordinary", None, vec![]),
+            (
+                ordinary_child,
+                BaseItemKind::Movie,
+                "Ordinary Physical",
+                Some(ordinary),
+                vec![ordinary],
+            ),
+        ] {
+            seed_linked_descendant_item(&db, id, item_kind, name, parent, &ancestors).await;
+        }
+        assert_eq!(
+            linked_descendant_names(&repository, &linked_descendant_query(root)).await,
+            ["Physical"]
+        );
+        assert!(
+            linked_descendant_names(&repository, &linked_descendant_query(Uuid::new_v4()))
+                .await
+                .is_empty()
+        );
+        seed_descendant_link(&db, root, linked, 0).await;
+        seed_descendant_link(&db, ordinary, linked, 0).await;
+        assert_eq!(
+            linked_descendant_names(&repository, &linked_descendant_query(ordinary)).await,
+            ["Ordinary Physical"]
+        );
+        assert_eq!(
+            linked_descendant_names(
+                &repository,
+                &InternalItemsQuery {
+                    recursive: false,
+                    physical_children_only: true,
+                    ..linked_descendant_query(root)
+                }
+            )
+            .await,
+            ["Parent Only", "Physical"]
+        );
+    }
+
+    #[allow(clippy::too_many_lines)] // one source graph and its membership/count/page boundary assertions
+    #[tokio::test]
+    async fn linked_container_visibility_is_applied_to_results_not_intermediate_folders() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let (allowed, denied, user_id, user) = two_libraries(&db).await;
+        let [root, intermediate, visible, played, blocked, outside] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        for (id, kind, name, parent, ancestors) in [
+            (root, BaseItemKind::BoxSet, "Root", None, vec![]),
+            (
+                intermediate,
+                BaseItemKind::Series,
+                "Hidden Intermediate",
+                None,
+                vec![],
+            ),
+            (
+                visible,
+                BaseItemKind::Movie,
+                "Alpha Visible",
+                Some(intermediate),
+                vec![intermediate],
+            ),
+            (
+                played,
+                BaseItemKind::Movie,
+                "Bravo Played",
+                Some(intermediate),
+                vec![intermediate],
+            ),
+            (
+                blocked,
+                BaseItemKind::Movie,
+                "Charlie Blocked",
+                None,
+                vec![],
+            ),
+            (outside, BaseItemKind::Movie, "Delta Outside", None, vec![]),
+        ] {
+            seed_linked_descendant_item(&db, id, kind, name, parent, &ancestors).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.top_parent_id = Some(guid_to_db(if id == outside { denied } else { allowed }));
+            row.is_virtual_item = id == intermediate;
+            crate::FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[row])
+                .await
+                .unwrap();
+        }
+        for id in [intermediate, blocked, outside] {
+            seed_descendant_link(&db, root, id, 0).await;
+        }
+        seed_user_data(&db, user_id, played, true, None).await;
+        seed_item_value(&db, blocked, ItemValueType::Tags, "blocked-selection").await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &user.id,
+            PreferenceKind::BlockedTags,
+            &["blocked-selection".to_owned()],
+        )
+        .await
+        .unwrap();
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &user.id,
+            PermissionKind::EnableAllFolders,
+            false,
+        )
+        .await
+        .unwrap();
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[allowed]).await;
+        let query = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::Movie],
+            is_virtual_item: Some(false),
+            is_played: Some(false),
+            limit: Some(1),
+            ..linked_descendant_query(root)
+        };
+        let result = repository.get_items(&query).await.unwrap();
+        assert_eq!(result.total_record_count, 1);
+        assert_eq!(result.items[0].id, guid_to_db(visible));
+        let resolved = repository.resolve_views(&query).await.unwrap().unwrap();
+        assert_eq!(resolved.top_parent_ids, [allowed]);
+        assert!(
+            resolved
+                .descendant_roots
+                .as_ref()
+                .unwrap()
+                .link_roots
+                .contains(&intermediate)
+        );
+        assert_eq!(count_over(&db, &resolved).await, 1);
+        let confined = repository
+            .get_items(&InternalItemsQuery {
+                ancestor_ids: vec![intermediate],
+                ..query
+            })
+            .await
+            .unwrap();
+        assert_eq!(confined.total_record_count, 1);
+        assert_eq!(confined.items[0].id, guid_to_db(visible));
+    }
+
+    #[tokio::test]
+    async fn explicit_descendant_seed_can_be_nonfolder_and_counts_reuse_root_resolution() {
+        use ferrofin_traits::persistence::ItemCountService as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let [root, movie, alternate] = std::array::from_fn(|_| Uuid::new_v4());
+        for (id, name) in [
+            (root, "Seed Movie"),
+            (movie, "Member Movie"),
+            (alternate, "Alternate Movie"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+        }
+        seed_descendant_link(&db, root, movie, 3).await;
+        seed_descendant_link(&db, movie, alternate, 2).await;
+        let query = InternalItemsQuery {
+            parent_id: Uuid::nil(),
+            descendant_of_id: Some(root),
+            ..linked_descendant_query(root)
+        };
+        assert_eq!(
+            linked_descendant_names(&repository, &query).await,
+            ["Member Movie"]
+        );
+        let count = crate::FerrofinItemCountService::new(db.clone());
+        assert_eq!(count.get_count(&query).await.unwrap(), 1);
+        assert_eq!(count.get_item_counts(&query).await.unwrap().movie_count, 1);
+        let resolved = resolve_descendant_query(&db, &query)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            resolve_descendant_query(&db, &resolved)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Changing the logical criterion invalidates an old internal snapshot.
+        let changed = InternalItemsQuery {
+            descendant_of_id: Some(movie),
+            ..resolved
+        };
+        assert_eq!(
+            linked_descendant_names(&repository, &changed).await,
+            ["Alternate Movie"]
+        );
     }
 
     fn repo(db: &Database) -> FerrofinItemRepository {
@@ -9990,16 +10986,15 @@ mod folder_get_result_tests {
         .await
         .unwrap();
         let repository = repository(&db).with_root_ids(roots);
-        let result = repository
-            .user_root_children(&InternalItemsQuery {
-                user: Some(user),
-                parent_id: roots.user_root,
-                user_root_children: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        let result = Box::pin(repository.user_root_children(&InternalItemsQuery {
+            user: Some(user),
+            parent_id: roots.user_root,
+            user_root_children: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .unwrap();
         let seen = ids(&result);
         for id in [library, view, plugin] {
             assert!(seen.contains(&id));

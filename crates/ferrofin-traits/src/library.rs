@@ -300,6 +300,22 @@ pub trait LibraryManager: Send + Sync {
         Err(ServiceError::backend("item visibility is not configured"))
     }
 
+    /// Applies the own-item IsVisible rule to a child set, preserving order.
+    /// Concrete managers batch policy and hierarchy reads for Folder consumers.
+    async fn filter_visible_items(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut visible = Vec::with_capacity(items.len());
+        for item in items {
+            if self.is_item_visible(&item, user).await? {
+                visible.push(item);
+            }
+        }
+        Ok(visible)
+    }
+
     /// `IsVisibleStandalone`: item, ancestor and library access with kind overrides.
     /// Managers must supply policy evaluation; the default fails closed.
     async fn is_item_visible_standalone(

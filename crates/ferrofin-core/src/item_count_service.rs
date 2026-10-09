@@ -126,6 +126,9 @@ impl FerrofinItemCountService {
     ) -> Result<PlayedAndTotal, ServiceError> {
         let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
         let filter = preferences.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         // Reuse the translated filter to constrain the matching item set, then
         // intersect with the ancestor's descendant closure.
         let matching = {
@@ -355,6 +358,9 @@ impl ItemCountService for FerrofinItemCountService {
         // catalogue's totals — numbers it could not then browse to.
         let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::Count);
         let count: i64 = qb
             .build_query_scalar::<i64>()
@@ -374,6 +380,9 @@ impl ItemCountService for FerrofinItemCountService {
         // endpoint's CPU on a large library.
         let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::TypeCounts);
         let rows = qb
             .build_query_as::<(String, i64)>()
@@ -573,6 +582,9 @@ impl ItemCountService for FerrofinItemCountService {
     ) -> Result<PlayedAndTotal, ServiceError> {
         let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
         let filter = preferences.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         // Linked-children played/total: count the parent's LinkedChildren that
         // match the filter and are played. Only the direct linked children are
         // counted; recursive linked-folder descent is deferred.

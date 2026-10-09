@@ -84,6 +84,69 @@ impl ItemVisibility {
             .collect()
     }
 
+    /// Applies Folder.GetChildren's child visibility and, for playlists and
+    /// collections, GetLinkedChildren's owner/library check. Root children are
+    /// supplied by the secure UserRootFolder loader; all hierarchy reads are
+    /// batched in one request-local context.
+    ///
+    /// # Errors
+    /// Propagates repository failures and hierarchy corruption.
+    pub async fn folder_children(
+        &self,
+        children: Vec<ferrofin_traits::persistence::FolderChild>,
+        user: &UserEntity,
+        filter_linked: bool,
+        roots: &[BaseItemEntity],
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<_> = children
+            .iter()
+            .map(|child| child.item.clone())
+            .chain(roots.iter().cloned())
+            .collect();
+        let context = self.load(&rows, Some(user)).await?;
+        let root_ids: HashSet<_> = roots
+            .iter()
+            .filter(|root| crate::kinds::is_folder(kind(root)))
+            .map(row_id)
+            .collect();
+        let mut result = Vec::new();
+        for child in children {
+            let item = context
+                .rows
+                .get(&row_id(&child.item))
+                .unwrap_or(&child.item);
+            if child.linked && filter_linked && !crate::kinds::is_item_by_name(kind(item)) {
+                // BaseItem.GetOwner is a single optional owner lookup.
+                let owner = uuid(item.owner_id.as_deref())
+                    .and_then(|id| context.rows.get(&id))
+                    .unwrap_or(item);
+                if owner
+                    .path
+                    .as_deref()
+                    .filter(|path| !path.is_empty())
+                    .is_some_and(crate::media_info_resolver::is_file_protocol)
+                {
+                    if !context
+                        .libraries(owner)?
+                        .iter()
+                        .any(|id| root_ids.contains(id))
+                    {
+                        continue;
+                    }
+                } else if !context.standalone(owner)? {
+                    continue;
+                }
+            }
+            if context.visible(item, false)? {
+                result.push(child.item);
+            }
+        }
+        Ok(result)
+    }
+
     /// Recomputes persisted parental scores from effective custom/official ratings
     /// and inherited metadata country, matching `BaseItem.OnMetadataChanged`.
     ///
@@ -773,6 +836,128 @@ mod tests {
                 .await
                 .expect("visibility")[0]
         }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture contrasts linked-child ownership with visible-library membership"
+    )]
+    async fn linked_folder_children_use_owner_and_visible_library_membership() {
+        use ferrofin_traits::persistence::FolderChild;
+        let f = Fixture::new().await;
+        let allowed = f
+            .item(
+                0x501,
+                BaseItemKind::CollectionFolder,
+                Some("/views/allowed"),
+                None,
+            )
+            .await;
+        let hidden = f
+            .item(
+                0x502,
+                BaseItemKind::CollectionFolder,
+                Some("/views/hidden"),
+                None,
+            )
+            .await;
+        let allowed_movie = f
+            .item(
+                0x503,
+                BaseItemKind::Movie,
+                Some("/media/allowed.mkv"),
+                Some(&allowed),
+            )
+            .await;
+        let hidden_movie = f
+            .item(
+                0x504,
+                BaseItemKind::Movie,
+                Some("/media/hidden.mkv"),
+                Some(&hidden),
+            )
+            .await;
+        let unmapped = f
+            .item(0x505, BaseItemKind::Movie, Some("/outside/movie.mkv"), None)
+            .await;
+        let mut owned = f.item(0x506, BaseItemKind::Video, None, None).await;
+        owned.owner_id = Some(hidden_movie.id.clone());
+        f.save(&owned).await;
+        let virtual_item = f.item(0x507, BaseItemKind::Movie, None, None).await;
+        let by_name = f
+            .item(0x508, BaseItemKind::Person, Some("/metadata/person"), None)
+            .await;
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&hidden.id])
+            .await;
+        let rows = [
+            allowed_movie.clone(),
+            hidden_movie.clone(),
+            unmapped,
+            owned,
+            virtual_item.clone(),
+            by_name.clone(),
+        ];
+        let make = || {
+            rows.iter()
+                .cloned()
+                .map(|item| FolderChild { item, linked: true })
+                .collect()
+        };
+        let visible = f
+            .service
+            .folder_children(make(), &f.user, true, std::slice::from_ref(&allowed))
+            .await
+            .unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                allowed_movie.id.as_str(),
+                virtual_item.id.as_str(),
+                by_name.id.as_str()
+            ]
+        );
+        // Ordinary folders do not filter their linked children by owning
+        // library. Physical children also retain this plain IsVisible rule.
+        let visible = f
+            .service
+            .folder_children(make(), &f.user, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), rows.len());
+        let physical = vec![FolderChild {
+            item: hidden_movie.clone(),
+            linked: false,
+        }];
+        assert_eq!(
+            f.service
+                .folder_children(physical, &f.user, true, &[])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut blocked = allowed_movie;
+        blocked.tags = Some("blocked".into());
+        f.save(&blocked).await;
+        f.pref(PreferenceKind::BlockedTags, &["blocked"]).await;
+        let visible = f
+            .service
+            .folder_children(
+                vec![FolderChild {
+                    item: blocked,
+                    linked: true,
+                }],
+                &f.user,
+                true,
+                std::slice::from_ref(&allowed),
+            )
+            .await
+            .unwrap();
+        assert!(visible.is_empty());
     }
 
     #[tokio::test]

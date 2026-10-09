@@ -1240,6 +1240,7 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
+        .with_dashboard_configuration(Arc::clone(&config_trait))
         .with_visibility(Arc::clone(&item_visibility))
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
@@ -1268,6 +1269,7 @@ pub async fn build_app_state(
             Arc::clone(&linked_children_service),
             Arc::clone(&collection_paths),
         ));
+    library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
     // The library monitor drives refreshes from two change sources: the
     // external-source webhooks (`POST /Library/{Series,Movies,Media}/{Added,

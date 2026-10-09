@@ -199,6 +199,9 @@ struct ItemsQuery {
     /// Whether to search descendants recursively.
     #[serde(default)]
     recursive: Option<bool>,
+    /// Override collection collapsing for this folder browse.
+    #[serde(default)]
+    collapse_box_set_items: Option<bool>,
     /// A free-text search term.
     #[serde(default)]
     search_term: Option<String>,
@@ -482,15 +485,106 @@ async fn get_items(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
-    // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
-    let mut internal = InternalItemsQuery {
+    let mut internal = items_query_options(&query, user)?;
+    // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
+    // non-recursive, id-less request whose parent resolves to the
+    // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
+    // The controller owns that decision; the repository applies it only if the
+    // parent really is the user root (an ABSENT `parentId` is, per
+    // `LibraryManager.GetParentItem(null, userId)`).
+    internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
+    // Explicit ids and text searches always return the requested titles.
+    if !internal.item_ids.is_empty()
+        || internal
+            .search_term
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        internal.collapse_box_set_items = Some(false);
+    }
+    // `IsVirtualItem` is driven ONLY by these two parameters on this route
+    // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
+    // no `isVirtualItem` query parameter to set it directly.
+    crate::handlers::query_parse::apply_location_types(
+        &mut internal.is_virtual_item,
+        query.location_types.as_deref(),
+        query.exclude_location_types.as_deref(),
+    );
+    // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
+    // fields, rejecting contradictory pairs with a `400`. Token parsing is
+    // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
+    // `Filters=IsUnPlayed` (sic), and upstream drops unknown tokens.
+    let filters = parse_csv_enums_lenient(query.filters.as_deref());
+    internal
+        .apply_filters(&filters)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // A BoxSet/Playlist-typed browse under a normal library is re-rooted: box
+    // sets live outside the library tree, so the parent becomes a
+    // linked-child-ancestor constraint instead (C# ItemsController's
+    // `linkedChildAncestorIds` redirect). Without this, the library's
+    // Collections tab can never list anything.
+    let (parent_type, folder_policy) =
+        check_parent_visibility(&state, &auth, &mut internal).await?;
+    internal.parent_type = parent_type;
+    // Reuse the already-loaded parent for SourceType and UserView dispatch;
+    // only source consumers that call Folder's policy inherit global flags.
+    internal.apply_folder_display_options = folder_policy;
+    redirect_container_browse(&state, &mut internal).await;
+    if !internal.item_ids.is_empty() {
+        // ItemsController clears query.Parent immediately before GetItems.
+        // Keep any linked-child ancestor constraint established by the
+        // BoxSet/Playlist redirect, but bypass parent/view child selection.
+        internal.set_parent(None);
+        internal.user_root_children = false;
+    }
+
+    let result = state.library.query_items(&internal).await?;
+    // The requested `Fields` plus the four image/user-data toggles (an
+    // `EnableImageTypes=Primary,Backdrop` browse must not answer with a
+    // `Logo` tag, and `ImageTypeLimit=1` caps the backdrops).
+    let mut options = query.dto_options();
+    // `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
+    //  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user
+    // whose policy whitelists tags always gets each row's `Tags`. The user
+    // DTO is served from the read-through cache, so this is no extra query
+    // on the common path.
+    if let Some(user) = internal.user.as_ref() {
+        let allowed_tags = state
+            .users
+            .get_user_dto(user, None)
+            .await?
+            .policy
+            .map(|p| p.allowed_tags)
+            .unwrap_or_default();
+        if !allowed_tags.is_empty() && !options.contains_field(ItemFields::Tags) {
+            options.fields.push(ItemFields::Tags);
+        }
+    }
+    let dtos = state
+        .dto
+        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+        .await?;
+    Ok(Json(QueryResult::new(
+        Some(result.start_index),
+        Some(result.total_record_count),
+        dtos,
+    )))
+}
+
+/// Convert HTTP query fields once, retaining the resolved user for DTO projection.
+fn items_query_options(
+    query: &ItemsQuery,
+    user: UserEntity,
+) -> Result<InternalItemsQuery, ApiError> {
+    Ok(InternalItemsQuery {
         user: Some(user),
         parent_id: query.parent_id.unwrap_or_default(),
         start_index: query.start_index,
         limit: query.limit,
         recursive: query.recursive.unwrap_or(false),
+        collapse_box_set_items: query.collapse_box_set_items,
+        apply_folder_display_options: true,
         search_term: query.search_term.clone(),
         include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
         exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
@@ -545,70 +639,7 @@ async fn get_items(
         person: query.person.clone(),
         enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
         ..InternalItemsQuery::default()
-    };
-    // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
-    // non-recursive, id-less request whose parent resolves to the
-    // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
-    // The controller owns that decision; the repository applies it only if the
-    // parent really is the user root (an ABSENT `parentId` is, per
-    // `LibraryManager.GetParentItem(null, userId)`).
-    internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
-    // `IsVirtualItem` is driven ONLY by these two parameters on this route
-    // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
-    // no `isVirtualItem` query parameter to set it directly.
-    crate::handlers::query_parse::apply_location_types(
-        &mut internal.is_virtual_item,
-        query.location_types.as_deref(),
-        query.exclude_location_types.as_deref(),
-    );
-    // C# `ApplyFilters` translates the `filters` flag set onto the tri-state
-    // fields, rejecting contradictory pairs with a `400`. Token parsing is
-    // lenient + case-insensitive like ASP.NET's binder: jellyfin-web sends
-    // `Filters=IsUnPlayed` (sic), and upstream drops unknown tokens.
-    let filters = parse_csv_enums_lenient(query.filters.as_deref());
-    internal
-        .apply_filters(&filters)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
-    // A BoxSet/Playlist-typed browse under a normal library is re-rooted: box
-    // sets live outside the library tree, so the parent becomes a
-    // linked-child-ancestor constraint instead (C# ItemsController's
-    // `linkedChildAncestorIds` redirect). Without this, the library's
-    // Collections tab can never list anything.
-    check_parent_visibility(&state, &auth, &internal).await?;
-    redirect_container_browse(&state, &mut internal).await;
-
-    let result = state.library.query_items(&internal).await?;
-    // The requested `Fields` plus the four image/user-data toggles (an
-    // `EnableImageTypes=Primary,Backdrop` browse must not answer with a
-    // `Logo` tag, and `ImageTypeLimit=1` caps the backdrops).
-    let mut options = query.dto_options();
-    // `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
-    //  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user
-    // whose policy whitelists tags always gets each row's `Tags`. The user
-    // DTO is served from the read-through cache, so this is no extra query
-    // on the common path.
-    if let Some(user) = internal.user.as_ref() {
-        let allowed_tags = state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .map(|p| p.allowed_tags)
-            .unwrap_or_default();
-        if !allowed_tags.is_empty() && !options.contains_field(ItemFields::Tags) {
-            options.fields.push(ItemFields::Tags);
-        }
-    }
-    let dtos = state
-        .dto
-        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
-        .await?;
-    Ok(Json(QueryResult::new(
-        Some(result.start_index),
-        Some(result.total_record_count),
-        dtos,
-    )))
+    })
 }
 
 /// Query parameters for `GET /Items/{itemId}`.
@@ -1346,10 +1377,12 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
-    query: &InternalItemsQuery,
-) -> Result<(), ApiError> {
+    query: &mut InternalItemsQuery,
+) -> Result<(Option<BaseItemKind>, bool), ApiError> {
+    use ferrofin_model::data::CollectionType;
+
     if query.parent_id.is_nil() {
-        return Ok(());
+        return Ok((None, true));
     }
     let parent = state
         .library
@@ -1369,7 +1402,151 @@ async fn check_parent_visibility(
     {
         return Err(ApiError::Unauthorized("Unauthorized access".into()));
     }
-    Ok(())
+    let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        serde_json::from_value(serde_json::Value::String(
+            row.type_
+                .rsplit('.')
+                .next()
+                .unwrap_or(&row.type_)
+                .to_owned(),
+        ))
+        .ok()
+    };
+    // Folder.GetItems dispatches explicit IDs straight to the repository,
+    // before GetItemsInternal/UserViewBuilder can alter kinds or recursion.
+    // The controller still checks the actual parent before that dispatch,
+    // then clears query.Parent after the container redirect below.
+    if !query.item_ids.is_empty() {
+        return Ok((None, false));
+    }
+    let is_channel = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        row.type_.rsplit('.').next() == Some("Channel")
+            || row
+                .channel_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| !id.is_nil())
+    };
+    if kind != "UserView" {
+        return Ok((kind_from(&parent), !is_channel(&parent)));
+    }
+
+    // UserViewBuilder's movie/TV recursive base views call QueryRecursive;
+    // folders/direct repository/subnavigation builders do not auto-collapse.
+    // ViewType belongs to the parent row already read for access, including
+    // adopted numeric values; it is never a new client preference.
+    let (view_type, parent_id) = user_view_browse_context(&parent);
+    let direct = user_view_uses_direct_items(view_type);
+    if direct {
+        // These simple direct builders set their kind and recursive mode
+        // regardless of the request, then forward explicit collapse to SQL.
+        // Their automatic global grouping policy is intentionally absent.
+        if let Some(kind) = match view_type {
+            Some(CollectionType::Moviemovies) => Some(BaseItemKind::Movie),
+            Some(CollectionType::Tvshowseries) => Some(BaseItemKind::Series),
+            _ => None,
+        } {
+            query.include_item_types = vec![kind];
+            query.recursive = true;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&parent), false));
+    }
+    if matches!(
+        view_type,
+        Some(CollectionType::movies | CollectionType::tvshows)
+    ) {
+        if !query.recursive {
+            return Ok((kind_from(&parent), false));
+        }
+        query.folder_query_recursive = true;
+        if query.include_item_types.is_empty() {
+            query.include_item_types = if view_type == Some(CollectionType::movies) {
+                vec![BaseItemKind::Movie]
+            } else {
+                vec![
+                    BaseItemKind::Series,
+                    BaseItemKind::Season,
+                    BaseItemKind::Episode,
+                ]
+            };
+        }
+        if let Some(parent_id) = parent_id
+            && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+        {
+            return Ok((kind_from(&query_parent), true));
+        }
+        return Ok((kind_from(&parent), true));
+    }
+    // The default builder delegates to its actual display/relational parent
+    // when one exists; an unparented UserView uses GetResult over media-folder
+    // children and has no automatic grouping policy.
+    if let Some(parent_id) = parent_id
+        && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+    {
+        if !query.recursive {
+            query.parent_id = parent_id;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&query_parent), !is_channel(&query_parent)));
+    }
+    Ok((kind_from(&parent), false))
+}
+
+/// Read UserView dispatch data from the parent already loaded for visibility.
+fn user_view_browse_context(
+    parent: &BaseItemEntity,
+) -> (Option<ferrofin_model::data::CollectionType>, Option<Uuid>) {
+    use ferrofin_model::data::CollectionType;
+    let data: serde_json::Value = parent
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_default();
+    let view_type = data
+        .get("ViewType")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CollectionType>(value).ok());
+    let parent_id = data
+        .get("DisplayParentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            parent
+                .parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        });
+    (view_type, parent_id)
+}
+
+/// These UserView builders use direct item selection rather than Folder policy.
+fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::CollectionType>) -> bool {
+    use ferrofin_model::data::CollectionType;
+    matches!(
+        view_type,
+        Some(
+            CollectionType::folders
+                | CollectionType::books
+                | CollectionType::Tvshowseries
+                | CollectionType::Tvgenres
+                | CollectionType::Tvgenre
+                | CollectionType::Tvlatest
+                | CollectionType::Tvnextup
+                | CollectionType::Tvresume
+                | CollectionType::Tvfavoriteseries
+                | CollectionType::Tvfavoriteepisodes
+                | CollectionType::Movielatest
+                | CollectionType::Movieresume
+                | CollectionType::Moviemovies
+                | CollectionType::Moviecollection
+                | CollectionType::Moviefavorites
+                | CollectionType::Moviegenres
+                | CollectionType::Moviegenre
+        )
+    )
 }
 
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
@@ -1610,7 +1787,6 @@ mod tests {
         "artists",
         // 12.1.0 only.
         "audioLanguages",
-        "collapseBoxSetItems",
         "hasOfficialRating",
         "isKids",
         "isMissing",

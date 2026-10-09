@@ -99,6 +99,17 @@ pub struct MediaStreamQuery {
     pub index: Option<i32>,
 }
 
+/// An immediate Folder child together with the source of its membership.
+/// Linked-only children need the owning playlist/collection's per-user check;
+/// a physical child that is also linked retains its physical membership.
+#[derive(Debug, Clone)]
+pub struct FolderChild {
+    /// The stored child row.
+    pub item: BaseItemEntity,
+    /// True when membership comes only from a LinkedChildren edge.
+    pub linked: bool,
+}
+
 /// Filter selecting media attachments to fetch.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.MediaAttachmentQuery`.
@@ -238,6 +249,17 @@ pub trait ItemRepository: Send + Sync {
         Err(ServiceError::backend(
             "folder child sorting is not implemented",
         ))
+    }
+
+    /// Loads immediate physical children followed by linked children in source
+    /// order. Does not filter, group or page; the Folder consumer applies access
+    /// and the pinned GetResult pipeline to these rows.
+    async fn get_folder_children(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<FolderChild>, ServiceError> {
+        let _ = query;
+        Err(ServiceError::backend("folder children are not implemented"))
     }
 
     /// Batch extra owners for video versions and the series allowed to group.
