@@ -1840,6 +1840,10 @@ impl FerrofinStreamStatePlanner {
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let ext = segment_file_extension(segment_container);
+        // DynamicHlsController floors the output muxing queue at 128. This
+        // applies to both copied and encoded streams, including audio-only HLS.
+        push_split(&mut args, "-max_muxing_queue_size");
+        args.push(options.max_muxing_queue_size.max(128).to_string());
         push_split(&mut args, "-f");
         args.push("hls".to_owned());
         push_split(&mut args, "-hls_time");
@@ -3551,6 +3555,105 @@ mod tests {
                 argument.as_str(),
                 "-re" | "-readrate" | "-readrate_catchup"
             )));
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_muxing_queue_obeys_the_saved_value_and_upstream_floor() {
+        // Pin DynamicHlsController.GetCommandLineArguments' signed boundary,
+        // output-option position and every HLS playlist/container family.
+        for configured in [i32::MIN, -1, 0, 127, 128, 129, 2048, i32::MAX] {
+            for kind in [PlaylistKind::Vod, PlaylistKind::Event] {
+                for container in ["ts", "mp4"] {
+                    for is_audio in [false, true] {
+                        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+                        let p = planner_over_with(
+                            Arc::new(FakeMediaSources {
+                                sources: vec![src],
+                                live_streams: HashMap::new(),
+                            }),
+                            false,
+                            &[],
+                            EncodingOptions {
+                                max_muxing_queue_size: configured,
+                                ..EncodingOptions::default()
+                            },
+                        );
+                        let mut req = request("abc");
+                        req.segment_container = Some(container.to_owned());
+                        let plan = p.plan(&req, is_audio, Some(0), kind).await.unwrap();
+                        let queue = plan
+                            .arguments
+                            .iter()
+                            .position(|arg| arg == "-max_muxing_queue_size")
+                            .unwrap();
+                        let input = plan.arguments.iter().position(|arg| arg == "-i").unwrap();
+                        let muxer = plan.arguments.iter().position(|arg| arg == "-f").unwrap();
+                        assert!(input < queue && queue < muxer, "{:?}", plan.arguments);
+                        assert_eq!(
+                            plan.arguments[queue + 1],
+                            if configured > 128 {
+                                configured.to_string()
+                            } else {
+                                "128".to_owned()
+                            },
+                        );
+                        assert_eq!(
+                            plan.arguments
+                                .iter()
+                                .filter(|arg| *arg == "-max_muxing_queue_size")
+                                .count(),
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_output_excludes_the_hls_muxing_queue_option() {
+        for configured in [-1, 8192] {
+            for is_audio in [false, true] {
+                let p = planner_over_with(
+                    Arc::new(FakeMediaSources {
+                        sources: vec![source(
+                            "abc",
+                            vec![video_stream("h264"), audio_stream("aac")],
+                        )],
+                        live_streams: HashMap::new(),
+                    }),
+                    false,
+                    &[],
+                    EncodingOptions {
+                        max_muxing_queue_size: configured,
+                        ..EncodingOptions::default()
+                    },
+                );
+                let mut request = request("abc");
+                request.output_container = Some(if is_audio { "m4a" } else { "mp4" }.to_owned());
+                let plan = p
+                    .plan(&request, is_audio, None, PlaylistKind::Progressive)
+                    .await
+                    .unwrap();
+                assert_eq!(plan.state.transcoding_type, TranscodingJobType::Progressive);
+                assert!(
+                    !plan
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "-max_muxing_queue_size"),
+                    "{:?}",
+                    plan.arguments
+                );
+                assert!(
+                    !plan
+                        .arguments
+                        .iter()
+                        .any(|argument| argument.starts_with("-hls_")),
+                    "{:?}",
+                    plan.arguments
+                );
+            }
         }
     }
 
