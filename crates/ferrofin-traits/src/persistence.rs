@@ -1231,10 +1231,10 @@ pub trait ItemPersistenceService: Send + Sync {
         self.set_item_image(item_id, image).await
     }
 
-    /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
+    /// Deletes one item image of `image_type`, returning the on-disk path of
     /// the removed rows so the caller can delete the files
-    /// (`ImageController.DeleteItemImage`). `index` is reserved for per-index
-    /// deletes; the current store deletes every row of the type.
+    /// (`ImageController.DeleteItemImage`). Deletes one slot in insertion order;
+    /// an omitted index selects zero and an invalid index removes nothing.
     ///
     /// The default removes nothing.
     ///

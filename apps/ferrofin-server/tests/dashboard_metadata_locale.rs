@@ -488,6 +488,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_nfo_image_path_setting(&api, library, &mut options, id, &media).await;
     verify_nfo_image_order_culture(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
+    verify_indexed_artwork_deletion(&api, id).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
     verify_automatic_subtitle_constraints(
@@ -1028,6 +1029,102 @@ async fn upload_artwork(api: &Api, id: &str, kind: &str) {
         "artwork upload: {status}: {}",
         response.text().await.unwrap()
     );
+}
+
+async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {
+    for kind in ["Backdrop", "Screenshot"] {
+        upload_artwork(api, id, kind).await;
+        upload_artwork(api, id, kind).await;
+        let endpoint = format!("/Items/{id}/Images");
+        let before = api.get(&endpoint).await;
+        let images: Vec<_> = before
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == kind)
+            .collect();
+        let deleted = images[1]["Path"].as_str().unwrap();
+        let expected: Vec<_> = images
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 1)
+            .map(|(_, image)| image["Path"].clone())
+            .collect();
+        for index in [-1, i32::MAX, 1] {
+            let response = api
+                .client
+                .delete(format!("{}{endpoint}/{kind}/{index}", api.base))
+                .header("Authorization", &api.auth)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+            if index != 1 {
+                assert_eq!(api.get(&endpoint).await, before);
+            }
+        }
+        assert!(!std::path::Path::new(deleted).exists());
+        let after = api.get(&endpoint).await;
+        let actual: Vec<_> = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == kind)
+            .map(|image| image["Path"].clone())
+            .collect();
+        assert_eq!(actual, expected);
+        for (index, path) in actual.iter().enumerate() {
+            assert!(std::path::Path::new(path.as_str().unwrap()).is_file());
+            let response = api
+                .client
+                .get(format!(
+                    "{}{endpoint}/{kind}/{index}?format=Original",
+                    api.base
+                ))
+                .header("Authorization", &api.auth)
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert!(!response.bytes().await.unwrap().is_empty());
+        }
+        // Omitting the index removes the first slot, leaving the other types alone.
+        let unrelated: Vec<_> = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] != kind)
+            .cloned()
+            .collect();
+        api.client
+            .delete(format!("{}{endpoint}/{kind}", api.base))
+            .header("Authorization", &api.auth)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let final_images = api.get(&endpoint).await;
+        assert_eq!(
+            final_images
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|image| image["ImageType"] != kind)
+                .cloned()
+                .collect::<Vec<_>>(),
+            unrelated
+        );
+        assert_eq!(
+            final_images
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|image| image["ImageType"] == kind)
+                .count(),
+            actual.len() - 1
+        );
+    }
 }
 
 // Keep the live option transitions and their disk assertions in one scenario.

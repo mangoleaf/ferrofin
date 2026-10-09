@@ -3060,26 +3060,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         &self,
         item_id: Uuid,
         image_type: ferrofin_model::entities::ImageType,
-        _index: Option<i32>,
+        index: Option<i32>,
     ) -> Result<Vec<String>, ServiceError> {
+        let index = index.unwrap_or(0);
+        // BaseItem.GetImageInfo uses ElementAtOrDefault: invalid slots do nothing.
+        if index < 0 {
+            return Ok(Vec::new());
+        }
         let item = guid_to_db(item_id);
         let disc = image_type_to_disc(image_type);
-        // Collect the on-disk paths before deleting so the caller can remove files.
-        let paths: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#,
+        // Select and remove one slot atomically on the writer. Insertion order
+        // matches get_image_infos, and RETURNING names only the deleted file.
+        sqlx::query_scalar(
+            r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = (
+                SELECT "Id" FROM "BaseItemImageInfos"
+                WHERE "ItemId" = ?1 AND "ImageType" = ?2
+                ORDER BY rowid LIMIT 1 OFFSET ?3
+            ) RETURNING "Path""#,
         )
         .bind(&item)
         .bind(disc)
-        .fetch_all(self.db.pool())
+        .bind(index)
+        .fetch_all(self.db.writer())
         .await
-        .map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
-            .bind(&item)
-            .bind(disc)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        Ok(paths)
+        .map_err(db_err)
     }
 
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
@@ -4185,6 +4189,93 @@ mod tests {
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
     };
+
+    #[tokio::test]
+    async fn indexed_image_deletion_preserves_siblings_and_compacts_slots() {
+        use ferrofin_model::entities::ImageType;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for id in [item, other] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        // Deliberately descending IDs: slots are insertion order, not GUID order.
+        for (id, owner, kind, path) in [
+            (9_u128, item, 2, "first.png"),
+            (8, item, 2, "middle.png"),
+            (7, item, 2, "last.png"),
+            (6, item, 0, "primary.png"),
+            (5, other, 2, "other.png"),
+            (4, item, 8, "screenshot-first.png"),
+            (3, item, 8, "screenshot-last.png"),
+        ] {
+            sqlx::query(r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height") VALUES (?1,?2,?3,?4,0,0)"#)
+                .bind(guid_to_db(Uuid::from_u128(id))).bind(guid_to_db(owner))
+                .bind(kind).bind(path).execute(db.writer()).await.unwrap();
+        }
+        for index in [-1, 3, i32::MAX] {
+            assert!(
+                store
+                    .delete_item_image(item, ImageType::Backdrop, Some(index))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, Some(1))
+                .await
+                .unwrap(),
+            ["middle.png"]
+        );
+        // The last image becomes index 1, retaining its row identity.
+        let remaining: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId"=?1 AND "ImageType"=2 ORDER BY rowid"#,
+        ).bind(guid_to_db(item)).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            remaining,
+            [
+                guid_to_db(Uuid::from_u128(9)),
+                guid_to_db(Uuid::from_u128(7))
+            ]
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, Some(1))
+                .await
+                .unwrap(),
+            ["last.png"]
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, None)
+                .await
+                .unwrap(),
+            ["first.png"]
+        );
+        assert!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Screenshot, Some(0))
+                .await
+                .unwrap(),
+            ["screenshot-first.png"]
+        );
+        let paths: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos" ORDER BY rowid"#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(paths, ["primary.png", "other.png", "screenshot-last.png"]);
+    }
 
     #[tokio::test]
     async fn indexed_images_preserve_insertion_order_and_replacement_identity() {
