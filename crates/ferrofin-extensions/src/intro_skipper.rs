@@ -751,8 +751,10 @@ impl DetectSegmentsTask {
     }
 
     /// The background analysis pass (`DetectSegmentsTask` →
-    /// `AnalyzeItemsAsync`): build the queue, analyse it, then drop the state
-    /// of seasons no longer in it.
+    /// `AnalyzeItemsAsync`): build the queue and analyse it. Season state is
+    /// left alone — only the Clean Intro Skipper Cache task drops it, as
+    /// upstream's `CleanSeasonStateAsync` runs only there, so a library taken
+    /// out of analysis keeps its seasons' settings.
     #[tracing::instrument(name = "extension_run", skip_all, fields(extension = "intro_skipper"))]
     async fn run_analysis(&self, progress: &TaskProgress, config: &IntroSkipperConfig) {
         let queue = match self.queue(config).await {
@@ -763,14 +765,6 @@ impl DetectSegmentsTask {
             }
         };
         let stored = self.analyze_queue(&queue, config, progress).await;
-        // `CleanCacheTask` → `CleanSeasonStateAsync` over the whole queue
-        // (excluded seasons included): drop the state of seasons that no
-        // longer have items, so a season re-created under the same id does not
-        // inherit it.
-        let live: Vec<Uuid> = queue.iter().map(|(season, _)| *season).collect();
-        if let Err(err) = self.actions.retain_seasons(&live).await {
-            tracing::warn!(%err, "intro skipper: could not drop stale season state");
-        }
         progress.report(100.0);
         tracing::info!(analyzed = stored, "intro skipper: analysis complete");
     }
@@ -1892,8 +1886,9 @@ mod tests {
         for id in [EP_A, EP_B] {
             assert!(intros_of(&h.segments, id).await.is_empty(), "episode {id}");
         }
-        // Any other action analyses as before, and a season with no episodes
-        // left loses its actions on the run (`CleanSeasonStateAsync`).
+        // Any other action analyses as before. A season with no episodes left
+        // keeps its actions through a detection pass; the clean task drops
+        // them (`CleanSeasonStateAsync` runs only there).
         h.actions
             .set_analyzer_actions(
                 SEASON,
@@ -1911,13 +1906,16 @@ mod tests {
             .await
             .expect("execute");
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
-        assert!(
-            h.actions
-                .analyzer_actions(gone)
-                .await
-                .expect("read")
-                .is_empty()
-        );
+        let kept = h.actions.analyzer_actions(gone).await.expect("read");
+        assert!(!kept.is_empty(), "a detection pass keeps it");
+        CleanCacheTask {
+            detect: Arc::new(h.task.clone()),
+        }
+        .execute(&TaskProgress::default())
+        .await
+        .expect("clean");
+        let dropped = h.actions.analyzer_actions(gone).await.expect("read");
+        assert!(dropped.is_empty(), "the clean task drops it");
         assert_eq!(
             h.actions.analyzer_actions(SEASON).await.expect("read")[&AnalysisMode::Introduction],
             AnalyzerAction::Chromaprint,
@@ -2766,6 +2764,43 @@ mod tests {
             }
             (got, want) => assert_eq!(got, want),
         }
+    }
+
+    /// A detection pass keeps the settings of seasons outside its queue (a
+    /// library taken out of analysis, say): only the clean task drops them.
+    #[tokio::test]
+    async fn a_detection_pass_keeps_other_seasons_settings() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let elsewhere = Uuid::from_u128(0x5ea5_0077);
+        h.actions
+            .set_analyzer_actions(
+                elsewhere,
+                &[(
+                    WireMode::Introduction,
+                    ferrofin_model::intro_skipper::AnalyzerAction::None,
+                )],
+            )
+            .await
+            .expect("actions");
+        h.actions
+            .set_excluded(elsewhere, Uuid::from_u128(0x78), true)
+            .await
+            .expect("disabled episode");
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(
+            !h.actions
+                .analyzer_actions(elsewhere)
+                .await
+                .expect("actions")
+                .is_empty()
+        );
+        assert!(
+            !h.actions
+                .excluded_episodes(elsewhere)
+                .await
+                .expect("disabled")
+                .is_empty()
+        );
     }
 
     /// `MediaSegmentsFirstEpisodeFilter`: only with `SkipFirstEpisode`, only
