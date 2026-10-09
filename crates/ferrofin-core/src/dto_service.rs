@@ -1446,6 +1446,25 @@ impl FerrofinDtoService {
             .collect())
     }
 
+    /// The folders no delete may name: every library location and the data
+    /// directory's collections and playlists folders, each as stored and
+    /// expanded.
+    async fn protected_paths(&self) -> Result<crate::item_deletion::ProtectedPaths, ServiceError> {
+        let locations: Vec<String> = self
+            .collection_folder_locations()
+            .await?
+            .into_iter()
+            .flat_map(|folder| folder.physical_locations)
+            .flat_map(|location| [self.virtual_paths.expand(&location), location])
+            .collect();
+        let folders = crate::item_deletion::PROTECTED_DATA_FOLDERS
+            .iter()
+            .flat_map(|folder| [self.virtual_paths.expand(folder), (*folder).to_owned()]);
+        Ok(crate::item_deletion::ProtectedPaths::new(
+            locations, folders,
+        ))
+    }
+
     /// Reads everything the page's parent-image blocks need, in as few round
     /// trips as the tree is deep: one narrow row read per hop of the walk
     /// (the page's episodes share one series, so a hop is a handful of ids),
@@ -4389,6 +4408,15 @@ impl FerrofinDtoService {
             list_page,
             ..crate::item_deletion::DeleteFacts::default()
         };
+        // The protected folders ([`crate::item_deletion::ProtectedPaths`]):
+        // only a row whose path is a directory can be one, so they are read
+        // only for a page holding one.
+        if items
+            .iter()
+            .any(|item| item.path.is_some() && crate::item_data::path_is_directory(item))
+        {
+            facts.protected = self.protected_paths().await?;
+        }
         // `Video.IsActiveRecording`: an in-memory set, and only when the page
         // holds a video at all.
         if let Some(live_tv) = self.live_tv.get()
@@ -9902,6 +9930,63 @@ mod tests {
                 assert_eq!(dto.can_delete, Some(on_a_page), "{what}: page DTO");
             }
         }
+    }
+
+    /// A library's own folder (its location `Folder`, or 1.3.x's phantom
+    /// album at the music library's root) is never `CanDelete`, even for an
+    /// administrator allowed to delete everywhere; a folder inside it is.
+    #[tokio::test]
+    async fn a_library_folder_is_never_deletable_in_the_dto() {
+        let db = test_db().await;
+        let (library, root, location, inside) = (
+            Uuid::from_u128(0xC0),
+            Uuid::from_u128(0xC1),
+            Uuid::from_u128(0xC2),
+            Uuid::from_u128(0xC3),
+        );
+        crate::test_support::seed_item_with_data(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Music",
+            r#"{"PhysicalLocationsList":["/media/music"]}"#,
+        )
+        .await;
+        seed_folder_item(&db, root, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, location, BaseItemKind::MusicAlbum, "music", Some(root)).await;
+        crate::test_support::set_item_path(&db, location, "/media/music/").await;
+        seed_folder_item(
+            &db,
+            inside,
+            BaseItemKind::MusicAlbum,
+            "Album",
+            Some(location),
+        )
+        .await;
+        crate::test_support::set_item_path(&db, inside, "/media/music/Artist/Album").await;
+        let user = Uuid::from_u128(0x202);
+        let entity = crate::test_support::seed_named_user(&db, user, "deleter").await;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user,
+            &[
+                ferrofin_db::enums::PermissionKind::IsAdministrator,
+                ferrofin_db::enums::PermissionKind::EnableContentDeletion,
+            ],
+            &[],
+        )
+        .await;
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        assert!(
+            !svc.can_delete(&fetch_item(&db, location).await, &entity)
+                .await
+                .expect("can delete")
+        );
+        assert!(
+            svc.can_delete(&fetch_item(&db, inside).await, &entity)
+                .await
+                .expect("can delete")
+        );
     }
 
     /// A `ParentId` cycle ends the library walk at its depth cap: no library

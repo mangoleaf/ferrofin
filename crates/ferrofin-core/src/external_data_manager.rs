@@ -129,6 +129,15 @@ impl FerrofinExternalDataManager {
     /// failures (C# `DeleteExternalItemFiles`).
     fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
         for path in self.path_manager.extracted_data_paths(item_id, media) {
+            // Never the root, an empty path or a relative one — a trickplay
+            // folder computed for a path with no folder would otherwise be
+            // `X.trickplay` against the server's working directory.
+            if !crate::item_deletion::is_deletable_path(std::path::Path::new(&path)) {
+                if !path.is_empty() {
+                    tracing::warn!(item_id = %item_id, path, "refusing to delete extracted data at a root or relative path");
+                }
+                continue;
+            }
             if !self.directory_remover.exists(&path) {
                 continue;
             }
@@ -453,5 +462,34 @@ mod tests {
 
         assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
         assert!(deletes.keyframe.lock().unwrap().is_empty());
+    }
+
+    /// The root guard: a root, empty or relative extracted-data path is
+    /// never removed, even when the remover says it exists — a trickplay
+    /// folder computed for a path with no folder would otherwise resolve
+    /// against the working directory.
+    #[tokio::test]
+    async fn root_empty_and_relative_paths_are_never_removed() {
+        let candidates = ["/", "", "Film.trickplay", "/x/kept"];
+        let remover = Arc::new(RecordingRemover {
+            existing: candidates.iter().map(|p| (*p).to_owned()).collect(),
+            ..Default::default()
+        });
+        let path_manager = Arc::new(StubPathManager {
+            paths: candidates.iter().map(|p| (*p).to_owned()).collect(),
+        });
+        let deletes = Arc::new(RecordingDeletes::default());
+        let mgr = FerrofinExternalDataManager::with_remover(
+            path_manager,
+            Arc::clone(&deletes) as Arc<dyn KeyframeRepository>,
+            Arc::clone(&deletes) as Arc<dyn MediaSegmentManager>,
+            Arc::clone(&deletes) as Arc<dyn TrickplayManager>,
+            Arc::clone(&deletes) as Arc<dyn ChapterManager>,
+            Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
+        );
+        mgr.delete_external_item_files(Uuid::new_v4(), MediaLocation::default())
+            .await
+            .expect("delete files");
+        assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/kept"]);
     }
 }

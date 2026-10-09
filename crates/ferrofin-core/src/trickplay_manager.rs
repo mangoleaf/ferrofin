@@ -490,7 +490,7 @@ impl FerrofinTrickplayManager {
         for info in existing.values() {
             let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
             if !has_tiles(&Path::new(&local_root).join(&sub))
-                && !has_tiles(&Path::new(&media_root).join(&sub))
+                && (media_root.is_empty() || !has_tiles(&Path::new(&media_root).join(&sub)))
             {
                 tracing::info!(
                     width = info.width,
@@ -568,11 +568,20 @@ impl FerrofinTrickplayManager {
             MediaLocation::of_file(&media_path),
             false,
         );
+        // `MediaLocation::of_file` is the location a delete uses
+        // (`containing_folder_path_at`) for every path that reaches here:
+        // `can_generate_trickplay` admits only a file, never a disc rip's
+        // folder. When rips gain trickplay, read their location as the delete
+        // does.
         let media_root = self.path_manager.trickplay_directory(
             item_id,
             MediaLocation::of_file(&media_path),
             true,
         );
+        // No folder beside the media (a path at the root): nothing to move.
+        if media_root.is_empty() {
+            return Ok(());
+        }
 
         for info in self.resolutions_for(item_id).await?.values() {
             let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);

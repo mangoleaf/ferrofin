@@ -1320,10 +1320,14 @@ impl FerrofinLibraryManager {
     /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
     /// before the item's files: each row's internal metadata folder
     /// (`{metadata}/library/{id2}/{id}`, and Ferrofin's own
-    /// `{metadata}/library/{GUID}`) and, for a video, its internal
-    /// extracted data (trickplay tiles, chapter images, subtitle and
-    /// attachment caches). A folder that cannot be removed is logged and
-    /// passed over, as upstream.
+    /// `{metadata}/library/{GUID}`). A folder that cannot be removed is
+    /// logged and passed over, as upstream.
+    ///
+    /// Upstream's list also names a video's internal extracted data
+    /// (trickplay tiles, chapter images, subtitle and attachment caches);
+    /// those go with [`Self::delete_external_files`] after the files, which
+    /// removes every one of them, so a delete whose files cannot be removed
+    /// keeps them.
     async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
         if let Some(paths) = &self.app_paths {
             use ferrofin_traits::system::ServerApplicationPaths as _;
@@ -1351,25 +1355,6 @@ impl FerrofinLibraryManager {
             .await;
             if let Err(err) = removed {
                 tracing::error!(%err, "deleting item metadata folders panicked");
-            }
-        }
-        if let Some(external) = self.external_data.get() {
-            for row in rows {
-                let kind = crate::item_type_lookup::kind_from_type_name(&row.type_)
-                    .unwrap_or(BaseItemKind::Folder);
-                let Ok(id) = Uuid::parse_str(&row.id) else {
-                    continue;
-                };
-                if crate::kinds::is_video(kind)
-                    && let Err(err) = external
-                        .delete_external_item_files(
-                            id,
-                            ferrofin_traits::system::MediaLocation::default(),
-                        )
-                        .await
-                {
-                    tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
-                }
             }
         }
     }
@@ -1403,9 +1388,25 @@ impl FerrofinLibraryManager {
         if channel.is_some() || !crate::media_info_resolver::is_file_protocol(&path) {
             return Ok(());
         }
+        let (_, protected) = self.delete_guard().await?;
         let row = row.clone();
         tokio::task::spawn_blocking(move || {
             let paths = crate::item_deletion::delete_paths(&row, kind, &path)?;
+            // A delete never removes a protected folder — a video wrongly
+            // stored as not mixed at a library's root would name the
+            // library's own folder.
+            if let Some(target) = paths
+                .iter()
+                .find(|target| protected.covers(&target.path.to_string_lossy()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to delete {}: a library folder or a folder above one",
+                        target.path.display()
+                    ),
+                ));
+            }
             crate::item_deletion::delete_item_paths(&paths)
         })
         .await
@@ -1479,6 +1480,87 @@ impl FerrofinLibraryManager {
         if let Some(changed) = &self.changed {
             let others: Vec<Uuid> = removed.into_iter().filter(|r| *r != id).collect();
             changed.record_removed_subtree(row, &others);
+        }
+        Ok(())
+    }
+
+    /// The libraries with their locations, and the protected folders
+    /// ([`crate::item_deletion::ProtectedPaths`]) they and the data
+    /// directory make — each folder as stored and expanded.
+    async fn delete_guard(
+        &self,
+    ) -> Result<
+        (
+            Vec<ferrofin_traits::persistence::LibraryLocations>,
+            crate::item_deletion::ProtectedPaths,
+        ),
+        ServiceError,
+    > {
+        let libraries = self.persistence.library_locations().await?;
+        let locations: Vec<String> = libraries
+            .iter()
+            .flat_map(|library| &library.locations)
+            .flat_map(|location| [self.expand_path(location), location.clone()])
+            .collect();
+        let folders = crate::item_deletion::PROTECTED_DATA_FOLDERS
+            .iter()
+            .flat_map(|folder| [self.expand_path(folder), (*folder).to_owned()]);
+        let protected = crate::item_deletion::ProtectedPaths::new(locations, folders);
+        Ok((libraries, protected))
+    }
+
+    /// Refuses a delete before anything is written — no row, no file:
+    ///
+    /// - an item whose path is a protected folder — a library location, a
+    ///   folder above one, the collections or playlists folder — is never
+    ///   deleted (`401`, as a refused `CanDelete`; a divergence from
+    ///   upstream, [`crate::item_deletion::ProtectedPaths`]);
+    /// - with `delete_file_location`, an item in a library whose last
+    ///   completed full scan was not this scanner's
+    ///   ([`crate::library_scan::LIBRARY_LAYOUT_GENERATION`]): its row may be
+    ///   one an older build stored in a shape that names more than the item
+    ///   (1.3.x kept a music library's own folder as an album), so its files
+    ///   are not deleted by it until a scan has gone over the library. The
+    ///   refusal is a [`ServiceError::Conflict`] (`409`): the request is
+    ///   sound and the user may make it, but the library must be scanned
+    ///   first. Upstream has no such state; its refusals are `401` (the user
+    ///   may not — jellyfin-web reads it as a lost session) and `403`
+    ///   (account policy), neither of which says "scan, then retry".
+    ///   Collections and playlists are the server's own containers, never
+    ///   scanned, and an item outside every library (a recording) is not
+    ///   held back.
+    async fn check_delete_allowed(
+        &self,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+        options: &DeleteOptions,
+    ) -> Result<(), ServiceError> {
+        let Some(stored) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let path = self.expand_path(stored);
+        let (libraries, protected) = self.delete_guard().await?;
+        if protected.covers(stored) || protected.covers(&path) {
+            return Err(ServiceError::unauthorized("Unauthorized access"));
+        }
+        if !options.delete_file_location
+            || matches!(kind, BaseItemKind::BoxSet | BaseItemKind::Playlist)
+            || !crate::media_info_resolver::is_file_protocol(&path)
+        {
+            return Ok(());
+        }
+        let unscanned = libraries.iter().find(|library| {
+            library.scanned_by.as_deref() != Some(crate::library_scan::LIBRARY_LAYOUT_GENERATION)
+                && library.locations.iter().any(|location| {
+                    crate::library_scan::path_is_under(&path, &self.expand_path(location))
+                })
+        });
+        if let Some(library) = unscanned {
+            return Err(ServiceError::Conflict(format!(
+                "library {} has not been scanned by this version of the server yet; \
+                 scan it, then delete the item again",
+                library.id
+            )));
         }
         Ok(())
     }
@@ -2109,6 +2191,9 @@ impl LibraryManager for FerrofinLibraryManager {
         if !crate::kinds::can_delete(kind, has_parent) {
             return Err(ServiceError::unauthorized("Unauthorized access"));
         }
+        // Before anything is written: a protected folder is never deleted,
+        // and files go only where this scanner has been over the library.
+        self.check_delete_allowed(&row, kind, options).await?;
         if crate::kinds::is_video(kind) {
             let version_of = row
                 .primary_version_id

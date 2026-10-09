@@ -26,7 +26,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LocalVersionGroup, StoredImageMetadata, StoredItemLinks, VersionPromotion,
+    LibraryLocations, LocalVersionGroup, StoredImageMetadata, StoredItemLinks, VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -2834,6 +2834,66 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(true)
     }
 
+    async fn library_locations(&self) -> Result<Vec<LibraryLocations>, ServiceError> {
+        let Some(type_name) =
+            crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+        else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT b."Id", b."Data", m."Value" FROM "BaseItems" b
+               LEFT JOIN "FerrofinMeta" m ON m."Key" = ?2 || upper(b."Id")
+               WHERE b."Type" = ?1"#,
+        )
+        .bind(type_name)
+        .bind(LIBRARY_SCANNED_KEY_PREFIX)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, data, scanned_by)| {
+                Some(LibraryLocations {
+                    id: Uuid::parse_str(&id).ok()?,
+                    locations: crate::item_data::parse_data(data.as_deref())
+                        .get("PhysicalLocationsList")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    scanned_by,
+                })
+            })
+            .collect())
+    }
+
+    async fn record_library_scanned(
+        &self,
+        library: Uuid,
+        generation: &str,
+    ) -> Result<(), ServiceError> {
+        // Written only when it changes: a rescan of an unchanged library
+        // writes nothing.
+        sqlx::query(
+            r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, ?2)
+               ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value"
+               WHERE "Value" IS NOT excluded."Value""#,
+        )
+        .bind(format!(
+            "{LIBRARY_SCANNED_KEY_PREFIX}{}",
+            guid_to_db(library)
+        ))
+        .bind(generation)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn version_links(&self, primary: Uuid) -> Result<Vec<(Uuid, i32)>, ServiceError> {
         let rows: Vec<(String, i32)> = sqlx::query_as(
             r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
@@ -4065,6 +4125,11 @@ async fn move_one(
     }
     Ok(true)
 }
+
+/// The `FerrofinMeta` key prefix recording, per library (its stored
+/// `CollectionFolder` id follows), the scanner generation that last completed
+/// a full scan of it ([`ItemPersistenceService::record_library_scanned`]).
+const LIBRARY_SCANNED_KEY_PREFIX: &str = "library_scanned_by:";
 
 /// Whether `item` is a video another one owns — a local alternate version
 /// or a stacked part (`OwnerId` set, no `ExtraType`) — which retained user

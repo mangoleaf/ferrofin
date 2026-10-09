@@ -1100,6 +1100,35 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Every library (`CollectionFolder` row) with its media locations — the
+    /// `PhysicalLocationsList` of its `Data`, as stored — and the scanner
+    /// generation that last completed a full scan of it
+    /// ([`Self::record_library_scanned`]). The default (stub/fake services)
+    /// knows no library.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_locations(&self) -> Result<Vec<LibraryLocations>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Records that a full scan of `library` by scanner generation
+    /// `generation` ran to its end (Ferrofin's own bookkeeping,
+    /// `FerrofinMeta`). The default (stub/fake services) records nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn record_library_scanned(
+        &self,
+        library: Uuid,
+        generation: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (library, generation);
+        Ok(())
+    }
+
     /// A video's version rows — the `LinkedChildren` rows under `primary`
     /// of `ChildType` 2 (`LocalAlternateVersion`) and 3
     /// (`LinkedAlternateVersion`) — as `(child id, child type)`, each type in
@@ -1898,6 +1927,20 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// One library's media locations and the scanner generation that last
+/// completed a full scan of it ([`ItemPersistenceService::library_locations`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryLocations {
+    /// The library's `CollectionFolder` id.
+    pub id: Uuid,
+    /// Its media folders, as stored (`%AppDataPath%`-style tokens unexpanded).
+    pub locations: Vec<String>,
+    /// The scanner generation of its last completed full scan; `None` when
+    /// this build's scanner (or any Ferrofin since the marker exists) never
+    /// finished one.
+    pub scanned_by: Option<String>,
 }
 
 /// A deleted primary video's version promoted in its place

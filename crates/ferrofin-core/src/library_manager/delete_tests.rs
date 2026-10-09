@@ -221,16 +221,14 @@ async fn a_mixed_folder_movie_takes_every_prefix_sidecar() {
     let folder = f.library.to_string_lossy().into_owned();
     assert_eq!(
         f.external.deleted.lock().expect("lock").clone(),
-        vec![
-            // `GetInternalMetadataPaths` of a video, before the files.
-            (alien, String::new(), String::new()),
-            // `DeleteExternalItemFiles`, before the rows.
-            (alien, path, folder),
-        ]
+        // `DeleteExternalItemFiles` once, after the files, before the rows:
+        // it also covers what upstream's `GetInternalMetadataPaths` lists for
+        // a video.
+        vec![(alien, path, folder)]
     );
     assert_eq!(
         f.external.row_stored.lock().expect("lock").clone(),
-        vec![(alien, true), (alien, true)],
+        vec![(alien, true)],
         "the extracted data goes while the row is still stored (`:597-604`)"
     );
 }
@@ -795,5 +793,260 @@ async fn deleting_a_version_reroutes_it_to_its_primary() {
     assert_eq!(links_of(&f.db, g.primary).await, vec![(g.first, 2)]);
     for kept in [g.primary, g.first, g.part, g.trailer] {
         assert!(exists(&f, kept).await);
+    }
+}
+
+/// A library (`CollectionFolder` row) over `locations`; with `scanned`, its
+/// completed full scan by this scanner is recorded.
+async fn library(f: &Fixture, locations: &[&Path], scanned: bool) -> Uuid {
+    let locations: Vec<String> = locations
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let id = row(
+        &f.db,
+        BaseItemKind::CollectionFolder,
+        Some(&f.root.path().join("server/root/default/Library")),
+        |e| {
+            e.data = Some(serde_json::json!({ "PhysicalLocationsList": locations }).to_string());
+        },
+    )
+    .await;
+    if scanned {
+        FerrofinItemPersistenceService::new(f.db.clone())
+            .record_library_scanned(id, crate::library_scan::LIBRARY_LAYOUT_GENERATION)
+            .await
+            .expect("record");
+    }
+    id
+}
+
+/// A delete with files in a library this scanner has not gone over to its
+/// end yet is refused (`409`) before anything is written — no file, no
+/// row, no promotion; once the library's scan is recorded, the same delete
+/// goes through. An older generation's record counts as unscanned.
+#[tokio::test]
+async fn files_go_only_in_a_library_this_scanner_has_scanned() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    let id = library(&f, &[&f.library], false).await;
+
+    let err = f
+        .manager
+        .delete_item(g.primary, &with_files())
+        .await
+        .expect_err("not scanned yet");
+    assert!(matches!(err, ServiceError::Conflict(_)), "{err}");
+    assert!(g.folder.is_dir(), "no file deleted");
+    assert!(exists(&f, g.primary).await, "no row deleted");
+    assert_eq!(
+        crate::test_support::fetch_item(&f.db, g.first)
+            .await
+            .primary_version_id,
+        Some(guid_to_db(g.primary)),
+        "nothing promoted"
+    );
+    // Without files the rows may go: the marker guards the disk only.
+    let persistence = FerrofinItemPersistenceService::new(f.db.clone());
+    persistence
+        .record_library_scanned(id, "0")
+        .await
+        .expect("record");
+    assert!(matches!(
+        f.manager.delete_item(g.primary, &with_files()).await,
+        Err(ServiceError::Conflict(_))
+    ));
+    persistence
+        .record_library_scanned(id, crate::library_scan::LIBRARY_LAYOUT_GENERATION)
+        .await
+        .expect("record");
+    f.manager
+        .delete_item(g.primary, &with_files())
+        .await
+        .expect("scanned: deleted");
+    assert!(!g.folder.exists());
+}
+
+/// 1.3.x's phantom album — a `MusicAlbum` row whose path is the music
+/// library's own folder — and a library location `Folder` can never be
+/// deleted, scanned library or not: no file and no row goes.
+#[tokio::test]
+async fn a_library_folder_is_never_deleted() {
+    let f = fixture().await;
+    let music = f.library.join("Music");
+    touch(&music.join("Artist/Album/01.flac"));
+    for scanned in [false, true] {
+        let library = library(&f, &[&music], scanned).await;
+        let phantom = row(&f.db, BaseItemKind::MusicAlbum, Some(&music), |e| {
+            e.parent_id = Some(guid_to_db(library));
+        })
+        .await;
+        let location = row(&f.db, BaseItemKind::Folder, Some(&music), |e| {
+            e.parent_id = Some(guid_to_db(library));
+        })
+        .await;
+        for item in [phantom, location] {
+            for options in [with_files(), DeleteOptions::default()] {
+                let err = f
+                    .manager
+                    .delete_item(item, &options)
+                    .await
+                    .expect_err("a library's own folder");
+                assert!(matches!(err, ServiceError::Unauthorized(_)), "{err}");
+                assert!(exists(&f, item).await);
+            }
+        }
+        assert!(music.join("Artist/Album/01.flac").is_file());
+    }
+}
+
+/// The data directory's collections folder is never deleted; a collection
+/// inside it still is.
+#[tokio::test]
+async fn the_collections_folder_is_never_deleted() {
+    let f = fixture().await;
+    let collections = f.root.path().join("server/data/collections");
+    touch(&collections.join("Saga [boxset]/collection.xml"));
+    let root = row(&f.db, BaseItemKind::AggregateFolder, None, |_| {}).await;
+    let folder = row(&f.db, BaseItemKind::Folder, None, |e| {
+        e.path = Some("%AppDataPath%/collections".to_owned());
+        e.parent_id = Some(guid_to_db(root));
+    })
+    .await;
+    let err = f
+        .manager
+        .delete_item(folder, &with_files())
+        .await
+        .expect_err("the collections folder");
+    assert!(matches!(err, ServiceError::Unauthorized(_)), "{err}");
+    assert!(collections.join("Saga [boxset]/collection.xml").is_file());
+    assert!(exists(&f, folder).await);
+}
+
+/// A video wrongly stored as not mixed at a library's root names the
+/// library's own folder: the delete is refused and the library stays.
+#[tokio::test]
+async fn a_delete_never_removes_a_library_folder() {
+    let f = fixture().await;
+    let movies = f.library.join("Movies");
+    let file = movies.join("Loose.mkv");
+    touch(&file);
+    touch(&movies.join("Other (2001)/Other (2001).mkv"));
+    library(&f, &[&movies], true).await;
+    let loose = row(&f.db, BaseItemKind::Movie, Some(&file), |_| {}).await;
+    assert!(
+        f.manager.delete_item(loose, &with_files()).await.is_err(),
+        "names the library folder"
+    );
+    assert!(file.is_file() && movies.join("Other (2001)/Other (2001).mkv").is_file());
+    assert!(exists(&f, loose).await);
+}
+
+/// Deleting a local version with its files is upstream's `Video.
+/// GetDeletePaths`: a version not in a mixed folder names its containing
+/// folder — the primary's — so the whole folder goes; the primary's row
+/// stays (the next scan removes it) and the version's playlist entries name
+/// the primary.
+#[tokio::test]
+async fn deleting_a_local_version_with_files_takes_the_primarys_folder() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    let list = row(&f.db, BaseItemKind::Playlist, None, |_| {}).await;
+    link(&f.db, list, g.second, 0).await;
+
+    f.manager
+        .delete_item(g.second, &with_files())
+        .await
+        .expect("delete");
+
+    assert!(!g.folder.exists(), "the shared folder goes");
+    assert!(!exists(&f, g.second).await);
+    assert!(exists(&f, g.primary).await, "the primary's row stays");
+    assert_eq!(links_of(&f.db, list).await, vec![(g.primary, 0)]);
+}
+
+/// Upstream promotes before it deletes files, so a first path that cannot
+/// be deleted leaves a promoted group behind: the new primary stands alone
+/// with the old one's versions and playlist entries, the old primary's row,
+/// part and trailer stay (owned, no longer a group), and every file is
+/// where it was.
+#[tokio::test]
+async fn a_failed_file_delete_after_a_promotion_leaves_a_consistent_group() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if permissions_are_bypassed() {
+        return;
+    }
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    std::fs::set_permissions(&g.folder, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let result = f.manager.delete_item(g.primary, &with_files()).await;
+    std::fs::set_permissions(&g.folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(
+        matches!(result, Err(ServiceError::Backend(_))),
+        "{result:?}"
+    );
+
+    for kept in [g.primary, g.first, g.second, g.merged, g.part, g.trailer] {
+        assert!(exists(&f, kept).await, "{kept} stays");
+    }
+    assert!(g.folder.join("Film (2000) - 1080p.mkv").is_file());
+    let promoted = crate::test_support::fetch_item(&f.db, g.first).await;
+    assert_eq!(promoted.primary_version_id, None);
+    assert_eq!(promoted.owner_id, None);
+    assert_eq!(
+        links_of(&f.db, g.first).await,
+        vec![(g.second, 2), (g.merged, 3)]
+    );
+    assert!(
+        links_of(&f.db, g.primary).await.is_empty(),
+        "no versions left"
+    );
+    assert_eq!(links_of(&f.db, g.playlist).await, vec![(g.first, 0)]);
+    let old = crate::test_support::fetch_item(&f.db, g.primary).await;
+    assert_eq!(old.primary_version_id, None);
+    let part = crate::test_support::fetch_item(&f.db, g.part).await;
+    assert_eq!(
+        part.owner_id,
+        Some(guid_to_db(g.primary)),
+        "still the old primary's"
+    );
+}
+
+/// Retention on a promotion: the deleted primary's history and the missing
+/// version's go to the placeholder (detached, as any deleted row's), the
+/// promoted version keeps its own.
+#[tokio::test]
+async fn a_promotion_detaches_the_deleted_rows_history_and_keeps_the_promoted() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    std::fs::remove_file(g.folder.join("Film (2000) - 4K.mkv")).expect("remove");
+    let user = Uuid::new_v4();
+    crate::test_support::seed_named_user(&f.db, user, "watcher").await;
+    for item in [g.primary, g.first, g.second] {
+        crate::test_support::seed_user_data(&f.db, user, item, true, None).await;
+    }
+    let placeholder = Uuid::from_u128(1);
+    let before = crate::user_data_manager::user_data_row_count(&f.db, placeholder).await;
+
+    f.manager
+        .delete_item(g.primary, &DeleteOptions::default())
+        .await
+        .expect("delete");
+
+    assert_eq!(
+        crate::user_data_manager::user_data_row_count(&f.db, placeholder).await - before,
+        2,
+        "the old primary's and the missing version's history is retained"
+    );
+    assert_eq!(
+        crate::user_data_manager::user_data_row_count(&f.db, g.second).await,
+        1,
+        "the promoted version keeps its own"
+    );
+    for gone in [g.primary, g.first] {
+        assert_eq!(
+            crate::user_data_manager::user_data_row_count(&f.db, gone).await,
+            0
+        );
     }
 }

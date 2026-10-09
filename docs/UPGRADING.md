@@ -165,6 +165,13 @@ brought the item back. Now:
     **that subfolder**, photos and anything else in it included.
 
   Delete such items from disk yourself if you want to keep what is around them.
+- Three more cases are kept as Jellyfin has them:
+  - deleting **one version** of a film kept in the film's own folder deletes that whole
+    folder, **the other versions included**;
+  - a single video in a folder that also holds subfolders is not counted as sharing its
+    folder, so deleting it takes **the folder with its subfolders**;
+  - deleting a DVD or Blu-ray rip, or a multi-disc set, deletes its folder, **with any
+    other media inside it** that the rip or set hid from the library.
 - An item with other versions (another cut or resolution of the same film, kept beside
   it or merged into it with **Group versions**) is replaced by its first remaining
   version, as in Jellyfin: that version keeps its own watch history, the item's playlist
@@ -178,12 +185,40 @@ brought the item back. Now:
 Check what a folder holds before deleting from it, and keep a backup of anything you are
 not sure about.
 
+Two safeguards differ from Jellyfin:
+
+- **Scan each library once after upgrading before deleting from it.** Until a full scan of
+  a library by this version has finished, a delete of an item in it is refused (`409
+  Conflict`, and jellyfin-web shows an error) and nothing is deleted: rows an earlier
+  Ferrofin stored can name more than the item — 1.3.x, for example, stored a music
+  library's own folder as an album, and deleting that album would have deleted the whole
+  library. Run **Scan All Libraries** (Dashboard → Libraries) or scan the library, then
+  delete again. The same applies to a database adopted from Jellyfin. Collections and
+  playlists are not affected.
+- **A library's own folder is never deleted**, nor any folder above one, nor the server's
+  collections and playlists folders. An item whose path is one of them shows no delete
+  entry, and deleting it by id answers `401`; Jellyfin would delete the folder. No delete
+  removes such a folder either: a video at a library's root that Ferrofin does not count
+  as sharing the folder is refused rather than taking the library with it.
+
 **If your media is mounted read-only** (a read-only NFS or SMB mount, a container volume
 mounted `:ro`), a delete now fails: the server answers with an error and nothing of your
-media is deleted, the item stays in the library. As in Jellyfin, the artwork Ferrofin had
-downloaded for that item is cleared first and comes back on its next metadata refresh. To
-let Ferrofin delete media, mount it read-write for the server's user; otherwise untick
-**Allow media deletion from** for your accounts so the delete entry is not offered.
+media is deleted, the item stays in the library. Some things have already happened by
+then, as in Jellyfin, and are not undone:
+
+- the artwork and metadata Ferrofin keeps for the item in its own data folder are
+  cleared. Art a metadata refresh downloads comes back on the item's next refresh; **an
+  image you uploaded, or art for a library whose image fetchers are turned off, does not
+  come back**;
+- if the item had other versions, the first remaining one has already taken its place:
+  it is its own item now, the item's playlist and collection entries have moved to it,
+  and versions whose files were already gone have been removed from the library;
+- if the item was itself a version, its playlist and collection entries have moved to
+  the item it is a version of, which no longer lists it.
+
+To let Ferrofin delete media, mount it read-write for the server's user; otherwise
+untick **Allow media deletion from** for your accounts so the delete entry is not
+offered.
 
 **Who may delete** follows Jellyfin more closely. Ferrofin 1.3.0–1.3.2 already refused
 accounts without deletion rights; three things are refined:

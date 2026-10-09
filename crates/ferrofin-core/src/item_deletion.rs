@@ -49,6 +49,8 @@ pub(crate) struct DeleteFacts {
     /// `LibraryManager.GetCollectionFolders` — read only when
     /// [`Self::needs_libraries`] says the folder grants decide.
     pub(crate) libraries: HashMap<Uuid, Vec<Uuid>>,
+    /// The folders no delete may name ([`ProtectedPaths`]).
+    pub(crate) protected: ProtectedPaths,
     /// Whether this answers for a page of items (`DtoService.
     /// GetBaseItemDtos`), where upstream calls the non-virtual
     /// `CanDelete(user, allCollectionFolders)` and so skips the playlist
@@ -66,6 +68,79 @@ impl DeleteFacts {
             && self.permissions.as_ref().is_some_and(|p| {
                 !p.enable_content_deletion && !p.content_deletion_folders.is_empty()
             })
+    }
+}
+
+/// The folders a delete never takes: every configured library location,
+/// every folder above one, and the data directory's `collections` and
+/// `playlists` folders.
+///
+/// Divergence from upstream (owner decision): `Folder.CanDelete()` is
+/// `!IsRoot && IsFileProtocol`, so upstream would let an item whose path is a
+/// library's own folder — a location `Folder` row, or 1.3.x's phantom
+/// album at a music library's root — delete that whole library from disk,
+/// and an item at the collections or playlists folder delete every
+/// collection or playlist. Here such an item cannot be deleted at all
+/// (`CanDelete` is `false`), and no delete removes such a folder.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProtectedPaths {
+    /// The library locations.
+    locations: Vec<String>,
+    /// The other folders: the collections and playlists folders.
+    folders: Vec<String>,
+}
+
+/// The data directory's folders [`ProtectedPaths`] keeps, in their stored
+/// (`%AppDataPath%`) spelling.
+pub(crate) const PROTECTED_DATA_FOLDERS: [&str; 2] =
+    ["%AppDataPath%/collections", "%AppDataPath%/playlists"];
+
+/// `path` without trailing separators (the root stays `/`).
+fn trim_separators(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && path.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+impl ProtectedPaths {
+    /// The protected folders: `locations` (each in every spelling it may be
+    /// stored or read in — as stored and expanded) and `folders`.
+    pub(crate) fn new(
+        locations: impl IntoIterator<Item = String>,
+        folders: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let keep = |p: String| {
+            let trimmed = trim_separators(&p);
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        Self {
+            locations: locations.into_iter().filter_map(keep).collect(),
+            folders: folders.into_iter().filter_map(keep).collect(),
+        }
+    }
+
+    /// Whether `path` is a protected folder or a folder above a library
+    /// location (compared ignoring ASCII case, as the library matching does).
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        let path = trim_separators(path);
+        if path.is_empty() {
+            return false;
+        }
+        let above = |location: &String| {
+            path == "/"
+                || location
+                    .get(..path.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(path))
+                    && location[path.len()..].starts_with('/')
+        };
+        self.locations
+            .iter()
+            .chain(&self.folders)
+            .any(|p| p.eq_ignore_ascii_case(path))
+            || self.locations.iter().any(above)
     }
 }
 
@@ -171,6 +246,9 @@ fn is_authorized_to_delete(
 /// C# `BaseItem.CanDelete(User)` — the DTO's `CanDelete` for `facts.user_id`,
 /// and the check `LibraryController.DeleteItem` answers `401` on.
 ///
+/// An item whose path is a protected folder ([`ProtectedPaths`]) cannot be
+/// deleted by anyone — a divergence from upstream, see there.
+///
 /// Without a user it is the file-level [`can_delete_file`] (upstream's
 /// `user is null ? item.CanDelete() : …`). With one:
 /// - a playlist answers `IsAdministrator || user.Id == OwnerUserId`
@@ -183,6 +261,13 @@ fn is_authorized_to_delete(
 ///   override;
 /// - anything else is `CanDelete() && IsAuthorizedToDelete(user, …)`.
 pub(crate) fn can_delete(item: &BaseItemEntity, kind: BaseItemKind, facts: &DeleteFacts) -> bool {
+    if item
+        .path
+        .as_deref()
+        .is_some_and(|path| facts.protected.covers(path))
+    {
+        return false;
+    }
     let file_level = can_delete_file(item, kind, &facts.active_recordings);
     let Some(user_id) = facts.user_id else {
         return file_level;
@@ -361,6 +446,22 @@ pub(crate) fn delete_paths(
 /// The removal's failure, for a `required` path.
 fn delete_item_path(target: &DeletePath, required: bool) -> std::io::Result<()> {
     let path = &target.path;
+    // Never the root, an empty path or a relative one (which would resolve
+    // against the server's working directory): a row at `/`, or a video at
+    // `/x.mkv` whose containing folder is `/`, deletes nothing.
+    if !is_deletable_path(path) {
+        if required {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to delete {}: a root, empty or relative path",
+                    path.display()
+                ),
+            ));
+        }
+        tracing::warn!(path = %path.display(), "refusing to delete a root, empty or relative path");
+        return Ok(());
+    }
     // `Directory.Exists(path) || File.Exists(path)`, both following links.
     if !(path.is_dir() || path.is_file()) {
         return Ok(());
@@ -389,6 +490,13 @@ fn delete_item_path(target: &DeletePath, required: bool) -> std::io::Result<()> 
             Ok(())
         }
     }
+}
+
+/// Whether a delete may remove `path` at all: an absolute path below the
+/// root — never `/` itself, an empty path or a relative one.
+#[must_use]
+pub(crate) fn is_deletable_path(path: &Path) -> bool {
+    path.is_absolute() && path.parent().is_some()
 }
 
 /// `DeleteItem`'s loop over `GetDeletePaths` (`LibraryManager.cs:582-594`):
@@ -686,7 +794,9 @@ mod tests {
     }
 
     /// A video at the root (`/`) has no containing folder (.NET's
-    /// `GetDirectoryName("/")` is `null`): nothing is named, never `/`.
+    /// `GetDirectoryName("/")` is `null`): no path is named. (A path that
+    /// did name `/` would still be refused by [`delete_item_path`]'s root
+    /// guard.)
     #[rstest]
     #[case::movie(BaseItemKind::Movie)]
     #[case::video(BaseItemKind::Video)]
@@ -891,6 +1001,123 @@ mod tests {
             is_directory: true,
         }])
         .expect("a missing first path is not a failure");
+    }
+
+    /// [`ProtectedPaths::covers`]: a library location (with or without a
+    /// trailing separator, any ASCII case), every folder above one (the root
+    /// included), and the collections and playlists folders — never a
+    /// folder inside a location or a sibling sharing its prefix.
+    #[rstest]
+    #[case::location("/media/movies", true)]
+    #[case::trailing_separator("/media/movies/", true)]
+    #[case::case("/MEDIA/Movies", true)]
+    #[case::above("/media", true)]
+    #[case::root("/", true)]
+    #[case::collections("/data/collections", true)]
+    #[case::collections_token("%AppDataPath%/collections", true)]
+    #[case::inside("/media/movies/Film (2000)", false)]
+    #[case::sibling("/media/movies2", false)]
+    #[case::a_collection("/data/collections/Saga [boxset]", false)]
+    #[case::empty("", false)]
+    fn protected_paths_cover_locations_folders_above_them_and_the_data_folders(
+        #[case] path: &str,
+        #[case] expected: bool,
+    ) {
+        let protected = ProtectedPaths::new(
+            ["/media/movies/".to_owned()],
+            [
+                "/data/collections".to_owned(),
+                PROTECTED_DATA_FOLDERS[0].to_owned(),
+            ],
+        );
+        assert_eq!(protected.covers(path), expected, "{path}");
+    }
+
+    /// A library's own folder and the collections folder are never
+    /// deletable, even for an administrator allowed to delete everywhere —
+    /// a divergence from upstream's `Folder.CanDelete()`.
+    #[rstest]
+    #[case::location_folder(BaseItemKind::Folder, "/media/movies")]
+    #[case::phantom_album(BaseItemKind::MusicAlbum, "/media/music")]
+    #[case::collections_folder(BaseItemKind::Folder, "/data/collections")]
+    fn a_protected_folder_cannot_be_deleted(#[case] kind: BaseItemKind, #[case] path: &str) {
+        let mut item = row(kind, Some(path));
+        item.is_folder = true;
+        let mut facts = user_facts(ContentPermissions {
+            is_administrator: true,
+            enable_content_deletion: true,
+            ..ContentPermissions::default()
+        });
+        assert!(
+            can_delete(&item, kind, &facts),
+            "unprotected, upstream's answer"
+        );
+        facts.protected = ProtectedPaths::new(
+            ["/media/movies".to_owned(), "/media/music".to_owned()],
+            ["/data/collections".to_owned()],
+        );
+        assert!(!can_delete(&item, kind, &facts));
+    }
+
+    /// The root guard of `DeleteItemPath`: the root, an empty path and a
+    /// relative one are refused — the first path's refusal fails the
+    /// delete, a later one is passed over. The root is tried as a file, so
+    /// a broken guard could not remove anything.
+    #[test]
+    fn root_empty_and_relative_paths_are_refused() {
+        for path in ["/", "", "relative/Film"] {
+            assert!(!is_deletable_path(Path::new(path)), "{path:?}");
+            let target = DeletePath {
+                path: PathBuf::from(path),
+                is_directory: false,
+            };
+            let err = delete_item_paths(std::slice::from_ref(&target)).expect_err("refused");
+            assert!(err.to_string().contains("refusing"), "{err}");
+            let tmp = tempfile::tempdir().expect("tmp");
+            let later = tmp.path().join("later.nfo");
+            touch(&later);
+            delete_item_paths(&[
+                DeletePath {
+                    path: later.clone(),
+                    is_directory: false,
+                },
+                target,
+            ])
+            .expect("a later refused path is passed over");
+            assert!(!later.exists());
+        }
+        assert!(is_deletable_path(Path::new("/x.mkv")));
+    }
+
+    /// The rows that would name the root: a rip at `/`, a folder row at `/`,
+    /// and a video not in a mixed folder at `/x.mkv` (whose containing
+    /// folder is `/`). Each names `/`, which the root guard refuses.
+    #[rstest]
+    #[case::rip_at_root(BaseItemKind::Movie, "/", Some(r#"{"VideoType":"Dvd"}"#), false)]
+    #[case::folder_at_root(BaseItemKind::Folder, "/", None, true)]
+    #[case::video_beside_root(BaseItemKind::Movie, "/x.mkv", None, false)]
+    fn rows_naming_the_root_name_only_what_the_guard_refuses(
+        #[case] kind: BaseItemKind,
+        #[case] path: &str,
+        #[case] data: Option<&str>,
+        #[case] is_folder: bool,
+    ) {
+        let mut item = row(kind, Some(path));
+        item.data = data.map(str::to_owned);
+        item.is_folder = is_folder;
+        let paths = delete_paths(&item, kind, path).expect("paths");
+        assert!(
+            paths
+                .iter()
+                .all(|target| target.path == Path::new("/") || target.path == Path::new(path)),
+            "{paths:?}"
+        );
+        assert!(
+            paths
+                .first()
+                .is_some_and(|first| !is_deletable_path(&first.path)),
+            "{paths:?}"
+        );
     }
 
     #[test]

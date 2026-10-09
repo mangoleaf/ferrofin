@@ -98,10 +98,18 @@ impl PathManager for FerrofinPathManager {
             // (PathManager.cs:96-103): `Alien.Resurrection.mkv` →
             // `Alien.Resurrection.trickplay` beside the file, and a folder
             // item's (or a disc rip's) inside the folder.
+            // No folder to save beside (a path at the root, or none): no
+            // such directory, never one relative to the working directory.
+            if media.containing_folder.is_empty() {
+                return String::new();
+            }
             let file_name = std::path::Path::new(media.path)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            if file_name.is_empty() {
+                return String::new();
+            }
             return std::path::Path::new(media.containing_folder)
                 .join(change_extension(&file_name, ".trickplay"))
                 .to_string_lossy()
@@ -344,6 +352,29 @@ mod tests {
         assert!(paths.iter().any(|p| p.contains("subtitles")));
         assert!(paths.iter().any(|p| p.ends_with("movie.trickplay")));
         assert!(paths.iter().any(|p| p.contains("/chapters")));
+    }
+
+    /// No folder to save trickplay beside (a path with no parent folder):
+    /// no directory at all, never `X.trickplay` against the working
+    /// directory; a file at the root saves beside it in `/`.
+    #[test]
+    fn a_trickplay_folder_with_no_containing_folder_is_none() {
+        let (_tmp, m) = manager();
+        let id = Uuid::new_v4();
+        let nowhere = MediaLocation {
+            path: "Film.mkv",
+            containing_folder: "",
+        };
+        assert_eq!(m.trickplay_directory(id, nowhere, true), "");
+        assert!(
+            m.extracted_data_paths(id, nowhere)
+                .iter()
+                .all(|p| p.is_empty() || std::path::Path::new(p).is_absolute())
+        );
+        assert_eq!(
+            m.trickplay_directory(id, MediaLocation::of_file("/Film.mkv"), true),
+            "/Film.trickplay"
+        );
     }
 
     #[test]

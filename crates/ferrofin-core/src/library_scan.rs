@@ -817,6 +817,17 @@ fn fetcher_policies<'a>(
         .collect()
 }
 
+/// The generation of the scanner's stored library layout, recorded per
+/// library at the end of each completed full scan of it
+/// ([`ItemPersistenceService::record_library_scanned`]). A delete removes an
+/// item's files only in a library whose recorded generation is this one: rows
+/// an older build left (1.3.x stored, for example, a music library's own
+/// folder as an album) are not trusted to name what a delete may remove
+/// until this scanner has gone over them. Bump it whenever the scan's stored
+/// shapes change in a way that would make an older row's path unsafe to
+/// delete by.
+pub(crate) const LIBRARY_LAYOUT_GENERATION: &str = "1";
+
 /// The `MediaStreamInfos.StreamType` discriminant for an embedded image
 /// (an attached picture — cover art), matching `media_stream_type_to_disc`.
 const EMBEDDED_IMAGE_STREAM_TYPE: i32 = 3;
@@ -3912,6 +3923,19 @@ impl LibraryScanner {
         let mut result = self.run_scan(&folders, &all_folders, plan, None, run).await;
         if let Ok(outcome) = &mut result {
             outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
+            // Each library this scan went over to its end now holds rows this
+            // scanner wrote: a delete may remove files there.
+            if !outcome.stopped && !run.cancel.is_cancelled() {
+                for library in folders.iter().filter_map(collection_folder_id) {
+                    if let Err(err) = self
+                        .persistence
+                        .record_library_scanned(library, LIBRARY_LAYOUT_GENERATION)
+                        .await
+                    {
+                        tracing::warn!(%err, library = %library, "could not record the library's completed scan");
+                    }
+                }
+            }
         }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
@@ -14868,7 +14892,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 /// (`GetCollectionFolders`, `series_key_scope`) — and it is computed over
 /// every configured library in both a full and a scoped plan, so the two
 /// cannot disagree about it.
-fn path_is_under(path: &str, root: &str) -> bool {
+pub(crate) fn path_is_under(path: &str, root: &str) -> bool {
     let root = root.trim_end_matches('/');
     path == root
         || path
