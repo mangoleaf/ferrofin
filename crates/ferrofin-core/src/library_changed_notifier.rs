@@ -687,6 +687,7 @@ mod tests {
         let (n, events) = notifier(Duration::from_secs(30));
         n.set_audience(Arc::new(SplitAudience {
             visible: Vec::new(),
+            locations: Vec::new(),
             delivered: Mutex::new(Vec::new()),
         }) as Arc<dyn LibraryChangeAudience>);
         let item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
