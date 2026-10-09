@@ -99,6 +99,17 @@ pub struct MediaStreamQuery {
     pub index: Option<i32>,
 }
 
+/// An immediate Folder child together with the source of its membership.
+/// Linked-only children need the owning playlist/collection's per-user check;
+/// a physical child that is also linked retains its physical membership.
+#[derive(Debug, Clone)]
+pub struct FolderChild {
+    /// The stored child row.
+    pub item: BaseItemEntity,
+    /// True when membership comes only from a LinkedChildren edge.
+    pub linked: bool,
+}
+
 /// Filter selecting media attachments to fetch.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.MediaAttachmentQuery`.
@@ -210,6 +221,46 @@ pub trait ItemRepository: Send + Sync {
     /// # Errors
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Applies the pinned `UserViewBuilder.Filter` rules to already-visible
+    /// immediate children. Preserves input order; sorting, grouping, adjacency,
+    /// counting and paging belong to the caller. Request-only query filters
+    /// outside that source whitelist are ignored.
+    async fn filter_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child filtering is not implemented",
+        ))
+    }
+
+    /// Sorts an already-filtered child set without grouping or paging. Name
+    /// sorts use the pinned stable ordinal comparison; an empty OrderBy keeps
+    /// input order. Other sorts retain the repository's existing consumer.
+    async fn sort_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child sorting is not implemented",
+        ))
+    }
+
+    /// Loads immediate physical children followed by linked children in source
+    /// order. Does not filter, group or page; the Folder consumer applies access
+    /// and the pinned GetResult pipeline to these rows.
+    async fn get_folder_children(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<FolderChild>, ServiceError> {
+        let _ = query;
+        Err(ServiceError::backend("folder children are not implemented"))
+    }
 
     /// Batch extra owners for video versions and the series allowed to group.
     async fn get_extra_owner_ids_batch(
@@ -638,6 +689,26 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `GET /Library/VirtualFolders`.
     async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError>;
 
+    /// Merges `fields` into the `Data` JSON of item `item_id`, keeping every
+    /// other key — `Data` carries `CollectionType`, `PhysicalFolderIds`,
+    /// `PhysicalLocationsList` and the rest on a `CollectionFolder`. Writes
+    /// nothing when every field already holds its value, or when there is no
+    /// such row.
+    ///
+    /// The default (a stub/fake service) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn merge_data_fields(
+        &self,
+        item_id: Uuid,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, fields);
+        Ok(())
+    }
+
     /// Records a library folder's collection type (`movies`, `tvshows`, …) in
     /// the row's `Data` blob, leaving every other column and every other key in
     /// the blob alone — a no-op when the value is already there.
@@ -822,13 +893,11 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
-    /// carry: the library itself, which is what every row Ferrofin writes
-    /// carries, and — on a database adopted from Jellyfin — the physical
-    /// folders its `PhysicalFolderIds` names, which is what Jellyfin wrote
-    /// (`BaseItem.GetTopParent`: the item's ancestor directly under the
-    /// `AggregateFolder`). An adopted row keeps the physical folder until a
-    /// scan saves it, so a library's rows are read by both until then. The
-    /// library id comes first; a native library answers it alone.
+    /// carry: the folders of its locations its `PhysicalFolderIds` names,
+    /// which is what Jellyfin and Ferrofin write (`BaseItem.GetTopParent`:
+    /// the item's ancestor directly under the `AggregateFolder`), and the
+    /// library itself, which rows an older Ferrofin scan wrote carry until a
+    /// scan saves them. The library id comes first.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then scopes the library by its own id.
@@ -1145,6 +1214,21 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = (item_id, image);
         Ok(())
+    }
+
+    /// Replaces a multiple-image slot or appends beyond the current last slot.
+    /// Single-image types retain the ordinary replacement operation.
+    ///
+    /// # Errors
+    /// Returns a storage failure. Hosts supporting indexed artwork override this
+    /// compatibility adapter; single-image stores use `set_item_image`.
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        _index: usize,
+    ) -> Result<(), ServiceError> {
+        self.set_item_image(item_id, image).await
     }
 
     /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
@@ -1692,6 +1776,19 @@ pub trait PeopleRepository: Send + Sync {
             map.insert(id, people);
         }
         Ok(map)
+    }
+
+    /// Derives each name's configured by-name Person item id, in input order.
+    ///
+    /// This is the read-only identity half of Jellyfin's GetPerson: it uses
+    /// Person.GetPath and the configured item-id mode, never a credit-row id
+    /// or a generic matching-name row. Callers must verify the derived item
+    /// exists and is a Person. An unwired identity yields missing slots.
+    async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
     }
 
     /// Replaces an item's people with the given set, materializing a browsable

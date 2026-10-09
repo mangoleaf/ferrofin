@@ -7,8 +7,8 @@
 //! Port simplifications, all faithful to the trait's `Uuid`-identity surface:
 //! - `GetUserDataKeys` derives keys from stored metadata through the shared
 //!   user-data key repository, also used by retention recovery.
-//! - The C# in-memory `FastConcurrentLru` cache and the `UserDataSaved` event
-//!   are dropped; every read hits the table.
+//! - Reads use the table rather than the C# in-memory cache. Successful writes
+//!   notify the weak NFO listener with the source `UserDataSaved` reason.
 //! - `UpdatePlayState` needs the item's runtime + kind (for the resume-point
 //!   heuristics); those are read from the `BaseItems` row rather than a
 //!   pre-loaded domain object.
@@ -18,7 +18,8 @@
 //! read live from the injected [`ServerConfigurationManager`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future as _;
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -27,11 +28,12 @@ use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{UpdateUserItemDataDto, UserItemDataDto};
+use ferrofin_model::entities::UserDataSaveReason;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{ContentPermissions, UserDataManager};
+use ferrofin_traits::library::{ContentPermissions, UserDataManager, UserDataSaveListener};
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
@@ -48,6 +50,7 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 pub struct FerrofinUserDataManager {
     db: Database,
     config: Arc<dyn ServerConfigurationManager>,
+    save_listener: Arc<OnceLock<Weak<dyn UserDataSaveListener>>>,
 }
 
 impl std::fmt::Debug for FerrofinUserDataManager {
@@ -61,72 +64,75 @@ impl FerrofinUserDataManager {
     /// Creates a user-data manager over the given database and configuration.
     #[must_use]
     pub fn new(db: Database, config: Arc<dyn ServerConfigurationManager>) -> Self {
-        Self { db, config }
+        Self {
+            db,
+            config,
+            save_listener: Arc::new(OnceLock::new()),
+        }
     }
 
-    /// Reads the user-data row for an item/user pair, or `None`.
+    /// Attaches the NFO consumer without retaining a strong reference cycle.
     ///
-    /// Port of `UserDataManager.GetUserDataInternal`: match **any** of the
-    /// item's derived keys, then prefer the row keyed by the item's own id and
-    /// fall back to the first match. An adopted item carries several rows (one
-    /// per key) and they can disagree — a stale provider-keyed row from before
-    /// a metadata change, say — so which one wins is not arbitrary.
-    ///
-    /// The guid row alone would answer correctly on a database Jellyfin wrote,
-    /// because the item id is always among the keys it saves. It would miss on
-    /// one where only a provider-keyed row exists.
+    /// # Errors
+    /// Returns an error if startup tries to attach a second listener.
+    pub fn set_save_listener(
+        &self,
+        listener: Weak<dyn UserDataSaveListener>,
+    ) -> Result<(), ServiceError> {
+        self.save_listener
+            .set(listener)
+            .map_err(|_| ServiceError::backend("user-data save listener already attached"))
+    }
+
+    async fn notify_saved(&self, user_id: Uuid, item_id: Uuid, reason: UserDataSaveReason) {
+        let Some(listener) = self.save_listener.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let mut notification = Box::pin(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            async move {
+                if let Err(error) = listener.user_data_saved(user_id, item_id, reason).await {
+                    // Source NfoUserDataSaver catches export errors after commit.
+                    tracing::warn!(%user_id, %item_id, %error, "user-data NFO saver failed");
+                }
+            },
+        ));
+        // The pinned event handler is async void: it starts inline, then the
+        // user-data caller returns at its first incomplete await. Own the
+        // remainder in the runtime so slow NFO I/O does not delay HTTP writes.
+        let first_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(notification.as_mut().poll(cx))).await;
+        if first_poll.is_pending() {
+            drop(tokio::spawn(notification));
+        }
+    }
+
+    /// Resolves attached rows using the current item's source key order.
+    /// Provider keys precede the own GUID; an unmatched legacy row remains a
+    /// fallback rather than being filtered out before resolution.
     async fn read_row(
         &self,
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
         let keys = self.keys_for(item_id).await?;
-        let placeholders = (3..3 + keys.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        // ItemId/UserId are stored uppercase (Jellyfin's GUID casing) while
-        // CustomDataKey keeps the lowercase hyphenated form — exactly what a
-        // real 10.11.8 database contains, so the two need separate binds.
-        let sql = format!(
-            r#"SELECT * FROM "UserData"
-               WHERE "ItemId" = ?1 AND "UserId" = ?2
-                 AND "CustomDataKey" IN ({placeholders})"#,
-        );
-        let mut query = sqlx::query_as::<_, UserDataEntity>(sqlx::AssertSqlSafe(sql))
-            .bind(guid_to_db(item_id))
-            .bind(guid_to_db(user_id));
-        for key in &keys {
-            query = query.bind(key.clone());
-        }
-        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-
-        Ok(Self::preferred_row(&rows, &keys, item_id))
+        let rows = sqlx::query_as::<_, UserDataEntity>(
+            r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(guid_to_db(user_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(Self::preferred_row(&rows, &keys))
     }
 
-    /// Picks the row to answer with when an item carries several.
-    ///
-    /// The guid row first, then the highest-priority *key* that has a row —
-    /// **not** `rows.first()`, which is whatever order SQLite returned (PK
-    /// index order, i.e. alphabetical by `CustomDataKey`) and would make the
-    /// answer depend on how the provider ids happen to sort.
-    ///
-    /// A deliberate divergence: upstream's `directDataReference` compares
-    /// against `itemId.ToString("N")` while the keys it just built carry the
-    /// hyphenated `"D"` form, so that preference never actually fires and it
-    /// always falls through to `userData.First()`. Preferring the guid row is
-    /// what upstream evidently *meant*, and it is stable.
-    fn preferred_row(
-        rows: &[UserDataEntity],
-        keys: &[String],
-        item_id: Uuid,
-    ) -> Option<UserDataEntity> {
-        let own = item_id.to_string();
-        if let Some(row) = rows.iter().find(|r| r.custom_data_key == own) {
-            return Some(row.clone());
-        }
+    /// Pinned ResolveUserDataRow: exact current-key priority, then the first
+    /// attached candidate when none matches. No own-GUID override is applied.
+    fn preferred_row(rows: &[UserDataEntity], keys: &[String]) -> Option<UserDataEntity> {
         keys.iter()
-            .find_map(|key| rows.iter().find(|r| &r.custom_data_key == key))
+            .find_map(|key| rows.iter().find(|row| row.custom_data_key == *key))
+            .or_else(|| rows.first())
             .cloned()
     }
 
@@ -251,7 +257,7 @@ impl FerrofinUserDataManager {
         .bind(row.audio_stream_index)
         .bind(row.is_favorite)
         .bind(opt_datetime_to_db(row.last_played_date))
-        .bind(row.likes)
+        .bind(row.rating.map(|rating| rating >= 6.5))
         .bind(row.play_count)
         .bind(row.playback_position_ticks)
         .bind(row.played)
@@ -299,46 +305,49 @@ impl FerrofinUserDataManager {
 /// `SSSEEE` suffix — never the item guid, which is only ever the *last* key in
 /// the list. Ferrofin used to answer with the guid on every row.
 ///
-/// Everything is read off the `BaseItems` row the caller is already projecting;
-/// `providers` carries the `BaseItemProviders` rows **only when the caller's
-/// query hydrated them** (see
-/// [`UserDataManager::get_user_data_dtos_for_rows`]). An episode's series is
-/// reconstructed from its `SeriesId` alone — with no provider ids a series'
-/// only key is its own guid, so the suffix rule needs no second row read.
-fn row_fallback_key(
+/// The item's own providers follow its query hydration. Episode and Season
+/// resolve their actual Series independently: pinned Series uses GetItemById,
+/// which loads providers even when this browse page omitted ProviderIds.
+fn row_data_keys(
     item: &BaseItemEntity,
     item_id: Uuid,
     providers: &HashMap<Uuid, Vec<(String, String)>>,
-) -> String {
+    series_keys: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
     let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
-    let empty: Vec<(String, String)> = Vec::new();
-    let own_providers = providers.get(&item_id).unwrap_or(&empty);
-    let series_id = item
-        .series_id
-        .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok());
-    let series_providers = series_id
-        .and_then(|id| providers.get(&id))
-        .unwrap_or(&empty);
+    let own_providers = providers.get(&item_id).map_or(&[][..], Vec::as_slice);
     let source = key_source(item, item_id, kind, own_providers);
-    // Only a Season or an Episode consults its series (the same gate the write
-    // path uses); every other kind ignores the argument entirely.
-    let series_source = match (kind, series_id) {
-        (BaseItemKind::Season | BaseItemKind::Episode, Some(series)) => Some(KeySource {
-            item_id: series,
-            kind: BaseItemKind::Series,
-            tvdb: provider_value(series_providers, "Tvdb"),
-            imdb: provider_value(series_providers, "Imdb"),
-            custom: provider_value(series_providers, "Custom"),
-            name: item.series_name.as_deref(),
-            ..KeySource::default()
-        }),
-        _ => None,
+    let mut keys = user_data_keys(&source, None);
+    let Some(series) = series_keys.get(&guid_to_db(item_id)) else {
+        return keys;
     };
-    user_data_keys(&source, series_source.as_ref())
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| item_id.to_string())
+    let derived: Vec<String> = match kind {
+        BaseItemKind::Season => series
+            .iter()
+            .map(|key| format!("{key}{:03}", item.index_number.unwrap_or(0)))
+            .collect(),
+        BaseItemKind::Episode => {
+            let (Some(season), Some(episode)) = (item.parent_index_number, item.index_number)
+            else {
+                return keys;
+            };
+            // Episode omits the Series own GUID when provider keys exist;
+            // Season keeps every Series key. Both retain the child's GUID.
+            let take = if series.len() > 1 {
+                series.len() - 1
+            } else {
+                series.len()
+            };
+            series
+                .iter()
+                .take(take)
+                .map(|key| format!("{key}{season:03}{episode:03}"))
+                .collect()
+        }
+        _ => return keys,
+    };
+    keys.splice(0..0, derived);
+    keys
 }
 
 /// The key-derivation view of a `BaseItems` row.
@@ -395,7 +404,7 @@ fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
         playback_position_ticks: row.playback_position_ticks,
         play_count: row.play_count,
         is_favorite: row.is_favorite,
-        likes: row.likes,
+        likes: row.rating.map(|rating| rating >= 6.5),
         last_played_date: row.last_played_date,
         played: row.played,
         key: row.custom_data_key.clone(),
@@ -411,6 +420,35 @@ impl UserDataManager for FerrofinUserDataManager {
         item_id: Uuid,
         user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError> {
+        self.save_user_data_with_reason(
+            user_id,
+            item_id,
+            user_data,
+            UserDataSaveReason::UpdateUserData,
+        )
+        .await
+    }
+
+    async fn save_user_data_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &UpdateUserItemDataDto,
+        reason: UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        // Preserve the source comparisons, including its NaN behavior.
+        #[allow(
+            clippy::manual_range_contains,
+            reason = "the source Rating setter allows NaN"
+        )]
+        let invalid_rating = user_data
+            .rating
+            .is_some_and(|rating| rating < 0.0 || rating > 10.0);
+        if invalid_rating {
+            return Err(ServiceError::invalid_input(
+                "a 0 to 10 user rating is required",
+            ));
+        }
         // C# loads the existing row, applies only the set fields, then saves.
         let mut row = self
             .read_row(item_id, user_id)
@@ -426,8 +464,9 @@ impl UserDataManager for FerrofinUserDataManager {
         if let Some(v) = user_data.is_favorite {
             row.is_favorite = v;
         }
-        if user_data.likes.is_some() {
-            row.likes = user_data.likes;
+        if let Some(likes) = user_data.likes {
+            row.likes = Some(likes);
+            row.rating = Some(if likes { 10.0 } else { 1.0 });
         }
         if let Some(v) = user_data.played {
             row.played = v;
@@ -439,7 +478,9 @@ impl UserDataManager for FerrofinUserDataManager {
             row.rating = user_data.rating;
         }
 
-        self.upsert_row(&row).await
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
+        Ok(())
     }
 
     async fn get_user_data_dto(
@@ -476,55 +517,59 @@ impl UserDataManager for FerrofinUserDataManager {
         items: &[BaseItemEntity],
         user_id: Uuid,
         include_provider_ids: bool,
-    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
         let ids: Vec<Uuid> = items
             .iter()
-            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
             .collect();
-        let mut map = self.stored_user_data_dtos(&ids, user_id).await?;
-        // Only the rows with no stored user data need a synthesized key.
-        let missing: Vec<&BaseItemEntity> = items
+        let mut stored = self.stored_user_data_rows(&ids, user_id).await?;
+        let mut children: Vec<String> = items
             .iter()
-            .filter(|i| Uuid::parse_str(&i.id).is_ok_and(|id| !map.contains_key(&id)))
+            .filter(|item| {
+                matches!(
+                    kind_from_type_name(&item.type_),
+                    Some(BaseItemKind::Season | BaseItemKind::Episode)
+                )
+            })
+            .filter_map(|item| Uuid::parse_str(&item.id).ok().map(guid_to_db))
             .collect();
-        if missing.is_empty() {
-            return Ok(map);
-        }
-        // Provider ids, one batched read, and only when the caller's query
-        // hydrated them (see the trait doc). Season/Episode keys come from the
-        // SERIES, so its providers are read in the same pass.
+        children.sort_unstable();
+        children.dedup();
+        let series_keys = if children.is_empty() {
+            HashMap::new()
+        } else {
+            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+            crate::user_data_key_repository::load_child_series_keys(&mut conn, &children).await?
+        };
         let providers = if include_provider_ids {
-            let mut wanted: Vec<Uuid> = Vec::new();
-            for item in &missing {
-                let kind = kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder);
-                if uses_provider_ids(kind)
-                    && let Ok(id) = Uuid::parse_str(&item.id)
-                {
-                    wanted.push(id);
-                }
-                if matches!(kind, BaseItemKind::Season | BaseItemKind::Episode)
-                    && let Some(series) = item
-                        .series_id
-                        .as_deref()
-                        .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    wanted.push(series);
-                }
-            }
+            let mut wanted: Vec<Uuid> = items
+                .iter()
+                .filter(|item| {
+                    uses_provider_ids(
+                        kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder),
+                    )
+                })
+                .filter_map(|item| Uuid::parse_str(&item.id).ok())
+                .collect();
+            wanted.sort_unstable();
+            wanted.dedup();
             self.provider_ids_batch(&wanted).await?
         } else {
             HashMap::new()
         };
-        for item in missing {
-            let Ok(item_id) = Uuid::parse_str(&item.id) else {
+        let mut map = HashMap::with_capacity(items.len());
+        for item in items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
                 continue;
             };
-            let key = row_fallback_key(item, item_id, &providers);
-            map.insert(item_id, {
-                let mut row = Self::empty_row(item_id, user_id);
-                row.custom_data_key = key;
-                to_dto(&row, item_id)
+            let current = row_data_keys(item, id, &providers, &series_keys);
+            let candidates = stored.remove(&id).unwrap_or_default();
+            let row = Self::preferred_row(&candidates, &current).unwrap_or_else(|| {
+                let mut row = Self::empty_row(id, user_id);
+                row.custom_data_key = current.first().cloned().unwrap_or_default();
+                row
             });
+            map.insert(id, to_dto(&row, id));
         }
         Ok(map)
     }
@@ -555,7 +600,10 @@ impl UserDataManager for FerrofinUserDataManager {
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
         row.likes = likes;
+        row.rating = likes.map(|likes| if likes { 10.0 } else { 1.0 });
         self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::UpdateUserRating)
+            .await;
         Ok(to_dto(&row, item_id))
     }
 
@@ -564,6 +612,22 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
         item_id: Uuid,
         reported_position_ticks: Option<i64>,
+    ) -> Result<bool, ServiceError> {
+        self.update_play_state_with_reason(
+            user_id,
+            item_id,
+            reported_position_ticks,
+            UserDataSaveReason::PlaybackProgress,
+        )
+        .await
+    }
+
+    async fn update_play_state_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: UserDataSaveReason,
     ) -> Result<bool, ServiceError> {
         let config = self.config.configuration().await?;
         let (runtime_ticks, kind) = self
@@ -576,12 +640,17 @@ impl UserDataManager for FerrofinUserDataManager {
             .await?
             .unwrap_or_else(|| Self::empty_row(item_id, user_id));
 
-        // A report with no position (an interrupted/failed start where the client
-        // can't say where it was) tells us nothing. Jellyfin assumes "finished"
-        // here, which marks the item played and wipes a still-valid resume point;
-        // we preserve existing play-state instead so a hung resume doesn't destroy
-        // progress. ponytail: deliberate divergence from Jellyfin, see bug notes.
         let Some(mut position_ticks) = reported_position_ticks else {
+            if reason == UserDataSaveReason::PlaybackFinished {
+                // Source SessionManager's successful stop without a position
+                // counts a completed play before its PlaybackFinished event.
+                row.play_count += 1;
+                row.played = supports_played_status(kind);
+                row.playback_position_ticks = 0;
+                self.upsert_row(&row).await?;
+                self.notify_saved(user_id, item_id, reason).await;
+                return Ok(true);
+            }
             return Ok(false);
         };
         let has_runtime = runtime_ticks > 0;
@@ -641,6 +710,7 @@ impl UserDataManager for FerrofinUserDataManager {
 
         row.playback_position_ticks = position_ticks;
         self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
 
         Ok(played_to_completion)
     }
@@ -673,6 +743,8 @@ impl UserDataManager for FerrofinUserDataManager {
         row.played = true;
 
         self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
+            .await;
         Ok(to_dto(&row, item_id))
     }
 
@@ -693,6 +765,8 @@ impl UserDataManager for FerrofinUserDataManager {
         row.played = false;
 
         self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::TogglePlayed)
+            .await;
         Ok(to_dto(&row, item_id))
     }
 
@@ -737,7 +811,10 @@ impl UserDataManager for FerrofinUserDataManager {
         {
             row.played = true;
         }
-        self.upsert_row(&row).await
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, UserDataSaveReason::PlaybackStart)
+            .await;
+        Ok(())
     }
 
     async fn get_content_permissions(
@@ -746,21 +823,22 @@ impl UserDataManager for FerrofinUserDataManager {
     ) -> Result<Option<ContentPermissions>, ServiceError> {
         use ferrofin_db::enums::{PermissionKind, PreferenceKind};
         // One indexed read over both `(UserId, Kind)` tables, the shape
-        // `user_manager::load_permission_and_preference_maps` uses: the four
+        // `user_manager::load_permission_and_preference_maps` uses: the five
         // permissions and the "Allow media deletion from" list (stored
         // `,`-delimited, as C# writes it).
         let rows: Vec<(i64, i32, String)> = sqlx::query_as(
             r#"SELECT 0, "Kind", CAST("Value" AS TEXT) FROM "Permissions"
-               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5)
+               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5, ?6)
                UNION ALL
                SELECT 1, "Kind", "Value" FROM "Preferences"
-               WHERE "UserId" = ?1 AND "Kind" = ?6"#,
+               WHERE "UserId" = ?1 AND "Kind" = ?7"#,
         )
         .bind(guid_to_db(user_id))
         .bind(i32::from(PermissionKind::IsAdministrator))
         .bind(i32::from(PermissionKind::EnableContentDeletion))
         .bind(i32::from(PermissionKind::EnableContentDownloading))
         .bind(i32::from(PermissionKind::EnableCollectionManagement))
+        .bind(i32::from(PermissionKind::EnableMediaPlayback))
         .bind(i32::from(PreferenceKind::EnableContentDeletionFromFolders))
         .fetch_all(self.db.pool())
         .await
@@ -777,6 +855,7 @@ impl UserDataManager for FerrofinUserDataManager {
             .collect();
         Ok(Some(ContentPermissions {
             is_administrator: has(PermissionKind::IsAdministrator),
+            enable_media_playback: has(PermissionKind::EnableMediaPlayback),
             enable_content_deletion: has(PermissionKind::EnableContentDeletion),
             enable_content_downloading: has(PermissionKind::EnableContentDownloading),
             enable_collection_management: has(PermissionKind::EnableCollectionManagement),
@@ -851,43 +930,20 @@ impl FerrofinUserDataManager {
         Ok(out)
     }
 
-    /// The stored `UserData` DTOs for these items, keyed by item id — items
-    /// with no row are simply absent from the map.
-    ///
-    /// Split out of [`UserDataManager::get_user_data_dtos`] so the row-aware
-    /// form can reuse the identical read and differ only in the key it
-    /// synthesizes for a missing row.
-    async fn stored_user_data_dtos(
+    /// Attached candidate rows for a page, grouped without a per-item query.
+    async fn stored_user_data_rows(
         &self,
         item_ids: &[Uuid],
         user_id: Uuid,
-    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        // The bool tracks whether the stored DTO came from the item's own guid
-        // row, so a later one can displace a provider-keyed stand-in.
-        let mut map: std::collections::HashMap<Uuid, (UserItemDataDto, bool)> =
-            std::collections::HashMap::with_capacity(item_ids.len());
-        // One IN-query per chunk instead of one query per item.
+    ) -> Result<HashMap<Uuid, Vec<UserDataEntity>>, ServiceError> {
+        let mut map: HashMap<Uuid, Vec<UserDataEntity>> = HashMap::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
+                .map(|index| format!("?{index}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            // Every row for these items, not just the guid-keyed one. An
-            // adopted item carries a row per `CustomDataKey`, and filtering to
-            // `lower(ItemId)` here made a page disagree with the per-item
-            // endpoint about the same item whenever the default row was absent
-            // — favourite on `/Items/{id}`, not favourite in the listing.
-            //
-            // The per-item path resolves ties by derived-key priority; doing
-            // that here would mean deriving keys for a whole page, which is the
-            // N+1 this batch exists to avoid. Instead: prefer the guid row,
-            // else take the lowest key deterministically. The two agree
-            // wherever a guid row exists, which is every item either server has
-            // ever written — the id is always the last key saved.
             let sql = format!(
-                r#"SELECT * FROM "UserData"
-                   WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})
-                   ORDER BY "CustomDataKey""#,
+                r#"SELECT * FROM "UserData" WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})"#
             );
             let mut query = sqlx::query_as::<_, UserDataEntity>(sqlx::AssertSqlSafe(sql))
                 .bind(guid_to_db(user_id));
@@ -896,24 +952,42 @@ impl FerrofinUserDataManager {
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             for row in rows {
-                let Ok(item_id) = Uuid::parse_str(&row.item_id) else {
-                    continue;
-                };
-                let is_default = row.custom_data_key == item_id.to_string();
-                match map.entry(item_id) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert((to_dto(&row, item_id), is_default));
-                    }
-                    // A later guid row displaces an earlier provider-keyed one;
-                    // nothing displaces the guid row.
-                    std::collections::hash_map::Entry::Occupied(mut slot) if is_default => {
-                        slot.insert((to_dto(&row, item_id), true));
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {}
+                if let Ok(id) = Uuid::parse_str(&row.item_id) {
+                    map.entry(id).or_default().push(row);
                 }
             }
         }
-        Ok(map.into_iter().map(|(id, (dto, _))| (id, dto)).collect())
+        Ok(map)
+    }
+
+    /// Id-only reads resolve current keys once per page through the existing
+    /// metadata/provider batch seam, matching per-item selection without an N+1.
+    async fn stored_user_data_dtos(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let rows = self.stored_user_data_rows(item_ids, user_id).await?;
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<_> = rows.keys().copied().map(guid_to_db).collect();
+        let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
+        let keys: HashMap<_, _> =
+            crate::user_data_key_repository::load_keys_for_items(&mut connection, &ids)
+                .await?
+                .into_iter()
+                .collect();
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, candidates)| {
+                let own = [id.to_string()];
+                let current = keys
+                    .get(&guid_to_db(id))
+                    .map_or(own.as_slice(), Vec::as_slice);
+                Self::preferred_row(&candidates, current).map(|row| (id, to_dto(&row, id)))
+            })
+            .collect())
     }
 }
 
@@ -1892,15 +1966,10 @@ mod tests {
         assert_eq!(by_id[&movie].key, "tt0111161");
     }
 
-    /// A **stored** row still reports its own `CustomDataKey`; the derivation
-    /// only fills the missing-row case (C# `item.UserData?…FirstOrDefault() ??`).
-    ///
-    /// `save_user_data` writes one row per derived key, and
-    /// [`FerrofinUserDataManager::preferred_row`] deliberately prefers the guid
-    /// row (see its doc comment), so the stored answer here is the guid — the
-    /// pre-existing behaviour, unchanged by the missing-row derivation.
+    /// A stored row reports the first matching current key, including the
+    /// name-derived key before the own GUID.
     #[tokio::test]
-    async fn a_stored_row_keeps_its_own_key() {
+    async fn a_stored_row_uses_the_first_current_key() {
         let db = test_db().await;
         let user = Uuid::from_u128(1);
         let year = Uuid::from_u128(0xF301);
@@ -1923,7 +1992,7 @@ mod tests {
             .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
             .await
             .expect("rows");
-        assert_eq!(map[&year].key, year.to_string());
+        assert_eq!(map[&year].key, "Year-2021");
         assert!(map[&year].is_favorite);
     }
 
@@ -2055,7 +2124,7 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO "Permissions" ("Kind", "Value", "UserId", "RowVersion")
                VALUES (10, 1, ?1, 0), (11, 0, ?1, 0), (0, 1, ?1, 0), (21, 1, ?1, 0),
-                      (11, 1, ?2, 0)"#,
+                      (7, 1, ?1, 0), (11, 1, ?2, 0)"#,
         )
         .bind(ferrofin_db::store::guid_to_db(user))
         .bind(ferrofin_db::store::guid_to_db(other))
@@ -2085,6 +2154,7 @@ mod tests {
             perms,
             ContentPermissions {
                 is_administrator: true,
+                enable_media_playback: true,
                 enable_content_deletion: true,
                 enable_content_downloading: false,
                 enable_collection_management: true,
@@ -2277,5 +2347,908 @@ mod tests {
                 .is_none(),
             "an unknown user is 'no policy', not 'nothing permitted'"
         );
+    }
+    struct NfoSaveObserver {
+        manager: Arc<FerrofinUserDataManager>,
+        seen: std::sync::Mutex<Vec<(UserDataSaveReason, UserItemDataDto)>>,
+        fail: bool,
+        changed: tokio::sync::Notify,
+    }
+
+    impl NfoSaveObserver {
+        async fn wait_seen(&self, count: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let notified = self.changed.notified();
+                    if self.seen.lock().unwrap().len() >= count {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("owned NFO notification finishes");
+        }
+    }
+
+    #[async_trait]
+    impl UserDataSaveListener for NfoSaveObserver {
+        async fn user_data_saved(
+            &self,
+            user: Uuid,
+            item: Uuid,
+            reason: UserDataSaveReason,
+        ) -> Result<(), ServiceError> {
+            let persisted = self.manager.get_user_data_dto(item, user).await?.unwrap();
+            self.seen.lock().unwrap().push((reason, persisted));
+            self.changed.notify_one();
+            if self.fail {
+                Err(ServiceError::backend("NFO destination is unavailable"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nfo_notifications_keep_source_reasons_after_persistence_and_weak_ownership() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF001);
+        seed_user(&db, user).await;
+        seed_movie_with_runtime(&db, item, 12_000_000_000).await;
+        let manager = Arc::new(FerrofinUserDataManager::new(db, config()));
+        let observer = Arc::new(NfoSaveObserver {
+            manager: Arc::clone(&manager),
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+            changed: tokio::sync::Notify::new(),
+        });
+        let listener: Arc<dyn UserDataSaveListener> = observer.clone();
+        let weak = Arc::downgrade(&listener);
+        manager.set_save_listener(weak.clone()).unwrap();
+        assert!(manager.set_save_listener(weak.clone()).is_err());
+        manager
+            .save_user_data(user, item, &favorite_dto())
+            .await
+            .unwrap();
+        observer.wait_seen(1).await;
+        manager.set_likes(user, item, Some(true)).await.unwrap();
+        observer.wait_seen(2).await;
+        manager.set_likes(user, item, Some(false)).await.unwrap();
+        observer.wait_seen(3).await;
+        manager.set_likes(user, item, None).await.unwrap();
+        observer.wait_seen(4).await;
+        manager.mark_played(user, item, None).await.unwrap();
+        observer.wait_seen(5).await;
+        manager.mark_unplayed(user, item).await.unwrap();
+        observer.wait_seen(6).await;
+        manager.record_playback_start(user, item).await.unwrap();
+        observer.wait_seen(7).await;
+        manager
+            .update_play_state(user, item, Some(6_000_000_000))
+            .await
+            .unwrap();
+        observer.wait_seen(8).await;
+        manager
+            .update_play_state_with_reason(
+                user,
+                item,
+                Some(6_000_000_000),
+                UserDataSaveReason::PlaybackFinished,
+            )
+            .await
+            .unwrap();
+        observer.wait_seen(9).await;
+        manager
+            .update_play_state_with_reason(user, item, None, UserDataSaveReason::PlaybackFinished)
+            .await
+            .unwrap();
+        observer.wait_seen(10).await;
+        {
+            let seen = observer.seen.lock().unwrap();
+            assert_eq!(
+                seen.iter().map(|(reason, _)| *reason).collect::<Vec<_>>(),
+                vec![
+                    UserDataSaveReason::UpdateUserData,
+                    UserDataSaveReason::UpdateUserRating,
+                    UserDataSaveReason::UpdateUserRating,
+                    UserDataSaveReason::UpdateUserRating,
+                    UserDataSaveReason::TogglePlayed,
+                    UserDataSaveReason::TogglePlayed,
+                    UserDataSaveReason::PlaybackStart,
+                    UserDataSaveReason::PlaybackProgress,
+                    UserDataSaveReason::PlaybackFinished,
+                    UserDataSaveReason::PlaybackFinished,
+                ]
+            );
+            assert!(seen[0].1.is_favorite, "listener reads the committed write");
+            assert_eq!(seen[1].1.rating, Some(10.0));
+            assert_eq!(seen[2].1.rating, Some(1.0));
+            assert_eq!(seen[3].1.rating, None);
+            assert!(seen[4].1.played);
+            assert!(!seen[5].1.played);
+            assert_eq!(seen[7].1.playback_position_ticks, 6_000_000_000);
+            assert!(seen[9].1.played);
+            assert_eq!(seen[9].1.play_count, 2);
+            assert_eq!(seen[9].1.playback_position_ticks, 0);
+        }
+        drop(listener);
+        drop(observer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned notification releases the weak listener");
+        manager.mark_played(user, item, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nfo_listener_errors_do_not_undo_committed_data_and_failed_writes_do_not_notify() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF002);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let manager = Arc::new(FerrofinUserDataManager::new(db.clone(), config()));
+        let observer = Arc::new(NfoSaveObserver {
+            manager: Arc::clone(&manager),
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+            changed: tokio::sync::Notify::new(),
+        });
+        let listener: Arc<dyn UserDataSaveListener> = observer.clone();
+        manager
+            .set_save_listener(Arc::downgrade(&listener))
+            .unwrap();
+        manager
+            .save_user_data_with_reason(
+                user,
+                item,
+                &favorite_dto(),
+                UserDataSaveReason::UpdateUserRating,
+            )
+            .await
+            .unwrap();
+        observer.wait_seen(1).await;
+        assert!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_favorite
+        );
+        assert_eq!(observer.seen.lock().unwrap().len(), 1);
+        sqlx::query(r#"CREATE TRIGGER nfo_reject_userdata BEFORE INSERT ON "UserData" BEGIN SELECT RAISE(ABORT, 'fixture write rejection'); END"#).execute(db.writer()).await.unwrap();
+        assert!(manager.mark_unplayed(user, item).await.is_err());
+        assert_eq!(
+            observer.seen.lock().unwrap().len(),
+            1,
+            "no notification before a failed transaction commits"
+        );
+        assert!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_favorite
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_nfo_reads_prefer_current_provider_keys_and_keep_legacy_candidates() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF003);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "current-tmdb").await;
+        seed_provider_id(&db, item, "Imdb", "current-imdb").await;
+        for (key, count, favorite, rating) in [
+            (item.to_string(), 1, false, 2.5),
+            ("current-imdb".to_owned(), 3, false, 1.0),
+            ("current-tmdb".to_owned(), 7, true, 8.5),
+        ] {
+            sqlx::query(r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "PlayCount", "IsFavorite", "Rating", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0)"#).bind(guid_to_db(item)).bind(guid_to_db(user)).bind(key).bind(count).bind(favorite).bind(rating).execute(db.writer()).await.unwrap();
+        }
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        let selected = manager
+            .get_user_data_dto(item, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.key, "current-tmdb");
+        assert_eq!(selected.play_count, 7);
+        assert!(selected.is_favorite);
+        assert_eq!(selected.rating, Some(8.5));
+        assert_eq!(
+            manager.get_user_data_dtos(&[item], user).await.unwrap()[&item],
+            selected
+        );
+        let row = fetch_item(&db, item).await;
+        assert_eq!(
+            manager
+                .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, true)
+                .await
+                .unwrap()[&item],
+            selected
+        );
+        let unhydrated = manager
+            .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, false)
+            .await
+            .unwrap();
+        assert_eq!(unhydrated[&item].key, item.to_string());
+        assert_eq!(unhydrated[&item].play_count, 1);
+        sqlx::query(r#"DELETE FROM "UserData" WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "PlayCount", "IsFavorite", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, 'legacy-retained-key', 13, 1, 0, 0)"#).bind(guid_to_db(item)).bind(guid_to_db(user)).execute(db.writer()).await.unwrap();
+        let retained = manager
+            .get_user_data_dto(item, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.key, "legacy-retained-key");
+        assert_eq!(retained.play_count, 13);
+        assert!(retained.is_favorite);
+        assert_eq!(
+            manager.get_user_data_dtos(&[item], user).await.unwrap()[&item],
+            retained
+        );
+    }
+    #[tokio::test]
+    async fn user_rating_updates_follow_source_setter_order_and_validation() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF004);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let manager = FerrofinUserDataManager::new(db, config());
+        manager
+            .save_user_data(
+                user,
+                item,
+                &UpdateUserItemDataDto {
+                    likes: Some(false),
+                    rating: Some(8.5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rated = manager
+            .get_user_data_dto(item, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rated.rating, Some(8.5));
+        assert_eq!(
+            rated.likes,
+            Some(true),
+            "explicit Rating is applied after Likes and controls its getter"
+        );
+        for rating in [-0.01, 10.01] {
+            assert!(
+                manager
+                    .save_user_data(
+                        user,
+                        item,
+                        &UpdateUserItemDataDto {
+                            rating: Some(rating),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                manager
+                    .get_user_data_dto(item, user)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                rated
+            );
+        }
+        manager
+            .save_user_data(
+                user,
+                item,
+                &UpdateUserItemDataDto {
+                    likes: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .rating,
+            Some(1.0)
+        );
+        manager.set_likes(user, item, None).await.unwrap();
+        let cleared = manager
+            .get_user_data_dto(item, user)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.rating, None);
+        assert_eq!(cleared.likes, None);
+    }
+    struct HeldNfoObserver {
+        manager: Arc<FerrofinUserDataManager>,
+        entered: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl UserDataSaveListener for HeldNfoObserver {
+        async fn user_data_saved(
+            &self,
+            user: Uuid,
+            item: Uuid,
+            _reason: UserDataSaveReason,
+        ) -> Result<(), ServiceError> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                self.manager
+                    .get_user_data_dto(item, user)
+                    .await?
+                    .unwrap()
+                    .is_favorite
+            );
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished.notify_one();
+            Err(ServiceError::backend("held NFO destination failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn nfo_async_notification_returns_after_first_yield_with_committed_state_readable() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF005);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let manager = Arc::new(FerrofinUserDataManager::new(db, config()));
+        let observer = Arc::new(HeldNfoObserver {
+            manager: Arc::clone(&manager),
+            entered: std::sync::atomic::AtomicBool::new(false),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        let listener: Arc<dyn UserDataSaveListener> = observer.clone();
+        let weak = Arc::downgrade(&listener);
+        manager.set_save_listener(weak.clone()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.save_user_data_with_reason(
+                user,
+                item,
+                &favorite_dto(),
+                UserDataSaveReason::UpdateUserRating,
+            ),
+        )
+        .await
+        .expect("user-data write cannot wait for held NFO I/O")
+        .unwrap();
+        assert!(
+            observer.entered.load(std::sync::atomic::Ordering::SeqCst),
+            "async void listener starts before return"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_favorite,
+            "a held saver cannot hide committed data"
+        );
+        observer.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.finished.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_favorite,
+            "asynchronous export failure cannot roll back user data"
+        );
+        drop(listener);
+        drop(observer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime releases the listener when notification finishes");
+    }
+
+    #[tokio::test]
+    async fn user_rating_likes_matches_source_six_point_five_boundary_in_every_read_path() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF006);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let row = fetch_item(&db, item).await;
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for (rating, expected) in [
+            (0.0, false),
+            (5.0, false),
+            (6.49, false),
+            (6.5, true),
+            (10.0, true),
+        ] {
+            manager
+                .save_user_data(
+                    user,
+                    item,
+                    &UpdateUserItemDataDto {
+                        rating: Some(rating),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let single = manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(single.likes, Some(expected), "rating {rating}");
+            assert_eq!(
+                manager.get_user_data_dtos(&[item], user).await.unwrap()[&item],
+                single
+            );
+            for hydrated in [false, true] {
+                assert_eq!(
+                    manager
+                        .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, hydrated)
+                        .await
+                        .unwrap()[&item],
+                    single
+                );
+            }
+            let stored: Option<bool> = sqlx::query_scalar(
+                r#"SELECT "Likes" FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(stored, Some(expected));
+        }
+        sqlx::query(r#"UPDATE "UserData" SET "Rating" = NULL, "Likes" = 1 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_user_data_dto(item, user)
+                .await
+                .unwrap()
+                .unwrap()
+                .likes,
+            None,
+            "Likes getter derives from Rating rather than a stale serialized Likes column"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_episode_and_season_use_resolved_series_keys_without_provider_ids_field() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(0xF007);
+        let episode = Uuid::from_u128(0xF008);
+        let season = Uuid::from_u128(0xF009);
+        seed_user(&db, user).await;
+        seed_named_item(&db, series, BaseItemKind::Series, "Resolved Series").await;
+        for (provider, key) in [
+            ("Imdb", "series-imdb"),
+            ("Tvdb", "series-tvdb"),
+            ("Custom", "series-custom"),
+        ] {
+            seed_provider_id(&db, series, provider, key).await;
+        }
+        let mut rows = Vec::new();
+        for (item, kind, suffix) in [
+            (episode, BaseItemKind::Episode, "001002"),
+            (season, BaseItemKind::Season, "002"),
+        ] {
+            seed_item(&db, item, kind).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(item)).bind(guid_to_db(series)).execute(db.writer()).await.unwrap();
+            for (key, count) in [
+                (item.to_string(), 1),
+                (format!("{series}{suffix}"), 2),
+                (format!("series-tvdb{suffix}"), 3),
+                (format!("series-custom{suffix}"), 7),
+            ] {
+                sqlx::query(r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "PlayCount", "IsFavorite", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, ?4, 0, 0, 0)"#)
+                    .bind(guid_to_db(item)).bind(guid_to_db(user)).bind(key).bind(count).execute(db.writer()).await.unwrap();
+            }
+            rows.push(fetch_item(&db, item).await);
+        }
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for hydrated in [false, true] {
+            let selected = manager
+                .get_user_data_dtos_for_rows(&rows, user, hydrated)
+                .await
+                .unwrap();
+            assert_eq!(selected[&episode].key, "series-custom001002");
+            assert_eq!(selected[&season].key, "series-custom002");
+            assert_eq!(selected[&episode].play_count, 7);
+            assert_eq!(selected[&season].play_count, 7);
+            assert_eq!(
+                manager
+                    .get_user_data_dtos(&[episode, season], user)
+                    .await
+                    .unwrap(),
+                selected
+            );
+        }
+        sqlx::query(r#"DELETE FROM "UserData" WHERE "UserId" = ?1"#)
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let synthetic = manager
+            .get_user_data_dtos_for_rows(&rows, user, false)
+            .await
+            .unwrap();
+        assert_eq!(synthetic[&episode].key, "series-custom001002");
+        assert_eq!(synthetic[&season].key, "series-custom002");
+        // Once providers exist, Episode omits Series GUID; Season retains it.
+        for (item, suffix) in [(episode, "001002"), (season, "002")] {
+            for (key, count) in [(item.to_string(), 1), (format!("{series}{suffix}"), 2)] {
+                sqlx::query(r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "PlayCount", "IsFavorite", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, ?4, 0, 0, 0)"#)
+                    .bind(guid_to_db(item)).bind(guid_to_db(user)).bind(key).bind(count).execute(db.writer()).await.unwrap();
+            }
+        }
+        let selected = manager
+            .get_user_data_dtos_for_rows(&rows, user, false)
+            .await
+            .unwrap();
+        assert_eq!(selected[&episode].key, episode.to_string());
+        assert_eq!(selected[&season].key, format!("{series}002"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_or_non_series_child_pointer_does_not_invent_series_suffix_keys() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let episode = Uuid::from_u128(0xF00A);
+        let wrong_kind = Uuid::from_u128(0xF00B);
+        let missing = Uuid::from_u128(0xF00C);
+        seed_user(&db, user).await;
+        seed_item(&db, episode, BaseItemKind::Episode).await;
+        seed_item(&db, wrong_kind, BaseItemKind::Movie).await;
+        seed_provider_id(&db, wrong_kind, "Tmdb", "not-a-series").await;
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for pointer in [missing, wrong_kind] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(episode)).bind(guid_to_db(pointer)).execute(db.writer()).await.unwrap();
+            let row = fetch_item(&db, episode).await;
+            for hydrated in [false, true] {
+                let selected = manager
+                    .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, hydrated)
+                    .await
+                    .unwrap();
+                assert_eq!(selected[&episode].key, episode.to_string());
+            }
+            manager.set_likes(user, episode, Some(true)).await.unwrap();
+            let keys: Vec<String> =
+                sqlx::query_scalar(r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#)
+                    .bind(guid_to_db(episode))
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(keys, vec![episode.to_string()]);
+        }
+    }
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one source-contract regression checks the complete sequence"
+    )]
+    async fn child_user_data_resolves_nearest_series_parent_only_for_empty_or_nil_series_id() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let outer = Uuid::from_u128(0xF010);
+        let inner = Uuid::from_u128(0xF011);
+        let intermediate = Uuid::from_u128(0xF012);
+        let folder = Uuid::from_u128(0xF013);
+        let episode = Uuid::from_u128(0xF014);
+        let season = Uuid::from_u128(0xF015);
+        let missing = Uuid::from_u128(0xF016);
+        seed_user(&db, user).await;
+        for (id, kind) in [
+            (outer, BaseItemKind::Series),
+            (inner, BaseItemKind::Series),
+            (intermediate, BaseItemKind::Season),
+            (folder, BaseItemKind::Folder),
+            (episode, BaseItemKind::Episode),
+            (season, BaseItemKind::Season),
+        ] {
+            seed_item(&db, id, kind).await;
+        }
+        seed_provider_id(&db, outer, "Custom", "outer-series").await;
+        seed_provider_id(&db, inner, "Tvdb", "nearest-series").await;
+        for (id, parent) in [
+            (inner, outer),
+            (intermediate, inner),
+            (folder, intermediate),
+            (episode, folder),
+            (season, folder),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        // FindParent walks actual parents, not an intermediate Season's SeriesId.
+        sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(intermediate))
+            .bind(guid_to_db(outer))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for pointer in [None, Some(Uuid::nil())] {
+            let mut rows = Vec::new();
+            for item in [episode, season] {
+                sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(item)).bind(pointer.map(guid_to_db)).execute(db.writer()).await.unwrap();
+                rows.push(fetch_item(&db, item).await);
+            }
+            for hydrated in [false, true] {
+                let selected = manager
+                    .get_user_data_dtos_for_rows(&rows, user, hydrated)
+                    .await
+                    .unwrap();
+                assert_eq!(selected[&episode].key, "nearest-series001002");
+                assert_eq!(selected[&season].key, "nearest-series002");
+            }
+            for (item, suffix) in [(episode, "001002"), (season, "002")] {
+                manager
+                    .save_user_data_with_reason(
+                        user,
+                        item,
+                        &favorite_dto(),
+                        UserDataSaveReason::UpdateUserRating,
+                    )
+                    .await
+                    .unwrap();
+                let selected = manager
+                    .get_user_data_dto(item, user)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.key, format!("nearest-series{suffix}"));
+                assert!(selected.is_favorite);
+                let keys: Vec<String> = sqlx::query_scalar(
+                    r#"SELECT "CustomDataKey" FROM "UserData" WHERE "ItemId" = ?1"#,
+                )
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+                assert!(keys.contains(&item.to_string()));
+                assert!(keys.contains(&format!("nearest-series{suffix}")));
+                assert!(!keys.iter().any(|key| key.starts_with("outer-series")));
+                assert_eq!(keys.contains(&format!("{inner}{suffix}")), item == season);
+            }
+            let selected = manager
+                .get_user_data_dtos_for_rows(&rows, user, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager
+                    .get_user_data_dtos(&[episode, season], user)
+                    .await
+                    .unwrap(),
+                selected
+            );
+        }
+        sqlx::query(r#"DELETE FROM "UserData" WHERE "UserId" = ?1"#)
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        for pointer in [missing, folder] {
+            let mut rows = Vec::new();
+            for item in [episode, season] {
+                sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2 WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(item))
+                    .bind(guid_to_db(pointer))
+                    .execute(db.writer())
+                    .await
+                    .unwrap();
+                rows.push(fetch_item(&db, item).await);
+            }
+            for hydrated in [false, true] {
+                let selected = manager
+                    .get_user_data_dtos_for_rows(&rows, user, hydrated)
+                    .await
+                    .unwrap();
+                for item in [episode, season] {
+                    assert_eq!(
+                        selected[&item].key,
+                        item.to_string(),
+                        "a nonempty missing/wrong-kind pointer cannot trigger FindSeriesId fallback"
+                    );
+                    manager.set_likes(user, item, Some(true)).await.unwrap();
+                    assert_eq!(
+                        manager
+                            .get_user_data_dto(item, user)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .key,
+                        item.to_string()
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn child_series_parent_resolution_terminates_on_self_and_cyclic_parent_graphs() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let episode = Uuid::from_u128(0xF020);
+        let season = Uuid::from_u128(0xF021);
+        let folder = Uuid::from_u128(0xF022);
+        seed_user(&db, user).await;
+        for (item, kind) in [
+            (episode, BaseItemKind::Episode),
+            (season, BaseItemKind::Season),
+            (folder, BaseItemKind::Folder),
+        ] {
+            seed_item(&db, item, kind).await;
+        }
+        for (item, parent) in [(episode, episode), (season, folder), (folder, season)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2, "SeriesId" = ?3, "ParentIndexNumber" = 1, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(item)).bind(guid_to_db(parent)).bind(guid_to_db(Uuid::nil())).execute(db.writer()).await.unwrap();
+        }
+        let rows = vec![
+            fetch_item(&db, episode).await,
+            fetch_item(&db, season).await,
+        ];
+        let manager = FerrofinUserDataManager::new(db, config());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for hydrated in [false, true] {
+                let selected = manager
+                    .get_user_data_dtos_for_rows(&rows, user, hydrated)
+                    .await
+                    .unwrap();
+                assert_eq!(selected[&episode].key, episode.to_string());
+                assert_eq!(selected[&season].key, season.to_string());
+            }
+            for item in [episode, season] {
+                manager.set_likes(user, item, Some(true)).await.unwrap();
+                assert_eq!(
+                    manager
+                        .get_user_data_dto(item, user)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .key,
+                    item.to_string()
+                );
+            }
+        })
+        .await
+        .expect("finite cycle-safe SQL and parent walks cannot hang user-data reads or writes");
+    }
+
+    struct CultureNfoObserver {
+        captured: std::sync::Mutex<Vec<String>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl UserDataSaveListener for CultureNfoObserver {
+        async fn user_data_saved(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UserDataSaveReason,
+        ) -> Result<(), ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.notify_one();
+            self.release.notified().await;
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_nfo_notification_inherits_request_culture_after_the_first_yield() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF007);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let manager = FerrofinUserDataManager::new(db, config());
+        let observer = Arc::new(CultureNfoObserver {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        let listener: Arc<dyn UserDataSaveListener> = observer.clone();
+        manager
+            .set_save_listener(Arc::downgrade(&listener))
+            .unwrap();
+        let previous = ferrofin_util::current_culture::capture();
+        ferrofin_util::current_culture::scope(
+            "sv".into(),
+            manager.save_user_data_with_reason(
+                user,
+                item,
+                &favorite_dto(),
+                UserDataSaveReason::UpdateUserRating,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ferrofin_util::current_culture::capture(), previous);
+        observer.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.finished.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*observer.captured.lock().unwrap(), ["sv", "sv"]);
     }
 }

@@ -1,0 +1,306 @@
+{
+  "completed_findings": [
+    "U08",
+    "U09",
+    "U10",
+    "U11",
+    "U12",
+    "U14",
+    "U15",
+    "U16",
+    "U17",
+    "U18"
+  ],
+  "open_dependency": "U13",
+  "base_commit": "785a2423",
+  "rust_version": "1.98.1",
+  "jellyfin_behavior_oracle": "4910aafa1a",
+  "jellyfin_web_reference": "1e507c588f353482a00333f84e36ddb7c8fc8221",
+  "checks": {
+    "fmt": true,
+    "strict_workspace_clippy_all_targets_all_features": true,
+    "sql_boundary": true,
+    "server_build": true,
+    "workspace_tests": {
+      "passed": 7781,
+      "failed": 5,
+      "skipped": 5,
+      "exit_code": 100,
+      "gate_passed": false,
+      "before_test_fixture_correction": true,
+      "subsequently_corrected_failure": "ferrofin-api::videos::subtitle_upload_bad_base64_is_400",
+      "unresolved_watch_dependent_failures": [
+        "ferrofin-core::notify_watcher::tests::a_metadata_only_change_of_a_root_is_not_reported",
+        "ferrofin-mediaencoding::transcoding::fs_wait::tests::wakes_on_file_creation_well_before_the_fallback_tick",
+        "ferrofin-mediaencoding::transcoding::fs_wait::tests::change_before_wait_is_not_lost",
+        "ferrofin-server::scan_change_detection::a_scan_reprocesses_only_what_changed"
+      ]
+    },
+    "doctests": {
+      "passed": 3,
+      "failed": 0
+    },
+    "final_api_suite": {
+      "passed": 889,
+      "failed": 0,
+      "skipped": 0
+    },
+    "corrected_video_target": {
+      "passed": 14,
+      "failed": 0
+    },
+    "coverage": {
+      "ferrofin-api": {
+        "line_percent": 87.65,
+        "threshold_percent": 80,
+        "test_and_coverage_exit_code": 0
+      },
+      "ferrofin-core": {
+        "line_percent": 90.69,
+        "threshold_percent": 80,
+        "test_and_coverage_exit_code": 1,
+        "report_exit_code": 0,
+        "tests_passed": 2072,
+        "tests_failed": 4,
+        "failure_cause": "inotify watch capacity exhausted"
+      }
+    },
+    "inotify_probe": {
+      "outside_sandbox": true,
+      "paths": [
+        "/tmp",
+        "fresh temporary directory"
+      ],
+      "errno": 28,
+      "error": "ENOSPC",
+      "system_limits_changed": false
+    }
+  },
+  "native_checks": {
+    "U08": {
+      "before": {
+        "probe_records": 6,
+        "timings": {
+          "items_play_access": {
+            "samples": 50,
+            "median_ms": 1.927,
+            "p95_ms": 2.91
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u08-before-results.json"
+      },
+      "after": {
+        "probe_records": 6,
+        "timings": {
+          "items_play_access": {
+            "samples": 50,
+            "median_ms": 1.998,
+            "p95_ms": 2.98
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u08-after-results.json"
+      }
+    },
+    "U09": {
+      "before": {
+        "probe_records": 9,
+        "timings": {
+          "posted_playback_info": {
+            "samples": 50,
+            "median_ms": 1.538,
+            "p95_ms": 1.798
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u09-before-results.json"
+      },
+      "after": {
+        "probe_records": 9,
+        "timings": {
+          "posted_playback_info": {
+            "samples": 50,
+            "median_ms": 1.716,
+            "p95_ms": 2.192
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u09-after-results.json"
+      }
+    },
+    "U10": {
+      "before": {
+        "probe_records": 12,
+        "timings": {
+          "remote_playback_info": {
+            "samples": 50,
+            "median_ms": 1.515,
+            "p95_ms": 2.663
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u10-before-results.json"
+      },
+      "after": {
+        "probe_records": 12,
+        "timings": {
+          "remote_playback_info": {
+            "samples": 50,
+            "median_ms": 1.672,
+            "p95_ms": 2.721
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u10-after-results.json"
+      }
+    },
+    "U11": {
+      "before": {
+        "probe_records": 10,
+        "timings": {
+          "remote_bitrate_playback_info": {
+            "samples": 50,
+            "median_ms": 2.492,
+            "p95_ms": 5.752
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u11-before-results.json"
+      },
+      "after": {
+        "probe_records": 10,
+        "timings": {
+          "remote_bitrate_playback_info": {
+            "samples": 50,
+            "median_ms": 2.178,
+            "p95_ms": 5.759
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u11-after-results.json"
+      }
+    },
+    "U12": {
+      "before": {
+        "probe_records": 12,
+        "timings": {
+          "download_head": {
+            "samples": 50,
+            "median_ms": 1.246,
+            "p95_ms": 2.075
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u12-before-results.json"
+      },
+      "after": {
+        "probe_records": 12,
+        "timings": {
+          "download_head": {
+            "samples": 50,
+            "median_ms": 0.686,
+            "p95_ms": 0.758
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u12-after-results.json"
+      }
+    },
+    "U14": {
+      "verified": {
+        "probe_records": 18,
+        "timings": {
+          "add_existing_member": {
+            "samples": 50,
+            "median_ms": 0.762,
+            "p95_ms": 1.084
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u14-verified-results.json"
+      }
+    },
+    "U15": {
+      "before": {
+        "probe_records": 30,
+        "timings": {
+          "search": {
+            "samples": 50,
+            "median_ms": 0.787,
+            "p95_ms": 1.255
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u15-before-results.json"
+      },
+      "after": {
+        "probe_records": 30,
+        "timings": {
+          "search": {
+            "samples": 50,
+            "median_ms": 0.867,
+            "p95_ms": 1.063
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u15-after-results.json"
+      }
+    },
+    "U16": {
+      "verified": {
+        "probe_records": 80,
+        "timings": {
+          "livetv_info": {
+            "samples": 50,
+            "median_ms": 0.463,
+            "p95_ms": 0.795
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u16-verified-results.json"
+      }
+    },
+    "U17": {
+      "before": {
+        "probe_records": 52,
+        "timings": {
+          "pause": {
+            "samples": 50,
+            "median_ms": 0.565,
+            "p95_ms": 0.698
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u17-before-results.json"
+      },
+      "after": {
+        "probe_records": 52,
+        "timings": {
+          "pause": {
+            "samples": 50,
+            "median_ms": 0.775,
+            "p95_ms": 0.952
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u17-after-results.json"
+      }
+    },
+    "U18": {
+      "before": {
+        "probe_records": 21,
+        "timings": {
+          "list": {
+            "samples": 50,
+            "median_ms": 0.593,
+            "p95_ms": 0.763
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u18-before-results.json"
+      },
+      "after": {
+        "probe_records": 21,
+        "timings": {
+          "list": {
+            "samples": 50,
+            "median_ms": 0.691,
+            "p95_ms": 1.303
+          }
+        },
+        "source": "/tmp/ferrofin-dashboard-u18-after-results.json"
+      }
+    }
+  },
+  "performance_claim": false,
+  "combined_latency_measured": false,
+  "new_open_findings": [
+    "S01",
+    "S02"
+  ],
+  "next_finding": "U19"
+}

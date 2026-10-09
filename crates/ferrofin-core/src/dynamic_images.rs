@@ -63,6 +63,7 @@
 //! manual refresh; Ferrofin re-evaluates the (cheap) `HasChanged` gate each
 //! scan instead, and the two converge on the same image once one exists.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -205,7 +206,7 @@ pub struct DynamicImageProviders {
     /// `{root}/{ID}`, the same layout the scanner's downloads and the
     /// image-upload endpoint use, so an upload of another type survives and a
     /// rescan re-adopts the generated file.
-    metadata_dir: PathBuf,
+    metadata_dir: DirectoryPath,
 }
 
 impl std::fmt::Debug for DynamicImageProviders {
@@ -224,13 +225,13 @@ impl DynamicImageProviders {
         items: Arc<dyn ItemRepository>,
         persistence: Arc<dyn ItemPersistenceService>,
         processor: Arc<dyn ImageProcessor>,
-        metadata_dir: PathBuf,
+        metadata_dir: impl Into<DirectoryPath>,
     ) -> Self {
         Self {
             items,
             persistence,
             processor,
-            metadata_dir,
+            metadata_dir: metadata_dir.into(),
         }
     }
 

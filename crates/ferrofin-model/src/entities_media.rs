@@ -367,6 +367,93 @@ pub struct VirtualFolderInfo {
     pub refresh_status: Option<String>,
 }
 
+impl VirtualFolderInfo {
+    /// Whether one of this library's locations holds `path` — the location
+    /// itself or anything under it, compared as upstream compares physical
+    /// locations (`OrdinalIgnoreCase`).
+    #[must_use]
+    pub fn holds_path(&self, path: &str) -> bool {
+        self.location_holding(path).is_some()
+    }
+
+    /// The longest of this library's locations that holds `path`.
+    fn location_holding(&self, path: &str) -> Option<&str> {
+        let path = trim_separators(path);
+        self.locations
+            .iter()
+            .map(|location| trim_separators(location))
+            .filter(|location| {
+                path.len() >= location.len()
+                    && path.is_char_boundary(location.len())
+                    && path[..location.len()].eq_ignore_ascii_case(location)
+                    && (path.len() == location.len()
+                        || location.ends_with(['/', '\\'])
+                        || path[location.len()..].starts_with(['/', '\\']))
+            })
+            .max_by_key(|location| location.len())
+    }
+
+    /// Whether `top_parent_id` (a stored `TopParentId`, any GUID form) is
+    /// this library's collection folder.
+    fn is_collection_folder(&self, top_parent_id: &str) -> bool {
+        match (
+            self.item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+            uuid::Uuid::parse_str(top_parent_id).ok(),
+        ) {
+            (Some(own), Some(top)) => own == top,
+            _ => false,
+        }
+    }
+}
+
+/// A location without its trailing separators (the root stays itself).
+fn trim_separators(path: &str) -> &str {
+    match path.trim_end_matches(['/', '\\']) {
+        "" if !path.is_empty() => &path[..1],
+        trimmed => trimmed,
+    }
+}
+
+/// Every configured library one of whose locations holds `path` —
+/// `LibraryManager.GetCollectionFolders(item)`, which walks to the item's
+/// top-level physical folder and returns each collection folder whose
+/// physical locations contain it, so a folder two libraries share is in both.
+#[must_use]
+pub fn libraries_holding<'a>(
+    folders: &'a [VirtualFolderInfo],
+    path: &str,
+) -> Vec<&'a VirtualFolderInfo> {
+    folders.iter().filter(|f| f.holds_path(path)).collect()
+}
+
+/// The configured library that owns an item stored with `top_parent_id` at
+/// `path` (its own path, or for a path-less item its nearest ancestor's):
+/// the library whose collection folder is the `TopParentId` (a row an older
+/// Ferrofin scan wrote), else the one a location of which holds the path —
+/// the innermost, where locations nest. Upstream reads library options and
+/// collection folders through the item's location the same way
+/// (`LibraryManager.GetLibraryOptions` → `GetCollectionFolders`).
+#[must_use]
+pub fn owning_library<'a>(
+    folders: &'a [VirtualFolderInfo],
+    top_parent_id: Option<&str>,
+    path: Option<&str>,
+) -> Option<&'a VirtualFolderInfo> {
+    if let Some(top) = top_parent_id
+        && let Some(folder) = folders.iter().find(|f| f.is_collection_folder(top))
+    {
+        return Some(folder);
+    }
+    let path = path?;
+    folders
+        .iter()
+        .filter_map(|f| f.location_holding(path).map(|location| (location.len(), f)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, f)| f)
+}
+
 /// Since `BaseItem` and `DTOBaseItem` both have provider ids, this trait helps
 /// avoid code repetition by using extension methods (the free functions on
 /// this module).
@@ -1242,8 +1329,163 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     remove_provider_id(instance, provider.as_name());
 }
 
+/// Numeric/date snapshot used to sort normal episodes and positioned specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiredEpisodeOrder {
+    /// Physical parent season number.
+    pub season: Option<i64>,
+    /// Episode number within its parent season.
+    pub episode: Option<i64>,
+    /// Known premiere date, used to break regular episode ties.
+    pub premiere: Option<chrono::DateTime<chrono::Utc>>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Episode before which a special airs.
+    pub airs_before_episode: Option<i64>,
+}
+
+impl AiredEpisodeOrder {
+    /// Whether this snapshot represents season zero.
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.season.unwrap_or(-1) == 0
+    }
+
+    /// Compare aired positions exactly as Jellyfin's `AiredEpisodeOrderComparer`.
+    #[must_use]
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_special(), other.is_special()) {
+            (true, true) => self.special_value().cmp(&other.special_value()),
+            (false, false) => self.compare_episodes(other),
+            (false, true) => self.compare_episode_to_special(other),
+            (true, false) => other.compare_episode_to_special(self).reverse(),
+        }
+    }
+
+    /// `CompareEpisodeToSpecial(x = self, y = special)`.
+    fn compare_episode_to_special(&self, special: &Self) -> std::cmp::Ordering {
+        let x_season = self.season.unwrap_or(-1);
+        let y_season = special
+            .airs_after_season
+            .or(special.airs_before_season)
+            .unwrap_or(-1);
+        if x_season != y_season {
+            return x_season.cmp(&y_season);
+        }
+        // Special comes after the episode's season.
+        if special.airs_after_season.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        // Special comes before the season.
+        let Some(y_episode) = special.airs_before_episode else {
+            return std::cmp::Ordering::Greater;
+        };
+        // Can't really compare if this happens.
+        let Some(x_episode) = self.episode else {
+            return std::cmp::Ordering::Equal;
+        };
+        // Special comes before the episode it names.
+        if x_episode == y_episode {
+            return std::cmp::Ordering::Greater;
+        }
+        x_episode.cmp(&y_episode)
+    }
+
+    /// `GetSpecialCompareValue`: season, then airs-after, then the episode
+    /// it airs before, then the special's own number.
+    fn special_value(&self) -> i64 {
+        let mut value = self
+            .airs_after_season
+            .or(self.airs_before_season)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000);
+        if self.airs_after_season.is_some() {
+            value = value.saturating_add(1_000_000);
+        }
+        value = value.saturating_add(self.airs_before_episode.unwrap_or(0).saturating_mul(1_000));
+        value.saturating_add(self.episode.unwrap_or(0))
+    }
+
+    /// `CompareEpisodes`: `(season ?? -1) * 1000 + (episode ?? -1)`, then the
+    /// premiere dates when both are known.
+    fn compare_episodes(&self, other: &Self) -> std::cmp::Ordering {
+        let value = |o: &Self| {
+            o.season
+                .unwrap_or(-1)
+                .saturating_mul(1_000)
+                .saturating_add(o.episode.unwrap_or(-1))
+        };
+        let by_number = value(self).cmp(&value(other));
+        if by_number != std::cmp::Ordering::Equal {
+            return by_number;
+        }
+        match (self.premiere, other.premiere) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
+        let library = |id: &str, locations: &[&str]| super::VirtualFolderInfo {
+            item_id: Some(id.to_owned()),
+            locations: locations.iter().map(|l| (*l).to_owned()).collect(),
+            ..super::VirtualFolderInfo::default()
+        };
+        let movies = library("11111111-1111-1111-1111-111111111111", &["/media/Movies/"]);
+        let kids = library(
+            "22222222-2222-2222-2222-222222222222",
+            &["/media/movies/Kids"],
+        );
+        let all = [movies, kids];
+        let name = |f: Option<&super::VirtualFolderInfo>| f.and_then(|f| f.item_id.clone());
+        // An older row's collection folder, in the database's GUID form.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some(
+                    "11111111-1111-1111-1111-111111111111"
+                        .to_uppercase()
+                        .as_str()
+                ),
+                None
+            )),
+            all[0].item_id
+        );
+        // By path: case-insensitive, the innermost location wins.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some("not-a-library"),
+                Some("/media/MOVIES/Heat/Heat.mkv")
+            )),
+            all[0].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                None,
+                Some("/media/movies/Kids/Up/Up.mkv")
+            )),
+            all[1].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(&all, None, Some("/media/movies"))),
+            all[0].item_id
+        );
+        // A sibling that only shares a prefix is no location's.
+        assert!(super::owning_library(&all, None, Some("/media/Movies2/x.mkv")).is_none());
+        assert_eq!(
+            super::libraries_holding(&all, "/media/movies/Kids/Up").len(),
+            2
+        );
+    }
     use super::*;
 
     #[test]
@@ -1870,5 +2112,139 @@ mod tests {
         assert!(json.get("LibraryOptions").is_some());
         let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, info);
+    }
+}
+
+#[cfg(test)]
+mod aired_episode_order_tests {
+    use super::AiredEpisodeOrder;
+    use rstest::rstest;
+    use std::cmp::Ordering;
+    fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+        value.parse().unwrap()
+    }
+    /// A comparer operand: `(season, episode, before_season, after_season,
+    /// before_episode, premiere)`.
+    fn order(
+        season: Option<i64>,
+        episode: Option<i64>,
+        before_season: Option<i64>,
+        after_season: Option<i64>,
+        before_episode: Option<i64>,
+        premiere: Option<&str>,
+    ) -> AiredEpisodeOrder {
+        AiredEpisodeOrder {
+            season,
+            episode,
+            premiere: premiere.map(ts),
+            airs_before_season: before_season,
+            airs_after_season: after_season,
+            airs_before_episode: before_episode,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        order(None, None, None, None, None, None),
+        order(None, None, None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(2), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(0), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(2), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, Some(1), None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), None, None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(3), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Less
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        Ordering::Greater
+    )]
+    fn aired_episode_order_compare(
+        #[case] x: AiredEpisodeOrder,
+        #[case] y: AiredEpisodeOrder,
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(x.compare(&y), expected);
+        assert_eq!(y.compare(&x), expected.reverse());
     }
 }

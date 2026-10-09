@@ -168,14 +168,8 @@ enum DbPoolFileValue {
 /// Not here, and why:
 /// - MusicBrainz and the studio artwork repository: each has a real setting
 ///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
-/// - LrcLib and ListenBrainz: a scan never calls them (lyrics come from the
-///   "Download missing lyrics" task, similar artists on request), as upstream.
-/// - OpenSubtitles: a scan does not call it yet. Upstream's probe downloads
-///   missing subtitles when a library sets `SubtitleDownloadLanguages`
-///   (`FFProbeVideoInfo.AddExternalSubtitlesAsync`); that is not ported yet,
-///   and Ferrofin downloads them only in the "Download missing subtitles"
-///   task. Porting it needs an `opensubtitles` entry here, or the end-to-end
-///   scan test would reach the real API.
+/// - LrcLib: the scheduled lyric-download test uses `lrclib`; scans never
+///   download lyrics. ListenBrainz is only called for similar artists on request.
 /// - Image CDNs other than TMDb's: their URLs come from the provider answers
 ///   (fanart.tv, TheTVDB, TheAudioDB), which a mock serves.
 #[doc(hidden)]
@@ -196,6 +190,8 @@ pub struct ProviderEndpoints {
     pub fanart: Option<String>,
     /// Replaces TheAudioDB's API root (`…/api/v1/json/{key}`).
     pub audiodb: Option<String>,
+    /// Replaces `https://lrclib.net` for scheduled-lyrics integration tests.
+    pub lrclib: Option<String>,
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >

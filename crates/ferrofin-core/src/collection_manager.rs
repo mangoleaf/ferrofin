@@ -213,6 +213,43 @@ async fn playlists_folder(
     Ok(container)
 }
 
+/// Linked membership and local alternates are read in bounded batches rather
+/// than one SQLite round trip per movie in an unpaged plain-folder browse.
+async fn linked_children_for_parents(
+    db: &Database,
+    parents: &[Uuid],
+    child_type: Option<i32>,
+) -> Result<std::collections::HashMap<Uuid, std::collections::HashSet<Uuid>>, ServiceError> {
+    let mut result = std::collections::HashMap::new();
+    for parents in parents.chunks(512) {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" WHERE "ParentId" IN ("#,
+        );
+        let mut separated = query.separated(", ");
+        for parent in parents {
+            separated.push_bind(guid_to_db(*parent));
+        }
+        query.push(")");
+        if let Some(kind) = child_type {
+            query.push(r#" AND "ChildType" = "#).push_bind(kind);
+        }
+        let rows: Vec<(String, String)> = query
+            .build_query_as()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        for (parent, child) in rows {
+            if let (Ok(parent), Ok(child)) = (Uuid::parse_str(&parent), Uuid::parse_str(&child)) {
+                result
+                    .entry(parent)
+                    .or_insert_with(std::collections::HashSet::new)
+                    .insert(child);
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// The concrete (minimal) collection (box-set) manager.
 #[derive(Clone)]
 pub struct FerrofinCollectionManager {
@@ -326,6 +363,88 @@ impl CollectionManager for FerrofinCollectionManager {
             }
         }
         Ok(out)
+    }
+
+    async fn collapse_items_within_box_sets(
+        &self,
+        items: &[BaseItemEntity],
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use ferrofin_traits::options::InternalItemsQuery;
+        use std::collections::HashSet;
+        let collections = if let Some(folder) = self.get_collections_folder(false).await? {
+            let query = InternalItemsQuery {
+                user: user.cloned(),
+                parent_id: Uuid::parse_str(&folder.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?,
+                include_item_types: vec![BaseItemKind::BoxSet],
+                group_by_presentation_unique_key: false,
+                ..InternalItemsQuery::default()
+            };
+            let rows = self.library_manager.query_items(&query).await?.items;
+            if let Some(user) = user {
+                self.library_manager
+                    .filter_visible_items(rows, user)
+                    .await?
+            } else {
+                rows
+            }
+        } else {
+            Vec::new()
+        };
+        let collection_ids: Vec<_> = collections
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let movie_ids: Vec<_> = items
+            .iter()
+            .filter(|item| item.type_.rsplit('.').next() == Some("Movie"))
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        // ContainsLinkedChildByItemId checks all linked child kinds; alternate
+        // suppression consults only GetLocalAlternateVersionIds (type 2).
+        let (members, alternates) = tokio::try_join!(
+            linked_children_for_parents(&self.db, &collection_ids, None),
+            linked_children_for_parents(&self.db, &movie_ids, Some(2)),
+        )?;
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        for item in items {
+            let id = Uuid::parse_str(&item.id)
+                .map_err(|error| ServiceError::backend(error.to_string()))?;
+            let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+            if matches!(kind, "Movie" | "Series") {
+                let mut in_collection = false;
+                for collection in &collections {
+                    let collection_id = Uuid::parse_str(&collection.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?;
+                    if !members
+                        .get(&collection_id)
+                        .is_some_and(|children| children.contains(&id))
+                    {
+                        continue;
+                    }
+                    in_collection = true;
+                    if seen.insert(collection_id) {
+                        results.push(collection.clone());
+                    }
+                }
+                if in_collection {
+                    continue;
+                }
+                if kind == "Movie"
+                    && alternates
+                        .get(&id)
+                        .is_some_and(|children| children.iter().any(|child| seen.contains(child)))
+                {
+                    continue;
+                }
+            }
+            if seen.insert(id) {
+                results.push(item.clone());
+            }
+        }
+        Ok(results)
     }
 
     async fn get_collections_folder(
@@ -2412,5 +2531,96 @@ mod tests {
         .await
         .expect("update");
         assert_eq!(rows(&db, playlist).await, vec![b, b]);
+    }
+    #[tokio::test]
+    async fn plain_collection_collapse_uses_visible_folder_children_all_links_and_local_alternates()
+    {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let db = test_db().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                temp.path().to_str().unwrap(),
+                temp.path().join("log").to_str().unwrap(),
+                temp.path().join("config").to_str().unwrap(),
+                temp.path().join("cache").to_str().unwrap(),
+                temp.path().join("web").to_str().unwrap(),
+            ));
+        let linked = Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
+        let manager = FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            linked.clone(),
+            paths,
+        );
+        let mut items = Vec::new();
+        let mut ids = Vec::new();
+        for (kind, name) in [
+            (BaseItemKind::Movie, "Movie one"),
+            (BaseItemKind::Movie, "Movie shortcut"),
+            (BaseItemKind::Series, "Series"),
+            (BaseItemKind::Video, "Video"),
+            (BaseItemKind::Movie, "Standalone"),
+            (BaseItemKind::Movie, "Alternate"),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_named_item(&db, id, kind, name).await;
+            items.push(crate::test_support::fetch_item(&db, id).await);
+            ids.push(id);
+        }
+        assert_eq!(
+            manager
+                .collapse_items_within_box_sets(&items, None)
+                .await
+                .unwrap(),
+            items,
+            "missing collection folder leaves input unchanged"
+        );
+        let first = manager
+            .create_collection(&CollectionCreationOptions {
+                name: "First collection".into(),
+                item_id_list: vec![ids[0], ids[2], ids[3]],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let second = manager
+            .create_collection(&CollectionCreationOptions {
+                name: "Second collection".into(),
+                item_id_list: vec![ids[0]],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        linked
+            .upsert_linked_child(Uuid::parse_str(&second.id).unwrap(), ids[1], 1)
+            .await
+            .unwrap();
+        linked.upsert_linked_child(ids[5], ids[4], 2).await.unwrap();
+        let orphan = Uuid::new_v4();
+        crate::test_support::seed_named_item(
+            &db,
+            orphan,
+            BaseItemKind::BoxSet,
+            "Orphan collection",
+        )
+        .await;
+        linked.upsert_linked_child(orphan, ids[4], 0).await.unwrap();
+        let result = manager
+            .collapse_items_within_box_sets(&items, None)
+            .await
+            .unwrap();
+        let ids_out: Vec<_> = result.iter().map(|item| item.id.clone()).collect();
+        assert_eq!(ids_out.len(), 4);
+        assert!(ids_out.contains(&first.id));
+        assert!(ids_out.contains(&second.id));
+        assert_eq!(
+            result[2].id, items[3].id,
+            "generic Video does not implement ISupportsBoxSetGrouping"
+        );
+        assert_eq!(
+            result[3].id, items[4].id,
+            "an orphan BoxSet outside Collections is not discovered; local alternates are not duplicated"
+        );
     }
 }

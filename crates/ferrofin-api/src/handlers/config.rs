@@ -7,10 +7,10 @@
 //! - `GET`/`POST /System/Configuration/{key}` — a *named* configuration.
 //!
 //! Named configurations are Jellyfin's pluggable per-key config store. `branding`
-//! has a dedicated typed store; every other key (`encoding`/`network`/`metadata`/
-//! `xbmcmetadata` and any plugin key) round-trips through a generic per-key store
-//! at `{config}/named/{key}.json`. Known sections bind through typed JsonDefaults
-//! converters before persistence; plugin-owned documents keep their raw shape.
+//! has a dedicated typed store; other keys use per-key files at
+//! `{config}/users/named/{key}.json`. Core sections bind through typed
+//! JsonDefaults converters before persistence and return typed documents on
+//! reads. Plugin-owned documents keep their raw shape.
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -23,7 +23,7 @@ use ferrofin_model::branding::{BrandingOptions, BrandingOptionsDto};
 use ferrofin_model::configuration::{MetadataOptions, ServerConfiguration};
 use serde_json::Value;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, JsonValueBody};
 use crate::state::AppState;
@@ -83,7 +83,7 @@ async fn get_configuration(
 )]
 async fn update_configuration(
     State(state): State<AppState>,
-    _auth: RequireAdmin,
+    _auth: RequireAdminWithDefault,
     JsonBody(configuration): JsonBody<ServerConfiguration>,
 ) -> Result<StatusCode, ApiError> {
     state.config.update_configuration(&configuration).await?;
@@ -100,7 +100,7 @@ async fn update_configuration(
     responses((status = 200, description = "Metadata options returned", body = MetadataOptions)),
     tag = "ferrofin"
 )]
-async fn get_default_metadata_options(_auth: RequireAdmin) -> Json<MetadataOptions> {
+async fn get_default_metadata_options(_auth: RequireAdminWithDefault) -> Json<MetadataOptions> {
     Json(MetadataOptions::default())
 }
 
@@ -118,7 +118,7 @@ async fn get_default_metadata_options(_auth: RequireAdmin) -> Json<MetadataOptio
 )]
 async fn update_branding_configuration(
     State(state): State<AppState>,
-    _auth: RequireAdmin,
+    _auth: RequireAdminWithDefault,
     JsonBody(dto): JsonBody<BrandingOptionsDto>,
 ) -> Result<StatusCode, ApiError> {
     let mut current = state.config.get_branding().await?;
@@ -166,14 +166,37 @@ async fn read_named_config(path: &std::path::Path) -> Option<Value> {
     }
 }
 
+/// Loads a core section through its configuration DTO. Older
+/// documents may omit members; deserialization supplies their defaults. Like
+/// `BaseConfigurationManager.LoadConfiguration`, an invalid stored document
+/// yields defaults and a diagnostic, without overwriting the damaged file.
+fn load_named_configuration<T: serde::de::DeserializeOwned + Default>(
+    key: &str,
+    saved: Option<Value>,
+) -> T {
+    let Some(saved) = saved else {
+        return T::default();
+    };
+    match serde_json::from_value(saved) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(
+                configuration_key = key,
+                error = %error,
+                "saved named configuration could not be read; falling back to defaults"
+            );
+            T::default()
+        }
+    }
+}
+
 /// `GET /System/Configuration/{key}` — a named configuration.
 ///
 /// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
-/// dedicated typed store; every other key round-trips through the generic
-/// per-key store (`{config}/named/{key}.json`), falling back to a typed default
-/// object for the known core sections (`encoding`/`network`/`metadata`/
-/// `xbmcmetadata`) when nothing has been saved. An unknown, never-saved key is
-/// still `501`.
+/// dedicated typed store; other core keys load their DTO from the per-key
+/// store (`{config}/users/named/{key}.json`). Omitted members receive defaults,
+/// and invalid documents fall back with a warning. Plugin-owned keys retain
+/// their raw shape; an unknown, never-saved key is still `501`.
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -186,7 +209,10 @@ async fn get_named_configuration(
     _auth: RequireAuth,
     Path(key): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    use ferrofin_model::configuration::{MetadataConfiguration, XbmcMetadataOptions};
+    use ferrofin_model::configuration::{
+        EncodingOptions, MetadataConfiguration, XbmcMetadataOptions,
+    };
+    use ferrofin_model::live_tv::LiveTvOptions;
     let to_value = |r: Result<Value, serde_json::Error>| {
         r.map_err(|e| {
             ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
@@ -199,18 +225,14 @@ async fn get_named_configuration(
             state.config.get_branding().await?,
         ))?));
     }
-    // A previously-saved value wins over the default object.
+    // Load once: retrying through a manager after a failed file read would
+    // turn the logged fallback into another parse error on the same file.
     let saved = match named_config_file(&state, &key) {
         Some(path) => read_named_config(&path).await,
         None => None,
     };
     if key.eq_ignore_ascii_case("encoding") {
-        let options = match saved {
-            Some(value) => {
-                serde_json::from_value(value).map_err(|error| configuration_error(&error))?
-            }
-            None => state.config.get_encoding_options().await?,
-        };
+        let options = load_named_configuration::<EncodingOptions>(&key, saved);
         return encoding_response(&options).map(Json);
     }
     // `livetv` merges the persisted scalars (recording paths, padding) with the
@@ -218,12 +240,8 @@ async fn get_named_configuration(
     // dashboard's Live TV page renders its tuner and guide-provider lists from
     // this config object, so they must reflect the manager's state.
     if key.eq_ignore_ascii_case("livetv") {
-        let mut value = match saved {
-            Some(v) => v,
-            None => to_value(serde_json::to_value(
-                ferrofin_model::live_tv::LiveTvOptions::default(),
-            ))?,
-        };
+        let options = load_named_configuration::<LiveTvOptions>(&key, saved);
+        let mut value = to_value(serde_json::to_value(options))?;
         if let (Some(live_tv), Value::Object(map)) = (state.live_tv.as_ref(), &mut value) {
             // A backend failure must not read as "no tuners configured": the
             // rows still render empty (Jellyfin's corrupt-store fallback also
@@ -260,33 +278,19 @@ async fn get_named_configuration(
         }
         return Ok(Json(value));
     }
-    if let Some(value) = saved {
-        // A `network.json` written by an older Ferrofin spells four keys the
-        // way `PascalCase` derived them (`EnableIpv4`, `RemoteIpFilter`, …),
-        // not the way the contract does. Served verbatim, jellyfin-web would
-        // not recognise them: the network page would render an empty remote-IP
-        // filter, and the operator's next Save would write that emptiness back.
-        // Round-tripping through the typed struct — whose serde aliases read
-        // the old names — hands the page the contract's spelling instead.
-        if key.eq_ignore_ascii_case("network") {
-            match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(value.clone())
-            {
-                Ok(config) => return Ok(Json(to_value(serde_json::to_value(config))?)),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "the saved network configuration could not be read; serving it unchanged"
-                ),
-            }
-        }
-        return Ok(Json(value));
-    }
     let value = match key.to_ascii_lowercase().as_str() {
-        "network" => to_value(serde_json::to_value(
-            ferrofin_networking::NetworkConfiguration::default(),
-        ))?,
-        "metadata" => to_value(serde_json::to_value(MetadataConfiguration::default()))?,
-        "xbmcmetadata" => to_value(serde_json::to_value(XbmcMetadataOptions::default()))?,
-        _ => return Err(ApiError::NotImplemented),
+        // The DTO's aliases also read the old EnableIpv4/RemoteIpFilter names;
+        // serialization always returns the names understood by jellyfin-web.
+        "network" => to_value(serde_json::to_value(load_named_configuration::<
+            ferrofin_networking::NetworkConfiguration,
+        >(&key, saved)))?,
+        "metadata" => to_value(serde_json::to_value(load_named_configuration::<
+            MetadataConfiguration,
+        >(&key, saved)))?,
+        "xbmcmetadata" => to_value(serde_json::to_value(load_named_configuration::<
+            XbmcMetadataOptions,
+        >(&key, saved)))?,
+        _ => saved.ok_or(ApiError::NotImplemented)?,
     };
     Ok(Json(value))
 }
@@ -362,7 +366,7 @@ fn normalize_named_configuration(key: &str, raw: &str) -> Result<Value, ApiError
 )]
 async fn update_named_configuration(
     State(state): State<AppState>,
-    _auth: RequireAdmin,
+    _auth: RequireAdminWithDefault,
     Path(key): Path<String>,
     JsonValueBody(raw): JsonValueBody<Box<serde_json::value::RawValue>>,
 ) -> Result<StatusCode, ApiError> {
@@ -373,40 +377,74 @@ async fn update_named_configuration(
         state.config.update_branding(&branding).await?;
         return Ok(StatusCode::NO_CONTENT);
     }
+    // Once accepted, finish persistence and the live update even if the HTTP
+    // client disconnects. The worker owns the save lock until both are done.
+    tokio::spawn(save_named_configuration(state, key, body))
+        .await
+        .map_err(|error| {
+            ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
+        })??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn save_named_configuration(
+    state: AppState,
+    key: String,
+    body: Value,
+) -> Result<(), ApiError> {
+    use ferrofin_common::configuration::ConfigurationValidationError;
+    use ferrofin_traits::error::ServiceError;
     let path = named_config_file(&state, &key)
         .ok_or_else(|| ApiError::BadRequest("invalid configuration key".to_owned()))?;
-    let io_err = |e: &std::io::Error| {
-        ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
-            "persist configuration `{key}`: {e}"
-        )))
+    let _save = state.configuration_write_lock.lock().await;
+    // Parse everything needed by the live consumer before replacing the file.
+    let network = if key.eq_ignore_ascii_case("network") {
+        Some(
+            serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(body.clone())
+                .map_err(|error| configuration_error(&error))?,
+        )
+    } else {
+        None
     };
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| io_err(&e))?;
-    }
-    let bytes = serde_json::to_vec_pretty(&body).map_err(|e| {
-        ApiError::from(ferrofin_traits::error::ServiceError::backend(format!(
-            "serialize configuration `{key}`: {e}"
-        )))
-    })?;
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|e| io_err(&e))?;
-    // The network policy caches its parsed subnets, so a saved
-    // `LocalNetworkSubnets` / `RemoteIPFilter` has to be pushed into it or it
-    // would keep enforcing the configuration the server booted with until a
-    // restart. C# `NetworkManager` subscribes to the same configuration event.
-    if key.eq_ignore_ascii_case("network") {
-        match serde_json::from_value::<ferrofin_networking::NetworkConfiguration>(body) {
-            Ok(config) => state.update_network_settings(&config),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "the saved network configuration could not be read back; the running policy is unchanged"
-            ),
+    let json = serde_json::to_string_pretty(&body).map_err(|error| configuration_error(&error))?;
+    if let Some(validator) = state
+        .configuration_validators
+        .get(&key.to_ascii_lowercase())
+    {
+        let saved = read_named_config(&path).await;
+        // Validate against the same typed/default value exposed by GET. In
+        // particular, a malformed old encoding file must remain repairable.
+        let old = if key.eq_ignore_ascii_case("encoding") {
+            serde_json::to_string(&load_named_configuration::<
+                ferrofin_model::configuration::EncodingOptions,
+            >(&key, saved))
+        } else {
+            serde_json::to_string(&saved.unwrap_or_else(|| serde_json::json!({})))
         }
+        .map_err(|error| configuration_error(&error))?;
+        validator
+            .validate(&old, &json)
+            .map_err(|error| match error {
+                ConfigurationValidationError::DirectoryNotFound(message) => {
+                    ServiceError::not_found(message)
+                }
+                ConfigurationValidationError::InvalidOperation(message) => {
+                    ServiceError::backend(message)
+                }
+            })?;
     }
-    Ok(StatusCode::NO_CONTENT)
+    let committed: std::sync::Arc<str> = json.clone().into();
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+    })
+    .await
+    .map_err(|error| ServiceError::backend(format!("configuration writer: {error}")))?
+    .map_err(|error| ServiceError::backend(format!("persist configuration `{key}`: {error}")))?;
+    if let Some(config) = network {
+        state.update_network_settings(&config);
+    }
+    state.config.named_configuration_updated(&key, committed);
+    Ok(())
 }
 
 /// `GET /System/Configuration/Branding` — the branding configuration.

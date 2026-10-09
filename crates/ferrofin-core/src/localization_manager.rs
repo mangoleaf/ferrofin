@@ -1,39 +1,10 @@
 //! [`LocalizationManager`] — a concrete culture/country/parental-rating service.
 //!
-//! Port of `Emby.Server.Implementations.Localization.LocalizationManager`, cut
-//! down to the culture-data surface that the rest of Ferrofin needs today.
-//!
-//! **Flagged for `ferrofin-traits`:** the C# `ILocalizationManager` interface was
-//! deliberately *not* ported into `ferrofin-traits` (its module doc says the
-//! service is "not part of the wire contract, so it is dropped"). Consumers of
-//! this data (the DTO layer's language display names, the metadata provider's
-//! rating scores) will need a trait to inject it. This unit ships a **concrete
-//! struct**; a follow-up should add an `ILocalizationManager` trait to
-//! `ferrofin-traits` and have this type implement it. The public methods here are
-//! named to match that future trait so the change is mechanical.
-//!
-//! Dataset scope (a *minimal* embedded dataset, not the full Jellyfin resource
-//! bundle):
-//! - **Cultures** — a compact ISO 639 table (`(t, b, two-letter, display)`)
-//!   covering the common media languages, parsed the same way C# parses
-//!   `iso6392.txt` (building the ISO 639-2/B → /T map as a side effect).
-//! - **Countries** — a short [`CountryInfo`] list for the common metadata
-//!   regions.
-//! - **Parental ratings** — the US rating system (the primary source of ratings
-//!   in metadata providers), with the same "common ratings" back-fill and score
-//!   ordering the C# `GetParentalRatings` performs.
-//!
-//! The localized-*string* machinery (`GetLocalizedString`, the per-culture JSON
-//! resource dictionaries) is out of scope for this minimal port and is omitted;
-//! the runtime translation catalog is a `ferrofin-server` asset concern.
-//!
-//! All the vendored tables (cultures, countries, ratings, UI-language options) are
-//! parsed **once** into process-wide [`LazyLock`] statics rather than being rebuilt on
-//! every call: the source data is `include_str!`-embedded and immutable, so nothing
-//! about it can vary at runtime. The only per-instance state left is the configured
-//! default country code and the parental-rating list derived from it.
+//! Ports Jellyfin's cultures, country tables, parental ratings and core strings.
+//! Immutable embedded tables are parsed once. Server UI culture and metadata
+//! country are read from live configuration when resolving a value.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use ferrofin_model::entities_media::{ParentalRating, ParentalRatingScore};
@@ -63,9 +34,8 @@ const ISO6392: &str = include_str!("data/iso6392.txt");
 /// `Emby.Server.Implementations/Localization/countries.json` (v10.11.8, 139 ISO-3166 entries).
 const COUNTRIES_JSON: &str = include_str!("data/countries.json");
 
-/// Jellyfin's bundled US parental-rating system, vendored verbatim from
-/// `Emby.Server.Implementations/Localization/Ratings/us.json` (v10.11.8).
-const RATINGS_US_JSON: &str = include_str!("data/ratings-us.json");
+#[path = "data/parental_ratings.rs"]
+mod parental_ratings;
 
 #[path = "data/core_dictionaries.rs"]
 mod core_dictionaries;
@@ -245,10 +215,11 @@ static LOCALIZATION_OPTION_LIST: LazyLock<Vec<LocalizationOption>> = LazyLock::n
 static CULTURE_DATA: LazyLock<CultureData> = LazyLock::new(load_culture_data);
 
 /// Every known rating system, keyed by upper-case country code, parsed once.
-static PARENTAL_RATINGS: LazyLock<HashMap<String, RatingTable>> = LazyLock::new(|| {
-    let mut systems = HashMap::new();
-    systems.insert("US".to_owned(), load_rating_table(RATINGS_US_JSON));
-    systems
+static PARENTAL_RATINGS: LazyLock<BTreeMap<String, RatingTable>> = LazyLock::new(|| {
+    parental_ratings::TABLES
+        .iter()
+        .map(|(country, json)| ((*country).to_owned(), load_rating_table(json)))
+        .collect()
 });
 
 /// A parental-rating system as stored in `Ratings/*.json` (C# `ParentalRatingSystem`).
@@ -295,23 +266,15 @@ struct RatingTable {
     by_name: HashMap<String, ParentalRatingScore>,
 }
 
-/// A concrete culture/country/parental-rating service over a minimal dataset.
-///
-/// See the module docs: this stands in for the (unported) C#
-/// `ILocalizationManager` and should be fronted by a `ferrofin-traits` trait in a
-/// follow-up.
+/// Culture, country and parental-rating services over the embedded resources.
 #[derive(Clone)]
 pub struct LocalizationManager {
     /// The server default country code for rating fallback.
-    metadata_country_code: String,
+    metadata_country_code: Arc<dyn Fn() -> String + Send + Sync>,
     /// `ServerConfiguration.UICulture` — the culture `GetLocalizedString`
     /// resolves phrases in (en-US fallback), read live so an admin change
     /// applies without a restart, as the C# config fallback does.
     ui_culture: Arc<dyn Fn() -> String + Send + Sync>,
-    /// The default country's parental-rating list, built once at construction. It
-    /// depends on `metadata_country_code`, so unlike the tables above it cannot be a
-    /// process-wide static — but it is still immutable for the manager's lifetime.
-    parental_ratings: Vec<ParentalRating>,
 }
 
 impl Default for LocalizationManager {
@@ -323,7 +286,7 @@ impl Default for LocalizationManager {
 impl std::fmt::Debug for LocalizationManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalizationManager")
-            .field("metadata_country_code", &self.metadata_country_code)
+            .field("metadata_country_code", &(self.metadata_country_code)())
             .field("ui_culture", &(self.ui_culture)())
             .finish_non_exhaustive()
     }
@@ -335,12 +298,20 @@ impl LocalizationManager {
     #[must_use]
     pub fn new(metadata_country_code: &str) -> Self {
         let metadata_country_code = metadata_country_code.to_ascii_uppercase();
-        let parental_ratings = build_parental_ratings(&metadata_country_code);
         Self {
-            metadata_country_code,
+            metadata_country_code: Arc::new(move || metadata_country_code.clone()),
             ui_culture: Arc::new(|| DEFAULT_CULTURE.to_owned()),
-            parental_ratings,
         }
+    }
+
+    /// Reads the current metadata country when resolving default ratings.
+    #[must_use]
+    pub fn with_metadata_country_source(
+        mut self,
+        source: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_country_code = Arc::new(source);
+        self
     }
 
     /// Sets a fixed server UI culture (`ServerConfiguration.UICulture`) phrases
@@ -483,10 +454,10 @@ impl LocalizationManager {
     /// The parental-rating list for the server default country, back-filled with
     /// the common ratings and ordered by score (C# `GetParentalRatings`).
     ///
-    /// Built once in [`LocalizationManager::new`]; this is a clone of that list.
+    /// Resolves the live server country against the immutable parsed tables.
     #[must_use]
     pub fn get_parental_ratings(&self) -> Vec<ParentalRating> {
-        self.parental_ratings.clone()
+        build_parental_ratings(&(self.metadata_country_code)())
     }
 
     /// Resolves a rating string to a score (C# `GetRatingScore`, Jellyfin 12.1
@@ -569,7 +540,7 @@ impl LocalizationManager {
                     return Some(*score);
                 }
             }
-        } else if let Some(table) = parental_ratings_for(&self.metadata_country_code)
+        } else if let Some(table) = parental_ratings_for(&(self.metadata_country_code)())
             && let Some(score) = table.by_name.get(&rating_key(cleaned))
         {
             // Fall back to the server default language for the ratings check.
@@ -763,7 +734,9 @@ fn load_rating_table(json: &str) -> RatingTable {
                     // providers are not consistent (`VM18` vs `vm18`).
                     if by_name.insert(rating_key(&rating), score).is_none() {
                         ordered.push((rating, score));
-                    } else if let Some(slot) = ordered.iter_mut().find(|(name, _)| name == &rating)
+                    } else if let Some(slot) = ordered
+                        .iter_mut()
+                        .find(|(name, _)| rating_key(name) == rating_key(&rating))
                     {
                         slot.1 = score;
                     }
@@ -862,6 +835,15 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
 
     fn get_localization_options(&self) -> Vec<LocalizationOption> {
         LocalizationManager::get_localization_options(self)
+    }
+
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // Pinned BuildLocalizationData scans all embedded Core resources, not
+        // the historical fixed dropdown. Request options validate the names.
+        core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, _)| code.replace('_', "-"))
+            .collect()
     }
 
     fn get_localized_string(&self, phrase: &str) -> String {
@@ -1033,8 +1015,14 @@ mod tests {
         assert_eq!(m.get_rating_score("Unrated", None), None);
         // Multi-value: first resolvable wins.
         assert_eq!(
-            m.get_rating_score("n/a / PG", None).map(|s| s.score),
+            m.get_rating_score("Unrated / PG", None).map(|s| s.score),
             Some(10)
+        );
+        // With all tables loaded, upstream's slash split resolves the `a`
+        // fragment via BG's A=0. Only a whole `n/a` is an unrated marker.
+        assert_eq!(
+            m.get_rating_score("n/a / PG", None).map(|s| s.score),
+            Some(0)
         );
         // Country-prefixed.
         assert_eq!(m.get_rating_score("US:R", None).map(|s| s.score), Some(17));
@@ -1278,11 +1266,10 @@ mod tests {
         assert!(parental_ratings_for("zz").is_none());
     }
 
-    /// A non-US default country has no vendored table, so only the back-fill remains —
-    /// which is why the rating list cannot be a process-wide static.
+    /// An unknown country exposes only the common backfill.
     #[test]
     fn parental_ratings_depend_on_the_configured_country() {
-        let names: Vec<String> = shipped("DE")
+        let names: Vec<String> = shipped("ZZ")
             .get_parental_ratings()
             .into_iter()
             .map(|r| r.name)
@@ -1413,5 +1400,86 @@ mod tests {
             .expect("ZZ-DUP listed");
         assert_eq!(listed.rating_score, Some(dup));
         assert_eq!(listed.value, Some(18));
+    }
+    /// Cases ported from upstream LocalizationManagerTests at 4910aafa1a.
+    #[rstest]
+    #[case("CA-R", "CA", 18, Some(1))]
+    #[case("FSK-16", "DE", 16, None)]
+    #[case("FSK-18", "DE", 18, None)]
+    #[case("FSK-18", "US", 18, None)]
+    #[case("TV-MA", "US", 17, Some(1))]
+    #[case("XXX", "asdf", 1000, None)]
+    #[case("Germany: FSK-18", "DE", 18, None)]
+    #[case("Rated : R", "US", 17, Some(0))]
+    #[case("Rated: R", "US", 17, Some(0))]
+    #[case("Rated R", "US", 17, Some(0))]
+    #[case(" PG-13 ", "US", 13, Some(0))]
+    #[case("TV-MA", "DE", 17, Some(1))]
+    #[case("PG-13", "FR", 13, Some(0))]
+    #[case("R", "JP", 17, Some(0))]
+    #[case("us:R", "DE", 17, Some(0))]
+    #[case("US:PG-13", "DE", 13, Some(0))]
+    #[case("ca:R", "US", 18, Some(1))]
+    fn international_rating_oracles(
+        #[case] rating: &str,
+        #[case] country: &str,
+        #[case] score: i32,
+        #[case] subscore: Option<i32>,
+    ) {
+        assert_eq!(
+            LocalizationManager::new(country).get_rating_score(rating, None),
+            Some(ParentalRatingScore::new(score, subscore))
+        );
+    }
+
+    #[test]
+    fn live_country_changes_rating_choices_and_ambiguous_scores() {
+        let country = Arc::new(std::sync::RwLock::new("US".to_owned()));
+        let read = Arc::clone(&country);
+        let manager = LocalizationManager::default()
+            .with_metadata_country_source(move || read.read().unwrap().clone());
+        assert_eq!(manager.get_parental_ratings().len(), 56);
+        assert_eq!(manager.get_rating_score("PG", None).unwrap().score, 10);
+        *country.write().unwrap() = "DE".into();
+        let ratings = manager.get_parental_ratings();
+        assert_eq!(ratings.len(), 24);
+        assert_eq!(
+            ratings.iter().find(|r| r.name == "FSK-12").unwrap().value,
+            Some(12)
+        );
+        *country.write().unwrap() = "CA".into();
+        assert_eq!(manager.get_rating_score("PG", None).unwrap().score, 8);
+        assert_eq!(
+            manager.get_rating_score("PG", Some("US")).unwrap().score,
+            10
+        );
+        // Both gb.json and uk.json declare GB, as in upstream LoadAll.
+        assert_eq!(parental_ratings::TABLES.len(), 45);
+        assert_eq!(PARENTAL_RATINGS.len(), 44);
+        // Cross-country fallback order must prefer the 0-prefer resource.
+        assert_eq!(
+            LocalizationManager::new("ZZ")
+                .get_rating_score("M", None)
+                .unwrap()
+                .score,
+            18
+        );
+    }
+
+    #[test]
+    fn startup_supported_ui_cultures_follow_all_embedded_resources() {
+        let manager = LocalizationManager::default();
+        let names =
+            ferrofin_traits::localization::LocalizationManager::get_supported_ui_cultures(&manager);
+        assert_eq!(names.len(), 105, "pinned embedded resource set");
+        for name in [
+            "en-US", "ar-SA", "lt-LT", "he-IL", "ur", "sv", "uz", "ka", "km",
+        ] {
+            assert!(
+                names.iter().any(|actual| actual == name),
+                "missing startup culture {name}"
+            );
+        }
+        assert!(!names.iter().any(|name| name.contains('_')));
     }
 }

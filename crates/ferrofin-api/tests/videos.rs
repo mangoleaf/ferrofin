@@ -97,7 +97,12 @@ impl AuthService for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -112,7 +117,12 @@ impl AuthorizationContext for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }

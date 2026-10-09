@@ -784,6 +784,22 @@ fn ok_state_full(
     media_sources: Arc<OkMediaSources>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
+    ok_state_with_auth(
+        item_id,
+        media_sources,
+        users,
+        Arc::new(OkAuthContext),
+        Arc::new(OkAuthService),
+    )
+}
+
+fn ok_state_with_auth(
+    item_id: Uuid,
+    media_sources: Arc<OkMediaSources>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    auth_context: Arc<dyn AuthorizationContext>,
+    auth_service: Arc<dyn AuthService>,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary { item_id }),
         users,
@@ -799,8 +815,8 @@ fn ok_state_full(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        auth_context,
+        auth_service,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -870,6 +886,75 @@ async fn playback_info_post_returns_media_sources() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(response).await;
     assert_eq!(json["MediaSources"][0]["Id"], "source-1");
+}
+
+#[tokio::test]
+async fn api_key_playback_info_only_requires_a_user_for_profile_negotiation() {
+    let item_id = Uuid::from_u128(0xABCD);
+    for (body, expected) in [
+        (serde_json::json!({}), StatusCode::OK),
+        (
+            serde_json::json!({"DeviceProfile": {}}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!({"DeviceProfile": {}, "UserId": USER_ID}),
+            StatusCode::OK,
+        ),
+        (
+            serde_json::json!({"DeviceProfile": {}, "UserId": Uuid::from_u128(999)}),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let app = ok_state_with_auth(
+            item_id,
+            Arc::new(OkMediaSources {
+                path: "/tmp/ferrofin-test-media.mp4".to_owned(),
+                opened: Mutex::new(None),
+            }),
+            Arc::new(OkUsers),
+            Arc::new(ferrofin_api::test_support::FakeAuthContext),
+            Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+        );
+        let response = create_router(app)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                    .header("X-Emby-Token", "valid")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn posted_playback_user_is_authorized_and_query_takes_precedence() {
+    let item_id = Uuid::from_u128(0xABCD);
+    for (query, expected) in [
+        (String::new(), StatusCode::FORBIDDEN),
+        (format!("?userId={USER_ID}"), StatusCode::OK),
+    ] {
+        let response = create_router(ok_state(item_id, "/tmp/ferrofin-test-media.mp4"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Items/{item_id}/PlaybackInfo{query}"))
+                    .header("X-Emby-Token", "valid")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"UserId": Uuid::from_u128(999)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{query}");
+    }
 }
 
 /// `POST /LiveStreams/Open` folds `?userId=` and the body's `UserId` and then

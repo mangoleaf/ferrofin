@@ -32,6 +32,8 @@ members = [
     #   Wave 6: ferrofin-core        Wave 7: ferrofin-api        Wave 8: apps/ferrofin-server
 ]
 
+exclude = ["vendor/icu_collator"]
+
 [workspace.package]
 version = "0.4.1"
 edition = "2024"
@@ -154,6 +156,7 @@ wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+unicode-normalization = "0.1.25"
 async-trait = "0.1.92"
 libc = "0.2"
 argon2 = "0.6.0"
@@ -175,11 +178,18 @@ bitflags = "2.13.2"
 # transitive dependency of flate2/zip, so it adds no new compilation.
 crc32fast = "1.5.2"
 regex = "1"
+percent-encoding = "2.3.2"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.
 icu_collator = "2.3.1"
 icu_casemap = "2.3.0"
+icu_locale_core = "2.3.0"
+icu_collections = "2.3.0"
+icu_locale_fallback = "2.3.0"
+icu_normalizer = "2.3.0"
+icu_provider = "2.3.1"
+zerovec = "0.11.8"
 fancy-regex = "0.19.2"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 
@@ -196,3 +206,7 @@ tempfile = "3"          # temp SQLite files for ferrofin-db tests
 inherits = "release"
 debug = true
 strip = false
+
+# Exact ICU4X2.3.1 with a reviewed Jamo dispatch correction for search data.
+[patch.crates-io]
+icu_collator = { path = "vendor/icu_collator" }

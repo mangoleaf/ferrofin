@@ -1,16 +1,18 @@
 //! Book and comic local metadata — port of `MediaBrowser.Providers/Books`.
 //!
-//! Four readers, tried in `ComicProvider`'s DI registration order — the first
-//! with metadata wins — plus the two cover extractors:
+//! Local readers run in the configured library/server order — the first
+//! with metadata wins. ComicProvider has three internal readers; EPUB and OPF
+//! are independent local readers. The table shows the default order:
 //!
 //! | Order | Source | C# | What it reads |
 //! |---|---|---|---|
 //! | 1 | the `.cbz` archive comment | `ComicBookInfoProvider` | the ComicBookInfo JSON schema |
 //! | 2 | `<stem>.xml`, else `ComicInfo.xml`, beside the file | `ExternalComicInfoProvider` | the ComicRack schema, as a sidecar |
 //! | 3 | `ComicInfo.xml` inside a `.cbz` | `InternalComicInfoProvider` | the same schema, bundled |
-//! | 4 | `<stem>.opf`, `content.opf`, `metadata.opf`, or the one inside a `.epub` | `OpfProvider`/`EpubProvider` | Dublin Core + Calibre |
+//! | 4 | the OPF inside a `.epub` | `EpubProvider` | Dublin Core + Calibre |
+//! | 5 | `<stem>.opf`, `content.opf`, or `metadata.opf` | `OpfProvider` | Dublin Core + Calibre |
 //!
-//! `OpfProvider` is unfiltered, so step 4 runs for a comic too — a `.cbz` in a
+//! `OpfProvider` is unfiltered, so step 5 runs for a comic too — a `.cbz` in a
 //! Calibre directory resolves through it.
 //!
 //! Covers come from an explicitly named `cover.<ext>` in a comic archive, else
@@ -101,55 +103,72 @@ impl BookMetadata {
     }
 }
 
-/// Reads a book's embedded/sidecar metadata, trying each source in the order
-/// `ComicProvider` does and returning the first hit.
-///
-/// `None` means no source had anything — the item keeps its filename-derived
-/// name, exactly as upstream leaves it.
+/// Enabled local book readers in the library's configured order. Each reader
+/// has upstream default order 50, so registration breaks unconfigured ties.
+#[must_use]
+pub fn book_metadata_readers(
+    library: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+) -> Vec<&'static str> {
+    use crate::library_options::{fetcher_names, local_metadata_reader_rank};
+    let mut readers = vec![
+        fetcher_names::COMIC,
+        fetcher_names::EPUB,
+        fetcher_names::OPF,
+    ];
+    readers.retain(|name| {
+        library.is_none_or(|library| {
+            !library
+                .disabled_local_metadata_readers
+                .iter()
+                .any(|disabled| disabled.eq_ignore_ascii_case(name))
+        })
+    });
+    readers.sort_by_key(|name| local_metadata_reader_rank(library, global, name));
+    readers
+}
+
+/// Reads the first successful local reader in the default registration order.
 #[must_use]
 pub fn read_book_metadata(path: &str) -> Option<BookMetadata> {
-    let extension = extension_of(path);
-    if extension == "epub" {
-        return read_epub_metadata(path);
+    read_book_metadata_with_readers(path, &book_metadata_readers(None, None))
+}
+
+/// Runs the selected local readers until one supplies metadata. Readers are
+/// separate from image extraction and never merge fields across local sources,
+/// matching `MetadataService.ExecuteMetadataProviders`' first-success break.
+#[must_use]
+pub fn read_book_metadata_with_readers(path: &str, readers: &[&str]) -> Option<BookMetadata> {
+    use crate::library_options::fetcher_names;
+    readers.iter().find_map(|reader| match *reader {
+        fetcher_names::COMIC => read_comic_metadata(path),
+        fetcher_names::EPUB if extension_of(path) == "epub" => read_epub_metadata(path),
+        fetcher_names::OPF => read_sidecar(path, &["opf"], &["content.opf", "metadata.opf"])
+            .and_then(|xml| parse_opf(&xml)),
+        _ => None,
+    })
+}
+
+/// ComicProvider's internal readers have a fixed registration order. The
+/// external ComicInfo reader is applicable to any Book, including EPUB/PDF.
+fn read_comic_metadata(path: &str) -> Option<BookMetadata> {
+    let zip_comic = extension_of(path) == "cbz";
+    if zip_comic
+        && let Some(comment) = read_archive_comment(path)
+        && let Some(book) = parse_comic_book_info(&comment)
+    {
+        return Some(book);
     }
-    if extension == "opf" {
-        return std::fs::read_to_string(path)
-            .ok()
-            .and_then(|xml| parse_opf(&xml));
+    if let Some(xml) = read_sidecar(path, &["xml"], &["ComicInfo.xml"])
+        && let Some(book) = parse_comic_info(&xml)
+    {
+        return Some(book);
     }
-    if COMIC_EXTENSIONS.contains(&extension.as_str()) {
-        // `ComicProvider` returns the first source with metadata, over the DI
-        // registration order: ComicBookInfoProvider, then External (sidecar),
-        // then Internal (in-archive). Reading the archive first would let a
-        // stale bundled ComicInfo.xml beat the comment the user rewrote.
-        // 1. The ComicBookInfo JSON in the archive comment.
-        if let Some(comment) = read_archive_comment(path)
-            && let Some(book) = parse_comic_book_info(&comment)
-        {
-            return Some(book);
-        }
-        // 2. A sidecar next to the file. C# `GetXmlFilePath` prefers
-        //    `<stem>.xml` and only then the fixed `ComicInfo.xml`.
-        if let Some(xml) = read_sidecar(path, &["xml"], &["ComicInfo.xml"])
-            && let Some(book) = parse_comic_info(&xml)
-        {
-            return Some(book);
-        }
-        // 3. ComicInfo.xml inside the archive.
-        if let Some(xml) = read_archive_entry_text(path, "comicinfo.xml")
-            && let Some(book) = parse_comic_info(&xml)
-        {
-            return Some(book);
-        }
-        // `OpfProvider` is an unfiltered `ILocalMetadataProvider<Book>`, so it
-        // runs for a comic too: a `.cbz` in a Calibre directory still resolves
-        // through the sidecar chain below.
+    if zip_comic {
+        read_archive_entry_text(path, "comicinfo.xml").and_then(|xml| parse_comic_info(&xml))
+    } else {
+        None
     }
-    // A plain book file may still have an `.opf` sidecar. C# `GetXmlFile`
-    // probes `<stem>.opf` (most specific), then `content.opf`, then Calibre's
-    // `metadata.opf` — a Calibre library is the whole reason the last one is
-    // there, and without it such a library reads nothing.
-    read_sidecar(path, &["opf"], &["content.opf", "metadata.opf"]).and_then(|xml| parse_opf(&xml))
 }
 
 /// Reads the first sidecar that exists beside `path`: one named after the
@@ -1225,6 +1244,87 @@ mod tests {
         }
         writer.finish().expect("finish archive");
         path.to_string_lossy().into_owned()
+    }
+
+    #[rstest::rstest]
+    #[case::sidecar(Some(vec!["Open Packaging Format", "EPUB Metadata"]), "Sidecar")]
+    #[case::embedded(Some(vec!["EPUB Metadata", "Open Packaging Format"]), "Embedded")]
+    #[case::comic(Some(vec!["Comic Provider", "EPUB Metadata"]), "Comic")]
+    #[case::exact_names(Some(vec!["open packaging format", "EPUB Metadata"]), "Embedded")]
+    #[case::empty_overrides_server(Some(vec![]), "Comic")]
+    #[case::absent_inherits_server(None, "Sidecar")]
+    fn configured_readers_choose_one_metadata_source(
+        #[case] order: Option<Vec<&str>>,
+        #[case] expected: &str,
+    ) {
+        use ferrofin_model::configuration::{LibraryOptions, MetadataOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_archive(&dir, "book.epub", &[
+            ("META-INF/container.xml", br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#),
+            ("content.opf", br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Embedded</dc:title></metadata></package>"#),
+        ], None);
+        std::fs::write(dir.path().join("metadata.opf"), r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/"><metadata><dc:title>Sidecar</dc:title><dc:description>Sidecar only</dc:description></metadata></package>"#).unwrap();
+        std::fs::write(
+            dir.path().join("ComicInfo.xml"),
+            "<ComicInfo><Title>Comic</Title></ComicInfo>",
+        )
+        .unwrap();
+        let library = LibraryOptions {
+            local_metadata_reader_order: order
+                .map(|names| names.into_iter().map(str::to_owned).collect()),
+            ..Default::default()
+        };
+        let global = MetadataOptions {
+            local_metadata_reader_order: vec!["Open Packaging Format".to_owned()],
+            ..Default::default()
+        };
+        let readers = book_metadata_readers(Some(&library), Some(&global));
+        let found = read_book_metadata_with_readers(&path, &readers).unwrap();
+        assert_eq!(found.name.as_deref(), Some(expected));
+        assert_eq!(
+            found.overview.as_deref(),
+            (expected == "Sidecar").then_some("Sidecar only"),
+            "later local providers must not fill fields"
+        );
+    }
+
+    #[test]
+    fn an_empty_preferred_reader_falls_through_and_disabled_readers_do_not_run() {
+        use ferrofin_model::configuration::LibraryOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.pdf");
+        std::fs::write(&path, "fixture").unwrap();
+        std::fs::write(
+            dir.path().join("ComicInfo.xml"),
+            "<ComicInfo><Title>Comic</Title></ComicInfo>",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("metadata.opf"),
+            "<package><metadata><title>Sidecar</title></metadata></package>",
+        )
+        .unwrap();
+        let mut library = LibraryOptions {
+            local_metadata_reader_order: Some(vec![
+                "EPUB Metadata".to_owned(),
+                "Comic Provider".to_owned(),
+            ]),
+            ..Default::default()
+        };
+        let read = |library: &LibraryOptions| {
+            read_book_metadata_with_readers(
+                path.to_str().unwrap(),
+                &book_metadata_readers(Some(library), None),
+            )
+            .and_then(|book| book.name)
+        };
+        assert_eq!(read(&library).as_deref(), Some("Comic"));
+        library.disabled_local_metadata_readers = vec!["comic provider".to_owned()];
+        assert_eq!(read(&library).as_deref(), Some("Sidecar"));
+        library
+            .disabled_local_metadata_readers
+            .push("Open Packaging Format".to_owned());
+        assert_eq!(read(&library), None);
     }
 
     #[test]

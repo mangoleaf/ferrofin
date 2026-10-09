@@ -144,20 +144,37 @@ async fn add_virtual_folder_without_body_uses_query_paths() {
 }
 
 #[tokio::test]
-async fn add_virtual_folder_empty_name_is_bad_request() {
-    let (state, _vf) = working_state();
-    let response = create_router(state)
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Library/VirtualFolders?name=%20%20")
-                .header("X-Emby-Token", TOKEN)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+async fn add_virtual_folder_rejects_names_outside_the_upstream_regex() {
+    let (state, vf) = working_state();
+    let router = create_router(state);
+    for name in [
+        "",
+        "%20%20",
+        "%20Leading",
+        "Trailing%20",
+        "Line%0ABreak",
+        "%C2%A0Name",
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/Library/VirtualFolders?name={name}"))
+                    .header("X-Emby-Token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+    assert!(
+        ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -691,4 +708,109 @@ async fn backend_failure_maps_to_500() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn current_web_library_options_survive_creation_and_update() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dashboard-settings.json")).unwrap();
+    let mut options = fixture["library"].clone();
+    let (state, _vf) = working_state();
+    let router = create_router(state);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders?name=Fixture&collectionType=movies")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"LibraryOptions": options}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let listed = folders(&router).await;
+    for (field, expected) in options.as_object().unwrap() {
+        // Web still sends this hardcoded false. Jellyfin v12 removed it from
+        // LibraryOptions; it is not an editable control or a stored setting.
+        if field == "EnableArchiveMediaFiles" {
+            continue;
+        }
+        assert_eq!(
+            &listed[0]["LibraryOptions"][field], expected,
+            "created library: {field}"
+        );
+    }
+    options["Enabled"] = serde_json::json!(false);
+    options["TypeOptions"][0]["SimilarItemProviders"] =
+        serde_json::json!(["Local Genre/Tag", "TheMovieDb"]);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders/LibraryOptions")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"Id": listed[0]["ItemId"], "LibraryOptions": options})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let updated = folders(&router).await;
+    for (field, expected) in options.as_object().unwrap() {
+        // Web still sends this hardcoded false. Jellyfin v12 removed it from
+        // LibraryOptions; it is not an editable control or a stored setting.
+        if field == "EnableArchiveMediaFiles" {
+            continue;
+        }
+        assert_eq!(
+            &updated[0]["LibraryOptions"][field], expected,
+            "updated library: {field}"
+        );
+    }
+}
+
+/// FakeLibrary panics if a scan is queued: a default/false rename must neither
+/// index newly added files nor replace metadata through a background refresh.
+#[tokio::test]
+async fn rename_without_refresh_does_not_queue_a_scan() {
+    for refresh in ["", "&refreshLibrary=false"] {
+        let (state, vf) = working_state();
+        ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+            &*vf,
+            "Old",
+            None,
+            &ferrofin_model::configuration::LibraryOptions::default(),
+        )
+        .await
+        .unwrap();
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/Library/VirtualFolders/Name?name=Old&newName=New{refresh}"
+                    ))
+                    .header("X-Emby-Token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let folders = ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+            .await
+            .unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].name.as_deref(), Some("New"));
+    }
 }

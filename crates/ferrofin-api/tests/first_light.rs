@@ -177,9 +177,9 @@ async fn public_system_info_is_served_without_auth() {
 }
 
 #[tokio::test]
-async fn system_info_requires_auth() {
-    // The fake auth service rejects the tokenless request, so the authenticated
-    // full-info route is `401` — proving the route exists and is guarded.
+async fn system_info_is_available_during_first_time_setup() {
+    // FirstTimeSetupOrIgnoreParentalControl allows anonymous system information
+    // while setup is incomplete, matching the upstream wizard flow.
     let router = create_router(state_with_system("Ferrofin"));
     let response = router
         .oneshot(
@@ -190,7 +190,7 @@ async fn system_info_requires_auth() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

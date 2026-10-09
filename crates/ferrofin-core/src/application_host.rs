@@ -23,7 +23,9 @@ use std::sync::{Arc, RwLock};
 use ferrofin_networking::NetworkManager;
 
 use async_trait::async_trait;
-use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::configuration::{
+    ConfigurationListener, ConfigurationUpdate, ServerConfigurationManager,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
 use ferrofin_traits::system::{ServerApplicationHost, ServerApplicationPaths};
@@ -90,7 +92,7 @@ pub struct FerrofinServerApplicationHost {
     bound_http_port: AtomicU16,
     machine_name: String,
     /// The last-published server name (`Configuration.ServerName`), or `None`
-    /// when blank — in which case the friendly name is the machine name.
+    /// when empty — in which case the friendly name is the machine name.
     server_name: std::sync::RwLock<Option<String>>,
     core_startup_completed: std::sync::atomic::AtomicBool,
 }
@@ -158,28 +160,44 @@ impl FerrofinServerApplicationHost {
     /// The [`friendly_name`](ServerApplicationHost::friendly_name) getter is
     /// synchronous, so the async `Configuration.ServerName` is snapshotted here
     /// (at startup and whenever the configuration changes) rather than fetched on
-    /// each call. A blank name clears the cache, so the friendly name falls back
+    /// each call. An empty name clears the cache, so the friendly name falls back
     /// to the machine name.
     ///
     /// # Errors
     ///
     /// Propagates any failure reading the current configuration.
     pub async fn refresh_server_name(&self) -> Result<(), ServiceError> {
-        let name = self
-            .configuration_manager
-            .configuration()
-            .await?
-            .server_name
-            .clone();
-        let published = if name.trim().is_empty() {
+        let configuration = self.configuration_manager.configuration().await?;
+        self.publish_server_name(&configuration.server_name);
+        Ok(())
+    }
+
+    /// Returns an observer keeping the advertised name in sync with saves.
+    ///
+    /// Register it before the initial refresh. It retains a weak host reference
+    /// so the host/configuration-manager pair can be dropped on restart.
+    #[must_use]
+    pub fn configuration_listener(self: &Arc<Self>) -> Arc<ConfigurationListener> {
+        let host = Arc::downgrade(self);
+        Arc::new(move |update| {
+            if let ConfigurationUpdate::Server(configuration) = update
+                && let Some(host) = host.upgrade()
+            {
+                host.publish_server_name(&configuration.server_name);
+            }
+        })
+    }
+
+    fn publish_server_name(&self, name: &str) {
+        // ApplicationHost.FriendlyName uses IsNullOrEmpty, not whitespace trim.
+        let published = if name.is_empty() {
             None
         } else {
-            Some(name)
+            Some(name.to_owned())
         };
         if let Ok(mut guard) = self.server_name.write() {
             *guard = published;
         }
-        Ok(())
     }
 
     /// Builds a URL from a host, an optional scheme, and an optional port,
@@ -634,5 +652,46 @@ mod tests {
         let expanded = h.expand_virtual_path(&virtual_path);
         assert_eq!(expanded, format!("{data}/subtitles/x.srt"));
         assert_eq!(h.reverse_virtual_path(&expanded), virtual_path);
+    }
+    #[tokio::test]
+    async fn saved_names_update_the_host_and_empty_names_restore_the_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = test_paths(directory.path());
+        let configuration = Arc::new(
+            FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+                .await
+                .unwrap(),
+        );
+        let host = Arc::new(FerrofinServerApplicationHost::new(
+            paths,
+            configuration.clone(),
+            HostNetworkInfo::default(),
+            "fixture-machine",
+        ));
+        configuration.add_configuration_listener(host.configuration_listener());
+        host.refresh_server_name().await.unwrap();
+        for (saved, expected) in [
+            ("Living Room", "Living Room"),
+            ("   ", "   "),
+            ("", "fixture-machine"),
+        ] {
+            let mut update = configuration.snapshot();
+            update.server_name = saved.into();
+            configuration.update_configuration(&update).await.unwrap();
+            assert_eq!(host.friendly_name(), expected);
+        }
+        configuration
+            .named_configuration_updated("branding", Arc::from(r#"{"ServerName":"unrelated"}"#));
+        assert_eq!(host.friendly_name(), "fixture-machine");
+        let weak = Arc::downgrade(&host);
+        drop(host);
+        assert!(
+            weak.upgrade().is_none(),
+            "the subscription must not retain a stopped host"
+        );
+        configuration
+            .update_configuration(&configuration.snapshot())
+            .await
+            .unwrap();
     }
 }

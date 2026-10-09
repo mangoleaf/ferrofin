@@ -944,7 +944,9 @@ impl FerrofinItemPersistenceService {
         // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
         // whole-value lookup first, unrated parts skipped, case-insensitive
         // tables), so the pass runs once more under a new key.
-        const META_KEY: &str = "rating_levels_v121";
+        // Earlier Ferrofin builds loaded only the US table. Re-run once with
+        // the complete upstream dataset so existing non-US rows are filtered.
+        const META_KEY: &str = "rating_levels_all_countries";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -1954,6 +1956,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         collection_type: &str,
     ) -> Result<(), ServiceError> {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "CollectionType".to_owned(),
+            serde_json::Value::String(collection_type.to_owned()),
+        );
+        self.merge_data_fields(item_id, &fields).await
+    }
+
+    async fn merge_data_fields(
+        &self,
+        item_id: Uuid,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ServiceError> {
         let id = guid_to_db(item_id);
         // Read on the pool first: the steady state (already recorded) must not
         // touch the single writer connection.
@@ -1966,26 +1981,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let Some(stored) = current else {
             return Ok(()); // no such row
         };
-        // Merge into whatever the blob already holds — `Data` also carries
-        // `PhysicalFolderIds`/`ViewType`/`DisplayParentId` on some rows, and
-        // replacing it wholesale would drop them.
+        // Merge into whatever the blob already holds, which replacing it
+        // wholesale would drop.
         let mut data = stored
             .as_deref()
             .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        if data
-            .get("CollectionType")
-            .and_then(serde_json::Value::as_str)
-            == Some(collection_type)
+        let Some(obj) = data.as_object_mut() else {
+            return Ok(());
+        };
+        if fields
+            .iter()
+            .all(|(key, value)| obj.get(key) == Some(value))
         {
             return Ok(());
         }
-        if let Some(obj) = data.as_object_mut() {
-            obj.insert(
-                "CollectionType".to_owned(),
-                serde_json::Value::String(collection_type.to_owned()),
-            );
+        for (key, value) in fields {
+            obj.insert(key.clone(), value.clone());
         }
         sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
             .bind(&id)
@@ -2983,6 +2996,66 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        index: usize,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::entities::ImageType;
+        if !matches!(
+            image.image_type,
+            ImageType::Backdrop | ImageType::Screenshot
+        ) {
+            return self.set_item_image(item_id, image).await;
+        }
+        let item = guid_to_db(item_id);
+        let kind = image_type_to_disc(image.image_type);
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2 ORDER BY rowid"#,
+        ).bind(&item).bind(kind).fetch_all(&mut *tx).await.map_err(db_err)?;
+        if let Some(id) = rows.get(index) {
+            // UPDATE preserves both identity and insertion order of this slot.
+            sqlx::query(
+                r#"UPDATE "BaseItemImageInfos" SET "Path" = ?2, "Width" = ?3,
+                "Height" = ?4, "Blurhash" = ?5, "DateModified" = ?6 WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(&item)
+            .bind(kind)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn delete_item_image(
         &self,
         item_id: Uuid,
@@ -3566,12 +3639,13 @@ pub struct SeriesKeyScope {
 /// Resolves a series' [`SeriesKeyScope`] from the configured libraries.
 ///
 /// C# `GetCollectionFolders(item)` walks up to the top-level physical folder
-/// (the series' parent directory) and returns every `CollectionFolder` whose
-/// `PhysicalLocations` contain it, compared `OrdinalIgnoreCase` — which is
-/// how one show folder shared by two libraries lands in both. A series with
-/// no path (or one under no library) falls back to its `TopParentId` library
-/// alone. The library options come from the `TopParentId` library, else the
-/// first location match.
+/// (the location the series sits in) and returns every `CollectionFolder`
+/// whose `PhysicalLocations` contain it, compared `OrdinalIgnoreCase` — which
+/// is how one show folder shared by two libraries lands in both. A series
+/// with no path (or one under no library) falls back to its `TopParentId`
+/// when that is a library (a row an older scan wrote; a location's folder is
+/// not one). The library options come from the owning library
+/// ([`owning_library`](ferrofin_model::entities_media::owning_library)).
 #[must_use]
 pub fn series_key_scope(
     folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
@@ -3586,31 +3660,21 @@ pub fn series_key_scope(
     let folder_id = |f: &ferrofin_model::entities_media::VirtualFolderInfo| {
         f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok())
     };
-    let top_parent = top_parent_id.and_then(|id| Uuid::parse_str(id).ok());
-    let parent_dir = path
-        .and_then(|p| std::path::Path::new(p).parent())
-        .and_then(std::path::Path::to_str)
-        .map(|d| d.trim_end_matches('/'));
-    let located: Vec<&ferrofin_model::entities_media::VirtualFolderInfo> = parent_dir
-        .map(|dir| {
-            folders
-                .iter()
-                .filter(|f| {
-                    f.locations
-                        .iter()
-                        .any(|loc| loc.trim_end_matches('/').eq_ignore_ascii_case(dir))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let owning = top_parent
-        .and_then(|tp| folders.iter().find(|f| folder_id(f) == Some(tp)))
-        .or_else(|| located.first().copied());
+    let owning = ferrofin_model::entities_media::owning_library(folders, top_parent_id, path);
     let options = owning.and_then(|f| f.library_options.as_ref());
-    let mut collection_folder_ids: Vec<Uuid> =
-        located.iter().filter_map(|f| folder_id(f)).collect();
+    let mut collection_folder_ids: Vec<Uuid> = path
+        .map(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(folder_id)
+        .collect();
     if collection_folder_ids.is_empty() {
-        collection_folder_ids.extend(top_parent);
+        // Only a library: a location's folder never names the key.
+        collection_folder_ids.extend(
+            top_parent_id
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|top| owning.and_then(folder_id) == Some(*top)),
+        );
     }
     let preferred_metadata_language = blank(own_language)
         .or_else(|| blank(options.and_then(|o| o.preferred_metadata_language.as_deref())))
@@ -4121,6 +4185,86 @@ mod tests {
     use super::{
         FerrofinItemPersistenceService, container_row, ensure_container, seed_container_data,
     };
+
+    #[tokio::test]
+    async fn indexed_images_preserve_insertion_order_and_replacement_identity() {
+        use chrono::Utc;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        store
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(item),
+                type_: "MediaBrowser.Controller.Entities.Movie".into(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        // Reverse GUID order exposes a reader that confuses UUID sorting with slots.
+        for (id, path) in [(2_u128, "first.png"), (1, "second.png")] {
+            sqlx::query(r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height") VALUES (?1,?2,2,?3,0,0)"#)
+                .bind(guid_to_db(Uuid::from_u128(id))).bind(guid_to_db(item)).bind(path)
+                .execute(db.writer()).await.unwrap();
+        }
+        let repo = crate::test_support::item_repository_over(db.clone());
+        assert_eq!(
+            repo.get_image_infos(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["first.png", "second.png"]
+        );
+        let image = |path: &str| ItemImageInfo {
+            path: path.into(),
+            image_type: ImageType::Backdrop,
+            date_modified: Utc::now(),
+            width: 3,
+            height: 4,
+            blur_hash: Some("hash".into()),
+        };
+        store
+            .set_item_image_at_index(item, &image("new-first.png"), 0)
+            .await
+            .unwrap();
+        store
+            .set_item_image_at_index(item, &image("third.png"), 2)
+            .await
+            .unwrap();
+        let images = repo.get_image_infos(item).await.unwrap();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["new-first.png", "second.png", "third.png"]
+        );
+        assert_eq!((images[0].width, images[0].height), (3, 4));
+        let first_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId"=?1 AND "Path"='new-first.png'"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(first_id, guid_to_db(Uuid::from_u128(2)));
+        repo.swap_item_images(item, ImageType::Backdrop, 0, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_image_infos(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["third.png", "second.png", "new-first.png"]
+        );
+    }
 
     #[tokio::test]
     async fn retention_delete_resolves_keys_across_chunks_and_existing_placeholders() {
@@ -7336,12 +7480,18 @@ mod tests {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let localization = crate::localization_manager::LocalizationManager::new("US");
-        let cases: [RatingCase; 5] = [
+        service
+            .mark_repair_done("rating_levels_v121")
+            .await
+            .unwrap();
+        let cases: [RatingCase; 7] = [
             (0x7A01, Some("12"), Some(12), None),
             (0x7A02, Some("TV-MA"), Some(17), Some(1)),
             (0x7A03, Some("Rated R"), Some(17), Some(0)),
             (0x7A04, Some("unknown-junk"), None, None),
             (0x7A05, None, None, None),
+            (0x7A06, Some("FSK-18"), Some(18), None),
+            (0x7A07, Some("CA:R"), Some(18), Some(1)),
         ];
         for (id, rating, _, _) in cases {
             let id = Uuid::from_u128(id);
@@ -7366,11 +7516,11 @@ mod tests {
             .await
             .expect("repair");
 
-        // Four rated rows plus every unrated one (upstream's blank-rating
+        // Six rated rows plus every unrated one (upstream's blank-rating
         // update matches the migration placeholder too).
         assert_eq!(
             updated,
-            4 + u64::try_from(unrated_rows).expect("count fits")
+            6 + u64::try_from(unrated_rows).expect("count fits")
         );
         for (id, rating, score, sub_score) in cases {
             let row = fetch_item(&db, Uuid::from_u128(id)).await;
@@ -7457,6 +7607,19 @@ mod tests {
             scope(c, Some("/elsewhere/Show"), None).collection_folder_ids,
             vec![c],
             "under no library: the TopParentId library"
+        );
+        // Below a sub-folder of the location: still that library's, as the
+        // walk up to the top-level folder finds it.
+        assert_eq!(
+            scope(a, Some("/media/anime/Shows/Show"), None).collection_folder_ids,
+            vec![c]
+        );
+        // A location's folder is the TopParentId of what it holds; it is no
+        // library, so it never stands in for one.
+        assert!(
+            scope(Uuid::from_u128(9), Some("/elsewhere/Show"), None)
+                .collection_folder_ids
+                .is_empty()
         );
     }
 

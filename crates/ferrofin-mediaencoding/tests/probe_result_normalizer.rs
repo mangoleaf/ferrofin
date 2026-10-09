@@ -663,3 +663,38 @@ fn get_media_info_music_success() {
     assert!(res.genres.iter().any(|g| g == "Dance"));
     assert!(res.genres.iter().any(|g| g == "Jazz"));
 }
+
+#[test]
+fn audio_probe_retains_unsplit_tags_with_format_precedence_and_no_wire_extension() {
+    let result: InternalMediaInfoResult = serde_json::from_value(serde_json::json!({
+        "streams":[{"index":0,"codec_type":"audio","codec_name":"flac", "tags":{
+            "ARTIST":"stream / artist", "ALBUMARTISTS":"Additional / Album", "GENRE":"Rock; Metal"
+        }}],
+        "format":{"format_name":"flac","tags":{
+            "ArTiSt":"Format / Artist", "ARTISTS":"Preferred; Artist", "ALBUMARTIST":"Album / Artist"
+        }}
+    })).unwrap();
+    let audio = normalizer().get_media_info(
+        result.clone(),
+        None,
+        true,
+        "/music/Track.flac",
+        MediaProtocol::File,
+    );
+    let raw = audio.raw_audio_tags.as_ref().unwrap();
+    assert_eq!(raw["artist"], "Format / Artist");
+    assert_eq!(raw["artists"], "Preferred; Artist");
+    assert_eq!(raw["albumartist"], "Album / Artist");
+    assert_eq!(raw["albumartists"], "Additional / Album");
+    assert_eq!(raw["genre"], "Rock; Metal");
+    assert!(!raw.contains_key("ARTIST"));
+    assert!(
+        serde_json::to_value(&audio)
+            .unwrap()
+            .get("RawAudioTags")
+            .is_none()
+    );
+    let video =
+        normalizer().get_media_info(result, None, false, "/video/File.mkv", MediaProtocol::File);
+    assert!(video.raw_audio_tags.is_none());
+}

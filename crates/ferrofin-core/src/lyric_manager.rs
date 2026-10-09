@@ -45,6 +45,7 @@
 //! registered the manager behaves like a server without a lyric plugin: search
 //! is empty, download misses.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -88,7 +89,7 @@ pub struct FerrofinLyricManager {
     /// downloaded lyrics always land under `{metadata}/library/{id2}/{idN}`,
     /// which is what makes an upload work over a read-only media mount. Absent
     /// → only the media folder can be written (unit-test default).
-    metadata_path: Option<PathBuf>,
+    metadata_path: Option<DirectoryPath>,
     /// The virtual-folder seam used to resolve the item's library options, i.e.
     /// `LibraryOptions.SaveLyricsWithMedia`. Absent → treated as `false`, the
     /// upstream default: never write into the media folder unasked.
@@ -128,7 +129,8 @@ impl FerrofinLyricManager {
 
     /// Registers the remote lyric providers searched/downloaded through.
     #[must_use]
-    pub fn with_providers(mut self, providers: Vec<Arc<dyn LyricProvider>>) -> Self {
+    pub fn with_providers(mut self, mut providers: Vec<Arc<dyn LyricProvider>>) -> Self {
+        providers.sort_by_key(|provider| provider.order());
         self.providers = providers;
         self
     }
@@ -137,7 +139,7 @@ impl FerrofinLyricManager {
     /// uploaded/downloaded lyrics are always written under — Jellyfin's
     /// `Audio.GetInternalMetadataPath()` target.
     #[must_use]
-    pub fn with_metadata_path(mut self, metadata_path: impl Into<PathBuf>) -> Self {
+    pub fn with_metadata_path(mut self, metadata_path: impl Into<DirectoryPath>) -> Self {
         self.metadata_path = Some(metadata_path.into());
         self
     }
@@ -182,31 +184,39 @@ impl FerrofinLyricManager {
         )
     }
 
-    /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns
-    /// `media_path` — the flag that decides whether the media folder is a save
-    /// target at all. Defaults to `false` (the upstream default) when no
-    /// virtual-folder seam is attached or the lookup fails.
-    async fn save_with_media(&self, media_path: &Path) -> bool {
+    /// `LibraryOptions.SaveLyricsWithMedia` for the library that owns the
+    /// item. Older collection-folder ids take precedence; adopted physical
+    /// parent ids use the innermost matching location, as the shared library
+    /// resolver does for metadata. Options are read afresh for every save.
+    async fn save_with_media(&self, item: &BaseItemEntity) -> bool {
         let Some(folders) = &self.virtual_folders else {
             return false;
         };
         let Ok(folders) = folders.get_virtual_folders().await else {
             return false;
         };
-        folders
-            .iter()
-            .find(|f| f.locations.iter().any(|loc| media_path.starts_with(loc)))
-            .and_then(|f| f.library_options.as_ref())
-            .is_some_and(|o| o.save_lyrics_with_media)
+        ferrofin_model::entities_media::owning_library(
+            &folders,
+            item.top_parent_id.as_deref(),
+            item.path.as_deref(),
+        )
+        .and_then(|f| f.library_options.as_ref())
+        .is_some_and(|o| o.save_lyrics_with_media)
     }
 
     /// The save-path list for a lyric, in `TrySaveLyric` order: the media folder
     /// only when the library opts in, then always the internal metadata folder.
     /// The file name is the media base name plus the lowercased lyric format.
-    async fn save_targets(&self, item_id: Uuid, media_path: &Path, format: &str) -> Vec<PathBuf> {
+    async fn save_targets(
+        &self,
+        item_id: Uuid,
+        item: &BaseItemEntity,
+        media_path: &Path,
+        format: &str,
+    ) -> Vec<PathBuf> {
         let name = sidecar_file_name(media_path, &normalise_format(format));
         let mut targets = Vec::new();
-        if self.save_with_media(media_path).await
+        if self.save_with_media(item).await
             && let Some(folder) = media_path.parent()
         {
             targets.push(folder.join(&name));
@@ -257,6 +267,47 @@ impl FerrofinLyricManager {
         }
         out.retain(|p| p.is_file());
         out
+    }
+
+    /// The request overload of LyricManager.SearchLyricsAsync: disabled names
+    /// compare without case, but provider order uses exact names and keeps
+    /// intrinsic/default order when two providers have the same configured rank.
+    async fn search_request(&self, request: &LyricSearchRequest) -> Vec<RemoteLyricInfoDto> {
+        let mut providers: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                !request
+                    .disabled_lyric_fetchers
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(provider.name()))
+            })
+            .collect();
+        providers.sort_by_key(|provider| {
+            request
+                .lyric_fetcher_order
+                .iter()
+                .position(|name| name == provider.name())
+                .unwrap_or(usize::MAX)
+        });
+        if request.search_all_providers {
+            return futures_util::future::join_all(
+                providers
+                    .iter()
+                    .map(|provider| self.search_provider(provider, request)),
+            )
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        }
+        for provider in providers {
+            let results = self.search_provider(provider, request).await;
+            if !results.is_empty() {
+                return results;
+            }
+        }
+        Vec::new()
     }
 
     /// Routes a namespaced lyric id (`"{provider_id}_{provider_local_id}"`,
@@ -437,16 +488,38 @@ impl LyricManager for FerrofinLyricManager {
         let Some(item) = self.item(item_id).await? else {
             return Ok(Vec::new());
         };
-        let request = search_request_for(&item);
-        // Query providers one at a time until one has results — the C#
-        // `SearchAllProviders == false` default path.
-        for provider in &self.providers {
-            let results = self.search_provider(provider, &request).await;
-            if !results.is_empty() {
-                return Ok(results);
+        // The Audio overload used by LyricsController intentionally leaves
+        // disabled/order switches at their defaults for a manual search.
+        Ok(self.search_request(&search_request_for(&item)).await)
+    }
+
+    async fn search_lyrics_automatically(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        let Some(item) = self.item(item_id).await? else {
+            return Ok(Vec::new());
+        };
+        let mut request = search_request_for(&item);
+        request.is_automated = true;
+        if let Some(folders) = &self.virtual_folders {
+            let folders = folders.get_virtual_folders().await?;
+            if let Some(options) = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.library_options.as_ref())
+            {
+                request
+                    .disabled_lyric_fetchers
+                    .clone_from(&options.disabled_lyric_fetchers);
+                request
+                    .lyric_fetcher_order
+                    .clone_from(&options.lyric_fetcher_order);
             }
         }
-        Ok(Vec::new())
+        Ok(self.search_request(&request).await)
     }
 
     async fn download_lyrics(
@@ -454,7 +527,16 @@ impl LyricManager for FerrofinLyricManager {
         item_id: Uuid,
         lyric_id: &str,
     ) -> Result<Option<LyricDto>, ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
+        let item = self
+            .item(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("item has no media path for lyrics"))?;
+        let Some(path) = item
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+        else {
             return Err(ServiceError::not_found("item has no media path for lyrics"));
         };
 
@@ -468,7 +550,9 @@ impl LyricManager for FerrofinLyricManager {
             return Ok(None);
         };
 
-        let targets = self.save_targets(item_id, &path, &response.format).await;
+        let targets = self
+            .save_targets(item_id, &item, path, &response.format)
+            .await;
         Self::try_save_to_files(&targets, &response.text)?;
         Ok(Some(dto))
     }
@@ -488,7 +572,16 @@ impl LyricManager for FerrofinLyricManager {
         format: &str,
         lyrics: &str,
     ) -> Result<Option<LyricDto>, ServiceError> {
-        let Some(path) = self.item_path(item_id).await? else {
+        let item = self
+            .item(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("item has no media path for lyrics"))?;
+        let Some(path) = item
+            .path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+        else {
             return Err(ServiceError::not_found("item has no media path for lyrics"));
         };
         // `SaveLyricAsync` parses FIRST and returns null — the controller's
@@ -496,7 +589,7 @@ impl LyricManager for FerrofinLyricManager {
         let Some(dto) = parse_by_format(format, lyrics) else {
             return Ok(None);
         };
-        let targets = self.save_targets(item_id, &path, format).await;
+        let targets = self.save_targets(item_id, &item, path, format).await;
         Self::try_save_to_files(&targets, lyrics)?;
         Ok(Some(dto))
     }
@@ -985,6 +1078,8 @@ mod tests {
     /// received and replays canned search/fetch results.
     struct FakeLyricProvider {
         name: &'static str,
+        order: i32,
+        search_barrier: Option<Arc<tokio::sync::Barrier>>,
         search_results: Vec<RemoteLyricInfo>,
         fetch_response: Option<LyricResponse>,
         fail_search: bool,
@@ -996,6 +1091,8 @@ mod tests {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
+                order: 0,
+                search_barrier: None,
                 search_results: Vec::new(),
                 fetch_response: None,
                 fail_search: false,
@@ -1011,11 +1108,18 @@ mod tests {
             self.name
         }
 
+        fn order(&self) -> i32 {
+            self.order
+        }
+
         async fn search(
             &self,
             request: &LyricSearchRequest,
         ) -> Result<Vec<RemoteLyricInfo>, ServiceError> {
             *self.last_request.lock().expect("lock") = Some(request.clone());
+            if let Some(barrier) = &self.search_barrier {
+                barrier.wait().await;
+            }
             if self.fail_search {
                 return Err(ServiceError::backend("provider down"));
             }
@@ -1207,6 +1311,213 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Several saved policies on one live manager.
+    async fn automated_lyrics_use_live_library_provider_selection_and_exact_order() {
+        let db = test_support::test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("music");
+        let inner = outer.join("nested");
+        std::fs::create_dir_all(&inner).unwrap();
+        let item_id = seed_audio(&db, &inner.join("song.flac").to_string_lossy()).await;
+        let mut audio = test_support::fetch_item(&db, item_id).await;
+        audio.top_parent_id = Some(guid_to_db(Uuid::new_v4()));
+        test_support::save_item(&db, &audio).await;
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        folders
+            .add_virtual_folder(
+                "A outer",
+                Some(CollectionTypeOptions::music),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: outer.to_string_lossy().into_owned(),
+                    }],
+                    disabled_lyric_fetchers: vec!["First".to_owned(), "Second".to_owned()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: inner.to_string_lossy().into_owned(),
+            }],
+            disabled_lyric_fetchers: vec!["fIrSt".to_owned()],
+            lyric_fetcher_order: vec!["Second".to_owned(), "First".to_owned()],
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder("Z inner", Some(CollectionTypeOptions::music), &options)
+            .await
+            .unwrap();
+        let mut first = FakeLyricProvider::new("First");
+        first.search_results = vec![synced_result("1", "[00:01.00]First")];
+        let first = Arc::new(first);
+        let mut second = FakeLyricProvider::new("Second");
+        second.search_results = vec![synced_result("2", "[00:01.00]Second")];
+        let second = Arc::new(second);
+        let mgr = manager_over(&db, vec![first.clone(), second.clone()])
+            .with_virtual_folders(folders.clone());
+        let expected = |name: &str| provider_id(name);
+        let automated = mgr.search_lyrics_automatically(item_id).await.unwrap();
+        assert!(automated[0].id.starts_with(&expected("Second")));
+        assert!(
+            first.last_request.lock().unwrap().is_none(),
+            "disabled provider ran"
+        );
+        let request = second.last_request.lock().unwrap().clone().unwrap();
+        assert!(request.is_automated);
+        assert_eq!(
+            request.disabled_lyric_fetchers,
+            options.disabled_lyric_fetchers
+        );
+        assert_eq!(request.lyric_fetcher_order, options.lyric_fetcher_order);
+        let manual = mgr.search_lyrics(item_id).await.unwrap();
+        assert!(
+            manual[0].id.starts_with(&expected("First")),
+            "manual search retains the Audio-overload defaults"
+        );
+        let request = first.last_request.lock().unwrap().clone().unwrap();
+        assert!(!request.is_automated);
+        assert!(request.disabled_lyric_fetchers.is_empty());
+        assert!(request.lyric_fetcher_order.is_empty());
+        options.disabled_lyric_fetchers.clear();
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        assert!(
+            mgr.search_lyrics_automatically(item_id).await.unwrap()[0]
+                .id
+                .starts_with(&expected("Second"))
+        );
+        options.lyric_fetcher_order = vec!["second".to_owned()];
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        assert!(
+            mgr.search_lyrics_automatically(item_id).await.unwrap()[0]
+                .id
+                .starts_with(&expected("First")),
+            "wrong case is unranked; registration order remains stable"
+        );
+        options.lyric_fetcher_order = vec!["Second".to_owned()];
+        options.disabled_lyric_fetchers = vec!["sEcOnD".to_owned()];
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        assert!(
+            mgr.search_lyrics_automatically(item_id).await.unwrap()[0]
+                .id
+                .starts_with(&expected("First"))
+        );
+        options.disabled_lyric_fetchers.push("FIRST".to_owned());
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        *first.last_request.lock().unwrap() = None;
+        *second.last_request.lock().unwrap() = None;
+        assert!(
+            mgr.search_lyrics_automatically(item_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(first.last_request.lock().unwrap().is_none());
+        assert!(second.last_request.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lyric_intrinsic_order_is_stable_and_exact_request_order_overrides_it() {
+        let mut late = FakeLyricProvider::new("Late");
+        late.order = 3;
+        late.search_results = vec![synced_result("1", "Late")];
+        let mut early = FakeLyricProvider::new("Early");
+        early.order = -2;
+        early.search_results = vec![synced_result("2", "Early")];
+        let mut tie = FakeLyricProvider::new("Tie");
+        tie.order = -2;
+        tie.search_results = vec![synced_result("3", "Tie")];
+        let manager = FerrofinLyricManager::new().with_providers(vec![
+            Arc::new(late),
+            Arc::new(early),
+            Arc::new(tie),
+        ]);
+        let mut request = LyricSearchRequest {
+            search_all_providers: true,
+            ..Default::default()
+        };
+        let ids = |rows: Vec<ferrofin_model::lyrics::RemoteLyricInfoDto>| {
+            rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+        };
+        let default = ids(manager.search_request(&request).await);
+        assert!(default[0].starts_with(&provider_id("Early")));
+        assert!(
+            default[1].starts_with(&provider_id("Tie")),
+            "equal intrinsic order retains registration order"
+        );
+        assert!(default[2].starts_with(&provider_id("Late")));
+        request.lyric_fetcher_order = vec!["Late".to_owned()];
+        let overridden = ids(manager.search_request(&request).await);
+        assert!(overridden[0].starts_with(&provider_id("Late")));
+        request.lyric_fetcher_order = vec!["late".to_owned()];
+        assert_eq!(
+            ids(manager.search_request(&request).await),
+            default,
+            "configured names are case-sensitive"
+        );
+    }
+
+    #[tokio::test]
+    async fn lyric_search_all_starts_providers_concurrently_and_returns_configured_order() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut first = FakeLyricProvider::new("First");
+        first.search_results = vec![synced_result("1", "First")];
+        first.search_barrier = Some(Arc::clone(&barrier));
+        let mut second = FakeLyricProvider::new("Second");
+        second.search_results = vec![synced_result("2", "Second")];
+        second.search_barrier = Some(barrier);
+        let manager =
+            FerrofinLyricManager::new().with_providers(vec![Arc::new(first), Arc::new(second)]);
+        let request = LyricSearchRequest {
+            search_all_providers: true,
+            lyric_fetcher_order: vec!["Second".to_owned()],
+            ..Default::default()
+        };
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.search_request(&request),
+        )
+        .await
+        .expect("all providers must reach the barrier concurrently");
+        assert!(results[0].id.starts_with(&provider_id("Second")));
+        assert!(results[1].id.starts_with(&provider_id("First")));
+    }
+
+    #[tokio::test]
+    async fn lyric_request_search_all_keeps_configured_provider_order() {
+        let mut first = FakeLyricProvider::new("First");
+        first.search_results = vec![synced_result("1", "[00:01.00]First")];
+        let mut second = FakeLyricProvider::new("Second");
+        second.search_results = vec![synced_result("2", "[00:01.00]Second")];
+        let mgr =
+            FerrofinLyricManager::new().with_providers(vec![Arc::new(first), Arc::new(second)]);
+        let request = LyricSearchRequest {
+            search_all_providers: true,
+            lyric_fetcher_order: vec!["Second".to_owned()],
+            ..Default::default()
+        };
+        let results = mgr.search_request(&request).await;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].id.starts_with(&provider_id("Second")));
+        assert!(results[1].id.starts_with(&provider_id("First")));
+    }
+
+    #[tokio::test]
     async fn search_skips_failing_provider_and_falls_through() {
         let db = test_support::test_db().await;
         let item_id = seed_audio(&db, "/nonexistent/song.mp3").await;
@@ -1244,8 +1555,12 @@ mod tests {
             text: "[00:17.12]I want to live".to_owned(),
         });
         let fake = Arc::new(fake);
+        let current = Arc::new(std::sync::RwLock::new(meta.path().to_path_buf()));
+        let source = Arc::clone(&current);
         let mgr = manager_over(&db, vec![Arc::clone(&fake) as Arc<dyn LyricProvider>])
-            .with_metadata_path(meta.path());
+            .with_metadata_path(ferrofin_util::directory_path::DirectoryPath::live(
+                move || source.read().unwrap().clone(),
+            ));
 
         let lyric_id = format!("{}_42_synced", provider_id("Fake"));
         let dto = mgr
@@ -1278,6 +1593,14 @@ mod tests {
         mgr.delete_lyrics(item_id).await.expect("delete");
         assert!(!saved.exists());
         assert!(mgr.get_lyrics(item_id).await.expect("get").is_none());
+        let replacement = tempfile::tempdir().expect("new metadata");
+        *current.write().unwrap() = replacement.path().to_path_buf();
+        mgr.download_lyrics(item_id, &lyric_id)
+            .await
+            .expect("download after change");
+        assert!(metadata_sidecar(replacement.path(), item_id, "song", "lrc").is_file());
+        assert!(!saved.exists());
+        assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
     }
 
     #[tokio::test]
@@ -1309,6 +1632,115 @@ mod tests {
             "[00:01.00]hi"
         );
         assert!(!metadata_sidecar(meta.path(), item_id, "song", "lrc").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One live off/on/root/fallback sequence.
+    async fn save_lyrics_uses_live_innermost_library_options_and_falls_back() {
+        let db = test_support::test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("music");
+        let inner = root.join("nested");
+        std::fs::create_dir_all(&inner).unwrap();
+        let media = inner.join("song.flac");
+        std::fs::write(&media, b"flac").unwrap();
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        // Adopted rows name a physical root, not either collection folder.
+        let mut audio = test_support::fetch_item(&db, item_id).await;
+        audio.top_parent_id = Some(guid_to_db(Uuid::new_v4()));
+        test_support::save_item(&db, &audio).await;
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        let mut options = LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: inner.to_string_lossy().into_owned(),
+            }],
+            ..Default::default()
+        };
+        folders
+            .add_virtual_folder(
+                "A outer",
+                Some(CollectionTypeOptions::music),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: root.to_string_lossy().into_owned(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        folders
+            .add_virtual_folder("Z inner", Some(CollectionTypeOptions::music), &options)
+            .await
+            .unwrap();
+        let current = Arc::new(std::sync::RwLock::new(tmp.path().join("metadata-a")));
+        let source = Arc::clone(&current);
+        let mgr = manager_over(&db, Vec::new())
+            .with_virtual_folders(folders.clone())
+            .with_metadata_path(ferrofin_util::directory_path::DirectoryPath::live(
+                move || source.read().unwrap().clone(),
+            ));
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]internal")
+            .await
+            .unwrap();
+        let first = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
+        assert!(first.is_file());
+        assert!(!media.with_extension("lrc").exists());
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = true;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]adjacent")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(media.with_extension("lrc")).unwrap(),
+            "[00:01.00]adjacent"
+        );
+        assert!(
+            !first.exists(),
+            "the writable media target ends the fallback list"
+        );
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = false;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        *current.write().unwrap() = tmp.path().join("metadata-b");
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]new root")
+            .await
+            .unwrap();
+        let replacement = metadata_sidecar(&current.read().unwrap(), item_id, "song", "lrc");
+        assert!(replacement.is_file());
+        assert!(!first.exists());
+        assert_eq!(
+            mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
+            "new root"
+        );
+        mgr.delete_lyrics(item_id).await.unwrap();
+        options.save_lyrics_with_media = true;
+        folders
+            .update_library_options("Z inner", &options)
+            .await
+            .unwrap();
+        // A directory reliably blocks the media filename even in elevated tests.
+        std::fs::create_dir(media.with_extension("lrc")).unwrap();
+        mgr.save_lyric(item_id, "lrc", "[00:01.00]fallback")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(replacement).unwrap(),
+            "[00:01.00]fallback"
+        );
+        assert_eq!(
+            mgr.get_lyrics(item_id).await.unwrap().unwrap().lyrics[0].text,
+            "fallback"
+        );
     }
 
     #[tokio::test]

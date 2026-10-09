@@ -1375,6 +1375,47 @@ mod tests {
         assert!(video.localized_default.is_none());
     }
 
+    /// Dashboard UICulture updates must affect an already-constructed service,
+    /// including its derived display titles, on the next media-stream read.
+    #[tokio::test]
+    async fn saved_ui_culture_updates_stream_labels_without_reconstructing_services() {
+        use ferrofin_traits::configuration::ServerConfigurationManager as _;
+        let root = tempfile::tempdir().unwrap();
+        let configuration = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(root.path()),
+            )
+            .await
+            .unwrap(),
+        );
+        let source = Arc::clone(&configuration);
+        let localization = crate::localization_manager::LocalizationManager::default()
+            .with_ui_culture_source(move || source.snapshot_shared().ui_culture.clone());
+        for (culture, expected) in [
+            ("de", "Standard"),
+            ("fr", "Par défaut"),
+            ("xx-YY", "Default"),
+            ("", "Default"),
+        ] {
+            let mut settings = configuration.snapshot();
+            settings.ui_culture = culture.into();
+            configuration.update_configuration(&settings).await.unwrap();
+            let mut audio = MediaStream {
+                stream_type: MediaStreamType::Audio,
+                codec: Some("aac".into()),
+                is_default: true,
+                ..Default::default()
+            };
+            localize_stream(&mut audio, &localization);
+            assert_eq!(audio.localized_default.as_deref(), Some(expected));
+            assert!(audio.display_title.as_ref().unwrap().contains(expected));
+            assert_eq!(
+                localization.get_localized_string_for("Default", "de"),
+                "Standard"
+            );
+        }
+    }
+
     /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
     struct StubEncoder;
 

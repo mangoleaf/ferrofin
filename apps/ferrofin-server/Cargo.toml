@@ -20,6 +20,7 @@ name = "ferrofin-server"
 path = "src/main.rs"
 
 [dependencies]
+ferrofin-util.workspace = true
 # every impl crate — this is the composition root that assembles them
 ferrofin-api.workspace = true
 ferrofin-core.workspace = true

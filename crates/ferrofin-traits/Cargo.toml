@@ -15,12 +15,13 @@ tokio = { workspace = true, features = ["sync"] }
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
+ferrofin-util.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

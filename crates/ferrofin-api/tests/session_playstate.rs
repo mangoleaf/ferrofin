@@ -129,6 +129,7 @@ fn authed_info() -> AuthorizationInfo {
         token: Some("token-abc".into()),
         is_api_key: false,
         user: Some(user_entity(USER_ID, "alice")),
+        user_policy: None,
         is_authenticated: true,
         remote_endpoint: Some("203.0.113.9".to_owned()),
     }
@@ -516,6 +517,14 @@ fn current_session_dto(with_guest: bool) -> SessionInfoDto {
 
 #[async_trait]
 impl SessionManager for RecordingSessions {
+    async fn assert_can_control(&self, controller: &str, target: &str) -> Result<(), ServiceError> {
+        assert_eq!(controller, SESSION_ID);
+        if target == "forbidden-session" {
+            return Err(ServiceError::Forbidden("control denied".to_owned()));
+        }
+        Ok(())
+    }
+
     async fn log_session_activity(
         &self,
         _app_name: &str,
@@ -1066,14 +1075,24 @@ async fn sync_play_returns_501_when_manager_unwired() {
 
 /// Authenticates as [`USER_ID`] with a chosen stored `SyncPlayAccess` value, so
 /// the policy table can be driven from a test.
-struct PolicyAuth(i32);
+struct PolicyAuth {
+    access: i32,
+    admin: bool,
+    api_key: bool,
+}
 
 impl PolicyAuth {
     fn info(&self) -> AuthorizationInfo {
         let mut user = user_entity(USER_ID, "alice");
-        user.sync_play_access = self.0;
+        user.sync_play_access = self.access;
         AuthorizationInfo {
-            user: Some(user),
+            user: (!self.api_key).then_some(user),
+            is_api_key: self.api_key,
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                is_administrator: self.admin,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
             ..authed_info()
         }
     }
@@ -1155,9 +1174,22 @@ impl SyncPlayManager for GatedSyncPlay {
 /// A state whose caller has `access` and whose SyncPlay membership is `active`,
 /// plus the "the manager was reached" flag.
 fn policy_state(access: i32, active: bool) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
+    policy_state_as(access, active, false, false)
+}
+
+fn policy_state_as(
+    access: i32,
+    active: bool,
+    admin: bool,
+    api_key: bool,
+) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
     let (sessions, user_data) = recording();
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let auth = Arc::new(PolicyAuth(access));
+    let auth = Arc::new(PolicyAuth {
+        access,
+        admin,
+        api_key,
+    });
     let state = AppState::new(
         Arc::new(OkLibrary),
         Arc::new(OkUsers),
@@ -1638,7 +1670,7 @@ async fn send_message_defaults_header() {
 }
 
 #[tokio::test]
-async fn add_and_remove_user_are_204() {
+async fn attaching_another_user_needs_admin_but_removal_only_needs_control() {
     let (sessions, user_data) = recording();
     let app = state(sessions.clone(), user_data);
     let (status, _) = send(
@@ -1648,11 +1680,8 @@ async fn add_and_remove_user_are_204() {
         Body::empty(),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(
-        sessions.calls.lock().unwrap().added_user,
-        Some((SESSION_ID.to_owned(), GUEST_ID))
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(sessions.calls.lock().unwrap().added_user, None);
 
     let (status, _) = send(
         app,
@@ -1965,4 +1994,84 @@ async fn get_sessions_controllable_by_self_as_non_admin_is_allowed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_mutations_refuse_an_uncontrollable_target_before_writing() {
+    let (sessions, user_data) = recording();
+    let app = state(sessions.clone(), user_data);
+    for (method, uri, body) in [
+        (
+            "POST",
+            format!("/Sessions/forbidden-session/User/{USER_ID}"),
+            "",
+        ),
+        (
+            "DELETE",
+            format!("/Sessions/forbidden-session/User/{GUEST_ID}"),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities?id=forbidden-session".to_owned(),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities/Full?id=forbidden-session".to_owned(),
+            "{}",
+        ),
+        (
+            "POST",
+            format!("/Sessions/Viewing?sessionId=forbidden-session&itemId={ITEM_ID}"),
+            "",
+        ),
+    ] {
+        let (status, _) = send(app.clone(), method, &uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let calls = sessions.calls.lock().unwrap();
+    assert!(
+        calls.added_user.is_none()
+            && calls.removed_user.is_none()
+            && calls.capabilities.is_none()
+            && calls.now_viewing.is_none()
+    );
+}
+
+#[tokio::test]
+async fn sync_play_inherits_admin_override_but_api_keys_have_no_user() {
+    for access in [CREATE_AND_JOIN, JOIN_ONLY, NO_SYNC_PLAY] {
+        for (method, uri, body, allowed) in [
+            (
+                "POST",
+                "/SyncPlay/New",
+                r#"{"GroupName":"g"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/SyncPlay/Join",
+                r#"{"GroupId":"00000000-0000-0000-0000-000000000001"}"#,
+                StatusCode::NO_CONTENT,
+            ),
+            ("GET", "/SyncPlay/List", "", StatusCode::OK),
+            ("POST", "/SyncPlay/Leave", "", StatusCode::NO_CONTENT),
+        ] {
+            for api_key in [false, true] {
+                let (app, reached) = policy_state_as(access, false, !api_key, api_key);
+                let (status, _) = send(app, method, uri, Body::from(body)).await;
+                assert_eq!(
+                    status,
+                    if api_key {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        allowed
+                    },
+                    "{access} {api_key} {uri}"
+                );
+                assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), !api_key);
+            }
+        }
+    }
 }

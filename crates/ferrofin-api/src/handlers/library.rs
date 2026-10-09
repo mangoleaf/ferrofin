@@ -480,12 +480,22 @@ async fn get_available_options(
     // `isNewLibrary` decides which providers report `DefaultEnabled` — it is the
     // add-library wizard's pre-ticked checkbox set, not a cosmetic hint. Ignoring
     // it pre-enabled every saver and remote fetcher on a new library.
-    Ok(Json(
-        state
-            .providers
-            .get_library_options_info(&item_types, query.is_new_library)
-            .await?,
-    ))
+    let mut options = state
+        .providers
+        .get_library_options_info(&item_types, query.is_new_library)
+        .await?;
+    options.media_segment_providers = state
+        .media_segments
+        .registered_segment_providers()
+        .into_iter()
+        .map(
+            |provider| ferrofin_model::configuration::LibraryOptionInfoDto {
+                name: Some(provider.name),
+                default_enabled: true,
+            },
+        )
+        .collect();
+    Ok(Json(options))
 }
 
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.

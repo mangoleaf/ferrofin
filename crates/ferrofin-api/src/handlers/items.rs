@@ -22,6 +22,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -198,6 +199,9 @@ struct ItemsQuery {
     /// Whether to search descendants recursively.
     #[serde(default)]
     recursive: Option<bool>,
+    /// Override collection collapsing for this folder browse.
+    #[serde(default)]
+    collapse_box_set_items: Option<bool>,
     /// A free-text search term.
     #[serde(default)]
     search_term: Option<String>,
@@ -303,6 +307,21 @@ struct ItemsQuery {
     /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
     #[serde(default)]
     is_locked: Option<bool>,
+    /// Restrict to items with (or without) an overview.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_overview: Option<bool>,
+    /// Restrict to items with (or without) an IMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_imdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tmdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TVDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tvdb_id: Option<bool>,
+    /// Restrict to items with (or without) a custom or official parental rating.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_parental_rating: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -334,6 +353,24 @@ struct ItemsQuery {
     /// Minimum critic rating.
     #[serde(default)]
     min_critic_rating: Option<f64>,
+    /// Inclusive lower premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    min_premiere_date: Option<DateTime<Utc>>,
+    /// Inclusive upper premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    max_premiere_date: Option<DateTime<Utc>>,
+    /// Return this item and its immediate neighbours after sorting, before paging.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    adjacent_to: Option<Uuid>,
     /// Restrict to items whose name starts with this value.
     #[serde(default)]
     name_starts_with: Option<String>,
@@ -390,6 +427,36 @@ impl ItemsQuery {
     }
 }
 
+/// ASP.NET's string binder converts empty/whitespace query strings to null.
+/// Keep nonblank values byte-for-byte: leading/trailing spaces are part of the
+/// requested name boundary, not text to trim. Internal typed queries bypass
+/// this HTTP binding and retain their own source filter semantics.
+fn http_name_boundary(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// ASP.NET nullable booleans accept case-insensitive, trimmed true/false and
+/// bind empty or whitespace-only values to null; malformed values fail with 400.
+fn http_presence_filter<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if raw.trim().eq_ignore_ascii_case("true") {
+        Ok(Some(true))
+    } else if raw.trim().eq_ignore_ascii_case("false") {
+        Ok(Some(false))
+    } else {
+        Err(serde::de::Error::custom(format!("invalid boolean {raw:?}")))
+    }
+}
+
 /// `GET /Items` — a paged, filtered, user-scoped library query.
 ///
 /// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
@@ -418,62 +485,7 @@ async fn get_items(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
-    // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
-    let mut internal = InternalItemsQuery {
-        user: Some(user),
-        start_index: query.start_index,
-        limit: query.limit,
-        recursive: query.recursive.unwrap_or(false),
-        search_term: query.search_term.clone(),
-        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
-        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
-        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
-        image_types: parse_csv_enums_lenient(query.image_types.as_deref()),
-        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
-        item_ids: parse_csv_uuids(query.ids.as_deref())?,
-        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
-        genres: parse_pipe_strings(query.genres.as_deref()),
-        tags: parse_pipe_strings(query.tags.as_deref()),
-        official_ratings: parse_pipe_strings(query.official_ratings.as_deref()),
-        years: parse_csv_i32(query.years.as_deref())?,
-        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
-        studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
-        person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
-        artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
-        exclude_artist_ids: parse_csv_uuids(query.exclude_artist_ids.as_deref())?,
-        album_artist_ids: parse_csv_uuids(query.album_artist_ids.as_deref())?,
-        contributing_artist_ids: parse_csv_uuids(query.contributing_artist_ids.as_deref())?,
-        album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
-        is_favorite: query.is_favorite,
-        is_played: query.is_played,
-        is_movie: query.is_movie,
-        is_series: query.is_series,
-        is_4k: query.is_4k,
-        is_hd: query.is_hd,
-        is_3d: query.is_3d,
-        is_locked: query.is_locked,
-        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
-        has_subtitles: query.has_subtitles,
-        has_trailer: query.has_trailer,
-        has_special_feature: query.has_special_feature,
-        has_theme_song: query.has_theme_song,
-        has_theme_video: query.has_theme_video,
-        index_number: query.index_number,
-        parent_index_number: query.parent_index_number,
-        min_community_rating: query.min_community_rating,
-        min_critic_rating: query.min_critic_rating,
-        name_starts_with: query.name_starts_with.clone(),
-        name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
-        name_less_than: query.name_less_than.clone(),
-        person: query.person.clone(),
-        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
-        ..InternalItemsQuery::default()
-    };
-    if let Some(parent) = query.parent_id {
-        internal.parent_id = parent;
-    }
+    let mut internal = items_query_options(&query, user)?;
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -481,6 +493,15 @@ async fn get_items(
     // parent really is the user root (an ABSENT `parentId` is, per
     // `LibraryManager.GetParentItem(null, userId)`).
     internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
+    // Explicit ids and text searches always return the requested titles.
+    if !internal.item_ids.is_empty()
+        || internal
+            .search_term
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        internal.collapse_box_set_items = Some(false);
+    }
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
     // no `isVirtualItem` query parameter to set it directly.
@@ -503,8 +524,20 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
-    check_parent_visibility(&state, &auth, &internal).await?;
+    let (parent_type, folder_policy) =
+        check_parent_visibility(&state, &auth, &mut internal).await?;
+    internal.parent_type = parent_type;
+    // Reuse the already-loaded parent for SourceType and UserView dispatch;
+    // only source consumers that call Folder's policy inherit global flags.
+    internal.apply_folder_display_options = folder_policy;
     redirect_container_browse(&state, &mut internal).await;
+    if !internal.item_ids.is_empty() {
+        // ItemsController clears query.Parent immediately before GetItems.
+        // Keep any linked-child ancestor constraint established by the
+        // BoxSet/Playlist redirect, but bypass parent/view child selection.
+        internal.set_parent(None);
+        internal.user_root_children = false;
+    }
 
     let result = state.library.query_items(&internal).await?;
     // The requested `Fields` plus the four image/user-data toggles (an
@@ -537,6 +570,76 @@ async fn get_items(
         Some(result.total_record_count),
         dtos,
     )))
+}
+
+/// Convert HTTP query fields once, retaining the resolved user for DTO projection.
+fn items_query_options(
+    query: &ItemsQuery,
+    user: UserEntity,
+) -> Result<InternalItemsQuery, ApiError> {
+    Ok(InternalItemsQuery {
+        user: Some(user),
+        parent_id: query.parent_id.unwrap_or_default(),
+        start_index: query.start_index,
+        limit: query.limit,
+        recursive: query.recursive.unwrap_or(false),
+        collapse_box_set_items: query.collapse_box_set_items,
+        apply_folder_display_options: true,
+        search_term: query.search_term.clone(),
+        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
+        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
+        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        image_types: parse_csv_enums_lenient(query.image_types.as_deref()),
+        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
+        item_ids: parse_csv_uuids(query.ids.as_deref())?,
+        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
+        genres: parse_pipe_strings(query.genres.as_deref()),
+        tags: parse_pipe_strings(query.tags.as_deref()),
+        official_ratings: parse_pipe_strings(query.official_ratings.as_deref()),
+        years: parse_csv_i32(query.years.as_deref())?,
+        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
+        studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
+        person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
+        artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
+        exclude_artist_ids: parse_csv_uuids(query.exclude_artist_ids.as_deref())?,
+        album_artist_ids: parse_csv_uuids(query.album_artist_ids.as_deref())?,
+        contributing_artist_ids: parse_csv_uuids(query.contributing_artist_ids.as_deref())?,
+        album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
+        is_favorite: query.is_favorite,
+        is_played: query.is_played,
+        is_movie: query.is_movie,
+        is_series: query.is_series,
+        is_4k: query.is_4k,
+        is_hd: query.is_hd,
+        is_3d: query.is_3d,
+        is_locked: query.is_locked,
+        has_overview: query.has_overview,
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        has_parental_rating: query.has_parental_rating,
+        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
+        has_subtitles: query.has_subtitles,
+        has_trailer: query.has_trailer,
+        has_special_feature: query.has_special_feature,
+        has_theme_song: query.has_theme_song,
+        has_theme_video: query.has_theme_video,
+        index_number: query.index_number,
+        parent_index_number: query.parent_index_number,
+        min_community_rating: query.min_community_rating,
+        min_critic_rating: query.min_critic_rating,
+        min_premiere_date: query.min_premiere_date,
+        max_premiere_date: query.max_premiere_date,
+        adjacent_to: query.adjacent_to,
+        name_starts_with: http_name_boundary(query.name_starts_with.as_deref()),
+        name_starts_with_or_greater: http_name_boundary(
+            query.name_starts_with_or_greater.as_deref(),
+        ),
+        name_less_than: http_name_boundary(query.name_less_than.as_deref()),
+        person: query.person.clone(),
+        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
+        ..InternalItemsQuery::default()
+    })
 }
 
 /// Query parameters for `GET /Items/{itemId}`.
@@ -1274,10 +1377,12 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
-    query: &InternalItemsQuery,
-) -> Result<(), ApiError> {
+    query: &mut InternalItemsQuery,
+) -> Result<(Option<BaseItemKind>, bool), ApiError> {
+    use ferrofin_model::data::CollectionType;
+
     if query.parent_id.is_nil() {
-        return Ok(());
+        return Ok((None, true));
     }
     let parent = state
         .library
@@ -1297,7 +1402,153 @@ async fn check_parent_visibility(
     {
         return Err(ApiError::Unauthorized("Unauthorized access".into()));
     }
-    Ok(())
+    let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        serde_json::from_value(serde_json::Value::String(
+            row.type_
+                .rsplit('.')
+                .next()
+                .unwrap_or(&row.type_)
+                .to_owned(),
+        ))
+        .ok()
+    };
+    // Folder.GetItems dispatches explicit IDs straight to the repository,
+    // before GetItemsInternal/UserViewBuilder can alter kinds or recursion.
+    // The controller still checks the actual parent before that dispatch,
+    // then clears query.Parent after the container redirect below.
+    if !query.item_ids.is_empty() {
+        return Ok((None, false));
+    }
+    let is_channel = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        row.type_.rsplit('.').next() == Some("Channel")
+            || row
+                .channel_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| !id.is_nil())
+    };
+    if kind != "UserView" {
+        return Ok((kind_from(&parent), !is_channel(&parent)));
+    }
+
+    // UserViewBuilder's movie/TV recursive base views call QueryRecursive;
+    // folders/direct repository/subnavigation builders do not auto-collapse.
+    // ViewType belongs to the parent row already read for access, including
+    // adopted numeric values; it is never a new client preference.
+    let (view_type, parent_id) = user_view_browse_context(&parent);
+    let direct = user_view_uses_direct_items(view_type);
+    if direct {
+        // These simple direct builders set their kind and recursive mode
+        // regardless of the request, then forward explicit collapse to SQL.
+        // Their automatic global grouping policy is intentionally absent.
+        if let Some(kind) = match view_type {
+            Some(CollectionType::Moviemovies) => Some(BaseItemKind::Movie),
+            Some(CollectionType::Tvshowseries) => Some(BaseItemKind::Series),
+            _ => None,
+        } {
+            query.include_item_types = vec![kind];
+            query.recursive = true;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&parent), false));
+    }
+    if matches!(
+        view_type,
+        Some(CollectionType::movies | CollectionType::tvshows)
+    ) {
+        if !query.recursive {
+            return Ok((kind_from(&parent), false));
+        }
+        query.folder_query_recursive = true;
+        if query.include_item_types.is_empty() {
+            query.include_item_types = if view_type == Some(CollectionType::movies) {
+                vec![BaseItemKind::Movie]
+            } else {
+                vec![
+                    BaseItemKind::Series,
+                    BaseItemKind::Season,
+                    BaseItemKind::Episode,
+                ]
+            };
+        }
+        if let Some(parent_id) = parent_id
+            && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+        {
+            return Ok((kind_from(&query_parent), true));
+        }
+        return Ok((kind_from(&parent), true));
+    }
+    // The default builder delegates to its actual display/relational parent
+    // when one exists; an unparented UserView uses GetResult over media-folder
+    // children and has no automatic grouping policy.
+    if let Some(parent_id) = parent_id
+        && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+    {
+        if !query.recursive || kind_from(&query_parent) == Some(BaseItemKind::Season) {
+            // A default view delegates to that Season's GetItemsInternal even
+            // for recursive requests; its aired selection needs the real row.
+            query.parent_id = parent_id;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&query_parent), !is_channel(&query_parent)));
+    }
+    Ok((kind_from(&parent), false))
+}
+
+/// Read UserView dispatch data from the parent already loaded for visibility.
+fn user_view_browse_context(
+    parent: &BaseItemEntity,
+) -> (Option<ferrofin_model::data::CollectionType>, Option<Uuid>) {
+    use ferrofin_model::data::CollectionType;
+    let data: serde_json::Value = parent
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_default();
+    let view_type = data
+        .get("ViewType")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CollectionType>(value).ok());
+    let parent_id = data
+        .get("DisplayParentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            parent
+                .parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        });
+    (view_type, parent_id)
+}
+
+/// These UserView builders use direct item selection rather than Folder policy.
+fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::CollectionType>) -> bool {
+    use ferrofin_model::data::CollectionType;
+    matches!(
+        view_type,
+        Some(
+            CollectionType::folders
+                | CollectionType::books
+                | CollectionType::Tvshowseries
+                | CollectionType::Tvgenres
+                | CollectionType::Tvgenre
+                | CollectionType::Tvlatest
+                | CollectionType::Tvnextup
+                | CollectionType::Tvresume
+                | CollectionType::Tvfavoriteseries
+                | CollectionType::Tvfavoriteepisodes
+                | CollectionType::Movielatest
+                | CollectionType::Movieresume
+                | CollectionType::Moviemovies
+                | CollectionType::Moviecollection
+                | CollectionType::Moviefavorites
+                | CollectionType::Moviegenres
+                | CollectionType::Moviegenre
+        )
+    )
 }
 
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
@@ -1534,18 +1785,11 @@ mod tests {
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
     const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
-        "adjacentTo",
         "albums",
         "artists",
         // 12.1.0 only.
         "audioLanguages",
-        "collapseBoxSetItems",
-        "hasImdbId",
         "hasOfficialRating",
-        "hasOverview",
-        "hasParentalRating",
-        "hasTmdbId",
-        "hasTvdbId",
         "isKids",
         "isMissing",
         "isNews",
@@ -1554,13 +1798,11 @@ mod tests {
         "isUnaired",
         "maxHeight",
         "maxOfficialRating",
-        "maxPremiereDate",
         "maxWidth",
         "minDateLastSaved",
         "minDateLastSavedForUser",
         "minHeight",
         "minOfficialRating",
-        "minPremiereDate",
         "minWidth",
         "personTypes",
         "seriesStatus",

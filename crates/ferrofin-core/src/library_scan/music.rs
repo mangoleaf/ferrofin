@@ -22,12 +22,13 @@
 //! Identify refreshes it with the request's options
 //! ([`refresh_by_name_artist`](LibraryScanner::refresh_by_name_artist)).
 
+use ferrofin_traits::providers::ItemUpdateType;
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::{ImageType, MetadataField};
+use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::RemoteSearchResult;
 use ferrofin_providers::library_options::fetcher_names;
 use ferrofin_providers::metadata_merge::{
@@ -41,9 +42,8 @@ use uuid::Uuid;
 
 use super::{
     FetcherPolicy, LibraryScanner, RefreshReach, RemoteAnswer, RemoteFold, RemoteImage, ScanCancel,
-    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, download_images,
-    download_remote_images, images_changed, item_values_of, preferred_language, provider_order,
-    search_result_ids, split_pipe,
+    ScanOutcome, ScanRun, Served, append_fanart, apply_album_child_metadata, images_changed,
+    item_values_of, preferred_language, provider_order, search_result_ids, split_pipe,
 };
 use crate::item_type_lookup;
 use crate::refresh_plan::{
@@ -157,6 +157,8 @@ pub(super) struct MusicFetch {
     audiodb_images: bool,
     /// fanart.tv's album/artist images.
     fanart_images: bool,
+    /// A named plugin image provider enabled for this item.
+    dynamic_images: bool,
     /// How the remote image providers fill the item's images.
     images: ImageFetch,
 }
@@ -169,7 +171,7 @@ impl MusicFetch {
 
     /// A remote image provider runs.
     fn any_images(self) -> bool {
-        self.audiodb_images || self.fanart_images
+        self.audiodb_images || self.fanart_images || self.dynamic_images
     }
 
     /// A remote provider of either kind runs.
@@ -506,6 +508,10 @@ impl LibraryScanner {
             fanart_images: images
                 && self.fanart.is_some()
                 && policy.image_enabled(name, fetcher_names::FANART),
+            dynamic_images: images
+                && self.dynamic_providers.iter().any(|provider| {
+                    provider.library_gated() && policy.image_enabled(name, provider.name())
+                }),
             images: plan.remote_images,
         }
     }
@@ -702,6 +708,8 @@ impl LibraryScanner {
             policy: FetcherPolicy {
                 options: None,
                 global: Some(&server),
+
+                ..Default::default()
             },
             aggregate: full_refresh(&plan, &request),
             owns_stamp: true,
@@ -756,6 +764,27 @@ impl LibraryScanner {
         let Some(stored) = items.retrieve_item(work.id).await? else {
             return Ok(Some(false));
         };
+        let lookup = super::ResolverGuesses {
+            own_language: super::own_language(stored.preferred_metadata_language.as_deref()),
+            own_country: super::own_language(stored.preferred_metadata_country_code.as_deref()),
+            ..Default::default()
+        };
+        let locale = self
+            .resolve_metadata_locale(
+                &stored,
+                &lookup,
+                work.policy,
+                &mut super::ArtworkCache::default(),
+            )
+            .await?;
+        let resolved_work = MusicRefresh {
+            policy: FetcherPolicy {
+                effective_locale: Some(&locale),
+                ..work.policy
+            },
+            ..*work
+        };
+        let work = &resolved_work;
         let options = work.request.options;
         let fetch = self.music_fetch(work.kind, &work.plan, work.policy, stored.is_locked);
         // The fields the user locked keep their stored values through the
@@ -904,7 +933,7 @@ impl LibraryScanner {
         settle_sort_name(&mut row);
 
         // The remote image providers, keyed by the ids just settled.
-        let (images, image_failures) = if fetch.any_images() {
+        let (mut images, mut image_failures) = if fetch.any_images() {
             let artist_key = answer
                 .artist_id
                 .clone()
@@ -912,6 +941,7 @@ impl LibraryScanner {
             let fetched = cancel
                 .unless_cancelled(count_request_failures(Box::pin(self.music_images(
                     work,
+                    &row,
                     fetch,
                     &ids,
                     artist_key,
@@ -925,6 +955,11 @@ impl LibraryScanner {
         } else {
             (None, 0)
         };
+
+        if let Some(images) = &mut images {
+            let previous = items.get_image_infos(work.id).await?;
+            image_failures += self.publish_media_artwork(&row, images, &previous).await;
+        }
 
         // `RefreshMetadata`'s tail: the stamp and `SaveInternal`.
         let row_changed = row != stored;
@@ -975,6 +1010,7 @@ impl LibraryScanner {
         if ids_changed {
             self.persistence.replace_provider_ids(work.id, &ids).await?;
         }
+        let saved_images = images.is_some();
         if let Some(images) = images {
             self.persistence.save_item_images(work.id, &images).await?;
         }
@@ -984,6 +1020,17 @@ impl LibraryScanner {
         self.persistence
             .save_items(std::slice::from_ref(&row))
             .await?;
+        self.save_metadata_sidecars(
+            work.id,
+            if answered || work.request.force_save || work.request.options.replace_all_metadata {
+                ItemUpdateType::MetadataDownload
+            } else if saved_images {
+                ItemUpdateType::ImageUpdate
+            } else {
+                ItemUpdateType::MetadataImport
+            },
+        )
+        .await;
         Ok(Some(true))
     }
 
@@ -1520,6 +1567,7 @@ impl LibraryScanner {
     async fn music_images(
         &self,
         work: &MusicRefresh<'_>,
+        row: &BaseItemEntity,
         fetch: MusicFetch,
         ids: &[(String, String)],
         artist_key: Option<String>,
@@ -1530,12 +1578,38 @@ impl LibraryScanner {
         else {
             return None;
         };
+        let stored = match items.get_image_infos(work.id).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(%err, item_id = %work.id, "failed to read the item's images");
+                return None;
+            }
+        };
+        let preferences = ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            work.policy.options,
+            work.kind.type_name(),
+        );
+        let needs = |name| {
+            fetch.images == ImageFetch::All
+                || ferrofin_providers::library_options::image_types_for_fetcher(
+                    work.kind.type_name(),
+                    name,
+                )
+                .iter()
+                .any(|kind| {
+                    stored
+                        .iter()
+                        .filter(|image| image.image_type == *kind)
+                        .count()
+                        < preferences.limit(*kind)
+                })
+        };
         let mut found: Vec<ferrofin_providers::TmdbImage> = Vec::new();
         let mut fanart_found = Vec::new();
         match work.kind {
             MusicKind::Album => {
                 let group = valid_id(ids, "MusicBrainzReleaseGroup");
-                if fetch.audiodb_images {
+                if fetch.audiodb_images && needs(fetcher_names::AUDIODB) {
                     match (audiodb, &self.audiodb, group.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(group)) => {
@@ -1547,17 +1621,22 @@ impl LibraryScanner {
                     }
                 }
                 if fetch.fanart_images
+                    && needs(fetcher_names::FANART)
                     && let (Some(fanart), Some(group), Some(artist)) = (
                         &self.fanart,
                         group.as_deref(),
                         valid_id(ids, "MusicBrainzAlbumArtist"),
                     )
                 {
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&work.policy.metadata_language());
                     fanart_found.extend(fanart.album_images(&artist, group).await);
                 }
             }
             MusicKind::Artist | MusicKind::ByNameArtist => {
-                if fetch.audiodb_images {
+                if fetch.audiodb_images && needs(fetcher_names::AUDIODB) {
                     match (audiodb, &self.audiodb, artist_key.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(id)) => {
@@ -1568,75 +1647,93 @@ impl LibraryScanner {
                     }
                 }
                 if fetch.fanart_images
+                    && needs(fetcher_names::FANART)
                     && let (Some(fanart), Some(id)) = (&self.fanart, artist_key.as_deref())
                 {
+                    let fanart = fanart
+                        .as_ref()
+                        .clone()
+                        .with_language(&work.policy.metadata_language());
                     fanart_found.extend(fanart.artist_images(id).await);
                 }
             }
         }
-        if found.is_empty() && fanart_found.is_empty() {
+        if found.is_empty() && fanart_found.is_empty() && !fetch.dynamic_images {
             return None;
         }
-        let stored = match items.get_image_infos(work.id).await {
-            Ok(stored) => stored,
-            Err(err) => {
-                tracing::warn!(%err, item_id = %work.id, "failed to read the item's images");
-                return None;
-            }
-        };
         let mut remote: Vec<RemoteImage> = Vec::new();
         append_fanart(&mut remote, found);
         let mut fanart_remote = Vec::new();
         append_fanart(&mut fanart_remote, fanart_found);
-        let remote = super::ordered_remote_images(
-            vec![
-                (fetcher_names::AUDIODB, remote),
-                (fetcher_names::FANART, fanart_remote),
-            ],
-            work.policy,
-            if matches!(work.kind, MusicKind::Album) {
-                "MusicAlbum"
-            } else {
-                "MusicArtist"
-            },
-        );
-        let key = work.id.to_string();
-        let dir = meta_root.join(&key);
-        let mut images = stored.clone();
-        match fetch.images {
-            ImageFetch::None => return None,
-            ImageFetch::MissingOnly => {
-                let present: HashSet<ImageType> = stored.iter().map(|i| i.image_type).collect();
-                let missing: Vec<RemoteImage> = remote
-                    .into_iter()
-                    .filter(|i| !present.contains(&i.image_type))
-                    .collect();
-                if missing.is_empty() {
-                    return None;
-                }
-                let mut downloaded = download_images(tmdb, &dir, &key, missing).await;
-                self.fill_image_metadata(&mut downloaded).await;
-                images.extend(downloaded);
-            }
-            ImageFetch::All => {
-                // "If image file is stored with media, don't replace that
-                // later" (`MergeImages` → `UpdateReplaceImages`).
-                let with_media: HashSet<ImageType> = stored
+        let kind = work.kind.type_name();
+        let mut sources = vec![
+            (fetcher_names::AUDIODB, Some(remote)),
+            (fetcher_names::FANART, Some(fanart_remote)),
+        ];
+        if fetch.dynamic_images {
+            sources.extend(
+                self.dynamic_providers
                     .iter()
-                    .filter(|i| !std::path::Path::new(&i.path).starts_with(meta_root))
-                    .map(|i| i.image_type)
-                    .collect();
-                let mut downloaded =
-                    download_remote_images(tmdb, &dir, &key, remote, Some(&with_media)).await;
+                    .filter(|p| p.library_gated() && work.policy.image_enabled(kind, p.name()))
+                    .map(|p| (p.name(), None)),
+            );
+        }
+        sources.sort_by_key(|(name, _)| work.policy.image_order(kind, name));
+        let key = work.id.to_string();
+        let meta_root = meta_root.resolve();
+        let dir = meta_root.join(&key);
+        let mut images: Vec<_> = stored
+            .iter()
+            .filter(|image| {
+                fetch.images != ImageFetch::All
+                    || !std::path::Path::new(&image.path).starts_with(&meta_root)
+            })
+            .cloned()
+            .collect();
+        if fetch.images == ImageFetch::None {
+            return None;
+        }
+        let preferences = ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
+            work.policy.options,
+            kind,
+        );
+        for (name, candidates) in sources {
+            if let Some(candidates) = candidates {
+                let mut downloaded = super::artwork::acquire_images(
+                    tmdb,
+                    &dir,
+                    candidates,
+                    preferences,
+                    &images,
+                    fetch.images == ImageFetch::All,
+                )
+                .await;
                 self.fill_image_metadata(&mut downloaded).await;
-                let replaced: HashSet<ImageType> =
-                    downloaded.iter().map(|i| i.image_type).collect();
-                images.retain(|i| {
-                    with_media.contains(&i.image_type) || !replaced.contains(&i.image_type)
-                });
                 images.extend(downloaded);
+            } else {
+                self.apply_dynamic_images(
+                    row,
+                    &mut images,
+                    FetcherPolicy {
+                        only_image_provider: Some(name),
+                        replace_images: fetch.images == ImageFetch::All,
+                        ..work.policy
+                    },
+                )
+                .await;
             }
         }
+        if fetch.images == ImageFetch::All {
+            super::artwork::prune_old_backdrops(&dir, &images);
+            let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
+            images.extend(
+                stored
+                    .iter()
+                    .filter(|image| !acquired.contains(&image.image_type))
+                    .cloned(),
+            );
+        }
+        self.fill_image_metadata(&mut images).await;
         images_changed(&images, Some(&stored)).then_some(images)
     }
 }
@@ -1854,6 +1951,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&audiodb_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &[]),
@@ -1867,6 +1966,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&musicbrainz_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, Some(&chosen(AUDIODB)), &[]),
@@ -1903,6 +2004,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&plugin_first),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &named),
@@ -1916,15 +2019,17 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&between),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &named),
             [
                 MusicSource::MusicBrainz,
-                MusicSource::Dynamic(0),
-                MusicSource::AudioDb
+                MusicSource::AudioDb,
+                MusicSource::Dynamic(0)
             ],
-            "the saved order names fetchers case-insensitively"
+            "a differently cased order entry is unranked, but still enabled"
         );
         // No saved order: MusicBrainz (0) and TheAudioDB (1) declare an
         // `IHasOrder` below the plugin's 50.
@@ -1942,6 +2047,8 @@ mod tests {
         let policy = FetcherPolicy {
             options: Some(&names_it),
             global: None,
+
+            ..Default::default()
         };
         assert_eq!(
             music_sources(policy, MusicKind::Album, None, &unnamed),

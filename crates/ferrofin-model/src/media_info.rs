@@ -311,6 +311,12 @@ pub struct MediaInfo {
     #[serde(flatten)]
     pub media_source: MediaSourceInfo,
 
+    /// Unsplit, lowercased-key embedded audio tags from the encoder. Kept
+    /// internally so the audio prober can apply live library options after
+    /// probing; this is never part of the HTTP DTO or its schema.
+    #[serde(skip)]
+    pub raw_audio_tags: Option<HashMap<String, String>>,
+
     /// Gets or sets the chapters.
     pub chapters: Vec<ChapterInfo>,
 
@@ -549,5 +555,21 @@ mod tests {
         assert!(json.get("Protocol").is_some());
         let back: MediaInfo = serde_json::from_value(json).unwrap();
         assert_eq!(info, back);
+    }
+    #[test]
+    fn raw_audio_tags_remain_internal_and_cannot_be_supplied_through_json() {
+        let info = MediaInfo {
+            raw_audio_tags: Some(HashMap::from([(
+                "artist".to_owned(),
+                "unsplit / artist".to_owned(),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(info.clone().raw_audio_tags, info.raw_audio_tags);
+        let mut json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("RawAudioTags").is_none());
+        json["RawAudioTags"] = serde_json::json!({"artist":"untrusted"});
+        let decoded: MediaInfo = serde_json::from_value(json).unwrap();
+        assert!(decoded.raw_audio_tags.is_none());
     }
 }

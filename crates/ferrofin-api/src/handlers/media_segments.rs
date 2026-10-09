@@ -4,9 +4,8 @@
 //! - `GET /MediaSegments/{itemId}` — the intro/outro/recap/commercial/preview
 //!   segments stored for an item, optionally filtered by type.
 //!
-//! The plugin-owned `SegmentEditor` routes (`/MediaSegmentsApi/*`, tagged
-//! `SegmentEditor` in the contract) belong to a dynamic plugin host and stay on
-//! the `501` stub.
+//! The plugin-owned `SegmentEditor` routes (`/MediaSegmentsApi/*`) are implemented
+//! by the Intro Skipper handlers and retain their management view of stored rows.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -44,8 +43,8 @@ fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
 /// Port of `MediaSegmentsController.GetItemSegments`: resolves the item (`404`
 /// when absent), then returns its stored segments narrowed to the requested
 /// [`MediaSegmentType`]s (all types when the filter is empty), wrapped in a
-/// [`QueryResult`]. The C# per-library provider filtering is a documented
-/// deferral in the manager (all stored segments are returned).
+/// [`QueryResult`]. Rows are limited to registered providers enabled on the
+/// owning library, matching Jellyfin's default provider filter.
 #[utoipa::path(
     get,
     path = "/MediaSegments/{itemId}",
@@ -84,7 +83,7 @@ async fn get_item_segments(
 
     let segments = state
         .media_segments
-        .get_segments(item_id, type_filter, false)
+        .get_segments(item_id, type_filter, true)
         .await?;
     let count = i32::try_from(segments.len()).unwrap_or(i32::MAX);
     Ok(Json(QueryResult::new(Some(0), Some(count), segments)))
@@ -118,7 +117,7 @@ async fn erase_provider_segments(
     };
     state
         .media_segments
-        .delete_all_provider_segments(&provider_id, type_filter)
+        .delete_all_producer_segments(&provider_id, type_filter)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -80,6 +80,8 @@ pub struct HostState {
     /// The manager handles behind `query-items`/`write-media-segments`,
     /// installed by the composition root after loading (empty during load).
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
+    /// True when this guest call attempted a write suppressed by live segment policy.
+    pub segment_policy_skipped: bool,
     /// The empty WASI context (see the struct docs).
     pub wasi: wasmtime_wasi::WasiCtx,
     /// The resource table WASI's generated bindings require.
@@ -324,6 +326,17 @@ impl host::Host for HostState {
         // Each plugin writes under its own provider id, so replacement can
         // never touch another provider's (or a user's) segments.
         let provider_id = format!("wasm:{}", self.plugin_id);
-        crate::capabilities::write_media_segments(cx, &provider_id, &item_id, &segments)
+        crate::capabilities::write_media_segments_from_plugin(
+            cx,
+            &self.plugin_name,
+            &provider_id,
+            self.state_path.as_deref(),
+            &item_id,
+            &segments,
+        )
+        .map(|outcome| {
+            self.segment_policy_skipped |=
+                outcome == crate::capabilities::SegmentWriteOutcome::PolicySkipped;
+        })
     }
 }

@@ -53,7 +53,7 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::user_uuid;
@@ -130,7 +130,7 @@ struct ForgotPasswordPinDto {
 /// Filename prefix for a pending password-reset record under the data dir
 /// (`passwordreset-<userId>.json`). Port of C#
 /// `DefaultPasswordResetProvider._passwordResetFileBase`.
-const PASSWORD_RESET_PREFIX: &str = "passwordreset-";
+const PASSWORD_RESET_PREFIX: &str = "passwordreset";
 
 /// How long an issued forgot-password pin stays valid. Port of C#
 /// `DefaultPasswordResetProvider` (30 minutes).
@@ -139,7 +139,7 @@ const PIN_TTL_MINUTES: i64 = 30;
 /// The on-disk record of an in-progress forgot-password reset.
 ///
 /// Port of C# `DefaultPasswordResetProvider.SerializablePasswordReset`, written
-/// to `{data}/passwordreset-<userId>.json` when a pin is issued and consumed by
+/// to the program-data directory when a pin is issued and consumed by
 /// the `/Pin` redemption.
 #[derive(Debug, serde::Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -165,87 +165,81 @@ fn generate_reset_pin() -> String {
     format!("{:02X}-{:02X}-{:02X}-{:02X}", b[0], b[1], b[2], b[3])
 }
 
-/// Normalizes a pin for comparison: strip the grouping dashes, uppercase.
+/// Comparison ignores grouping dashes, but preserves case (C# Ordinal).
 fn normalize_pin(pin: &str) -> String {
-    pin.replace('-', "").to_ascii_uppercase()
+    pin.replace('-', "")
 }
 
-/// Issues a reset pin for a user, writing the record to
-/// `{data_dir}/passwordreset-<user_id>.json`. Returns the `PinCode` result to
-/// send the client and the plaintext pin (for the server log). Port of
-/// `DefaultPasswordResetProvider.StartForgotPassword`.
+/// Every username receives the same response shape. Only a known local user
+/// gets a recovery file; the path uses the entered name's invariant-uppercase
+/// UTF-16 MD5, matching Jellyfin's built-in provider.
 fn issue_reset_pin(
     data_dir: &std::path::Path,
-    user_id: &str,
-    user_name: &str,
-) -> Result<(ForgotPasswordResult, String), ServiceError> {
-    let pin = generate_reset_pin();
+    entered_username: &str,
+    user_name: Option<&str>,
+) -> Result<ForgotPasswordResult, ServiceError> {
     let expiration = chrono::Utc::now() + chrono::Duration::minutes(PIN_TTL_MINUTES);
-    let pin_file = data_dir.join(format!("{PASSWORD_RESET_PREFIX}{user_id}.json"));
-    let record = SerializablePasswordReset {
-        expiration_date: expiration,
-        pin: pin.clone(),
-        pin_file: pin_file.to_string_lossy().into_owned(),
-        user_name: user_name.to_owned(),
-    };
-    std::fs::create_dir_all(data_dir)
-        .map_err(|e| ServiceError::backend(format!("create data dir: {e}")))?;
-    let bytes = serde_json::to_vec(&record)
-        .map_err(|e| ServiceError::backend(format!("serialize reset record: {e}")))?;
-    std::fs::write(&pin_file, bytes)
-        .map_err(|e| ServiceError::backend(format!("write reset record: {e}")))?;
-    Ok((
-        ForgotPasswordResult {
-            action: ForgotPasswordAction::PinCode,
-            pin_file: Some(record.pin_file),
-            pin_expiration_date: Some(expiration),
-        },
-        pin,
-    ))
+    let hash = ferrofin_common::extensions::get_md5(
+        &ferrofin_util::string_extensions::upper_invariant(entered_username),
+    );
+    let path = data_dir.join(format!("{PASSWORD_RESET_PREFIX}{}.json", hash.simple()));
+    let pin_file = path.to_string_lossy().into_owned();
+    if let Some(user_name) = user_name {
+        let record = SerializablePasswordReset {
+            expiration_date: expiration,
+            pin: generate_reset_pin(),
+            pin_file: pin_file.clone(),
+            user_name: user_name.to_owned(),
+        };
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| ServiceError::backend(format!("create reset directory: {e}")))?;
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|e| ServiceError::backend(format!("serialize reset record: {e}")))?;
+        ferrofin_util::file_helper::atomic_write(&path, &bytes)
+            .map_err(|e| ServiceError::backend(format!("write reset record: {e}")))?;
+    }
+    Ok(ForgotPasswordResult {
+        action: ForgotPasswordAction::PinCode,
+        pin_file: Some(pin_file),
+        pin_expiration_date: Some(expiration),
+    })
 }
 
-/// Scans `data_dir` for pending reset records: deletes expired ones, and for
-/// each whose pin matches `entered_pin` (dashes/case ignored) returns its
-/// `(user_name, pin)` and deletes the record. An empty pin matches nothing. Port
-/// of `DefaultPasswordResetProvider.RedeemPasswordResetPin`.
+/// Find matches and purge expired records. Matching files remain until their
+/// password update succeeds, so a failed update does not consume recovery.
 fn redeem_reset_pins(
     data_dir: &std::path::Path,
     entered_pin: &str,
-) -> Result<Vec<(String, String)>, ServiceError> {
+) -> Result<Vec<(String, std::path::PathBuf)>, ServiceError> {
     let entered = normalize_pin(entered_pin);
     let mut matches = Vec::new();
-
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        // No data dir yet ⇒ no pending resets.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(matches),
-        Err(e) => return Err(ServiceError::backend(format!("read data dir: {e}"))),
+        Err(e) => return Err(ServiceError::backend(format!("read reset directory: {e}"))),
     };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name_is_reset = path
+    for entry in entries {
+        let path = entry
+            .map_err(|e| ServiceError::backend(format!("read reset entry: {e}")))?
+            .path();
+        if !path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(PASSWORD_RESET_PREFIX));
-        let is_json = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
-        if !name_is_reset || !is_json {
+            .is_some_and(|n| n.starts_with(PASSWORD_RESET_PREFIX))
+            || !path.is_file()
+        {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_slice::<SerializablePasswordReset>(&bytes) else {
-            continue;
-        };
-
+        let bytes = std::fs::read(&path)
+            .map_err(|e| ServiceError::backend(format!("read reset record: {e}")))?;
+        let record = serde_json::from_slice::<Option<SerializablePasswordReset>>(&bytes)
+            .map_err(|e| ServiceError::backend(format!("parse reset record: {e}")))?
+            .ok_or_else(|| ServiceError::not_found("invalid reset record"))?;
         if record.expiration_date < chrono::Utc::now() {
-            let _ = std::fs::remove_file(&path);
-        } else if !entered.is_empty() && normalize_pin(&record.pin) == entered {
-            matches.push((record.user_name, record.pin));
-            let _ = std::fs::remove_file(&path);
+            std::fs::remove_file(&path)
+                .map_err(|e| ServiceError::backend(format!("remove expired reset: {e}")))?;
+        } else if normalize_pin(&record.pin) == entered {
+            matches.push((record.user_name, path));
         }
     }
     Ok(matches)
@@ -317,18 +311,23 @@ async fn assert_can_update_user(
     auth: &AuthorizationInfo,
     target: &UserEntity,
 ) -> Result<(), ApiError> {
-    let caller_id = auth.user_id();
-    // `auth.user_id()` is the nil GUID for a caller with no user (an API key),
-    // and C# compares against `User.Id`, a real `Guid` that is never empty. So
-    // the self-update branch requires a real caller *and* a target whose stored
-    // id parses — degrading an unparseable target id to nil would make it
-    // compare equal to a userless caller and grant the update.
-    if !caller_id.is_nil() && Uuid::parse_str(&target.id).is_ok_and(|id| id == caller_id) {
+    let target_id = Uuid::parse_str(&target.id).ok().filter(|id| !id.is_nil());
+    if target_id.is_none() {
+        return Err(ApiError::Forbidden("user update not allowed".to_owned()));
+    }
+    // API keys carry the administrator role upstream. Validate the target
+    // first so a corrupt stored id never becomes the anonymous/nil caller.
+    if auth.is_api_key {
         return Ok(());
     }
     if let Some(caller) = &auth.user
         && is_administrator(state, caller).await?
     {
+        return Ok(());
+    }
+    // All three account-update actions pass restrictUserPreferences=true to
+    // RequestHelpers.AssertCanUpdateUser, including password changes/resets.
+    if target_id == Some(auth.user_id()) && target.enable_user_preference_access {
         return Ok(());
     }
     Err(ApiError::Forbidden("user update not allowed".to_owned()))
@@ -504,24 +503,46 @@ async fn get_users(
     RequireAuth(_auth): RequireAuth,
     Query(query): Query<GetUsersQuery>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled).await?;
+    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
     Ok(Json(dtos))
 }
 
 /// `GET /Users/Public` — the login-screen-visible users.
 ///
 /// Port of `UserController.GetPublicUsers`: only non-hidden, non-disabled users
-/// are returned, regardless of the startup-wizard state (Jellyfin excludes hidden
-/// and disabled users in both wizard states). The device/network narrowing the C#
-/// applies needs a network manager (deferred at this layer), so it is not applied.
+/// are returned in both wizard states. After setup, remote callers only see
+/// accounts that allow remote access, using the shared live network policy.
+/// Authenticated callers also filter by their device after setup.
 #[utoipa::path(
     get,
     path = "/Users/Public",
     responses((status = 200, description = "Public users returned", body = [UserDto])),
     tag = "ferrofin"
 )]
-async fn get_public_users(State(state): State<AppState>) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, Some(false), Some(false)).await?;
+async fn get_public_users(
+    State(state): State<AppState>,
+    identity: Result<AuthenticatedIdentity, ApiError>,
+    parts: Parts,
+) -> Result<Json<Vec<UserDto>>, ApiError> {
+    let setup = state
+        .config
+        .configuration()
+        .await?
+        .is_startup_wizard_completed;
+    // C# reads the authenticated claim, not an anonymous DeviceId header.
+    let auth = identity.ok().map(|identity| identity.0);
+    let device_id = auth
+        .as_ref()
+        .and_then(|auth| auth.device_id.as_deref())
+        .filter(|id| setup && !id.trim().is_empty());
+    let mut dtos = filtered_user_dtos(&state, Some(false), Some(false), device_id).await?;
+    if setup && !state.is_in_local_network(state.client_address(&parts)) {
+        dtos.retain(|dto| {
+            dto.policy
+                .as_ref()
+                .is_some_and(|policy| policy.enable_remote_access)
+        });
+    }
     Ok(Json(dtos))
 }
 
@@ -531,6 +552,7 @@ async fn filtered_user_dtos(
     state: &AppState,
     is_hidden: Option<bool>,
     is_disabled: Option<bool>,
+    device_id: Option<&str>,
 ) -> Result<Vec<UserDto>, ApiError> {
     let mut users = state.users.get_users().await?;
     users.sort_by(|a, b| a.username.cmp(&b.username));
@@ -546,6 +568,11 @@ async fn filtered_user_dtos(
         }
         if let Some(want) = is_disabled
             && policy.is_some_and(|p| p.is_disabled) != want
+        {
+            continue;
+        }
+        if let Some(device_id) = device_id
+            && !state.devices.can_access_device(user, device_id).await?
         {
             continue;
         }
@@ -569,7 +596,7 @@ async fn filtered_user_dtos(
 )]
 async fn get_user_by_id(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuthIgnoringSchedule(_auth): RequireAuthIgnoringSchedule,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;
@@ -720,12 +747,44 @@ async fn update_user(
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
+        update_device_access(&state, &user).await?;
     }
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
     notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The pinned `DeviceAccessHost` observes `OnUserUpdated`, emitted by rename.
+/// Policy/configuration saves do not emit that event in the pinned source.
+async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
+    if user_policy(state, user)
+        .await?
+        .is_some_and(|p| p.enable_all_devices)
+    {
+        return Ok(());
+    }
+    let devices = state
+        .devices
+        .get_devices(&ferrofin_traits::devices::DeviceQuery {
+            user_id: Some(user_uuid(user)?),
+            ..Default::default()
+        })
+        .await?
+        .items;
+    // Empty IDs are explicitly skipped by upstream's event handler.
+    for device in &devices {
+        if !device.device_id.is_empty()
+            && !state
+                .devices
+                .can_access_device(user, &device.device_id)
+                .await?
+        {
+            state.sessions.logout_device(device).await?;
+        }
+    }
+    Ok(())
 }
 
 /// `POST /Users/{userId}/Policy` — update a user's policy.
@@ -857,10 +916,11 @@ async fn update_user_password(
 
     // A non-admin caller (or one changing their own explicit-userId account)
     // must prove the current password.
-    let caller_is_admin = match &auth.user {
-        Some(caller) => is_administrator(&state, caller).await?,
-        None => false,
-    };
+    let caller_is_admin = auth.is_api_key
+        || match &auth.user {
+            Some(caller) => is_administrator(&state, caller).await?,
+            None => false,
+        };
     let updating_self = query.user_id.is_some_and(|id| id == auth.user_id());
     if !caller_is_admin || updating_self {
         let ok = state
@@ -868,7 +928,7 @@ async fn update_user_password(
             .authenticate_user(
                 &user.username,
                 body.current_pw.as_ref().map_or("", Secret::expose),
-                "",
+                auth.remote_endpoint.as_deref().unwrap_or("127.0.0.1"),
                 false,
             )
             .await?;
@@ -883,7 +943,10 @@ async fn update_user_password(
         .users
         .change_password(user_id, body.new_pw.as_ref().map_or("", Secret::expose))
         .await?;
-    state.sessions.revoke_user_tokens(user_id, "").await?;
+    state
+        .sessions
+        .revoke_user_tokens(user_id, auth.token.as_ref().map_or("", Secret::expose))
+        .await?;
     log_password_changed(&state, user_id, &user.username).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -903,16 +966,11 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
     .await;
 }
 
-/// `POST /Users/ForgotPassword` — begin the forgot-password flow.
-///
-/// Port of `UserController.ForgotPassword` → `UserManager.StartForgotPassword` →
-/// the built-in `DefaultPasswordResetProvider`: when the entered username matches
-/// a user, a random pin (valid [`PIN_TTL_MINUTES`]) is written to
-/// `{data}/passwordreset-<userId>.json` and its path returned as `PinFile` with
-/// action [`ForgotPasswordAction::PinCode`]. The pin is also logged (there is no
-/// e-mail provider — the admin reads it from the server log, matching Jellyfin).
-/// An unknown / blank username yields [`ForgotPasswordAction::ContactAdmin`] so
-/// the endpoint never discloses whether an account exists.
+/// `POST /Users/ForgotPassword` — begin built-in password recovery.
+/// Known users on the local network get a PIN file in ProgramDataPath. All
+/// callers receive PinCode and the computed path, without disclosing account
+/// existence. Unknown reset-provider IDs fall back to this built-in provider,
+/// which is the only currently registered choice, matching Jellyfin.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
@@ -921,39 +979,31 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
 )]
 async fn forgot_password(
     State(state): State<AppState>,
+    parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordDto>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    let contact_admin = || {
-        Ok(Json(ForgotPasswordResult {
-            action: ForgotPasswordAction::ContactAdmin,
-            pin_file: None,
-            pin_expiration_date: None,
-        }))
+    let _guard = state.password_reset_lock.lock().await;
+    let user = if body.entered_username.trim().is_empty() {
+        None
+    } else {
+        state.users.get_user_by_name(&body.entered_username).await?
     };
-
-    let username = body.entered_username.trim();
-    if username.is_empty() {
-        return contact_admin();
-    }
-    let Some(user) = state.users.get_user_by_name(username).await? else {
-        return contact_admin();
-    };
-
-    let dir = std::path::PathBuf::from(state.config.application_paths().data_path());
-    let (result, pin) = issue_reset_pin(&dir, &user.id, &user.username)?;
-    // No e-mail provider: surface the pin in the log so the admin can relay it.
-    tracing::info!(user = %user.username, pin = %pin, "forgot-password pin issued");
-    Ok(Json(result))
+    let local = state.is_in_local_network(state.client_address(&parts));
+    let username = user
+        .as_ref()
+        .filter(|_| local)
+        .map(|user| user.username.as_str());
+    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
+    Ok(Json(issue_reset_pin(
+        &dir,
+        &body.entered_username,
+        username,
+    )?))
 }
 
-/// `POST /Users/ForgotPassword/Pin` — redeem a forgot-password pin.
-///
-/// Port of `UserController.ForgotPasswordPin` →
-/// `DefaultPasswordResetProvider.RedeemPasswordResetPin`: scans the pending
-/// `passwordreset-*.json` records, deleting expired ones. When one matches the
-/// entered pin (dashes/case ignored) its user's password is set to the pin (so
-/// they can log in and change it) and the record deleted. Reports the set of
-/// usernames reset.
+/// `POST /Users/ForgotPassword/Pin` — redeem a case-sensitive recovery PIN.
+/// Dashes are ignored for comparison. The password becomes the exact entered
+/// PIN, and the file is consumed only after a successful password update.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
@@ -964,20 +1014,27 @@ async fn forgot_password_pin(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
 ) -> Result<Json<PinRedeemResult>, ApiError> {
-    let dir = std::path::PathBuf::from(state.config.application_paths().data_path());
+    let _guard = state.password_reset_lock.lock().await;
+    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
     let mut users_reset = Vec::new();
-    for (user_name, pin) in redeem_reset_pins(&dir, &body.pin)? {
-        // Set the matched user's password to the pin so they can log in and
-        // change it (C# `_userManager.ChangePassword(resetUser, pin)`).
-        if let Some(user) = state.users.get_user_by_name(&user_name).await?
-            && let Ok(user_id) = Uuid::parse_str(&user.id)
-        {
-            state.users.change_password(user_id, &pin).await?;
-            users_reset.push(user.username);
-        }
+    for (user_name, path) in redeem_reset_pins(&dir, &body.pin)? {
+        let user = state
+            .users
+            .get_user_by_name(&user_name)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("user for recovery record"))?;
+        let user_id = user_uuid(&user)?;
+        state.users.change_password(user_id, &body.pin).await?;
+        log_password_changed(&state, user_id, &user.username).await;
+        users_reset.push(user.username);
+        std::fs::remove_file(path)
+            .map_err(|e| ServiceError::backend(format!("remove consumed reset: {e}")))?;
+    }
+    if users_reset.is_empty() {
+        return Err(ServiceError::not_found("no matching password reset request").into());
     }
     Ok(Json(PinRedeemResult {
-        success: !users_reset.is_empty(),
+        success: true,
         users_reset,
     }))
 }
@@ -1152,42 +1209,45 @@ mod tests {
                 .iter()
                 .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
         );
-        // Normalization strips dashes and uppercases, so a lowercased/spaced-out
-        // entry still matches.
-        assert_eq!(
-            normalize_pin(&pin),
-            normalize_pin(&pin.to_ascii_lowercase())
-        );
-        assert_eq!(normalize_pin("1a-2b"), "1A2B");
+        assert_eq!(normalize_pin("1a-2b"), "1a2b");
+        assert_ne!(normalize_pin("AA-BB"), normalize_pin("aa-bb"));
     }
 
     #[test]
     fn issue_then_redeem_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let (result, pin) = issue_reset_pin(dir.path(), "user-1", "alice").unwrap();
+        let result = issue_reset_pin(dir.path(), "aLiCe", Some("alice")).unwrap();
         assert_eq!(result.action, super::ForgotPasswordAction::PinCode);
-        assert!(result.pin_file.is_some());
         assert!(result.pin_expiration_date.is_some());
-        // The record file exists.
-        let file = dir
-            .path()
-            .join(format!("{PASSWORD_RESET_PREFIX}user-1.json"));
-        assert!(file.exists());
-
-        // A wrong pin matches nothing and leaves the record in place.
-        assert!(
-            redeem_reset_pins(dir.path(), "FF-FF-FF-FF")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(file.exists());
-        // An empty pin never matches.
+        let file = std::path::PathBuf::from(result.pin_file.unwrap());
+        let expected = dir.path().join(format!(
+            "{PASSWORD_RESET_PREFIX}{}.json",
+            ferrofin_common::extensions::get_md5("ALICE").simple()
+        ));
+        assert_eq!(file, expected);
+        let record: SerializablePasswordReset =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(redeem_reset_pins(dir.path(), "wrong").unwrap().is_empty());
         assert!(redeem_reset_pins(dir.path(), "").unwrap().is_empty());
-
-        // The right pin (dashes/case ignored) returns the user + consumes the file.
-        let matched = redeem_reset_pins(dir.path(), &pin.to_ascii_lowercase()).unwrap();
-        assert_eq!(matched, vec![("alice".to_owned(), pin)]);
-        assert!(!file.exists());
+        assert_eq!(
+            redeem_reset_pins(dir.path(), &record.pin.replace('-', "")).unwrap(),
+            vec![("alice".to_owned(), file.clone())]
+        );
+        assert!(
+            file.exists(),
+            "only the handler consumes a successfully applied reset"
+        );
+        let absent = issue_reset_pin(dir.path(), "unknown", None).unwrap();
+        assert_eq!(absent.action, super::ForgotPasswordAction::PinCode);
+        assert!(!std::path::Path::new(&absent.pin_file.unwrap()).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

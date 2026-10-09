@@ -635,3 +635,88 @@ async fn a_season_tvdb_fails_for_takes_tmdbs_answer_unstamped() {
     assert_eq!(season.overview.as_deref(), Some("TMDB season."));
     assert_eq!(season.date_last_refreshed, None, "TheTVDB failed");
 }
+
+/// Both physical and virtual season zero names follow saved options on a quiet
+/// scan. Name locks still preserve the user's edit on a later scan.
+#[rstest::rstest]
+#[case::physical(false)]
+#[case::virtual_season(true)]
+#[tokio::test]
+async fn season_zero_uses_saved_name_and_keeps_name_locks(#[case] flat: bool) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let mut library = Library::new(
+        tmp.path(),
+        LibraryOptions {
+            season_zero_display_name: "Bonus".to_owned(),
+            type_options: ["Series", "Season", "Episode"]
+                .into_iter()
+                .map(|kind| TypeOptions {
+                    type_: Some(kind.to_owned()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let show = library.season_dir.parent().unwrap().to_owned();
+    std::fs::remove_dir_all(&library.season_dir).expect("remove fixture season");
+    library.season_dir = if flat {
+        show.clone()
+    } else {
+        show.join("Season 0")
+    };
+    std::fs::create_dir_all(&library.season_dir).expect("specials folder");
+    std::fs::write(library.season_dir.join("Show S00E01.mkv"), b"fixture").expect("episode");
+    let key = if flat {
+        show.join("#virtual-season-0")
+    } else {
+        library.season_dir.clone()
+    };
+    library.season_id = derive_item_id(BaseItemKind::Season, &key.to_string_lossy()).unwrap();
+    let scanner = library.scanner("http://127.0.0.1:9");
+    scanner.scan_all().await.expect("initial scan");
+    assert_eq!(library.season().await.name.as_deref(), Some("Bonus"));
+
+    let folder = library.vf.get_virtual_folders().await.unwrap().remove(0);
+    let mut options = folder.library_options.unwrap();
+    options.season_zero_display_name = "Extras".to_owned();
+    library
+        .vf
+        .update_library_options("TV", &options)
+        .await
+        .unwrap();
+    scanner.scan_all().await.expect("quiet rescan");
+    assert_eq!(library.season().await.name.as_deref(), Some("Extras"));
+    options.season_zero_display_name = "EXTRAS".to_owned();
+    library
+        .vf
+        .update_library_options("TV", &options)
+        .await
+        .unwrap();
+    scanner.scan_all().await.expect("case-only rescan");
+    assert_eq!(library.season().await.name.as_deref(), Some("Extras"));
+
+    library.set_season(r#""Name" = 'Mine'"#).await;
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (?1, ?2)"#)
+        .bind(ferrofin_db::enums::metadata_field::to_i32(
+            MetadataField::Name,
+        ))
+        .bind(ferrofin_db::store::guid_to_db(library.season_id))
+        .execute(library.db.writer())
+        .await
+        .unwrap();
+    scanner.scan_all().await.expect("locked rescan");
+    assert_eq!(library.season().await.name.as_deref(), Some("Mine"));
+    let episode = derive_item_id(
+        BaseItemKind::Episode,
+        &library.season_dir.join("Show S00E01.mkv").to_string_lossy(),
+    )
+    .unwrap();
+    let episode = library.items.retrieve_item(episode).await.unwrap().unwrap();
+    assert_eq!(
+        episode.season_name.as_deref(),
+        Some("Mine"),
+        "children use the locked season name"
+    );
+}

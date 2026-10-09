@@ -300,6 +300,22 @@ pub trait LibraryManager: Send + Sync {
         Err(ServiceError::backend("item visibility is not configured"))
     }
 
+    /// Applies the own-item IsVisible rule to a child set, preserving order.
+    /// Concrete managers batch policy and hierarchy reads for Folder consumers.
+    async fn filter_visible_items(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut visible = Vec::with_capacity(items.len());
+        for item in items {
+            if self.is_item_visible(&item, user).await? {
+                visible.push(item);
+            }
+        }
+        Ok(visible)
+    }
+
     /// `IsVisibleStandalone`: item, ancestor and library access with kind overrides.
     /// Managers must supply policy evaluation; the default fails closed.
     async fn is_item_visible_standalone(
@@ -1139,7 +1155,7 @@ fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
 /// `EnableVideoPlaybackTranscoding`, and its `SupportsDirectStream` becomes
 /// `EnablePlaybackRemuxing`. Everything else (photos, books, unknown media)
 /// is left as the source built it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlaybackPermissions {
     /// `PermissionKind.EnableVideoPlaybackTranscoding`.
     pub video_transcoding: bool,
@@ -1149,8 +1165,18 @@ pub struct PlaybackPermissions {
     pub remuxing: bool,
 }
 
-/// The user permissions `BaseItem.CanDelete(user)` and `CanDownload(user)`
-/// read, from [`UserDataManager::get_content_permissions`].
+impl From<&UserPolicy> for PlaybackPermissions {
+    fn from(policy: &UserPolicy) -> Self {
+        Self {
+            video_transcoding: policy.enable_video_playback_transcoding,
+            audio_transcoding: policy.enable_audio_playback_transcoding,
+            remuxing: policy.enable_playback_remuxing,
+        }
+    }
+}
+
+/// The user permissions `BaseItem.CanDelete(user)`, `CanDownload(user)` and
+/// `GetPlayAccess(user)` read, from [`UserDataManager::get_content_permissions`].
 ///
 /// Upstream reads each with `user.HasPermission(PermissionKind.…)` and the
 /// folder list with `user.GetPreferenceValues<Guid>(PreferenceKind.
@@ -1164,6 +1190,9 @@ pub struct ContentPermissions {
     /// collection. It grants nothing for ordinary media: an administrator
     /// without "Allow media deletion" cannot delete a movie, as upstream.
     pub is_administrator: bool,
+    /// `PermissionKind.EnableMediaPlayback` — controls `PlayAccess`, including
+    /// for administrators, who have no override for this permission.
+    pub enable_media_playback: bool,
     /// `PermissionKind.EnableContentDeletion` — the dashboard's "Allow media
     /// deletion" (any library).
     pub enable_content_deletion: bool,
@@ -1345,11 +1374,24 @@ pub trait UserManager: Send + Sync {
 
 fn _assert_object_safe_user_manager(_: &dyn UserManager) {}
 
+/// Observes a committed user-data write with its pinned save reason.
+/// The NFO consumer subscribes weakly so it may retain the user-data manager.
+#[async_trait]
+pub trait UserDataSaveListener: Send + Sync {
+    /// Handles a successfully persisted write. Listener failures must not undo it.
+    async fn user_data_saved(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError>;
+}
+
 /// Reads and writes per-user, per-item playback/rating data.
 ///
 /// Port of `IUserDataManager`. User/item arguments become [`Uuid`] identities;
-/// results are the [`UserItemDataDto`] presentation DTO. The C# `event
-/// UserDataSaved` is dropped (events are wired separately in `ferrofin-core`).
+/// results are the [`UserItemDataDto`] presentation DTO. The committed-write
+/// listener carries the source `UserDataSaved` reason to its NFO consumer.
 #[async_trait]
 pub trait UserDataManager: Send + Sync {
     /// Saves user data supplied as an update DTO.
@@ -1359,6 +1401,19 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
         user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError>;
+
+    /// Saves user data with the caller's source event reason.
+    /// The default preserves compatibility with implementations without listeners.
+    async fn save_user_data_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &UpdateUserItemDataDto,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        let _ = reason;
+        self.save_user_data(user_id, item_id, user_data).await
+    }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
     async fn get_user_data_dto(
@@ -1464,6 +1519,19 @@ pub trait UserDataManager: Send + Sync {
         reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError>;
 
+    /// Updates play state with PlaybackProgress or PlaybackFinished preserved.
+    async fn update_play_state_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<bool, ServiceError> {
+        let _ = reason;
+        self.update_play_state(user_id, item_id, reported_position_ticks)
+            .await
+    }
+
     /// Records that playback of an item just started for a user.
     ///
     /// Port of the user-data half of C# `SessionManager.OnPlaybackStart`:
@@ -1511,15 +1579,15 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// The slice of the user's policy that `CanDelete(user)` and
-    /// `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
+    /// The slice of the user's policy that `CanDelete(user)`, `GetPlayAccess(user)`
+    /// and `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
     /// `BoxSet`/`Playlist` overrides, and `IsAuthorizedToDownload`), for the
-    /// DTO builder's per-user `CanDelete`/`CanDownload` and the delete
+    /// DTO builder's per-user `CanDelete`/`CanDownload`/`PlayAccess` and the delete
     /// endpoints' check, which use the same value.
     ///
     /// `None` means "no policy known". `CanDownload` then falls back to the
-    /// file-level fact, and `CanDelete` for a user is `false`: a deletion is
-    /// never granted on an unknown policy. The default returns `None`; the
+    /// file-level fact, while `CanDelete` is `false` and `PlayAccess` is `None`:
+    /// neither permission is granted on an unknown policy. The default returns `None`; the
     /// concrete manager reads the `Permissions` and `Preferences` rows.
     async fn get_content_permissions(
         &self,

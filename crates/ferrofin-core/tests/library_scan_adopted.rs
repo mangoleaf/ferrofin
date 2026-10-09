@@ -533,19 +533,21 @@ async fn a_library_s_own_folders_and_folders_on_disk_are_never_pruned() {
     assert!(rows.contains_key(&lib.cf));
 }
 
-/// A native library — no `PhysicalFolderIds`, no physical folder — is read
-/// by its collection folder alone and pruned as it always was, and a row of
-/// a kind the scan never plans is kept while its path is on disk.
+/// A native library names its location's folder in `PhysicalFolderIds` as
+/// Jellyfin's does (owner decision D1), so it is read by its collection folder
+/// and that folder, and pruned as it always was; a row of a kind the scan
+/// never plans is kept while its path is on disk.
 #[tokio::test]
-async fn a_native_library_is_read_by_its_collection_folder_alone() {
+async fn a_native_library_is_read_by_its_collection_folder_and_location() {
     let lib = Library::new(false).await;
+    let location = derive_item_id(BaseItemKind::Folder, &lib.media.to_string_lossy()).expect("id");
     assert_eq!(
         lib.persistence
             .library_top_parents(lib.cf)
             .await
             .expect("read")
             .expect("answers"),
-        vec![lib.cf]
+        vec![lib.cf, location]
     );
     let stray = derive_item_id(
         BaseItemKind::Folder,

@@ -1,0 +1,259 @@
+{
+  "archive_sha256": "486751335ea00fb12cb3b4d52ddefd3df9b61ff81e1546ba506d3c41cec45a54",
+  "generator_sha256": "669fb899bc51f7ab4e5f1ed605e3b704c79473a3456f1e47e5e3d60e23120402",
+  "output_sha256": "b40e091befa37baae06f17121953edaff4d7a0ba95bebc80942852dabaed1741",
+  "search_entries": 22,
+  "input_files": [
+    {
+      "name": "collation/implicithan/az_search_data.toml",
+      "sha256": "a4379c0ab171425b90285f4bdce48d1ea4236bbae1b38d5cb75ebf7b42a94e7c",
+      "bytes": 8589
+    },
+    {
+      "name": "collation/implicithan/az_search_meta.toml",
+      "sha256": "46e50f0795abf2ff78163054642c3793abe301a9c48bc23b39027354b6d29cc8",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/bs_search_data.toml",
+      "sha256": "205dee17af3e54b16e42959c75f44659207b9490b2c82b43a863dc44f452468b",
+      "bytes": 8787
+    },
+    {
+      "name": "collation/implicithan/bs_search_meta.toml",
+      "sha256": "b80267a3c6841adea15c7f0fa054f020df33a52ce35747be3a4d75a13045fa61",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/ca_search_data.toml",
+      "sha256": "00456cf4dd0ddab69d1d1f343ac8a57bd1e29484210ab16dfe6bcd56664917e8",
+      "bytes": 7800
+    },
+    {
+      "name": "collation/implicithan/ca_search_meta.toml",
+      "sha256": "3325d01f03619097d206e0a03e062bc639d9952ee59831d121f8a496a67791fa",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/da_search_data.toml",
+      "sha256": "b9892124c01a8ea27ffee35f86e1a7ba34299d9d2aa82ee59f0d89eff116a838",
+      "bytes": 9093
+    },
+    {
+      "name": "collation/implicithan/da_search_meta.toml",
+      "sha256": "f12290e2a2569daf1e47d5c5f365cb0012e0ad86d38f4ef9a88ef385160c998c",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/de_search_data.toml",
+      "sha256": "73f3411224af4f70fdfa6aef4201ef7163d9a526aded4ae93b45df5114ac66ad",
+      "bytes": 7697
+    },
+    {
+      "name": "collation/implicithan/de_search_meta.toml",
+      "sha256": "8a220be16408500449afe0fd859437f4f6c3f519f9918d39918e442bcbf1371b",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/es_search_data.toml",
+      "sha256": "69572b99218bb0b4fb55a1b59bafe37c5443a383abea167493f61fe51d9e286e",
+      "bytes": 7371
+    },
+    {
+      "name": "collation/implicithan/es_search_meta.toml",
+      "sha256": "021c1109546bfca68cc464617e68d2a17fcedd8fac98acd60626ccb3fc974056",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/fi_search_data.toml",
+      "sha256": "4e40bca00a6efddc0592f453ef6e4e0665811cecb4a5a37c8b122f50084303b6",
+      "bytes": 9858
+    },
+    {
+      "name": "collation/implicithan/fi_search_meta.toml",
+      "sha256": "6d691bd7cfebdfe3cb8d7009b64ced4f5f5419bf562377165cc9cd3377fea5a8",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/fo_search_data.toml",
+      "sha256": "0f2fcaaca89c1adee3ce0da578143467dfc371ad0f293d39a12db9047db44f10",
+      "bytes": 9206
+    },
+    {
+      "name": "collation/implicithan/fo_search_meta.toml",
+      "sha256": "cf1f74d59134d46852432d3054a24b2247589c7558c91a41157eaf781137845b",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/gl_search_data.toml",
+      "sha256": "6d70d53206d96b17ef3b8ab188727b6d4c704fbaa301357dd135f1aa7b497a3c",
+      "bytes": 7371
+    },
+    {
+      "name": "collation/implicithan/gl_search_meta.toml",
+      "sha256": "0f6a1b0b5cda585e58c6b98fcb5681e68c1c1276926f3872bad7e613aa904b66",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/hr_search_data.toml",
+      "sha256": "78ec59a36086e505ebb0ca87c0d886418169c03884a2f4b2d8ea24d6d362bcdb",
+      "bytes": 8787
+    },
+    {
+      "name": "collation/implicithan/hr_search_meta.toml",
+      "sha256": "9136742a669dd3861e19b45a79e1f3cb9d9537b26491aacb9970dc9c1b0ac27f",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/is_search_data.toml",
+      "sha256": "15fb620d7b2eaf07b5fcd24e29f09ec4bf22506152d1338f35e792aa73fcfef4",
+      "bytes": 8820
+    },
+    {
+      "name": "collation/implicithan/is_search_meta.toml",
+      "sha256": "30a94242e6d3e0663c2e9562b7d3bbed51a6df492edcd1b931fe5c4babef2e7b",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/kl_search_data.toml",
+      "sha256": "c20f1ad243ec8fcb37391d93c5c24d363ed546eb1dba2be771acc85d25c02f7a",
+      "bytes": 9200
+    },
+    {
+      "name": "collation/implicithan/kl_search_meta.toml",
+      "sha256": "9dec1abc186c691236259e83d51d864615d7440ac765664d7aa5509f604a8e3b",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/ko_search_data.toml",
+      "sha256": "341aab63244abd6d69bb2c63af134bc85acdf6d9bec7a3bf3f3a056e2fa0e30d",
+      "bytes": 9541
+    },
+    {
+      "name": "collation/implicithan/ko_search_meta.toml",
+      "sha256": "13f87a32a0011f54e1b5347ca452aa5412a9e103f5b910239c508a4ceae983f8",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/ko_searchjl_data.toml",
+      "sha256": "6e2d3e6f9e307e12db4a2e865fcfa02511e8d6eb91dbb626567cf13549e2b122",
+      "bytes": 6761
+    },
+    {
+      "name": "collation/implicithan/ko_searchjl_meta.toml",
+      "sha256": "83bf9daaf577507d4b0c78be8cd638ef9f43c5232f9223313001ed71651afbc2",
+      "bytes": 79
+    },
+    {
+      "name": "collation/implicithan/no_search_data.toml",
+      "sha256": "857795ef9dd609438dbec8046e73f730131a969ca9c5a7c62e22f590d74a455e",
+      "bytes": 9206
+    },
+    {
+      "name": "collation/implicithan/no_search_meta.toml",
+      "sha256": "61e8a7ac6d0cbb6fa6625bd70397621813f2ee5a5e8b91f56e63256c4ffd67e1",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/root_search_data.toml",
+      "sha256": "677660b5107562521e4dab47fff3fb98155a4cda56dba36045d2bbd923be0f37",
+      "bytes": 7006
+    },
+    {
+      "name": "collation/implicithan/root_search_meta.toml",
+      "sha256": "7da120e1d0d02d8538c8e936c7b2ef1f7eaa0805fc029202f1e1732013d3d438",
+      "bytes": 79
+    },
+    {
+      "name": "collation/implicithan/se_search_data.toml",
+      "sha256": "2aa08751f6aa75bf910d954d49e05a331c1c6a63444ff2c8d3b37463c9ef9eb5",
+      "bytes": 11017
+    },
+    {
+      "name": "collation/implicithan/se_search_meta.toml",
+      "sha256": "5c990a5f74738172ec9de01beb410832c1a1973a7e5b24eef10b1ac6c683d4c0",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/sk_search_data.toml",
+      "sha256": "408e4af66675b8b5bf886c7597d5812094b04dea52de2a65c1dd4f1db3f9d1c5",
+      "bytes": 8890
+    },
+    {
+      "name": "collation/implicithan/sk_search_meta.toml",
+      "sha256": "1b178984266b2730a0acfc1e2ed97eb9cd8901f4bf1e52ada30c69cf421f2ca8",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/smn_search_data.toml",
+      "sha256": "cbd32626f86eaa8cc3c0f033ed460ce14dd808b13f9bfc83bedd4113f91de304",
+      "bytes": 8968
+    },
+    {
+      "name": "collation/implicithan/smn_search_meta.toml",
+      "sha256": "9d5d21bae25e6325f741dd5358ef8c69e45f8ebe57fd1d19d3596413cf82a490",
+      "bytes": 78
+    },
+    {
+      "name": "collation/implicithan/sr_Latn_search_data.toml",
+      "sha256": "7fe2ae696e0c682ef5c5ffcbc7c8f708713c560129fd1f8814b60aca13d156b0",
+      "bytes": 8792
+    },
+    {
+      "name": "collation/implicithan/sr_Latn_search_meta.toml",
+      "sha256": "41b67ecc1be3a50811b87b244e2b3e141df3441ab685cd8f5df8cd7b689c9e4e",
+      "bytes": 82
+    },
+    {
+      "name": "collation/implicithan/sv_search_data.toml",
+      "sha256": "b2dc12ed87baee22124b9f8bd5ca2fb17e4853ce8f1ee53db12eba0526e4fe1c",
+      "bytes": 9173
+    },
+    {
+      "name": "collation/implicithan/sv_search_meta.toml",
+      "sha256": "9b9e6132fd8fb4ea7dfc5168dc389b8a08f87efef927ab59f6764ebd9c2bb21b",
+      "bytes": 77
+    },
+    {
+      "name": "collation/implicithan/tr_search_data.toml",
+      "sha256": "8d80247dc55e224b11a1834560439902f6a0a555c062174b19b08adc08c9f5b3",
+      "bytes": 8087
+    },
+    {
+      "name": "collation/implicithan/tr_search_meta.toml",
+      "sha256": "cd6d3ea3b37ff6e17b1fada2b7661bef83477017b2a2e04f9fc6669dba15f5e7",
+      "bytes": 77
+    }
+  ],
+  "scope": "22 actual search/searchjl tailorings; raw trie retains original representation. ICU4X source converter only rebuilds the trie and clears Hangul syllable mappings; runtime handles syllables separately. All22 source vectors restore67 modern Jamo by a checked copy-on-write overlay; only those67 codepoints differ. Korean archaic equality preprocessing is a separately pinned CLDR source rule set.",
+  "generator": "tools/generate-search-collation-data.py",
+  "output": "generated_search_data.rs",
+  "source_urls": {
+    "archive": "https://github.com/unicode-org/icu/releases/download/release-78.1rc/icu4x-icuexportdata-78.1rc.zip",
+    "root_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-48-2/common/collation/root.xml",
+    "korean_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-48-2/common/collation/ko.xml",
+    "exporter": "https://raw.githubusercontent.com/unicode-org/icu/release-78.1rc/icu4c/source/tools/genrb/parse.cpp",
+    "builder": "https://raw.githubusercontent.com/unicode-org/icu/release-78.1rc/icu4c/source/i18n/collationdatabuilder.cpp"
+  },
+  "korean_source_sha256": "d4c35933a28bd6712138e92528f4c6fe0e2d150b296dcaaa0fdde10c7ba8ca34",
+  "root_search_source_sha256": "af6784292b2ec2576efcfdc5e1073f272edc1265a2dc5286ba9bd16b2d7a1ed9",
+  "dependency_versions": {
+    "icu_collator": "2.3.1 exact vendored source with one Jamo dispatch condition",
+    "icu_collections": "2.3.0",
+    "icu_locale_fallback": "2.3.0",
+    "icu_normalizer": "2.3.0",
+    "icu_provider": "2.3.1",
+    "zerovec": "0.11.8"
+  },
+  "unit_dotnet_oracle": {
+    "framework": "10.0.12",
+    "cases_sha256": "6cde3d236e5bb8de90b32e8f7ee932711fc97874cbb09e0ee484816070c973ad",
+    "reference_sha256": "0456d5d9d2e3a7a7b8271de6f5271c24c1a4c68ad09f081dc48fe5fbdbf1c6d9",
+    "generator": "source-only extraction; exact pair order and signs retained",
+    "pair_count": 1276,
+    "row_count": 29,
+    "output_sha256": "ed12718a63390e79a81aadde2937ad4350818de0880cd27f8697b2da2d223826"
+  },
+  "vendor_original_vcs_commit": "898d79c69f37da7b45a15a5714663c9b59b3d928",
+  "latest_check": "Existing locked versions were independently checked against official crates.io records; no unrelated version upgrades."
+}

@@ -11,21 +11,15 @@
 //! into the [`PathManager`] trickplay layout, and persist the info row.
 //!
 //! Departures from the C# (documented per the port rules):
-//! - The per-library `EnableTrickplayImageExtraction` gate is honoured (an
-//!   item in a library with it off has its tiles and rows pruned, as in C#),
-//!   but `SaveTrickplayWithMedia` only feeds the "user-managed, leave alone"
-//!   guard: tiles are always generated into the **internal**
-//!   (non-save-with-media) layout, matching [`Self::get_trickplay_tile_path`].
-//! - The eligibility gate (`CanGenerateTrickplay`) checks the persisted row:
-//!   not a virtual item, an existing on-disk media path, and a runtime of at
-//!   least one interval. The C# `VideoType` (Iso/Dvd/BluRay), `IsPlaceHolder`,
-//!   `IsShortcut` and media-stream checks ride the un-ported domain `Video`
-//!   object; the path-existence check covers their practical effect here.
-//! - `DiscoverExistingTrickplayAsync`'s pruning of orphaned DB rows (folders
-//!   gone from both possible locations) is ported; its cataloguing of
-//!   user-placed folders with arbitrary width/tile dimensions is not — the
-//!   per-width import branch below still adopts on-disk tiles that match the
-//!   configured tile grid.
+//! - Per-library extraction and storage settings govern generation, tile
+//!   lookup and migration. Disabled extraction preserves media-adjacent files
+//!   as user-managed unless an explicit replacement was requested.
+//! - Eligibility reads the resolved/stored video type, placeholder and shortcut
+//!   facts, live DVR captures/channel livestreams, runtime and any media streams
+//!   before discovery, pruning or generation (`CanGenerateTrickplay`).
+//! - Existing user-managed grids are discovered in the selected location,
+//!   including when extraction is disabled. Invalid or overflowing grid
+//!   dimensions are ignored before division or database insertion.
 //! - The hardware-acceleration / keyframe-only extraction options select the
 //!   software ffmpeg path (see [`TrickplayFrameExtractor`]).
 //!
@@ -45,13 +39,14 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::playback::TrickplayInfoEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, TrickplayOptions};
-use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
@@ -80,6 +75,8 @@ pub struct FerrofinTrickplayManager {
     streams: Arc<dyn MediaStreamRepository>,
     frame_extractor: Arc<dyn TrickplayFrameExtractor>,
     image_encoder: Arc<dyn ImageEncoder>,
+    live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
+    virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -89,9 +86,23 @@ impl std::fmt::Debug for FerrofinTrickplayManager {
     }
 }
 
+/// Task-owned temporary directories must also be removed when a scan/task
+/// drops its future during encoding, the Rust counterpart of the source finally.
+struct TemporaryTrickplayDirectory(PathBuf);
+
+impl Drop for TemporaryTrickplayDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(directory = %self.0.display(), %error, "cannot remove trickplay temporary directory");
+        }
+    }
+}
+
 /// The per-width refresh context shared by [`FerrofinTrickplayManager`] helpers:
-/// the item identity, its media path, its stored video width, and the resolved
-/// internal trickplay directory.
+/// the item identity, its media path, its stored video width, and the selected
+/// trickplay directory.
 struct WidthRefreshContext<'a> {
     /// The item being refreshed.
     item_id: Uuid,
@@ -104,33 +115,44 @@ struct WidthRefreshContext<'a> {
     /// needs the codec, and a hardware scaler takes fixed pixel dimensions, so
     /// an anamorphic source has to be un-stretched from its aspect ratio.
     video_stream: Option<MediaStream>,
-    /// The internal trickplay directory for the item.
+    /// The selected trickplay directory for the item.
     trickplay_dir: &'a str,
 }
 
 impl FerrofinTrickplayManager {
-    /// The item's video stream, or `None` when it has none recorded or the
-    /// lookup fails.
-    ///
-    /// Upstream takes `mediaSource.VideoStream`, which is the item's first
-    /// video stream; the same choice here. A failure is logged and degrades to
-    /// the software path rather than failing the refresh — trickplay without
-    /// hardware is slow, trickplay that errors is absent.
-    async fn video_stream(&self, item_id: Uuid) -> Option<MediaStream> {
-        let query = MediaStreamQuery {
-            item_id,
-            stream_type: Some(MediaStreamType::Video),
-            ..MediaStreamQuery::default()
+    /// Reads all streams because `CanGenerateTrickplay` tests their count,
+    /// while the encoder only consumes the first video stream.
+    async fn media_streams(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<ferrofin_db::entities::base_items::MediaStreamInfoEntity>, ServiceError> {
+        self.streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                ..MediaStreamQuery::default()
+            })
+            .await
+    }
+
+    /// Connects the live DVR capture state without a strong library/DVR cycle.
+    #[must_use]
+    pub fn with_live_tv(
+        mut self,
+        live_tv: &Arc<dyn ferrofin_traits::stubs::LiveTvManager>,
+    ) -> Self {
+        self.live_tv = Some(Arc::downgrade(live_tv));
+        self
+    }
+
+    async fn is_active_recording(&self, entity: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let Some(live_tv) = self.live_tv.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return Ok(false);
         };
-        match self.streams.get_media_streams(&query).await {
-            Ok(rows) => rows.into_iter().next().map(stream_to_dto),
-            Err(e) => {
-                // Debug for the same reason as the encoding-options read: one
-                // line per item across a library pass (LOGGING.md).
-                tracing::debug!(item_id = %item_id, "cannot read video stream for trickplay: {e}");
-                None
-            }
-        }
+        Ok(live_tv
+            .active_recording_paths()
+            .await?
+            .iter()
+            .any(|path| entity.path.as_ref() == Some(path)))
     }
 
     /// Creates a trickplay manager over the given database, path manager,
@@ -155,7 +177,30 @@ impl FerrofinTrickplayManager {
             streams,
             frame_extractor,
             image_encoder,
+            live_tv: None,
+            virtual_folders: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Connects the live library-options reader before the server starts.
+    pub fn attach_virtual_folders(&self, folders: Arc<dyn VirtualFolderManager>) {
+        let _ = self.virtual_folders.set(folders);
+    }
+
+    async fn library_options(
+        &self,
+        entity: &BaseItemEntity,
+    ) -> Result<Option<LibraryOptions>, ServiceError> {
+        let Some(folders) = self.virtual_folders.get() else {
+            return Ok(None);
+        };
+        let folders = folders.get_virtual_folders().await?;
+        Ok(ferrofin_model::entities_media::owning_library(
+            &folders,
+            entity.top_parent_id.as_deref(),
+            entity.path.as_deref(),
+        )
+        .and_then(|library| library.library_options.clone()))
     }
 
     /// Fetches all stored trickplay rows for an item, keyed by tile width.
@@ -184,10 +229,13 @@ impl FerrofinTrickplayManager {
         Ok(())
     }
 
-    /// Reads the current [`TrickplayOptions`], clamping a too-small interval to
-    /// [`MIN_INTERVAL_MS`] (mirroring the C# guard).
+    /// Reads raw options. Eligibility and discovery precede the generation-only
+    /// minimum-interval guard in the pinned manager.
     async fn trickplay_options(&self) -> Result<TrickplayOptions, ServiceError> {
-        let mut options = self.config.configuration().await?.trickplay_options.clone();
+        Ok(self.config.configuration().await?.trickplay_options.clone())
+    }
+
+    fn clamp_generation_interval(options: &mut TrickplayOptions) {
         if options.interval < MIN_INTERVAL_MS {
             tracing::warn!(
                 interval = options.interval,
@@ -195,18 +243,55 @@ impl FerrofinTrickplayManager {
             );
             options.interval = MIN_INTERVAL_MS;
         }
-        Ok(options)
     }
 
-    /// The port of `CanGenerateTrickplay`: returns the item's media path when
-    /// trickplay can be generated for it (not virtual, existing on-disk path,
-    /// runtime of at least one interval), `None` otherwise.
-    fn can_generate_trickplay(entity: &BaseItemEntity, interval_ms: i32) -> Option<String> {
-        if entity.is_virtual_item {
+    /// `CanGenerateTrickplay` uses any recorded stream, including an audio-only
+    /// probe. The later extraction step tolerates an absent video stream.
+    fn can_generate_trickplay(
+        entity: &BaseItemEntity,
+        interval_ms: i32,
+        has_streams: bool,
+        active_recording: bool,
+    ) -> Option<String> {
+        if !has_streams || active_recording {
             return None;
         }
-        let path = entity.path.clone()?;
-        if path.is_empty() || !Path::new(&path).is_file() {
+        let data = crate::item_data::parse_data(entity.data.as_deref());
+        let video_type = data
+            .get("VideoType")
+            .and_then(|v| serde_json::from_value::<VideoType>(v.clone()).ok())
+            .unwrap_or(VideoType::VideoFile);
+        if matches!(
+            video_type,
+            VideoType::Iso | VideoType::Dvd | VideoType::BluRay
+        ) || data
+            .get("IsPlaceHolder")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || data.get("IsShortcut").and_then(serde_json::Value::as_bool) == Some(true)
+        {
+            return None;
+        }
+        let path = entity.path.clone().unwrap_or_default();
+        if Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("strm"))
+        {
+            return None;
+        }
+        let channel = entity
+            .channel_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .is_some_and(|id| !id.is_nil());
+        if channel
+            && entity
+                .tags
+                .as_deref()
+                .into_iter()
+                .flat_map(|tags| tags.split('|'))
+                .any(|tag| tag.eq_ignore_ascii_case("livestream"))
+        {
             return None;
         }
         let runtime = entity.run_time_ticks?;
@@ -225,6 +310,28 @@ impl FerrofinTrickplayManager {
         width: i32,
         options: &TrickplayOptions,
     ) -> Result<(), ServiceError> {
+        // Source checks these only inside per-width work: they do not bypass
+        // discovery or the outer disabled/replace cleanup.
+        if !Path::new(ctx.media_path).is_file() {
+            tracing::warn!(item = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
+            return Ok(());
+        }
+        if Path::new(ctx.media_path)
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("backdrops"))
+        {
+            tracing::debug!(item = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
+            return Ok(());
+        }
+        // CanGenerateTrickplay counts all streams, but the pinned per-width
+        // body dereferences mediaSource.VideoStream.Width. An audio-only source
+        // therefore stops inside that body's caught error after outer cleanup.
+        let Some(video_stream) = ctx.video_stream.as_ref() else {
+            return Err(ServiceError::backend(
+                "trickplay media source has no video stream",
+            ));
+        };
         // The width has to be even, otherwise a lot of filters cannot sample it;
         // a video narrower than the setting caps the width at the video's —
         // its video STREAM's width (`mediaSource.VideoStream.Width`,
@@ -232,11 +339,7 @@ impl FerrofinTrickplayManager {
         // row's `Width` is 0 for a probe that found no dimensions, which is
         // "unknown", not a zero-pixel video.
         let mut actual_width = 2 * (width / 2);
-        if let Some(video_width) = ctx
-            .video_stream
-            .as_ref()
-            .and_then(|stream| stream.width)
-            .map(i64::from)
+        if let Some(video_width) = video_stream.width.map(i64::from)
             && video_width < i64::from(width)
         {
             tracing::warn!(
@@ -282,12 +385,9 @@ impl FerrofinTrickplayManager {
         );
         let frames_dir =
             std::env::temp_dir().join(format!("ferrofin_trickplay_{}", Uuid::new_v4().simple()));
-        let result = self
-            .extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
-            .await;
-        // Always clean the extracted-frames temp dir (the C# `finally`).
-        let _ = std::fs::remove_dir_all(&frames_dir);
-        result
+        let _frames_cleanup = TemporaryTrickplayDirectory(frames_dir.clone());
+        self.extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
+            .await
     }
 
     /// Runs the frame extraction plus [`Self::create_tiles`], saving the
@@ -359,13 +459,9 @@ impl FerrofinTrickplayManager {
         std::fs::create_dir_all(&work_dir)
             .map_err(|e| ServiceError::backend(format!("cannot create tile work dir: {e}")))?;
 
-        let result = self
-            .create_tiles_in(images, width, options, &work_dir, output_dir)
-            .await;
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&work_dir);
-        }
-        result
+        let _tiles_cleanup = TemporaryTrickplayDirectory(work_dir.clone());
+        self.create_tiles_in(images, width, options, &work_dir, output_dir)
+            .await
     }
 
     /// The fallible body of [`Self::create_tiles`], separated so the caller can
@@ -499,6 +595,102 @@ impl FerrofinTrickplayManager {
         Ok(())
     }
 
+    /// Discovers the selected location before applying the extraction flag.
+    /// User-managed grids are catalogued even when extraction is disabled.
+    async fn discover_existing_trickplay(
+        &self,
+        entity: &BaseItemEntity,
+        item_id: Uuid,
+        media_path: &str,
+        save_with_media: bool,
+        options: &TrickplayOptions,
+    ) -> Result<(), ServiceError> {
+        self.prune_orphaned_rows(item_id, media_path).await?;
+        let mut existing = self.resolutions_for(item_id).await?;
+        let root = self
+            .path_manager
+            .trickplay_directory(item_id, media_path, save_with_media);
+        if !Path::new(&root).is_dir() {
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(&root)
+            .map_err(|error| ServiceError::backend(format!("cannot list trickplay: {error}")))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ServiceError::backend(format!("cannot list trickplay: {error}"))
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some((width, tile_width, tile_height)) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_grid_name)
+            else {
+                continue;
+            };
+            if existing.contains_key(&width) {
+                continue;
+            }
+            let mut tiles = Vec::new();
+            for tile in std::fs::read_dir(&path).map_err(|error| {
+                ServiceError::backend(format!("cannot read trickplay grid: {error}"))
+            })? {
+                let tile = tile
+                    .map_err(|error| {
+                        ServiceError::backend(format!("cannot list trickplay grid: {error}"))
+                    })?
+                    .path();
+                if tile.is_file()
+                    && tile
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
+                {
+                    tiles.push(tile.to_string_lossy().into_owned());
+                }
+            }
+            tiles.sort();
+            let Some(first) = tiles.first() else {
+                continue;
+            };
+            let Some((interval, thumbnail_count)) = discovered_timing(
+                entity.run_time_ticks,
+                tiles.len(),
+                tile_width,
+                tile_height,
+                options.interval,
+            ) else {
+                // No valid row can represent an overflowing/unusable grid.
+                tracing::warn!(directory = %path.display(), "invalid trickplay tile capacity");
+                continue;
+            };
+            let size = self.image_encoder.get_image_size(first).await?;
+            let mut info = TrickplayInfoEntity {
+                item_id: guid_to_db(item_id),
+                width,
+                tile_width,
+                tile_height,
+                interval,
+                thumbnail_count,
+                height: ceil_div(size.height, tile_height).max(1),
+                bandwidth: 0,
+            };
+            for tile in &tiles {
+                let bytes = std::fs::metadata(tile)
+                    .map_err(|error| ServiceError::backend(format!("cannot stat tile: {error}")))?
+                    .len();
+                info.bandwidth =
+                    info.bandwidth
+                        .max(tile_bitrate(bytes, tile_width, tile_height, interval));
+            }
+            self.save_trickplay_info(&info).await?;
+            existing.insert(width, info);
+            tracing::debug!(item_id = %item_id, width, interval, thumbnail_count, "discovered existing trickplay grid");
+        }
+        Ok(())
+    }
+
     /// The trailing cleanup of `RefreshTrickplayDataAsync`: removes tile
     /// folders in the trickplay directory that no stored row accounts for.
     async fn prune_unexpected_folders(
@@ -535,13 +727,9 @@ impl FerrofinTrickplayManager {
     /// Moves this item's generated trickplay tiles to the location the
     /// configuration dictates.
     ///
-    /// Port of `MoveGeneratedTrickplayDataAsync`. Ferrofin has no per-library
-    /// `SaveTrickplayWithMedia` option (see `ferrofin-providers`'
-    /// `LibraryOptions`), so the configured location is always the **internal**
-    /// data-dir layout: any tiles found in a media-adjacent `.trickplay` folder
-    /// are moved into the internal directory (media wins over an already
-    /// populated internal folder, as in the C#), and the emptied `.trickplay`
-    /// parent folder is removed.
+    /// Port of `MoveGeneratedTrickplayDataAsync`: reads the owning library's
+    /// current extraction flag and destination on every task invocation.
+    /// Moves either way and removes the emptied source container.
     ///
     /// This is an inherent method (not on the [`TrickplayManager`] trait),
     /// consumed by the "Migrate Trickplay Image Location" scheduled task.
@@ -551,78 +739,111 @@ impl FerrofinTrickplayManager {
     /// Returns [`ServiceError`] when the item lookup, configuration read, or a
     /// filesystem move fails.
     pub async fn move_generated_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        self.move_trickplay_data(item_id, false).await
+    }
+
+    /// The source migration task selects physical Video kinds, including owned
+    /// extras and complete channel VOD. SourceTypes is declared but not consumed
+    /// by the pinned query. Keep its other filters outside the public manager.
+    pub(crate) async fn move_generated_library_trickplay_data(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        self.move_trickplay_data(item_id, true).await
+    }
+
+    async fn move_trickplay_data(
+        &self,
+        item_id: Uuid,
+        library_only: bool,
+    ) -> Result<(), ServiceError> {
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
-        let options = self.trickplay_options().await?;
-        let Some(media_path) = Self::can_generate_trickplay(&entity, options.interval) else {
+        if library_only && !is_library_video(&entity) {
+            return Ok(());
+        }
+        let Some(library) = self.library_options(&entity).await? else {
             return Ok(());
         };
-
+        if !library.enable_trickplay_image_extraction {
+            return Ok(());
+        }
+        let options = self.trickplay_options().await?;
+        let streams = self.media_streams(item_id).await?;
+        let Some(media_path) = Self::can_generate_trickplay(
+            &entity,
+            options.interval,
+            !streams.is_empty(),
+            self.is_active_recording(&entity).await?,
+        ) else {
+            return Ok(());
+        };
         let local_root = self
             .path_manager
             .trickplay_directory(item_id, &media_path, false);
         let media_root = self
             .path_manager
             .trickplay_directory(item_id, &media_path, true);
-
+        let (source_root, destination_root) = if library.save_trickplay_with_media {
+            (&local_root, &media_root)
+        } else {
+            (&media_root, &local_root)
+        };
         for info in self.resolutions_for(item_id).await?.values() {
             let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
-            let media_dir = Path::new(&media_root).join(&sub);
-            let local_dir = Path::new(&local_root).join(&sub);
-            if !media_dir.is_dir() {
-                continue;
-            }
-            // Mirror the C# guard: move when the media-adjacent folder has
-            // files and the internal one is either absent or itself populated
-            // (the move replaces it).
-            let local_exists = local_dir.exists();
-            if has_tiles(&media_dir) && (!local_exists || has_tiles(&local_dir)) {
-                move_content(&media_dir, &local_dir)?;
-                tracing::info!(
-                    item = %item_id,
-                    to = %local_dir.display(),
-                    "moved trickplay images"
-                );
+            let source = Path::new(source_root).join(&sub);
+            let destination = Path::new(destination_root).join(&sub);
+            // Match the source's enumerated-file guard, including a populated
+            // destination that receives matching-file overwrites, while an
+            // existing empty destination remains untouched.
+            if source.is_dir()
+                && has_files(&source)?
+                && (!destination.is_dir() || has_files(&destination)?)
+            {
+                move_content(&source, &destination)?;
+                tracing::info!(item = %item_id, to = %destination.display(), "moved trickplay images");
             }
         }
         Ok(())
     }
-}
-
-#[async_trait]
-impl TrickplayManager for FerrofinTrickplayManager {
-    async fn refresh_trickplay_data(
+    /// Scan callers supply the fresh probe context; scheduled tasks read it
+    /// from the repository. Both use one extraction and storage implementation.
+    async fn refresh_media(
         &self,
         item_id: Uuid,
+        entity: &BaseItemEntity,
+        video_stream: Option<MediaStream>,
+        has_streams: bool,
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
-        let Some(entity) = self.items.retrieve_item(item_id).await? else {
+        let mut options = self.trickplay_options().await?;
+        let Some(media_path) = Self::can_generate_trickplay(
+            entity,
+            options.interval,
+            has_streams,
+            self.is_active_recording(entity).await?,
+        ) else {
             return Ok(());
         };
-        let options = self.trickplay_options().await?;
-        let Some(media_path) = Self::can_generate_trickplay(&entity, options.interval) else {
-            return Ok(());
-        };
-        // Video backdrops are supported media but never get trickplay.
-        if Path::new(&media_path)
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|n| n.eq_ignore_ascii_case("backdrops"))
-        {
-            tracing::debug!(item = %item_id, path = media_path, "ignoring backdrop media");
-            return Ok(());
-        }
-
         // Catalog what is already on disk before pruning or generating.
         if !replace {
-            self.prune_orphaned_rows(item_id, &media_path).await?;
+            self.discover_existing_trickplay(
+                entity,
+                item_id,
+                &media_path,
+                library_options.save_trickplay_with_media,
+                &options,
+            )
+            .await?;
         }
 
-        let trickplay_dir = self
-            .path_manager
-            .trickplay_directory(item_id, &media_path, false);
+        let trickplay_dir = self.path_manager.trickplay_directory(
+            item_id,
+            &media_path,
+            library_options.save_trickplay_with_media,
+        );
 
         let enabled = library_options.enable_trickplay_image_extraction;
         // When extraction is disabled and files live next to media, treat them
@@ -647,11 +868,12 @@ impl TrickplayManager for FerrofinTrickplayManager {
             }
         }
 
+        Self::clamp_generation_interval(&mut options);
         tracing::debug!(item = %item_id, replace, "trickplay refresh");
         let ctx = WidthRefreshContext {
             item_id,
             media_path: &media_path,
-            video_stream: self.video_stream(item_id).await,
+            video_stream,
             trickplay_dir: &trickplay_dir,
         };
         for width in &options.width_resolutions {
@@ -666,6 +888,72 @@ impl TrickplayManager for FerrofinTrickplayManager {
         }
 
         self.prune_unexpected_folders(item_id, &trickplay_dir).await
+    }
+}
+
+#[async_trait]
+impl TrickplayManager for FerrofinTrickplayManager {
+    async fn refresh_trickplay_data(
+        &self,
+        item_id: Uuid,
+        replace: bool,
+        library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let Some(entity) = self.items.retrieve_item(item_id).await? else {
+            return Ok(());
+        };
+        let streams = self.media_streams(item_id).await?;
+        let has_streams = !streams.is_empty();
+        let stream = streams
+            .into_iter()
+            .find(|stream| {
+                stream.stream_type
+                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
+            })
+            .map(stream_to_dto);
+        self.refresh_media(
+            item_id,
+            &entity,
+            stream,
+            has_streams,
+            replace,
+            library_options,
+        )
+        .await
+    }
+
+    async fn refresh_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: Option<&[ferrofin_db::entities::base_items::MediaStreamInfoEntity]>,
+        replace: bool,
+        library_options: &LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let stored_streams;
+        let streams = if let Some(streams) = streams {
+            streams
+        } else {
+            stored_streams = self.media_streams(item_id).await?;
+            &stored_streams
+        };
+        let stream = streams
+            .iter()
+            .find(|stream| {
+                stream.stream_type
+                    == crate::db_error::media_stream_type_to_disc(MediaStreamType::Video)
+            })
+            .cloned()
+            .map(stream_to_dto);
+        self.refresh_media(
+            item_id,
+            entity,
+            stream,
+            !streams.is_empty(),
+            replace,
+            library_options,
+        )
+        .await
     }
 
     async fn get_trickplay_resolutions(
@@ -854,22 +1142,108 @@ impl TrickplayManager for FerrofinTrickplayManager {
         width: i32,
         index: i32,
     ) -> Result<Option<String>, ServiceError> {
-        // Port of C# `GetTrickplayTilePathAsync`: locate the resolution, then
-        // build `{trickplay-dir}/{width} - {tw}x{th}/{index}.jpg`. The C#
-        // `saveWithMedia` flag (a per-library option) is not modeled at this
-        // seam, so the internal (non-save-with-media) directory is used; the
-        // media path it ignores is passed empty.
+        // Resolve the library live, so toggling the option affects HTTP tile
+        // reads immediately. Existing data is moved by the migration task.
         let resolutions = self.resolutions_for(item_id).await?;
         let Some(info) = resolutions.get(&width) else {
             return Ok(None);
         };
-        let base = self.path_manager.trickplay_directory(item_id, "", false);
+        let entity = self.items.retrieve_item(item_id).await?;
+        let library = if let Some(entity) = entity.as_ref() {
+            self.library_options(entity).await?
+        } else {
+            None
+        };
+        let base = self.path_manager.trickplay_directory(
+            item_id,
+            entity
+                .as_ref()
+                .and_then(|row| row.path.as_deref())
+                .unwrap_or_default(),
+            library.is_some_and(|options| options.save_trickplay_with_media),
+        );
         let subdir = format!("{} - {}x{}", width, info.tile_width, info.tile_height);
         let path = std::path::Path::new(&base)
             .join(subdir)
             .join(format!("{index}.jpg"));
         Ok(Some(path.to_string_lossy().into_owned()))
     }
+}
+
+/// Physical Video kinds accepted by the scheduled tasks, including owned extras.
+/// The pinned query never consumes SourceTypes, so complete channel VOD remains eligible.
+pub(crate) fn is_library_video(entity: &BaseItemEntity) -> bool {
+    !entity.is_folder
+        && !entity.is_virtual_item
+        && entity
+            .media_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("Video"))
+        && matches!(
+            crate::item_type_lookup::kind_from_type_name(&entity.type_),
+            Some(
+                ferrofin_model::data::BaseItemKind::Movie
+                    | ferrofin_model::data::BaseItemKind::Episode
+                    | ferrofin_model::data::BaseItemKind::MusicVideo
+                    | ferrofin_model::data::BaseItemKind::Trailer
+                    | ferrofin_model::data::BaseItemKind::Video
+            )
+        )
+}
+
+/// The pinned `^(\d+) - (\d+)x(\d+)$` grid shape. All dimensions must be
+/// positive and fit the stored i32 row; malformed user folders are ignored.
+fn parse_grid_name(name: &str) -> Option<(i32, i32, i32)> {
+    let (width, grid) = name.split_once(" - ")?;
+    let (columns, rows) = grid.split_once('x')?;
+    let number = |value: &str| {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| value.parse::<i32>().ok())
+            .flatten()
+            .filter(|value| *value > 0)
+    };
+    Some((number(width)?, number(columns)?, number(rows)?))
+}
+
+/// Infers padded tile count/interval exactly as DiscoverExistingTrickplayAsync:
+/// retain the configured interval if consistent, otherwise snap the midpoint
+/// to seconds with .NET midpoint-to-even rounding and clamp to the bounds.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // Bounds are checked before conversion; video runtimes fit exact f64 integers.
+fn discovered_timing(
+    runtime_ticks: Option<i64>,
+    files: usize,
+    tile_width: i32,
+    tile_height: i32,
+    configured_interval: i32,
+) -> Option<(i32, i32)> {
+    let capacity = tile_width
+        .checked_mul(tile_height)
+        .filter(|capacity| *capacity > 0)?;
+    let files = i32::try_from(files).ok().filter(|files| *files > 0)?;
+    let maximum = files.checked_mul(capacity)?;
+    maximum.checked_add(capacity - 1)?;
+    let minimum = (files - 1).checked_mul(capacity)?.checked_add(1)?;
+    let Some(runtime_ticks) = runtime_ticks else {
+        return Some((configured_interval.max(MIN_INTERVAL_MS), maximum));
+    };
+    let runtime_ms = (runtime_ticks / TICKS_PER_MS).max(0) as f64;
+    let min_interval = (runtime_ms / f64::from(maximum)).ceil().max(1000.0);
+    let max_interval = (runtime_ms / f64::from(minimum)).floor().max(min_interval);
+    let interval = if f64::from(configured_interval) >= min_interval
+        && f64::from(configured_interval) <= max_interval
+    {
+        f64::from(configured_interval)
+    } else {
+        ((min_interval.midpoint(max_interval) / 1000.0).round_ties_even() * 1000.0)
+            .clamp(min_interval, max_interval)
+    };
+    if interval > f64::from(i32::MAX) {
+        return None;
+    }
+    let count = (runtime_ms / interval)
+        .round_ties_even()
+        .clamp(f64::from(minimum), f64::from(maximum)) as i32;
+    Some((interval as i32, count))
 }
 
 /// Formats a floating-point duration like C#'s `{0:0.###}` — up to three
@@ -983,15 +1357,77 @@ fn move_dir(src: &Path, dst: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// ManagedFileSystem.MoveDirectory: rename when possible; otherwise copy flat
+/// source files with overwrite, preserving other populated destination files.
+fn move_migration_directory(src: &Path, dst: &Path) -> Result<(), ServiceError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ServiceError::backend(format!("cannot create migration parent: {error}"))
+        })?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst).map_err(|error| {
+        ServiceError::backend(format!("cannot create migration destination: {error}"))
+    })?;
+    for entry in std::fs::read_dir(src)
+        .map_err(|error| ServiceError::backend(format!("cannot read migration source: {error}")))?
+    {
+        let entry = entry.map_err(|error| {
+            ServiceError::backend(format!("cannot list migration source: {error}"))
+        })?;
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).map_err(|error| {
+                ServiceError::backend(format!("cannot copy migrated tile: {error}"))
+            })?;
+        }
+    }
+    std::fs::remove_dir_all(src).map_err(|error| {
+        ServiceError::backend(format!("cannot remove migration source: {error}"))
+    })?;
+    Ok(())
+}
+
+/// Migration checks any file, whereas discovery checks specifically JPEGs.
+fn has_files(directory: &Path) -> Result<bool, ServiceError> {
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        ServiceError::backend(format!("cannot read migration directory: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ServiceError::backend(format!("cannot list migration directory: {error}"))
+        })?;
+        if entry.path().is_file() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Port of the C# `MoveContent`: moves `src` into `dst`, then removes `src`'s
 /// now-empty parent folder (the `.trickplay` container) when nothing is left in
 /// it.
 fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
-    move_dir(src, dst)?;
-    if let Some(parent) = src.parent()
-        && std::fs::read_dir(parent).is_ok_and(|mut d| d.next().is_none())
-    {
-        let _ = std::fs::remove_dir(parent);
+    move_migration_directory(src, dst)?;
+    if let Some(parent) = src.parent() {
+        let entries = std::fs::read_dir(parent).map_err(|error| {
+            ServiceError::backend(format!("cannot read migration source parent: {error}"))
+        })?;
+        let mut has_directories = false;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ServiceError::backend(format!("cannot list migration source parent: {error}"))
+            })?;
+            has_directories |= entry.path().is_dir();
+        }
+        // The source enumerates directories, then attempts a nonrecursive
+        // deletion. Remaining ordinary files cause its reported cleanup error.
+        if !has_directories {
+            std::fs::remove_dir(parent).map_err(|error| {
+                ServiceError::backend(format!("cannot remove migration source parent: {error}"))
+            })?;
+        }
     }
     Ok(())
 }
@@ -1015,9 +1451,11 @@ mod tests {
     use async_trait::async_trait;
     use ferrofin_db::Database;
     use ferrofin_drawing::ImageCrateEncoder;
+    use ferrofin_model::entities::MediaStreamType;
     use ferrofin_traits::configuration::ServerConfigurationManager;
     use ferrofin_traits::error::ServiceError;
     use ferrofin_traits::media_encoding::TrickplayFrameExtractor;
+    use ferrofin_traits::persistence::MediaStreamRepository as _;
     use ferrofin_traits::system::PathManager;
     use ferrofin_traits::trickplay::TrickplayManager;
 
@@ -1083,6 +1521,8 @@ mod tests {
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
+        last_output: Mutex<Option<String>>,
+        hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl FakeExtractor {
@@ -1093,6 +1533,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
                 last_stream: Mutex::new(None),
+                last_output: Mutex::new(None),
+                hold: None,
             }
         }
 
@@ -1122,6 +1564,7 @@ mod tests {
                 Some((request.interval_ms, request.max_width));
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             let output_dir = request.output_dir;
+            *self.last_output.lock().unwrap() = Some(output_dir.to_owned());
             let max_width = request.max_width;
             std::fs::create_dir_all(output_dir).expect("create frames dir");
             let width = u32::try_from(max_width).expect("positive width");
@@ -1133,6 +1576,10 @@ mod tests {
                     .expect("write frame jpg");
                 paths.push(path.to_string_lossy().into_owned());
             }
+            if let Some((entered, release)) = &self.hold {
+                entered.notify_one();
+                release.notified().await;
+            }
             Ok(paths)
         }
     }
@@ -1140,7 +1587,7 @@ mod tests {
     /// The full manager fixture: temp app paths, real path manager / item
     /// repository / `image`-crate encoder, fake config + extractor.
     struct Rig {
-        _tmp: tempfile::TempDir,
+        temp_dir: tempfile::TempDir,
         mgr: FerrofinTrickplayManager,
         extractor: Arc<FakeExtractor>,
         pm: Arc<dyn PathManager>,
@@ -1169,7 +1616,7 @@ mod tests {
             Arc::new(ImageCrateEncoder::new()),
         );
         Rig {
-            _tmp: tmp,
+            temp_dir: tmp,
             mgr,
             extractor,
             pm,
@@ -1206,7 +1653,7 @@ mod tests {
         runtime_ticks: Option<i64>,
         video_width: Option<i64>,
     ) -> String {
-        seed_item(db, id, BaseItemKind::Movie).await;
+        crate::test_support::seed_video_item(db, id, BaseItemKind::Movie).await;
         let media_path = rig.media_dir.join(format!("{id}.mkv"));
         std::fs::write(&media_path, b"not really a video").expect("media file");
         let path_str = media_path.to_string_lossy().into_owned();
@@ -1221,6 +1668,20 @@ mod tests {
         .execute(db.writer())
         .await
         .expect("update item media fields");
+        let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
+        repo.save_media_streams(
+            id,
+            &[ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                item_id: guid_to_db(id),
+                stream_index: 1,
+                stream_type: crate::db_error::media_stream_type_to_disc(MediaStreamType::Video),
+                codec: Some("h264".to_owned()),
+                width: video_width,
+                ..Default::default()
+            }],
+        )
+        .await
+        .expect("seed eligible media stream");
         path_str
     }
 
@@ -1297,7 +1758,6 @@ mod tests {
         dar: Option<&str>,
         width: Option<i64>,
     ) {
-        use ferrofin_traits::persistence::MediaStreamRepository as _;
         let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
         let row = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
             item_id: guid_to_db(item),
@@ -1342,20 +1802,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_without_a_video_stream_still_extracts() {
-        // An item whose streams were never probed still gets trickplay, on the
-        // software path. Degrading is correct; failing the refresh is not.
+    async fn audio_only_streams_allow_outer_pruning_but_do_not_encode() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
-        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
-
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let repo = crate::FerrofinMediaStreamRepository::new(db.clone());
+        repo.save_media_streams(
+            item,
+            &[ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                item_id: guid_to_db(item),
+                stream_index: 0,
+                stream_type: crate::db_error::media_stream_type_to_disc(MediaStreamType::Audio),
+                codec: Some("aac".to_owned()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let grid = root.join("320 - 10x10");
+        std::fs::create_dir_all(&grid).unwrap();
+        image::RgbImage::new(3200, 1800)
+            .save(grid.join("0.jpg"))
+            .unwrap();
+        r.mgr.save_trickplay_info(&info(item, 320)).await.unwrap();
         r.mgr
-            .refresh_trickplay_data(item, false, &extraction_on())
+            .refresh_trickplay_data(item, false, &LibraryOptions::default())
             .await
-            .expect("refresh");
-
-        assert_eq!(r.extractor.calls(), 1);
+            .unwrap();
+        assert!(
+            !root.exists(),
+            "all-stream eligibility permits disabled internal pruning"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        r.mgr
+            .refresh_trickplay_data(item, true, &extraction_on())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "the caught per-width missing-video error never encodes"
+        );
         assert!(r.extractor.last_stream().is_none());
     }
 
@@ -1458,7 +1953,14 @@ mod tests {
         assert_eq!(r.extractor.calls(), 0, "import path never extracts");
         let res = r.mgr.get_trickplay_resolutions(item).await.expect("res");
         let row = &res[&320];
-        assert_eq!(row.thumbnail_count, 1, "one tile file imported");
+        assert_eq!(
+            row.thumbnail_count, 2,
+            "padded thumbnail count is inferred from runtime"
+        );
+        assert_eq!(
+            row.interval, 2_250_000,
+            "incompatible configured interval is inferred from the grid bounds"
+        );
         assert_eq!(row.height, 180, "tile height / grid rows");
         assert!(row.bandwidth > 0);
     }
@@ -1469,6 +1971,20 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        // Saved defaults keep extraction off; a normal refresh does not start
+        // ffmpeg or insert a manifest row before the library opts in.
+        r.mgr
+            .refresh_trickplay_data(item, false, &LibraryOptions::default())
+            .await
+            .expect("initial disabled refresh");
+        assert_eq!(r.extractor.calls(), 0);
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         r.mgr
             .refresh_trickplay_data(item, false, &extraction_on())
             .await
@@ -1491,9 +2007,34 @@ mod tests {
                 .is_empty()
         );
 
-        // Save-with-media + disabled: user-managed, left alone.
+        // RegenerateTrickplay in a full refresh sets replace even when the
+        // enable flag is off: the pinned manager deliberately regenerates.
+        r.mgr
+            .refresh_trickplay_data(item, true, &LibraryOptions::default())
+            .await
+            .expect("forced generation despite extraction being disabled");
+        assert_eq!(r.extractor.calls(), 2);
+        assert!(tile_dir.join("0.jpg").is_file());
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .contains_key(&320)
+        );
+        r.mgr
+            .refresh_trickplay_data(item, false, &LibraryOptions::default())
+            .await
+            .expect("normal refresh resumes disabled pruning");
+        assert_eq!(r.extractor.calls(), 2);
+        assert!(!tile_dir.exists());
+
+        // Save-with-media + disabled: user-managed, catalogued and left alone.
+        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
         std::fs::create_dir_all(&tile_dir).expect("tile dir");
-        std::fs::write(tile_dir.join("0.jpg"), b"x").expect("tile");
+        image::RgbImage::new(640, 360)
+            .save(tile_dir.join("0.jpg"))
+            .expect("valid tile");
         r.mgr
             .refresh_trickplay_data(
                 item,
@@ -1506,6 +2047,59 @@ mod tests {
             .await
             .expect("leave alone");
         assert!(tile_dir.join("0.jpg").is_file(), "user-managed tiles kept");
+    }
+
+    #[tokio::test]
+    async fn missing_and_backdrop_files_do_not_bypass_disabled_outer_cleanup() {
+        for backdrop in [false, true] {
+            let db = test_db().await;
+            let item = Uuid::new_v4();
+            let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+            let mut media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+            if backdrop {
+                let directory = r.media_dir.join("backdrops");
+                std::fs::create_dir_all(&directory).unwrap();
+                let path = directory.join("background.mkv");
+                std::fs::rename(&media, &path).unwrap();
+                media = path.to_string_lossy().into_owned();
+                let mut entity = crate::test_support::fetch_item(&db, item).await;
+                entity.path = Some(media.clone());
+                crate::test_support::save_item(&db, &entity).await;
+            } else {
+                std::fs::remove_file(&media).unwrap();
+            }
+            let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+            let grid = root.join("320 - 2x2");
+            std::fs::create_dir_all(&grid).unwrap();
+            image::RgbImage::new(640, 360)
+                .save(grid.join("0.jpg"))
+                .unwrap();
+            r.mgr.save_trickplay_info(&info(item, 320)).await.unwrap();
+            r.mgr
+                .refresh_trickplay_data(item, false, &LibraryOptions::default())
+                .await
+                .unwrap();
+            assert!(
+                !root.exists(),
+                "source disabled cleanup precedes missing-file/backdrop checks"
+            );
+            assert!(
+                r.mgr
+                    .get_trickplay_resolutions(item)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            r.mgr
+                .refresh_trickplay_data(item, true, &extraction_on())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.extractor.calls(),
+                0,
+                "missing/backdrop media still skips actual encoding"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1580,22 +2174,16 @@ mod tests {
     }
 
     /// `if (mediaSource.VideoStream.Width is not null && … < width)`
-    /// (`TrickplayManager.cs:427-431`): a stream with no width, or no stream
-    /// at all, caps nothing — even when the item row's `Width` is the 0 a
-    /// dimensionless probe writes — so trickplay is still extracted at the
-    /// configured width.
-    #[rstest::rstest]
-    #[case::stream_without_width(true)]
-    #[case::no_stream(false)]
+    /// (`TrickplayManager.cs:427-431`): a video stream with no width caps
+    /// nothing, even when the item row has the zero width from a dimensionless
+    /// probe. Missing video streams are covered by the audio-only regression.
     #[tokio::test]
-    async fn an_unknown_video_width_caps_nothing(#[case] with_stream: bool) {
+    async fn an_unknown_video_width_caps_nothing() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(2, 180));
         seed_video(&db, &r, item, Some(HOUR_TICKS), Some(0)).await;
-        if with_stream {
-            seed_sized_video_stream(&db, item, "h264", None, None).await;
-        }
+        seed_sized_video_stream(&db, item, "h264", None, None).await;
 
         r.mgr
             .refresh_trickplay_data(item, false, &extraction_on())
@@ -1621,7 +2209,7 @@ mod tests {
             .expect("save");
         // A folder no row accounts for → unexpected.
         let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
-        let stray = root.join("999 - 3x3");
+        let stray = root.join("unexpected-folder");
         std::fs::create_dir_all(&stray).expect("stray dir");
         std::fs::write(stray.join("0.jpg"), b"x").expect("stray tile");
 
@@ -1648,6 +2236,8 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders);
 
         // A stored row plus tiles living media-adjacent (`{stem}.trickplay`).
         let mut row = info(item, 320);
@@ -1677,6 +2267,8 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders);
 
         // Row + internal tiles only: nothing to move, nothing destroyed.
         let mut row = info(item, 320);
@@ -1763,5 +2355,757 @@ mod tests {
                 .expect("tile")
                 .is_none()
         );
+    }
+    #[test]
+    fn user_grid_names_and_padded_thumbnail_timing_are_source_compatible() {
+        assert_eq!(super::parse_grid_name("640 - 3x2"), Some((640, 3, 2)));
+        for name in [
+            "640-3x2",
+            "640 - 3X2",
+            "640 - 3x2x1",
+            "0 - 3x2",
+            "640 - 0x2",
+            "640 - 3x0",
+            "999999999999999999 - 3x2",
+            " 640 - 3x2",
+        ] {
+            assert!(super::parse_grid_name(name).is_none(), "{name}");
+        }
+        assert_eq!(
+            super::discovered_timing(Some(60_000 * 10_000), 2, 3, 2, 10_000),
+            Some((7_000, 9)),
+            "configured 10s cannot fit two partially padded grids"
+        );
+        assert_eq!(
+            super::discovered_timing(Some(60_000 * 10_000), 2, 3, 2, 6_000),
+            Some((6_000, 10)),
+            "compatible configured interval is retained"
+        );
+        assert_eq!(
+            super::discovered_timing(Some(5_000 * 10_000), 1, 5, 1, 2_000),
+            Some((2_000, 2)),
+            ".NET rounds 2.5 to even"
+        );
+        assert_eq!(
+            super::discovered_timing(None, 2, 3, 2, 100),
+            Some((1000, 12))
+        );
+        assert!(super::discovered_timing(Some(HOUR_TICKS), 2, i32::MAX, 2, 10_000).is_none());
+        assert!(super::discovered_timing(Some(HOUR_TICKS), usize::MAX, 2, 2, 10_000).is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_sidecars_are_catalogued_at_their_own_grid_without_extracting_or_deleting() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(60_000 * 10_000), None).await;
+        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let tiles = root.join("640 - 3x2");
+        std::fs::create_dir_all(&tiles).unwrap();
+        for index in 0..2 {
+            image::RgbImage::new(1920, 360)
+                .save(tiles.join(format!("{index}.jpg")))
+                .unwrap();
+        }
+        // Malformed/empty grids do not produce database entries. A zero grid
+        // is rejected before dividing, and overflow never reaches row storage.
+        for name in [
+            "800 - 0x2",
+            "900 - 2x0",
+            "0 - 2x2",
+            "800 - 9999999999x2",
+            "unrelated",
+            "800 - 2x2",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let bytes = std::fs::read(tiles.join("0.jpg")).unwrap();
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.extractor.calls(), 0);
+        assert_eq!(std::fs::read(tiles.join("0.jpg")).unwrap(), bytes);
+        let resolutions = r.mgr.get_trickplay_resolutions(item).await.unwrap();
+        assert_eq!(resolutions.len(), 1);
+        let info = &resolutions[&640];
+        assert_eq!(
+            (info.tile_width, info.tile_height, info.height),
+            (3, 2, 180)
+        );
+        assert_eq!((info.interval, info.thumbnail_count), (7_000, 9));
+        assert!(info.bandwidth > 0);
+        assert!(
+            r.mgr.get_trickplay_manifest(item).await.unwrap()[&item.simple().to_string()]
+                .contains_key(&640)
+        );
+        assert!(
+            r.mgr
+                .get_hls_playlist(item, 640, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("LAYOUT=3x2")
+        );
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "a second disabled refresh reuses catalogued data"
+        );
+        // Pruning checks both locations before dropping rows; deleting the
+        // selected files makes the next discovery remove the orphaned row.
+        std::fs::remove_dir_all(&tiles).unwrap();
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[tokio::test]
+    async fn scan_without_a_new_probe_uses_stored_streams_and_adopts_disabled_user_grid() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(2, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        seed_sized_video_stream(&db, item, "h264", None, Some(200)).await;
+        let mut entity = r.mgr.items.retrieve_item(item).await.unwrap().unwrap();
+        entity.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
+        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("640 - 3x2");
+        std::fs::create_dir_all(&grid).unwrap();
+        image::RgbImage::new(1920, 360)
+            .save(grid.join("0.jpg"))
+            .unwrap();
+        let before = std::fs::read(grid.join("0.jpg")).unwrap();
+        r.mgr
+            .refresh_trickplay_for_media(
+                item,
+                &entity,
+                None,
+                false,
+                &LibraryOptions {
+                    extract_trickplay_images_during_library_scan: true,
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .contains_key(&640)
+        );
+        assert_eq!(std::fs::read(grid.join("0.jpg")).unwrap(), before);
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "disabled extraction adopts cached sidecar without encoding"
+        );
+        r.mgr
+            .refresh_trickplay_for_media(item, &entity, None, true, &extraction_on())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.last_request(),
+            Some((10_000, 200)),
+            "no fresh probe still carries persisted stream dimensions"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_running_scan_removes_its_partially_written_frame_directory() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(2, 180);
+        extractor.hold = Some((entered.clone(), release));
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let manager = r.mgr.clone();
+        let work = tokio::spawn(async move {
+            manager
+                .refresh_trickplay_data(item, false, &extraction_on())
+                .await
+        });
+        entered.notified().await;
+        let directory = PathBuf::from(r.extractor.last_output.lock().unwrap().clone().unwrap());
+        assert!(
+            directory.join("00000001.jpg").exists(),
+            "encoder wrote a partial frame before suspension"
+        );
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert!(
+            !directory.exists(),
+            "source finally cleanup runs when the future is dropped"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    async fn configured_library(
+        rig: &Rig,
+        save_with_media: bool,
+    ) -> (Arc<crate::FerrofinVirtualFolderManager>, LibraryOptions) {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            rig.temp_dir.path().join("views"),
+        ));
+        let options = LibraryOptions {
+            path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                path: rig.media_dir.to_string_lossy().into_owned(),
+            }],
+            enable_trickplay_image_extraction: true,
+            save_trickplay_with_media: save_with_media,
+            ..LibraryOptions::default()
+        };
+        folders
+            .add_virtual_folder(
+                "Movies",
+                Some(ferrofin_model::entities::CollectionTypeOptions::movies),
+                &options,
+            )
+            .await
+            .unwrap();
+        (folders, options)
+    }
+
+    #[tokio::test]
+    async fn sidecar_generation_and_http_lookup_honor_the_library_destination_without_fallback() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, mut options) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert!(sidecar.join("320 - 2x2/0.jpg").is_file());
+        assert!(!internal.exists());
+        assert_eq!(
+            r.mgr.get_trickplay_tile_path(item, 320, 0).await.unwrap(),
+            Some(
+                sidecar
+                    .join("320 - 2x2/0.jpg")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        let original = std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap();
+        options.enable_trickplay_image_extraction = false;
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        assert_eq!(r.extractor.calls(), 1, "disabled sidecars are user-managed");
+        assert_eq!(
+            std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap(),
+            original
+        );
+        r.mgr
+            .refresh_trickplay_data(item, true, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            2,
+            "forced replacement still uses the selected sidecar"
+        );
+        std::fs::remove_dir_all(&sidecar).unwrap();
+        std::fs::write(&sidecar, b"blocked output destination").unwrap();
+        r.mgr
+            .refresh_trickplay_data(item, true, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"blocked output destination"
+        );
+        assert!(
+            !internal.exists(),
+            "a failed sidecar write does not choose internal storage"
+        );
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .unwrap()
+                .is_empty(),
+            "failed writing cannot leave a manifest pointing at absent tiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_destination_changes_move_both_ways_and_disabled_extraction_prevents_migration() {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(6, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, mut options) = configured_library(&r, false).await;
+        r.mgr.attach_virtual_folders(folders.clone());
+        r.mgr
+            .refresh_trickplay_data(item, false, &options)
+            .await
+            .unwrap();
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let original = std::fs::read(internal.join("320 - 2x2/0.jpg")).unwrap();
+        for save in [true, false] {
+            options.save_trickplay_with_media = save;
+            folders
+                .update_library_options("Movies", &options)
+                .await
+                .unwrap();
+            let selected = if save { &sidecar } else { &internal };
+            let old = if save { &internal } else { &sidecar };
+            let tile = selected.join("320 - 2x2/0.jpg");
+            assert_eq!(
+                r.mgr.get_trickplay_tile_path(item, 320, 0).await.unwrap(),
+                Some(tile.to_string_lossy().into_owned()),
+                "HTTP lookup reads the new option live"
+            );
+            assert!(
+                !tile.exists(),
+                "changing the checkbox alone does not relocate data"
+            );
+            r.mgr.move_generated_trickplay_data(item).await.unwrap();
+            assert_eq!(std::fs::read(&tile).unwrap(), original);
+            assert!(
+                !old.exists(),
+                "empty source container is cleaned after migration"
+            );
+            assert_eq!(
+                r.extractor.calls(),
+                1,
+                "migration reuses tiles instead of re-encoding"
+            );
+        }
+        options.enable_trickplay_image_extraction = false;
+        options.save_trickplay_with_media = true;
+        folders
+            .update_library_options("Movies", &options)
+            .await
+            .unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert!(internal.join("320 - 2x2/0.jpg").is_file());
+        assert!(
+            !sidecar.exists(),
+            "disabled extraction leaves generated data in place during migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_overwrites_matching_tiles_preserves_other_files_and_skips_empty_destination()
+    {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::write(internal.join("0.jpg"), b"source").unwrap();
+        std::fs::create_dir_all(&sidecar).unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert!(
+            internal.join("0.jpg").exists(),
+            "an existing empty destination is skipped by the pinned guard"
+        );
+        std::fs::write(sidecar.join("0.jpg"), b"old collision").unwrap();
+        std::fs::write(sidecar.join("extra.jpg"), b"preserved destination file").unwrap();
+        r.mgr.move_generated_trickplay_data(item).await.unwrap();
+        assert_eq!(std::fs::read(sidecar.join("0.jpg")).unwrap(), b"source");
+        assert_eq!(
+            std::fs::read(sidecar.join("extra.jpg")).unwrap(),
+            b"preserved destination file"
+        );
+        assert!(!internal.exists());
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_reports_a_file_blocking_the_selected_destination_and_retains_the_source() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+        std::fs::create_dir_all(&internal).unwrap();
+        std::fs::write(internal.join("0.jpg"), b"source tiles").unwrap();
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, b"destination blocker").unwrap();
+        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert_eq!(
+            std::fs::read(internal.join("0.jpg")).unwrap(),
+            b"source tiles"
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"destination blocker");
+        assert_eq!(r.extractor.calls(), 0);
+        assert_eq!(
+            r.mgr.get_trickplay_resolutions(item).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_reports_source_container_cleanup_errors_after_moving_tiles() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let mut row = info(item, 320);
+        row.tile_width = 2;
+        row.tile_height = 2;
+        r.mgr.save_trickplay_info(&row).await.unwrap();
+        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        std::fs::create_dir_all(internal.join("320 - 2x2")).unwrap();
+        std::fs::write(internal.join("320 - 2x2/0.jpg"), b"source tiles").unwrap();
+        std::fs::write(internal.join("retained.txt"), b"ordinary source file").unwrap();
+        assert!(r.mgr.move_generated_trickplay_data(item).await.is_err());
+        assert_eq!(
+            std::fs::read(sidecar.join("320 - 2x2/0.jpg")).unwrap(),
+            b"source tiles"
+        );
+        assert!(!internal.join("320 - 2x2").exists());
+        assert_eq!(
+            std::fs::read(internal.join("retained.txt")).unwrap(),
+            b"ordinary source file"
+        );
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_task_selects_physical_videos_and_preserves_owned_extras_and_channel_vod() {
+        use crate::scheduled_tasks::{ScheduledTask as _, TaskProgress};
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(0, 180));
+        let (folders, _) = configured_library(&r, true).await;
+        r.mgr.attach_virtual_folders(folders);
+        let owner = Uuid::new_v4();
+        seed_item(&db, owner, BaseItemKind::Movie).await;
+        let mut cases = Vec::new();
+        for (label, eligible) in [
+            ("owned", true),
+            ("missing_media", true),
+            ("channel", true),
+            ("virtual", false),
+            ("folder", false),
+            ("audio", false),
+        ] {
+            let item = Uuid::new_v4();
+            let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+            let mut entity = crate::test_support::fetch_item(&db, item).await;
+            match label {
+                "owned" => entity.owner_id = Some(guid_to_db(owner)),
+                "missing_media" => std::fs::remove_file(&media).unwrap(),
+                "channel" => entity.channel_id = Some(Uuid::new_v4().to_string()),
+                "virtual" => entity.is_virtual_item = true,
+                "folder" => entity.is_folder = true,
+                "audio" => entity.media_type = Some("Audio".to_owned()),
+                _ => unreachable!(),
+            }
+            crate::test_support::save_item(&db, &entity).await;
+            let mut row = info(item, 320);
+            row.tile_width = 2;
+            row.tile_height = 2;
+            r.mgr.save_trickplay_info(&row).await.unwrap();
+            let internal =
+                PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            let sidecar =
+                PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+            std::fs::create_dir_all(&internal).unwrap();
+            std::fs::write(internal.join("0.jpg"), label.as_bytes()).unwrap();
+            cases.push((label, internal, sidecar, eligible));
+        }
+        let task = crate::scheduled_tasks::maintenance::MoveTrickplayImagesTask::new(Arc::new(
+            r.mgr.clone(),
+        ));
+        task.execute(&TaskProgress::default()).await.unwrap();
+        for (label, internal, sidecar, eligible) in cases {
+            assert_eq!(sidecar.join("0.jpg").exists(), eligible, "{label}");
+            assert_eq!(internal.join("0.jpg").exists(), !eligible, "{label}");
+            let selected = if eligible { sidecar } else { internal };
+            assert_eq!(
+                std::fs::read(selected.join("0.jpg")).unwrap(),
+                label.as_bytes()
+            );
+        }
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_context_uses_fresh_runtime_and_video_dimensions_before_final_row_save() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(2, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), Some(1920)).await;
+        let mut fresh = r.mgr.items.retrieve_item(item).await.unwrap().unwrap();
+        fresh.run_time_ticks = Some(5_000 * 10_000);
+        r.mgr
+            .refresh_trickplay_for_media(item, &fresh, Some(&[]), true, &extraction_on())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "fresh runtime below the interval is ineligible despite the stored hour"
+        );
+        fresh.run_time_ticks = Some(60_000 * 10_000);
+        r.mgr
+            .refresh_trickplay_for_media(item, &fresh, Some(&[]), true, &extraction_on())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.calls(),
+            0,
+            "fresh empty streams are ineligible even when stored probe rows exist"
+        );
+        let stream = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+            item_id: fresh.id.clone(),
+            stream_index: 0,
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            codec: Some("h264".to_owned()),
+            width: Some(200),
+            height: Some(180),
+            ..Default::default()
+        };
+        r.mgr
+            .refresh_trickplay_for_media(item, &fresh, Some(&[stream]), true, &extraction_on())
+            .await
+            .unwrap();
+        assert_eq!(
+            r.extractor.last_request(),
+            Some((10_000, 200)),
+            "fresh stream width caps extraction"
+        );
+        assert_eq!(
+            r.mgr
+                .items
+                .retrieve_item(item)
+                .await
+                .unwrap()
+                .unwrap()
+                .run_time_ticks,
+            Some(HOUR_TICKS),
+            "the old metadata row remains untouched until the scanner's final save"
+        );
+    }
+    #[tokio::test]
+    async fn unreadable_user_tile_is_catalogued_with_source_minimum_height_without_encoding() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[]), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("640 - 3x2");
+        std::fs::create_dir_all(&grid).unwrap();
+        std::fs::write(grid.join("0.jpg"), b"invalid JPEG bytes").unwrap();
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(grid.join("0.jpg")).unwrap(),
+            b"invalid JPEG bytes"
+        );
+        assert_eq!(r.extractor.calls(), 0);
+        // Pinned SkiaEncoder.GetImageSize returns default dimensions for
+        // undecodable bytes; discovery clamps the resulting height to one.
+        let rows = r.mgr.get_trickplay_resolutions(item).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[&640].height, 1);
+    }
+
+    #[tokio::test]
+    async fn ineligible_media_is_untouched_before_discovery_pruning_or_forced_generation() {
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        for data in [
+            serde_json::json!({"VideoType":"Iso"}),
+            serde_json::json!({"VideoType":2}),
+            serde_json::json!({"VideoType":"BluRay"}),
+            serde_json::json!({"IsPlaceHolder":true}),
+            serde_json::json!({"IsShortcut":true}),
+            serde_json::json!({}),
+        ] {
+            let item = Uuid::new_v4();
+            let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+            let mut entity = crate::test_support::fetch_item(&db, item).await;
+            entity.data = Some(data.to_string());
+            crate::test_support::save_item(&db, &entity).await;
+            if data.as_object().unwrap().is_empty() {
+                crate::FerrofinMediaStreamRepository::new(db.clone())
+                    .save_media_streams(item, &[])
+                    .await
+                    .unwrap();
+            }
+            let grid =
+                PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            std::fs::create_dir_all(&grid).unwrap();
+            std::fs::write(grid.join("0.jpg"), b"existing data must remain untouched").unwrap();
+            r.mgr.save_trickplay_info(&info(item, 320)).await.unwrap();
+            for (replace, options) in [(false, LibraryOptions::default()), (true, extraction_on())]
+            {
+                r.mgr
+                    .refresh_trickplay_data(item, replace, &options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(grid.join("0.jpg")).unwrap(),
+                    b"existing data must remain untouched"
+                );
+                assert!(
+                    r.mgr
+                        .get_trickplay_resolutions(item)
+                        .await
+                        .unwrap()
+                        .contains_key(&320)
+                );
+            }
+        }
+        assert_eq!(r.extractor.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_media_gate_uses_shortcut_channel_and_current_recording_facts() {
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let item = Uuid::new_v4();
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let mut entity = r.mgr.items.retrieve_item(item).await.unwrap().unwrap();
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, false)
+                .is_some()
+        );
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, true).is_none()
+        );
+        entity.tags = Some("LiVeStReAm".to_owned());
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, false)
+                .is_some(),
+            "a library tag alone is complete"
+        );
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, false)
+                .is_none()
+        );
+        entity.tags = None;
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, false)
+                .is_some(),
+            "complete channel files remain eligible"
+        );
+        let shortcut = Path::new(&media).with_extension("STRM");
+        std::fs::write(&shortcut, b"file:///video.mkv").unwrap();
+        entity.path = Some(shortcut.to_string_lossy().into_owned());
+        assert!(
+            FerrofinTrickplayManager::can_generate_trickplay(&entity, 10_000, true, false)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_user_grid_discovery_uses_raw_interval_before_generation_clamps_it() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let mut options = options_2x2(&[320]);
+        options.interval = 100;
+        let r = rig(&db, options, FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(5_000 * 10_000), None).await;
+        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 5x1");
+        std::fs::create_dir_all(&grid).unwrap();
+        image::RgbImage::new(1600, 180)
+            .save(grid.join("0.jpg"))
+            .unwrap();
+        r.mgr
+            .refresh_trickplay_data(
+                item,
+                false,
+                &LibraryOptions {
+                    save_trickplay_with_media: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let row = &r.mgr.get_trickplay_resolutions(item).await.unwrap()[&320];
+        assert_eq!(
+            (row.interval, row.thumbnail_count),
+            (3000, 2),
+            "raw 100ms cannot fit this grid; a premature 1000ms clamp would incorrectly infer five thumbnails"
+        );
+        assert_eq!(r.extractor.calls(), 0);
     }
 }

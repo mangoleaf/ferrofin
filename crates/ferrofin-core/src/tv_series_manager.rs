@@ -51,6 +51,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
+use ferrofin_model::entities_media::AiredEpisodeOrder as AiredOrder;
 use ferrofin_model::querying::QueryResult;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -320,13 +321,13 @@ fn determine_next_episode(
         let mut considered: Vec<(AiredOrder, &BaseItemEntity)> = result
             .specials
             .iter()
-            .map(|ep| (AiredOrder::of(ep), ep))
+            .map(|ep| (aired_order(ep), ep))
             .filter(|(order, _)| {
                 order.airs_before_season.is_some() || order.airs_after_season.is_some()
             })
             .collect();
-        considered.extend(last_watched.map(|ep| (AiredOrder::of(ep), ep)));
-        considered.extend(next.map(|ep| (AiredOrder::of(ep), ep)));
+        considered.extend(last_watched.map(|ep| (aired_order(ep), ep)));
+        considered.extend(next.map(|ep| (aired_order(ep), ep)));
 
         if !considered.is_empty() {
             // `LibraryManager.Sort(…, AiredEpisodeOrder, Ascending)` — LINQ's
@@ -400,123 +401,28 @@ fn last_watched_date(result: &NextUpEpisodeBatchResult, rewatching: bool) -> Dat
         .unwrap_or_else(|| min + chrono::Duration::days(1))
 }
 
-/// The fields `AiredEpisodeOrderComparer` reads off an episode.
-///
-/// The `Airs*` numbers are not `BaseItems` columns: Jellyfin serializes them
-/// into the row's `Data` blob, so they are parsed from it — only for specials,
-/// the only rows whose `Airs*` the comparer consults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AiredOrder {
-    season: Option<i64>,
-    episode: Option<i64>,
-    premiere: Option<DateTime<Utc>>,
-    airs_before_season: Option<i64>,
-    airs_after_season: Option<i64>,
-    airs_before_episode: Option<i64>,
-}
-
-impl AiredOrder {
-    /// Reads an episode row's aired-order fields.
-    fn of(episode: &BaseItemEntity) -> Self {
-        let mut order = Self {
-            season: episode.parent_index_number,
-            episode: episode.index_number,
-            premiere: episode.premiere_date,
-            airs_before_season: None,
-            airs_after_season: None,
-            airs_before_episode: None,
-        };
-        if episode.parent_index_number == Some(0)
-            && let Some(blob) = episode
-                .data
-                .as_deref()
-                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-        {
-            let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
-            order.airs_before_season = number("AirsBeforeSeasonNumber");
-            order.airs_after_season = number("AirsAfterSeasonNumber");
-            order.airs_before_episode = number("AirsBeforeEpisodeNumber");
-        }
-        order
+/// Read source aired-order fields once per entity.
+fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
+    let mut order = AiredOrder {
+        season: episode.parent_index_number,
+        episode: episode.index_number,
+        premiere: episode.premiere_date,
+        airs_before_season: None,
+        airs_after_season: None,
+        airs_before_episode: None,
+    };
+    if episode.parent_index_number == Some(0)
+        && let Some(blob) = episode
+            .data
+            .as_deref()
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+    {
+        let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
+        order.airs_before_season = number("AirsBeforeSeasonNumber");
+        order.airs_after_season = number("AirsAfterSeasonNumber");
+        order.airs_before_episode = number("AirsBeforeEpisodeNumber");
     }
-
-    /// `(ParentIndexNumber ?? -1) == 0`.
-    fn is_special(&self) -> bool {
-        self.season.unwrap_or(-1) == 0
-    }
-
-    /// Port of `AiredEpisodeOrderComparer.Compare(Episode, Episode)`.
-    fn compare(&self, other: &Self) -> Ordering {
-        match (self.is_special(), other.is_special()) {
-            (true, true) => self.special_value().cmp(&other.special_value()),
-            (false, false) => self.compare_episodes(other),
-            (false, true) => self.compare_episode_to_special(other),
-            (true, false) => other.compare_episode_to_special(self).reverse(),
-        }
-    }
-
-    /// `CompareEpisodeToSpecial(x = self, y = special)`.
-    fn compare_episode_to_special(&self, special: &Self) -> Ordering {
-        let x_season = self.season.unwrap_or(-1);
-        let y_season = special
-            .airs_after_season
-            .or(special.airs_before_season)
-            .unwrap_or(-1);
-        if x_season != y_season {
-            return x_season.cmp(&y_season);
-        }
-        // Special comes after the episode's season.
-        if special.airs_after_season.is_some() {
-            return Ordering::Less;
-        }
-        // Special comes before the season.
-        let Some(y_episode) = special.airs_before_episode else {
-            return Ordering::Greater;
-        };
-        // Can't really compare if this happens.
-        let Some(x_episode) = self.episode else {
-            return Ordering::Equal;
-        };
-        // Special comes before the episode it names.
-        if x_episode == y_episode {
-            return Ordering::Greater;
-        }
-        x_episode.cmp(&y_episode)
-    }
-
-    /// `GetSpecialCompareValue`: season, then airs-after, then the episode
-    /// it airs before, then the special's own number.
-    fn special_value(&self) -> i64 {
-        let mut value = self
-            .airs_after_season
-            .or(self.airs_before_season)
-            .unwrap_or(0)
-            .saturating_mul(1_000_000_000);
-        if self.airs_after_season.is_some() {
-            value = value.saturating_add(1_000_000);
-        }
-        value = value.saturating_add(self.airs_before_episode.unwrap_or(0).saturating_mul(1_000));
-        value.saturating_add(self.episode.unwrap_or(0))
-    }
-
-    /// `CompareEpisodes`: `(season ?? -1) * 1000 + (episode ?? -1)`, then the
-    /// premiere dates when both are known.
-    fn compare_episodes(&self, other: &Self) -> Ordering {
-        let value = |o: &Self| {
-            o.season
-                .unwrap_or(-1)
-                .saturating_mul(1_000)
-                .saturating_add(o.episode.unwrap_or(-1))
-        };
-        let by_number = value(self).cmp(&value(other));
-        if by_number != Ordering::Equal {
-            return by_number;
-        }
-        match (self.premiere, other.premiere) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            _ => Ordering::Equal,
-        }
-    }
+    order
 }
 
 #[async_trait]
@@ -606,7 +512,7 @@ mod tests {
     use crate::item_type_lookup::stored_type_name;
     use crate::test_support::{seed_user, test_db};
 
-    use super::{AiredOrder, FerrofinTvSeriesManager, determine_next_episode};
+    use super::{AiredOrder, FerrofinTvSeriesManager, aired_order, determine_next_episode};
 
     // ── Minimal fakes for the injected collaborators ──
     //
@@ -1898,7 +1804,7 @@ mod tests {
     #[test]
     fn aired_order_reads_airs_numbers_from_the_data_blob_of_specials_only() {
         let sp = special(Uuid::new_v4(), 1, Some(1), None, Some(2));
-        let o = AiredOrder::of(&sp);
+        let o = aired_order(&sp);
         assert_eq!(o.airs_before_season, Some(1));
         assert_eq!(o.airs_before_episode, Some(2));
         assert_eq!(o.airs_after_season, None);
@@ -1907,6 +1813,6 @@ mod tests {
             data: Some(r#"{"AirsAfterSeasonNumber":7}"#.to_owned()),
             ..episode(Uuid::new_v4(), 1, 1)
         };
-        assert_eq!(AiredOrder::of(&regular).airs_after_season, None);
+        assert_eq!(aired_order(&regular).airs_after_season, None);
     }
 }

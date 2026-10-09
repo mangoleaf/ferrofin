@@ -876,7 +876,7 @@ mod tests {
 
         // The authed fake state's paths point under the temp dir; start clean.
         let backups = std::env::temp_dir()
-            .join("ferrofin-api-test-data")
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .join("backups");
         let _ = std::fs::remove_dir_all(&backups);
 

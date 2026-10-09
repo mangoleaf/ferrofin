@@ -18,6 +18,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         plugin_name: "host-impl-test".to_owned(),
         plugin_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff99".to_owned(),
         config_json: r#"{"k":"v"}"#.to_owned(),
+        segment_policy_skipped: false,
         limits: wasmtime::StoreLimitsBuilder::new().build(),
         memory_limit_bytes: 1024 * 1024,
         http: Arc::new(

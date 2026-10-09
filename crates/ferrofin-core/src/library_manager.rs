@@ -64,6 +64,11 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 #[derive(Clone)]
 pub struct FerrofinLibraryManager {
     items: Arc<dyn ItemRepository>,
+    dashboard_configuration:
+        Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
+    collections: Arc<
+        std::sync::OnceLock<std::sync::Weak<dyn ferrofin_traits::collections::CollectionManager>>,
+    >,
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     counts: Arc<dyn ItemCountService>,
@@ -102,6 +107,153 @@ pub struct FerrofinLibraryManager {
     /// the composition root. `None` (unit tests) means item writes announce
     /// nothing, which is what every test that does not assert on the push wants.
     changed: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
+}
+
+/// Port of Folder.CollapseBoxSetItems / AllowBoxSetCollapsing, not HasFilters:
+/// only the upstream allow-list disables this display transformation.
+fn folder_should_collapse(query: &InternalItemsQuery, movies: bool, shows: bool) -> bool {
+    if matches!(
+        query.parent_type,
+        Some(
+            BaseItemKind::BoxSet
+                | BaseItemKind::Season
+                | BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicArtist
+        )
+    ) {
+        return false;
+    }
+    if !folder_allows_collapsing(query) {
+        return false;
+    }
+    if let Some(explicit) = query.collapse_box_set_items {
+        return explicit;
+    }
+    let has_movies = query.include_item_types.is_empty()
+        || query.include_item_types.contains(&BaseItemKind::Movie);
+    let has_shows = query.include_item_types.is_empty()
+        || query.include_item_types.contains(&BaseItemKind::Series);
+    if query.user.is_some() {
+        (has_movies && movies) || (has_shows && shows)
+    } else {
+        has_movies || has_shows
+    }
+}
+
+fn folder_allows_collapsing(query: &InternalItemsQuery) -> bool {
+    [
+        query.is_favorite,
+        query.is_favorite_or_liked,
+        query.is_liked,
+        query.is_played,
+        query.is_resumable,
+        query.is_folder,
+        query.has_imdb_id,
+        query.has_official_rating,
+        query.has_overview,
+        query.has_parental_rating,
+        query.has_special_feature,
+        query.has_subtitles,
+        query.has_theme_song,
+        query.has_theme_video,
+        query.has_tmdb_id,
+        query.has_trailer,
+        query.is_3d,
+        query.is_4k,
+        query.is_hd,
+        query.is_locked,
+        query.is_place_holder,
+    ]
+    .iter()
+    .all(Option::is_none)
+        && query.genres.is_empty()
+        && query.genre_ids.is_empty()
+        && query.image_types.is_empty()
+        && query.person_ids.is_empty()
+        && query.item_ids.is_empty()
+        && query.studio_ids.is_empty()
+        && query.video_types.is_empty()
+        && query.years.is_empty()
+        && query.tags.is_empty()
+        && query.official_ratings.is_empty()
+        && query
+            .person
+            .as_ref()
+            .is_none_or(|person| person.trim().is_empty())
+        && query.min_index_number.is_none()
+        && !query.order_by.iter().any(|(order, _)| {
+            matches!(
+                order,
+                ferrofin_model::live_tv::ItemSortBy::CommunityRating
+                    | ferrofin_model::live_tv::ItemSortBy::CriticRating
+                    | ferrofin_model::live_tv::ItemSortBy::Runtime
+            )
+        })
+}
+
+fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> bool {
+    use crate::item_repository::{folder_ordinal_compare, folder_sort_name};
+    use ferrofin_util::string_extensions::upper_invariant;
+    let sort = folder_sort_name(item);
+    query
+        .name_starts_with
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .is_none_or(|prefix| upper_invariant(&sort).starts_with(&upper_invariant(prefix)))
+        && query
+            .name_starts_with_or_greater
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|bound| !folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
+        && query
+            .name_less_than
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
+}
+
+fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
+    value
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|id| !id.is_nil())
+}
+
+fn episode_presentation_key(item: &BaseItemEntity) -> String {
+    item.presentation_unique_key
+        .as_ref()
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .unwrap_or_else(|| item.id.clone())
+}
+
+fn episode_virtual_location(item: &BaseItemEntity) -> bool {
+    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+    let channel = kind == "Channel"
+        || (!matches!(
+            kind,
+            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
+        ) && episode_relation_id(item.channel_id.as_deref()).is_some());
+    item.path.as_deref().is_none_or(str::is_empty) && !channel
+}
+
+fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
+    let data = item
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
+    let number = |key| {
+        data.as_ref()
+            .and_then(|data| data.get(key))
+            .and_then(serde_json::Value::as_i64)
+    };
+    ferrofin_model::entities_media::AiredEpisodeOrder {
+        season: item.parent_index_number,
+        episode: item.index_number,
+        premiere: item.premiere_date,
+        airs_before_season: number("AirsBeforeSeasonNumber"),
+        airs_after_season: number("AirsAfterSeasonNumber"),
+        airs_before_episode: number("AirsBeforeEpisodeNumber"),
+    }
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -718,7 +870,8 @@ impl ScanWorker {
         };
         let request = request.clone();
         let cancel = cancel.clone();
-        tokio::spawn(
+        tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
             async move {
                 let report = move |percent: f64| lock_queue(&queue).report(percent);
                 runner
@@ -732,7 +885,7 @@ impl ScanWorker {
                     .await
             }
             .instrument(span.clone()),
-        )
+        ))
     }
 
     /// Waits for one scan's task and logs how it ended, inside `span` (only
@@ -966,6 +1119,8 @@ impl FerrofinLibraryManager {
     ) -> Self {
         Self {
             items,
+            dashboard_configuration: None,
+            collections: Arc::new(std::sync::OnceLock::new()),
             visibility: None,
             virtual_folders: None,
             counts,
@@ -981,6 +1136,415 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
         }
+    }
+
+    /// Configure live dashboard display options for controller folder browses.
+    #[must_use]
+    pub fn with_dashboard_configuration(
+        mut self,
+        config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.dashboard_configuration = Some(config);
+        self
+    }
+
+    /// CollectionManager owns the library manager. The reverse reference is
+    /// weak so the Folder post-filter consumer cannot create an Arc cycle.
+    pub fn attach_collections(
+        &self,
+        collections: &Arc<dyn ferrofin_traits::collections::CollectionManager>,
+    ) {
+        let _ = self.collections.set(Arc::downgrade(collections));
+    }
+
+    async fn folder_display_result(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<QueryResult<BaseItemEntity>>, ServiceError> {
+        if !query.apply_folder_display_options || !query.item_ids.is_empty() {
+            return Ok(None);
+        }
+        let Some(config) = &self.dashboard_configuration else {
+            return Ok(None);
+        };
+        let config = config.configuration().await?;
+        let movies = config.enable_grouping_movies_into_collections;
+        let shows = config.enable_grouping_shows_into_collections;
+        // Disabled recursive queries need no parent or collection reads. Plain
+        // Folder queries still use the pinned Filter→SortAndPage contract.
+        if query.recursive
+            && query.parent_type != Some(BaseItemKind::Season)
+            && query.collapse_box_set_items.is_none()
+            && !movies
+            && !shows
+            && query.user.is_some()
+        {
+            return Ok(None);
+        }
+        let mut resolved = query.clone();
+        if resolved.parent_type.is_none()
+            && !resolved.parent_id.is_nil()
+            && let Some(parent) = self.items.retrieve_item(resolved.parent_id).await?
+        {
+            resolved.parent_type = serde_json::from_value(serde_json::Value::String(
+                parent
+                    .type_
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&parent.type_)
+                    .to_owned(),
+            ))
+            .ok();
+        }
+        // Series queries use their own SQL options; Channel queries return
+        // through ChannelManager. Neither invokes Folder's automatic policy.
+        if !resolved.folder_query_recursive
+            && matches!(
+                resolved.parent_type,
+                Some(BaseItemKind::Series | BaseItemKind::Channel)
+            )
+        {
+            return Ok(None);
+        }
+        // Season.GetItemsInternal calls its live GetEpisodes consumer, then
+        // Filter/PostFilterAndSort. It never substitutes a collection.
+        if !resolved.folder_query_recursive
+            && resolved.parent_type == Some(BaseItemKind::Season)
+            && resolved.user.is_some()
+        {
+            resolved.collapse_box_set_items = None;
+            return self
+                .season_display_result(&resolved, config.display_specials_within_seasons)
+                .await
+                .map(Some);
+        }
+        // ItemsController's user-root shortcut and nonrecursive UserView
+        // builders have their own GetResult contract, outside Folder's policy.
+        if !resolved.recursive
+            && (!resolved.item_ids.is_empty()
+                || (resolved.user_root_children
+                    && (resolved.parent_id.is_nil()
+                        || resolved.parent_type == Some(BaseItemKind::UserRootFolder)))
+                || resolved.parent_type == Some(BaseItemKind::UserView))
+        {
+            return Ok(None);
+        }
+        let should_collapse = folder_should_collapse(&resolved, movies, shows);
+        // These domain overrides never substitute in plain Folder views.
+        // Preserve their existing browse consumers; full BoxSet DisplayOrder
+        // and music child-selection semantics are separate source gaps.
+        if !resolved.recursive
+            && matches!(
+                resolved.parent_type,
+                Some(BaseItemKind::BoxSet | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
+            )
+        {
+            resolved.collapse_box_set_items = None;
+            return self.items.get_items(&resolved).await.map(Some);
+        }
+        if resolved.recursive {
+            if !resolved.force_direct && should_collapse {
+                resolved.collapse_box_set_items = Some(true);
+                resolved.collapse_box_set_item_types = if movies && shows {
+                    Vec::new()
+                } else {
+                    [(movies, BaseItemKind::Movie), (shows, BaseItemKind::Series)]
+                        .into_iter()
+                        .filter_map(|(enabled, kind)| enabled.then_some(kind))
+                        .collect()
+                };
+            }
+            // Pinned QueryRecursive does not clear an explicit true when its
+            // auto-collapse gate fails, or when ForceDirect bypasses that gate.
+            return self.items.get_items(&resolved).await.map(Some);
+        }
+        // Plain Folder.GetItemsInternal filters visible unpaged children even
+        // with both grouping flags disabled. D01 owns the reusable pinned
+        // UserViewBuilder.Filter seam; keep sorting/paging after substitution.
+        let children = self.visible_folder_children(&resolved).await?;
+        let children = self.items.filter_folder_children(children, query).await?;
+        let items = if should_collapse && (movies || shows) && resolved.user.is_some() {
+            self.collapse_folder_children(children, query, movies, shows)
+                .await?
+        } else {
+            children
+        };
+        self.folder_post_filter_result(items, query).await.map(Some)
+    }
+
+    /// Season.GetItemsInternal: select aired episodes before Filter and paging.
+    /// The existing LibraryManager traits query seam keeps API independent of core.
+    #[allow(clippy::too_many_lines)] // source relation resolution, selection, then Filter/PostFilterAndSort
+    async fn season_display_result(
+        &self,
+        query: &InternalItemsQuery,
+        include_specials: bool,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let season = self.items.retrieve_item(query.parent_id).await?;
+        let series_id = season.as_ref().and_then(|season| {
+            episode_relation_id(season.series_id.as_deref())
+                .or_else(|| episode_relation_id(season.parent_id.as_deref()))
+        });
+        let series = match series_id {
+            Some(id) => self.items.retrieve_item(id).await?,
+            None => None,
+        }
+        .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
+        let mut episodes = Vec::new();
+        if let (Some(season), Some(series)) = (season, series) {
+            let rows = self
+                .items
+                .get_item_list(&InternalItemsQuery {
+                    user: query.user.clone(),
+                    series_presentation_unique_key: Some(episode_presentation_key(&series)),
+                    include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
+                    order_by: vec![(
+                        ferrofin_model::live_tv::ItemSortBy::SortName,
+                        ferrofin_model::dto::SortOrder::Ascending,
+                    )],
+                    dto_options: query.dto_options.clone(),
+                    // Season.GetItemsInternal passes shouldIncludeMissing=true.
+                    ..Default::default()
+                })
+                .await?;
+            let series_seasons: Vec<_> = rows
+                .iter()
+                .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
+                .cloned()
+                .collect();
+            let mut seasons: HashMap<_, _> = series_seasons
+                .iter()
+                .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+                .collect();
+            seasons.insert(query.parent_id, season.clone());
+            let mut unknown = std::collections::HashSet::new();
+            for row in &rows {
+                if row.type_.rsplit('.').next() == Some("Episode")
+                    && let Some(id) = episode_relation_id(row.season_id.as_deref())
+                        .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+                    && !seasons.contains_key(&id)
+                {
+                    unknown.insert(id);
+                }
+            }
+            if !unknown.is_empty() {
+                for row in self
+                    .items
+                    .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
+                    .await?
+                {
+                    if row.type_.rsplit('.').next() == Some("Season")
+                        && let Some(id) = episode_relation_id(Some(&row.id))
+                    {
+                        seasons.insert(id, row);
+                    }
+                }
+            }
+            let key = episode_presentation_key(&season);
+            let number = season.index_number;
+            let support_specials = include_specials && number.is_some_and(|number| number != 0);
+            let mut matches = Vec::new();
+            for row in rows
+                .into_iter()
+                .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
+            {
+                let parent = episode_relation_id(row.season_id.as_deref())
+                    .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+                    .and_then(|id| seasons.get(&id))
+                    .or_else(|| {
+                        (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                            .then(|| {
+                                series_seasons
+                                    .iter()
+                                    .find(|parent| parent.index_number == row.parent_index_number)
+                            })
+                            .flatten()
+                    });
+                let same_season = parent.is_some_and(|parent| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                        &episode_presentation_key(parent),
+                        &key,
+                    )
+                });
+                // The disabled source query is restricted to the season's
+                // presentation ancestry, before FilterEpisodesBySeason runs.
+                if !include_specials && !same_season {
+                    continue;
+                }
+                let order = episode_air_order(&row);
+                let current = if support_specials {
+                    order
+                        .airs_after_season
+                        .or(order.airs_before_season)
+                        .or(order.season)
+                } else {
+                    order.season
+                };
+                let matches_number = current.is_some() && number.is_some() && current == number;
+                let matches_virtual = current.is_none()
+                    && number.is_none()
+                    && episode_virtual_location(&season)
+                    && parent.is_none_or(episode_virtual_location);
+                if matches_number || matches_virtual || same_season {
+                    matches.push((order, row));
+                }
+            }
+            if number != Some(0) {
+                matches.sort_by(|(left, _), (right, _)| left.compare(right));
+            }
+            episodes = matches.into_iter().map(|(_, row)| row).collect();
+        }
+        let mut episodes = self.items.filter_folder_children(episodes, query).await?;
+        let mut post_query = query.clone();
+        if let [(ferrofin_model::live_tv::ItemSortBy::AiredEpisodeOrder, direction)] =
+            query.order_by.as_slice()
+        {
+            episodes.sort_by(|left, right| {
+                let ordering = episode_air_order(left).compare(&episode_air_order(right));
+                if *direction == ferrofin_model::dto::SortOrder::Descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+            post_query.order_by.clear();
+        }
+        self.folder_post_filter_result(episodes, &post_query).await
+    }
+
+    /// Load physical and linked Folder children with the existing access checks.
+    async fn visible_folder_children(
+        &self,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut child_query = InternalItemsQuery {
+            user: resolved.user.clone(),
+            parent_id: resolved.parent_id,
+            parent_type: resolved.parent_type,
+            group_by_presentation_unique_key: false,
+            ..InternalItemsQuery::default()
+        };
+        let children = if matches!(
+            resolved.parent_type,
+            Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder)
+        ) {
+            // Folder.GetChildren's physical-root arm delegates to the user
+            // root, retaining its access exemptions and virtual children.
+            if let Some(root) = self.get_user_root_folder().await? {
+                child_query.parent_id = Uuid::parse_str(&root.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                child_query.parent_type = Some(BaseItemKind::UserRootFolder);
+                child_query.user_root_children = true;
+                self.items.get_items(&child_query).await?.items
+            } else {
+                Vec::new()
+            }
+        } else {
+            let children = self.items.get_folder_children(&child_query).await?;
+            if let Some(user) = resolved.user.as_ref() {
+                let filter_linked = matches!(
+                    resolved.parent_type,
+                    Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+                );
+                let roots = if filter_linked && children.iter().any(|child| child.linked) {
+                    if let Some(root) = self.get_user_root_folder().await? {
+                        let root_query = InternalItemsQuery {
+                            user: Some(user.clone()),
+                            parent_id: Uuid::parse_str(&root.id)
+                                .map_err(|error| ServiceError::backend(error.to_string()))?,
+                            user_root_children: true,
+                            group_by_presentation_unique_key: false,
+                            ..InternalItemsQuery::default()
+                        };
+                        self.items.get_items(&root_query).await?.items
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                let visibility = self
+                    .visibility
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::backend("folder visibility is not configured"))?;
+                visibility
+                    .folder_children(children, user, filter_linked, &roots)
+                    .await?
+            } else {
+                children.into_iter().map(|child| child.item).collect()
+            }
+        };
+        Ok(children)
+    }
+
+    /// Substitute eligible movie or series children through CollectionManager.
+    async fn collapse_folder_children(
+        &self,
+        children: Vec<BaseItemEntity>,
+        query: &InternalItemsQuery,
+        movies: bool,
+        shows: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(collections) = self.collections.get().and_then(std::sync::Weak::upgrade) else {
+            return Err(ServiceError::backend(
+                "collection collapsing is not configured",
+            ));
+        };
+        let (eligible, remaining): (Vec<_>, Vec<_>) = if movies && shows {
+            (children, Vec::new())
+        } else {
+            children.into_iter().partition(|item| {
+                let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+                (movies && kind == "Movie") || (shows && kind == "Series")
+            })
+        };
+        let mut items = collections
+            .collapse_items_within_box_sets(&eligible, query.user.as_ref())
+            .await?;
+        items.extend(remaining);
+        Ok(items)
+    }
+
+    /// Apply Folder name rechecks, stable sorting, adjacency, counts and paging.
+    async fn folder_post_filter_result(
+        &self,
+        mut items: Vec<BaseItemEntity>,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        // Folder.PostFilterAndSort re-applies only these three letter filters
+        // after replacing matching members with differently named collections.
+        if query.user.is_some() {
+            items.retain(|item| folder_name_matches(item, query));
+        }
+        items = self.items.sort_folder_children(items, query).await?;
+        if let Some(adjacent) = query.adjacent_to.filter(|id| !id.is_nil()) {
+            if let Some(index) = items
+                .iter()
+                .position(|item| Uuid::parse_str(&item.id).ok() == Some(adjacent))
+            {
+                items = items
+                    .into_iter()
+                    .skip(index.saturating_sub(1))
+                    .take(if index == 0 { 2 } else { 3 })
+                    .collect();
+            } else {
+                items.clear();
+            }
+        }
+        let start_index = query.start_index.unwrap_or(0);
+        let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        let start = usize::try_from(start_index.max(0)).unwrap_or(usize::MAX);
+        let limit = query
+            .limit
+            .filter(|limit| *limit > 0)
+            .map_or(usize::MAX, |limit| {
+                usize::try_from(limit).unwrap_or(usize::MAX)
+            });
+        Ok(QueryResult::new(
+            Some(start_index),
+            Some(total),
+            items.into_iter().skip(start).take(limit).collect(),
+        ))
     }
 
     /// Installs the standalone item-visibility evaluator.
@@ -1264,6 +1828,23 @@ impl LibraryManager for FerrofinLibraryManager {
             .await?[0])
     }
 
+    async fn filter_visible_items(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let visible = service.visible(&items, user, false).await?;
+        Ok(items
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(item, visible)| visible.then_some(item))
+            .collect())
+    }
+
     async fn is_item_visible_standalone(
         &self,
         item: &BaseItemEntity,
@@ -1388,6 +1969,9 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        if let Some(result) = self.folder_display_result(query).await? {
+            return Ok(result);
+        }
         self.items.get_items(query).await
     }
 
@@ -1589,6 +2173,11 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
+        let mut rated = items.to_vec();
+        if let Some(visibility) = &self.visibility {
+            visibility.update_rating_scores(&mut rated).await?;
+        }
+        let items = rated.as_slice();
         self.persistence.save_items(items).await?;
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,
@@ -2062,7 +2651,12 @@ impl FerrofinLibraryManager {
             progress: Arc::clone(&self.scan_progress),
         };
         let span = tracing::info_span!(parent: None, "library_scan", trigger = trigger.as_str());
-        let task = tokio::spawn(worker.drain().instrument(span));
+        // Source Task.Run captures the culture of the caller that starts the
+        // draining worker; subsequent enqueued requests share that worker.
+        let task = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            worker.drain().instrument(span),
+        ));
         #[cfg(test)]
         {
             lock_queue(&self.scan_queue).worker_task = Some(task.abort_handle());
@@ -4731,5 +5325,852 @@ mod tests {
             .await
             .expect_err("missing");
         assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    struct CultureScanRunner {
+        captured: Mutex<Vec<String>>,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl ScanRunner for CultureScanRunner {
+        async fn run(
+            &self,
+            _: &ScanTarget,
+            _: ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_and_child_scans_inherit_the_starting_callers_culture() {
+        let db = test_db().await;
+        let runner = Arc::new(CultureScanRunner {
+            captured: Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        ferrofin_util::current_culture::scope("sv".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        ferrofin_util::current_culture::scope("de-DE".into(), async {
+            mgr.submit(
+                ScanRequest::folder_refresh(
+                    ScanTarget::Library(Uuid::from_u128(0xC0)),
+                    replace_all(),
+                ),
+                false,
+                None,
+            );
+        })
+        .await;
+        until_queued(&mgr, 1, 0).await;
+        runner.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            *runner.captured.lock().unwrap(),
+            ["sv", "sv", "sv", "sv"],
+            "one source Task.Run drains all queued requests under its starting culture"
+        );
+        ferrofin_util::current_culture::scope("en-US".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            &runner.captured.lock().unwrap()[4..],
+            ["en-US", "en-US"],
+            "a new worker captures a new caller"
+        );
+    }
+    #[derive(Default)]
+    struct CollapsingConfiguration(
+        std::sync::Mutex<ferrofin_model::configuration::ServerConfiguration>,
+    );
+    #[async_trait]
+    impl ferrofin_traits::configuration::ServerConfigurationManager for CollapsingConfiguration {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not needed")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.0.lock().unwrap().clone()))
+        }
+        async fn update_configuration(
+            &self,
+            value: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().unwrap() = value.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn season_display_specials_is_live_and_precedes_filter_sort_count_and_page() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let config = Arc::new(CollapsingConfiguration::default());
+        let library = manager(&db).with_dashboard_configuration(config.clone());
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let series = Uuid::new_v4();
+        let zero = Uuid::new_v4();
+        let one = Uuid::new_v4();
+        let key = "display-series";
+        let mut rows = vec![BaseItemEntity {
+            id: guid_to_db(series),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("Display show".into()),
+            is_folder: true,
+            presentation_unique_key: Some(key.into()),
+            path: Some(tmp.path().join("show").to_string_lossy().into_owned()),
+            ..Default::default()
+        }];
+        for (id, number) in [(zero, 0), (one, 1)] {
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                name: Some(format!("Season {number}")),
+                sort_name: Some(format!("{number:04}")),
+                index_number: Some(number),
+                parent_id: Some(guid_to_db(series)),
+                // Guid.Empty must use the real Series parent.
+                series_id: Some(guid_to_db(Uuid::nil())),
+                series_presentation_unique_key: Some(key.into()),
+                presentation_unique_key: Some(format!("display-season-{number}")),
+                is_folder: true,
+                path: Some(
+                    tmp.path()
+                        .join(format!("show/season{number}"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            });
+        }
+        // Duplicate season numbers can exist in grouped/adopted series. The
+        // direct Series child's fallback must use the first saved season order,
+        // not the iteration order of the identity lookup map.
+        rows.push(BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some("Replica season 1".into()),
+            sort_name: Some("9999".into()),
+            index_number: Some(1),
+            parent_id: Some(guid_to_db(series)),
+            series_id: Some(guid_to_db(series)),
+            series_presentation_unique_key: Some(key.into()),
+            presentation_unique_key: Some("other-season-key".into()),
+            is_folder: true,
+            path: Some(tmp.path().join("replica").to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let mut episode_ids = Vec::new();
+        for (season_id, number, index, name, physical) in [
+            (one, 1, 1, "One", true),
+            (one, 1, 2, "Two", true),
+            (zero, 0, 1, "Z Special", true),
+            (one, 1, 3, "Missing", false),
+        ] {
+            let id = Uuid::new_v4();
+            episode_ids.push(id);
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                clean_name: Some(name.to_lowercase()),
+                parent_id: Some(guid_to_db(if name == "One" { series } else { season_id })),
+                // A direct Series child resolves its season by its number.
+                season_id: Some(guid_to_db(if name == "One" {
+                    Uuid::nil()
+                } else {
+                    season_id
+                })),
+                parent_index_number: Some(number),
+                index_number: Some(index),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.into()),
+                media_type: Some("Video".into()),
+                is_virtual_item: !physical,
+                path: physical.then(|| {
+                    tmp.path()
+                        .join(format!("{name}.mkv"))
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                data: (number == 0).then(|| {
+                    serde_json::json!({"AirsBeforeSeasonNumber":1,"AirsBeforeEpisodeNumber":2})
+                        .to_string()
+                }),
+                ..Default::default()
+            });
+        }
+        library.persistence.save_items(&rows).await.unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            parent_id: one,
+            parent_type: Some(BaseItemKind::Season),
+            apply_folder_display_options: true,
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|row| row.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for enabled in [false, true, false] {
+            config.0.lock().unwrap().display_specials_within_seasons = enabled;
+            let expected = if enabled {
+                vec!["One", "Z Special", "Two", "Missing"]
+            } else {
+                vec!["One", "Two", "Missing"]
+            };
+            for recursive in [false, true] {
+                let selected = InternalItemsQuery {
+                    recursive,
+                    ..query.clone()
+                };
+                let result = library.query_items(&selected).await.unwrap();
+                assert_eq!(
+                    result.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(result), expected);
+                let page = library
+                    .query_items(&InternalItemsQuery {
+                        start_index: Some(1),
+                        limit: Some(1),
+                        ..selected.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(page), [if enabled { "Z Special" } else { "Two" }]);
+            }
+            let physical = library
+                .query_items(&InternalItemsQuery {
+                    is_virtual_item: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(physical),
+                if enabled {
+                    vec!["One", "Z Special", "Two"]
+                } else {
+                    vec!["One", "Two"]
+                }
+            );
+            let prefix = library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some("Z".into()),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(prefix),
+                if enabled { vec!["Z Special"] } else { vec![] }
+            );
+            let sorted = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(sorted),
+                if enabled {
+                    vec!["Missing", "One", "Two", "Z Special"]
+                } else {
+                    vec!["Missing", "One", "Two"]
+                }
+            );
+            let descending = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Descending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(descending),
+                if enabled {
+                    vec!["Missing", "Two", "Z Special", "One"]
+                } else {
+                    vec!["Missing", "Two", "One"]
+                }
+            );
+            let adjacent = library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(episode_ids[1]),
+                    start_index: Some(1),
+                    limit: Some(1),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(adjacent.total_record_count, 3);
+            assert_eq!(names(adjacent), ["Two"]);
+            let zero_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: zero,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(names(zero_result), ["Z Special"]);
+            let orphan = Uuid::new_v4();
+            let orphan_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: orphan,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert!(orphan_result.items.is_empty());
+            for recursive in [false, true] {
+                let direct = library
+                    .query_items(&InternalItemsQuery {
+                        item_ids: vec![episode_ids[2]],
+                        recursive,
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    direct.items.is_empty(),
+                    "internal explicit IDs keep the supplied parent and bypass aired selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_display_guard_matches_the_pinned_allow_list_and_parent_exclusions() {
+        let mut query = InternalItemsQuery {
+            collapse_box_set_items: Some(true),
+            ..Default::default()
+        };
+        assert!(super::folder_should_collapse(&query, false, false));
+        macro_rules! boolean_guard { ($($field:ident),*) => { $(
+            query.$field = Some(false);
+            assert!(!super::folder_allows_collapsing(&query), stringify!($field));
+            query.$field = None;
+        )* }; }
+        boolean_guard!(
+            is_favorite,
+            is_favorite_or_liked,
+            is_liked,
+            is_played,
+            is_resumable,
+            is_folder,
+            has_imdb_id,
+            has_official_rating,
+            has_overview,
+            has_parental_rating,
+            has_special_feature,
+            has_subtitles,
+            has_theme_song,
+            has_theme_video,
+            has_tmdb_id,
+            has_trailer,
+            is_3d,
+            is_4k,
+            is_hd,
+            is_locked,
+            is_place_holder
+        );
+        macro_rules! list_guard { ($($field:ident => $value:expr),*) => { $(
+            query.$field.push($value);
+            assert!(!super::folder_allows_collapsing(&query), stringify!($field));
+            query.$field.clear();
+        )* }; }
+        list_guard!(genres => "Drama".into(), genre_ids => Uuid::new_v4(), image_types => ImageType::Primary,
+            person_ids => Uuid::new_v4(), item_ids => Uuid::new_v4(), studio_ids => Uuid::new_v4(),
+            video_types => ferrofin_model::entities::VideoType::VideoFile, years => 2020,
+            tags => "tag".into(), official_ratings => "PG".into());
+        query.person = Some("Person".into());
+        assert!(!super::folder_allows_collapsing(&query));
+        query.person = Some(" ".into());
+        query.min_index_number = Some(1);
+        assert!(!super::folder_allows_collapsing(&query));
+        query.min_index_number = None;
+        for order in [
+            ferrofin_model::live_tv::ItemSortBy::CommunityRating,
+            ferrofin_model::live_tv::ItemSortBy::CriticRating,
+            ferrofin_model::live_tv::ItemSortBy::Runtime,
+        ] {
+            query.order_by = vec![(order, ferrofin_model::dto::SortOrder::Ascending)];
+            assert!(!super::folder_allows_collapsing(&query));
+        }
+        query.order_by.clear();
+        // These are deliberately not part of AllowBoxSetCollapsing.
+        query.has_tvdb_id = Some(false);
+        query.min_community_rating = Some(1.0);
+        query.min_width = Some(1);
+        assert!(super::folder_allows_collapsing(&query));
+        for parent in [
+            BaseItemKind::BoxSet,
+            BaseItemKind::Season,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::MusicArtist,
+        ] {
+            query.parent_type = Some(parent);
+            assert!(!super::folder_should_collapse(&query, true, true));
+        }
+    }
+
+    #[test]
+    fn post_collapse_name_ranges_use_ordinal_comparison_and_literal_prefixes() {
+        let row = BaseItemEntity {
+            sort_name: Some("𐀀 title".into()),
+            ..Default::default()
+        };
+        assert!(
+            !super::folder_name_matches(
+                &row,
+                &InternalItemsQuery {
+                    name_less_than: Some("\u{e000}".into()),
+                    ..Default::default()
+                }
+            ),
+            "pinned Linux .NET OrdinalIgnoreCase orders the supplementary scalar after the BMP private-use codepoint"
+        );
+        let row = BaseItemEntity {
+            sort_name: Some("alpha% title".into()),
+            ..Default::default()
+        };
+        assert!(!super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("Alpha_".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("Alpha%".into()),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercises live collection policy across recursive and direct Folder paths"
+    )]
+    async fn collection_display_options_are_live_scoped_and_match_recursive_and_plain_folder_paths()
+    {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
+        let db = test_db().await;
+        let config = Arc::new(CollapsingConfiguration::default());
+        let temporary_paths = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            temporary_paths.path().to_string_lossy().into_owned(),
+        ));
+        let library = Arc::new(
+            base.with_dashboard_configuration(config.clone())
+                .with_visibility(visibility),
+        );
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::CollectionFolder, "Library").await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> = {
+            let temp = temporary_paths.path();
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                temp.to_str().unwrap(),
+                temp.join("log").to_str().unwrap(),
+                temp.join("config").to_str().unwrap(),
+                temp.join("cache").to_str().unwrap(),
+                temp.join("web").to_str().unwrap(),
+            ))
+        };
+        let collections: Arc<dyn CollectionManager> =
+            Arc::new(crate::collection_manager::FerrofinCollectionManager::new(
+                db.clone(),
+                library.clone(),
+                Arc::new(
+                    crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
+                ),
+                paths,
+            ));
+        library.attach_collections(&collections);
+        let mut rows = Vec::new();
+        for (kind, name) in [
+            (BaseItemKind::Movie, "Alpha movie"),
+            (BaseItemKind::Series, "Bravo series"),
+            (BaseItemKind::Video, "Charlie video"),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, name).await;
+            let mut item = crate::test_support::fetch_item(&db, id).await;
+            item.parent_id = Some(guid_to_db(folder));
+            item.top_parent_id = Some(guid_to_db(folder));
+            item.sort_name = Some(name.to_lowercase());
+            item.is_folder = crate::kinds::is_folder(kind);
+            item.clean_name = Some(crate::text_util::get_clean_value(name));
+            library.persistence.save_items(&[item]).await.unwrap();
+            rows.push(id);
+        }
+        let episode = Uuid::new_v4();
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Unplayed episode").await;
+        let mut episode_row = crate::test_support::fetch_item(&db, episode).await;
+        episode_row.parent_id = Some(guid_to_db(rows[1]));
+        episode_row.series_id = Some(guid_to_db(rows[1]));
+        episode_row.media_type = Some("Video".into());
+        episode_row.top_parent_id = Some(guid_to_db(folder));
+        library
+            .persistence
+            .save_items(&[episode_row])
+            .await
+            .unwrap();
+        // Scanning persists the ancestry closure separately from the item row.
+        // Folder played counts use these leaf descendants, not ParentId alone.
+        library
+            .persistence
+            .set_ancestors(episode, &[rows[1], folder])
+            .await
+            .unwrap();
+        for (id, name) in rows.iter().zip([
+            "Zulu movie collection",
+            "Alpha show collection",
+            "Video collection",
+        ]) {
+            collections
+                .create_collection(&CollectionCreationOptions {
+                    name: name.into(),
+                    item_id_list: vec![*id],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let query = InternalItemsQuery {
+            user: Some(user),
+            parent_id: folder,
+            parent_type: Some(BaseItemKind::CollectionFolder),
+            recursive: true,
+            apply_folder_display_options: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::Video,
+            ],
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|item| item.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (movies, shows, expected) in [
+            (
+                false,
+                false,
+                vec!["Alpha movie", "Bravo series", "Charlie video"],
+            ),
+            (
+                true,
+                false,
+                vec!["Bravo series", "Charlie video", "Zulu movie collection"],
+            ),
+            (
+                false,
+                true,
+                vec!["Alpha movie", "Alpha show collection", "Charlie video"],
+            ),
+            (
+                true,
+                true,
+                vec![
+                    "Alpha show collection",
+                    "Video collection",
+                    "Zulu movie collection",
+                ],
+            ),
+        ] {
+            {
+                let mut settings = config.0.lock().unwrap();
+                settings.enable_grouping_movies_into_collections = movies;
+                settings.enable_grouping_shows_into_collections = shows;
+            }
+            assert_eq!(
+                names(library.query_items(&query).await.unwrap()),
+                expected,
+                "live {movies}/{shows}"
+            );
+            let plain = InternalItemsQuery {
+                recursive: false,
+                ..query.clone()
+            };
+            let expected_plain = if movies && shows {
+                vec![
+                    "Alpha show collection",
+                    "Charlie video",
+                    "Zulu movie collection",
+                ]
+            } else {
+                expected.clone()
+            };
+            assert_eq!(
+                names(library.query_items(&plain).await.unwrap()),
+                expected_plain,
+                "plain live {movies}/{shows}"
+            );
+            assert_eq!(
+                names(
+                    library
+                        .query_items(&InternalItemsQuery {
+                            is_played: Some(false),
+                            ..plain
+                        })
+                        .await
+                        .unwrap()
+                ),
+                ["Alpha movie", "Bravo series", "Charlie video"]
+            );
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        apply_folder_display_options: false,
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha movie", "Bravo series", "Charlie video"],
+            "internal queries do not inherit Folder options"
+        );
+        for bypass in [
+            InternalItemsQuery {
+                collapse_box_set_items: Some(false),
+                ..query.clone()
+            },
+            InternalItemsQuery {
+                is_played: Some(false),
+                ..query.clone()
+            },
+            InternalItemsQuery {
+                force_direct: true,
+                ..query.clone()
+            },
+        ] {
+            assert_eq!(
+                names(library.query_items(&bypass).await.unwrap()),
+                ["Alpha movie", "Bravo series", "Charlie video"]
+            );
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        is_played: Some(false),
+                        collapse_box_set_items: Some(true),
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [
+                "Alpha show collection",
+                "Video collection",
+                "Zulu movie collection"
+            ],
+            "recursive explicit true survives a failed auto-collapse allow-list gate"
+        );
+        let plain = InternalItemsQuery {
+            recursive: false,
+            ..query.clone()
+        };
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        name_contains: Some("does not exist".into()),
+                        index_number: Some(99),
+                        parent_index_number: Some(42),
+                        source_types: vec![ferrofin_traits::options::SourceType::Channel],
+                        ..plain.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [
+                "Alpha show collection",
+                "Charlie video",
+                "Zulu movie collection"
+            ],
+            "plain Filter ignores unsupported query fields and accepts null parent indices"
+        );
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some(" ".into()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "initial Filter treats whitespace as a real prefix"
+        );
+        let plain_items = library.query_items(&plain).await.unwrap().items;
+        let last_collection = Uuid::parse_str(&plain_items.last().unwrap().id).unwrap();
+        let adjacent = library
+            .query_items(&InternalItemsQuery {
+                adjacent_to: Some(last_collection),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(adjacent.total_record_count, 2);
+        assert_eq!(names(adjacent), ["Charlie video", "Zulu movie collection"]);
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(Uuid::new_v4()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        assert_eq!(
+            names(library.query_items(&plain).await.unwrap()),
+            [
+                "Alpha show collection",
+                "Charlie video",
+                "Zulu movie collection"
+            ],
+            "plain path groups only Movie/Series, even with both flags true"
+        );
+        let page = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 3);
+        assert_eq!(names(page), ["Charlie video"]);
+        let outside = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(99),
+                limit: Some(1),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outside.total_record_count, 3);
+        assert!(outside.items.is_empty());
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some("A".into()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "plain path filters member names before substitution and rechecks collection names afterwards"
+        );
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        name_starts_with: Some("A".into()),
+                        ..query
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha show collection"],
+            "recursive path defers letters until after substitution"
+        );
+        {
+            let mut settings = config.0.lock().unwrap();
+            settings.enable_grouping_movies_into_collections = false;
+            settings.enable_grouping_shows_into_collections = false;
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        collapse_box_set_items: Some(true),
+                        ..plain
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha movie", "Bravo series", "Charlie video"],
+            "plain explicit true does not override both disabled settings"
+        );
     }
 }

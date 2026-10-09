@@ -1568,3 +1568,48 @@ fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::Ferrofi
         )),
     )
 }
+
+#[tokio::test]
+async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
+    use ferrofin_model::entities_media::ParentalRatingScore;
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let links = ferrofin_core::FerrofinLinkedChildrenService::new(db.clone());
+    let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "adult");
+    child.inherited_parental_rating_value = Some(18);
+    persist.save_items(&[child]).await.unwrap();
+    let mut parents = Vec::new();
+    for (id, name, score) in [(0x991, "rated", Some(10)), (0x992, "unrated", None)] {
+        let mut parent = item(Uuid::from_u128(id), BaseItemKind::BoxSet, name);
+        parent.inherited_parental_rating_value = score;
+        parents.push(parent);
+    }
+    persist.save_items(&parents).await.unwrap();
+    for parent in &parents {
+        links
+            .upsert_linked_child(
+                Uuid::parse_str(&parent.id).unwrap(),
+                Uuid::from_u128(0x990),
+                0,
+            )
+            .await
+            .unwrap();
+    }
+    let query = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::BoxSet],
+        max_parental_rating: Some(ParentalRatingScore::new(12, None)),
+        ..Default::default()
+    };
+    let found = repo(&db).get_item_list(&query).await.unwrap();
+    assert_eq!(
+        found.iter().map(|i| i.name.as_deref()).collect::<Vec<_>>(),
+        vec![Some("rated")]
+    );
+    // A child below the limit admits an unrated container too.
+    let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
+    child.inherited_parental_rating_value = Some(12);
+    child.inherited_parental_rating_sub_value = Some(0);
+    persist.save_items(&[child]).await.unwrap();
+    assert_eq!(repo(&db).get_item_list(&query).await.unwrap().len(), 2);
+}

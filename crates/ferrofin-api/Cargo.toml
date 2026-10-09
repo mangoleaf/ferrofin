@@ -38,6 +38,9 @@ axum = { workspace = true, features = ["ws", "macros"] }
 serde_path_to_error.workspace = true
 axum-extra.workspace = true
 chrono.workspace = true
+# ItemsController converts offsetless premiere dates with local standard-time
+# rules for skipped/repeated wall times; reuse the workspace-locked libc.
+libc.workspace = true
 tower.workspace = true
 tower-http = { workspace = true, features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 tokio = { workspace = true }
@@ -47,6 +50,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true
 form_urlencoded.workspace = true
+percent-encoding.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true

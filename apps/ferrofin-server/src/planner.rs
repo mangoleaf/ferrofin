@@ -141,6 +141,9 @@ pub struct FerrofinStreamStatePlanner {
     /// Optional: `None` (the composition unit test) leaves the names empty —
     /// they are logging metadata, never load-bearing.
     library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// The configured libraries, which name the library an item's location
+    /// belongs to. `None` leaves the library name empty.
+    virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -179,6 +182,7 @@ impl FerrofinStreamStatePlanner {
             subtitles,
             supports_tonemapx,
             library: None,
+            virtual_folders: None,
         }
     }
 
@@ -190,6 +194,17 @@ impl FerrofinStreamStatePlanner {
         library: Arc<dyn ferrofin_traits::library::LibraryManager>,
     ) -> Self {
         self.library = Some(library);
+        self
+    }
+
+    /// Wires the configured libraries, which the transcode logs name an
+    /// item's library by.
+    #[must_use]
+    pub fn with_virtual_folders(
+        mut self,
+        folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    ) -> Self {
+        self.virtual_folders = Some(folders);
         self
     }
 
@@ -209,13 +224,17 @@ impl FerrofinStreamStatePlanner {
         };
         names.item_name = item.name.clone();
         names.series_name = item.series_name.clone();
-        if let Some(top) = item
-            .top_parent_id
-            .as_deref()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            && let Ok(Some(folder)) = library.get_item_by_id(top).await
+        // The library whose location holds the item (its `TopParentId` is
+        // that location's folder; a row an older scan wrote names the library).
+        if let Some(folders) = &self.virtual_folders
+            && let Ok(folders) = folders.get_virtual_folders().await
         {
-            names.library_name = folder.name;
+            names.library_name = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.name.clone());
         }
         names
     }
@@ -798,18 +817,26 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             (value > 0).then_some(value)
         };
 
+        // EncodingHelper.TryStreamCopy: a user's transcoding veto wins even
+        // over incompatible codecs, bitrate caps, subtitles and client copy
+        // vetoes. There is no administrator bypass or remux-permission HTTP gate.
         let copy_video = video_stream
             .as_ref()
-            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v));
-        // `TryStreamCopy` runs only under `if (state.VideoRequest is not null)`:
-        // an audio-only HLS request never stream-copies its audio (the variant
-        // URL keeps `audioCodec=aac`, and ffmpeg re-encodes).
+            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v))
+            || (!is_audio
+                && request
+                    .playback_permissions
+                    .is_some_and(|p| !p.video_transcoding));
+        // Upstream only invokes TryStreamCopy for a VideoRequest. Audio-only
+        // requests retain their requested codec; negotiation enforces that flag.
         let copy_audio = !is_audio
-            && audio_stream.as_ref().is_some_and(|a| {
+            && (audio_stream.as_ref().is_some_and(|a| {
                 self.encoding_helper
                     .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
                     .0
-            });
+            }) || request
+                .playback_permissions
+                .is_some_and(|p| !p.audio_transcoding));
 
         // Resolve the effective output codecs from the copy decision.
         let output_video_codec = video_stream.as_ref().map(|_| {
@@ -1833,6 +1860,17 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.live_stream_id.hash(&mut hasher);
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
+    // Saved policy can change the effective codecs on an otherwise identical
+    // URL. Do not serve a previous encoder job after a permission change.
+    request.playback_permissions.hash(&mut hasher);
+    // ForceRemoteSourceTranscoding changes these negotiated vetoes. A new
+    // encoding request must not reuse a copied stream with the same session.
+    request.allow_video_stream_copy.hash(&mut hasher);
+    request.allow_audio_stream_copy.hash(&mut hasher);
+    // A newly negotiated internet bitrate limit changes the encoded output,
+    // even when a client retains its playback session and codec selection.
+    request.video_bitrate.hash(&mut hasher);
+    request.audio_bitrate.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
     // subtitled and non-subtitled transcode of the same item would collide. The
     // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
@@ -2188,6 +2226,102 @@ mod tests {
             query_string: "?x=1".to_owned(),
             ..HlsStreamRequest::default()
         }
+    }
+
+    #[tokio::test]
+    async fn renegotiated_bitrate_caps_change_encoding_and_cached_output() {
+        let mut video = video_stream("h264");
+        video.bit_rate = Some(8_000_000);
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        req.video_bitrate = Some(2_000_000);
+        req.audio_bitrate = Some(128_000);
+        let first = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        req.video_bitrate = Some(500_000);
+        let limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(limited.state.output_video_bitrate, Some(500_000));
+        assert!(limited.arguments.join(" ").contains("-maxrate 500000"));
+        assert_ne!(first.playlist_path, limited.playlist_path);
+        req.audio_bitrate = Some(64_000);
+        let audio_limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
+        assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
+        assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    #[tokio::test]
+    async fn saved_transcoding_permissions_override_client_copy_vetoes() {
+        use ferrofin_traits::library::PlaybackPermissions;
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut paths = std::collections::HashSet::new();
+        for bits in 0..8 {
+            let mut req = request("abc");
+            let permissions = PlaybackPermissions {
+                video_transcoding: bits & 1 != 0,
+                audio_transcoding: bits & 2 != 0,
+                remuxing: bits & 4 != 0,
+            };
+            req.playback_permissions = Some(permissions);
+            req.allow_video_stream_copy = false;
+            req.allow_audio_stream_copy = false;
+            req.video_codec = Some("h264".to_owned());
+            req.audio_codec = Some("aac".to_owned());
+            req.max_width = Some(160);
+            req.video_bitrate = Some(100_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.state.output_video_codec.as_deref(),
+                Some(if permissions.video_transcoding {
+                    "h264"
+                } else {
+                    "copy"
+                })
+            );
+            assert_eq!(
+                plan.state.output_audio_codec.as_deref(),
+                Some(if permissions.audio_transcoding {
+                    "aac"
+                } else {
+                    "copy"
+                })
+            );
+            let args = plan.arguments.join(" ");
+            assert_eq!(
+                args.contains("-c:v copy"),
+                !permissions.video_transcoding,
+                "{args}"
+            );
+            assert_eq!(
+                args.contains("-c:a copy"),
+                !permissions.audio_transcoding,
+                "{args}"
+            );
+            assert!(
+                paths.insert(output_id(&req, "ts", false)),
+                "policy changes must not reuse old encoded segments"
+            );
+        }
+        // Userless API keys still follow the client's copy vetoes.
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_video_codec.as_deref(), Some("copy"));
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+        // TryStreamCopy is only called for a VideoRequest upstream. Preserve
+        // that exception for direct audio-only requests with a known URL.
+        req.playback_permissions = Some(PlaybackPermissions {
+            video_transcoding: false,
+            audio_transcoding: false,
+            remuxing: false,
+        });
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
     }
 
     #[tokio::test]
@@ -4264,6 +4398,7 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-maxrate 1000000"), "re-encode caps: {args}");
         assert!(args.contains("-b:a 128000"), "audio bitrate: {args}");
+        let encoded_playlist = plan.playlist_path.clone();
 
         // A copy-eligible request (8 Mbps cap above the 6 Mbps source): both
         // streams copy, the bitrates are still the GetStreamingState values
@@ -4287,6 +4422,10 @@ mod tests {
             "copy has no bitrate args: {args}"
         );
         assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
+        assert_ne!(
+            plan.playlist_path, encoded_playlist,
+            "copy vetoes must separate encoded and copied output"
+        );
         assert_eq!(
             plan.min_segments, 3,
             "3s segments → 3 (StreamState.MinSegments)"

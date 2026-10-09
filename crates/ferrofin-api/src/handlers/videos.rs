@@ -58,6 +58,7 @@ async fn get_video_stream(
 /// requested container hint and is ignored for the direct-stream slice.
 async fn get_video_stream_by_container(
     State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _container)): Path<(Uuid, String)>,
     Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
@@ -69,7 +70,7 @@ async fn get_video_stream_by_container(
         Ok(path) => serve_static_file(&path, request).await,
         Err(ApiError::NotFound(_)) => {
             let raw = request.uri().query().map(ToOwned::to_owned);
-            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw);
+            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw, &auth);
             crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request)
                 .await
         }
@@ -232,16 +233,26 @@ async fn get_download(
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    require_visible_item(&state, item_id, auth.user.as_ref()).await?;
-    let path = stream_path(&state, item_id).await?;
+    let item = state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // The controller's CanDownload(user) check follows the policy check.
     // Administrators pass the policy, but an explicitly disabled download
     // permission still fails this per-item check. API keys have no user policy.
-    if policy.is_some_and(|p| !p.enable_content_downloading) {
+    if policy.is_some_and(|p| !p.enable_content_downloading)
+        || !state.dto.can_download(&item).await?
+    {
         return Err(ApiError::BadRequest(
             "user cannot download this item".to_owned(),
         ));
     }
+    // Download the requested item's own file. Playback-source resolution can
+    // promote an alternate version to its primary and would serve the wrong file.
+    let path = item
+        .path
+        .ok_or_else(|| ApiError::BadRequest("item has no download path".to_owned()))?;
     let filename = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())

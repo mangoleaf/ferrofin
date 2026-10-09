@@ -100,6 +100,7 @@ impl AuthService for AdminAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            token: Some("current-session".into()),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -112,6 +113,7 @@ impl AuthService for AdminAuth {
 struct MemUsers {
     /// Records the last (user_id, new_password) passed to `change_password`.
     changed_password: Mutex<Option<(Uuid, String)>>,
+    fail_password_change: std::sync::atomic::AtomicBool,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
@@ -177,6 +179,12 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        if self
+            .fail_password_change
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ServiceError::backend("password store unavailable"));
+        }
         *self.changed_password.lock().unwrap() = Some((user_id, new_password.to_owned()));
         Ok(())
     }
@@ -209,6 +217,8 @@ impl UserManager for MemUsers {
             has_password: Some(user.password.is_some()),
             policy: Some(UserPolicy {
                 is_administrator: is_admin,
+                // This account fixture has no device restrictions.
+                enable_all_devices: true,
                 ..UserPolicy::default()
             }),
             configuration: Some(UserConfiguration::default()),
@@ -317,9 +327,11 @@ impl QuickConnect for OkQuickConnect {
     }
 }
 
-/// A [`SessionManager`] whose `revoke_user_tokens` no-ops (used by delete/policy);
-/// every other method is unused by these tests.
-struct NoopSessions;
+/// Records token revocation while leaving unrelated session methods unused.
+#[derive(Default)]
+struct NoopSessions {
+    revoked: Mutex<Vec<(Uuid, String)>>,
+}
 
 #[async_trait]
 impl SessionManager for NoopSessions {
@@ -493,9 +505,13 @@ impl SessionManager for NoopSessions {
     }
     async fn revoke_user_tokens(
         &self,
-        _user_id: Uuid,
-        _current_access_token: &str,
+        user_id: Uuid,
+        current_access_token: &str,
     ) -> Result<(), ServiceError> {
+        self.revoked
+            .lock()
+            .unwrap()
+            .push((user_id, current_access_token.to_owned()));
         Ok(())
     }
     async fn close_live_stream_if_needed(
@@ -534,13 +550,29 @@ fn state_with_auth(
     activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
     auth: Arc<dyn AuthService>,
 ) -> AppState {
+    state_with_sessions(
+        users,
+        config,
+        activity,
+        auth,
+        Arc::new(NoopSessions::default()),
+    )
+}
+
+fn state_with_sessions(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+    sessions: Arc<dyn SessionManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
-        Arc::new(NoopSessions),
+        sessions,
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         config,
@@ -1560,7 +1592,7 @@ async fn update_policy_records_and_guards_last_admin() {
 }
 
 #[tokio::test]
-async fn forgot_password_unknown_user_reports_contact_admin() {
+async fn forgot_password_unknown_user_returns_the_uniform_pin_response() {
     // An unknown username must not disclose account existence, and touches no
     // filesystem (the user lookup returns `None` before a pin is issued).
     let router = create_router(state(
@@ -1581,58 +1613,138 @@ async fn forgot_password_unknown_user_reports_contact_admin() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["Action"], "ContactAdmin");
+    let body = body_json(response).await;
+    assert_eq!(body["Action"], "PinCode");
+    assert!(body["PinExpirationDate"].is_string());
+    assert!(!std::path::Path::new(body["PinFile"].as_str().unwrap()).exists());
 }
 
-#[tokio::test]
-async fn forgot_password_known_user_issues_and_redeems_pin() {
-    let users = Arc::new(MemUsers::default());
-    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
-
-    // 1) Request a pin for a known user → PinCode + a real pin file.
-    let response = router
+async fn recovery_request(
+    router: &axum::Router,
+    path: &str,
+    body: serde_json::Value,
+    peer: &str,
+) -> axum::response::Response {
+    router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/Users/ForgotPassword")
+                .uri(path)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "EnteredUsername": "bob" }).to_string(),
+                .extension(axum::extract::ConnectInfo(
+                    peer.parse::<std::net::SocketAddr>().unwrap(),
                 ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once() {
+    use std::sync::atomic::Ordering;
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let start = "/Users/ForgotPassword";
+    let redeem = "/Users/ForgotPassword/Pin";
+    let local = "127.0.0.1:4321";
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        "203.0.113.8:4321",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let remote = body_json(response).await;
+    assert_eq!(remote["Action"], "PinCode");
+    assert!(!std::path::Path::new(remote["PinFile"].as_str().unwrap()).exists());
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        local,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["Action"], "PinCode");
-    let pin_file = body["PinFile"].as_str().expect("pin file path").to_owned();
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&pin_file).unwrap()).unwrap();
-    let pin = record["Pin"].as_str().unwrap().to_owned();
-
-    // 2) Redeem the pin → success, bob reset, password set to the pin, file gone.
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Users/ForgotPassword/Pin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::json!({ "Pin": pin }).to_string()))
-                .unwrap(),
+    assert_eq!(body["PinFile"], remote["PinFile"]);
+    let file = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    record["Pin"] = serde_json::json!("A1-B2-C3-D4");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let wrong = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"a1-b2-c3-d4"}),
+        local,
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    users.fail_password_change.store(true, Ordering::SeqCst);
+    let failed = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(file.exists(), "failed password update preserves recovery");
+    users.fail_password_change.store(false, Ordering::SeqCst);
+    // Two concurrent redemption attempts must produce exactly one reset.
+    let (first, second) = tokio::join!(
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
+        ),
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["Success"], true);
-    assert_eq!(body["UsersReset"][0], "bob");
-
+    );
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
     let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
-    assert_eq!(pw, pin);
-    assert!(!std::path::Path::new(&pin_file).exists());
+    assert_eq!(
+        pw, "A1B2C3D4",
+        "the exact entered form becomes the password"
+    );
+    assert!(!file.exists());
+    // A matched file for a deleted user also remains recoverable after failure.
+    record["UserName"] = serde_json::json!("deleted");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let missing = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    record["ExpirationDate"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let expired = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    assert!(!file.exists());
 }
 
 #[tokio::test]
@@ -1789,8 +1901,8 @@ async fn user_scoped_configuration_forwards() {
 /// id. `AuthorizationInfo::user_id()` is the nil GUID for a caller with no user
 /// (an API key), so degrading an unparseable *target* id to nil as well made the
 /// two compare equal and granted the update — C# compares against `User.Id`, a
-/// `Guid` that is never `Guid.Empty` for a loaded user. A userless caller must
-/// be refused whatever the target row looks like.
+/// `Guid` that is never `Guid.Empty` for a loaded user. Even an elevated API
+/// key must not turn an invalid stored id into an anonymous self-update.
 #[tokio::test]
 async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
     let users = Arc::new(MemUsers::default());
@@ -1817,4 +1929,92 @@ async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
         StatusCode::FORBIDDEN,
         "a caller with no user must not be able to update a corrupt-id row"
     );
+}
+
+#[tokio::test]
+async fn changing_password_preserves_the_requesting_session() {
+    let users = Arc::new(MemUsers::default());
+    let sessions = Arc::new(NoopSessions::default());
+    let app = state_with_sessions(
+        users,
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    );
+    let router = create_router(app);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/Password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"NewPw":"replacement"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *sessions.revoked.lock().unwrap(),
+        vec![(ADMIN_ID, "current-session".to_owned())]
+    );
+}
+
+/// A normal account editing itself with preferences disabled must be denied,
+/// while an API key retains its upstream administrator role.
+#[tokio::test]
+async fn account_updates_respect_preferences_and_api_key_elevation() {
+    struct BobAuth;
+    #[async_trait]
+    impl AuthService for BobAuth {
+        async fn authenticate(
+            &self,
+            _: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(AuthorizationInfo {
+                user: Some(user_entity(BOB_ID, "bob", None)),
+                is_authenticated: true,
+                ..Default::default()
+            })
+        }
+    }
+    for (path, body) in [
+        ("/Users", r#"{"Name":"new-name"}"#),
+        ("/Users/Password", r#"{"NewPw":"replacement"}"#),
+        (
+            "/Users/Configuration",
+            r#"{"AudioLanguagePreference":"fr"}"#,
+        ),
+    ] {
+        for (auth, expected) in [
+            (
+                Arc::new(BobAuth) as Arc<dyn AuthService>,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService) as Arc<dyn AuthService>,
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let app = state_with_auth(
+                Arc::new(MemUsers::default()),
+                Arc::new(MemConfig::new(true)),
+                Arc::new(ferrofin_api::test_support::FakeActivity),
+                auth,
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{path}?userId={BOB_ID}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 }

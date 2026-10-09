@@ -124,10 +124,7 @@ pub struct FanartClient {
     limiter: RateLimiter,
     /// Optional user personal key (`client_key`), raising limits/freshness.
     personal_key: Option<String>,
-    /// The preferred artwork language for the ordering (Ferrofin has no per-item
-    /// metadata-language plumbing yet, so this is fixed at construction).
-    // ponytail: fixed language — thread the library's metadata language through
-    // if per-library artwork language selection is wanted.
+    /// The preferred artwork language for this request's ordering.
     language: String,
     /// The web-service base (const in production; overridable in tests).
     base_url: String,
@@ -158,6 +155,15 @@ impl FanartClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         base_url.clone_into(&mut self.base_url);
+        self
+    }
+
+    /// Selects the item's preferred artwork language. Clones share the HTTP
+    /// client and rate limiter, so each library can rank the same response
+    /// without changing another library's preference.
+    #[must_use]
+    pub fn with_language(mut self, language: &str) -> Self {
+        language.clone_into(&mut self.language);
         self
     }
 
@@ -491,6 +497,12 @@ mod tests {
             order,
             vec!["wide-en-high", "wide-en-low", "wide-de", "narrow-en"]
         );
+        let german = client.clone().with_language("de");
+        german.sort(&mut images);
+        assert_eq!(images[0].url, "wide-de", "language wins over likes");
+        assert_eq!(images[3].url, "narrow-en", "width wins over language");
+        client.sort(&mut images);
+        assert_eq!(images[0].url, "wide-en-high", "request clones are isolated");
     }
 
     #[test]

@@ -198,10 +198,12 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
 
     // Restart: the listener goes away and comes back while `run` keeps running.
     let tok = token(&client, &base).await;
+    let configuration = prepare_dashboard_restart(&client, &base, &tok).await;
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
     wait_until(&client, &base, &name, false).await;
     wait_until(&client, &base, &name, true).await;
     assert!(!server.is_finished(), "a restart must not exit the process");
+    assert_dashboard_restarted(&client, &base, &tok, &configuration).await;
     assert_eq!(metrics(&client).await, 200, "/metrics survives the restart");
     assert_eq!(
         discover(discovery_addr).await,
@@ -243,6 +245,49 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     assert!(
         !is_up(&client, &base, &name).await,
         "shutdown leaves nothing listening"
+    );
+}
+
+/// Saved dashboard settings survive a new lifetime, while the restart flag
+/// clears. The old session token must still authorize these checks.
+async fn prepare_dashboard_restart(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> serde_json::Value {
+    let mut config = get_json(client, base, "/System/Configuration", token).await;
+    config["UICulture"] = serde_json::json!("de");
+    config["QuickConnectAvailable"] = serde_json::json!(false);
+    config["ParallelImageEncodingLimit"] = serde_json::json!(2);
+    assert_eq!(
+        post_json(client, base, "/System/Configuration", token, &config)
+            .await
+            .0,
+        204
+    );
+    let info = get_json(client, base, "/System/Info", token).await;
+    assert_eq!(info["HasPendingRestart"], true);
+    config
+}
+
+async fn assert_dashboard_restarted(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    expected: &serde_json::Value,
+) {
+    let actual = get_json(client, base, "/System/Configuration", token).await;
+    assert_eq!(
+        &actual, expected,
+        "saved settings survive the new host lifetime"
+    );
+    assert_eq!(
+        get_json(client, base, "/System/Info", token).await["HasPendingRestart"],
+        false
+    );
+    assert_eq!(
+        get_json(client, base, "/QuickConnect/Enabled", token).await,
+        false
     );
 }
 

@@ -189,6 +189,8 @@ struct HlsQuery {
 struct HlsRequestContext {
     /// The access token presented by the request, if any.
     api_key: Option<String>,
+    /// Trusted policy snapshot from authorization, including on segment requests.
+    playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
     /// The peer's IP from the connection; `None` when the server was not started
     /// with connect-info (tests) — treated as not local, the conservative answer.
     remote_ip: Option<std::net::IpAddr>,
@@ -207,6 +209,7 @@ impl HlsRequestContext {
     ) -> Self {
         Self {
             api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
+            playback_permissions: auth.user_policy.as_deref().map(Into::into),
             // Inserted by the server's `with_connect_info`; absent behind a
             // body-consuming extractor or in tests.
             remote_ip: parts
@@ -272,6 +275,7 @@ fn build_request(
         enable_adaptive_bitrate_streaming: query.enable_adaptive_bitrate_streaming.unwrap_or(false),
         enable_trickplay: query.enable_trickplay.unwrap_or(true),
         api_key: ctx.api_key,
+        playback_permissions: ctx.playback_permissions,
         is_in_local_network: ctx
             .remote_ip
             .is_some_and(crate::handlers::system::is_in_local_network),
@@ -313,10 +317,17 @@ pub(crate) fn request_from_query(
     item_id: Uuid,
     query: HlsQueryPub,
     raw_query: Option<String>,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
 ) -> HlsStreamRequest {
-    // The progressive-transcode fallback builds no master playlist, so the
-    // token/peer context is irrelevant there.
-    build_request(item_id, query.0, raw_query, HlsRequestContext::default())
+    build_request(
+        item_id,
+        query.0,
+        raw_query,
+        HlsRequestContext {
+            playback_permissions: auth.user_policy.as_deref().map(Into::into),
+            ..HlsRequestContext::default()
+        },
+    )
 }
 
 /// A public wrapper around the crate-private [`HlsQuery`] so `videos`/`audio` can
@@ -464,14 +475,17 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 /// cannot set an `Authorization` header on a segment URL authenticate.
 async fn get_video_hls_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw, HlsRequestContext::default());
+    let (parts, body) = request.into_parts();
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let request = Request::from_parts(parts, body);
+    let req = build_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, false).await?;
     served_file_response(file, request).await
 }
@@ -480,14 +494,17 @@ async fn get_video_hls_segment(
 /// segment. Authenticated for the same reason as its video sibling above.
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw, HlsRequestContext::default());
+    let (parts, body) = request.into_parts();
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let request = Request::from_parts(parts, body);
+    let req = build_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
 }
@@ -598,7 +615,7 @@ async fn stop_encoding_process(
 /// `application/octet-stream`). A missing item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
-    auth: Result<crate::auth::RequireAuth, ApiError>,
+    auth: Result<crate::auth::AuthenticatedIdentity, ApiError>,
     Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
 ) -> Result<Response, ApiError> {
     let user = auth.ok().and_then(|auth| auth.0.user);
@@ -823,6 +840,7 @@ mod tests {
         .expect("parses");
         let ctx = HlsRequestContext {
             api_key: Some("tok".to_owned()),
+            playback_permissions: None,
             remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 192, 168, 1, 5,
             ))),
@@ -851,6 +869,7 @@ mod tests {
         let query: HlsQuery = parse("").expect("parses");
         let ctx = HlsRequestContext {
             api_key: None,
+            playback_permissions: None,
             remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))),
             subtitles_in_manifest_default: true,
         };

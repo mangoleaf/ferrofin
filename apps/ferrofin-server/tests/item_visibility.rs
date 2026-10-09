@@ -268,6 +268,8 @@ async fn fixture() -> Fixture {
     policy["EnableAllFolders"] = json!(false);
     policy["EnabledFolders"] = json!([allowed_library]);
     policy["EnableContentDeletion"] = json!(true);
+    // The operation permission must pass before these tests reach visibility.
+    policy["EnableSubtitleManagement"] = json!(true);
     let (status, _) = call(
         &router,
         "POST",
@@ -392,6 +394,19 @@ async fn hidden_items_return_404_before_direct_reads_and_writes() {
         .await
         .0,
         StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Items/{id}/PlaybackInfo"),
+            Some(&f.admin),
+            Some(json!({"UserId": f.viewer_id, "DeviceProfile": {}})),
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND,
+        "the posted target user scopes visibility before playback negotiation"
     );
     // Elevation does not bypass the administrator's own library restrictions.
     let (_, user) = call(
@@ -564,6 +579,58 @@ async fn hidden_images_and_indirect_media_are_checked_before_cached_responses() 
             }
         }
     }
+    // Public routes retain an authenticated identity even when a default-route
+    // schedule would deny it. Dropping it would bypass item visibility.
+    let (_, viewer) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let policy = viewer["Policy"].clone();
+    let mut outside_schedule = policy.clone();
+    outside_schedule["AccessSchedules"] = json!([{
+        "Id": 0, "UserId": f.viewer_id,
+        "DayOfWeek": "Everyday", "StartHour": 1, "EndHour": 0
+    }]);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(outside_schedule),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&f.router, "GET", "/Items", Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        image_response(&f, &uri, Some(&f.viewer), false, None)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(policy),
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
     // Upstream permits user-less public images; retain that policy.
     assert_eq!(
         image_response(&f, &uri, None, false, None).await.status(),
@@ -963,4 +1030,530 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         .0,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn public_user_picker_filters_authenticated_devices_after_setup() {
+    let h = boot().await;
+    let router = ferrofin_api::create_router(h.wired.state.clone());
+    let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let id = create_user(&router, &admin, "device-user", "pw").await;
+    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    dto["Policy"]["IsHidden"] = json!(false);
+    dto["Policy"]["EnableAllDevices"] = json!(false);
+    dto["Policy"]["EnabledDevices"] = json!([]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for setup in [false, true] {
+        let (_, mut config) =
+            call(&router, "GET", "/System/Configuration", Some(&admin), None).await;
+        config["IsStartupWizardCompleted"] = json!(setup);
+        assert_eq!(
+            call(
+                &router,
+                "POST",
+                "/System/Configuration",
+                Some(&admin),
+                Some(config)
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        for token in [None, Some(admin.as_str())] {
+            let (status, users) = call(&router, "GET", "/Users/Public", token, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                users.as_array().unwrap().iter().any(|u| u["Id"] == id),
+                !setup || token.is_none(),
+                "setup={setup}, authenticated={}",
+                token.is_some()
+            );
+        }
+    }
+    // Match the header device used by `call`, case-insensitively.
+    dto["Policy"]["EnabledDevices"] = json!([admin[..8].to_uppercase()]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, users) = call(&router, "GET", "/Users/Public", Some(&admin), None).await;
+    assert!(users.as_array().unwrap().iter().any(|u| u["Id"] == id));
+}
+
+#[tokio::test]
+async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
+    let h = boot().await;
+    let router = ferrofin_api::create_router(h.wired.state.clone());
+    let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let id = create_user(&router, &admin, "device-user", "pw").await;
+    let (user, _) = login(&router, "device-user", "pw").await;
+    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    dto["Policy"]["EnableAllDevices"] = json!(false);
+    dto["Policy"]["EnabledDevices"] = json!([]);
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users/{id}/Policy"),
+            Some(&admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::OK,
+        "policy saves do not emit OnUserUpdated in the pinned source"
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            "/Users/AuthenticateByName",
+            None,
+            Some(json!({"Username":"device-user", "Pw":"pw"}))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN,
+        "a denied device is a security error, not bad credentials"
+    );
+    assert_eq!(
+        call(
+            &router,
+            "POST",
+            &format!("/Users?userId={id}"),
+            Some(&admin),
+            Some(json!({"Name":"renamed"}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn metadata_rating_edits_keep_browse_and_direct_access_consistent() {
+    let f = fixture().await;
+    let movies = items_by_path(&f.router, &f.admin).await;
+    let id = movies
+        .iter()
+        .find(|(path, _)| path.contains("Alpha"))
+        .unwrap()
+        .1
+        .clone();
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    dto["Policy"]["MaxParentalRating"] = json!(12);
+    dto["Policy"]["MaxParentalSubRating"] = json!(0);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for (custom, official, country, expected) in [
+        (Some("10"), "FSK-18", "US", true),
+        (None, "FSK-18", "US", false),
+        (None, "PG", "CA", true),
+        (None, "PG", "AU", false),
+        (None, "", "US", true),
+    ] {
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Items/{id}"),
+                Some(&f.admin),
+                Some(
+                    json!({"Name":"Alpha", "CustomRating":custom, "OfficialRating":official,
+                "PreferredMetadataCountryCode":country})
+                )
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, listing) = call(
+            &f.router,
+            "GET",
+            "/Items?recursive=true&includeItemTypes=Movie",
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listing["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["Id"] == id),
+            expected,
+            "{custom:?} {official} {country}"
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Items/{id}"),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            if expected {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn saved_unrated_policy_filters_browse_and_numeric_enum_values_round_trip() {
+    let f = fixture().await;
+    let movies = items_by_path(&f.router, &f.admin).await;
+    let id = movies
+        .iter()
+        .find(|(path, _)| path.contains("Alpha"))
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Items/{id}"),
+            Some(&f.admin),
+            Some(json!({"Name":"Alpha","OfficialRating":"Unrated","CustomRating":null}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    for (blocked, visible) in [
+        (json!([]), true),
+        (json!(["Movie", 99]), false),
+        (json!([]), true),
+    ] {
+        dto["Policy"]["BlockUnratedItems"] = blocked.clone();
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Users/{}/Policy", f.viewer_id),
+                Some(&f.admin),
+                Some(dto["Policy"].clone())
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, saved) = call(
+            &f.router,
+            "GET",
+            &format!("/Users/{}", f.viewer_id),
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        assert_eq!(saved["Policy"]["BlockUnratedItems"], blocked);
+        let (status, listed) = call(
+            &f.router,
+            "GET",
+            &format!("/Items?ids={id}"),
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["Id"] == id),
+            visible
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Items/{id}"),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            if visible {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn saved_tags_filter_lists_counts_and_views_with_root_allow_exception() {
+    let f = fixture().await;
+    let (_, mut dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    dto["Policy"]["EnableAllFolders"] = json!(true);
+    for (id, name, tags) in [
+        (&f.allowed, "Tagged", json!(["Café"])),
+        (&f.hidden, "Private", json!(["private"])),
+    ] {
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Items/{id}"),
+                Some(&f.admin),
+                Some(json!({"Name":name,"Tags":tags,"Genres":["Shared"]}))
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    for (blocked, allowed, count) in [
+        (json!([]), json!([]), 4),
+        (json!(["private"]), json!([]), 3),
+        (json!([]), json!(["CAFE"]), 1),
+        (json!(["café"]), json!(["CAFE"]), 0),
+        (json!([]), json!([]), 4),
+    ] {
+        dto["Policy"]["BlockedTags"] = blocked;
+        dto["Policy"]["AllowedTags"] = allowed;
+        assert_eq!(
+            call(
+                &f.router,
+                "POST",
+                &format!("/Users/{}/Policy", f.viewer_id),
+                Some(&f.admin),
+                Some(dto["Policy"].clone())
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, listed) = call(
+            &f.router,
+            "GET",
+            "/Items?recursive=true&includeItemTypes=Movie",
+            Some(&f.viewer),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["TotalRecordCount"], count);
+        assert_eq!(
+            listed["Items"].as_array().unwrap().len(),
+            usize::try_from(count).unwrap()
+        );
+        let (status, counts) = call(&f.router, "GET", "/Items/Counts", Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(counts["MovieCount"], count);
+        for path in ["/Items", "/UserViews?includeHidden=true"] {
+            let (status, roots) = call(&f.router, "GET", path, Some(&f.viewer), None).await;
+            assert_eq!(status, StatusCode::OK, "{path} {roots}");
+            let names: Vec<_> = roots["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|i| i["Name"].as_str())
+                .collect();
+            assert!(
+                names.contains(&"Allowed") && names.contains(&"Hidden"),
+                "{path} {names:?}"
+            );
+        }
+    }
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let folder = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["Name"] == "Allowed")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Items/{folder}"),
+            Some(&f.admin),
+            Some(json!({"Name":"Allowed","Tags":["Private"]}))
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    dto["Policy"]["BlockedTags"] = json!(["private"]);
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(dto["Policy"].clone())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    for path in ["/Items", "/UserViews?includeHidden=true"] {
+        let (status, roots) = call(&f.router, "GET", path, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{path} {roots}");
+        let names: Vec<_> = roots["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["Name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"Allowed") && names.contains(&"Hidden"),
+            "{path} {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_web_schedule_payload_saves_and_revokes_existing_requests() {
+    let f = fixture().await;
+    let (_, mut user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    for (schedules, allowed) in [
+        (json!([]), true),
+        (
+            json!([{"DayOfWeek":"Everyday","StartHour":"25","EndHour":"26"}]),
+            false,
+        ),
+        (
+            json!([{"DayOfWeek":"Everyday","StartHour":"0","EndHour":"24"}]),
+            true,
+        ),
+        (json!([]), true),
+    ] {
+        // Current Web rebuilds these three fields from HTML data attributes;
+        // its POST carries neither the database Id nor the associated UserId.
+        user["Policy"]["AccessSchedules"] = schedules;
+        let (status, saved) = call(
+            &f.router,
+            "POST",
+            &format!("/Users/{}/Policy", f.viewer_id),
+            Some(&f.admin),
+            Some(user["Policy"].clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{saved}");
+        let (_, saved) = call(
+            &f.router,
+            "GET",
+            &format!("/Users/{}", f.viewer_id),
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        let read = saved["Policy"]["AccessSchedules"].as_array().unwrap();
+        assert_eq!(
+            read.len(),
+            user["Policy"]["AccessSchedules"].as_array().unwrap().len()
+        );
+        for row in read {
+            assert!(row["Id"].as_i64().unwrap() > 0);
+            assert_eq!(row["UserId"], f.viewer_id);
+        }
+        assert_eq!(
+            call(&f.router, "GET", "/Users/Me", Some(&f.viewer), None)
+                .await
+                .0,
+            if allowed {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/Users/{}", f.viewer_id),
+                Some(&f.viewer),
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
 }

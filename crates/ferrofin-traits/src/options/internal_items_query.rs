@@ -30,6 +30,20 @@ pub enum SourceType {
     LiveTv,
 }
 
+/// The once-resolved roots for an internal descendant query.
+///
+/// Leaf IDs stay in the database sub-select; these vectors contain only the
+/// seed and folders discovered by the pinned linked-root traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescendantQueryRoots {
+    /// The logical descendant criterion this snapshot resolves.
+    pub parent_id: Uuid,
+    /// Roots whose direct ancestor closure plus one seam hop contributes rows.
+    pub closure_roots: Vec<Uuid>,
+    /// Roots whose linked children contribute rows, across every child kind.
+    pub link_roots: Vec<Uuid>,
+}
+
 /// The central item query. Every field is an optional filter, a pagination/sort
 /// control, or DTO/user context; an empty query matches everything.
 ///
@@ -54,6 +68,8 @@ pub struct InternalItemsQuery {
     pub limit: Option<i32>,
     /// The user the query is scoped to.
     pub user: Option<UserEntity>,
+    /// Whether repository resolution has loaded the user content preferences.
+    pub user_preferences_loaded: bool,
 
     // --- boolean tri-state filters ---
     /// Restrict to folders / non-folders.
@@ -309,8 +325,22 @@ pub struct InternalItemsQuery {
     /// the repository ignores it unless the parent really does resolve to the
     /// user root.
     pub user_root_children: bool,
+    /// Apply the Folder display policy on an ItemsController browse. Internal
+    /// repository queries and latest/resume queries leave this false.
+    pub apply_folder_display_options: bool,
+    /// The source movie/TV base UserView directly calls Folder.QueryRecursive,
+    /// bypassing its parent's Series/Season/Channel GetItemsInternal override.
+    /// Derived dispatch context, never a client option.
+    pub folder_query_recursive: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
+    /// Restrict to physical and linked descendants of this item.
+    /// Internal scope used for recursive BoxSet/Playlist reads; filters and
+    /// paging apply to the resulting rows, never to traversal intermediates.
+    pub descendant_of_id: Option<Uuid>,
+    /// Cached internal root resolution for the row and count statements.
+    /// Repositories recompute it when its parent differs from DescendantOfId.
+    pub descendant_roots: Option<DescendantQueryRoots>,
     /// Restrict to descendants of these ancestors.
     pub ancestor_ids: Vec<Uuid>,
     /// Restrict to items whose linked children descend from these ancestors.
@@ -450,6 +480,7 @@ impl Default for InternalItemsQuery {
             start_index: None,
             limit: None,
             user: None,
+            user_preferences_loaded: false,
             is_folder: None,
             is_favorite: None,
             is_favorite_or_liked: None,
@@ -541,7 +572,11 @@ impl Default for InternalItemsQuery {
             parent_physical_folder_ids: Vec::new(),
             virtual_child_parent_id: None,
             user_root_children: false,
+            apply_folder_display_options: false,
+            folder_query_recursive: false,
             parent_type: None,
+            descendant_of_id: None,
+            descendant_roots: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),
             top_parent_ids: Vec::new(),
@@ -633,6 +668,7 @@ impl InternalItemsQuery {
             || !self.subtitle_languages.is_empty()
             || !self.linked_child_ancestor_ids.is_empty()
             || !self.ancestor_ids.is_empty()
+            || self.descendant_of_id.is_some()
             || self.is_favorite.is_some()
             || self.is_favorite_or_liked.is_some()
             || self.is_liked.is_some()
@@ -707,9 +743,13 @@ impl InternalItemsQuery {
     /// The C# method also derives `block_unrated_items`,
     /// `exclude_inherited_tags` and `include_inherited_tags` from the user's
     /// **preferences** (`PreferenceKind.*`). Those rows live in a separate
-    /// preferences table, not on [`UserEntity`], so the caller must populate
-    /// those three fields from a preference lookup; they are left untouched here.
+    /// preferences table, not on [`UserEntity`], so repository query resolution populates
+    /// those three fields from a preference lookup before translating SQL.
     pub fn set_user(&mut self, user: UserEntity) {
+        self.user_preferences_loaded = false;
+        self.block_unrated_items.clear();
+        self.exclude_inherited_tags.clear();
+        self.include_inherited_tags.clear();
         if let Some(max) = user.max_parental_rating_score {
             self.max_parental_rating = Some(ParentalRatingScore::new(
                 i32::try_from(max).unwrap_or(i32::MAX),
@@ -854,6 +894,16 @@ mod tests {
             ..Default::default()
         };
         assert!(!q3.has_filters());
+    }
+
+    #[test]
+    fn descendant_of_id_is_a_filter_before_root_resolution() {
+        let query = InternalItemsQuery {
+            descendant_of_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(query.has_filters());
+        assert!(query.descendant_roots.is_none());
     }
 
     #[test]

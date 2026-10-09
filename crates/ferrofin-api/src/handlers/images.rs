@@ -55,7 +55,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::image_upload::{
@@ -646,7 +646,7 @@ async fn serve_item_image(
 async fn authorize_image_item(
     state: &AppState,
     id: Uuid,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
 ) -> Result<ItemResolved, ApiError> {
     if let Some(user) = auth.ok().and_then(|auth| auth.0.user) {
         require_item(state, id, Some(&user)).await?;
@@ -674,7 +674,7 @@ async fn authorize_image_item(
 )]
 async fn get_item_image(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
     request: Request,
@@ -708,7 +708,7 @@ async fn get_item_image(
 )]
 async fn get_item_image_by_index(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<ImageQuery>,
     request: Request,
@@ -750,7 +750,7 @@ async fn get_item_image_by_index(
 #[allow(clippy::type_complexity)]
 async fn get_item_image_parametrized(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((
         item_id,
         image_type,
@@ -1055,7 +1055,7 @@ by_name_image_handlers!(
 )]
 async fn get_user_image(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -1063,7 +1063,7 @@ async fn get_user_image(
     // An explicit id is public; without one, use the authenticated caller.
     let user_id = query
         .user_id
-        .or_else(|| auth.ok().map(|RequireAuth(info)| info.user_id()))
+        .or_else(|| auth.ok().map(|AuthenticatedIdentity(info)| info.user_id()))
         .filter(|id| !id.is_nil())
         .ok_or_else(|| ApiError::BadRequest("UserId is required if unauthenticated".to_owned()))?;
     state
@@ -1165,7 +1165,7 @@ async fn delete_user_image(
 /// and ignored, as upstream does.
 async fn get_user_image_legacy(
     state: State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
@@ -1178,7 +1178,7 @@ async fn get_user_image_legacy(
 /// path-scoped form of `GET /UserImage`.
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
@@ -1423,6 +1423,13 @@ async fn update_item_image_index(
     state
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)
+        .await?;
+    state
+        .providers
+        .save_metadata(
+            item_id,
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -534,6 +534,24 @@ impl DeviceManager for FerrofinDeviceManager {
         self.access_allows(&access, device_id)
     }
 
+    async fn can_access_devices(
+        &self,
+        user: &UserEntity,
+        device_ids: &[&str],
+    ) -> Result<Vec<bool>, ServiceError> {
+        if device_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if device_ids.iter().any(|id| id.is_empty()) {
+            return Err(ServiceError::invalid_input("deviceId must not be empty"));
+        }
+        let access = self.resolve_access(Some(user)).await?;
+        device_ids
+            .iter()
+            .map(|id| self.access_allows(&access, id))
+            .collect()
+    }
+
     async fn update_device_options(
         &self,
         device_id: &str,

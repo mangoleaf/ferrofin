@@ -17,11 +17,10 @@
 //!   replaces a stored item's date whenever that reader runs, in either mode
 //!   (`MetadataService.MergeData`).
 //!
-//! The filesystems this runs on (btrfs, tmpfs, ext4) report a birth time,
-//! which cannot be set: a file's creation time is the moment the test wrote
-//! it. Its mtime is set years back so the btime-less rule (the older of
-//! ctime and mtime) would be told apart too, and "detected" is asserted
-//! against a window opened after the file was written.
+//! The file's mtime is set years back to distinguish Linux's source runtime
+//! clock (the older of ctime and mtime) from statx birth time. Other platforms
+//! retain their native creation-time backend. "Detected" is asserted against
+//! a window opened after the file was written.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -187,12 +186,16 @@ fn set_mtime(path: &Path, at: &str) {
         .expect("set mtime");
 }
 
-/// .NET's `CreationTimeUtc` on Unix, as the scan reads it: the birth time
-/// when the filesystem reports one, else the older of ctime and mtime.
+/// .NET's Linux backend uses the older of ctime and mtime. Other Unix
+/// backends can expose birth time, falling back to the same oldest-time rule.
 fn creation_time(path: &Path) -> DateTime<Utc> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path).expect("stat");
-    let birth = meta.created().ok();
+    let birth = if cfg!(target_os = "linux") {
+        None
+    } else {
+        meta.created().ok()
+    };
     let ctime = DateTime::from_timestamp(
         meta.ctime(),
         u32::try_from(meta.ctime_nsec()).expect("nanos"),

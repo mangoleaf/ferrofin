@@ -9,6 +9,7 @@
 //! `{cache}/sd-countries.json` while it is younger than [`COUNTRY_CACHE_DAYS`],
 //! then a fresh fetch that rewrites both.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
@@ -40,7 +41,7 @@ const COUNTRIES_CACHE_FILE: &str = "sd-countries.json";
 #[derive(Clone)]
 pub struct SchedulesDirect {
     fetcher: Arc<dyn SourceFetcher>,
-    cache_dir: PathBuf,
+    cache_dir: DirectoryPath,
     /// `SchedulesDirect._countriesCache`: the bytes last read or fetched.
     countries: Arc<RwLock<Option<Vec<u8>>>>,
 }
@@ -57,7 +58,7 @@ impl SchedulesDirect {
     /// Creates the client over `fetcher`, caching on disk under `cache_dir`
     /// (the application cache path — `IApplicationPaths.CachePath` upstream).
     #[must_use]
-    pub fn new(fetcher: Arc<dyn SourceFetcher>, cache_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(fetcher: Arc<dyn SourceFetcher>, cache_dir: impl Into<DirectoryPath>) -> Self {
         Self {
             fetcher,
             cache_dir: cache_dir.into(),
@@ -88,7 +89,8 @@ impl SchedulesDirect {
             return Ok(cached);
         }
 
-        let cache_path = self.countries_cache_path();
+        let cache_dir = self.cache_dir.resolve();
+        let cache_path = cache_dir.join(COUNTRIES_CACHE_FILE);
         if cache_is_fresh(&cache_path).await {
             match tokio::fs::read(&cache_path).await {
                 Ok(bytes) => {
@@ -110,9 +112,9 @@ impl SchedulesDirect {
         let url = format!("{API_URL}/available/countries");
         let bytes = self.fetcher.fetch_bytes(&url).await?;
 
-        tokio::fs::create_dir_all(&self.cache_dir)
+        tokio::fs::create_dir_all(&cache_dir)
             .await
-            .map_err(|e| LiveTvError::io(format!("create {}", self.cache_dir.display()), e))?;
+            .map_err(|e| LiveTvError::io(format!("create {}", cache_path.display()), e))?;
         tokio::fs::write(&cache_path, &bytes)
             .await
             .map_err(|e| LiveTvError::io(format!("write {}", cache_path.display()), e))?;

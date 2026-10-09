@@ -117,7 +117,9 @@ impl AuthorizationContext for OkAuth {
 /// A configuration manager returning canned config + branding, capturing writes.
 #[derive(Default)]
 struct StubConfig {
+    updates: Mutex<Vec<(String, Arc<str>)>>,
     branding: Mutex<BrandingOptions>,
+    configuration: Mutex<Option<Arc<ServerConfiguration>>>,
     paths: StubPaths,
 }
 
@@ -181,19 +183,36 @@ impl ServerApplicationPaths for StubPaths {
 
 #[async_trait]
 impl ServerConfigurationManager for StubConfig {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        let saved = std::fs::read(
+            self.paths.config_dir.clone() + "/named/" + &key.to_ascii_lowercase() + ".json",
+        )
+        .unwrap();
+        assert_eq!(json.as_bytes(), saved);
+        self.updates.lock().unwrap().push((key.to_owned(), json));
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::new(self.paths.clone())
     }
     async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
-        Ok(Arc::new(ServerConfiguration {
-            server_name: "Ferrofin".to_owned(),
-            ..Default::default()
-        }))
+        Ok(self
+            .configuration
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| {
+                Arc::new(ServerConfiguration {
+                    server_name: "Ferrofin".to_owned(),
+                    ..Default::default()
+                })
+            }))
     }
     async fn update_configuration(
         &self,
-        _configuration: &ServerConfiguration,
+        configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
+        *self.configuration.lock().unwrap() = Some(Arc::new(configuration.clone()));
         Ok(())
     }
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -394,6 +413,19 @@ fn admin_state_with_paths(paths: StubPaths) -> AppState {
 
 /// [`state_with_paths`] with the caller's role decided by `users`.
 fn state_with(paths: StubPaths, users: Arc<dyn UserManager>) -> AppState {
+    state_with_config(
+        users,
+        Arc::new(StubConfig {
+            paths,
+            ..Default::default()
+        }),
+    )
+}
+
+fn state_with_config(
+    users: Arc<dyn UserManager>,
+    config: Arc<dyn ServerConfigurationManager>,
+) -> AppState {
     let auth = Arc::new(OkAuth);
     AppState::new(
         Arc::new(FakeLibrary),
@@ -404,10 +436,7 @@ fn state_with(paths: StubPaths, users: Arc<dyn UserManager>) -> AppState {
         Arc::new(FakeSessions),
         Arc::new(StubSystem),
         Arc::new(FakeAppHost),
-        Arc::new(StubConfig {
-            paths,
-            ..StubConfig::default()
-        }),
+        config,
         Arc::new(FakeProviders),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -805,9 +834,10 @@ async fn a_saved_network_configuration_is_served_under_the_contract_names() {
 }
 
 #[tokio::test]
-async fn a_network_configuration_that_cannot_be_read_is_served_unchanged_and_warned() {
-    // Normalization must not become a way to lose a document: if it will not
-    // parse, hand the client exactly what is on disk and say so.
+async fn a_network_configuration_that_cannot_be_read_returns_defaults_without_overwriting() {
+    // Match BaseConfigurationManager.LoadConfiguration: a malformed stored
+    // section returns a typed default and a warning. Reading must not replace
+    // the original document, which the operator may still be able to repair.
     let dir = tempfile::tempdir().unwrap();
     write_named_config(
         dir.path(),
@@ -823,16 +853,133 @@ async fn a_network_configuration_that_cannot_be_read_is_served_unchanged_and_war
         with_captured_logs(get(state, "/System/Configuration/network")).await;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["InternalHttpPort"], serde_json::json!(8096));
     assert_eq!(
-        json(&body)["InternalHttpPort"],
-        serde_json::json!("not a port")
-    );
-    assert_eq!(
-        logs.warnings_matching("network configuration").len(),
+        logs.warnings_matching("named configuration").len(),
         1,
         "the unreadable configuration must be reported: {:?}",
         logs.0.lock().unwrap()
     );
+    assert_eq!(
+        std::fs::read(dir.path().join("named/network.json")).unwrap(),
+        br#"{"InternalHttpPort":"not a port"}"#
+    );
+}
+
+/// These partial documents predate typed named-config writes. The dashboard
+/// must see constructor defaults for omitted members, just as it does when
+/// Jellyfin loads a partial XML configuration. Unknown members are not typed
+/// settings and must not leak back into a core configuration response.
+#[tokio::test]
+async fn saved_core_configurations_return_typed_defaults() {
+    for (key, mut saved, default_field, default_value) in [
+        (
+            "metadata",
+            serde_json::json!({}),
+            "UseFileCreationTimeForDateAdded",
+            serde_json::json!(true),
+        ),
+        (
+            "xbmcmetadata",
+            serde_json::json!({"UserId":"user-1"}),
+            "SaveImagePathsInNfo",
+            serde_json::json!(true),
+        ),
+        (
+            "livetv",
+            serde_json::json!({"PrePaddingSeconds":120}),
+            "SaveRecordingNFO",
+            serde_json::json!(true),
+        ),
+        (
+            "network",
+            serde_json::json!({"EnableIpv4":false}),
+            "InternalHttpPort",
+            serde_json::json!(8096),
+        ),
+        (
+            "encoding",
+            serde_json::json!({"EncodingThreadCount":3}),
+            "DownMixAudioBoost",
+            serde_json::json!(2.0),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        saved["UnrecognizedSetting"] = serde_json::json!("old client value");
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        write_named_config(dir.path(), key, &bytes);
+        let app = state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        });
+        // The key is case-insensitive even though JSON members bind exactly.
+        let uri = format!("/System/Configuration/{}", key.to_ascii_uppercase());
+        let ((status, body), logs) = with_captured_logs(get(app, &uri)).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        let response = json(&body);
+        assert_eq!(response[default_field], default_value, "{key}");
+        assert!(response.get("UnrecognizedSetting").is_none(), "{key}");
+        for (field, value) in saved.as_object().unwrap() {
+            match field.as_str() {
+                "UnrecognizedSetting" => {}
+                "EnableIpv4" => assert_eq!(&response["EnableIPv4"], value),
+                _ => assert_eq!(&response[field], value),
+            }
+        }
+        assert!(logs.warnings_matching("named configuration").is_empty());
+        assert_eq!(
+            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
+            bytes,
+            "a GET must not rewrite the stored document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_core_configurations_return_defaults_and_report_the_section() {
+    for (key, field, default_value) in [
+        ("metadata", "UseFileCreationTimeForDateAdded", true),
+        ("xbmcmetadata", "SaveImagePathsInNfo", true),
+        ("livetv", "SaveRecordingNFO", true),
+        ("encoding", "EnableThrottling", false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({field: "invalid boolean"})).unwrap();
+        write_named_config(dir.path(), key, &bytes);
+        let app = state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        });
+        let ((status, body), logs) =
+            with_captured_logs(get(app, &format!("/System/Configuration/{key}"))).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        assert_eq!(json(&body)[field], default_value, "{key}");
+        let warnings = logs.warnings_matching("named configuration");
+        assert_eq!(warnings.len(), 1, "{key}");
+        assert!(warnings[0].contains(key));
+        assert_eq!(
+            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn plugin_named_configuration_keeps_its_own_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    let uri = "/System/Configuration/plugin-owned";
+    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    assert_eq!(
+        post(app.clone(), uri, &document).await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = get(app, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body), document);
 }
 
 /// A Live TV manager whose two configuration reads fail (backend down).
@@ -1152,4 +1299,204 @@ async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization()
         StatusCode::NO_CONTENT
     );
     assert_eq!(get(app, uri).await.0, StatusCode::OK);
+}
+
+/// The store is supplied by the host; these tests exercise its API boundary.
+struct RejectEncoderChange;
+
+impl ferrofin_common::configuration::ValidatingConfiguration for RejectEncoderChange {
+    fn validate(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> Result<(), ferrofin_common::configuration::ConfigurationValidationError> {
+        use ferrofin_common::configuration::ConfigurationValidationError;
+        let old: ferrofin_model::configuration::EncodingOptions =
+            serde_json::from_str(old).unwrap();
+        let new: ferrofin_model::configuration::EncodingOptions =
+            serde_json::from_str(new).unwrap();
+        assert_eq!(old.encoding_thread_count, 7);
+        if new.transcoding_temp_path.as_deref() == Some("missing") {
+            return Err(ConfigurationValidationError::DirectoryNotFound(
+                "missing directory".into(),
+            ));
+        }
+        Err(ConfigurationValidationError::InvalidOperation(
+            "rejected update".into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn registered_store_validates_before_replacing_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = br#"{"EncodingThreadCount":7}"#;
+    write_named_config(dir.path(), "encoding", original);
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_configuration_validator("ENCODING", Arc::new(RejectEncoderChange));
+    for (body, status) in [
+        (
+            serde_json::json!({"TranscodingTempPath":"missing"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            serde_json::json!({"EncoderAppPath":"changed"}),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        assert_eq!(
+            post(app.clone(), "/System/Configuration/Encoding", &body).await,
+            status
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("named/encoding.json")).unwrap(),
+            original
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+    let dir = tempfile::tempdir().unwrap();
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), ""),
+    )));
+    let remote = "203.0.113.9".parse().unwrap();
+    let uri = "/System/Configuration/network";
+    let body = serde_json::json!({"LocalNetworkSubnets":["203.0.113.0/24"]});
+    // A destination directory makes rename fail after the temporary file is written.
+    std::fs::create_dir_all(dir.path().join("named/network.json")).unwrap();
+    assert!(!state.is_in_local_network(remote));
+    assert_eq!(
+        post(state.clone(), uri, &body).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!state.is_in_local_network(remote));
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+    std::fs::remove_dir(dir.path().join("named/network.json")).unwrap();
+    let mut workers = tokio::task::JoinSet::new();
+    for index in 0..20 {
+        let app = state.clone();
+        workers.spawn(async move {
+            let subnets = if index % 2 == 0 {
+                vec!["203.0.113.0/24"]
+            } else {
+                vec!["192.168.0.0/16"]
+            };
+            post(
+                app,
+                uri,
+                &serde_json::json!({"LocalNetworkSubnets": subnets}),
+            )
+            .await
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+    }
+    let saved: NetworkConfiguration =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    let expected = NetworkManager::with_defaults(saved, "").is_in_local_network(remote);
+    assert_eq!(state.is_in_local_network(remote), expected);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn only_successful_named_saves_notify_configuration_observers() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(StubConfig {
+        paths: StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        },
+        ..Default::default()
+    });
+    let app = state_with_config(Arc::new(FakeAdminUsers), manager.clone());
+    let uri = "/System/Configuration/metadata";
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"UseFileCreationTimeForDateAdded": false})
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(manager.updates.lock().unwrap().len(), 1);
+    assert_eq!(
+        post(
+            app.clone(),
+            uri,
+            &serde_json::json!({"UseFileCreationTimeForDateAdded": "bad"})
+        )
+        .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    std::fs::remove_file(dir.path().join("named/metadata.json")).unwrap();
+    std::fs::create_dir(dir.path().join("named/metadata.json")).unwrap();
+    assert_eq!(
+        post(app, uri, &serde_json::json!({})).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(manager.updates.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn current_web_configuration_payloads_survive_save_and_readback() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dashboard-settings.json")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    for key in [
+        "server",
+        "branding",
+        "encoding",
+        "network",
+        "metadata",
+        "xbmcmetadata",
+        "livetv",
+    ] {
+        let uri = if key == "server" {
+            "/System/Configuration".into()
+        } else {
+            format!("/System/Configuration/{key}")
+        };
+        let payload = &fixture[key];
+        assert_eq!(
+            post(app.clone(), &uri, payload).await,
+            StatusCode::NO_CONTENT,
+            "{key}"
+        );
+        let (status, bytes) = get(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{key}");
+        let returned = json(&bytes);
+        for (field, expected) in payload.as_object().unwrap() {
+            assert_eq!(
+                &returned[field], expected,
+                "{key}.{field} must survive the Web save action"
+            );
+        }
+    }
 }

@@ -129,6 +129,23 @@ pub fn image_fetcher_rank(
 /// plugin's metadata source rank by it.
 pub const DEFAULT_ORDER: i32 = 50;
 
+/// The configured local-reader position: a saved library order (even empty)
+/// takes precedence over the server's per-item-type order. Names match exactly,
+/// as `ProviderManager.GetConfiguredOrder` uses `Array.IndexOf`.
+#[must_use]
+pub fn local_metadata_reader_rank(
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+    global: Option<&ferrofin_model::configuration::MetadataOptions>,
+    name: &str,
+) -> usize {
+    let order = options
+        .and_then(|library| library.local_metadata_reader_order.as_deref())
+        .unwrap_or_else(|| {
+            global.map_or(&[], |global| global.local_metadata_reader_order.as_slice())
+        });
+    configured_order(order, name)
+}
+
 /// `GetDefaultOrder` of built-in metadata fetcher `name` for item type `kind`
 /// (`ProviderManager.cs:630-640`): its `IHasOrder.Order`, else
 /// [`DEFAULT_ORDER`]. Upstream master `96bca6f0bd`: `TmdbMovieProvider`,
@@ -178,26 +195,25 @@ pub const BUILT_IN_METADATA_FETCHERS: &[&str] = &[
     fetcher_names::AUDIODB,
 ];
 
-/// Default order for built-in artwork providers. Explicit library order is
-/// applied before this tie-breaker. Fanart leads movie and series artwork,
-/// and precedes AudioDB for music, with OMDb as the final poster fallback.
+/// The upstream image provider's `IHasOrder`, per item type. Providers without
+/// that interface have order 50; a configured rank precedes this default.
 #[must_use]
-pub fn default_image_order(name: &str) -> usize {
-    match name {
-        fetcher_names::TMDB | fetcher_names::AUDIODB => 1,
-        fetcher_names::TVDB => 50,
-        fetcher_names::OMDB => 90,
-        _ => 0,
+pub fn default_image_order(kind: &str, name: &str) -> usize {
+    match (name, kind) {
+        (fetcher_names::TMDB, "Movie" | "Trailer" | "BoxSet" | "Person")
+        | (fetcher_names::FANART, "MusicArtist") => 0,
+        (fetcher_names::TMDB, "Series") | (fetcher_names::AUDIODB, "MusicAlbum") => 2,
+        (fetcher_names::TMDB | fetcher_names::FANART | fetcher_names::AUDIODB, _) => 1,
+        (fetcher_names::OMDB, _) => 90,
+        (fetcher_names::EMBEDDED_IMAGES, _) => 99,
+        _ => 50,
     }
 }
 
 /// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
-/// `name` in `order`, or last.
-fn configured_order(order: &[String], name: &str) -> usize {
-    order
-        .iter()
-        .position(|f| f.eq_ignore_ascii_case(name))
-        .unwrap_or(usize::MAX)
+/// `name` in `order`, or last. Unlike enable lists, order uses exact casing.
+pub(crate) fn configured_order(order: &[String], name: &str) -> usize {
+    order.iter().position(|f| f == name).unwrap_or(usize::MAX)
 }
 
 /// The library's configured `MetadataFetcherOrder` for item type `kind`, or
@@ -301,6 +317,13 @@ pub mod fetcher_names {
     /// calling itself that would start ticked in a new library.
     pub const SCREEN_GRABBER: &str = "Screen Grabber";
 
+    /// Comic archive comments and ComicInfo XML local reader.
+    pub const COMIC: &str = "Comic Provider";
+    /// Embedded EPUB OPF metadata reader.
+    pub const EPUB: &str = "EPUB Metadata";
+    /// Sidecar OPF metadata reader.
+    pub const OPF: &str = "Open Packaging Format";
+
     /// Every built-in fetcher name — the reserved set a dynamically
     /// registered (WASM) provider name must not collide with: a plugin
     /// declaring `"TheMovieDb"` would ride TMDB's checkbox/order and
@@ -318,6 +341,9 @@ pub mod fetcher_names {
         EMBEDDED_IMAGES,
         AUDIO_IMAGES,
         SCREEN_GRABBER,
+        COMIC,
+        EPUB,
+        OPF,
     ];
 }
 
@@ -504,7 +530,7 @@ fn providers() -> Vec<Provider> {
 
 /// The providers that read from the library's own files.
 fn local_providers() -> Vec<Provider> {
-    vec![Provider {
+    let mut providers = vec![Provider {
         name: "Nfo",
         caps: &[Cap::LocalMetadata, Cap::MetadataSaver, Cap::LocalImage],
         types: &[
@@ -514,11 +540,29 @@ fn local_providers() -> Vec<Provider> {
             "Episode",
             "MusicVideo",
             "BoxSet",
+            "MusicAlbum",
+            "MusicArtist",
         ],
         default_enabled: true,
         compiled: true,
         images: NO_IMAGES,
-    }]
+    }];
+    providers.extend(
+        [
+            fetcher_names::COMIC,
+            fetcher_names::EPUB,
+            fetcher_names::OPF,
+        ]
+        .map(|name| Provider {
+            name,
+            caps: &[Cap::LocalMetadata],
+            types: &["Book"],
+            default_enabled: true,
+            compiled: true,
+            images: NO_IMAGES,
+        }),
+    );
+    providers
 }
 
 /// The providers that fetch from an external service.
@@ -763,11 +807,8 @@ fn audio_extractor_images(_type_name: &str) -> &'static [ImageType] {
 /// `GetSupportedImages` (`TvdbSeriesImageProvider.cs:59-66`,
 /// `TvdbSeasonImageProvider.cs:59-64`, `TvdbEpisodeImageProvider.cs:49-52`).
 ///
-/// TODO(parity, open work item): the scan's image pass does not ask TheTVDB
-/// for a season's artwork yet (see `fetch_tv_still_images`); port
-/// `TvdbSeasonImageProvider.GetImages` — the season's TVDB id from the series'
-/// extended record for its display order, then `/seasons/{id}/extended`'s
-/// artworks by season artwork type.
+/// Season acquisition follows the selected display order and uses the season
+/// artwork reference types (`TvdbClient::season_images`) in scan and refresh.
 fn tvdb_images(type_name: &str) -> &'static [ImageType] {
     use ImageType::{Art, Backdrop, Banner, Logo, Primary};
     const SERIES: &[ImageType] = &[Primary, Banner, Backdrop, Logo, Art];
@@ -812,6 +853,20 @@ fn audiodb_images(type_name: &str) -> &'static [ImageType] {
     match type_name {
         "MusicArtist" => ARTIST,
         "MusicAlbum" => ALBUM,
+        _ => &[],
+    }
+}
+
+/// Supported automatic image types for one built-in fetcher, used to avoid
+/// querying a provider when all of its enabled slots are already filled.
+#[must_use]
+pub fn image_types_for_fetcher(kind: &str, name: &str) -> &'static [ImageType] {
+    match name {
+        fetcher_names::TMDB => tmdb_images(kind),
+        fetcher_names::TVDB => tvdb_images(kind),
+        fetcher_names::FANART => fanart_images(kind),
+        fetcher_names::AUDIODB => audiodb_images(kind),
+        fetcher_names::OMDB if matches!(kind, "Movie" | "Episode") => omdb_images(kind),
         _ => &[],
     }
 }
@@ -888,6 +943,9 @@ pub fn library_options_info(
         provs
             .iter()
             .filter(|p| p.compiled && p.caps.contains(&cap))
+            .filter(|p| {
+                cap != Cap::LocalMetadata || item_types.iter().any(|kind| p.applies_to(kind))
+            })
             // The saver/reader lists are not per-type, so the saver rule sees
             // the whole request (C# `IsSaverEnabledByDefault(name, itemTypes,
             // isNewLibrary)`: no saver in a new library, else the server's
@@ -1009,6 +1067,28 @@ pub fn all_metadata_plugins() -> Vec<MetadataPluginSummary> {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("Movie", "TheMovieDb", 0)]
+    #[case("Series", "TheMovieDb", 2)]
+    #[case("Season", "TheMovieDb", 1)]
+    #[case("Episode", "TheMovieDb", 1)]
+    #[case("Movie", "FanArt", 1)]
+    #[case("Series", "FanArt", 1)]
+    #[case("MusicArtist", "FanArt", 0)]
+    #[case("MusicAlbum", "TheAudioDB", 2)]
+    #[case("MusicArtist", "TheAudioDB", 1)]
+    #[case("Audio", "Image Extractor", 50)]
+    #[case("Movie", "Embedded Image Extractor", 99)]
+    #[case("Movie", "ArtworkPlugin", 50)]
+    #[test]
+    fn image_order_is_the_upstream_provider_class_order(
+        #[case] kind: &str,
+        #[case] name: &str,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(super::default_image_order(kind, name), expected);
+    }
+
     use super::{all_metadata_plugins, library_options_info};
     use ferrofin_model::configuration::MetadataPluginType;
 
@@ -1287,6 +1367,31 @@ mod tests {
             assert!(ticked(&existing, kind, false), "{kind} metadata, existing");
             assert!(ticked(&existing, kind, true), "{kind} images, existing");
         }
+    }
+
+    #[test]
+    fn books_advertise_the_three_configurable_local_readers() {
+        let options = library_options_info(&["Book".to_owned()], true, &[], &[]);
+        let names: Vec<_> = options
+            .metadata_readers
+            .iter()
+            .map(|reader| reader.name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            ["Comic Provider", "EPUB Metadata", "Open Packaging Format"]
+        );
+        let movies = library_options_info(&["Movie".to_owned()], true, &[], &[]);
+        assert_eq!(movies.metadata_readers.len(), 1);
+        assert_eq!(movies.metadata_readers[0].name.as_deref(), Some("Nfo"));
+        let music = library_options_info(
+            &["MusicAlbum".to_owned(), "MusicArtist".to_owned()],
+            true,
+            &[],
+            &[],
+        );
+        assert_eq!(music.metadata_readers.len(), 1);
+        assert_eq!(music.metadata_readers[0].name.as_deref(), Some("Nfo"));
     }
 
     #[test]
@@ -1713,7 +1818,7 @@ mod tests {
             0
         );
         assert_eq!(
-            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "musicbrainz"),
+            metadata_fetcher_rank(None, Some(&global), "MusicAlbum", "MusicBrainz"),
             1
         );
         assert_eq!(
@@ -1746,6 +1851,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_order_is_exact_while_enable_lists_ignore_case() {
+        let options = LibraryOptions {
+            type_options: vec![TypeOptions {
+                type_: Some("Movie".to_owned()),
+                metadata_fetchers: vec!["themoviedb".to_owned()],
+                metadata_fetcher_order: vec!["themoviedb".to_owned()],
+                image_fetchers: vec!["themoviedb".to_owned()],
+                image_fetcher_order: vec!["themoviedb".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(super::metadata_fetcher_enabled(
+            Some(&options),
+            None,
+            "Movie",
+            "TheMovieDb"
+        ));
+        assert!(super::image_fetcher_enabled(
+            Some(&options),
+            None,
+            "Movie",
+            "TheMovieDb"
+        ));
+        assert_eq!(
+            super::metadata_fetcher_rank(Some(&options), None, "Movie", "TheMovieDb"),
+            usize::MAX
+        );
+        assert_eq!(
+            super::image_fetcher_rank(Some(&options), None, "Movie", "TheMovieDb"),
+            usize::MAX
+        );
+        assert_eq!(
+            super::configured_order(&["TheMovieDb".to_owned()], "TheMovieDb"),
+            0
+        );
+    }
+
     /// The image fetchers' supported types per kind, as `GetSupportedImages`
     /// declares them (`TmdbSeriesImageProvider.cs:47-53`,
     /// `TmdbEpisodeImageProvider.cs:46-49`, `TvdbSeriesImageProvider.cs:
@@ -1769,5 +1913,24 @@ mod tests {
             super::fanart_images("Season").is_empty(),
             "not advertised until its season fetch is ported"
         );
+    }
+    #[test]
+    fn current_web_receives_available_similarity_provider_choices() {
+        let dto = library_options_info(&["Movie".into()], true, &[], &[]);
+        let body = serde_json::to_value(dto).unwrap();
+        let choices = body["TypeOptions"][0]["SimilarItemProviders"]
+            .as_array()
+            .expect("the current Web library editor needs these choices");
+        assert!(
+            choices
+                .iter()
+                .any(|p| p["Name"] == "Local Genre/Tag" && p["DefaultEnabled"] == true)
+        );
+        assert!(
+            choices
+                .iter()
+                .any(|p| p["Name"] == "TheMovieDb" && p["DefaultEnabled"] == false)
+        );
+        assert!(!choices.iter().any(|p| p["Name"] == "ListenBrainz"));
     }
 }

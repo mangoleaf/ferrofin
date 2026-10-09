@@ -205,7 +205,21 @@ pub trait SessionManager: Send + Sync {
     /// Broadcasts a "restart required" notification to all sessions.
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError>;
 
-    /// Adds an additional (guest) user to a session.
+    /// Checks Jellyfin's `AssertCanControl` before mutating a named session.
+    /// An empty controlling id denotes a trusted internal/API-key operation.
+    /// Implementations without session authorization fail closed.
+    async fn assert_can_control(
+        &self,
+        _controlling_session_id: &str,
+        _session_id: &str,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Forbidden(
+            "session control is not available".to_owned(),
+        ))
+    }
+
+    /// Adds an additional (guest) user to a session. Request handlers must
+    /// authorize session control and attachment before calling this operation.
     async fn add_additional_user(
         &self,
         session_id: &str,

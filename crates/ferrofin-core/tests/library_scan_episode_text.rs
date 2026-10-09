@@ -37,8 +37,8 @@ const SERIES_SEARCH_JSON: &str = r#"{"results": [{"id": 1399, "name": "GoT"}]}"#
 /// `/tv/{id}`: series details.
 const SERIES_DETAILS_JSON: &str = r#"{"overview": "A series.", "genres": []}"#;
 
-/// `/tv/{id}/season/1`: the episode text. No image paths, so the artwork pass
-/// never reaches for the network.
+/// `/tv/{id}/season/1`: episode text without artwork. The independent
+/// image-list routes below return no candidates.
 const SEASON_JSON: &str = r#"{
     "name": "Season 1",
     "overview": "The first season.",
@@ -83,8 +83,11 @@ fn spawn_tmdb_with(series_details: &'static str) -> (String, Arc<AtomicUsize>, A
             let mut buf = [0u8; 2048];
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-            // `/credits` first: its path contains `/season/` too.
-            let (status, payload) = if req.contains("/episode/") {
+            // Image-list requests share the episode prefix but are not metadata
+            // requests. L14 acquires artwork independently of season text.
+            let (status, payload) = if req.contains("/images") {
+                ("200 OK", r#"{"posters":[],"backdrops":[],"stills":[]}"#)
+            } else if req.contains("/episode/") {
                 counter.fetch_add(1, Ordering::SeqCst);
                 ("200 OK", CREDITS_JSON)
             } else if req.contains("/season/") {

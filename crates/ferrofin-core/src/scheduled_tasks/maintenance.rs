@@ -741,7 +741,11 @@ impl ScheduledTask for MoveTrickplayImagesTask {
                 .collect();
             seen.dedup();
             for item_id in seen {
-                if let Err(e) = self.trickplay.move_generated_trickplay_data(item_id).await {
+                if let Err(e) = self
+                    .trickplay
+                    .move_generated_library_trickplay_data(item_id)
+                    .await
+                {
                     tracing::warn!(item = %item_id, error = %e, "error moving trickplay files");
                 } else {
                     moved += 1;

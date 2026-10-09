@@ -76,6 +76,12 @@ pub fn create_router(state: AppState) -> Router {
         state.clone(),
         crate::ip_access::ip_access_layer,
     ))
+    // Startup's localization middleware precedes authentication and captures
+    // the formatting culture inherited by metadata saves and queued refreshes.
+    .layer(middleware::from_fn_with_state(
+        state.request_culture(),
+        crate::request_culture::request_culture_layer,
+    ))
     .with_state(state)
     .merge(ferrofin_health::health_router(Vec::new()))
     .merge(spec_router())
@@ -266,14 +272,14 @@ mod tests {
 
     #[tokio::test]
     async fn real_authenticated_route_returns_401_without_token() {
-        // `/System/Info` now has a real handler behind `RequireAuth`; the fake
+        // `/System/Endpoint` now has a real handler behind `RequireAuth`; the fake
         // auth service rejects the tokenless request, so it is `401` (route
         // exists) rather than the `501` stub or a `404`.
         let router = create_router(fake_state());
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/System/Info")
+                    .uri("/System/Endpoint")
                     .body(Body::empty())
                     .unwrap(),
             )

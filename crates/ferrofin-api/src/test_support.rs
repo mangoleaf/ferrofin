@@ -400,10 +400,22 @@ impl AuthService for AuthedAuthService {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
+        Ok(authenticated_user_info())
+    }
+}
+
+/// A valid ordinary test user with a cached policy. Handler-only fakes use this
+/// instead of an authenticated context with neither a user nor an API key.
+#[must_use]
+pub fn authenticated_user_info() -> AuthorizationInfo {
+    AuthorizationInfo {
+        is_authenticated: true,
+        user: Some(sample_user()),
+        user_policy: Some(Arc::new(UserPolicy {
+            enable_remote_access: true,
+            ..UserPolicy::default()
+        })),
+        ..AuthorizationInfo::default()
     }
 }
 
@@ -1431,7 +1443,7 @@ impl ServerApplicationPaths for FakePaths {
         // A process-unique temp root so path-backed handlers (e.g. Backup) have a
         // real, writable directory to operate in during tests.
         std::env::temp_dir()
-            .join("ferrofin-api-test-data")
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
     }
@@ -2152,6 +2164,11 @@ impl LocalizationManager for FakeLocalization {
     }
     fn get_localization_options(&self) -> Vec<LocalizationOption> {
         unimplemented!("fake")
+    }
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // AppState snapshots this at construction; INFRA fixtures only need
+        // the built-in startup culture, without invoking unused API handlers.
+        vec!["en-US".to_owned()]
     }
     fn get_localized_string(&self, phrase: &str) -> String {
         phrase.to_owned()

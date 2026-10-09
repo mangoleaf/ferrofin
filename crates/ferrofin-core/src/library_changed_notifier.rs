@@ -219,9 +219,16 @@ impl LibraryChangedNotifier {
             let Ok(visible) = audience.visible_library_ids(user_id).await else {
                 continue;
             };
-            let visible: HashSet<String> =
-                visible.iter().map(|id| id.simple().to_string()).collect();
-            let info = folded.for_libraries(&visible);
+            // An item names its library through its `TopParentId`: the
+            // library, or one of its locations' folders.
+            let tops = audience
+                .library_top_parents(&visible)
+                .await
+                .unwrap_or_else(|_| visible.clone());
+            let n = |ids: &[Uuid]| -> HashSet<String> {
+                ids.iter().map(|id| id.simple().to_string()).collect()
+            };
+            let info = folded.for_libraries(&n(&visible), &n(&tops));
             // `if (info.IsEmpty) continue;` — a user who can see none of the
             // changed libraries is told nothing at all, rather than being
             // handed an empty envelope that makes their client re-fetch.
@@ -259,10 +266,17 @@ impl Folded {
     /// alone, because the row is already gone and `IsVisibleStandalone` has
     /// nothing left to test — telling a client to drop an id it never had is
     /// harmless, whereas withholding it leaves a deleted item on screen.
-    fn for_libraries(&self, visible: &HashSet<String>) -> LibraryUpdateInfo {
+    ///
+    /// `tops` are the `TopParentId`s those libraries' items carry (each
+    /// library and its locations' folders); `visible` the libraries.
+    fn for_libraries(
+        &self,
+        visible: &HashSet<String>,
+        tops: &HashSet<String>,
+    ) -> LibraryUpdateInfo {
         let keep = |v: &[Changed]| -> Vec<Changed> {
             v.iter()
-                .filter(|c| c.top_parent.as_ref().is_some_and(|t| visible.contains(t)))
+                .filter(|c| c.top_parent.as_ref().is_some_and(|t| tops.contains(t)))
                 .cloned()
                 .collect()
         };
@@ -322,8 +336,9 @@ fn build(
         }
         Some(_) => Vec::new(),
         // No recipient to scope to (no audience wired): fall back to the
-        // libraries the changed items belong to, which is the most a broadcast
-        // can honestly say.
+        // top parents of the changed items (their locations' folders, or on
+        // older rows their libraries), which is the most a broadcast can
+        // honestly say without the library list.
         None => {
             let mut seen = HashSet::new();
             added
@@ -575,6 +590,8 @@ mod tests {
     struct SplitAudience {
         /// user id -> the one library that user can see
         visible: Vec<(Uuid, Uuid)>,
+        /// library -> the folder of its one location
+        locations: Vec<(Uuid, Uuid)>,
         delivered: Mutex<Vec<(Uuid, LibraryUpdateInfo)>>,
     }
 
@@ -591,6 +608,16 @@ mod tests {
                 .map(|(_, l)| *l)
                 .collect())
         }
+        async fn library_top_parents(&self, libraries: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            let mut tops = libraries.to_vec();
+            tops.extend(
+                self.locations
+                    .iter()
+                    .filter(|(l, _)| libraries.contains(l))
+                    .map(|(_, folder)| *folder),
+            );
+            Ok(tops)
+        }
         async fn deliver(&self, user_id: Uuid, payload: &str) -> Result<(), ServiceError> {
             self.delivered.lock().expect("lock").push((
                 user_id,
@@ -605,14 +632,16 @@ mod tests {
         let (n, events) = notifier(Duration::from_secs(30));
         let (lib_a, lib_b) = (Uuid::new_v4(), Uuid::new_v4());
         let (alice, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let location_a = Uuid::new_v4();
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib_a), (bob, lib_b)],
+            locations: vec![(lib_a, location_a), (lib_b, Uuid::new_v4())],
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
 
-        // One item added to library A only.
-        let item = movie(Uuid::new_v4(), Uuid::new_v4(), lib_a);
+        // One item added to library A only, under its location's folder.
+        let item = movie(Uuid::new_v4(), Uuid::new_v4(), location_a);
         n.record_added(std::slice::from_ref(&item));
         tokio::time::sleep(Duration::from_secs(31)).await;
 
@@ -689,6 +718,7 @@ mod tests {
         let (lib, alice) = (Uuid::new_v4(), Uuid::new_v4());
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib)],
+            locations: Vec::new(),
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
@@ -716,6 +746,7 @@ mod tests {
         let (lib_a, lib_b, alice) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let audience = Arc::new(SplitAudience {
             visible: vec![(alice, lib_a), (alice, lib_b)],
+            locations: Vec::new(),
             delivered: Mutex::new(Vec::new()),
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);

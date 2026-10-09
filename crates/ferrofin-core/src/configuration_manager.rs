@@ -12,9 +12,9 @@
 //!   the configuration directory. The wire shape is unchanged — it is the same
 //!   [`ServerConfiguration`] the API returns.
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
-//!   the metadata path against the filesystem. The event bus is out of scope for
-//!   this unit; the metadata-path validation is preserved
-//!   ([`validate_metadata_path`](Self::validate_metadata_path)): a new, non-empty
+//!   the metadata path against the filesystem. Successful saves notify registered
+//!   observers; the metadata-path validation is preserved
+//!   ([`prepare_metadata_path`]): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
 //!   reproduced by pushing the new `MetadataPath` into the shared
@@ -58,7 +58,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, ServerConfiguration};
-use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::configuration::{
+    ConfigurationListener, ConfigurationUpdate, ServerConfigurationManager,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -215,7 +217,9 @@ pub struct FerrofinServerConfigurationManager {
     /// The `metadata.json` the last "unusable" warning was logged for, so a
     /// broken document warns once per change, not on every read.
     metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
-    configuration: RwLock<Arc<ServerConfiguration>>,
+    configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
 }
 
 /// A file a warning was logged for, by its modification time (`None` when
@@ -407,6 +411,8 @@ impl FerrofinServerConfigurationManager {
             }
         }
 
+        initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
+        prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
 
         Ok(Self {
@@ -416,8 +422,26 @@ impl FerrofinServerConfigurationManager {
             encoding_file,
             metadata_file,
             metadata_warned: std::sync::Mutex::new(None),
-            configuration: RwLock::new(Arc::new(configuration)),
+            configuration: Arc::new(RwLock::new(Arc::new(configuration))),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Subscribes to successful main, branding, and named-store saves.
+    ///
+    /// The host registers listeners while constructing its services. A
+    /// listener receives the exact committed snapshot; failed saves emit none.
+    /// Keep captured service references weak if they own this manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener registry's lock is poisoned.
+    pub fn add_configuration_listener(&self, listener: Arc<ConfigurationListener>) {
+        self.listeners
+            .write()
+            .expect("configuration listener lock poisoned")
+            .push(listener);
     }
 
     /// The metadata configuration as saved now — C#
@@ -549,33 +573,20 @@ impl FerrofinServerConfigurationManager {
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)
     }
-
-    /// Validates a proposed metadata path, mirroring C# `ValidateMetadataPath`.
-    ///
-    /// A new, non-empty path that differs from the current one must already
-    /// exist as a directory; otherwise the update is rejected. An unchanged or
-    /// blank path is always accepted.
-    fn validate_metadata_path(&self, new_path: &str) -> Result<(), ServiceError> {
-        if new_path.trim().is_empty() {
-            return Ok(());
-        }
-        // Read through the shared handle: this only needs one field, so a deep
-        // clone of the whole document would be pure waste.
-        let current = self.snapshot_shared();
-        if new_path == current.metadata_path {
-            return Ok(());
-        }
-        if !PathBuf::from(new_path).is_dir() {
-            return Err(ServiceError::InvalidInput(format!(
-                "metadata path does not exist: {new_path}"
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        notify_listeners(
+            &self.listeners,
+            &ConfigurationUpdate::Named {
+                key: key.to_ascii_lowercase(),
+                json,
+            },
+        );
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
     }
@@ -588,26 +599,51 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         &self,
         configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
-        // ReplaceConfiguration: validate, persist, then apply side effects.
-        self.validate_metadata_path(&configuration.metadata_path)?;
-        write_config(&self.config_file, configuration).await?;
-
-        // Build the replacement outside the lock, then swap the pointer: the
-        // write section is a single pointer store, and readers holding an older
-        // handle keep a consistent view of the document they took.
+        // Hold the writer through validation, persistence, publication and
+        // notification. A cancelled caller must not leave disk ahead of memory.
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let old_metadata = self.snapshot_shared().metadata_path.clone();
+        let old_cache = self.snapshot_shared().cache_path.clone();
         let replacement = Arc::new(configuration.clone());
-        {
-            let mut guard = self
-                .configuration
-                .write()
-                .expect("configuration lock poisoned");
-            *guard = replacement;
-        }
-
-        // OnConfigurationUpdated → UpdateMetadataPath.
-        self.paths
-            .set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
-        Ok(())
+        let json = serde_json::to_vec_pretty(configuration)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
+        let path = self.config_file.clone();
+        let current = Arc::clone(&self.configuration);
+        let paths = Arc::clone(&self.paths);
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
+            if let Some(cache) = replacement
+                .cache_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                let cache_path = PathBuf::from(cache);
+                if old_cache.as_deref() != Some(cache) {
+                    if !cache_path.is_dir() {
+                        return Err(ServiceError::not_found(format!(
+                            "cache path does not exist: {cache}"
+                        )));
+                    }
+                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
+                    std::fs::File::create_new(&probe)
+                        .and_then(|_| std::fs::remove_file(&probe))
+                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
+                }
+                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
+                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
+            }
+            ferrofin_util::file_helper::atomic_write(&path, &json)
+                .map_err(|e| io_err("write configuration", &path, &e))?;
+            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            paths.set_cache_path(replacement.cache_path.as_deref());
+            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
+            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -622,16 +658,27 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
-        if let Some(parent) = self.branding_file.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io_err("create configuration directory", parent, &e))?;
-        }
-        let json = serde_json::to_vec_pretty(branding)
-            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?;
-        tokio::fs::write(&self.branding_file, json)
-            .await
-            .map_err(|e| io_err("write branding", &self.branding_file, &e))
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let json: Arc<str> = serde_json::to_string_pretty(branding)
+            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?
+            .into();
+        let path = self.branding_file.clone();
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+                .map_err(|e| io_err("write branding", &path, &e))?;
+            notify_listeners(
+                &listeners,
+                &ConfigurationUpdate::Named {
+                    key: "branding".into(),
+                    json,
+                },
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
@@ -643,6 +690,61 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+    }
+}
+
+/// A changed dashboard directory must already exist and accept a write.
+/// Startup and unchanged paths are created if absent, as in UpdateMetadataPath.
+fn prepare_metadata_path(
+    paths: &FerrofinServerApplicationPaths,
+    proposed: &str,
+    previous: Option<&str>,
+) -> Result<(), ServiceError> {
+    let metadata = if proposed.trim().is_empty() {
+        PathBuf::from(paths.default_internal_metadata_path())
+    } else {
+        PathBuf::from(proposed)
+    };
+    if !proposed.trim().is_empty() && previous.is_some_and(|old| old != proposed) {
+        if !metadata.is_dir() {
+            return Err(ServiceError::not_found(format!(
+                "metadata path does not exist: {proposed}"
+            )));
+        }
+        let probe = metadata.join(uuid::Uuid::new_v4().to_string());
+        std::fs::File::create_new(&probe)
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| io_err("validate metadata directory", &metadata, &e))?;
+    }
+    std::fs::create_dir_all(&metadata)
+        .map_err(|e| io_err("prepare metadata directory", &metadata, &e))
+}
+
+fn initialize_cache_path(
+    paths: &FerrofinServerApplicationPaths,
+    configured: Option<&str>,
+) -> Result<(), ServiceError> {
+    let cache = configured
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(|| PathBuf::from(paths.cache_path()), PathBuf::from);
+    FerrofinServerApplicationPaths::prepare_cache_path(&cache)
+        .map_err(|e| io_err("prepare cache directory", &cache, &e))?;
+    paths.set_cache_path(configured);
+    Ok(())
+}
+
+fn notify_listeners(
+    listeners: &RwLock<Vec<Arc<ConfigurationListener>>>,
+    update: &ConfigurationUpdate,
+) {
+    // Release the registry lock before invoking listeners so a callback can
+    // inspect configuration or register another observer without deadlocking.
+    let callbacks = listeners
+        .read()
+        .expect("configuration listener lock poisoned")
+        .clone();
+    for callback in callbacks {
+        callback(update);
     }
 }
 
@@ -892,6 +994,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_override_is_live_persisted_and_clear_requires_fresh_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let original = paths.cache_path();
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut config = mgr.snapshot();
+        for name in ["cache-one", "cache-two"] {
+            let cache = tmp.path().join(name);
+            std::fs::create_dir(&cache).expect("cache");
+            config.cache_path = Some(cache.to_string_lossy().into_owned());
+            mgr.update_configuration(&config).await.expect("save");
+            assert_eq!(paths.cache_path(), cache.to_string_lossy());
+            assert_eq!(
+                paths.image_cache_path(),
+                cache.join("images").to_string_lossy()
+            );
+            assert!(cache.join(".jellyfin-cache").is_file());
+            assert!(
+                std::fs::read_to_string(cache.join("CACHEDIR.TAG"))
+                    .expect("tag")
+                    .starts_with("Signature: 8a477f597d28d172789f06886806bc55\n")
+            );
+        }
+        let reloaded_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&reloaded_paths))
+            .await
+            .expect("reload");
+        assert_eq!(reloaded_paths.cache_path(), paths.cache_path());
+        config.cache_path = Some("  ".into());
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_ne!(paths.cache_path(), original);
+        let restarted_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&restarted_paths))
+            .await
+            .expect("restart");
+        assert_eq!(restarted_paths.cache_path(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_paths_preserve_saved_configuration_and_live_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let previous = std::fs::read(&mgr.config_file).expect("config");
+        let original = paths.cache_path();
+        let mut config = mgr.snapshot();
+        config.cache_path = Some(tmp.path().join("missing").to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        let incompatible = tmp.path().join("config-root");
+        std::fs::create_dir(&incompatible).expect("mkdir");
+        std::fs::write(incompatible.join(".jellyfin-config"), "").expect("marker");
+        config.cache_path = Some(incompatible.to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(std::fs::read(&mgr.config_file).expect("config"), previous);
+        assert_eq!(paths.cache_path(), original);
+        assert!(!incompatible.join(".jellyfin-cache").exists());
+    }
+
+    #[tokio::test]
     async fn update_persists_and_syncs_metadata_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
@@ -990,7 +1161,7 @@ mod tests {
         ));
     }
 
-    /// `validate_metadata_path` reads the live document, so an unchanged path is
+    /// Metadata-path validation reads the live document, so an unchanged path is
     /// accepted even after the configuration has been replaced.
     #[tokio::test]
     async fn metadata_path_validation_reads_the_current_document() {
@@ -1114,6 +1285,46 @@ mod tests {
         assert!(mgr.get_encoding_options().await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_directory_write_failure_preserves_config_and_clearing_resets_live_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let original = paths.internal_metadata_path();
+        let valid = tmp.path().join("custom-metadata");
+        std::fs::create_dir(&valid).expect("mkdir");
+        let mut config = mgr.snapshot();
+        config.metadata_path = valid.to_string_lossy().into_owned();
+        mgr.update_configuration(&config).await.expect("save valid");
+        assert_eq!(paths.internal_metadata_path(), config.metadata_path);
+        let previous = std::fs::read(&mgr.config_file).expect("read config");
+        let blocked = tmp.path().join("readonly");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555))
+            .expect("readonly");
+        config.metadata_path = blocked.to_string_lossy().into_owned();
+        let cannot_write = std::fs::File::create(blocked.join("probe")).is_err();
+        let result = mgr.update_configuration(&config).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        if cannot_write {
+            assert!(matches!(result, Err(ServiceError::Backend(_))));
+            assert_eq!(
+                std::fs::read(&mgr.config_file).expect("read config"),
+                previous
+            );
+            assert_eq!(paths.internal_metadata_path(), valid.to_string_lossy());
+        }
+        config.metadata_path = String::new();
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_eq!(paths.internal_metadata_path(), original);
+        assert!(std::path::Path::new(&original).is_dir());
+    }
+
     #[tokio::test]
     async fn update_rejects_missing_metadata_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1128,7 +1339,7 @@ mod tests {
             .update_configuration(&cfg)
             .await
             .expect_err("should reject");
-        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
     /// A fresh install is 12.0's `false`; an adopted `system.xml` carries its
@@ -1652,5 +1863,99 @@ mod tests {
                 .use_file_creation_time_for_date_added
         );
         assert!(mgr.metadata_file.exists(), "seeded as the named JSON");
+    }
+    #[tokio::test]
+    async fn observers_see_committed_snapshots_and_no_failed_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .unwrap(),
+        );
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        let weak = Arc::downgrade(&manager);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            let manager = weak.upgrade().unwrap();
+            if let ConfigurationUpdate::Server(config) = update {
+                let saved: ServerConfiguration =
+                    serde_json::from_slice(&std::fs::read(&manager.config_file).unwrap()).unwrap();
+                assert_eq!(saved.server_name, config.server_name);
+                assert_eq!(manager.snapshot_shared().server_name, config.server_name);
+                assert_eq!(
+                    manager.paths.internal_metadata_path(),
+                    manager.paths.default_internal_metadata_path()
+                );
+            }
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in 0..20 {
+            let manager = Arc::clone(&manager);
+            jobs.spawn(async move {
+                let mut config = manager.snapshot();
+                config.server_name = format!("server-{index}");
+                manager.update_configuration(&config).await.unwrap();
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(updates.lock().unwrap().len(), 20);
+        let previous = manager.snapshot_shared();
+        let bytes = std::fs::read(&manager.config_file).unwrap();
+        let mut invalid = (*previous).clone();
+        invalid.metadata_path = tmp.path().join("missing").to_string_lossy().into_owned();
+        assert!(manager.update_configuration(&invalid).await.is_err());
+        assert_eq!(std::fs::read(&manager.config_file).unwrap(), bytes);
+        // A persistence failure must not publish an event or swap the live Arc.
+        std::fs::remove_file(&manager.config_file).unwrap();
+        std::fs::create_dir(&manager.config_file).unwrap();
+        let mut rejected = (*previous).clone();
+        rejected.server_name = "must-not-publish".into();
+        assert!(manager.update_configuration(&rejected).await.is_err());
+        assert!(Arc::ptr_eq(&previous, &manager.snapshot_shared()));
+        assert_eq!(updates.lock().unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn branding_and_named_stores_publish_the_committed_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .unwrap();
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let branding = BrandingOptions {
+            custom_css: Some("body { color: red; }".into()),
+            ..Default::default()
+        };
+        manager.update_branding(&branding).await.unwrap();
+        manager
+            .named_configuration_updated("NETWORK", Arc::from(r#"{"EnableRemoteAccess":false}"#));
+        {
+            let events = updates.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            let ConfigurationUpdate::Named { key, json } = &events[0] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "branding");
+            assert_eq!(
+                json.as_bytes(),
+                std::fs::read(&manager.branding_file).unwrap()
+            );
+            let ConfigurationUpdate::Named { key, json } = &events[1] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "network");
+            assert_eq!(&**json, r#"{"EnableRemoteAccess":false}"#);
+        }
+        std::fs::remove_file(&manager.branding_file).unwrap();
+        std::fs::create_dir(&manager.branding_file).unwrap();
+        assert!(manager.update_branding(&branding).await.is_err());
+        assert_eq!(updates.lock().unwrap().len(), 2);
     }
 }

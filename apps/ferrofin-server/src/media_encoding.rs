@@ -54,6 +54,9 @@ const IDLE_REAPER_SWEEP_SECS: u64 = 10;
 pub struct MediaEncodingExtras {
     /// Resolves item/series/library display names for the transcode logs.
     pub library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// The configured libraries, which name the library an item's location
+    /// belongs to in those logs.
+    pub virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     /// Supplies the item's trickplay tile resolutions for the master playlist.
     pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
     /// Releases the live stream a killed job was reading.
@@ -233,6 +236,10 @@ pub fn build_media_encoding(
     );
     let planner = match library {
         Some(library) => planner.with_library(library),
+        None => planner,
+    };
+    let planner = match extras.virtual_folders.clone() {
+        Some(folders) => planner.with_virtual_folders(folders),
         None => planner,
     };
     let transcoder = TokioSegmentTranscoder::new();
@@ -731,6 +738,7 @@ mod tests {
             _item_id: Uuid,
             _media_path: &str,
             _chapter_position_ticks: i64,
+            _date_modified_ticks: i64,
         ) -> String {
             String::new()
         }
@@ -831,6 +839,7 @@ mod tests {
             &ffmpeg,
             MediaEncodingExtras {
                 library: None,
+                virtual_folders: None,
                 trickplay: None,
                 sessions: None,
             },
@@ -1123,6 +1132,7 @@ mod tests {
             &ffmpeg,
             MediaEncodingExtras {
                 library: None,
+                virtual_folders: None,
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
             },

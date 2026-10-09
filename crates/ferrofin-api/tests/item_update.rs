@@ -675,10 +675,12 @@ impl ProviderManager for RecordingProviders {
     }
     async fn save_metadata(
         &self,
-        _item_id: Uuid,
-        _update_type: ItemUpdateType,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
-        unimplemented!()
+        assert!(!item_id.is_nil());
+        assert_eq!(update_type, ItemUpdateType::MetadataEdit);
+        Ok(())
     }
     async fn get_all_metadata_plugins(
         &self,

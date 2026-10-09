@@ -128,8 +128,8 @@ crate::json::enums::wire_enum! {
 /// Forward reference: upstream this is
 /// `Jellyfin.Database.Implementations.Entities.AccessSchedule`. Embedded in
 /// [`UserPolicy`]; move when that entity is ported.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "PascalCase")]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct AccessSchedule {
     /// Gets the id of this instance.
@@ -367,5 +367,20 @@ mod sync_play_access_tests {
 
         assert!(!Access::None.can_create_groups());
         assert!(!Access::None.can_join_groups());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn access_schedule_accepts_a_new_row_without_database_identity() {
+        let schedule: super::AccessSchedule = serde_json::from_value(serde_json::json!({
+            "DayOfWeek": "Weekday", "StartHour": 9.5, "EndHour": 17.25
+        }))
+        .unwrap();
+        assert_eq!(schedule.id, 0);
+        assert!(schedule.user_id.is_nil());
+        assert_eq!(schedule.day_of_week, super::DynamicDayOfWeek::Weekday);
+        assert_eq!((schedule.start_hour, schedule.end_hour), (9.5, 17.25));
     }
 }
