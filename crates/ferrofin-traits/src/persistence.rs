@@ -211,6 +211,35 @@ pub trait ItemRepository: Send + Sync {
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Applies the pinned `UserViewBuilder.Filter` rules to already-visible
+    /// immediate children. Preserves input order; sorting, grouping, adjacency,
+    /// counting and paging belong to the caller. Request-only query filters
+    /// outside that source whitelist are ignored.
+    async fn filter_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child filtering is not implemented",
+        ))
+    }
+
+    /// Sorts an already-filtered child set without grouping or paging. Name
+    /// sorts use the pinned stable ordinal comparison; an empty OrderBy keeps
+    /// input order. Other sorts retain the repository's existing consumer.
+    async fn sort_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child sorting is not implemented",
+        ))
+    }
+
     /// Batch extra owners for video versions and the series allowed to group.
     async fn get_extra_owner_ids_batch(
         &self,

@@ -665,7 +665,7 @@ fn program_dto_options(
 /// RFC 3339 first (what every Jellyfin client sends), then the offset-less
 /// forms ASP.NET's `DateTime` model binder also accepts, read as UTC. An
 /// unparseable value fails the bind — a `400`, as it is upstream.
-fn deserialize_optional_date_time<'de, D>(
+pub(crate) fn deserialize_optional_date_time<'de, D>(
     deserializer: D,
 ) -> Result<Option<DateTime<Utc>>, D::Error>
 where

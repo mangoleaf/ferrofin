@@ -11,7 +11,9 @@
 //! not taken as a field (it would be injected at the composition root if a later
 //! method needs it).
 
-use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
+use ferrofin_util::string_extensions::{
+    equals_ordinal_ignore_case, lower_invariant, upper_invariant,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,7 +77,7 @@ impl std::fmt::Debug for FerrofinItemRepository {
 
 /// The columns [`FerrofinItemRepository::top_parent_ids_for_query`] reads to
 /// resolve one view.
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 struct ViewRow {
     /// The stored CLR type name.
     #[sqlx(rename = "Type")]
@@ -198,10 +200,370 @@ impl FerrofinItemRepository {
             rows = enabled;
             let hidden = self.hidden_media_folders(user).await?;
             if !hidden.is_empty() {
-                rows.retain(|row| Uuid::parse_str(&row.id).is_ok_and(|id| !hidden.contains(&id)));
+                rows.retain(|row| {
+                    Some(row.type_.as_str()) != stored_type_name(BaseItemKind::CollectionFolder)
+                        || Uuid::parse_str(&row.id).is_ok_and(|id| !hidden.contains(&id))
+                });
             }
         }
         Ok(Some(rows))
+    }
+
+    /// `UserViewBuilder.GetUserItems(folders)` starts from visible root children,
+    /// even for a recursive request, then applies GetResult's filters/sort/page.
+    /// The root-controller shortcut deliberately ignores those query options and
+    /// cannot be used as the final folders-view result.
+    async fn folders_view_result(
+        &self,
+        filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
+    ) -> Result<Option<QueryResult<BaseItemEntity>>, ServiceError> {
+        // Folder.GetItems bypasses GetItemsInternal/UserViewBuilder when IDs
+        // are explicit. Preserve that direct repository query and parent scope.
+        if filter.parent_id.is_nil() || filter.physical_children_only || !filter.item_ids.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        if !crate::user_view_manager::is_folders_view_fields(
+            &parent.type_name,
+            parent.path.as_deref(),
+            parent.data.as_deref(),
+        ) {
+            return Ok(None);
+        }
+        let root_query = InternalItemsQuery {
+            user: filter.user.clone(),
+            parent_id: self.roots.map_or_else(Uuid::nil, |roots| roots.user_root),
+            user_root_children: true,
+            ..Default::default()
+        };
+        // This helper uses fetch_rows for the real user root. Box this edge of
+        // the mutually recursive async calls; the root is never a folders view.
+        let children = Box::pin(self.user_root_children(&root_query))
+            .await?
+            .unwrap_or_default();
+        // GetResult does not sort without an explicit OrderBy. Keep the root
+        // helper's order (including appended plugin folders) in that case.
+        let rows = self.filter_folder_children_inner(children, filter).await?;
+        let mut rows = self.sort_folder_children_inner(rows, filter).await?;
+        // Adjacency includes the selected item, runs after sorting, and precedes
+        // paging. A missing selected item has no neighbours in this result set.
+        if let Some(adjacent) = filter.adjacent_to.filter(|id| !id.is_nil()) {
+            rows = rows
+                .iter()
+                .position(|row| Uuid::parse_str(&row.id).ok() == Some(adjacent))
+                .map_or_else(Vec::new, |index| {
+                    rows[index.saturating_sub(1)..(index + 2).min(rows.len())].to_vec()
+                });
+        }
+        let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+        let start = usize::try_from(filter.start_index.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+        let take = filter
+            .limit
+            .filter(|limit| *limit > 0)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(usize::MAX);
+        let rows = rows.into_iter().skip(start).take(take).collect();
+        Ok(Some(QueryResult::new(
+            Some(filter.start_index.unwrap_or(0)),
+            Some(total),
+            rows,
+        )))
+    }
+
+    async fn sort_folder_children_inner(
+        &self,
+        mut rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        if rows.is_empty() || filter.order_by.is_empty() {
+            return Ok(rows);
+        }
+        if filter.order_by.iter().all(|(by, _)| {
+            matches!(
+                by,
+                ItemSortBy::Name
+                    | ItemSortBy::SortName
+                    | ItemSortBy::Default
+                    | ItemSortBy::Unrecognized(_)
+            )
+        }) {
+            rows.sort_by(|a, b| {
+                for (by, direction) in &filter.order_by {
+                    let ordering = match by {
+                        ItemSortBy::Name => {
+                            folder_ordinal_compare(a.name.as_deref(), b.name.as_deref())
+                        }
+                        ItemSortBy::SortName => folder_ordinal_compare(
+                            Some(&folder_sort_name(a)),
+                            Some(&folder_sort_name(b)),
+                        ),
+                        _ => continue,
+                    };
+                    let ordering = if *direction == SortOrder::Descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                    if !ordering.is_eq() {
+                        return ordering;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            return Ok(rows);
+        }
+        // Keep the existing consumer for other sort fields. Its broader
+        // comparator parity is a separate query review, not this display flag.
+        let matching = InternalItemsQuery {
+            user: filter.user.clone(),
+            user_preferences_loaded: true,
+            item_ids: rows
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect(),
+            order_by: filter.order_by.clone(),
+            group_by_presentation_unique_key: false,
+            include_owned_items: true,
+            ..Default::default()
+        };
+        self.fetch_rows_resolved(&matching, QueryShape::FullRows)
+            .await
+    }
+
+    /// The in-memory GetResult whitelist. Ordinary query translation has
+    /// intentionally different semantics and cannot implement this consumer.
+    // Independent source whitelist filters are kept together for review.
+    #[allow(clippy::too_many_lines)]
+    async fn filter_folder_children_inner(
+        &self,
+        mut rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let collation = folder_name_collator(filter)?;
+        rows.retain(|row| folder_child_matches_fields(row, filter, collation));
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        if !filter.studio_ids.is_empty() || !filter.genre_ids.is_empty() {
+            let ids: Vec<_> = filter
+                .studio_ids
+                .iter()
+                .chain(&filter.genre_ids)
+                .copied()
+                .collect();
+            let named = self.retrieve_items(&ids).await?;
+            rows.retain(|row| {
+                let matches = |ids: &[Uuid], values: Option<&str>| {
+                    ids.is_empty()
+                        || named.iter().any(|reference| {
+                            Uuid::parse_str(&reference.id).is_ok_and(|id| ids.contains(&id))
+                                && reference
+                                    .name
+                                    .as_deref()
+                                    .is_some_and(|name| folder_values_contain(values, name))
+                        })
+                };
+                matches(&filter.studio_ids, row.studios.as_deref())
+                    && matches(&filter.genre_ids, row.genres.as_deref())
+            });
+        }
+        if filter.has_imdb_id.is_some()
+            || filter.has_tmdb_id.is_some()
+            || filter.has_tvdb_id.is_some()
+        {
+            let ids = folder_row_ids_json(&rows)?;
+            let providers: Vec<(String, String, String)> = sqlx::query_as(
+                r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+                   WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#,
+            )
+            .bind(ids)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let mut present: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for (id, provider, value) in providers {
+                if !value.is_empty() {
+                    present
+                        .entry(id)
+                        .or_default()
+                        .insert(upper_invariant(&provider));
+                }
+            }
+            rows.retain(|row| {
+                [
+                    (filter.has_imdb_id, "IMDB"),
+                    (filter.has_tmdb_id, "TMDB"),
+                    (filter.has_tvdb_id, "TVDB"),
+                ]
+                .into_iter()
+                .all(|(requested, key)| {
+                    requested.is_none_or(|wanted| {
+                        present
+                            .get(&row.id)
+                            .is_some_and(|providers| providers.contains(key))
+                            == wanted
+                    })
+                })
+            });
+        }
+        if !filter.image_types.is_empty() {
+            let ids = folder_row_ids_json(&rows)?;
+            let image_types: Vec<(String, i32)> = sqlx::query_as(
+                r#"SELECT "ItemId", "ImageType" FROM "BaseItemImageInfos"
+                   WHERE "ImageType" <> 10 AND "ItemId" IN (SELECT value FROM json_each(?1))
+                   UNION ALL SELECT "ItemId", 10 FROM "Chapters"
+                   WHERE "ChapterIndex" = 0 AND "ImagePath" IS NOT NULL AND "ImagePath" <> ''
+                     AND "ItemId" IN (SELECT value FROM json_each(?1))"#,
+            )
+            .bind(ids)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let mut present: HashMap<String, std::collections::HashSet<i32>> = HashMap::new();
+            for (id, kind) in image_types {
+                present.entry(id).or_default().insert(kind);
+            }
+            rows.retain(|row| {
+                present.get(&row.id).is_some_and(|images| {
+                    filter
+                        .image_types
+                        .iter()
+                        .any(|kind| images.contains(&kind.json_value()))
+                })
+            });
+        }
+        let own_requested = filter.is_liked.is_some()
+            || filter.is_favorite_or_liked.is_some()
+            || filter.is_favorite.is_some()
+            || filter.is_resumable.is_some()
+            || (filter.is_played.is_some() && rows.iter().any(|row| !row.is_folder));
+        if own_requested && !rows.is_empty() {
+            let user = filter.user_id().ok_or_else(|| {
+                ServiceError::invalid_input("folder user-data filtering requires a user")
+            })?;
+            let own = self.folder_own_user_data(&rows, user).await?;
+            rows.retain(|row| {
+                let value = own.get(&row.id);
+                // UserItemData.Likes is computed from Rating; the nullable
+                // persisted Likes column is not this source property.
+                let liked = value
+                    .and_then(|value| value.rating)
+                    .map(|rating| rating >= 6.5);
+                let favorite = value.is_some_and(|value| value.is_favorite);
+                filter.is_liked.is_none_or(|wanted| liked == Some(wanted))
+                    && filter
+                        .is_favorite_or_liked
+                        .is_none_or(|wanted| (favorite || liked.unwrap_or(false)) == wanted)
+                    && filter.is_favorite.is_none_or(|wanted| favorite == wanted)
+                    && filter.is_resumable.is_none_or(|wanted| {
+                        value.is_some_and(|value| value.playback_position_ticks > 0) == wanted
+                    })
+                    && (row.is_folder
+                        || filter
+                            .is_played
+                            .is_none_or(|wanted| value.is_some_and(|value| value.played) == wanted))
+            });
+        }
+        if let (Some(played), Some(user)) = (filter.is_played, filter.user.as_ref()) {
+            use ferrofin_traits::persistence::ItemCountService as _;
+            let ids: Vec<_> = rows
+                .iter()
+                .filter(|row| row.is_folder)
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            if !ids.is_empty() {
+                let counts = crate::FerrofinItemCountService::new(self.db.clone())
+                    .get_played_and_total_count_batch(&ids, user)
+                    .await?;
+                rows.retain(|row| {
+                    !row.is_folder
+                        || Uuid::parse_str(&row.id).is_ok_and(|id| {
+                            let count = counts.get(&id).copied().unwrap_or_default();
+                            (count.played >= count.total) == played
+                        })
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Resolve the source's first current key, then its attached-row fallback.
+    /// Batch queries avoid introducing a read per immediate child.
+    pub(crate) async fn folder_own_user_data(
+        &self,
+        rows: &[BaseItemEntity],
+        user: Uuid,
+    ) -> Result<HashMap<String, ferrofin_db::entities::playback::UserDataEntity>, ServiceError>
+    {
+        use ferrofin_db::entities::playback::UserDataEntity;
+        let ids: Vec<_> = rows.iter().map(|row| row.id.clone()).collect();
+        let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
+        let keys: HashMap<_, _> =
+            crate::user_data_key_repository::load_keys_for_items(&mut connection, &ids)
+                .await?
+                .into_iter()
+                .collect();
+        let candidates: Vec<UserDataEntity> = sqlx::query_as(
+            r#"SELECT * FROM "UserData" WHERE "UserId" = ?1
+               AND "ItemId" IN (SELECT value FROM json_each(?2)) ORDER BY "CustomDataKey""#,
+        )
+        .bind(guid_to_db(user))
+        .bind(folder_row_ids_json(rows)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(db_err)?;
+        let mut by_item: HashMap<String, Vec<UserDataEntity>> = HashMap::new();
+        for candidate in candidates {
+            by_item
+                .entry(candidate.item_id.clone())
+                .or_default()
+                .push(candidate);
+        }
+        let mut selected = HashMap::new();
+        for row in rows {
+            let Some(candidates) = by_item.remove(&row.id) else {
+                continue;
+            };
+            let mut current = keys.get(&row.id).cloned().unwrap_or_default();
+            // SourceType is a derived, JsonIgnore property: Channel's kind
+            // always wins; LiveTV kinds suppress base ChannelId; ordinary items
+            // derive it from the actual nonempty ChannelId, never a Data token.
+            let channel = match crate::item_type_lookup::kind_from_type_name(&row.type_) {
+                Some(BaseItemKind::Channel) => true,
+                Some(
+                    BaseItemKind::LiveTvChannel
+                    | BaseItemKind::TvChannel
+                    | BaseItemKind::LiveTvProgram
+                    | BaseItemKind::TvProgram,
+                ) => false,
+                _ => row
+                    .channel_id
+                    .as_deref()
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())),
+            };
+            if channel
+                && let Some(external) = row.external_id.as_ref().filter(|value| !value.is_empty())
+            {
+                // Derived classes prepend their provider keys ahead of BaseItem;
+                // the channel key is immediately before the own-Guid last key.
+                current.insert(current.len().saturating_sub(1), external.clone());
+            }
+            let preferred = current.iter().find_map(|key| {
+                candidates
+                    .iter()
+                    .position(|value| value.custom_data_key == *key)
+            });
+            if let Some(value) = candidates.into_iter().nth(preferred.unwrap_or(0)) {
+                selected.insert(row.id.clone(), value);
+            }
+        }
+        Ok(selected)
     }
 
     /// The media-folder ids `user` may NOT see — `Folder.IsVisible`'s
@@ -254,18 +616,53 @@ impl FerrofinItemRepository {
     /// until a scan saves them again, so a library's rows carry either: a view
     /// is translated to itself AND its physical folders
     /// ([`library_top_parents_by_view`]), never to the folders alone.
+    async fn query_view_row(db: &Database, id: Uuid) -> Result<Option<ViewRow>, ServiceError> {
+        sqlx::query_as(r#"SELECT "Type", "ParentId", "Path", "Data", "TopParentId" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id)).fetch_optional(db.pool()).await.map_err(db_err)
+    }
+
+    async fn query_parent_row(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<ViewRow>, ServiceError> {
+        if filter.parent_id.is_nil()
+            || filter.physical_children_only
+            || self.roots.is_some_and(|roots| {
+                filter.parent_id == roots.aggregate
+                    || (!filter.recursive && filter.parent_id == roots.user_root)
+            })
+        {
+            return Ok(None);
+        }
+        Self::query_view_row(&self.db, filter.parent_id).await
+    }
+
     async fn resolve_views(
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let parent = self.query_parent_row(filter).await?;
+        self.resolve_views_with_parent(filter, parent.as_ref())
+            .await
+    }
+
+    async fn resolve_views_with_parent(
+        &self,
+        filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
         let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
         let prepared = preferences.as_ref().unwrap_or(filter);
-        Ok(self.resolve_views_prepared(prepared).await?.or(preferences))
+        Ok(self
+            .resolve_views_prepared(prepared, parent)
+            .await?
+            .or(preferences))
     }
 
     async fn resolve_views_prepared(
         &self,
         filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
     ) -> Result<Option<InternalItemsQuery>, ServiceError> {
         // `physical_children_only` is the delete-cascade path: it must keep
         // meaning "the rows this item owns", never widen to a library's whole
@@ -318,9 +715,14 @@ impl FerrofinItemRepository {
         if filter.recursive
             && filter.parent_id != Uuid::nil()
             && !filter.physical_children_only
-            && let Some(mut folders) =
-                Self::top_parent_ids_for_query(&self.db, filter.parent_id, filter.user.as_ref(), 0)
-                    .await?
+            && let Some(mut folders) = Self::top_parent_ids_for_query(
+                &self.db,
+                filter.parent_id,
+                filter.user.as_ref(),
+                0,
+                parent.cloned(),
+            )
+            .await?
         {
             // A view that resolves to nothing matches nothing — upstream
             // substitutes a fresh guid for exactly this reason ("Prevent
@@ -366,10 +768,12 @@ impl FerrofinItemRepository {
             }
         }
         if wants_parent {
-            let folders = self
-                .physical_folders_by_view(&[filter.parent_id])
-                .await?
-                .remove(&filter.parent_id)
+            let folders = parent
+                .filter(|row| {
+                    Some(row.type_name.as_str()) == stored_type_name(BaseItemKind::CollectionFolder)
+                })
+                .and_then(|row| row.data.as_deref())
+                .map(parse_physical_folder_ids)
                 .unwrap_or_default();
             if !folders.is_empty() {
                 resolved
@@ -443,6 +847,7 @@ impl FerrofinItemRepository {
         id: Uuid,
         user: Option<&UserEntity>,
         depth: u8,
+        row: Option<ViewRow>,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         // A `DisplayParentId`/`ParentId` chain is data, so it can be a cycle.
         // Upstream recurses without a guard and would stack-overflow; refusing to
@@ -450,14 +855,10 @@ impl FerrofinItemRepository {
         if depth > 8 {
             return Ok(Some(Vec::new()));
         }
-        let row: Option<ViewRow> = sqlx::query_as(
-            r#"SELECT "Type", "ParentId", "Path", "Data", "TopParentId"
-               FROM "BaseItems" WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(id))
-        .fetch_optional(db.pool())
-        .await
-        .map_err(db_err)?;
+        let row = match row {
+            Some(row) => Some(row),
+            None => Self::query_view_row(db, id).await?,
+        };
         let Some(ViewRow {
             type_name,
             parent_id,
@@ -473,18 +874,13 @@ impl FerrofinItemRepository {
             // The physical folders AND the collection folder itself: an
             // adopted row carries the first until a scan saves it with the
             // second ([`library_top_parents_by_view`]).
-            let folders = library_top_parents_by_view(db, &[id])
-                .await?
-                .remove(&id)
+            let mut folders = data
+                .as_deref()
+                .map(parse_physical_folder_ids)
                 .unwrap_or_default();
-            // Native libraries use the collection folder as TopParentId.
-            // Always scope a library by top parent: its ancestor closure also
-            // includes parentless extras attached through OwnerId.
-            return Ok(Some(if folders.is_empty() {
-                vec![id]
-            } else {
-                folders
-            }));
+            folders.retain(|folder| *folder != id);
+            folders.insert(0, id);
+            return Ok(Some(folders));
         }
         if kind != Some(BaseItemKind::UserView) {
             // C#'s last arm — `item.GetTopParent()` — but only when we got here by
@@ -535,9 +931,15 @@ impl FerrofinItemRepository {
             // A dangling pointer resolves to nothing, NOT to the ancestor closure:
             // upstream returns `[]` when `GetItemById` misses.
             return Ok(Some(
-                Box::pin(Self::top_parent_ids_for_query(db, next, user, depth + 1))
-                    .await?
-                    .unwrap_or_default(),
+                Box::pin(Self::top_parent_ids_for_query(
+                    db,
+                    next,
+                    user,
+                    depth + 1,
+                    None,
+                ))
+                .await?
+                .unwrap_or_default(),
             ));
         }
 
@@ -594,6 +996,7 @@ impl FerrofinItemRepository {
                 folder,
                 Some(user),
                 depth + 1,
+                None,
             ))
             .await?
             {
@@ -628,29 +1031,19 @@ impl FerrofinItemRepository {
             }))
     }
 
-    /// The physical folders each of `ids` stands for, for those that are
-    /// Jellyfin collection folders. Ids that are not — every id on a
-    /// Ferrofin-written database — are simply absent from the map.
-    ///
-    /// One statement for the whole set, and restricted to the collection-folder
-    /// type: only those rows carry `PhysicalFolderIds` (7 of 7 on the real
-    /// library, no other type), so without the guard every ordinary browse of a
-    /// series or a folder would read and JSON-parse that item's `Data` blob to
-    /// learn nothing.
-    async fn physical_folders_by_view(
-        &self,
-        ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
-        physical_folders_by_view(&self.db, ids).await
-    }
-
     /// Runs a translated query in the requested shape, returning full rows.
     async fn fetch_rows(
         &self,
         filter: &InternalItemsQuery,
         shape: QueryShape,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let resolved = self.resolve_views(filter).await?;
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(result.items);
+        }
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
         self.fetch_rows_resolved(resolved.as_ref().unwrap_or(filter), shape)
             .await
     }
@@ -682,7 +1075,17 @@ impl FerrofinItemRepository {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
-        let resolved = self.resolve_views(filter).await?;
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(result
+                .items
+                .into_iter()
+                .map(|row| (row.id, row.clean_name))
+                .collect());
+        }
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::IdAndCleanName);
         qb.build_query_as::<(String, Option<String>)>()
@@ -693,7 +1096,17 @@ impl FerrofinItemRepository {
 
     /// Runs a translated query returning only the id column.
     async fn fetch_ids(&self, filter: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        let resolved = self.resolve_views(filter).await?;
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(result
+                .items
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect());
+        }
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::IdsOnly);
         let ids: Vec<String> = qb
@@ -2007,6 +2420,213 @@ async fn live_tv_view_id(db: &Database) -> Result<Option<Uuid>, ServiceError> {
     Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
 }
 
+/// ICU's root secondary strength is invariant linguistic comparison ignoring
+/// case while retaining accents. Only name filters require this data.
+fn folder_name_collator(
+    filter: &InternalItemsQuery,
+) -> Result<Option<&'static icu_collator::CollatorBorrowed<'static>>, ServiceError> {
+    use icu_collator::options::{CollatorOptions, Strength};
+    static COLLATOR: std::sync::OnceLock<Result<icu_collator::CollatorBorrowed<'static>, String>> =
+        std::sync::OnceLock::new();
+    if ![
+        &filter.name_starts_with,
+        &filter.name_starts_with_or_greater,
+        &filter.name_less_than,
+    ]
+    .iter()
+    .any(|value| value.as_deref().is_some_and(|value| !value.is_empty()))
+    {
+        return Ok(None);
+    }
+    COLLATOR
+        .get_or_init(|| {
+            let mut options = CollatorOptions::default();
+            options.strength = Some(Strength::Secondary);
+            icu_collator::Collator::try_new(icu_collator::CollatorPreferences::default(), options)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Some)
+        .map_err(|error| ServiceError::backend(format!("folder name collation: {error}")))
+}
+
+fn folder_invariant_starts_with(
+    collator: &icu_collator::CollatorBorrowed<'_>,
+    value: &str,
+    prefix: &str,
+) -> bool {
+    use unicode_normalization::UnicodeNormalization as _;
+    let normalized: String = value.nfc().collect();
+    // Compare complete canonical combining sequences, never a base character
+    // cut off from its accent. SQL LIKE's '%' and '_' remain literal here.
+    (0..=normalized.len())
+        .filter(|end| normalized.is_char_boundary(*end))
+        .filter(|end| {
+            normalized[*end..]
+                .chars()
+                .next()
+                .is_none_or(|next| !unicode_normalization::char::is_combining_mark(next))
+        })
+        .any(|end| collator.compare(&normalized[..end], prefix).is_eq())
+}
+
+fn folder_nonempty(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// The pinned SortNameComparer/NameComparer use ordinal case-insensitive
+/// comparison, including supplementary scalar order. Keep equal keys stable,
+/// with no generic SQL tiebreaker.
+pub(crate) fn folder_ordinal_compare(
+    left: Option<&str>,
+    right: Option<&str>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => upper_invariant(left).cmp(&upper_invariant(right)),
+    }
+}
+
+pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
+    let kind =
+        crate::item_type_lookup::kind_from_type_name(&row.type_).unwrap_or(BaseItemKind::Folder);
+    // BaseItemMapper assigns SortName then ForcedSortName; that setter clears
+    // the cached key. A stale stored key must never mask a nonempty override.
+    if let Some(forced) = row
+        .forced_sort_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        return crate::kinds::forced_sort_name_for(kind, forced);
+    }
+    row.sort_name.clone().unwrap_or_else(|| {
+        crate::kinds::sort_name_for(kind, row.name.as_deref().unwrap_or_default())
+    })
+}
+
+fn folder_values_contain(values: Option<&str>, wanted: &str) -> bool {
+    values.is_some_and(|values| {
+        values
+            .split('|')
+            .filter(|value| !value.is_empty())
+            .any(|value| equals_ordinal_ignore_case(value, wanted))
+    })
+}
+
+fn folder_row_ids_json(rows: &[BaseItemEntity]) -> Result<String, ServiceError> {
+    serde_json::to_string(&rows.iter().map(|row| &row.id).collect::<Vec<_>>())
+        .map_err(|error| ServiceError::backend(error.to_string()))
+}
+
+// Mirrors the source's explicit property whitelist, not generic SQL query
+// predicates. The length reflects independent optional source filters.
+#[allow(clippy::too_many_lines)]
+fn folder_child_matches_fields(
+    row: &BaseItemEntity,
+    filter: &InternalItemsQuery,
+    collator: Option<&icu_collator::CollatorBorrowed<'_>>,
+) -> bool {
+    if let Some(collator) = collator {
+        let sort_name = folder_sort_name(row);
+        if folder_nonempty(filter.name_starts_with.as_deref())
+            .is_some_and(|prefix| !folder_invariant_starts_with(collator, &sort_name, prefix))
+            || folder_nonempty(filter.name_starts_with_or_greater.as_deref())
+                .is_some_and(|bound| collator.compare(bound, &sort_name).is_gt())
+            || folder_nonempty(filter.name_less_than.as_deref())
+                .is_some_and(|bound| !collator.compare(bound, &sort_name).is_gt())
+        {
+            return false;
+        }
+    }
+    let kind = crate::item_type_lookup::kind_from_type_name(&row.type_);
+    if (!filter.media_types.is_empty()
+        && !filter
+            .media_types
+            .iter()
+            .any(|kind| media_type_name(*kind) == row.media_type.as_deref().unwrap_or("Unknown")))
+        || (!filter.include_item_types.is_empty()
+            && !kind.is_some_and(|kind| filter.include_item_types.contains(&kind)))
+        || kind.is_some_and(|kind| filter.exclude_item_types.contains(&kind))
+        || filter
+            .is_virtual_item
+            .is_some_and(|wanted| row.is_virtual_item != wanted)
+        || filter
+            .is_folder
+            .is_some_and(|wanted| row.is_folder != wanted)
+        || filter
+            .is_locked
+            .is_some_and(|wanted| row.is_locked != wanted)
+        || filter.has_overview.is_some_and(|wanted| {
+            row.overview
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+                != wanted
+        })
+    {
+        return false;
+    }
+    if let Some(wanted) = filter.has_parental_rating {
+        let rating = row
+            .custom_rating
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or(row.official_rating.as_deref());
+        if rating.is_some_and(|value| !value.is_empty()) != wanted {
+            return false;
+        }
+    }
+    if (!filter.genres.is_empty()
+        && !filter
+            .genres
+            .iter()
+            .any(|value| folder_values_contain(row.genres.as_deref(), value)))
+        || (!filter.tags.is_empty()
+            && !filter
+                .tags
+                .iter()
+                .any(|value| folder_values_contain(row.tags.as_deref(), value)))
+        || (!filter.years.is_empty()
+            && !row
+                .production_year
+                .is_some_and(|value| filter.years.iter().any(|year| i64::from(*year) == value)))
+        || (!filter.official_ratings.is_empty()
+            && !filter
+                .official_ratings
+                .iter()
+                .any(|value| value == row.official_rating.as_deref().unwrap_or_default()))
+    {
+        return false;
+    }
+    if (!filter.item_ids.is_empty()
+        && !Uuid::parse_str(&row.id).is_ok_and(|id| filter.item_ids.contains(&id)))
+        || Uuid::parse_str(&row.id).is_ok_and(|id| filter.exclude_item_ids.contains(&id))
+        || filter
+            .min_community_rating
+            .is_some_and(|min| !row.community_rating.is_some_and(|value| value >= min))
+        || filter
+            .min_critic_rating
+            .is_some_and(|min| !row.critic_rating.is_some_and(|value| value >= min))
+        || filter
+            .min_index_number
+            .is_some_and(|min| row.index_number.is_none_or(|value| value < i64::from(min)))
+        || filter
+            .min_premiere_date
+            .is_some_and(|min| row.premiere_date.is_none_or(|value| value < min))
+        || filter
+            .max_premiere_date
+            .is_some_and(|max| row.premiere_date.is_none_or(|value| value > max))
+        || filter.parent_index_number.is_some_and(|wanted| {
+            row.parent_index_number
+                .is_some_and(|value| value != i64::from(wanted))
+        })
+    {
+        return false;
+    }
+    true
+}
+
 /// One of the user's guid-list folder preferences.
 async fn folder_preference(
     user_db: &Database,
@@ -2018,6 +2638,22 @@ async fn folder_preference(
 
 #[async_trait]
 impl ItemRepository for FerrofinItemRepository {
+    async fn filter_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.filter_folder_children_inner(rows, filter).await
+    }
+
+    async fn sort_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.sort_folder_children_inner(rows, filter).await
+    }
+
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
         visible_views(&self.db, user).await
     }
@@ -2127,10 +2763,16 @@ impl ItemRepository for FerrofinItemRepository {
                 children,
             ));
         }
+        let parent = self.query_parent_row(filter).await?;
+        if let Some(result) = self.folders_view_result(filter, parent.as_ref()).await? {
+            return Ok(result);
+        }
         // Resolve once for both statements below: the page and its count share
         // one scope, and asking the database twice for the same library's
         // folders is a round trip on every paged browse.
-        let resolved = self.resolve_views(filter).await?;
+        let resolved = self
+            .resolve_views_with_parent(filter, parent.as_ref())
+            .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
         let items = self
             .fetch_rows_resolved(filter, QueryShape::FullRows)
@@ -8079,5 +8721,1374 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(userless.items.len(), 2);
+    }
+
+    // One persisted root fixture verifies ordered filtering, state changes and paging together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn folders_view_filters_sorts_pages_and_never_recurses_into_media() {
+        use crate::aggregate_folder::RootFolderIds;
+        use crate::test_support::seed_folder_item;
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let db = test_db().await;
+        let (first, second, user_id, user) = two_libraries(&db).await;
+        let roots = RootFolderIds {
+            user_root: Uuid::new_v4(),
+            aggregate: Uuid::new_v4(),
+        };
+        seed_folder_item(
+            &db,
+            roots.user_root,
+            BaseItemKind::UserRootFolder,
+            "Root",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            roots.aggregate,
+            BaseItemKind::AggregateFolder,
+            "Physical",
+            None,
+        )
+        .await;
+        for id in [first, second] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ParentId" = ?2, "IsFolder" = 1 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(roots.user_root))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        let playlists = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            playlists,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(roots.aggregate),
+        )
+        .await;
+        let view = Uuid::new_v4();
+        seed_folder_item(&db, view, BaseItemKind::UserView, "Folders", None).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"ViewType":"folders"}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(view))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let repository = repo(&db).with_root_ids(roots);
+        let query = InternalItemsQuery {
+            parent_id: view,
+            user: Some(user.clone()),
+            recursive: true,
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        assert_eq!(
+            repository
+                .get_items(&query)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["First", "Playlists", "Second"]
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    order_by: Vec::new(),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["First", "Second", "Playlists"],
+            "GetResult preserves GetChildren order when no sort is requested"
+        );
+        for recursive in [false, true] {
+            let explicit = InternalItemsQuery {
+                item_ids: vec![first, playlists],
+                recursive,
+                ..query.clone()
+            };
+            let result = repository.get_items(&explicit).await.unwrap();
+            assert!(
+                result.items.is_empty(),
+                "explicit IDs bypass the folders builder and retain the empty persisted view scope"
+            );
+            assert_eq!(result.total_record_count, 0);
+            assert!(repository.get_item_ids(&explicit).await.unwrap().is_empty());
+            assert!(
+                repository
+                    .fetch_id_clean_names(&explicit)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let nil_adjacent = repository
+            .get_items(&InternalItemsQuery {
+                adjacent_to: Some(Uuid::nil()),
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            nil_adjacent.total_record_count, 3,
+            "source treats an empty adjacent GUID as absent"
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    name_contains: Some("does-not-exist".to_owned()),
+                    parent_index_number: Some(42),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            3,
+            "GetResult ignores NameContains and permits a null ParentIndexNumber"
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    has_parental_rating: Some(true),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            0
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    has_parental_rating: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            3
+        );
+        crate::test_support::seed_user_data(&db, user_id, first, false, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "PlaybackPositionTicks" = 10 WHERE "UserId" = ?1 AND "ItemId" = ?2"#).bind(guid_to_db(user_id)).bind(guid_to_db(first)).execute(db.writer()).await.unwrap();
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    is_resumable: Some(true),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .items[0]
+                .id,
+            guid_to_db(first),
+            "GetResult reads the root folder's own resume position rather than the SQL series/season rollup"
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    is_resumable: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            2
+        );
+        for (leaf, parent) in [
+            (Uuid::from_u128(0x9803), first),
+            (Uuid::from_u128(0x9804), second),
+        ] {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(leaf))
+                .bind(guid_to_db(parent))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        crate::test_support::seed_user_data(&db, user_id, Uuid::from_u128(0x9803), true, None)
+            .await;
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    is_played: Some(true),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["First", "Playlists"],
+            "folder played state comes from descendants; empty plugin folders count as played"
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    is_played: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .items[0]
+                .id,
+            guid_to_db(second)
+        );
+        let page = repository
+            .get_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                order_by: vec![(ItemSortBy::SortName, SortOrder::Descending)],
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 3);
+        assert_eq!(page.items[0].id, guid_to_db(playlists));
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    start_index: Some(99),
+                    limit: Some(1),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            3
+        );
+        let zero_limit = repository
+            .get_items(&InternalItemsQuery {
+                limit: Some(0),
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_limit.items.len(),
+            3,
+            "GetResult applies a limit only when positive"
+        );
+        let filtered = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::CollectionFolder],
+            name_starts_with: Some("S".to_owned()),
+            ..query.clone()
+        };
+        assert_eq!(repository.get_item_ids(&filtered).await.unwrap(), [second]);
+        assert_eq!(
+            repository.get_item_list(&filtered).await.unwrap()[0].id,
+            guid_to_db(second)
+        );
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Movie],
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            0,
+            "recursive=true still means root children in this view"
+        );
+        let adjacent = repository
+            .get_items(&InternalItemsQuery {
+                adjacent_to: Some(playlists),
+                start_index: Some(1),
+                limit: Some(1),
+                ..query.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(adjacent.total_record_count, 3);
+        assert_eq!(adjacent.items[0].id, guid_to_db(playlists));
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    adjacent_to: Some(Uuid::new_v4()),
+                    ..query.clone()
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            0
+        );
+        // AllowedTags exempts these immediate root children. Folder permissions
+        // still remove the other library; plugin folders retain source visibility.
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            PreferenceKind::AllowedTags,
+            &["only-media".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(repository.get_items(&query).await.unwrap().items.len(), 3);
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(guid_to_db(user_id))
+            .bind(i32::from(PermissionKind::EnableAllFolders))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[first]).await;
+        let restricted = repository.get_items(&query).await.unwrap();
+        assert_eq!(
+            restricted
+                .items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["First", "Playlists"]
+        );
+        set_folder_preference(
+            &db,
+            user_id,
+            PreferenceKind::BlockedMediaFolders,
+            &[first, second],
+        )
+        .await;
+        assert_eq!(
+            repository
+                .get_items(&query)
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["Playlists"]
+        );
+        // A filtered empty scope must not fall through to the server catalogue.
+        assert_eq!(
+            repository
+                .get_items(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::CollectionFolder],
+                    ..query
+                })
+                .await
+                .unwrap()
+                .total_record_count,
+            0
+        );
+    }
+}
+
+#[cfg(test)]
+mod folder_get_result_tests {
+    use super::*;
+    use crate::test_support::{
+        seed_folder_item, seed_named_item, seed_provider_id, seed_user_data,
+        seed_user_with_defaults, test_db,
+    };
+    use ferrofin_model::data::MediaType;
+
+    fn repository(db: &Database) -> FerrofinItemRepository {
+        FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )
+    }
+
+    async fn ordered_rows(
+        repository: &FerrofinItemRepository,
+        ids: &[Uuid],
+    ) -> Vec<BaseItemEntity> {
+        let mut rows = Vec::new();
+        for id in ids {
+            rows.push(repository.retrieve_item(*id).await.unwrap().unwrap());
+        }
+        rows
+    }
+
+    fn ids(rows: &[BaseItemEntity]) -> Vec<Uuid> {
+        rows.iter()
+            .map(|row| Uuid::parse_str(&row.id).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn literal_name_prefixes_use_case_insensitive_invariant_combining_sequences() {
+        let collator = folder_name_collator(&InternalItemsQuery {
+            name_starts_with: Some("x".to_owned()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        for (name, prefix, expected) in [
+            ("a%b folder", "A%B", true),
+            ("axxb folder", "a%b", false),
+            ("a_b folder", "A_B", true),
+            ("axb folder", "a_b", false),
+            ("ÉCLAIR", "é", true),
+            ("e\u{301}clair", "É", true),
+            ("éclair", "e", false),
+            ("e\u{301}clair", "e", false),
+            ("e\u{301}\u{323}clair", "e\u{301}", false),
+            (" folders", " ", true),
+            ("folders", " ", false),
+            ("folder", "\u{ad}FOL", true),
+        ] {
+            assert_eq!(
+                folder_invariant_starts_with(collator, name, prefix),
+                expected,
+                "{name:?}/{prefix:?}"
+            );
+        }
+        let row = BaseItemEntity {
+            sort_name: Some("éclair".to_owned()),
+            ..Default::default()
+        };
+        let query = InternalItemsQuery {
+            name_starts_with_or_greater: Some("e".to_owned()),
+            name_less_than: Some("f".to_owned()),
+            ..Default::default()
+        };
+        assert!(folder_child_matches_fields(
+            &row,
+            &query,
+            folder_name_collator(&query).unwrap()
+        ));
+        let whitespace = InternalItemsQuery {
+            name_starts_with: Some(" ".to_owned()),
+            ..Default::default()
+        };
+        assert!(!folder_child_matches_fields(
+            &row,
+            &whitespace,
+            folder_name_collator(&whitespace).unwrap()
+        ));
+    }
+
+    #[test]
+    fn source_ordinal_sort_preserves_case_ties_and_supplementary_order() {
+        assert!(folder_ordinal_compare(Some("ÉCLAIR"), Some("éclair")).is_eq());
+        for (left, right, expected) in [
+            ("\u{10000}", "\u{e000}", std::cmp::Ordering::Greater),
+            ("\u{e000}", "\u{10000}", std::cmp::Ordering::Less),
+            ("\u{10000}", "\u{ffff}", std::cmp::Ordering::Greater),
+            ("\u{10400}", "\u{10428}", std::cmp::Ordering::Equal),
+            ("x\u{10000}", "x\u{e000}", std::cmp::Ordering::Greater),
+            ("\u{10000}", "\u{10001}", std::cmp::Ordering::Less),
+            ("\u{10000}", "\u{20000}", std::cmp::Ordering::Less),
+        ] {
+            assert_eq!(folder_ordinal_compare(Some(left), Some(right)), expected);
+        }
+        assert!(!folder_ordinal_compare(Some("straße"), Some("STRASSE")).is_eq());
+        let mut rows = [
+            BaseItemEntity {
+                name: Some("second".to_owned()),
+                sort_name: Some("SAME".to_owned()),
+                ..Default::default()
+            },
+            BaseItemEntity {
+                name: Some("first".to_owned()),
+                sort_name: Some("same".to_owned()),
+                ..Default::default()
+            },
+        ];
+        rows.sort_by(|a, b| {
+            folder_ordinal_compare(Some(&folder_sort_name(a)), Some(&folder_sort_name(b)))
+        });
+        assert_eq!(rows[0].name.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn raw_named_arrays_keep_accents_and_accept_any_existing_referenced_item() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let candidate = Uuid::new_v4();
+        let accented = Uuid::new_v4();
+        let cleaned = Uuid::new_v4();
+        seed_folder_item(&db, candidate, BaseItemKind::Folder, "candidate", None).await;
+        seed_named_item(&db, accented, BaseItemKind::Movie, "CAFÉ").await;
+        seed_named_item(&db, cleaned, BaseItemKind::Genre, "cafe").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Genres" = 'Café', "Tags" = 'ÉCLAIR', "Studios" = 'Café' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(candidate)).execute(db.writer()).await.unwrap();
+        let rows = ordered_rows(&repo, &[candidate]).await;
+        for query in [
+            InternalItemsQuery {
+                genres: vec!["cafe".to_owned()],
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                tags: vec!["eclair".to_owned()],
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                genre_ids: vec![cleaned],
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                studio_ids: vec![cleaned],
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                studio_ids: vec![Uuid::new_v4()],
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                repo.filter_folder_children(rows.clone(), &query)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let query = InternalItemsQuery {
+            genres: vec!["CAFÉ".to_owned()],
+            tags: vec!["éclair".to_owned()],
+            studio_ids: vec![accented],
+            genre_ids: vec![accented],
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&repo.filter_folder_children(rows, &query).await.unwrap()),
+            [candidate]
+        );
+    }
+
+    #[tokio::test]
+    async fn liked_false_excludes_unrated_and_favorite_or_liked_accepts_rating_alone() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let liked = Uuid::new_v4();
+        let disliked = Uuid::new_v4();
+        let unrated = Uuid::new_v4();
+        let favorite = Uuid::new_v4();
+        for id in [liked, disliked, unrated, favorite] {
+            seed_folder_item(&db, id, BaseItemKind::Folder, "folder", None).await;
+            seed_user_data(&db, user_id, id, false, None).await;
+        }
+        sqlx::query(r#"UPDATE "UserData" SET "Rating" = 6.5, "Likes" = 0 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(liked))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        sqlx::query(r#"UPDATE "UserData" SET "Rating" = 6.4, "Likes" = 1 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(disliked))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(favorite))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let rows = ordered_rows(&repo, &[unrated, liked, favorite, disliked]).await;
+        for (query, wanted) in [
+            (
+                InternalItemsQuery {
+                    is_liked: Some(true),
+                    user: Some(user.clone()),
+                    ..Default::default()
+                },
+                vec![liked],
+            ),
+            (
+                InternalItemsQuery {
+                    is_liked: Some(false),
+                    user: Some(user.clone()),
+                    ..Default::default()
+                },
+                vec![disliked],
+            ),
+            (
+                InternalItemsQuery {
+                    is_favorite_or_liked: Some(true),
+                    user: Some(user.clone()),
+                    ..Default::default()
+                },
+                vec![liked, favorite],
+            ),
+            (
+                InternalItemsQuery {
+                    is_favorite_or_liked: Some(false),
+                    user: Some(user.clone()),
+                    ..Default::default()
+                },
+                vec![unrated, disliked],
+            ),
+            (
+                InternalItemsQuery {
+                    is_favorite: Some(true),
+                    user: Some(user.clone()),
+                    ..Default::default()
+                },
+                vec![favorite],
+            ),
+        ] {
+            assert_eq!(
+                ids(&repo
+                    .filter_folder_children(rows.clone(), &query)
+                    .await
+                    .unwrap()),
+                wanted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn current_movie_provider_key_wins_over_conflicting_retired_rows() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "movie").await;
+        seed_provider_id(&db, movie, "Tmdb", "123").await;
+        seed_user_data(&db, user_id, movie, false, None).await;
+        // Stale own-ID row says favorite/resume/played; source current TMDB row
+        // says disliked/unplayed. ANY-row SQL would select the movie incorrectly.
+        sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1, "Rating" = 10, "PlaybackPositionTicks" = 55, "Played" = 1 WHERE "ItemId" = ?1"#).bind(guid_to_db(movie)).execute(db.writer()).await.unwrap();
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played","Rating") VALUES (?1,?2,'123',0,0,0,0,1)"#).bind(guid_to_db(movie)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let rows = ordered_rows(&repo, &[movie]).await;
+        for query in [
+            InternalItemsQuery {
+                is_favorite: Some(true),
+                user: Some(user.clone()),
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                is_resumable: Some(true),
+                user: Some(user.clone()),
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                is_played: Some(true),
+                user: Some(user.clone()),
+                ..Default::default()
+            },
+            InternalItemsQuery {
+                is_liked: Some(true),
+                user: Some(user.clone()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                repo.filter_folder_children(rows.clone(), &query)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        is_liked: Some(false),
+                        user: Some(user),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [movie]
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_channel_external_key_precedes_own_id_and_unmatched_rows_have_fallback() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let channel = Uuid::new_v4();
+        let fallback = Uuid::new_v4();
+        for id in [channel, fallback] {
+            seed_folder_item(&db, id, BaseItemKind::Folder, "folder", None).await;
+            seed_user_data(&db, user_id, id, false, None).await;
+        }
+        let mut entity = crate::test_support::fetch_item(&db, channel).await;
+        entity.external_id = Some("channel-key".to_owned());
+        entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+        entity.data = Some(r#"{"SourceType":0}"#.to_owned());
+        crate::test_support::save_item(&db, &entity).await;
+        sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = 'retired-only', "IsFavorite" = 1 WHERE "ItemId" = ?1"#).bind(guid_to_db(fallback)).execute(db.writer()).await.unwrap();
+        sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#).bind(guid_to_db(channel)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+        let rows = ordered_rows(&repo, &[fallback, channel]).await;
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        is_favorite: Some(true),
+                        user: Some(user),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [fallback, channel]
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_key_selection_uses_real_source_facts_and_cannot_borrow_another_users_rows() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let other_id = Uuid::new_v4();
+        let other = crate::test_support::seed_named_user(&db, other_id, "other").await;
+        crate::test_support::grant_default_permissions(&db, other_id).await;
+        let mut cases = Vec::new();
+        for (label, kind, channel_id, serialized_source, wants_external) in [
+            (
+                "real_channel_child",
+                BaseItemKind::Folder,
+                Some(Uuid::new_v4()),
+                0,
+                true,
+            ),
+            ("channel_kind", BaseItemKind::Channel, None, 0, true),
+            ("stale_channel_token", BaseItemKind::Folder, None, 1, false),
+            (
+                "empty_channel_guid",
+                BaseItemKind::Folder,
+                Some(Uuid::nil()),
+                1,
+                false,
+            ),
+            (
+                "live_tv_channel",
+                BaseItemKind::LiveTvChannel,
+                Some(Uuid::new_v4()),
+                1,
+                false,
+            ),
+            (
+                "live_tv_program",
+                BaseItemKind::LiveTvProgram,
+                Some(Uuid::new_v4()),
+                1,
+                false,
+            ),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, label).await;
+            let mut entity = crate::test_support::fetch_item(&db, id).await;
+            entity.is_folder = matches!(kind, BaseItemKind::Folder | BaseItemKind::Channel);
+            entity.channel_id = channel_id.map(guid_to_db);
+            entity.external_id = Some("shared-channel-key".to_owned());
+            entity.data = Some(serde_json::json!({"SourceType":serialized_source}).to_string());
+            crate::test_support::save_item(&db, &entity).await;
+            // Canonical attached own-ID and external rows disagree. Neither
+            // another item with this external key nor another user can supply
+            // this item's favorite value.
+            for selected_user in [user_id, other_id] {
+                seed_user_data(&db, selected_user, id, false, None).await;
+                sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = ?3, "IsFavorite" = 0 WHERE "ItemId" = ?1 AND "UserId" = ?2"#)
+                    .bind(guid_to_db(id)).bind(guid_to_db(selected_user)).bind(id.to_string())
+                    .execute(db.writer()).await.unwrap();
+                sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'shared-channel-key',?3,0,0,0)"#)
+                    .bind(guid_to_db(id)).bind(guid_to_db(selected_user)).bind(selected_user == user_id)
+                    .execute(db.writer()).await.unwrap();
+            }
+            cases.push((id, wants_external));
+        }
+        let ordered: Vec<_> = cases.iter().map(|(id, _)| *id).collect();
+        let rows = ordered_rows(&repo, &ordered).await;
+        let selected = repo
+            .filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    user: Some(user),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&selected),
+            cases
+                .iter()
+                .filter_map(|(id, external)| external.then_some(*id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows,
+                &InternalItemsQuery {
+                    user: Some(other),
+                    is_favorite: Some(true),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "attached rows are scoped to both item and user before key precedence"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_played_uses_own_state_while_empty_folder_is_played_and_resume_can_be_played() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let leaf = Uuid::new_v4();
+        let empty = Uuid::new_v4();
+        seed_named_item(&db, leaf, BaseItemKind::Movie, "leaf").await;
+        seed_folder_item(&db, empty, BaseItemKind::Folder, "empty", None).await;
+        seed_user_data(&db, user_id, leaf, false, None).await;
+        let rows = ordered_rows(&repo, &[leaf, empty]).await;
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        is_played: Some(true),
+                        user: Some(user.clone()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [empty]
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        is_played: Some(false),
+                        user: Some(user.clone()),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [leaf]
+        );
+        sqlx::query(r#"UPDATE "UserData" SET "Played" = 1, "PlaybackPositionTicks" = 1 WHERE "ItemId" = ?1"#).bind(guid_to_db(leaf)).execute(db.writer()).await.unwrap();
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        is_resumable: Some(true),
+                        user: Some(user),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [leaf]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_provider_values_do_not_count_as_ids_and_chapter_images_use_index_zero() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let empty = Uuid::new_v4();
+        let present = Uuid::new_v4();
+        for id in [empty, present] {
+            seed_folder_item(&db, id, BaseItemKind::Folder, "folder", None).await;
+        }
+        seed_provider_id(&db, empty, "Imdb", "").await;
+        seed_provider_id(&db, present, "iMdB", "tt1").await;
+        for (id, index, path) in [
+            (empty, 0, ""),
+            (empty, 1, "later.jpg"),
+            (present, 0, "first.jpg"),
+        ] {
+            sqlx::query(r#"INSERT INTO "Chapters" ("ItemId","ChapterIndex","ImagePath","StartPositionTicks") VALUES (?1,?2,?3,0)"#).bind(guid_to_db(id)).bind(index).bind(path).execute(db.writer()).await.unwrap();
+        }
+        let rows = ordered_rows(&repo, &[empty, present]).await;
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        has_imdb_id: Some(true),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [present]
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        has_imdb_id: Some(false),
+                        has_tmdb_id: Some(false),
+                        has_tvdb_id: Some(false),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [empty]
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        image_types: vec![ImageType::Chapter],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [present]
+        );
+    }
+
+    // One ordered fixture compares the source whitelist and nullable-field defaults.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn typed_filter_preserves_supplied_order_and_ignores_unlisted_request_filters() {
+        let db = test_db().await;
+        let repo = repository(&db);
+        let later = Uuid::new_v4();
+        let earlier = Uuid::new_v4();
+        seed_folder_item(&db, later, BaseItemKind::Folder, "Zulu", None).await;
+        seed_folder_item(&db, earlier, BaseItemKind::Folder, "Alpha", None).await;
+        let rows = ordered_rows(&repo, &[later, earlier]).await;
+        let query = InternalItemsQuery {
+            name_contains: Some("missing".to_owned()),
+            search_term: Some("missing".to_owned()),
+            limit: Some(1),
+            start_index: Some(100),
+            parent_index_number: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(rows.clone(), &query)
+                .await
+                .unwrap()),
+            [later, earlier]
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        official_ratings: vec![String::new()],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [later, earlier]
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows.clone(),
+                    &InternalItemsQuery {
+                        media_types: vec![MediaType::Unknown],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [later, earlier]
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    media_types: vec![MediaType::Video],
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    is_virtual_item: Some(true),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    is_folder: Some(false),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Movie],
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            repo.filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    exclude_item_types: vec![BaseItemKind::Folder],
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        item_ids: vec![earlier],
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()),
+            [earlier]
+        );
+    }
+
+    #[test]
+    fn numeric_date_presence_and_nullable_parent_filters_use_source_defaults() {
+        let date = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = BaseItemEntity {
+            is_locked: true,
+            overview: Some(" ".to_owned()),
+            custom_rating: Some(" ".to_owned()),
+            community_rating: Some(6.5),
+            critic_rating: Some(70.0),
+            index_number: Some(2),
+            production_year: Some(2025),
+            premiere_date: Some(date),
+            official_rating: Some("PG".to_owned()),
+            ..Default::default()
+        };
+        let query = InternalItemsQuery {
+            is_locked: Some(true),
+            has_overview: Some(true),
+            has_parental_rating: Some(true),
+            years: vec![2025],
+            min_community_rating: Some(6.5),
+            min_critic_rating: Some(70.0),
+            min_index_number: Some(2),
+            min_premiere_date: Some(date),
+            max_premiere_date: Some(date),
+            official_ratings: vec!["PG".to_owned()],
+            parent_index_number: Some(99),
+            ..Default::default()
+        };
+        assert!(folder_child_matches_fields(&row, &query, None));
+        for absent in [
+            BaseItemEntity {
+                community_rating: None,
+                ..row.clone()
+            },
+            BaseItemEntity {
+                critic_rating: None,
+                ..row.clone()
+            },
+            BaseItemEntity {
+                index_number: None,
+                ..row.clone()
+            },
+            BaseItemEntity {
+                premiere_date: None,
+                ..row.clone()
+            },
+            BaseItemEntity {
+                production_year: None,
+                ..row.clone()
+            },
+            BaseItemEntity {
+                official_rating: Some("pg".to_owned()),
+                ..row.clone()
+            },
+            BaseItemEntity {
+                parent_index_number: Some(1),
+                ..row.clone()
+            },
+            BaseItemEntity {
+                overview: Some(String::new()),
+                ..row.clone()
+            },
+            BaseItemEntity {
+                is_locked: false,
+                ..row.clone()
+            },
+        ] {
+            assert!(!folder_child_matches_fields(&absent, &query, None));
+        }
+        assert!(folder_child_matches_fields(
+            &row,
+            &InternalItemsQuery {
+                min_index_number: Some(0),
+                exclude_item_ids: vec![Uuid::new_v4()],
+                ..Default::default()
+            },
+            None
+        ));
+    }
+    #[tokio::test]
+    async fn shared_sort_keeps_no_order_and_name_ties_without_sql_name_tiebreaks() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let db = test_db().await;
+        let repo = repository(&db);
+        let rows = vec![
+            BaseItemEntity {
+                name: Some("Zulu".to_owned()),
+                sort_name: Some("SAME".to_owned()),
+                ..Default::default()
+            },
+            BaseItemEntity {
+                name: Some("Alpha".to_owned()),
+                sort_name: Some("same".to_owned()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            repo.sort_folder_children(rows.clone(), &InternalItemsQuery::default())
+                .await
+                .unwrap(),
+            rows
+        );
+        assert_eq!(
+            repo.sort_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+            rows
+        );
+        let names = repo
+            .sort_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    order_by: vec![
+                        (ItemSortBy::SortName, SortOrder::Ascending),
+                        (ItemSortBy::Name, SortOrder::Ascending),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(names[0].name.as_deref(), Some("Alpha"));
+        assert_eq!(
+            repo.sort_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::Name, SortOrder::Descending)],
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap(),
+            rows
+        );
+    }
+    #[tokio::test]
+    async fn root_folder_preferences_apply_only_to_collection_folders_not_views_or_plugins() {
+        use crate::aggregate_folder::RootFolderIds;
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let roots = RootFolderIds {
+            user_root: Uuid::new_v4(),
+            aggregate: Uuid::new_v4(),
+        };
+        seed_folder_item(
+            &db,
+            roots.user_root,
+            BaseItemKind::UserRootFolder,
+            "root",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            roots.aggregate,
+            BaseItemKind::AggregateFolder,
+            "physical",
+            None,
+        )
+        .await;
+        let library = Uuid::new_v4();
+        let view = Uuid::new_v4();
+        let plugin = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "library",
+            Some(roots.user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "view",
+            Some(roots.user_root),
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            plugin,
+            BaseItemKind::PlaylistsFolder,
+            "plugin",
+            Some(roots.aggregate),
+        )
+        .await;
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            PreferenceKind::BlockedMediaFolders,
+            &[guid_to_db(view), guid_to_db(plugin)],
+        )
+        .await
+        .unwrap();
+        let repository = repository(&db).with_root_ids(roots);
+        let result = repository
+            .user_root_children(&InternalItemsQuery {
+                user: Some(user),
+                parent_id: roots.user_root,
+                user_root_children: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let seen = ids(&result);
+        for id in [library, view, plugin] {
+            assert!(seen.contains(&id));
+        }
+    }
+}
+
+#[cfg(test)]
+mod folder_forced_sort_tests {
+    use super::*;
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+
+    #[tokio::test]
+    async fn forced_source_key_overrides_stale_stored_key_in_filter_and_name_order() {
+        let db = crate::test_support::test_db().await;
+        let repo = FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let forced = BaseItemEntity {
+            name: Some("Original title".to_owned()),
+            type_: stored_type_name(BaseItemKind::Folder).unwrap().to_owned(),
+            sort_name: Some("aaa retired".to_owned()),
+            forced_sort_name: Some("The Spider-Man: Homecoming".to_owned()),
+            is_folder: true,
+            ..Default::default()
+        };
+        assert_eq!(folder_sort_name(&forced), "spiderman: homecoming");
+        let middle = BaseItemEntity {
+            name: Some("Middle".to_owned()),
+            sort_name: Some("middle".to_owned()),
+            forced_sort_name: None,
+            ..forced.clone()
+        };
+        let rows = vec![forced.clone(), middle];
+        let sorted = repo
+            .sort_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sorted[0].name.as_deref(), Some("Middle"));
+        assert_eq!(sorted[1].name.as_deref(), Some("Original title"));
+        let selected = repo
+            .filter_folder_children(
+                rows.clone(),
+                &InternalItemsQuery {
+                    name_starts_with: Some("SPIDER".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected, [forced]);
+        assert!(
+            repo.filter_folder_children(
+                rows,
+                &InternalItemsQuery {
+                    name_starts_with: Some("aaa".to_owned()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn forced_person_preserves_source_non_alphanumeric_rule_and_empty_override_is_absent() {
+        let person = BaseItemEntity {
+            type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+            name: Some("Display".to_owned()),
+            sort_name: Some("cached".to_owned()),
+            forced_sort_name: Some("  The Spider-Man".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(folder_sort_name(&person), "The Spider-Man");
+        assert_eq!(
+            folder_sort_name(&BaseItemEntity {
+                forced_sort_name: Some(String::new()),
+                ..person
+            }),
+            "cached"
+        );
     }
 }

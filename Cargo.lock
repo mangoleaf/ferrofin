@@ -1228,6 +1228,7 @@ dependencies = [
  "form_urlencoded",
  "futures-core",
  "futures-util",
+ "libc",
  "opentelemetry",
  "opentelemetry_sdk",
  "serde",
@@ -1286,6 +1287,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "futures-util",
+ "icu_collator",
  "image",
  "libc",
  "notify",
@@ -1304,6 +1306,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 

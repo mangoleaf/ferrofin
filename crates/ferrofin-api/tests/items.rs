@@ -2126,3 +2126,355 @@ async fn a_dropped_request_still_finishes_its_delete() {
         assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
     }
 }
+
+/// Plain nullable string query parameters use ASP.NET ConvertEmptyStringToNull.
+/// This is an HTTP boundary, not permission to trim nonblank internal filters.
+#[tokio::test]
+async fn items_http_name_boundaries_bind_blank_to_null_and_preserve_nonblank() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            ("", None),
+            ("%20", None),
+            ("%09%0A%0D", None),
+            ("%C2%A0%E2%80%83", None),
+            ("%20A%20", Some(" A ")),
+            ("%25", Some("%")),
+            ("_", Some("_")),
+        ] {
+            let library = OkLibrary {
+                item_id: Uuid::from_u128(0x5A),
+                adopted_tree: false,
+                last_query: Arc::default(),
+                deleted: Arc::default(),
+                gate: None,
+            };
+            let seen = Arc::clone(&library.last_query);
+            let uri = format!(
+                "{path}?recursive=true&nameStartsWith={encoded}&nameStartsWithOrGreater={encoded}&nameLessThan={encoded}"
+            );
+            let response = create_router(ok_state_with(library))
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header("X-Emby-Token", "valid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let query = seen.lock().unwrap().take().expect("query_items ran");
+            assert_eq!(query.name_starts_with.as_deref(), expected, "{uri}");
+            assert_eq!(
+                query.name_starts_with_or_greater.as_deref(),
+                expected,
+                "{uri}"
+            );
+            assert_eq!(query.name_less_than.as_deref(), expected, "{uri}");
+        }
+    }
+}
+
+async fn capture_items_filter_query(uri: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let captured = seen.lock().unwrap().take();
+    (response.status(), captured)
+}
+
+/// Both controller routes forward every exposed GetResult presence flag,
+/// including nullable boolean binding rather than silently discarding it.
+#[tokio::test]
+async fn items_get_result_presence_flags_reach_both_routes() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            ("true", Some(true)),
+            ("false", Some(false)),
+            ("%20TrUe%20", Some(true)),
+            ("%09FaLsE%0A", Some(false)),
+            ("", None),
+            ("%20", None),
+            ("%C2%A0%E2%80%83", None),
+        ] {
+            let uri = format!(
+                "{path}?recursive=true&hasOverview={encoded}&hasImdbId={encoded}&hasTmdbId={encoded}&hasTvdbId={encoded}&hasParentalRating={encoded}"
+            );
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let query = query.expect("query_items ran");
+            assert_eq!(query.has_overview, expected, "{uri}");
+            assert_eq!(query.has_imdb_id, expected, "{uri}");
+            assert_eq!(query.has_tmdb_id, expected, "{uri}");
+            assert_eq!(query.has_tvdb_id, expected, "{uri}");
+            assert_eq!(query.has_parental_rating, expected, "{uri}");
+        }
+    }
+}
+
+/// Inclusive premiere dates are normalized to UTC without dropping 100ns
+/// precision; empty dates and empty adjacency remain absent on both routes.
+#[tokio::test]
+async fn items_get_result_dates_and_adjacency_reach_both_routes() {
+    let adjacent = Uuid::from_u128(0x5678);
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            (
+                "2026-01-02T03:04:05.0000001%2B02:00",
+                Some("2026-01-02T01:04:05.0000001Z"),
+            ),
+            (
+                "2026-01-02T03:04:05.0000001Z",
+                Some("2026-01-02T03:04:05.0000001Z"),
+            ),
+            ("", None),
+            ("%20", None),
+        ] {
+            let uri = format!(
+                "{path}?recursive=true&minPremiereDate={encoded}&maxPremiereDate={encoded}&adjacentTo={adjacent}"
+            );
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let query = query.expect("query_items ran");
+            let expected =
+                expected.map(|raw| raw.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+            assert_eq!(query.min_premiere_date, expected, "{uri}");
+            assert_eq!(query.max_premiere_date, expected, "{uri}");
+            assert_eq!(query.adjacent_to, Some(adjacent), "{uri}");
+        }
+        for (encoded, expected) in [
+            ("", None),
+            ("%20", None),
+            ("00000000-0000-0000-0000-000000000000", Some(Uuid::nil())),
+        ] {
+            let uri = format!("{path}?recursive=true&adjacentTo={encoded}");
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                query.expect("query_items ran").adjacent_to,
+                expected,
+                "{uri}"
+            );
+        }
+    }
+}
+
+/// Invalid exposed filters fail at binding instead of returning unfiltered data.
+#[tokio::test]
+async fn items_get_result_invalid_filters_fail_before_querying() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for parameter in [
+            "hasOverview=1",
+            "hasImdbId=yes",
+            "hasTmdbId=null",
+            "hasTvdbId=no",
+            "hasParentalRating=maybe",
+            "minPremiereDate=invalid",
+            "maxPremiereDate=2026-02-30",
+            "adjacentTo=not-a-guid",
+        ] {
+            let uri = format!("{path}?recursive=true&{parameter}");
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(query.is_none(), "{uri} must fail before querying");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct ItemsDateOracleRow {
+    timezone: String,
+    raw: String,
+    utc: Option<String>,
+}
+
+#[cfg(unix)]
+fn items_date_oracle_rows() -> Vec<ItemsDateOracleRow> {
+    if let Ok(path) = std::env::var("FERROFIN_ITEMS_DATE_ORACLE") {
+        return serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    }
+    // Actual BCL10 oracle results, with stable named-zone transition dates.
+    // A root-only validation may supply the full measured160+row JSON using
+    // FERROFIN_ITEMS_DATE_ORACLE; neither path mutates the test process TZ.
+    let cases = [
+        ("UTC", "2026-01-02", "2026-01-02T00:00:00Z"),
+        ("UTC", "1969-12-31T23:59:59", "1969-12-31T23:59:59Z"),
+        (
+            "America/New_York",
+            "2026-01-02T03:04:05.0000001",
+            "2026-01-02T08:04:05.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "2026-07-02T03:04:05.0000001",
+            "2026-07-02T07:04:05.0000001Z",
+        ),
+        ("America/New_York", "2026-01-02", "2026-01-02T05:00:00Z"),
+        (
+            "America/New_York",
+            "2026-03-08T02:30:00.0000001",
+            "2026-03-08T07:30:00.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "2026-11-01T01:30:00.0000001",
+            "2026-11-01T06:30:00.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "0001-01-01T00:00:00",
+            "0001-01-01T04:57:00Z",
+        ),
+        (
+            "America/New_York",
+            "9999-12-31T23:59:59.9999999",
+            "9999-12-31T23:59:59.9999999Z",
+        ),
+        (
+            "Europe/Dublin",
+            "2026-03-29T01:30:00.0000001",
+            "2026-03-29T00:30:00.0000001Z",
+        ),
+        (
+            "Europe/Dublin",
+            "2026-10-25T01:30:00.0000001",
+            "2026-10-25T00:30:00.0000001Z",
+        ),
+        (
+            "Europe/Dublin",
+            "0001-01-01T00:00:00",
+            "0001-01-01T00:25:00Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "2026-04-05T01:45:00.0000001",
+            "2026-04-04T15:15:00.0000001Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "2026-10-04T02:15:00.0000001",
+            "2026-10-03T15:45:00.0000001Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "0001-01-01T00:00:00",
+            "0001-01-01T00:00:00Z",
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(zone, raw, utc)| ItemsDateOracleRow {
+            timezone: zone.to_owned(),
+            raw: raw.to_owned(),
+            utc: Some(utc.to_owned()),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+async fn capture_items_date_socket_query(uri: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let seen = Arc::clone(&library.last_query);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = create_router(ok_state_with(library));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket.write_all(format!("GET {uri} HTTP/1.1\r\nHost: {address}\r\nX-Emby-Token: valid\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.read_to_end(&mut bytes),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    read.expect("owned HTTP server responds").unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    let code = response
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let captured = seen.lock().unwrap().take();
+    (StatusCode::from_u16(code).unwrap(), captured)
+}
+
+/// The actual modern and legacy Items routes bind local dates in owned child
+/// processes so concurrent tests never change their environment or timezone.
+#[cfg(unix)]
+#[tokio::test]
+async fn items_get_result_local_dates_match_dotnet_child_process() {
+    let rows = items_date_oracle_rows();
+    let Ok(zone) = std::env::var("FERROFIN_ITEMS_DATE_TEST_ZONE") else {
+        let zones = rows
+            .iter()
+            .map(|row| &row.timezone)
+            .collect::<std::collections::BTreeSet<_>>();
+        for zone in zones {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "items_get_result_local_dates_match_dotnet_child_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("TZ", zone)
+                .env("FERROFIN_ITEMS_DATE_TEST_ZONE", zone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{zone}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    for row in rows.iter().filter(|row| row.timezone == zone) {
+        let encoded = form_urlencoded::byte_serialize(row.raw.as_bytes()).collect::<String>();
+        for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+            let uri = format!(
+                "{path}?recursive=true&minPremiereDate={encoded}&maxPremiereDate={encoded}"
+            );
+            let (status, query) = capture_items_date_socket_query(&uri).await;
+            if let Some(expected) = row.utc.as_deref() {
+                assert_eq!(status, StatusCode::OK, "{zone}: {uri}");
+                let query = query.expect("query_items ran");
+                let expected = Some(expected.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+                assert_eq!(query.min_premiere_date, expected, "min {zone}: {uri}");
+                assert_eq!(query.max_premiere_date, expected, "max {zone}: {uri}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{zone}: {uri}");
+                assert!(query.is_none(), "{zone}: {uri} must fail before querying");
+            }
+        }
+    }
+}

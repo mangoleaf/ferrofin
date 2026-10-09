@@ -611,6 +611,31 @@ pub fn rewrite_view_preference(value: &str, stale: &[Uuid], canonical: Uuid) -> 
     touched.then(|| rewritten.join(","))
 }
 
+/// Seeds the adopted token path and historical save date for the warm-view test.
+#[cfg(test)]
+pub(crate) async fn seed_adopted_folder_view(db: &Database, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await?;
+    Ok(())
+}
+
+/// Seeds an explicit stored sort key for named-view comparer regressions.
+#[cfg(test)]
+pub(crate) async fn seed_view_sort_name(
+    db: &Database,
+    id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(name)
+        .execute(db.writer())
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

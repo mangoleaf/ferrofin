@@ -32,8 +32,10 @@ use ferrofin_model::live_tv::ItemSortBy;
 use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{UserManager, UserViewManager, VirtualFolderManager};
+use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery,
 };
@@ -104,10 +106,37 @@ const LIVE_TV_VIEW_NAME: &str = "Live TV";
 /// (C# `PlaylistsFolder.Name`).
 pub(crate) const PLAYLISTS_FOLDER_NAME: &str = "Playlists";
 
+/// The type-wide folders view is a derived root browser, never a library.
+pub(crate) fn is_folders_view_row(row: &BaseItemEntity) -> bool {
+    is_folders_view_fields(&row.type_, row.path.as_deref(), row.data.as_deref())
+}
+
+pub(crate) fn is_folders_view_fields(
+    type_name: &str,
+    path: Option<&str>,
+    blob: Option<&str>,
+) -> bool {
+    if Some(type_name) != item_type_lookup::stored_type_name(BaseItemKind::UserView) {
+        return false;
+    }
+    let data = crate::item_data::parse_data(blob);
+    match data.get("ViewType") {
+        Some(value) => {
+            value.as_i64() == Some(12)
+                || value
+                    .as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("folders"))
+        }
+        None => path.is_some_and(|path| path.replace('\\', "/").ends_with("/views/folders")),
+    }
+}
+
 /// The concrete user-view manager.
 #[derive(Clone)]
 pub struct FerrofinUserViewManager {
     items: Arc<dyn ItemRepository>,
+    configuration: Option<Arc<dyn ServerConfigurationManager>>,
+    localization: Option<Arc<dyn LocalizationManager>>,
     /// The item store, set by the composition root. It provisions the Live TV
     /// `UserView` row, and — together with a
     /// [`playlists_path`](Self::playlists_path) — [`get_media_folders`] uses it
@@ -176,6 +205,8 @@ impl FerrofinUserViewManager {
     pub fn new(items: Arc<dyn ItemRepository>) -> Self {
         Self {
             items,
+            configuration: None,
+            localization: None,
             persistence: None,
             user_root: None,
             playlists_path: None,
@@ -187,6 +218,126 @@ impl FerrofinUserViewManager {
             visibility: None,
             metadata_path: None,
         }
+    }
+
+    /// Wires the live dashboard display settings and server UI localization.
+    #[must_use]
+    pub fn with_dashboard_configuration(
+        mut self,
+        configuration: Arc<dyn ServerConfigurationManager>,
+        localization: Arc<dyn LocalizationManager>,
+    ) -> Self {
+        self.configuration = Some(configuration);
+        self.localization = Some(localization);
+        self
+    }
+
+    /// `GetNamedView(name, folders, "")`: localization changes the display name
+    /// while the type/path-derived id stays stable. Disabled views remain stored
+    /// so the user's hidden-view preferences survive a later re-enable.
+    async fn folders_view(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let (Some(configuration), Some(persistence), Some(metadata_path)) =
+            (&self.configuration, &self.persistence, &self.metadata_path)
+        else {
+            return Ok(None);
+        };
+        if !configuration.configuration().await?.enable_folder_view {
+            return Ok(None);
+        }
+        // Source root Children includes plugin folders even when MediaFolders
+        // has never been requested. Settle that same root on the first Folders
+        // view read; the existing stores keep warm reads idempotent.
+        if let Some(root) = &self.user_root {
+            root.ensure().await?;
+        }
+        self.ensure_playlists_folder().await?;
+        let metadata_path = metadata_path.resolve();
+        let view_path = crate::user_view_repository::named_view_path(&metadata_path, "folders");
+        let Some(id) = crate::user_view_repository::named_view_id(
+            &self.id_derivation,
+            &metadata_path,
+            "folders",
+        ) else {
+            return Ok(None);
+        };
+        let name = self.localization.as_ref().map_or_else(
+            || "Folders".to_owned(),
+            |localization| localization.get_localized_string("Folders"),
+        );
+        let mut previous = self.items.retrieve_item(id).await?;
+        if let Some(row) = &mut previous
+            && let Some(path) = &row.path
+        {
+            // BaseItemRepository.Map expands virtual paths upstream. This row
+            // seam otherwise returns adopted token paths verbatim; compare the
+            // resolved path so a warm adopted view does not get saved every read.
+            let path = crate::virtual_paths::replace_ignore_ascii_case(
+                path,
+                "%MetadataPath%",
+                &metadata_path.to_string_lossy(),
+            );
+            let path = crate::virtual_paths::replace_ignore_ascii_case(
+                &path,
+                "%AppDataPath%",
+                &configuration.application_paths().data_path(),
+            );
+            row.path = Some(path.replace('\\', "/"));
+        }
+        let same_path = previous.as_ref().is_some_and(|row| {
+            is_folders_view_row(row)
+                && row.path.as_deref().is_some_and(|path| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                        path,
+                        &view_path.to_string_lossy(),
+                    )
+                })
+        });
+        if same_path
+            && previous
+                .as_ref()
+                .is_some_and(|row| row.name.as_deref() == Some(name.as_str()))
+        {
+            return Ok(previous);
+        }
+        tokio::fs::create_dir_all(&view_path)
+            .await
+            .map_err(|error| {
+                ServiceError::backend(format!("create folders view directory: {error}"))
+            })?;
+        let mut row = if same_path {
+            previous.unwrap_or_default()
+        } else {
+            BaseItemEntity::default()
+        };
+        if !same_path {
+            let metadata = tokio::fs::metadata(&view_path).await.map_err(|error| {
+                ServiceError::backend(format!("read folders view directory dates: {error}"))
+            })?;
+            row.date_created = metadata
+                .created()
+                .or_else(|_| metadata.modified())
+                .ok()
+                .map(chrono::DateTime::<Utc>::from);
+            row.date_modified = metadata.modified().ok().map(chrono::DateTime::<Utc>::from);
+        }
+        row.id = ferrofin_db::store::guid_to_db(id);
+        item_type_lookup::stored_type_name(BaseItemKind::UserView)
+            .unwrap_or_default()
+            .clone_into(&mut row.type_);
+        row.name = Some(name.clone());
+        row.sort_name = Some(create_sort_name(&name));
+        row.forced_sort_name = Some(String::new());
+        row.path = Some(view_path.to_string_lossy().into_owned());
+        row.parent_id = None;
+        row.is_folder = true;
+        row.date_created = row.date_created.or_else(|| Some(Utc::now()));
+        let mut data = crate::item_data::parse_data(row.data.as_deref());
+        data.insert("ViewType".to_owned(), serde_json::json!("folders"));
+        row.data = Some(serde_json::Value::Object(data).to_string());
+        persistence.save_items(std::slice::from_ref(&row)).await?;
+        // SaveItems stamps the stored row; expose that fresh timestamp/Etag on
+        // the same response that creates or renames the localized view.
+        Ok(self.items.retrieve_item(id).await?.or(Some(row)))
     }
 
     /// Attaches `{InternalMetadataPath}` so the Live TV `UserView` row can be
@@ -764,7 +915,11 @@ impl UserViewManager for FerrofinUserViewManager {
             ..Default::default()
         };
         let views = self.items.get_item_list(&query).await?;
-        let views = self.only_canonical_user_views(user_id, views);
+        let views: Vec<_> = self
+            .only_canonical_user_views(user_id, views)
+            .into_iter()
+            .filter(|row| !is_folders_view_row(row))
+            .collect();
         let views = if let (Some(visibility), Some(users)) = (&self.visibility, &self.users) {
             let user = users
                 .get_user_by_id(user_id)
@@ -782,7 +937,16 @@ impl UserViewManager for FerrofinUserViewManager {
         let views = self
             .without_childless_linked_libraries(user_id, views)
             .await?;
-        let views = self.without_disabled_live_tv(user_id, views).await?;
+        let mut views = self.without_disabled_live_tv(user_id, views).await?;
+        if let Some(view) = self.folders_view().await? {
+            views.push(view);
+            views.sort_by(|a, b| {
+                crate::item_repository::folder_ordinal_compare(
+                    Some(&crate::item_repository::folder_sort_name(a)),
+                    Some(&crate::item_repository::folder_sort_name(b)),
+                )
+            });
+        }
         if include_hidden {
             Ok(views)
         } else {
@@ -2952,6 +3116,348 @@ mod tests {
         assert_eq!(
             mgr.user_named_view_id(user, folder, "playlists"),
             Some(Uuid::parse_str("45D83C7B-5EDC-AF5C-B7E4-6C1612C07B6A").expect("view"))
+        );
+    }
+
+    struct DashboardConfiguration(
+        std::sync::Mutex<ferrofin_model::configuration::ServerConfiguration>,
+        tempfile::TempDir,
+    );
+
+    impl Default for DashboardConfiguration {
+        fn default() -> Self {
+            Self(
+                std::sync::Mutex::new(ferrofin_model::configuration::ServerConfiguration::default()),
+                tempfile::tempdir().expect("dashboard application paths"),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ServerConfigurationManager for DashboardConfiguration {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            crate::app_paths::test_paths(self.1.path())
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.0.lock().unwrap().clone()))
+        }
+        async fn update_configuration(
+            &self,
+            value: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().unwrap() = value.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    // One live sequence verifies identity across toggle, localization and hidden preferences.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn folder_view_toggle_localization_and_hidden_preferences_are_live_and_keep_the_id() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(DashboardConfiguration::default());
+        config.0.lock().unwrap().enable_folder_view = false;
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().unwrap().ui_culture.clone()
+            }),
+        );
+        let manager = manager(&db)
+            .with_playlists_store(
+                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+                tmp.path().join("playlists"),
+            )
+            .with_metadata_path(tmp.path().join("metadata"))
+            .with_database(db.clone())
+            .with_dashboard_configuration(config.clone(), localization);
+        let stale = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            stale,
+            BaseItemKind::UserView,
+            "Stale folders",
+            r#"{"ViewType":"folders"}"#,
+        )
+        .await;
+        assert!(
+            !manager
+                .get_user_views_with_hidden(user, true)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row),
+            "disabled hides persisted/adopted folder views too"
+        );
+        config.0.lock().unwrap().enable_folder_view = true;
+        let views = manager.get_user_views(user).await.unwrap();
+        let folders: Vec<_> = views
+            .iter()
+            .filter(|row| is_folders_view_row(row))
+            .collect();
+        assert_eq!(
+            folders.len(),
+            1,
+            "only the canonical named folders view is appended"
+        );
+        let id = Uuid::parse_str(&folders[0].id).unwrap();
+        assert_ne!(id, stale);
+        assert_eq!(folders[0].name.as_deref(), Some("Folders"));
+        assert!(tmp.path().join("metadata/views/folders").is_dir());
+        let stored = manager.items.retrieve_item(id).await.unwrap().unwrap();
+        manager.get_user_views(user).await.unwrap();
+        assert_eq!(
+            manager
+                .items
+                .retrieve_item(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .date_last_saved,
+            stored.date_last_saved,
+            "warm reads do not rewrite the view"
+        );
+        config.0.lock().unwrap().ui_culture = "fr".to_owned();
+        let localized = manager
+            .get_user_views(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(is_folders_view_row)
+            .unwrap();
+        assert_eq!(Uuid::parse_str(&localized.id).unwrap(), id);
+        assert_eq!(localized.name.as_deref(), Some("Dossiers"));
+        assert_eq!(localized.sort_name.as_deref(), Some("dossiers"));
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(id)],
+        )
+        .await
+        .unwrap();
+        assert!(
+            !manager
+                .get_user_views(user)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row)
+        );
+        assert!(
+            manager
+                .get_user_views_with_hidden(user, true)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row)
+        );
+        config.0.lock().unwrap().enable_folder_view = false;
+        assert!(
+            !manager
+                .get_user_views_with_hidden(user, true)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row)
+        );
+        assert!(
+            manager.items.retrieve_item(id).await.unwrap().is_some(),
+            "disabled does not discard the stored identity/preferences"
+        );
+        config.0.lock().unwrap().enable_folder_view = true;
+        assert!(
+            !manager
+                .get_user_views(user)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row),
+            "hidden preference survives disable/re-enable"
+        );
+        assert_eq!(
+            manager
+                .get_user_views_with_hidden(user, true)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(is_folders_view_row)
+                .unwrap()
+                .id,
+            guid_to_db(id)
+        );
+    }
+    #[test]
+    fn folders_view_accepts_adopted_numeric_type_but_not_explicit_null_or_other_type() {
+        let user_view = item_type_lookup::stored_type_name(BaseItemKind::UserView).unwrap();
+        let path = Some("%MetadataPath%\\views\\folders");
+        assert!(is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":12}"#)
+        ));
+        assert!(is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":"FOLDERS"}"#)
+        ));
+        assert!(is_folders_view_fields(user_view, path, None));
+        assert!(!is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":null}"#)
+        ));
+        assert!(!is_folders_view_fields(
+            user_view,
+            path,
+            Some(r#"{"ViewType":1}"#)
+        ));
+        assert!(!is_folders_view_fields(
+            item_type_lookup::stored_type_name(BaseItemKind::Folder).unwrap(),
+            path,
+            Some(r#"{"ViewType":12}"#)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adopted_numeric_folder_view_keeps_metadata_relative_id_and_warm_timestamp() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata = tmp.path().join("metadata");
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let id = crate::user_view_repository::named_view_id(&mode, &metadata, "folders").unwrap();
+        let moved_mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/relocated/programdata".to_owned()),
+        };
+        assert_eq!(
+            crate::user_view_repository::named_view_id(
+                &moved_mode,
+                std::path::Path::new("/relocated/programdata/metadata"),
+                "folders"
+            ),
+            Some(id)
+        );
+        seed_item_with_data(
+            &db,
+            id,
+            BaseItemKind::UserView,
+            "Folders",
+            r#"{"ViewType":12}"#,
+        )
+        .await;
+        crate::user_view_repository::seed_adopted_folder_view(&db, id)
+            .await
+            .unwrap();
+        let config = Arc::new(DashboardConfiguration::default());
+        config.0.lock().unwrap().enable_folder_view = true;
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().unwrap().ui_culture.clone()
+            }),
+        );
+        let manager = manager(&db)
+            .with_playlists_store(
+                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+                tmp.path().join("playlists"),
+            )
+            .with_metadata_path(metadata.clone())
+            .with_id_derivation(mode)
+            .with_dashboard_configuration(config.clone(), localization);
+        let before = manager.items.retrieve_item(id).await.unwrap().unwrap();
+        for _ in 0..2 {
+            let views = manager.get_user_views(user).await.unwrap();
+            let folder = views
+                .iter()
+                .filter(|view| is_folders_view_row(view))
+                .collect::<Vec<_>>();
+            assert_eq!(folder.len(), 1);
+            assert_eq!(folder[0].id, guid_to_db(id));
+            assert_eq!(
+                folder[0].path.as_deref(),
+                Some(metadata.join("views/folders").to_string_lossy().as_ref())
+            );
+        }
+        let after = manager.items.retrieve_item(id).await.unwrap().unwrap();
+        assert_eq!(after.date_last_saved, before.date_last_saved);
+        assert_eq!(
+            after.path.as_deref(),
+            Some("%MetadataPath%\\views\\folders"),
+            "warm token expansion is read-only"
+        );
+        config.0.lock().unwrap().ui_culture = "fr".to_owned();
+        let renamed = manager
+            .get_user_views(user)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(is_folders_view_row)
+            .unwrap();
+        assert_eq!(renamed.id, guid_to_db(id));
+        assert_eq!(renamed.name.as_deref(), Some("Dossiers"));
+        assert_ne!(renamed.date_last_saved, before.date_last_saved);
+        config.0.lock().unwrap().enable_folder_view = false;
+        assert!(
+            !manager
+                .get_user_views(user)
+                .await
+                .unwrap()
+                .iter()
+                .any(is_folders_view_row)
+        );
+        assert!(manager.items.retrieve_item(id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn appended_folder_view_uses_pinned_ordinal_ignore_case_home_order() {
+        let db = test_db().await;
+        let user = Uuid::new_v4();
+        seed_user(&db, user).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(DashboardConfiguration::default());
+        config.0.lock().unwrap().enable_folder_view = true;
+        let localization = Arc::new(crate::LocalizationManager::new("US"));
+        let zulu = Uuid::new_v4();
+        seed_item_with_data(&db, zulu, BaseItemKind::CollectionFolder, "Zulu", "{}").await;
+        crate::user_view_repository::seed_view_sort_name(&db, zulu, "ZULU")
+            .await
+            .unwrap();
+        let manager = manager(&db)
+            .with_playlists_store(
+                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+                tmp.path().join("playlists"),
+            )
+            .with_metadata_path(tmp.path().join("metadata"))
+            .with_dashboard_configuration(config, localization);
+        let views = manager.get_user_views(user).await.unwrap();
+        let folders = views.iter().position(is_folders_view_row).unwrap();
+        let zulu = views
+            .iter()
+            .position(|view| Uuid::parse_str(&view.id).ok() == Some(zulu))
+            .unwrap();
+        assert!(
+            folders < zulu,
+            "source SortNameComparer folds case before comparing"
         );
     }
 }

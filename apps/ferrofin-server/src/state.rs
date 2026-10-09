@@ -1005,6 +1005,7 @@ pub async fn build_app_state(
     // manager is built after it.
     let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
+            .with_dashboard_configuration(Arc::clone(&config_trait), Arc::clone(&localization))
             .with_visibility(Arc::clone(&item_visibility))
             .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
             // The provisioned row's parent is the `AggregateFolder`, the way

@@ -22,6 +22,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -303,6 +304,21 @@ struct ItemsQuery {
     /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
     #[serde(default)]
     is_locked: Option<bool>,
+    /// Restrict to items with (or without) an overview.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_overview: Option<bool>,
+    /// Restrict to items with (or without) an IMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_imdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tmdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TVDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tvdb_id: Option<bool>,
+    /// Restrict to items with (or without) a custom or official parental rating.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_parental_rating: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -334,6 +350,24 @@ struct ItemsQuery {
     /// Minimum critic rating.
     #[serde(default)]
     min_critic_rating: Option<f64>,
+    /// Inclusive lower premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    min_premiere_date: Option<DateTime<Utc>>,
+    /// Inclusive upper premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    max_premiere_date: Option<DateTime<Utc>>,
+    /// Return this item and its immediate neighbours after sorting, before paging.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    adjacent_to: Option<Uuid>,
     /// Restrict to items whose name starts with this value.
     #[serde(default)]
     name_starts_with: Option<String>,
@@ -390,6 +424,36 @@ impl ItemsQuery {
     }
 }
 
+/// ASP.NET's string binder converts empty/whitespace query strings to null.
+/// Keep nonblank values byte-for-byte: leading/trailing spaces are part of the
+/// requested name boundary, not text to trim. Internal typed queries bypass
+/// this HTTP binding and retain their own source filter semantics.
+fn http_name_boundary(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// ASP.NET nullable booleans accept case-insensitive, trimmed true/false and
+/// bind empty or whitespace-only values to null; malformed values fail with 400.
+fn http_presence_filter<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if raw.trim().eq_ignore_ascii_case("true") {
+        Ok(Some(true))
+    } else if raw.trim().eq_ignore_ascii_case("false") {
+        Ok(Some(false))
+    } else {
+        Err(serde::de::Error::custom(format!("invalid boolean {raw:?}")))
+    }
+}
+
 /// `GET /Items` — a paged, filtered, user-scoped library query.
 ///
 /// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
@@ -423,6 +487,7 @@ async fn get_items(
     // and a second full copy of every string on it buys nothing.
     let mut internal = InternalItemsQuery {
         user: Some(user),
+        parent_id: query.parent_id.unwrap_or_default(),
         start_index: query.start_index,
         limit: query.limit,
         recursive: query.recursive.unwrap_or(false),
@@ -454,6 +519,11 @@ async fn get_items(
         is_hd: query.is_hd,
         is_3d: query.is_3d,
         is_locked: query.is_locked,
+        has_overview: query.has_overview,
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        has_parental_rating: query.has_parental_rating,
         video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
         has_subtitles: query.has_subtitles,
         has_trailer: query.has_trailer,
@@ -464,16 +534,18 @@ async fn get_items(
         parent_index_number: query.parent_index_number,
         min_community_rating: query.min_community_rating,
         min_critic_rating: query.min_critic_rating,
-        name_starts_with: query.name_starts_with.clone(),
-        name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
-        name_less_than: query.name_less_than.clone(),
+        min_premiere_date: query.min_premiere_date,
+        max_premiere_date: query.max_premiere_date,
+        adjacent_to: query.adjacent_to,
+        name_starts_with: http_name_boundary(query.name_starts_with.as_deref()),
+        name_starts_with_or_greater: http_name_boundary(
+            query.name_starts_with_or_greater.as_deref(),
+        ),
+        name_less_than: http_name_boundary(query.name_less_than.as_deref()),
         person: query.person.clone(),
         enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
         ..InternalItemsQuery::default()
     };
-    if let Some(parent) = query.parent_id {
-        internal.parent_id = parent;
-    }
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -1534,18 +1606,12 @@ mod tests {
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
     const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
-        "adjacentTo",
         "albums",
         "artists",
         // 12.1.0 only.
         "audioLanguages",
         "collapseBoxSetItems",
-        "hasImdbId",
         "hasOfficialRating",
-        "hasOverview",
-        "hasParentalRating",
-        "hasTmdbId",
-        "hasTvdbId",
         "isKids",
         "isMissing",
         "isNews",
@@ -1554,13 +1620,11 @@ mod tests {
         "isUnaired",
         "maxHeight",
         "maxOfficialRating",
-        "maxPremiereDate",
         "maxWidth",
         "minDateLastSaved",
         "minDateLastSavedForUser",
         "minHeight",
         "minOfficialRating",
-        "minPremiereDate",
         "minWidth",
         "personTypes",
         "seriesStatus",
