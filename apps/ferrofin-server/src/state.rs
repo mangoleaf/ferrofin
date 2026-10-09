@@ -1174,6 +1174,10 @@ pub async fn build_app_state(
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().metadata_options.clone()
     })
+    .with_dummy_chapter_duration({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().dummy_chapter_duration
+    })
     .with_metadata_locale({
         let config_mgr = Arc::clone(&config_mgr);
         move || {

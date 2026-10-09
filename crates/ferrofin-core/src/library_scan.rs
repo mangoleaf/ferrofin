@@ -2777,6 +2777,7 @@ pub struct LibraryScanner {
     /// Live library counts, shared with dashboard readers.
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
+    dummy_chapter_duration: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
     chapter_image_extractor:
         std::sync::OnceLock<Arc<crate::chapter_image_extractor::ChapterImageExtractor>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -3078,6 +3079,7 @@ impl LibraryScanner {
             trickplay: None,
             subtitle_downloader: std::sync::OnceLock::new(),
             chapter_image_extractor: std::sync::OnceLock::new(),
+            dummy_chapter_duration: None,
         }
     }
 
@@ -3110,6 +3112,17 @@ impl LibraryScanner {
         downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) {
         let _ = self.subtitle_downloader.set(downloader);
+    }
+
+    /// Reads the saved automatic chapter interval before each successful video
+    /// refresh. Nonpositive values disable generation, matching the dashboard.
+    #[must_use]
+    pub fn with_dummy_chapter_duration(
+        mut self,
+        read: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        self.dummy_chapter_duration = Some(Arc::new(read));
+        self
     }
 
     /// Connects scan-time trickplay and reads Blocking/NonBlocking timing live.
@@ -5961,6 +5974,56 @@ impl LibraryScanner {
         Ok(())
     }
 
+    /// Chapter generation uses the same pure generator as the media-info
+    /// provider parity tests, rather than duplicating its count/runtime rules.
+    fn video_chapters(
+        &self,
+        video: &BaseItemEntity,
+        probe: &ProbeRows,
+    ) -> Result<Vec<ferrofin_model::entities_media::ChapterInfo>, ServiceError> {
+        let mut chapters = probe
+            .chapters
+            .iter()
+            .map(|chapter| ferrofin_model::entities_media::ChapterInfo {
+                start_position_ticks: chapter.start_position_ticks,
+                name: chapter.name.clone(),
+                image_path: chapter.image_path.clone(),
+                image_date_modified: chapter.image_date_modified.unwrap_or_default(),
+                image_tag: None,
+            })
+            .collect::<Vec<_>>();
+        let duration = self
+            .dummy_chapter_duration
+            .as_ref()
+            .map_or(0, |read| read());
+        let video_stream = probe.streams.iter().any(|stream| {
+            stream.stream_type
+                == crate::db_error::media_stream_type_to_disc(
+                    ferrofin_model::entities::MediaStreamType::Video,
+                )
+        });
+        if duration > 0 && chapters.len() <= 1 && video_stream {
+            let encoder = self.media_encoder.as_ref().ok_or_else(|| {
+                ServiceError::backend("a successful video probe requires its media encoder")
+            })?;
+            chapters =
+                ferrofin_providers::mediainfo::FFProbeVideoInfo::new(encoder.as_ref(), duration)
+                    .create_dummy_chapters(&ferrofin_providers::mediainfo::VideoProbeInput {
+                        name: video.name.clone(),
+                        run_time_ticks: video.run_time_ticks,
+                        ..Default::default()
+                    })?;
+            let template = self.localization.as_ref().map_or_else(
+                || "Chapter {0}".to_owned(),
+                |localization| localization.get_localized_string("ChapterNameValue"),
+            );
+            for (index, chapter) in chapters.iter_mut().enumerate() {
+                chapter.name = Some(template.replace("{0}", &(index + 1).to_string()));
+            }
+        }
+        Ok(chapters)
+    }
+
     /// The batches every item in the walk reads from, gathered once up front.
     ///
     /// Each of these replaced a per-item query, so they are the difference
@@ -7374,7 +7437,14 @@ impl LibraryScanner {
             entity.data =
                 crate::item_data::set_data_field(entity.data.as_deref(), "Container", container);
         }
-        entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
+        // A successful video probe replaces its duration even when ffprobe
+        // cannot determine one (FFProbeVideoInfo.RunTimeTicks assignment).
+        // Retaining the previous duration would generate stale dummy chapters.
+        entity.run_time_ticks = if media_is_audio {
+            source.run_time_ticks.or(entity.run_time_ticks)
+        } else {
+            source.run_time_ticks
+        };
         // A file's stat'ed length outranks the probe's: `SaveInternal` stamps
         // `Size = file.Length` after every provider ran. Only a directory
         // (a disc rip, which has no length of its own) keeps the probe's.
@@ -11707,17 +11777,17 @@ impl LibraryScanner {
         };
         let id = Uuid::parse_str(&video.id)
             .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
-        let mut chapters = probe
-            .chapters
-            .iter()
-            .map(|chapter| ferrofin_model::entities_media::ChapterInfo {
-                start_position_ticks: chapter.start_position_ticks,
-                name: chapter.name.clone(),
-                image_path: chapter.image_path.clone(),
-                image_date_modified: chapter.image_date_modified.unwrap_or_default(),
-                image_tag: None,
-            })
-            .collect::<Vec<_>>();
+        let mut chapters = match self.video_chapters(video, probe) {
+            Ok(chapters) => chapters,
+            Err(error) => {
+                // ProbeProvider is a pre-refresh custom provider. Jellyfin
+                // catches its ordinary error without incrementing Failures:
+                // updated probe fields/streams survive, old chapters remain,
+                // and other successful providers may complete the refresh.
+                tracing::error!(%error, item_id = %video.id, "cannot generate dummy chapters");
+                return Ok(());
+            }
+        };
         if let Some(extractor) = self.chapter_image_extractor.get() {
             let during_scan =
                 options.is_some_and(|options| options.extract_chapter_images_during_library_scan);
@@ -14329,6 +14399,26 @@ fn merge_onto_stored(
     row
 }
 
+/// Restores direct probe properties after the provider metadata merge. A
+/// completed video probe owns its nullable stream index regardless of the
+/// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
+/// must not restore an index from the previous probe.
+fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
+    let data = crate::item_data::parse_data(scanned.data.as_deref());
+    if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
+        row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
+    }
+    if scanned.media_type.as_deref() == Some("Video")
+        && let Some(index) = data.get("DefaultVideoStreamIndex").cloned()
+        && let Some(data) = crate::item_data::merge_data_fields(
+            row.data.as_deref(),
+            &[("DefaultVideoStreamIndex", Some(index))],
+        )
+    {
+        row.data = Some(data);
+    }
+}
+
 /// Lays what this scan read off the filesystem over the saved row: the
 /// planner's structure (`UpdateFromResolvedItem`, and the parent links a
 /// move changes) and the stat, plus what a probe that ran measured.
@@ -14351,13 +14441,8 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     {
         row.data = Some(data);
     }
-    if probe_ran
-        && let Some(container) = crate::item_data::read_data_string(
-            &crate::item_data::parse_data(scanned.data.as_deref()),
-            "Container",
-        )
-    {
-        row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
+    if probe_ran {
+        overlay_probe_data(row, scanned);
     }
     row.id.clone_from(&scanned.id);
     row.type_.clone_from(&scanned.type_);
@@ -14398,7 +14483,11 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
             *value = measured;
         }
     }
-    if probe_ran && scanned.run_time_ticks.is_some() {
+    if probe_ran
+        && (scanned.run_time_ticks.is_some() || scanned.media_type.as_deref() == Some("Video"))
+    {
+        // RunTimeTicks is a direct probe-owned property, including a newly
+        // unknown video duration; provider metadata merging must not refill it.
         row.run_time_ticks = scanned.run_time_ticks;
     }
 }
@@ -31249,6 +31338,537 @@ mod chapter_image_refresh_tests {
             crate::item_data::parse_data(video.data.as_deref())["DefaultVideoStreamIndex"]
                 .is_null()
         );
+    }
+    #[test]
+    fn completed_video_probe_index_survives_both_metadata_merge_choices() {
+        let mut video = MediaInfo::default();
+        video
+            .media_source
+            .media_streams
+            .push(ferrofin_model::entities_media::MediaStream {
+                index: 7,
+                stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                ..Default::default()
+            });
+        let empty = MediaInfo::default();
+        for replace in [false, true] {
+            for locked in [false, true] {
+                for (probed, audio, expected) in [
+                    (Some(&video), false, Some(7)),
+                    (Some(&empty), false, None),
+                    (None, false, Some(2)),
+                    (Some(&empty), true, Some(2)),
+                ] {
+                    let stored = BaseItemEntity {
+                        media_type: Some(if audio { "Audio" } else { "Video" }.to_owned()),
+                        data: Some(r#"{"DefaultVideoStreamIndex":2,"Retained":true}"#.to_owned()),
+                        ..Default::default()
+                    };
+                    let mut scanned = stored.clone();
+                    LibraryScanner::apply_probe(
+                        &mut scanned,
+                        probed,
+                        audio,
+                        FetcherPolicy::default(),
+                    );
+                    let saved = merge_onto_stored(
+                        &stored,
+                        &scanned,
+                        SaveFacts {
+                            locked,
+                            probe_ran: probed.is_some(),
+                            locked_fields: &[],
+                            merge: MergeMode {
+                                replace,
+                                ..MergeMode::DEFAULT
+                            },
+                            before_refresh: false,
+                            replace_all: replace,
+                            remote_answered: false,
+                            redated: None,
+                        },
+                        None,
+                    );
+                    let data = crate::item_data::parse_data(saved.data.as_deref());
+                    assert_eq!(
+                        data["DefaultVideoStreamIndex"],
+                        serde_json::json!(expected),
+                        "replace={replace}, locked={locked}, audio={audio}, probe={}",
+                        probed.is_some()
+                    );
+                    assert_eq!(data["Retained"], true);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn saved_dummy_chapter_interval_is_read_live_and_generates_localized_rows() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (mut scanner, repo) = scanner(&fixture);
+        scanner.media_encoder = Some(fixture.encoder.clone());
+        scanner.localization = Some(Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source(|| "fr".to_owned()),
+        ));
+        let duration = Arc::new(AtomicI32::new(0));
+        let read = Arc::clone(&duration);
+        scanner = scanner.with_dummy_chapter_duration(move || read.load(Ordering::Relaxed));
+        let mut probe = video_probe(&[]);
+        probe.streams = vec![ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+            stream_index: 2,
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            ..Default::default()
+        }];
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        duration.store(12, Ordering::Relaxed);
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let generated = repo.get_chapters(id).await.unwrap();
+        assert_eq!(
+            generated
+                .iter()
+                .map(|chapter| chapter.start_position_ticks)
+                .collect::<Vec<_>>(),
+            [0, 120_000_000, 240_000_000, 360_000_000, 480_000_000]
+        );
+        assert_eq!(generated[0].name.as_deref(), Some("Chapitre 1"));
+        assert_eq!(generated[4].name.as_deref(), Some("Chapitre 5"));
+        duration.store(30, Ordering::Relaxed);
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repo.get_chapters(id).await.unwrap().len(), 2);
+        duration.store(90, Ordering::Relaxed);
+        probe.chapters = video_probe(&[50_000_000]).chapters;
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let single = repo.get_chapters(id).await.unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            single[0].start_position_ticks, 0,
+            "one existing marker is replaced when generation is enabled"
+        );
+        for disabled in [0, -1] {
+            duration.store(disabled, Ordering::Relaxed);
+            scanner
+                .persist_video_chapters(
+                    &fixture.video,
+                    &probe,
+                    MetadataRefreshMode::Default,
+                    Some(&fixture.options),
+                    &ScanCancel::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.get_chapters(id).await.unwrap()[0].start_position_ticks,
+                50_000_000
+            );
+        }
+        duration.store(1, Ordering::Relaxed);
+        probe.chapters = video_probe(&[50_000_000, 150_000_000]).chapters;
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::Default,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let original = repo.get_chapters(id).await.unwrap();
+        assert_eq!(
+            original
+                .iter()
+                .map(|chapter| chapter.start_position_ticks)
+                .collect::<Vec<_>>(),
+            [50_000_000, 150_000_000]
+        );
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &video_probe(&[]),
+                MetadataRefreshMode::ValidationOnly,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repo.get_chapters(id).await.unwrap(), original);
+        assert!(
+            fixture.encoder.calls.lock().unwrap().is_empty(),
+            "the chapter interval does not enable image extraction during scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn dummy_generation_requires_video_streams_and_rejects_corrupt_runtimes() {
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (mut scanner, _) = scanner(&fixture);
+        scanner.media_encoder = Some(fixture.encoder.clone());
+        scanner = scanner.with_dummy_chapter_duration(|| 600);
+        let mut probe = video_probe(&[50_000_000]);
+        assert_eq!(
+            scanner.video_chapters(&fixture.video, &probe).unwrap()[0].start_position_ticks,
+            50_000_000,
+            "no video stream means no replacement"
+        );
+        probe.streams = vec![ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            ..Default::default()
+        }];
+        for runtime in [Some(-1), Some(12 * 3600 * 10_000_000 + 1)] {
+            fixture.video.run_time_ticks = runtime;
+            assert!(
+                scanner
+                    .video_chapters(&fixture.video, &probe)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid runtime")
+            );
+        }
+        for runtime in [None, Some(0)] {
+            fixture.video.run_time_ticks = runtime;
+            assert!(
+                scanner
+                    .video_chapters(&fixture.video, &probe)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        fixture.video.run_time_ticks = Some(12 * 3600 * 10_000_000);
+        assert_eq!(
+            scanner
+                .video_chapters(&fixture.video, &probe)
+                .unwrap()
+                .len(),
+            72
+        );
+    }
+    struct InvalidDummyRuntimeProbe(std::sync::atomic::AtomicI64);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::media_encoding::MediaEncoder for InvalidDummyRuntimeProbe {
+        fn encoder_path(&self) -> String {
+            "ffmpeg".to_owned()
+        }
+        fn probe_path(&self) -> String {
+            "ffprobe".to_owned()
+        }
+        async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn get_media_info(
+            &self,
+            _: &ferrofin_traits::media_encoding::MediaInfoRequest,
+        ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+            Ok(ferrofin_model::dto::MediaSourceInfo {
+                container: Some("mkv".to_owned()),
+                run_time_ticks: match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                    i64::MIN => None,
+                    runtime => Some(runtime),
+                },
+                media_streams: vec![ferrofin_model::entities_media::MediaStream {
+                    index: 7,
+                    stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                    codec: Some("h264".to_owned()),
+                    width: Some(720),
+                    height: Some(480),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+        async fn extract_audio_image(
+            &self,
+            _: &str,
+            _: Option<i32>,
+        ) -> Result<String, ServiceError> {
+            unreachable!("video probe")
+        }
+        async fn extract_video_image(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ferrofin_model::dto::MediaSourceInfo,
+            _: &ferrofin_model::entities_media::MediaStream,
+            _: Option<ferrofin_model::entities::Video3DFormat>,
+            _: Option<i64>,
+        ) -> Result<String, ServiceError> {
+            unreachable!("invalid generation must not start an image extraction")
+        }
+        fn get_input_argument(
+            &self,
+            input: &str,
+            _: &ferrofin_model::dto::MediaSourceInfo,
+        ) -> String {
+            input.to_owned()
+        }
+        fn get_time_parameter(&self, ticks: i64) -> String {
+            ticks.to_string()
+        }
+        async fn convert_image(&self, _: &str, _: &str) -> Result<(), ServiceError> {
+            unreachable!("video probe")
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Real scan, repositories and provider-error outcome.
+    async fn rejected_dummy_runtime_preserves_chapters_and_completes_probe_metadata_refresh() {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::{ItemRepository as _, MediaStreamRepository as _};
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        fixture
+            .folders
+            .update_library_options("Videos", &fixture.options)
+            .await
+            .unwrap();
+        let (mut scanner, chapters) = scanner(&fixture);
+        let item_repository = Arc::new(crate::FerrofinItemRepository::new(
+            fixture.db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        ));
+        let encoder = Arc::new(InvalidDummyRuntimeProbe(std::sync::atomic::AtomicI64::new(
+            -1,
+        )));
+        scanner = scanner
+            .with_items(item_repository.clone())
+            .with_probe(encoder.clone(), fixture.streams.clone(), chapters.clone())
+            .with_dummy_chapter_duration(|| 600);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let image = fixture.target(0);
+        std::fs::create_dir_all(Path::new(&image).parent().unwrap()).unwrap();
+        std::fs::write(&image, b"old image").unwrap();
+        let mut old = video_probe(&[0, 200_000_000]).chapters;
+        old[0].image_path = Some(image.clone());
+        chapters.save_chapters(id, &old).await.unwrap();
+        let expected = chapters.get_chapters(id).await.unwrap();
+        for runtime in [-1, 12 * 3600 * 10_000_000 + 1] {
+            let mut stored = crate::test_support::fetch_item(&fixture.db, id).await;
+            let previous = DateTime::from_timestamp(946_684_800, 0).unwrap();
+            stored.date_last_refreshed = Some(previous);
+            crate::test_support::save_item(&fixture.db, &stored).await;
+            encoder
+                .0
+                .store(runtime, std::sync::atomic::Ordering::Relaxed);
+            scanner
+                .scan_paths_with(
+                    &[fixture.video.path.clone().unwrap()],
+                    &MetadataRefreshOptions {
+                        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+                        replace_all_metadata: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let saved = item_repository.retrieve_item(id).await.unwrap().unwrap();
+            assert_eq!(
+                saved.run_time_ticks,
+                Some(runtime),
+                "successful probe fields survive {runtime}"
+            );
+            assert_eq!(saved.width, Some(720));
+            assert!(
+                saved
+                    .date_last_refreshed
+                    .is_some_and(|date| date > previous),
+                "ordinary custom-provider errors do not increment source Failures"
+            );
+            assert_eq!(
+                crate::item_data::parse_data(saved.data.as_deref())["DefaultVideoStreamIndex"],
+                7
+            );
+            let streams = fixture
+                .streams
+                .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
+                    item_id: id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(streams.len(), 1);
+            assert_eq!(
+                streams[0].stream_index, 7,
+                "fresh streams saved before chapter generation"
+            );
+            assert_eq!(chapters.get_chapters(id).await.unwrap(), expected);
+            assert_eq!(std::fs::read(&image).unwrap(), b"old image");
+            assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn durationless_video_probe_clears_old_runtime_before_dummy_chapters() {
+        let stored = BaseItemEntity {
+            media_type: Some("Video".to_owned()),
+            run_time_ticks: Some(600_000_000),
+            ..Default::default()
+        };
+        let mut video = stored.clone();
+        LibraryScanner::apply_probe(&mut video, None, false, FetcherPolicy::default());
+        assert_eq!(
+            video.run_time_ticks, stored.run_time_ticks,
+            "failed/omitted probes keep duration"
+        );
+        LibraryScanner::apply_probe(
+            &mut video,
+            Some(&MediaInfo::default()),
+            false,
+            FetcherPolicy::default(),
+        );
+        assert_eq!(
+            video.run_time_ticks, None,
+            "a successful video probe supplies unknown duration"
+        );
+        let mut audio = stored;
+        audio.media_type = Some("Audio".to_owned());
+        LibraryScanner::apply_probe(
+            &mut audio,
+            Some(&MediaInfo::default()),
+            true,
+            FetcherPolicy::default(),
+        );
+        assert_eq!(
+            audio.run_time_ticks,
+            Some(600_000_000),
+            "audio merge behavior is outside this video correction"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Real reprobe and stored merge under both metadata replacement choices.
+    async fn durationless_reprobe_does_not_generate_dummy_chapters_from_stale_runtime() {
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::{ItemRepository as _, MediaStreamRepository as _};
+        let mut fixture = Fixture::new(RecordingEncoder::default()).await;
+        fixture.options.extract_chapter_images_during_library_scan = true;
+        fixture
+            .folders
+            .update_library_options("Videos", &fixture.options)
+            .await
+            .unwrap();
+        let (mut scanner, chapters) = scanner(&fixture);
+        let items = Arc::new(crate::FerrofinItemRepository::new(
+            fixture.db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        ));
+        let encoder = Arc::new(InvalidDummyRuntimeProbe(std::sync::atomic::AtomicI64::new(
+            i64::MIN,
+        )));
+        scanner = scanner
+            .with_items(items.clone())
+            .with_probe(encoder, fixture.streams.clone(), chapters.clone())
+            .with_dummy_chapter_duration(|| 10);
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        let old_image = fixture.target(0);
+        std::fs::create_dir_all(Path::new(&old_image).parent().unwrap()).unwrap();
+        std::fs::write(&old_image, b"previous completed frame").unwrap();
+        for replace_all_metadata in [false, true] {
+            let mut stored = crate::test_support::fetch_item(&fixture.db, id).await;
+            let previous = DateTime::from_timestamp(946_684_800, 0).unwrap();
+            stored.run_time_ticks = Some(600_000_000);
+            stored.date_last_refreshed = Some(previous);
+            if let Some(data) = crate::item_data::merge_data_fields(
+                stored.data.as_deref(),
+                &[("DefaultVideoStreamIndex", Some(serde_json::json!(2)))],
+            ) {
+                stored.data = Some(data);
+            }
+            crate::test_support::save_item(&fixture.db, &stored).await;
+            let mut old_chapters = video_probe(&[0, 200_000_000]).chapters;
+            old_chapters[0].image_path = Some(old_image.clone());
+            chapters.save_chapters(id, &old_chapters).await.unwrap();
+            scanner
+                .scan_paths_with(
+                    &[fixture.video.path.clone().unwrap()],
+                    &MetadataRefreshOptions {
+                        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+                        replace_all_metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let saved = items.retrieve_item(id).await.unwrap().unwrap();
+            assert_eq!(
+                saved.run_time_ticks, None,
+                "fresh unknown duration must survive the stored merge"
+            );
+            assert!(
+                saved
+                    .date_last_refreshed
+                    .is_some_and(|date| date > previous)
+            );
+            assert_eq!(saved.width, Some(720));
+            assert_eq!(
+                crate::item_data::parse_data(saved.data.as_deref())["DefaultVideoStreamIndex"],
+                7
+            );
+            let streams = fixture
+                .streams
+                .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
+                    item_id: id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(streams.len(), 1);
+            assert_eq!(streams[0].stream_index, 7);
+            assert!(
+                chapters.get_chapters(id).await.unwrap().is_empty(),
+                "runtime null generates no chapters, rather than using stale60seconds"
+            );
+            assert_eq!(
+                std::fs::read(&old_image).unwrap(),
+                b"previous completed frame",
+                "source empty-chapter reconciliation does not prune files"
+            );
+            assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+        }
     }
 }
 

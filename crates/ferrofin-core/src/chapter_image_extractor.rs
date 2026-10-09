@@ -568,7 +568,13 @@ pub(crate) mod tests {
                 .clone();
             let path = media.join("film.mkv");
             std::fs::write(&path, b"video").unwrap();
-            let id = Uuid::from_u128(0xC28);
+            // A path refresh must update this seeded Movie, using the default
+            // scanner's kind/path identity rather than creating another row.
+            let id = crate::item_type_lookup::derive_item_id(
+                ferrofin_model::data::BaseItemKind::Movie,
+                &path.to_string_lossy(),
+            )
+            .unwrap();
             let video = BaseItemEntity {
                 id: ferrofin_db::store::guid_to_db(id),
                 type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
