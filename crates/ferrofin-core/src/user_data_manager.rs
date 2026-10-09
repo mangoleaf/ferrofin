@@ -88,12 +88,15 @@ impl FerrofinUserDataManager {
         let Some(listener) = self.save_listener.get().and_then(Weak::upgrade) else {
             return;
         };
-        let mut notification = Box::pin(async move {
-            if let Err(error) = listener.user_data_saved(user_id, item_id, reason).await {
-                // Source NfoUserDataSaver catches export errors after commit.
-                tracing::warn!(%user_id, %item_id, %error, "user-data NFO saver failed");
-            }
-        });
+        let mut notification = Box::pin(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            async move {
+                if let Err(error) = listener.user_data_saved(user_id, item_id, reason).await {
+                    // Source NfoUserDataSaver catches export errors after commit.
+                    tracing::warn!(%user_id, %item_id, %error, "user-data NFO saver failed");
+                }
+            },
+        ));
         // The pinned event handler is async void: it starts inline, then the
         // user-data caller returns at its first incomplete await. Own the
         // remainder in the runtime so slow NFO I/O does not delay HTTP writes.
@@ -3170,5 +3173,82 @@ mod tests {
         })
         .await
         .expect("finite cycle-safe SQL and parent walks cannot hang user-data reads or writes");
+    }
+
+    struct CultureNfoObserver {
+        captured: std::sync::Mutex<Vec<String>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl UserDataSaveListener for CultureNfoObserver {
+        async fn user_data_saved(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: UserDataSaveReason,
+        ) -> Result<(), ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.notify_one();
+            self.release.notified().await;
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_nfo_notification_inherits_request_culture_after_the_first_yield() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(0xF007);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let manager = FerrofinUserDataManager::new(db, config());
+        let observer = Arc::new(CultureNfoObserver {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        let listener: Arc<dyn UserDataSaveListener> = observer.clone();
+        manager
+            .set_save_listener(Arc::downgrade(&listener))
+            .unwrap();
+        let previous = ferrofin_util::current_culture::capture();
+        ferrofin_util::current_culture::scope(
+            "sv".into(),
+            manager.save_user_data_with_reason(
+                user,
+                item,
+                &favorite_dto(),
+                UserDataSaveReason::UpdateUserRating,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.started.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ferrofin_util::current_culture::capture(), previous);
+        observer.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            observer.finished.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*observer.captured.lock().unwrap(), ["sv", "sv"]);
     }
 }

@@ -870,7 +870,8 @@ impl ScanWorker {
         };
         let request = request.clone();
         let cancel = cancel.clone();
-        tokio::spawn(
+        tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
             async move {
                 let report = move |percent: f64| lock_queue(&queue).report(percent);
                 runner
@@ -884,7 +885,7 @@ impl ScanWorker {
                     .await
             }
             .instrument(span.clone()),
-        )
+        ))
     }
 
     /// Waits for one scan's task and logs how it ended, inside `span` (only
@@ -2650,7 +2651,12 @@ impl FerrofinLibraryManager {
             progress: Arc::clone(&self.scan_progress),
         };
         let span = tracing::info_span!(parent: None, "library_scan", trigger = trigger.as_str());
-        let task = tokio::spawn(worker.drain().instrument(span));
+        // Source Task.Run captures the culture of the caller that starts the
+        // draining worker; subsequent enqueued requests share that worker.
+        let task = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            worker.drain().instrument(span),
+        ));
         #[cfg(test)]
         {
             lock_queue(&self.scan_queue).worker_task = Some(task.abort_handle());
@@ -5319,6 +5325,92 @@ mod tests {
             .await
             .expect_err("missing");
         assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    struct CultureScanRunner {
+        captured: Mutex<Vec<String>>,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl ScanRunner for CultureScanRunner {
+        async fn run(
+            &self,
+            _: &ScanTarget,
+            _: ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_and_child_scans_inherit_the_starting_callers_culture() {
+        let db = test_db().await;
+        let runner = Arc::new(CultureScanRunner {
+            captured: Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        ferrofin_util::current_culture::scope("sv".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        ferrofin_util::current_culture::scope("de-DE".into(), async {
+            mgr.submit(
+                ScanRequest::folder_refresh(
+                    ScanTarget::Library(Uuid::from_u128(0xC0)),
+                    replace_all(),
+                ),
+                false,
+                None,
+            );
+        })
+        .await;
+        until_queued(&mgr, 1, 0).await;
+        runner.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            *runner.captured.lock().unwrap(),
+            ["sv", "sv", "sv", "sv"],
+            "one source Task.Run drains all queued requests under its starting culture"
+        );
+        ferrofin_util::current_culture::scope("en-US".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            &runner.captured.lock().unwrap()[4..],
+            ["en-US", "en-US"],
+            "a new worker captures a new caller"
+        );
     }
     #[derive(Default)]
     struct CollapsingConfiguration(

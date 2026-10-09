@@ -5,6 +5,7 @@
 //! upstream xUnit tests are ported verbatim as the oracle).
 
 pub mod copy_to_extensions;
+pub mod current_culture;
 pub mod dictionary_extensions;
 pub mod directory_path;
 pub mod enumerable_extensions;

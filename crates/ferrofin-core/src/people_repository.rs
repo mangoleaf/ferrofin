@@ -993,6 +993,22 @@ impl PeopleRepository for FerrofinPeopleRepository {
         Ok(out)
     }
 
+    async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        // GetPerson derives the configured current identity and reads that
+        // exact row. The write-side legacy-row preservation is deliberately
+        // not a fallback to another identity or a generic matching name.
+        Ok(names
+            .iter()
+            .map(|name| {
+                self.person_item_id(name)
+                    .and_then(|id| Uuid::parse_str(&id).ok())
+            })
+            .collect())
+    }
+
     async fn update_people(
         &self,
         item_id: Uuid,
@@ -1274,6 +1290,110 @@ mod tests {
     use ferrofin_traits::options::InternalPeopleQuery;
     use ferrofin_traits::persistence::{PeopleRepository, PersonMetadata};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn nfo_actor_image_ids_follow_configured_path_instead_of_credit_ids() {
+        use crate::item_type_lookup::IdDerivation;
+        use crate::test_support::item_repository_over;
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0x9910);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let temporary = tempfile::tempdir().unwrap();
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(temporary.path().to_string_lossy().into_owned()),
+        };
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            mode,
+            temporary
+                .path()
+                .join("metadata/People")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let names = ["NFO Actor".to_owned(), "  Éva:III...  ".to_owned()];
+        repo.update_people(
+            movie,
+            &[person(&names[0], "Actor"), person(&names[1], "GuestStar")],
+        )
+        .await
+        .unwrap();
+        let resolved = repo.get_person_item_ids(&names).await.unwrap();
+        // Literal source path/type keys after the configured program-data rewrite,
+        // not the write implementation's per-(name,type) credit UUIDs.
+        let expected = [
+            ferrofin_common::extensions::get_md5(
+                "MediaBrowser.Controller.Entities.Personmetadata\\people\\n\\nfo actor",
+            ),
+            ferrofin_common::extensions::get_md5(
+                "MediaBrowser.Controller.Entities.Personmetadata\\people\\é\\éva iii",
+            ),
+        ];
+        assert_eq!(resolved, expected.map(Some));
+        let credits = repo
+            .get_people_batch(&[movie])
+            .await
+            .unwrap()
+            .remove(&movie)
+            .unwrap();
+        assert_eq!(credits.len(), 2);
+        for (credit, id) in credits.iter().zip(expected) {
+            assert_ne!(Uuid::parse_str(&credit.id).unwrap(), id);
+            let row = item_repository_over(db.clone())
+                .retrieve_item(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.type_, PERSON_TYPE_NAME);
+        }
+        let duplicate = [names[1].clone(), names[0].clone(), names[1].clone()];
+        assert_eq!(
+            repo.get_person_item_ids(&duplicate).await.unwrap(),
+            vec![Some(expected[1]), Some(expected[0]), Some(expected[1])]
+        );
+    }
+
+    #[tokio::test]
+    async fn nfo_actor_image_ids_do_not_adopt_matching_or_previous_rows() {
+        use crate::item_type_lookup::{
+            IdDerivation, person_item_id, person_path, previous_by_name_item_id,
+        };
+        use crate::test_support::{item_repository_over, seed_named_item};
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/config".into()),
+        };
+        let root = "/config/metadata/People";
+        let name = "İpek Actor";
+        let current = person_item_id(&mode, root, name).unwrap();
+        let previous =
+            previous_by_name_item_id(&mode, BaseItemKind::Person, &person_path(root, name))
+                .unwrap();
+        assert_ne!(current, previous);
+        seed_named_item(&db, previous, BaseItemKind::Person, name).await;
+        let matching = Uuid::from_u128(0x9920);
+        seed_named_item(&db, matching, BaseItemKind::Person, name).await;
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(mode, root.into());
+        assert_eq!(
+            repo.get_person_item_ids(&[name.to_owned()]).await.unwrap(),
+            vec![Some(current)]
+        );
+        let items = item_repository_over(db.clone());
+        assert!(items.retrieve_item(current).await.unwrap().is_none());
+        // A name match or retained older identity does not manufacture the
+        // current configured row; an actual wrong-kind row remains wrong-kind.
+        seed_named_item(&db, current, BaseItemKind::Movie, name).await;
+        let actual = items.retrieve_item(current).await.unwrap().unwrap();
+        assert_ne!(actual.type_, PERSON_TYPE_NAME);
+        assert_eq!(repo.get_person_item_ids(&[]).await.unwrap(), Vec::new());
+        let unwired = FerrofinPeopleRepository::new(db);
+        assert_eq!(
+            unwired
+                .get_person_item_ids(&[name.to_owned()])
+                .await
+                .unwrap(),
+            vec![None]
+        );
+    }
 
     fn person(name: &str, person_type: &str) -> PeopleEntity {
         PeopleEntity {

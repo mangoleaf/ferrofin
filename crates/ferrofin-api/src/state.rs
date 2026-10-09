@@ -257,15 +257,48 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
+    request_culture: Arc<crate::request_culture::RequestCultureOptions>,
 }
 
 impl AppState {
     /// Wraps an already-assembled [`Inner`] set of managers.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if the built-in English request culture cannot be parsed.
     pub fn from_inner(inner: Inner) -> Self {
+        let request_culture = crate::request_culture::RequestCultureOptions::new(
+            "en-US",
+            inner.localization.get_supported_ui_cultures(),
+        )
+        .expect("built-in request culture is valid");
         Self {
             inner: Arc::new(inner),
+            request_culture: Arc::new(request_culture),
         }
+    }
+
+    /// Snapshots Startup's request-localization culture and supported UI list.
+    /// Later UICulture saves only affect UI localization, as in the source.
+    ///
+    /// # Errors
+    /// Returns an error if the startup culture is invalid.
+    pub fn with_request_culture(
+        mut self,
+        culture: &str,
+    ) -> Result<Self, ferrofin_traits::error::ServiceError> {
+        self.request_culture = Arc::new(
+            crate::request_culture::RequestCultureOptions::new(
+                culture,
+                self.inner.localization.get_supported_ui_cultures(),
+            )
+            .map_err(|error| ferrofin_traits::error::ServiceError::backend(error.to_string()))?,
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn request_culture(&self) -> Arc<crate::request_culture::RequestCultureOptions> {
+        Arc::clone(&self.request_culture)
     }
 
     /// Builds an [`AppState`] from each manager trait object.

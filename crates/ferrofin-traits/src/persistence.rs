@@ -1778,6 +1778,19 @@ pub trait PeopleRepository: Send + Sync {
         Ok(map)
     }
 
+    /// Derives each name's configured by-name Person item id, in input order.
+    ///
+    /// This is the read-only identity half of Jellyfin's GetPerson: it uses
+    /// Person.GetPath and the configured item-id mode, never a credit-row id
+    /// or a generic matching-name row. Callers must verify the derived item
+    /// exists and is a Person. An unwired identity yields missing slots.
+    async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
+    }
+
     /// Replaces an item's people with the given set, materializing a browsable
     /// `Person` item per credit.
     ///

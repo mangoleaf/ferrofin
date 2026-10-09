@@ -29,6 +29,16 @@ pub trait LocalizationManager: Send + Sync {
     /// The list of localization (UI-language) options (C# `GetLocalizationOptions`).
     fn get_localization_options(&self) -> Vec<LocalizationOption>;
 
+    /// Embedded UI resource culture names used by Startup request localization.
+    /// Production derives these from the shipped resources; the default keeps
+    /// lightweight manager substitutes compatible with their offered options.
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        self.get_localization_options()
+            .into_iter()
+            .map(|option| option.value.replace('_', "-"))
+            .collect()
+    }
+
     /// A phrase localized in the server UI culture, falling back to `en-US`
     /// and then to the phrase itself (C# `GetLocalizedString(phrase)`).
     fn get_localized_string(&self, phrase: &str) -> String;

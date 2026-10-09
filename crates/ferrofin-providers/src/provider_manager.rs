@@ -2704,6 +2704,64 @@ impl LocalProviderManager {
         })
     }
 
+    fn remove_replaced_backdrop_file(
+        &self,
+        item_id: Uuid,
+        current: &[ItemImageInfo],
+        slot: usize,
+        image: &ItemImageInfo,
+    ) {
+        if image.image_type != ImageType::Backdrop {
+            return;
+        }
+        let Some(previous) = current
+            .iter()
+            .filter(|old| old.image_type == ImageType::Backdrop)
+            .nth(slot)
+        else {
+            return;
+        };
+        let Some(root) = &self.metadata_dir else {
+            return;
+        };
+        let old = std::path::Path::new(&previous.path);
+        if ferrofin_util::string_extensions::equals_ordinal_ignore_case(&previous.path, &image.path)
+            || !old.starts_with(root.join(ferrofin_db::store::guid_to_db(item_id)))
+            || old
+                .components()
+                .any(|part| part.as_os_str() == SHARED_ALBUM_ARTWORK_DIR)
+            || current
+                .iter()
+                .filter(|entry| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                        &entry.path,
+                        &previous.path,
+                    )
+                })
+                .count()
+                > 1
+        {
+            return;
+        }
+        let Some(parent) = old.parent().and_then(|parent| parent.canonicalize().ok()) else {
+            return;
+        };
+        let Ok(owned_root) = root
+            .join(ferrofin_db::store::guid_to_db(item_id))
+            .canonicalize()
+        else {
+            return;
+        };
+        if !parent.starts_with(owned_root) {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(old)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, path=%old.display(), "could not remove replaced internal backdrop");
+        }
+    }
+
     /// The error for an image operation on a manager built without the
     /// item-image store / TMDB client it needs (unit tests, hosts that never
     /// wired them) — a configuration error naming the op.
@@ -3805,6 +3863,36 @@ fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
     }
 }
 
+/// The image slot and its filename suffix are independent: the source's
+/// GetBackdropSaveFilename avoids every currently referenced backdrop stem.
+fn image_upload_file_index(
+    kind: ImageType,
+    slot: usize,
+    current: &[ItemImageInfo],
+) -> Result<Option<i32>, ServiceError> {
+    if kind != ImageType::Backdrop || slot == 0 {
+        return Ok(matches!(kind, ImageType::Backdrop | ImageType::Screenshot)
+            .then(|| i32::try_from(slot).unwrap_or(i32::MAX)));
+    }
+    (1..=i32::MAX)
+        .find(|index| {
+            let stem = image_file_stem(kind, Some(*index));
+            !current.iter().any(|image| {
+                image.image_type == ImageType::Backdrop
+                    && std::path::Path::new(&image.path)
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                                name, &stem,
+                            )
+                        })
+            })
+        })
+        .map(Some)
+        .ok_or_else(|| ServiceError::backend("no unused backdrop filename suffix"))
+}
+
 #[async_trait]
 impl ProviderManager for LocalProviderManager {
     async fn queue_refresh(
@@ -3820,11 +3908,14 @@ impl ProviderManager for LocalProviderManager {
         // refreshes land.
         let mgr = self.clone();
         let options = options.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(err) = mgr.refresh_full_item(item_id, &options).await {
-                tracing::warn!(%item_id, %err, "queued metadata refresh failed");
-            }
-        });
+        let handle = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            async move {
+                if let Err(err) = mgr.refresh_full_item(item_id, &options).await {
+                    tracing::warn!(%item_id, %err, "queued metadata refresh failed");
+                }
+            },
+        ));
         drop(handle);
         Ok(())
     }
@@ -3913,7 +4004,7 @@ impl ProviderManager for LocalProviderManager {
         } else {
             0
         };
-        let write_index = multiple.then(|| i32::try_from(index).unwrap_or(i32::MAX));
+        let write_index = image_upload_file_index(image_type, index, &current)?;
         let mut image =
             self.write_image_file(item_id, content, mime_type, image_type, write_index)?;
         if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
@@ -3928,6 +4019,7 @@ impl ProviderManager for LocalProviderManager {
         } else {
             store.set_item_image(item_id, &image).await?;
         }
+        self.remove_replaced_backdrop_file(item_id, &current, index, &image);
         self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
             .await
     }
@@ -6272,6 +6364,8 @@ mod tests {
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
     struct RecordingStore {
+        record_culture: bool,
+        culture_reads: std::sync::Mutex<Vec<String>>,
         images: std::sync::Mutex<Vec<(Uuid, ItemImageInfo)>>,
         stored_ids: std::sync::Mutex<HashMap<Uuid, Vec<(String, String)>>>,
         replaced: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
@@ -6395,6 +6489,17 @@ mod tests {
             &self,
             item_ids: &[Uuid],
         ) -> Result<HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+            if self.record_culture {
+                self.culture_reads
+                    .lock()
+                    .unwrap()
+                    .push(ferrofin_util::current_culture::capture());
+                tokio::task::yield_now().await;
+                self.culture_reads
+                    .lock()
+                    .unwrap()
+                    .push(ferrofin_util::current_culture::capture());
+            }
             let stored = self.stored_ids.lock().expect("lock");
             Ok(item_ids
                 .iter()
@@ -8089,6 +8194,246 @@ mod tests {
             "a refused download writes no artwork"
         );
     }
+    #[rstest::rstest]
+    #[case::first(ImageType::Backdrop, 0, &[], Some(0))]
+    #[case::count_collision(ImageType::Backdrop, 1, &["backdrop1.png"], Some(2))]
+    #[case::gap(ImageType::Backdrop, 2, &["backdrop.png", "backdrop2.png"], Some(1))]
+    #[case::case_and_extension(ImageType::Backdrop, 2, &["BACKDROP1.JPG", "backdrop2.webp"], Some(3))]
+    #[case::other_stems(ImageType::Backdrop, 2, &["fanart.png", "not-backdrop1.png"], Some(1))]
+    #[case::replacement_slot(ImageType::Backdrop, 1, &["backdrop.png", "backdrop1.png", "backdrop2.png"], Some(3))]
+    #[case::explicit_zero(ImageType::Backdrop, 0, &["backdrop.png", "backdrop1.png"], Some(0))]
+    #[case::screenshot_unchanged(ImageType::Screenshot, 2, &["backdrop2.png"], Some(2))]
+    #[case::single_image_unchanged(ImageType::Primary, 2, &["backdrop1.png"], None)]
+    fn image_upload_backdrop_filenames_match_pinned_source(
+        #[case] kind: ImageType,
+        #[case] slot: usize,
+        #[case] paths: &[&str],
+        #[case] expected: Option<i32>,
+    ) {
+        use super::image_upload_file_index;
+        let images: Vec<_> = paths
+            .iter()
+            .map(|path| ItemImageInfo {
+                path: format!("/metadata/{path}"),
+                image_type: ImageType::Backdrop,
+                date_modified: chrono::Utc::now(),
+                width: 1,
+                height: 1,
+                blur_hash: None,
+            })
+            .collect();
+        assert_eq!(
+            image_upload_file_index(kind, slot, &images).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn image_upload_backdrop_append_does_not_overwrite_a_referenced_file() {
+        use super::image_upload_file_index;
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9020);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        // One existing slot whose filename is backdrop1. Slot count 1 must
+        // append a distinct path rather than overwrite that referenced file.
+        let existing = manager
+            .write_image_file(
+                item_id,
+                b"earlier",
+                "image/png",
+                ImageType::Backdrop,
+                Some(1),
+            )
+            .unwrap();
+        let index =
+            image_upload_file_index(ImageType::Backdrop, 1, std::slice::from_ref(&existing))
+                .unwrap();
+        let appended = manager
+            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, index)
+            .unwrap();
+        assert_ne!(appended.path, existing.path);
+        assert_eq!(std::fs::read(&existing.path).unwrap(), b"earlier");
+        assert_eq!(std::fs::read(&appended.path).unwrap(), b"later");
+        assert!(appended.path.strip_suffix("backdrop2.png").is_some());
+        // The same PNG bytes do not change filename allocation or ownership.
+        let current = [existing.clone(), appended];
+        let index = image_upload_file_index(ImageType::Backdrop, 2, &current).unwrap();
+        let identical = manager
+            .write_image_file(item_id, b"earlier", "image/png", ImageType::Backdrop, index)
+            .unwrap();
+        assert!(identical.path.strip_suffix("backdrop3.png").is_some());
+        assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
+    }
+
+    #[test]
+    fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9022);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let replacement = manager
+            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .unwrap();
+        let previous_path = std::path::Path::new(&replacement.path).with_file_name("BACKDROP.PNG");
+        std::fs::write(&previous_path, b"earlier").unwrap();
+        let previous = ItemImageInfo {
+            path: previous_path.to_string_lossy().into_owned(),
+            ..replacement.clone()
+        };
+        manager.remove_replaced_backdrop_file(
+            item_id,
+            std::slice::from_ref(&previous),
+            0,
+            &replacement,
+        );
+        assert!(
+            previous_path.is_file(),
+            "source compares saved paths ignoring case"
+        );
+    }
+
+    #[test]
+    fn image_upload_backdrop_replacement_preserves_another_slots_case_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9023);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let previous = manager
+            .write_image_file(
+                item_id,
+                b"referenced",
+                "image/png",
+                ImageType::Backdrop,
+                Some(1),
+            )
+            .unwrap();
+        let replacement = manager
+            .write_image_file(
+                item_id,
+                b"replacement",
+                "image/png",
+                ImageType::Backdrop,
+                Some(2),
+            )
+            .unwrap();
+        let alias = ItemImageInfo {
+            path: std::path::Path::new(&previous.path)
+                .with_file_name("BACKDROP1.PNG")
+                .to_string_lossy()
+                .into_owned(),
+            ..previous.clone()
+        };
+        // Another slot can carry the same file's case alias on a
+        // case-insensitive filesystem. Preserve its owned backing file.
+        manager.remove_replaced_backdrop_file(item_id, &[previous.clone(), alias], 0, &replacement);
+        assert_eq!(std::fs::read(previous.path).unwrap(), b"referenced");
+        assert_eq!(std::fs::read(replacement.path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9021);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let previous = manager
+            .write_image_file(
+                item_id,
+                b"earlier",
+                "image/png",
+                ImageType::Backdrop,
+                Some(1),
+            )
+            .unwrap();
+        let replacement = manager
+            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(2))
+            .unwrap();
+        manager.remove_replaced_backdrop_file(
+            item_id,
+            std::slice::from_ref(&previous),
+            0,
+            &replacement,
+        );
+        assert!(!std::path::Path::new(&previous.path).exists());
+        assert_eq!(std::fs::read(&replacement.path).unwrap(), b"later");
+        let outside = tempfile::tempdir().unwrap();
+        let external_path = outside.path().join("external.png");
+        std::fs::write(&external_path, b"external").unwrap();
+        let external = ItemImageInfo {
+            path: external_path.to_string_lossy().into_owned(),
+            ..previous.clone()
+        };
+        manager.remove_replaced_backdrop_file(
+            item_id,
+            std::slice::from_ref(&external),
+            0,
+            &replacement,
+        );
+        assert!(external_path.is_file());
+        #[cfg(unix)]
+        {
+            let linked_parent = directory
+                .path()
+                .join(ferrofin_db::store::guid_to_db(item_id))
+                .join("external-link");
+            std::os::unix::fs::symlink(outside.path(), &linked_parent).unwrap();
+            let linked = ItemImageInfo {
+                path: linked_parent
+                    .join("external.png")
+                    .to_string_lossy()
+                    .into_owned(),
+                ..previous.clone()
+            };
+            manager.remove_replaced_backdrop_file(
+                item_id,
+                std::slice::from_ref(&linked),
+                0,
+                &replacement,
+            );
+            assert!(external_path.is_file());
+        }
+        let shared_path = directory
+            .path()
+            .join(ferrofin_db::store::guid_to_db(item_id))
+            .join(super::SHARED_ALBUM_ARTWORK_DIR)
+            .join("shared.png");
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        std::fs::write(&shared_path, b"shared").unwrap();
+        let shared = ItemImageInfo {
+            path: shared_path.to_string_lossy().into_owned(),
+            ..previous.clone()
+        };
+        manager.remove_replaced_backdrop_file(
+            item_id,
+            std::slice::from_ref(&shared),
+            0,
+            &replacement,
+        );
+        assert!(shared_path.is_file());
+        // A historical duplicate path still used by another slot is retained.
+        std::fs::write(&previous.path, b"retained").unwrap();
+        let duplicate = [previous.clone(), previous.clone()];
+        manager.remove_replaced_backdrop_file(item_id, &duplicate, 0, &replacement);
+        assert_eq!(std::fs::read(&previous.path).unwrap(), b"retained");
+        // Appending has no previous slot to delete.
+        manager.remove_replaced_backdrop_file(
+            item_id,
+            std::slice::from_ref(&previous),
+            1,
+            &replacement,
+        );
+        assert_eq!(std::fs::read(previous.path).unwrap(), b"retained");
+    }
+
     /// "Identify → Apply" (`RemoveOldMetadata` + `ReplaceAllMetadata`) on a
     /// box set TMDB answers for: the provider result replaces the row and
     /// clears what it did not return — the year, genres, studios, tags,
@@ -9284,6 +9629,48 @@ mod tests {
             assert_eq!(images[0].url.as_deref(), Some(url));
             assert_eq!(images[0].language.as_deref(), language);
         }
+    }
+
+    #[tokio::test]
+    async fn pathless_provider_refresh_inherits_the_request_culture_across_awaits() {
+        let item_id = Uuid::new_v4();
+        let mut album = row("Audio.MusicAlbum", "Culture fixture");
+        album.id = item_id.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, album)]),
+            seen: tx,
+        });
+        let store = Arc::new(RecordingStore {
+            record_culture: true,
+            ..Default::default()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_image_store(store.clone(), dir.path().to_path_buf());
+        ferrofin_util::current_culture::scope(
+            "sv".into(),
+            mgr.queue_refresh(
+                item_id,
+                &MetadataRefreshOptions {
+                    metadata_refresh_mode: MetadataRefreshMode::None,
+                    image_refresh_mode: MetadataRefreshMode::None,
+                    ..Default::default()
+                },
+                RefreshPriority::High,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.culture_reads.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*store.culture_reads.lock().unwrap(), ["sv", "sv"]);
     }
 
     #[tokio::test]

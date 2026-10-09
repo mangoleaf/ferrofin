@@ -837,6 +837,15 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
         LocalizationManager::get_localization_options(self)
     }
 
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // Pinned BuildLocalizationData scans all embedded Core resources, not
+        // the historical fixed dropdown. Request options validate the names.
+        core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, _)| code.replace('_', "-"))
+            .collect()
+    }
+
     fn get_localized_string(&self, phrase: &str) -> String {
         LocalizationManager::get_localized_string(self, phrase)
     }
@@ -1455,5 +1464,22 @@ mod tests {
                 .score,
             18
         );
+    }
+
+    #[test]
+    fn startup_supported_ui_cultures_follow_all_embedded_resources() {
+        let manager = LocalizationManager::default();
+        let names =
+            ferrofin_traits::localization::LocalizationManager::get_supported_ui_cultures(&manager);
+        assert_eq!(names.len(), 105, "pinned embedded resource set");
+        for name in [
+            "en-US", "ar-SA", "lt-LT", "he-IL", "ur", "sv", "uz", "ka", "km",
+        ] {
+            assert!(
+                names.iter().any(|actual| actual == name),
+                "missing startup culture {name}"
+            );
+        }
+        assert!(!names.iter().any(|name| name.contains('_')));
     }
 }

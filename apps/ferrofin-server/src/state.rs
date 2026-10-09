@@ -2186,6 +2186,8 @@ pub async fn build_app_state(
         tasks,
     );
 
+    let state = state.with_request_culture(&server_config.ui_culture)?;
+
     // ---- media-encoding pair (real transcode/HLS + attachments) -----------
     // Replace the disabled stubs `AppState::new` installed with the
     // ffmpeg-backed transcode/HLS chain and the real attachment extractor.

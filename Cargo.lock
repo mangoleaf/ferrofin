@@ -1231,6 +1231,7 @@ dependencies = [
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
+ "percent-encoding",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1632,12 +1633,19 @@ name = "ferrofin-util"
 version = "0.4.1"
 dependencies = [
  "icu_casemap",
+ "icu_collator",
+ "icu_collections",
+ "icu_locale_core",
+ "icu_locale_fallback",
+ "icu_normalizer",
+ "icu_provider",
  "rand 0.8.7",
  "regex",
  "rstest",
  "thiserror 2.0.21",
  "unicode-normalization",
  "uuid",
+ "zerovec",
 ]
 
 [[package]]
@@ -2222,8 +2230,6 @@ checksum = "059fcda0fc8d33effc6633a8cf0d8a3c17caf7d7c91918fba9918744f501e4e8"
 [[package]]
 name = "icu_collator"
 version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08984ed58ac439ebf3e13d2cf26b0c46a60afcd21721c1d14087c0b240344dda"
 dependencies = [
  "icu_collator_data",
  "icu_collections",

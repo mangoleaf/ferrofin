@@ -810,7 +810,8 @@ impl FerrofinTaskManager {
             trigger,
             outcome = tracing::field::Empty,
         );
-        let handle = tokio::spawn(
+        let handle = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
             async move {
                 let started = std::time::Instant::now();
                 tracing::info!("scheduled task started");
@@ -832,7 +833,7 @@ impl FerrofinTaskManager {
                 this.finish(&key_owned, &task, start, &outcome, &progress);
             }
             .instrument(span),
-        );
+        ));
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             // The spawned run may already have finished (state back to Idle);
@@ -2704,5 +2705,68 @@ mod tests {
                 Err(ServiceError::NotFound(_))
             ));
         }
+    }
+
+    struct CultureTask {
+        captured: std::sync::Mutex<Vec<String>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for CultureTask {
+        fn key(&self) -> &str {
+            "culture"
+        }
+        fn name(&self) -> &str {
+            "Culture task"
+        }
+        fn description(&self) -> &str {
+            "Captures queued refresh context"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _: &TaskProgress) -> Result<(), ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.notify_one();
+            self.release.notified().await;
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn library_refresh_scheduled_task_inherits_the_starting_request_culture() {
+        let manager = FerrofinTaskManager::new();
+        let task = Arc::new(CultureTask {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        manager.register(task.clone());
+        ferrofin_util::current_culture::scope("sv".into(), async {
+            manager.queue("culture").unwrap();
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), task.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(manager.get("culture").unwrap().state, TaskState::Running);
+        task.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task.finished.notified())
+            .await
+            .unwrap();
+        assert_eq!(*task.captured.lock().unwrap(), ["sv", "sv"]);
     }
 }

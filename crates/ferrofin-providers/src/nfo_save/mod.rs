@@ -2,14 +2,14 @@
 //! Selection follows Jellyfin's ProviderManager and the per-kind NFO savers.
 
 mod mapping;
-mod paths;
+pub(crate) mod paths;
 mod policy;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::configuration::XbmcMetadataOptions;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
@@ -27,6 +27,14 @@ use crate::xbmc::{
     item::{NfoBaseItem, NfoItemKind},
     saver,
 };
+
+fn person_kind(person: &PeopleEntity) -> ferrofin_model::data::PersonKind {
+    person
+        .person_type
+        .as_ref()
+        .and_then(|kind| serde_json::from_value(serde_json::Value::String(kind.clone())).ok())
+        .unwrap_or(ferrofin_model::data::PersonKind::Unknown)
+}
 
 type SaveLocks = Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>;
 
@@ -165,16 +173,11 @@ impl NfoSaver {
             release_date_format: options.release_date_format.clone(),
         };
         let xml = self.serialize(item_id, &result, &config).await?;
-        let mut images = if options.save_image_paths_in_nfo {
+        let images = if options.save_image_paths_in_nfo {
             self.items.get_image_infos(item_id).await?
         } else {
             Vec::new()
         };
-        for image in &mut images {
-            if image.is_local_file() {
-                image.path = paths::substitute(&image.path, substitutions);
-            }
-        }
         let streams = if policy::kind(row).is_some_and(NfoItemKind::is_video) {
             self.streams
                 .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
@@ -202,6 +205,7 @@ impl NfoSaver {
                 item: &result.item,
                 original_language: row.original_language.as_deref(),
                 images: &images,
+                image_substitutions: substitutions,
                 streams: &streams,
                 user: user.as_ref(),
                 save_images: options.save_image_paths_in_nfo,
@@ -262,36 +266,32 @@ impl NfoSaver {
             .await?
             .remove(&id)
             .unwrap_or_default();
-        let mut people = Vec::new();
-        for person in self
+        let credits = self
             .people
             .get_people_batch(&[id])
             .await?
             .remove(&id)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        let actor_images = if save_images {
+            self.actor_primary_images(&credits).await?
+        } else {
+            HashMap::new()
+        };
+        let mut people = Vec::new();
+        for person in credits {
             let person_id = Uuid::parse_str(&person.id).unwrap_or_default();
-            let images = if save_images {
-                self.items.get_image_infos(person_id).await?
-            } else {
-                Vec::new()
-            };
+            let kind = person_kind(&person);
+            let image_url = actor_images.get(&person.name).cloned();
             people.push(PersonInfo {
                 id: person_id,
                 item_id: id,
                 name: person.name,
                 role: person.role,
-                type_: person
-                    .person_type
-                    .and_then(|kind| serde_json::from_value(serde_json::Value::String(kind)).ok())
-                    .unwrap_or(ferrofin_model::data::PersonKind::Unknown),
+                type_: kind,
                 sort_order: person
                     .sort_order
                     .and_then(|order| i32::try_from(order).ok()),
-                image_url: images
-                    .into_iter()
-                    .find(|image| image.image_type == ferrofin_model::entities::ImageType::Primary)
-                    .map(|image| image.path),
+                image_url,
                 ..Default::default()
             });
         }
@@ -300,6 +300,71 @@ impl NfoSaver {
             people: Some(people),
             ..Default::default()
         })
+    }
+
+    async fn actor_primary_images(
+        &self,
+        credits: &[PeopleEntity],
+    ) -> Result<HashMap<String, String>, ServiceError> {
+        use ferrofin_model::data::PersonKind;
+        let mut names: Vec<String> = credits
+            .iter()
+            .filter(|person| {
+                !matches!(
+                    person_kind(person),
+                    PersonKind::Director | PersonKind::Writer
+                )
+            })
+            .map(|person| person.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let resolved = self.people.get_person_item_ids(&names).await?;
+        if resolved.len() != names.len() {
+            return Err(ServiceError::backend(
+                "person identity lookup returned mismatched slots",
+            ));
+        }
+        let mut ids: Vec<Uuid> = resolved.iter().flatten().copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Source GetPerson accepts only the exact derived row when it is a
+        // Person, even if a credit or another kind has artwork at another id.
+        let people: HashSet<Uuid> = self
+            .items
+            .retrieve_items(&ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.type_.rsplit('.').next() == Some("Person"))
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        let mut images = HashMap::new();
+        for id in ids {
+            if people.contains(&id)
+                && let Some(image) = self
+                    .items
+                    .get_image_infos(id)
+                    .await?
+                    .into_iter()
+                    .find(|image| image.image_type == ferrofin_model::entities::ImageType::Primary)
+            {
+                images.insert(id, image.path);
+            }
+        }
+        Ok(names
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(name, id)| {
+                id.and_then(|id| images.get(&id).cloned())
+                    .map(|path| (name, path))
+            })
+            .collect())
     }
 
     async fn serialize(

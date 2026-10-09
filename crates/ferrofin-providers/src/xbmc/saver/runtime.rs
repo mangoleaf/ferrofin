@@ -10,6 +10,7 @@ pub(crate) struct DocumentExtras<'a> {
     pub item: &'a NfoBaseItem,
     pub original_language: Option<&'a str>,
     pub images: &'a [ItemImageInfo],
+    pub image_substitutions: &'a [ferrofin_model::configuration::PathSubstitution],
     pub streams: &'a [MediaStreamInfoEntity],
     pub user: Option<&'a UserItemDataDto>,
     pub save_images: bool,
@@ -28,7 +29,7 @@ pub(crate) fn complete_document(
         writer.element("originallanguage", language);
     }
     if extras.save_images {
-        add_images(&mut writer, extras.images);
+        add_images(&mut writer, extras.images, extras.image_substitutions)?;
     }
     if let Some(user) = extras.user {
         add_user(&mut writer, extras.item, user);
@@ -46,23 +47,41 @@ pub(crate) fn complete_document(
     Ok(xml)
 }
 
-fn add_images(writer: &mut NfoWriter, images: &[ItemImageInfo]) {
+fn add_images(
+    writer: &mut NfoWriter,
+    images: &[ItemImageInfo],
+    substitutions: &[ferrofin_model::configuration::PathSubstitution],
+) -> Result<(), ServiceError> {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+            .map_err(|error| ServiceError::backend(error.to_string()))?;
+    let emitted_path = |image: &ItemImageInfo| {
+        if image.is_local_file() {
+            crate::nfo_save::paths::substitute(&image.path, substitutions)
+        } else {
+            image.path.clone()
+        }
+    };
     writer.start_element("art");
     if let Some(image) = images
         .iter()
         .find(|image| image.image_type == ImageType::Primary)
     {
-        writer.element("poster", &image.path);
+        writer.element("poster", &emitted_path(image));
     }
     let mut backdrops: Vec<_> = images
         .iter()
         .filter(|image| image.image_type == ImageType::Backdrop)
         .collect();
-    backdrops.sort_by_key(|image| image.path.trim());
+    // OrderBy(Path?.Trim()) uses Comparer<string>.Default, hence the actual
+    // CurrentCulture. Order original paths before network substitutions;
+    // preserve source order when collation considers two paths equal.
+    backdrops.sort_by(|left, right| comparer.compare(left.path.trim(), right.path.trim()));
     for image in backdrops {
-        writer.element("fanart", &image.path);
+        writer.element("fanart", &emitted_path(image));
     }
     writer.end_element("art");
+    Ok(())
 }
 
 fn seconds(ticks: i64) -> String {
@@ -366,6 +385,7 @@ mod tests {
                 item: &result.item,
                 original_language: Some("fr"),
                 images: &[],
+                image_substitutions: &[],
                 streams: &[],
                 user: None,
                 save_images: false,
@@ -388,6 +408,7 @@ mod tests {
                 item: &result.item,
                 original_language: Some("fr"),
                 images: &[],
+                image_substitutions: &[],
                 streams: &[],
                 user: None,
                 save_images: false,
@@ -520,7 +541,7 @@ mod tests {
             depth: 0,
         };
         add_user(&mut writer, &item, &user);
-        add_images(&mut writer, &images);
+        add_images(&mut writer, &images, &[]).unwrap();
         let xml = writer.finish();
         for tag in [
             "<position>1.25</position>",
@@ -537,5 +558,93 @@ mod tests {
         assert!(xml.find("/a.jpg").unwrap() < xml.find("/z.jpg").unwrap());
         assert_eq!(seconds(-1), "-0.0000001");
         assert_eq!(seconds(10_000_000), "1");
+    }
+
+    #[tokio::test]
+    async fn backdrop_order_uses_original_paths_then_substitution_and_current_culture() {
+        use ferrofin_model::configuration::PathSubstitution;
+        let images: Vec<_> = [
+            (ImageType::Backdrop, "/original/z.jpg"),
+            (ImageType::Primary, "/original/poster.jpg"),
+            (ImageType::Backdrop, "/original/ä.jpg"),
+            (ImageType::Logo, "/original/unused.jpg"),
+            (ImageType::Backdrop, "https://remote/backdrop.jpg"),
+        ]
+        .into_iter()
+        .map(|(image_type, path)| ItemImageInfo {
+            image_type,
+            path: path.into(),
+            ..Default::default()
+        })
+        .collect();
+        let mappings = [
+            PathSubstitution {
+                from: "/original/ä.jpg".into(),
+                to: "/mapped/z-export.jpg".into(),
+            },
+            PathSubstitution {
+                from: "/original/z.jpg".into(),
+                to: "/mapped/a-export.jpg".into(),
+            },
+            PathSubstitution {
+                from: "/original/poster.jpg".into(),
+                to: "/mapped/poster.jpg".into(),
+            },
+            PathSubstitution {
+                from: "https://remote".into(),
+                to: "/wrong".into(),
+            },
+        ];
+        for (culture, expected) in [
+            ("en-US", ["/mapped/z-export.jpg", "/mapped/a-export.jpg"]),
+            ("sv", ["/mapped/a-export.jpg", "/mapped/z-export.jpg"]),
+        ] {
+            let xml = ferrofin_util::current_culture::scope(culture.into(), async {
+                tokio::task::yield_now().await;
+                let mut writer = NfoWriter {
+                    buf: String::new(),
+                    depth: 0,
+                };
+                add_images(&mut writer, &images, &mappings).unwrap();
+                writer.finish()
+            })
+            .await;
+            assert!(
+                xml.find(expected[0]).unwrap() < xml.find(expected[1]).unwrap(),
+                "{culture}: {xml}"
+            );
+            assert!(xml.contains("<poster>/mapped/poster.jpg</poster>"));
+            assert!(xml.contains("https://remote/backdrop.jpg"));
+            assert!(
+                !xml.contains("/original/")
+                    && !xml.contains("unused.jpg")
+                    && !xml.contains("/wrong")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backdrop_trimmed_collation_equalities_preserve_original_image_order() {
+        let images: Vec<_> = [" /é.jpg ", "/e\u{301}.jpg"]
+            .into_iter()
+            .map(|path| ItemImageInfo {
+                image_type: ImageType::Backdrop,
+                path: path.into(),
+                ..Default::default()
+            })
+            .collect();
+        ferrofin_util::current_culture::scope("en-US".into(), async {
+            let mut writer = NfoWriter {
+                buf: String::new(),
+                depth: 0,
+            };
+            add_images(&mut writer, &images, &[]).unwrap();
+            let xml = writer.finish();
+            assert!(
+                xml.find(" /é.jpg ").unwrap() < xml.find("/e\u{301}.jpg").unwrap(),
+                "stable source OrderBy: {xml}"
+            );
+        })
+        .await;
     }
 }

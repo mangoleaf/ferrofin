@@ -1,7 +1,7 @@
 //! BaseNfoSaver uses LibraryManager.GetPathAfterNetworkSubstitution for artwork.
 use ferrofin_model::configuration::PathSubstitution;
 
-pub(super) fn substitute(path: &str, substitutions: &[PathSubstitution]) -> String {
+pub(crate) fn substitute(path: &str, substitutions: &[PathSubstitution]) -> String {
     if path
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http"))

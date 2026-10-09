@@ -76,6 +76,12 @@ pub fn create_router(state: AppState) -> Router {
         state.clone(),
         crate::ip_access::ip_access_layer,
     ))
+    // Startup's localization middleware precedes authentication and captures
+    // the formatting culture inherited by metadata saves and queued refreshes.
+    .layer(middleware::from_fn_with_state(
+        state.request_culture(),
+        crate::request_culture::request_culture_layer,
+    ))
     .with_state(state)
     .merge(ferrofin_health::health_router(Vec::new()))
     .merge(spec_router())

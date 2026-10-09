@@ -2165,6 +2165,11 @@ impl LocalizationManager for FakeLocalization {
     fn get_localization_options(&self) -> Vec<LocalizationOption> {
         unimplemented!("fake")
     }
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // AppState snapshots this at construction; INFRA fixtures only need
+        // the built-in startup culture, without invoking unused API handlers.
+        vec!["en-US".to_owned()]
+    }
     fn get_localized_string(&self, phrase: &str) -> String {
         phrase.to_owned()
     }

@@ -485,6 +485,8 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_movie_image_options(&api, library, &mut options, id).await;
     verify_nfo_savers(&api, library, &mut options, id, &media).await;
     verify_selected_nfo_user(&api, library, &mut options, id, &media).await;
+    verify_nfo_image_path_setting(&api, library, &mut options, id, &media).await;
+    verify_nfo_image_order_culture(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
@@ -2153,6 +2155,404 @@ async fn verify_selected_nfo_user(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+}
+
+// Independently verify the live NFO artwork switch through actual image, item,
+// cast and named-configuration APIs, including its ImageUpdate threshold.
+#[allow(clippy::too_many_lines)]
+async fn verify_nfo_image_path_setting(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    let original_options = options.clone();
+    let original_configuration = api.get("/System/Configuration/xbmcmetadata").await;
+    options["MetadataSavers"] = json!([]);
+    options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let item_url = format!("/Items/{id}");
+    let mut item = api.get(&item_url).await;
+    item["LockData"] = json!(false);
+    api.post(&item_url, &item).await;
+    let nfo = media.join("movie.nfo");
+    std::fs::write(&nfo, "<movie><title>NFO image paths fixture</title><actor><name>NFO Actor</name><role>Reader</role><type>Actor</type></actor></movie>").unwrap();
+    let previous = item["Etag"].clone();
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"), &Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let actor = loop {
+        let found = api.get("/Persons?searchTerm=NFO%20Actor").await;
+        let current = api.get(&item_url).await;
+        if let Some(actor) = found["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|actor| actor["Name"] == "NFO Actor")
+            && current["Name"] == "NFO image paths fixture"
+            && current["Etag"] != previous
+            && current["People"].as_array().is_some_and(|people| {
+                people.iter().any(|person| {
+                    person["Id"] == actor["Id"]
+                        && person["Name"] == "NFO Actor"
+                        && person["Role"] == "Reader"
+                })
+            })
+        {
+            break actor["Id"].as_str().unwrap().to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the real NFO import did not materialize its credited person"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    upload_artwork(api, &actor, "Primary").await;
+    upload_artwork(api, id, "Primary").await;
+    let actor_images = api.get(&format!("/Items/{actor}/Images")).await;
+    let actor_path = actor_images
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|image| image["ImageType"] == "Primary")
+        .unwrap()["Path"]
+        .as_str()
+        .unwrap();
+    options["MetadataSavers"] = json!(["Nfo"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let mut configuration = original_configuration.clone();
+    for (enabled, image_kind) in [(false, "Logo"), (true, "Backdrop"), (false, "Thumb")] {
+        configuration["SaveImagePathsInNfo"] = json!(enabled);
+        api.post("/System/Configuration/xbmcmetadata", &configuration)
+            .await;
+        item = api.get(&item_url).await;
+        item["Name"] = json!(format!("NFO artwork {enabled}"));
+        api.post(&item_url, &item).await;
+        let before = std::fs::read_to_string(&nfo).unwrap();
+        assert_eq!(before.contains("<art>"), enabled, "{before}");
+        assert_eq!(
+            before.contains(actor_path),
+            enabled,
+            "the real credited person's local image follows the setting: {before}"
+        );
+        assert!(before.contains("<name>NFO Actor</name>"));
+        let previous_images = api.get(&format!("/Items/{id}/Images")).await;
+        upload_artwork(api, id, image_kind).await;
+        let after = std::fs::read_to_string(&nfo).unwrap();
+        if enabled {
+            let images = api.get(&format!("/Items/{id}/Images")).await;
+            let new_path = images
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|image| {
+                    image["ImageType"] == image_kind
+                        && !previous_images.as_array().unwrap().iter().any(|old| {
+                            old["ImageType"] == image_kind && old["Path"] == image["Path"]
+                        })
+                })
+                .unwrap()["Path"]
+                .as_str()
+                .unwrap();
+            assert!(
+                after.contains(new_path),
+                "ImageUpdate must refresh the NFO when image paths are enabled: {after}"
+            );
+            assert!(after.contains(actor_path));
+            for image in images.as_array().unwrap() {
+                let image_path = image["Path"].as_str().unwrap();
+                if image["ImageType"] == "Primary" {
+                    assert!(
+                        after.contains(&format!("<poster>{image_path}</poster>")),
+                        "{after}"
+                    );
+                } else if image["ImageType"] == "Backdrop" {
+                    assert!(
+                        after.contains(&format!("<fanart>{image_path}</fanart>")),
+                        "{after}"
+                    );
+                } else {
+                    assert!(
+                        !after.contains(image_path),
+                        "pinned art exports only poster/fanart: {after}"
+                    );
+                }
+            }
+            assert_ne!(after, before);
+            // Banner triggers an enabled saver, but is not an exported field;
+            // the source's byte comparison leaves an identical document intact.
+            upload_artwork(api, id, "Banner").await;
+            let banner_images = api.get(&format!("/Items/{id}/Images")).await;
+            let banner_path = banner_images
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|image| image["ImageType"] == "Banner")
+                .unwrap()["Path"]
+                .as_str()
+                .unwrap();
+            let unchanged = std::fs::read_to_string(&nfo).unwrap();
+            assert_eq!(unchanged, after, "Banner is not an NFO art field");
+            assert!(!unchanged.contains(banner_path));
+        } else {
+            assert_eq!(
+                after, before,
+                "ImageUpdate remains below the saver threshold when paths are off"
+            );
+            assert!(!after.contains(actor_path));
+        }
+    }
+    // The existing saver logs a filesystem error without undoing the image.
+    configuration["SaveImagePathsInNfo"] = json!(true);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    let before = std::fs::read_to_string(&nfo).unwrap();
+    let old_images = api.get(&format!("/Items/{id}/Images")).await;
+    let old_backdrops: Vec<_> = old_images
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|image| image["ImageType"] == "Backdrop")
+        .collect();
+    std::fs::remove_file(&nfo).unwrap();
+    std::fs::create_dir(&nfo).unwrap();
+    upload_artwork(api, id, "Backdrop").await;
+    assert!(nfo.is_dir());
+    let current_images = api.get(&format!("/Items/{id}/Images")).await;
+    let new_backdrops: Vec<_> = current_images
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|image| image["ImageType"] == "Backdrop")
+        .collect();
+    assert_eq!(
+        new_backdrops.len(),
+        old_backdrops.len() + 1,
+        "the failing saver must not undo the newly appended image"
+    );
+    let new_image = new_backdrops
+        .iter()
+        .find(|image| !old_backdrops.iter().any(|old| old["Path"] == image["Path"]))
+        .unwrap();
+    assert!(std::path::Path::new(new_image["Path"].as_str().unwrap()).is_file());
+    let served = api
+        .client
+        .get(format!(
+            "{}/Items/{id}/Images/Backdrop/{}",
+            api.base,
+            old_backdrops.len()
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert!(
+        !served.is_empty(),
+        "the newly saved image must remain readable through HTTP"
+    );
+    std::fs::remove_dir(&nfo).unwrap();
+    std::fs::write(&nfo, before).unwrap();
+    api.post(
+        "/System/Configuration/xbmcmetadata",
+        &original_configuration,
+    )
+    .await;
+    *options = original_options;
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+}
+
+fn mapped_nfo_fanarts(xml: &str) -> Vec<String> {
+    xml.split("<fanart>")
+        .skip(1)
+        .filter_map(|tail| tail.split_once("</fanart>").map(|(path, _)| path))
+        .filter(|path| path.starts_with("/nfo-order/"))
+        .map(str::to_owned)
+        .collect()
+}
+
+// Exact original-path ordering, live Images switch and inherited request culture
+// reach the real metadata, image-update, queued refresh and detached saver paths.
+#[allow(clippy::too_many_lines)]
+async fn verify_nfo_image_order_culture(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    let original_options = options.clone();
+    let original_server = api.get("/System/Configuration").await;
+    let original_nfo = api.get("/System/Configuration/xbmcmetadata").await;
+    let extra = media.join("extrafanart");
+    std::fs::create_dir_all(&extra).unwrap();
+    let a = extra.join("ä.png");
+    let z = extra.join("z.png");
+    for path in [&a, &z] {
+        std::fs::write(path, POSTER).unwrap();
+    }
+    let mut server = original_server.clone();
+    server["PathSubstitutions"] = json!([
+        {"From":a,"To":"/nfo-order/Z-export.png"},
+        {"From":z,"To":"/nfo-order/A-export.png"}
+    ]);
+    // RequestLocalizationOptions captured en-US at startup. The live UI
+    // localization setting changes independently and cannot replace that default.
+    server["UICulture"] = json!("sv");
+    api.post("/System/Configuration", &server).await;
+    let mut nfo_options = original_nfo.clone();
+    nfo_options["SaveImagePathsInNfo"] = json!(true);
+    nfo_options["UserId"] = api.get("/Users/Me").await["Id"].clone();
+    api.post("/System/Configuration/xbmcmetadata", &nfo_options)
+        .await;
+    options["MetadataSavers"] = json!(["Nfo"]);
+    options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
+    options["TypeOptions"][0]["ImageFetchers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let nfo = media.join("movie.nfo");
+    let en = vec![
+        "/nfo-order/Z-export.png".to_owned(),
+        "/nfo-order/A-export.png".to_owned(),
+    ];
+    let sv = vec![
+        "/nfo-order/A-export.png".to_owned(),
+        "/nfo-order/Z-export.png".to_owned(),
+    ];
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=FullRefresh&replaceAllMetadata=true"), &Value::Null).await;
+    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == en).await;
+    let images = api.get(&format!("/Items/{id}/Images")).await;
+    for path in [&a, &z] {
+        assert!(
+            images
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|image| image["ImageType"] == "Backdrop"
+                    && image["Path"] == path.to_str().unwrap()),
+            "real local artwork must be cataloged: {images}"
+        );
+    }
+    // This verifies Ferrofin's implemented queued caller path. The native full
+    // library proof starts persistent workers with aligned Swedish culture;
+    // it does not establish that every worker inherits the latest request.
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true&culture=sv-SE"), &Value::Null).await;
+    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == sv).await;
+    let response = api.client.post(format!("{}/Items/{id}/Images/Logo?culture=en-US", api.base))
+        .header("Authorization", &api.auth).header("Content-Type", "image/png")
+        .header("Accept-Language", "sv").header("Cookie", ".AspNetCore.Culture=c=sv|uic=sv")
+        .body("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==")
+        .send().await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(response.headers()["Content-Language"], "en-US");
+    assert_eq!(
+        mapped_nfo_fanarts(&std::fs::read_to_string(&nfo).unwrap()),
+        en,
+        "HTTP query culture precedes cookie and Accept-Language during ImageUpdate"
+    );
+    // A rating/favorite notification returns before filesystem work finishes;
+    // observe the actual XML without an intervening metadata edit.
+    api.post(
+        &format!("/UserFavoriteItems/{id}?culture=sv-SE"),
+        &Value::Null,
+    )
+    .await;
+    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == sv).await;
+    let response = api.client.post(format!("{}/Items/{id}/Images/Logo", api.base))
+        .header("Authorization", &api.auth).header("Content-Type", "image/png")
+        .header("Cookie", ".aspnetcore.cULTURE=c=en-US|uic=en-US")
+        .header("Accept-Language", "sv")
+        .body("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==")
+        .send().await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        mapped_nfo_fanarts(&std::fs::read_to_string(&nfo).unwrap()),
+        en,
+        "HTTP cookie precedes Accept-Language"
+    );
+    // /Library/Refresh adds a scheduled-task spawn before the scan queue.
+    // A fresh local image makes this default scan produce an actual update.
+    let later = extra.join("later.png");
+    std::fs::write(&later, POSTER).unwrap();
+    let tasks = api.get("/ScheduledTasks").await;
+    let previous_end = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["Key"] == "RefreshLibrary")
+        .unwrap()["LastExecutionResult"]["EndTimeUtc"]
+        .clone();
+    api.post("/Library/Refresh?culture=sv-SE", &Value::Null)
+        .await;
+    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == sv).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let tasks = api.get("/ScheduledTasks").await;
+        let task = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["Key"] == "RefreshLibrary")
+            .unwrap();
+        if task["State"] == "Idle" && task["LastExecutionResult"]["EndTimeUtc"] != previous_end {
+            assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh full-library task must finish: {tasks}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let images = api.get(&format!("/Items/{id}/Images")).await;
+    assert!(
+        images
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|image| image["ImageType"] == "Backdrop"
+                && image["Path"] == later.to_str().unwrap()),
+        "scheduled refresh must actually catalog the new local artwork: {images}"
+    );
+    nfo_options["SaveImagePathsInNfo"] = json!(false);
+    api.post("/System/Configuration/xbmcmetadata", &nfo_options)
+        .await;
+    let mut item = api.get(&format!("/Items/{id}")).await;
+    item["Name"] = json!("NFO order switch disabled");
+    api.post(&format!("/Items/{id}?culture=sv-SE"), &item).await;
+    assert!(!std::fs::read_to_string(&nfo).unwrap().contains("<art>"));
+    api.post("/System/Configuration/xbmcmetadata", &original_nfo)
+        .await;
+    api.post("/System/Configuration", &original_server).await;
+    *options = original_options;
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    for path in [&a, &z, &later] {
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_dir(extra).unwrap();
 }
 
 /// A language-only save reaches an existing inherited item without restarting.
