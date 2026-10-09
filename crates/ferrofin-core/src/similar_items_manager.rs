@@ -577,7 +577,9 @@ impl FerrofinSimilarItemsManager {
             BaseItemKind::LiveTvProgram if seed.is_series => {
                 LocalFilter::of_kinds(vec![BaseItemKind::Series])
             }
-            BaseItemKind::LiveTvProgram => LocalFilter::of_kinds(vec![BaseItemKind::LiveTvProgram]),
+            // The default source branch uses GetBaseItemKind(): the public
+            // Program alias has no stored type mapping and therefore fails closed.
+            BaseItemKind::LiveTvProgram => LocalFilter::of_kinds(vec![BaseItemKind::Program]),
             _ => LocalFilter::default(),
         }
     }
@@ -1504,7 +1506,7 @@ mod tests {
 
     /// A configuration manager with one knob: `EnableExternalContentInSuggestions`.
     struct FakeConfig {
-        external: bool,
+        external: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1516,7 +1518,8 @@ mod tests {
             &self,
         ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
             let mut config = crate::configuration_manager::default_server_configuration();
-            config.enable_external_content_in_suggestions = self.external;
+            config.enable_external_content_in_suggestions =
+                self.external.load(std::sync::atomic::Ordering::SeqCst);
             Ok(Arc::new(config))
         }
         async fn update_configuration(
@@ -1834,6 +1837,55 @@ mod tests {
             names.contains(&"Solaris".to_owned()),
             "the remote match resolved into the results: {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn external_content_switch_keeps_the_selected_remote_provider_running() {
+        let db = test_db().await;
+        let library = Uuid::from_u128(0xD049);
+        let seed = Uuid::from_u128(0xD04A);
+        let candidate = Uuid::from_u128(0xD04B);
+        seed_movie_in(&db, seed, "Seed", "SciFi", Some(library)).await;
+        seed_movie_in(&db, candidate, "Remote Match", "Drama", Some(library)).await;
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_provider_id(candidate, "Tmdb", "348")
+            .await
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mgr = manager(&db)
+            .with_configuration(config.clone())
+            .with_remote_providers(
+                vec![Arc::new(FakeRemote {
+                    name: "TheMovieDb",
+                    kind: BaseItemKind::Movie,
+                    references: vec![SimilarItemReference {
+                        provider_name: "Tmdb".into(),
+                        provider_id: "348".into(),
+                        score: None,
+                    }],
+                    cache: None,
+                    calls: calls.clone(),
+                })],
+                Arc::new(FakeFolders {
+                    library_id: library,
+                    providers: vec!["TheMovieDb".into()],
+                }),
+            );
+        for (index, enabled) in [false, true, false].into_iter().enumerate() {
+            config
+                .external
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+            let rows = mgr
+                .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sorted_names(&rows), ["Remote Match"]);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), index + 1);
+        }
     }
 
     #[tokio::test]
@@ -2913,7 +2965,9 @@ mod tests {
         )
         .await;
 
-        let on = manager(&db).with_configuration(Arc::new(FakeConfig { external: true }));
+        let on = manager(&db).with_configuration(Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(true),
+        }));
         let rows = on
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
@@ -2921,13 +2975,300 @@ mod tests {
             .expect("seed resolves");
         assert_eq!(names(&rows), vec!["Trailer".to_owned()]);
 
-        let off = manager(&db).with_configuration(Arc::new(FakeConfig { external: false }));
+        let off = manager(&db).with_configuration(Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        }));
         let rows = off
             .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
             .await
             .expect("similar")
             .expect("seed resolves");
         assert!(rows.is_empty(), "got {:?}", names(&rows));
+    }
+
+    /// All three source consumers share the live server switch, while the
+    /// non-movie Live TV branches continue selecting their own source kinds.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn live_external_setting_reaches_movie_program_and_recommendation_consumers() {
+        use ferrofin_traits::library::UserDataManager;
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xD040)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let played = Uuid::from_u128(0xD041);
+        let movie = Uuid::from_u128(0xD042);
+        let trailer = Uuid::from_u128(0xD043);
+        let program = Uuid::from_u128(0xD044);
+        let series = Uuid::from_u128(0xD045);
+        let show_program = Uuid::from_u128(0xD046);
+        let plain_program = Uuid::from_u128(0xD047);
+        seed_movie(&db, played, "Played", "SciFi").await;
+        seed_movie(&db, movie, "Movie", "SciFi").await;
+        for (id, kind, name) in [
+            (trailer, BaseItemKind::Trailer, "Trailer"),
+            (program, BaseItemKind::LiveTvProgram, "Movie Program"),
+            (series, BaseItemKind::Series, "Series"),
+            (show_program, BaseItemKind::LiveTvProgram, "Series Program"),
+            (plain_program, BaseItemKind::LiveTvProgram, "Plain Program"),
+        ] {
+            seed_kind(&db, id, kind, name, "SciFi").await;
+        }
+        // This consumer matrix uses explicitly adopted, distinct Program keys,
+        // as the native fixture does. Normal keyless guide grouping is separate.
+        let mut movie_program = crate::test_support::fetch_item(&db, program).await;
+        movie_program.is_movie = true;
+        movie_program.is_virtual_item = true;
+        movie_program.presentation_unique_key = Some(program.as_simple().to_string());
+        crate::test_support::save_item(&db, &movie_program).await;
+        let mut series_program = crate::test_support::fetch_item(&db, show_program).await;
+        series_program.is_series = true;
+        series_program.is_virtual_item = true;
+        series_program.presentation_unique_key = Some(show_program.as_simple().to_string());
+        crate::test_support::save_item(&db, &series_program).await;
+        let mut guide_program = crate::test_support::fetch_item(&db, plain_program).await;
+        guide_program.is_virtual_item = true;
+        guide_program.presentation_unique_key = Some(plain_program.as_simple().to_string());
+        crate::test_support::save_item(&db, &guide_program).await;
+        let library = crate::test_support::seed_library_over(
+            &db,
+            &[
+                played,
+                movie,
+                trailer,
+                program,
+                series,
+                show_program,
+                plain_program,
+            ],
+        )
+        .await;
+        let hidden_library = Uuid::from_u128(0xD04C);
+        crate::test_support::seed_item(&db, hidden_library, BaseItemKind::CollectionFolder).await;
+        for (id, kind, name) in [
+            (
+                Uuid::from_u128(0xD04D),
+                BaseItemKind::Trailer,
+                "Hidden Trailer",
+            ),
+            (
+                Uuid::from_u128(0xD04E),
+                BaseItemKind::LiveTvProgram,
+                "Hidden Program",
+            ),
+        ] {
+            seed_kind(&db, id, kind, name, "SciFi").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.top_parent_id = Some(ferrofin_db::store::guid_to_db(hidden_library));
+            row.is_movie = true;
+            row.is_virtual_item = kind == BaseItemKind::LiveTvProgram;
+            crate::test_support::save_item(&db, &row).await;
+        }
+        restrict_to_folders(&db, &user, &[library]).await;
+        seed_user_data(&db, user_id, played, true, Some(chrono::Utc::now())).await;
+        let config = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        });
+        let config_trait: Arc<dyn ServerConfigurationManager> = config.clone();
+        let mgr = manager(&db).with_configuration(config_trait.clone());
+        crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), config_trait)
+            .save_user_data(
+                user_id,
+                trailer,
+                &ferrofin_model::dto::UpdateUserItemDataDto {
+                    is_favorite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for enabled in [false, true, false] {
+            config
+                .external
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+            let rows = mgr
+                .get_similar_items(played, &[], Some(user_id), &DtoOptions::default(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = if enabled {
+                vec![
+                    "Movie",
+                    "Movie Program",
+                    "Plain Program",
+                    "Series Program",
+                    "Trailer",
+                ]
+            } else {
+                vec!["Movie"]
+            };
+            assert_eq!(sorted_names(&rows), expected);
+            // Program's movie flag selects a flat provider, so played movies
+            // remain eligible here (the movie scorer deliberately excludes them).
+            let rows = mgr
+                .get_similar_items(program, &[], Some(user_id), &DtoOptions::default(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sorted_names(&rows),
+                if enabled {
+                    vec![
+                        "Movie",
+                        "Plain Program",
+                        "Played",
+                        "Series Program",
+                        "Trailer",
+                    ]
+                } else {
+                    vec!["Movie", "Played"]
+                }
+            );
+            let rows = mgr
+                .get_similar_items(
+                    show_program,
+                    &[],
+                    Some(user_id),
+                    &DtoOptions::default(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sorted_names(&rows), ["Series"]);
+            let rows = mgr
+                .get_similar_items(
+                    plain_program,
+                    &[],
+                    Some(user_id),
+                    &DtoOptions::default(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "the public Program kind is not a stored type"
+            );
+            let recommendations = mgr
+                .get_movie_recommendations(
+                    Some(user_id),
+                    Uuid::nil(),
+                    20,
+                    20,
+                    &DtoOptions::default(),
+                )
+                .await
+                .unwrap();
+            let played_category = recommendations
+                .iter()
+                .find(|category| {
+                    category.recommendation_type == RecommendationType::SimilarToRecentlyPlayed
+                        && category.baseline_item_name == "Played"
+                })
+                .unwrap();
+            assert_eq!(sorted_names(&played_category.items), expected);
+            assert_eq!(
+                recommendations
+                    .iter()
+                    .any(|category| category.recommendation_type
+                        == RecommendationType::SimilarToLikedItem
+                        && category.baseline_item_name == "Trailer"),
+                enabled,
+                "liked external baseline follows source movie-kind pool"
+            );
+        }
+        grant_all_folders(&db, &user).await;
+        config
+            .external
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let rows = mgr
+            .get_similar_items(played, &[], Some(user_id), &DtoOptions::default(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sorted_names(&rows),
+            [
+                "Hidden Program",
+                "Hidden Trailer",
+                "Movie",
+                "Movie Program",
+                "Plain Program",
+                "Series Program",
+                "Trailer"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_movie_program_query_keeps_keyless_guide_grouping() {
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xD050)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let movie = Uuid::from_u128(0xD051);
+        let program = Uuid::from_u128(0xD052);
+        let plain = Uuid::from_u128(0xD053);
+        let series = Uuid::from_u128(0xD054);
+        seed_movie(&db, movie, "Movie", "SciFi").await;
+        for (id, name, is_movie, is_series) in [
+            (program, "Movie Program", true, false),
+            (plain, "Plain Program", false, false),
+            (series, "Series Program", false, true),
+        ] {
+            seed_kind(&db, id, BaseItemKind::LiveTvProgram, name, "SciFi").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.is_movie = is_movie;
+            row.is_series = is_series;
+            row.is_virtual_item = true;
+            crate::test_support::save_item(&db, &row).await;
+            assert!(
+                crate::test_support::fetch_item(&db, id)
+                    .await
+                    .presentation_unique_key
+                    .is_none()
+            );
+        }
+        crate::test_support::seed_library_over(&db, &[movie, program, plain, series]).await;
+        let config = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mgr = manager(&db).with_configuration(config.clone());
+        for enabled in [false, true, false] {
+            config
+                .external
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+            let rows = mgr
+                .get_similar_items(program, &[], Some(user_id), &DtoOptions::default(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut names = sorted_names(&rows);
+            assert!(names.iter().any(|name| name == "Movie"));
+            names.retain(|name| name != "Movie");
+            if enabled {
+                assert_eq!(names.len(), 1, "NULL guide keys form one movie-kind group");
+                assert!(matches!(
+                    names[0].as_str(),
+                    "Plain Program" | "Series Program"
+                ));
+            } else {
+                assert!(names.is_empty());
+            }
+            // The ordinary Program branch uses its public Program alias; the
+            // source storage lookup has no mapping, so it matches nothing.
+            let rows = mgr
+                .get_similar_items(plain, &[], Some(user_id), &DtoOptions::default(), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                rows.is_empty(),
+                "the public Program kind is not a stored type"
+            );
+        }
     }
 
     #[tokio::test]
