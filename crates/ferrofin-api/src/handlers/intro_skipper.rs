@@ -67,14 +67,17 @@ const IMPORT_STRING: &str = r#"@import url("https://cdn.jsdelivr.net/gh/intro-sk
 // Mode ↔ segment-type ↔ name helpers
 // ---------------------------------------------------------------------------
 
-/// Whether a stored item `type_` names an Episode or Movie — the item kinds the
-/// plugin's timestamp routes accept. The persisted value is the full CLR type
-/// name (e.g. `MediaBrowser.Controller.Entities.TV.Episode`), so match its last
-/// dotted segment.
-fn is_episode_or_movie(type_name: &str) -> bool {
+/// The kind a stored item names (its full CLR type name).
+fn kind_of(item: &BaseItemEntity) -> Option<BaseItemKind> {
+    BaseItemKind::from_stored_type_name(&item.type_)
+}
+
+/// Whether an item is an Episode or Movie — the kinds the plugin's timestamp
+/// routes accept.
+fn is_episode_or_movie(item: &BaseItemEntity) -> bool {
     matches!(
-        type_name.rsplit('.').next().unwrap_or(type_name),
-        "Episode" | "Movie"
+        kind_of(item),
+        Some(BaseItemKind::Episode | BaseItemKind::Movie)
     )
 }
 
@@ -302,7 +305,7 @@ async fn update_timestamps(
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
     };
-    if !is_episode_or_movie(&item.type_) {
+    if !is_episode_or_movie(&item) {
         return Err(ApiError::NotFound(format!(
             "item {id} is not an episode/movie"
         )));
@@ -347,7 +350,7 @@ async fn get_timestamps(
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
     };
-    if !is_episode_or_movie(&item.type_) {
+    if !is_episode_or_movie(&item) {
         return Err(ApiError::NotFound(format!(
             "item {id} is not an episode/movie"
         )));
@@ -623,7 +626,7 @@ async fn delete_segment(
         .get_item_by_id(item_id)
         .await?
         .and_then(|item| {
-            (item.type_.rsplit('.').next() == Some("Episode"))
+            (kind_of(&item) == Some(BaseItemKind::Episode))
                 .then(|| {
                     item.season_id
                         .as_deref()
@@ -980,7 +983,7 @@ async fn erase_movie(
         .library
         .get_item_by_id(movie_id)
         .await?
-        .is_some_and(|item| item.type_.rsplit('.').next() == Some("Movie"));
+        .is_some_and(|item| kind_of(&item) == Some(BaseItemKind::Movie));
     if !is_movie {
         return Err(ApiError::NotFound(format!("movie {movie_id}")));
     }
@@ -1056,7 +1059,7 @@ async fn update_disabled_episode(
         .get_item_by_id(request.episode_id)
         .await?
         .is_some_and(|item| {
-            item.type_.rsplit('.').next() == Some("Episode")
+            kind_of(&item) == Some(BaseItemKind::Episode)
                 && item
                     .season_id
                     .as_deref()
@@ -1126,14 +1129,20 @@ async fn clear_excluded_timestamps(
 /// Port of `VisualizationController.GetAnalyzerAction` →
 /// `Plugin.GetAllAnalyzerActionsAsync`: every mode in declaration order, the
 /// stored action or `Default`. Elevated, as the whole controller is upstream.
-/// 404 unless the id is a season with episodes — upstream's
-/// `QueuedMediaItems.ContainsKey`, the queue `season_episodes` mirrors.
+/// 404 unless the id is a season with episodes or a movie — upstream's
+/// `QueuedMediaItems.ContainsKey`, whose queue keys a movie by its own id.
 async fn get_analyzer_actions(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(season_id): Path<Uuid>,
 ) -> Result<Json<std::collections::BTreeMap<AnalysisMode, AnalyzerAction>>, ApiError> {
-    if season_episodes(&state, season_id).await?.is_empty() {
+    if season_episodes(&state, season_id).await?.is_empty()
+        && !state
+            .library
+            .get_item_by_id(season_id)
+            .await?
+            .is_some_and(|item| kind_of(&item) == Some(BaseItemKind::Movie))
+    {
         return Err(ApiError::NotFound(format!("season {season_id}")));
     }
     let stored = state.intro_skipper.analyzer_actions(season_id).await?;
@@ -1352,6 +1361,22 @@ mod tests {
     };
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use uuid::Uuid;
+
+    #[test]
+    fn items_are_told_apart_by_their_stored_type_name() {
+        use ferrofin_model::data::BaseItemKind;
+        let item = |kind: BaseItemKind| BaseItemEntity {
+            type_: kind.stored_type_name().expect("stored name").to_owned(),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(
+            super::kind_of(&item(BaseItemKind::Movie)),
+            Some(BaseItemKind::Movie)
+        );
+        assert!(super::is_episode_or_movie(&item(BaseItemKind::Episode)));
+        assert!(super::is_episode_or_movie(&item(BaseItemKind::Movie)));
+        assert!(!super::is_episode_or_movie(&item(BaseItemKind::Season)));
+    }
 
     #[test]
     fn episode_visualizations_drop_rows_whose_id_is_not_a_guid() {
