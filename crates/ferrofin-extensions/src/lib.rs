@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
 
+pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
@@ -44,6 +45,9 @@ pub struct ExtensionContext {
     /// (ffmpeg's `chromaprint` muxer, else `fpcalc`) — the intro skipper then
     /// reports unavailable.
     pub fingerprinter: Option<Arc<dyn Fingerprinter>>,
+    /// ffmpeg's other detections (silence, keyframes) and the audio-duration
+    /// probe.
+    pub ffmpeg: Arc<dyn ffmpeg::FfmpegService>,
     /// Root for per-extension caches (fingerprints): `{cache}/extensions`.
     pub cache_dir: PathBuf,
     /// Bulk merge/split of duplicate versions — the Merge Versions extension's
@@ -178,6 +182,7 @@ mod tests {
             library,
             plugins: Arc::new(DisabledPluginManager),
             fingerprinter: None,
+            ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
             cache_dir: PathBuf::from("/tmp/ferrofin-extensions-test-cache"),
             merge_versions: Arc::new(NoMerges),
             intro_skipper: Arc::new(

@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use super::queue::{Category, QueuedEpisode};
 use super::{DetectSegmentsTask, IntroSkipperConfig, config_hash};
+use crate::ffmpeg::ProcessOptions;
 use crate::fingerprint::Fingerprinter;
 
 /// One millisecond, the helpers' float tolerance (`TimeAdjustmentHelper.Epsilon`).
@@ -365,18 +366,34 @@ fn chapter_boundary(chapters: &[f64], reference: f64, (start, end): (f64, f64)) 
 /// near the episode start to 0 (no start offset then), else move it to the
 /// nearest chapter and apply `IntroStartOffset`; snap an end near the episode
 /// end to it, else move it to the nearest chapter and apply `IntroEndOffset`.
-/// A start not before the end keeps the original.
-/// TODO(intro-skipper step 6): silence (`AdjustIntroBasedOnSilence`) and
-/// keyframe (`SnapToKeyframe`) snapping of the end over the same window; bump
-/// `config_hash::ANALYZERS` with it, so stored segments are snapped too.
+/// An end not snapped comes with the window silence and keyframe snapping
+/// then search (see [`DetectSegmentsTask::adjust_intro_times`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Adjusted {
+    start: f64,
+    end: f64,
+    window: Option<(f64, f64)>,
+}
+
 fn adjust_times(
     c: &IntroSkipperConfig,
     duration: f64,
     chapters: &[f64],
     (start, end): (f64, f64),
-) -> (f64, f64) {
+) -> Adjusted {
     if c.end_snap_threshold < 0.0 || c.adjust_window_inward < 0.0 || c.adjust_window_outward < 0.0 {
-        return (start, end);
+        // Once per run of the server, not per segment (upstream logs each).
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                "intro skipper: EndSnapThreshold, AdjustWindowInward or AdjustWindowOutward is negative; times are left unadjusted"
+            );
+        }
+        return Adjusted {
+            start,
+            end,
+            window: None,
+        };
     }
     let adjusted_start = if start < 0.0 || start <= c.end_snap_threshold + EPSILON {
         0.0
@@ -394,27 +411,51 @@ fn adjust_times(
         };
         (moved + f64::from(c.intro_start_offset)).clamp(0.0, duration.max(0.0))
     };
-    let adjusted_end = if end >= duration - c.end_snap_threshold - EPSILON {
-        duration
-    } else {
-        let moved = if chapters.is_empty() {
-            end
-        } else {
-            let range = search_range(
-                end,
-                duration,
-                c.adjust_window_inward,
-                c.adjust_window_outward,
-            );
-            chapter_boundary(chapters, end, range)
+    if end >= duration - c.end_snap_threshold - EPSILON {
+        return Adjusted {
+            start: adjusted_start,
+            end: duration,
+            window: None,
         };
-        (moved - f64::from(c.intro_end_offset)).clamp(0.0, duration.max(0.0))
-    };
-    if adjusted_start >= adjusted_end {
-        (start, end)
-    } else {
-        (adjusted_start, adjusted_end)
     }
+    let moved = if chapters.is_empty() {
+        end
+    } else {
+        let range = search_range(
+            end,
+            duration,
+            c.adjust_window_inward,
+            c.adjust_window_outward,
+        );
+        chapter_boundary(chapters, end, range)
+    };
+    let adjusted_end = (moved - f64::from(c.intro_end_offset)).clamp(0.0, duration.max(0.0));
+    Adjusted {
+        start: adjusted_start,
+        end: adjusted_end,
+        window: Some(search_range(
+            adjusted_end,
+            duration,
+            c.adjust_window_inward,
+            c.adjust_window_outward,
+        )),
+    }
+}
+
+/// The adjusted times, unless the start is not before the end: the original.
+fn settle_times(original: (f64, f64), start: f64, end: f64) -> (f64, f64) {
+    if start >= end { original } else { (start, end) }
+}
+
+/// `AdjustIntroEndBasedOnSilenceAsync`'s pick: the start of the first
+/// silence long enough that overlaps the window and starts inside it.
+fn silence_end(silences: &[(f64, f64)], window: (f64, f64), minimum: f64, end: f64) -> f64 {
+    silences
+        .iter()
+        .find(|(start, stop)| {
+            window.0 < *stop && *start < window.1 && stop - start >= minimum && *start >= window.0
+        })
+        .map_or(end, |(start, _)| *start)
 }
 
 /// The Chromaprint mode a plugin mode fingerprints as.
@@ -801,7 +842,10 @@ impl DetectSegmentsTask {
                     .filter(|&i| i != lone && (items[i].entry.episode_number - number).abs() <= 1),
             );
         }
-        let prints = self.prints(items, &queue, mode, print, fingerprinter).await;
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let prints = self
+            .prints(items, &queue, mode, print, fingerprinter, options)
+            .await;
         let mut found: HashMap<usize, TimeRange> = HashMap::new();
         while !queue.is_empty() {
             let current = queue.remove(0);
@@ -844,13 +888,15 @@ impl DetectSegmentsTask {
                 break;
             }
             if let Some(range) = found.get(&current).copied() {
-                let (item_id, duration) = (
-                    items[current].entry.episode_id,
-                    items[current].entry.duration,
-                );
-                let chapters = self.chapter_starts(item_id, config).await;
-                let (start, end) =
-                    adjust_times(config, duration, &chapters, (range.start, range.end));
+                let item_id = items[current].entry.episode_id;
+                let (start, end) = self
+                    .adjust_intro_times(
+                        &items[current].entry,
+                        print,
+                        (range.start, range.end),
+                        config,
+                    )
+                    .await;
                 self.actions
                     .update_timestamp(StoredSegment {
                         item_id,
@@ -876,13 +922,14 @@ impl DetectSegmentsTask {
         mode: Mode,
         print: PrintMode,
         fingerprinter: &dyn Fingerprinter,
+        options: ProcessOptions,
     ) -> HashMap<usize, Arc<Vec<u32>>> {
         let mut prints = HashMap::new();
         for &index in queue {
             let item = &items[index];
             let fingerprint = match item.fingerprint_range(mode) {
                 Some((start, end)) => self
-                    .fingerprint_cached(item.entry.episode_id, &item.entry.path, start, end, print, fingerprinter)
+                    .fingerprint_cached(&item.entry, (start, end), print, fingerprinter, options)
                     .await
                     .unwrap_or_else(|err| {
                         tracing::debug!(%err, path = item.entry.path, ?mode, "intro skipper: fingerprint failed — no segment for this window");
@@ -931,6 +978,52 @@ impl DetectSegmentsTask {
         Ok(())
     }
 
+    /// `AdjustIntroTimesAsync`: the pure adjustment, then an end not snapped
+    /// to the episode end moved to the next silence (`AdjustIntroBasedOnSilence`)
+    /// and to the nearest keyframe (`SnapToKeyframe`) within the window. A
+    /// failed detection leaves the end where it is — for keyframes a
+    /// deliberate divergence: upstream's spawn failure there escapes the
+    /// analyzer and fails the season, over a refinement.
+    async fn adjust_intro_times(
+        &self,
+        entry: &QueuedEpisode,
+        print: PrintMode,
+        original: (f64, f64),
+        config: &IntroSkipperConfig,
+    ) -> (f64, f64) {
+        let chapters = self.chapter_starts(entry.episode_id, config).await;
+        let adjusted = adjust_times(config, entry.duration, &chapters, original);
+        let Some(window) = adjusted.window else {
+            return settle_times(original, adjusted.start, adjusted.end);
+        };
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let mut end = adjusted.end;
+        if config.adjust_intro_based_on_silence {
+            match self.silences(entry, print, window, config, options).await {
+                Ok(silences) => {
+                    end = silence_end(
+                        &silences,
+                        window,
+                        config.silence_detection_minimum_duration,
+                        end,
+                    );
+                }
+                Err(err) => {
+                    tracing::debug!(%err, item = entry.name, "intro skipper: silence detection failed");
+                }
+            }
+        }
+        if config.snap_to_keyframe {
+            match self.keyframes(entry, print, window, config, options).await {
+                Ok(keyframes) => end = nearest(keyframes.into_iter(), end),
+                Err(err) => {
+                    tracing::debug!(%err, item = entry.name, "intro skipper: keyframe detection failed");
+                }
+            }
+        }
+        settle_times(original, adjusted.start, end)
+    }
+
     /// The item's chapter starts (seconds), when `AdjustIntroBasedOnChapters`.
     async fn chapter_starts(&self, item_id: Uuid, config: &IntroSkipperConfig) -> Vec<f64> {
         if !config.adjust_intro_based_on_chapters {
@@ -965,6 +1058,17 @@ mod tests {
 
     fn cfg() -> IntroSkipperConfig {
         IntroSkipperConfig::default()
+    }
+
+    /// The pure adjustment settled (no silence or keyframe detection).
+    fn adjusted(
+        c: &IntroSkipperConfig,
+        duration: f64,
+        chapters: &[f64],
+        original: (f64, f64),
+    ) -> (f64, f64) {
+        let a = adjust_times(c, duration, chapters, original);
+        settle_times(original, a.start, a.end)
     }
 
     fn entry(episode_number: i64) -> QueuedEpisode {
@@ -1050,19 +1154,16 @@ mod tests {
             ..cfg()
         };
         // A start within EndSnapThreshold (2 s) snaps to 0 and skips the offset.
-        assert_eq!(adjust_times(&c, 1800.0, &[], (1.5, 60.0)), (0.0, 57.0));
+        assert_eq!(adjusted(&c, 1800.0, &[], (1.5, 60.0)), (0.0, 57.0));
         // Otherwise the offsets apply; an end near the episode end snaps to it.
-        assert_eq!(
-            adjust_times(&c, 1800.0, &[], (30.0, 1799.0)),
-            (32.0, 1800.0)
-        );
+        assert_eq!(adjusted(&c, 1800.0, &[], (30.0, 1799.0)), (32.0, 1800.0));
         // Chapters inside the window win: start window is [t-2, t+5].
         assert_eq!(
-            adjust_times(&cfg(), 1800.0, &[34.0, 120.0], (30.0, 118.0)),
+            adjusted(&cfg(), 1800.0, &[34.0, 120.0], (30.0, 118.0)),
             (34.0, 120.0)
         );
         // A start not before the end keeps the original.
-        assert_eq!(adjust_times(&c, 1800.0, &[], (30.0, 31.0)), (30.0, 31.0));
+        assert_eq!(adjusted(&c, 1800.0, &[], (30.0, 31.0)), (30.0, 31.0));
     }
 
     #[test]
@@ -1146,7 +1247,7 @@ mod tests {
             intro_end_offset: end_offset,
             ..cfg()
         };
-        assert_eq!(adjust_times(&c, duration, &[], original), expected);
+        assert_eq!(adjusted(&c, duration, &[], original), expected);
     }
 
     /// `TestAnimePreviewRefresh`: credits and an existing preview (`(0, 0)` is
@@ -1333,5 +1434,31 @@ mod tests {
         let hash_matches = HashMap::from([(Mode::Introduction, true)]);
         derive_states(&mut other, &[], &modes, &states, &hash_matches, false);
         assert_eq!(other.get(Mode::Introduction), EpisodeState::NotAnalyzed);
+    }
+
+    /// `AdjustIntroEndBasedOnSilenceAsync`: the first silence that overlaps
+    /// the window, starts inside it and lasts `SilenceDetectionMinimumDuration`.
+    #[rstest::rstest]
+    #[case::starts_before_the_window(&[(40.0, 45.0)], 49.5)]
+    #[case::too_short(&[(46.0, 46.1)], 49.5)]
+    #[case::outside(&[(52.0, 53.0)], 49.5)]
+    #[case::first_fit(&[(40.0, 45.0), (46.0, 47.0), (48.0, 49.0)], 46.0)]
+    fn silence_end_cases(#[case] silences: &[(f64, f64)], #[case] expected: f64) {
+        assert_eq!(silence_end(silences, (44.5, 51.5), 0.33, 49.5), expected);
+    }
+
+    /// Only an end not snapped to the episode end is refined, over
+    /// `GetSearchRange(end, duration, AdjustWindowInward, AdjustWindowOutward)`.
+    #[test]
+    fn the_refinement_window_follows_the_adjusted_end() {
+        let c = IntroSkipperConfig {
+            adjust_window_inward: 5.0,
+            adjust_window_outward: 2.0,
+            intro_end_offset: 1,
+            ..cfg()
+        };
+        let a = adjust_times(&c, 1800.0, &[], (10.0, 50.0));
+        assert_eq!((a.end, a.window), (49.0, Some((44.0, 51.0))));
+        assert_eq!(adjust_times(&c, 1800.0, &[], (10.0, 1799.0)).window, None);
     }
 }

@@ -22,6 +22,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use uuid::Uuid;
 
 use super::IntroSkipperConfig;
+use crate::ffmpeg::{FfmpegService, ProcessOptions};
 
 /// The plugin's name, as a library's `DisabledMediaSegmentProviders` lists it.
 const PLUGIN_NAME: &str = "Intro Skipper";
@@ -87,6 +88,7 @@ pub(super) type Queue = Vec<(Uuid, Vec<QueuedEpisode>)>;
 /// A library or virtual-folder read failed.
 pub(super) async fn build(
     library: &dyn LibraryManager,
+    ffmpeg: &dyn FfmpegService,
     folders: &[VirtualFolderInfo],
     config: &IntroSkipperConfig,
     include_excluded: bool,
@@ -137,7 +139,7 @@ pub(super) async fn build(
                 Some(BaseItemKind::Episode) => {
                     queue
                         .episode(
-                            library,
+                            (library, ffmpeg),
                             item,
                             &policy,
                             config,
@@ -147,7 +149,9 @@ pub(super) async fn build(
                         .await;
                 }
                 Some(BaseItemKind::Movie) => {
-                    queue.movie(item, &policy, config, include_excluded);
+                    queue
+                        .movie(ffmpeg, item, &policy, config, include_excluded)
+                        .await;
                 }
                 _ => {}
             }
@@ -226,7 +230,7 @@ impl QueueBuilder {
     /// `QueueManager.QueueEpisode`.
     async fn episode(
         &mut self,
-        library: &dyn LibraryManager,
+        (library, ffmpeg): (&dyn LibraryManager, &dyn FfmpegService),
         item: &BaseItemEntity,
         policy: &ExclusionPolicy,
         config: &IntroSkipperConfig,
@@ -252,11 +256,13 @@ impl QueueBuilder {
         let aired_season = aired_season_number(item).unwrap_or(0);
         let season_id = self.season_id(item, episode_id, series_id, aired_season);
         let duration = duration(item);
-        // TODO(intro-skipper step 6): `ProbeAudioDuration` (an ffprobe of the
-        // audio stream, when shorter than the runtime) for the credits end.
-        // Default off upstream.
+        let credits_duration = if excluded {
+            duration
+        } else {
+            credits_end(ffmpeg, &path, duration, config).await
+        };
         let (intro_end, credits_start, credits_end) =
-            episode_windows(duration, duration, analysis_percent, config);
+            episode_windows(duration, credits_duration, analysis_percent, config);
         let category = self.category(library, series_id, season_id).await;
         self.season(season_id).push(QueuedEpisode {
             series_name,
@@ -335,8 +341,9 @@ impl QueueBuilder {
     }
 
     /// `QueueManager.QueueMovieAsync`: queued under its own id, credits only.
-    fn movie(
+    async fn movie(
         &mut self,
+        ffmpeg: &dyn FfmpegService,
         item: &BaseItemEntity,
         policy: &ExclusionPolicy,
         config: &IntroSkipperConfig,
@@ -355,8 +362,11 @@ impl QueueBuilder {
             return;
         }
         let duration = duration(item);
-        // TODO(intro-skipper step 6): `ProbeAudioDuration`, as for episodes.
-        let credits_duration = duration;
+        let credits_duration = if excluded {
+            duration
+        } else {
+            credits_end(ffmpeg, &path, duration, config).await
+        };
         self.season(movie_id).push(QueuedEpisode {
             series_name: name.clone(),
             season_number: 0,
@@ -377,6 +387,26 @@ impl QueueBuilder {
             credits_fingerprint_end: credits_duration,
         });
     }
+}
+
+/// `ResolveCreditsFingerprintEndAsync`: with `ProbeAudioDuration`, the audio
+/// stream's end when it is shorter than the runtime (a file whose video
+/// outlasts its audio), else the runtime.
+async fn credits_end(
+    ffmpeg: &dyn FfmpegService,
+    path: &str,
+    duration: f64,
+    config: &IntroSkipperConfig,
+) -> f64 {
+    if !config.probe_audio_duration {
+        return duration;
+    }
+    let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+    ffmpeg
+        .probe_audio_duration(path, options)
+        .await
+        .filter(|audio| *audio > 0.0 && *audio < duration)
+        .unwrap_or(duration)
 }
 
 /// An episode's fingerprint windows, `(intro end, credits start, credits end)`,

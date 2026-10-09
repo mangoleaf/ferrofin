@@ -1474,6 +1474,10 @@ pub async fn build_app_state(
         media_segments: Arc::clone(&media_segments),
         plugins: Arc::clone(&plugins),
         fingerprinter,
+        ffmpeg: Arc::new(ferrofin_extensions::ffmpeg::Ffmpeg::new(
+            ffmpeg.ffmpeg.to_string_lossy(),
+            ffmpeg.ffprobe.to_string_lossy(),
+        )),
         cache_dir: config.cache_dir.join("extensions"),
         merge_versions: Arc::clone(&merge_versions),
         intro_skipper: Arc::clone(&intro_skipper),

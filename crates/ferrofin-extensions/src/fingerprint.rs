@@ -20,12 +20,20 @@ use std::process::{Output, Stdio};
 
 use async_trait::async_trait;
 
+use crate::ffmpeg::{self, ProcessOptions};
+
 /// Produces Chromaprint points for an audio window of a media file.
 #[async_trait]
 pub trait Fingerprinter: Send + Sync {
     /// Fingerprints `[start, end]` seconds of `path` into Chromaprint points, or
     /// an error string on any spawn/parse failure.
-    async fn fingerprint(&self, path: &str, start: f64, end: f64) -> Result<Vec<u32>, String>;
+    async fn fingerprint(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        options: ProcessOptions,
+    ) -> Result<Vec<u32>, String>;
 }
 
 /// A Chromaprint fingerprinter over `ffmpeg -f chromaprint`, or `fpcalc` when
@@ -116,49 +124,60 @@ impl ChromaprintFingerprinter {
 
 #[async_trait]
 impl Fingerprinter for ChromaprintFingerprinter {
-    async fn fingerprint(&self, path: &str, start: f64, end: f64) -> Result<Vec<u32>, String> {
+    async fn fingerprint(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        options: ProcessOptions,
+    ) -> Result<Vec<u32>, String> {
         let length = (end - start).max(1.0).ceil();
         if self.ffmpeg_chromaprint {
             // One pass: ffmpeg seeks, decodes and fingerprints the window, and
             // writes the raw points (little-endian u32) to stdout. No temp WAV,
             // and no dependence on a separately packaged Chromaprint.
-            let out = output(
+            // `FFmpegService.FingerprintAsync`'s own command: an output `-to`
+            // of exactly the window and a stereo downmix (Chromaprint mixes to
+            // mono itself; feeding it mono changes the points).
+            let (from, to) = (start.to_string(), (end - start).to_string());
+            let out = ffmpeg::ffmpeg(
                 &self.ffmpeg,
                 &[
-                    "-v",
-                    "error",
                     "-ss",
-                    &format!("{start}"),
+                    &from,
                     "-i",
                     path,
-                    // `FFmpegService.FingerprintAsync`'s own: an output `-to`
-                    // of exactly the window and a stereo downmix (Chromaprint
-                    // mixes to mono itself; feeding it mono changes the
-                    // points).
                     "-to",
-                    &format!("{}", end - start),
+                    &to,
                     "-ac",
                     "2",
-                    "-vn",
-                    "-sn",
-                    "-dn",
                     "-f",
                     "chromaprint",
                     "-fp_format",
                     "raw",
                     "-",
                 ],
+                options,
             )
             .await?;
-            check_status(&self.ffmpeg, &out)?;
-            return parse_raw_points(&out.stdout);
+            // Upstream reads whatever was written; an empty or torn print is
+            // the failure (with ffmpeg's own words, when it had any).
+            return parse_raw_points(&out.stdout).map_err(|err| {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                format!("{err} ({}): {}", out.status, stderr.trim())
+            });
         }
         let Some(fpcalc) = &self.fpcalc else {
             return Err("no Chromaprint backend".to_owned());
         };
         if start <= 0.0 {
             // Intro window: fpcalc reads the file directly, limited by -length.
-            fpcalc_points(fpcalc, &["-raw", "-length", &format!("{length:.0}"), path]).await
+            fpcalc_points(
+                fpcalc,
+                &["-raw", "-length", &format!("{length:.0}"), path],
+                options,
+            )
+            .await
         } else {
             // Credits window: decode [start, end] to a temp WAV, then fingerprint.
             let mut builder = tempfile::Builder::new();
@@ -173,7 +192,7 @@ impl Fingerprinter for ChromaprintFingerprinter {
             }
             .map_err(|e| format!("temp wav: {e}"))?;
             let tmp_path = tmp.path().to_string_lossy().into_owned();
-            run(
+            run_ffmpeg(
                 &self.ffmpeg,
                 &[
                     "-y",
@@ -197,6 +216,7 @@ impl Fingerprinter for ChromaprintFingerprinter {
                     "wav",
                     &tmp_path,
                 ],
+                options,
             )
             .await?;
             // `-length` is required here too: fpcalc's default analysis length
@@ -206,24 +226,11 @@ impl Fingerprinter for ChromaprintFingerprinter {
             fpcalc_points(
                 fpcalc,
                 &["-raw", "-length", &format!("{length:.0}"), &tmp_path],
+                options,
             )
             .await
         }
     }
-}
-
-/// Runs `program args…`, returning its captured output, or an error when it
-/// could not be spawned at all.
-async fn output(program: &str, args: &[&str]) -> Result<Output, String> {
-    tokio::process::Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        // The intro-skipper task cancels by dropping this future; fpcalc /
-        // ffmpeg must die with it (a fingerprint is minutes of CPU per file).
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| format!("spawn {program}: {e}"))
 }
 
 /// Fails on a non-zero exit, carrying the status + stderr.
@@ -238,12 +245,11 @@ fn check_status(program: &str, out: &Output) -> Result<(), String> {
     ))
 }
 
-/// Runs `program args…`, returning stdout as a string, or an error carrying the
-/// exit status + stderr on failure.
-async fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = output(program, args).await?;
-    check_status(program, &out)?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Runs ffmpeg as the analysis does (see [`ffmpeg::ffmpeg`]), failing on a
+/// non-zero exit with the status and stderr.
+async fn run_ffmpeg(program: &str, args: &[&str], options: ProcessOptions) -> Result<(), String> {
+    let out = ffmpeg::ffmpeg(program, args, options).await?;
+    check_status(program, &out)
 }
 
 /// Runs `fpcalc args…` and parses its points.
@@ -252,8 +258,12 @@ async fn run(program: &str, args: &[&str]) -> Result<String, String> {
 /// the complete fingerprint and *then* dies with
 /// "Error decoding audio frame (End of file)" (exit 3) whenever `-length`
 /// reaches the end of the stream — which a windowed credits WAV always does.
-async fn fpcalc_points(fpcalc: &str, args: &[&str]) -> Result<Vec<u32>, String> {
-    let out = output(fpcalc, args).await?;
+async fn fpcalc_points(
+    fpcalc: &str,
+    args: &[&str],
+    options: ProcessOptions,
+) -> Result<Vec<u32>, String> {
+    let out = ffmpeg::output(fpcalc, args, options).await?;
     match parse_fpcalc(&String::from_utf8_lossy(&out.stdout)) {
         Ok(points) => Ok(points),
         Err(parse_err) => {
@@ -395,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_reports_a_missing_program() {
-        let err = run("ferrofin-no-such-program", &[])
+        let err = run_ffmpeg("ferrofin-no-such-program", &[], ProcessOptions::default())
             .await
             .expect_err("spawn");
         assert!(err.starts_with("spawn ferrofin-no-such-program:"), "{err}");
@@ -575,7 +585,9 @@ echo "FINGERPRINT=1,2,3""#
         };
 
         // A non-zero exit carries the status and stderr.
-        let err = run(&boom, &[]).await.expect_err("non-zero exit");
+        let err = run_ffmpeg(&boom, &[], ProcessOptions::default())
+            .await
+            .expect_err("non-zero exit");
         assert!(err.contains("exit"), "{err}");
         assert!(err.ends_with("it broke"), "{err}");
 
@@ -594,7 +606,7 @@ echo "FINGERPRINT=1,2,3""#
         };
         assert_eq!(fp.backend(), "ffmpeg -f chromaprint");
         assert_eq!(
-            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0, ProcessOptions::default())
                 .await
                 .expect("fp"),
             vec![1, 2]
@@ -604,7 +616,9 @@ echo "FINGERPRINT=1,2,3""#
         let fp = fallback(&fpcalc, &ffmpeg);
         assert_eq!(fp.backend(), "fpcalc");
         assert_eq!(
-            fp.fingerprint("/media/a.mkv", 0.0, 90.0).await.expect("fp"),
+            fp.fingerprint("/media/a.mkv", 0.0, 90.0, ProcessOptions::default())
+                .await
+                .expect("fp"),
             vec![1, 2, 3]
         );
         assert_eq!(length(), "90");
@@ -614,7 +628,7 @@ echo "FINGERPRINT=1,2,3""#
         // whole — not truncated to fpcalc's 120 s default, which used to gut
         // credits detection.
         assert_eq!(
-            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+            fp.fingerprint("/media/a.mkv", 1500.0, 1800.0, ProcessOptions::default())
                 .await
                 .expect("fp"),
             vec![1, 2, 3]
@@ -626,7 +640,7 @@ echo "FINGERPRINT=1,2,3""#
         // yields it (chromaprint 1.5.1 on any window that reaches end-of-stream).
         assert_eq!(
             fallback(&fpcalc_eof, &ffmpeg)
-                .fingerprint("/media/a.mkv", 1500.0, 1800.0)
+                .fingerprint("/media/a.mkv", 1500.0, 1800.0, ProcessOptions::default())
                 .await
                 .expect("fp"),
             vec![1, 2, 3]
@@ -635,7 +649,7 @@ echo "FINGERPRINT=1,2,3""#
         // A failing decode fails the fingerprint rather than fingerprinting junk.
         assert!(
             fallback(&fpcalc, &broken_ffmpeg)
-                .fingerprint("/media/a.mkv", 1500.0, 1800.0)
+                .fingerprint("/media/a.mkv", 1500.0, 1800.0, ProcessOptions::default())
                 .await
                 .is_err()
         );
@@ -653,7 +667,7 @@ echo "FINGERPRINT=1,2,3""#
             ),
         );
         let fp = fallback(&fpcalc, &ffmpeg_probe).with_scratch_dir(scratch.clone());
-        fp.fingerprint("/media/a.mkv", 1500.0, 1800.0)
+        fp.fingerprint("/media/a.mkv", 1500.0, 1800.0, ProcessOptions::default())
             .await
             .expect("fp");
         let wav = std::fs::read_to_string(dir.path().join("wav-path")).expect("wav path");

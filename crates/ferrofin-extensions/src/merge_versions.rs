@@ -1833,6 +1833,7 @@ mod tests {
             )),
             plugins,
             fingerprinter: None,
+            ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
             cache_dir: std::env::temp_dir(),
             merge_versions: svc,
             intro_skipper: Arc::new(

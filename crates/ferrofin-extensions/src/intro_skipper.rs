@@ -31,6 +31,7 @@ use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ffmpeg::{FfmpegService, ProcessOptions};
 use crate::fingerprint::Fingerprinter;
 
 mod config_hash;
@@ -126,6 +127,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
         media_segments: Arc::clone(&cx.media_segments),
         plugins: Arc::clone(&cx.plugins),
         fingerprinter: cx.fingerprinter.clone(),
+        ffmpeg: Arc::clone(&cx.ffmpeg),
         cache_dir: cx.cache_dir.join("introskipper"),
         running: Arc::clone(&cx.intro_skipper_running),
         actions: Arc::clone(&cx.intro_skipper),
@@ -552,6 +554,8 @@ struct DetectSegmentsTask {
     media_segments: Arc<dyn MediaSegmentManager>,
     plugins: Arc<dyn PluginManager>,
     fingerprinter: Option<Arc<dyn Fingerprinter>>,
+    /// Silence and keyframe detection, the audio duration probe.
+    ffmpeg: Arc<dyn FfmpegService>,
     cache_dir: PathBuf,
     /// `true` while an analysis pass is running, so a second trigger is a no-op
     /// instead of a duplicate concurrent pass.
@@ -632,7 +636,14 @@ impl DetectSegmentsTask {
     /// entry, excluded ones flagged.
     async fn queue(&self, config: &IntroSkipperConfig) -> Result<queue::Queue, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
-        queue::build(self.library.as_ref(), &folders, config, true).await
+        queue::build(
+            self.library.as_ref(),
+            self.ffmpeg.as_ref(),
+            &folders,
+            config,
+            true,
+        )
+        .await
     }
 
     /// The background analysis pass (`DetectSegmentsTask` →
@@ -738,10 +749,10 @@ impl DetectSegmentsTask {
         tracing::info!(%season_id, analyzed = stored, "intro skipper: season rescanned");
     }
 
-    /// Deletes fingerprint files (`{item}.{mode tag}.{start}-{end}.fp`) of
-    /// `items` (all when `None`) for `mode` (all when `None`). Like the
-    /// plugin's `DeleteByMode`, a mode other than Introduction or Credits has
-    /// no cache to erase.
+    /// Deletes the detection caches (`{item}.{mode tag}.…`: prints, silences,
+    /// keyframes) of `items` (all when `None`) for `mode` (all when `None`).
+    /// Like the plugin's `DeleteByMode`, a mode nothing is cached for (Preview,
+    /// Commercial) has nothing to erase.
     async fn erase_cache_files(
         &self,
         items: Option<&[Uuid]>,
@@ -752,6 +763,7 @@ impl DetectSegmentsTask {
             // Older tags are orphaned caches of the same mode (see `mode_tag`).
             Some(WireMode::Introduction) => Some(&["intro2", "intro"]),
             Some(WireMode::Credits) => Some(&["credits3", "credits2", "credits"]),
+            Some(WireMode::Recap) => Some(&["recap2", "recap"]),
             Some(_) => return Ok(0),
         };
         let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
@@ -766,7 +778,11 @@ impl DetectSegmentsTask {
             .map_err(|err| ServiceError::backend(err.to_string()))?
         {
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "fp") {
+            // Every detection's cache (`DeleteForItem`/`DeleteByMode`).
+            if path
+                .extension()
+                .is_none_or(|ext| ext != "fp" && ext != SILENCE_CACHE && ext != KEYFRAME_CACHE)
+            {
                 continue;
             }
             let name = entry.file_name();
@@ -811,27 +827,113 @@ impl DetectSegmentsTask {
 
     /// Fingerprints an episode window, using an on-disk cache keyed by the window
     /// so a re-run skips the (expensive) decode.
+    /// TODO(intro-skipper step 10): gate on `CacheFingerprints` and key by
+    /// `ConfigHasher.DetectionCache`, as [`Self::detection_cached`] does.
     async fn fingerprint_cached(
         &self,
-        id: Uuid,
-        path: &str,
-        start: f64,
-        end: f64,
+        entry: &queue::QueuedEpisode,
+        (start, end): (f64, f64),
         mode: AnalysisMode,
         fingerprinter: &dyn Fingerprinter,
+        options: ProcessOptions,
     ) -> Result<Vec<u32>, String> {
-        let cache = self.print_path(id, start, end, mode);
+        let cache = self.print_path(entry.episode_id, start, end, mode);
         if let Ok(bytes) = tokio::fs::read(&cache).await
             && let Some(points) = decode_points(&bytes)
         {
             return Ok(points);
         }
-        let points = fingerprinter.fingerprint(path, start, end).await?;
+        let points = fingerprinter
+            .fingerprint(&entry.path, start, end, options)
+            .await?;
         let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
         let _ = tokio::fs::write(&cache, encode_points(&points)).await;
         Ok(points)
     }
+
+    /// A silence or keyframe detection, through its cache file when
+    /// `CacheFingerprints` (`DetectionCacheService.TryRead`/`Write`, kept as
+    /// files beside the prints): keyed by the item, the mode, the exact window
+    /// and the detection's `ConfigHasher.DetectionCache` hash, so a setting the
+    /// detection reads misses the cache.
+    async fn detection_cached<T, F>(
+        &self,
+        (entry, mode, window): (&queue::QueuedEpisode, AnalysisMode, (f64, f64)),
+        (kind, hash, enabled): (&str, &str, bool),
+        detect: F,
+    ) -> Result<Vec<T>, String>
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+        F: Future<Output = Result<Vec<T>, String>>,
+    {
+        let cache = self.cache_dir.join(format!(
+            "{}.{}.{}-{}.{hash}.{kind}",
+            entry.episode_id,
+            mode_tag(mode),
+            window.0,
+            window.1
+        ));
+        if enabled
+            && let Ok(bytes) = tokio::fs::read(&cache).await
+            && let Ok(found) = serde_json::from_slice(&bytes)
+        {
+            return Ok(found);
+        }
+        let found = detect.await?;
+        if enabled && let Ok(bytes) = serde_json::to_vec(&found) {
+            let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
+            let _ = tokio::fs::write(&cache, bytes).await;
+        }
+        Ok(found)
+    }
+
+    /// `DetectSilenceAsync` over the window.
+    async fn silences(
+        &self,
+        entry: &queue::QueuedEpisode,
+        mode: AnalysisMode,
+        window: (f64, f64),
+        config: &IntroSkipperConfig,
+        options: ProcessOptions,
+    ) -> Result<Vec<(f64, f64)>, String> {
+        let hash = config_hash::detection_cache(config, config_hash::Detection::Silence);
+        self.detection_cached(
+            (entry, mode, window),
+            (SILENCE_CACHE, &hash, config.cache_fingerprints),
+            self.ffmpeg.detect_silence(
+                &entry.path,
+                window.0,
+                window.1,
+                config.silence_detection_maximum_noise,
+                options,
+            ),
+        )
+        .await
+    }
+
+    /// `DetectKeyFramesAsync` over the window.
+    async fn keyframes(
+        &self,
+        entry: &queue::QueuedEpisode,
+        mode: AnalysisMode,
+        window: (f64, f64),
+        config: &IntroSkipperConfig,
+        options: ProcessOptions,
+    ) -> Result<Vec<f64>, String> {
+        let hash = config_hash::detection_cache(config, config_hash::Detection::Keyframe);
+        self.detection_cached(
+            (entry, mode, window),
+            (KEYFRAME_CACHE, &hash, config.cache_fingerprints),
+            self.ffmpeg
+                .detect_keyframes(&entry.path, window.0, window.1, options),
+        )
+        .await
+    }
 }
+
+/// The cache-file extensions of the detections besides the prints (`.fp`).
+const SILENCE_CACHE: &str = "silence";
+const KEYFRAME_CACHE: &str = "keyframes";
 
 /// A short filename tag for an analysis mode (part of the fingerprint-cache
 /// key).
@@ -970,6 +1072,7 @@ mod tests {
             path: &str,
             _start: f64,
             _end: f64,
+            _options: ProcessOptions,
         ) -> Result<Vec<u32>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.prints
@@ -1093,6 +1196,7 @@ mod tests {
                     config: config.as_bytes().to_vec(),
                 }),
                 fingerprinter,
+                ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
                 cache_dir: cache.path().join("introskipper"),
                 running: Arc::new(AtomicBool::new(false)),
                 virtual_folders: Arc::new(MediaLibrary(media.to_string_lossy().into_owned())),
@@ -1382,8 +1486,8 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// `DeleteForItem` / `DeleteByMode`: by item, by mode (Introduction and
-    /// Credits only), or everything.
+    /// `DeleteForItem` / `DeleteByMode`: by item, by mode, or everything —
+    /// every detection's cache (print, silence, keyframes).
     #[tokio::test]
     async fn erase_cache_deletes_by_item_and_mode() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
@@ -1401,17 +1505,18 @@ mod tests {
                 .erase_cache(Some(&[EP_A]), Some(WireMode::Introduction))
                 .await
                 .expect("erase"),
-            1
+            3
         );
         let after_a = cache_files(&h, EP_A);
         assert!(!after_a.iter().any(|f| f.contains(".intro2.")));
-        assert_eq!(after_a.len(), before_a.len() - 1, "the credits print stays");
+        assert_eq!(after_a.len(), before_a.len() - 3, "the credits caches stay");
         assert_eq!(
             h.task
                 .erase_cache(None, Some(WireMode::Recap))
                 .await
                 .expect("recap"),
-            0
+            0,
+            "nothing analysed as a recap"
         );
         h.task.erase_cache(None, None).await.expect("all");
         assert!(cache_files(&h, EP_A).is_empty() && cache_files(&h, EP_B).is_empty());
@@ -1535,9 +1640,15 @@ mod tests {
         ];
         let config: IntroSkipperConfig =
             serde_json::from_str(r#"{"SeriesExclusions":"Other"}"#).expect("legacy string list");
-        let queue = queue::build(h.task.library.as_ref(), &folders, &config, true)
-            .await
-            .expect("queue");
+        let queue = queue::build(
+            h.task.library.as_ref(),
+            h.task.ffmpeg.as_ref(),
+            &folders,
+            &config,
+            true,
+        )
+        .await
+        .expect("queue");
         let find = |key: Uuid| queue.iter().find(|(k, _)| *k == key).map(|(_, v)| v);
         let shows = find(season).expect("season 1");
         let ids: Vec<Uuid> = shows.iter().map(|e| e.episode_id).collect();
@@ -1555,9 +1666,15 @@ mod tests {
         assert_eq!(movie.category, queue::Category::Movie);
         assert_eq!(movie.credits_fingerprint_start, 6_000.0 - 900.0);
         // Excluded items stay out unless asked for.
-        let strict = queue::build(h.task.library.as_ref(), &folders, &config, false)
-            .await
-            .expect("queue");
+        let strict = queue::build(
+            h.task.library.as_ref(),
+            h.task.ffmpeg.as_ref(),
+            &folders,
+            &config,
+            false,
+        )
+        .await
+        .expect("queue");
         assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
     }
 
@@ -1662,6 +1779,121 @@ mod tests {
         (EP_B, "/media/s01e02.mkv", 1800.0),
         (Uuid::from_u128(0xA3), "/media/s01e03.mkv", 1800.0),
     ];
+
+    /// An intro end not snapped to the episode end moves to the first long
+    /// enough silence starting in its window, then to the nearest keyframe;
+    /// both detections are cached beside the prints.
+    #[tokio::test]
+    async fn an_intro_end_snaps_to_silence_then_a_keyframe() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            // The match ends at ~49.5 s; its window is [~44.5, ~51.5].
+            silences: vec![(40.0, 45.0), (46.0, 46.1), (46.0, 47.0)],
+            keyframes: vec![45.9, 48.0],
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        task.execute(&TaskProgress::default()).await.expect("run");
+        let intro = intros_of(&h.segments, EP_A).await;
+        assert_eq!((intro[0].start_ticks, intro[0].end_ticks), (0, 459_000_000));
+        // Silence and keyframes for each episode's intro and credits, over
+        // the window around the matched end, with the configured noise and
+        // process settings.
+        assert_eq!(ffmpeg.calls.load(Ordering::SeqCst), 8);
+        let log = ffmpeg.log.lock().expect("log").clone();
+        let intro_calls: Vec<_> = log.iter().filter(|c| c.2 < 100.0).collect();
+        assert_eq!(intro_calls.len(), 4, "{log:?}");
+        for (kind, _, start, end, noise, options) in intro_calls {
+            assert!(
+                (44.0..45.0).contains(start) && (51.0..52.0).contains(end),
+                "{kind} {start}-{end}"
+            );
+            assert_eq!(*noise, if *kind == "silence" { -50 } else { 0 });
+            assert_eq!(*options, ProcessOptions::default());
+        }
+        let files = std::fs::read_dir(h.cache.path().join("introskipper"))
+            .expect("cache")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect::<Vec<_>>();
+        assert!(files.iter().any(|f| f.ends_with(".silence")), "{files:?}");
+        assert!(files.iter().any(|f| f.ends_with(".keyframes")), "{files:?}");
+    }
+
+    /// A detection is cached under the settings it reads
+    /// (`ConfigHasher.DetectionCache`), and only with `CacheFingerprints`.
+    #[tokio::test]
+    async fn detections_are_cached_under_their_settings() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            silences: vec![(1.0, 2.0)],
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        let base = IntroSkipperConfig::default();
+        let queue = task.queue(&base).await.expect("queue");
+        let entry = &queue[0].1[0];
+        let detect = |config: IntroSkipperConfig| {
+            let task = task.clone();
+            async move {
+                task.silences(
+                    entry,
+                    AnalysisMode::Introduction,
+                    (0.0, 5.0),
+                    &config,
+                    ProcessOptions::default(),
+                )
+                .await
+                .expect("silences")
+            }
+        };
+        let calls = || ffmpeg.calls.load(Ordering::SeqCst);
+        assert_eq!(detect(base.clone()).await, [(1.0, 2.0)]);
+        assert_eq!(detect(base.clone()).await, [(1.0, 2.0)]);
+        assert_eq!(calls(), 1, "the second read is the cache's");
+        let noisier = IntroSkipperConfig {
+            silence_detection_maximum_noise: -40,
+            ..base.clone()
+        };
+        detect(noisier).await;
+        assert_eq!(calls(), 2, "a setting the detection reads misses");
+        let uncached = IntroSkipperConfig {
+            cache_fingerprints: false,
+            silence_detection_maximum_noise: -30,
+            ..base
+        };
+        detect(uncached.clone()).await;
+        detect(uncached).await;
+        assert_eq!(calls(), 4, "CacheFingerprints off: always detected");
+    }
+
+    /// `ProbeAudioDuration`: credits end where a shorter audio stream does.
+    #[tokio::test]
+    async fn the_credits_window_ends_with_a_shorter_audio_stream() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg {
+                audio_duration: Some(1700.0),
+                ..crate::ffmpeg::FakeFfmpeg::default()
+            }),
+            ..h.task.clone()
+        };
+        let window = |config: &str| {
+            let config: IntroSkipperConfig = serde_json::from_str(config).expect("config");
+            let task = task.clone();
+            async move {
+                let queue = task.queue(&config).await.expect("queue");
+                queue[0].1[0].credits_fingerprint_end
+            }
+        };
+        assert_eq!(window("{}").await, 1800.0);
+        assert_eq!(window(r#"{"ProbeAudioDuration":true}"#).await, 1700.0);
+    }
 
     /// The task over the harness with a plugin configuration.
     fn configured(h: &Harness, config: &str) -> DetectSegmentsTask {

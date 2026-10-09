@@ -28,5 +28,12 @@ serde_json.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 
+# `ProcessPriority`: the OS priority of analysis processes.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 rstest.workspace = true
