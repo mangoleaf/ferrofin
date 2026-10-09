@@ -410,6 +410,18 @@ pub trait IntroSkipperAnalysis: Send + Sync {
     /// Deletes the segments and cache of every item the exclusion policy now
     /// matches, then republishes them (`ClearExcludedTimestampsAsync`).
     async fn clear_excluded(&self) -> Result<ExcludedClear, ServiceError>;
+
+    /// Items were added, updated or removed (the plugin `Entrypoint`'s
+    /// `ItemAdded`/`ItemUpdated`/`ItemRemoved`): their seasons are queued for
+    /// automatic analysis, a removed item's cache deleted.
+    async fn items_changed(&self, added: &[Uuid], updated: &[Uuid], removed: &[Uuid]);
+
+    /// A scheduled task finished (`ITaskManager.TaskCompleted`); `completed`
+    /// when it succeeded.
+    async fn task_completed(&self, key: &str, completed: bool);
+
+    /// A plugin's configuration was saved (`ConfigurationChanged`).
+    async fn plugin_configuration_changed(&self, plugin_id: Uuid);
 }
 
 fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}
@@ -459,6 +471,13 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
             "the intro skipper extension is not attached",
         ))
     }
+
+    // Without the extension there is nothing to analyse.
+    async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
+
+    async fn task_completed(&self, _key: &str, _completed: bool) {}
+
+    async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
 }
 
 /// The [`InMemoryIntroSkipperStore`] state.

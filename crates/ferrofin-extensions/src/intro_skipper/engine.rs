@@ -505,7 +505,7 @@ impl DetectSegmentsTask {
         tracing::info!(seasons = count, "intro skipper: analysis started");
         let processed = AtomicUsize::new(0);
         let parallelism = usize::try_from(config.max_parallelism.max(1)).unwrap_or(1);
-        futures_util::stream::iter(seasons.into_iter().enumerate())
+        let analyzed = futures_util::stream::iter(seasons.into_iter().enumerate())
             .map(|(index, (season, entries))| {
                 // Logged before the season's fingerprinting (the slow part),
                 // so a stall shows as the last such line.
@@ -525,7 +525,11 @@ impl DetectSegmentsTask {
             })
             .buffer_unordered(parallelism)
             .fold(0, |sum, n| async move { sum + n })
-            .await
+            .await;
+        // A pass consumes `AnalyzeAgain` (upstream resets it after any
+        // `AnalyzeItemsAsync` that had work).
+        self.runtime.analyze_again.store(false, Ordering::SeqCst);
+        analyzed
     }
 
     /// One season of `AnalyzeItemsAsync`. The season's whole share of the
@@ -659,9 +663,8 @@ impl DetectSegmentsTask {
         config: &IntroSkipperConfig,
         ffmpeg_valid: bool,
     ) -> Result<Vec<Item>, ServiceError> {
-        // TODO(intro-skipper step 11): `AnalyzeAgain` (set by a settings
-        // change) re-analyses everything once.
-        let analyze_again = false;
+        // `AnalyzeAgain`: the settings changed since the last pass.
+        let analyze_again = self.runtime.analyze_again.load(Ordering::SeqCst);
         let hash_matches: HashMap<Mode, bool> = modes
             .iter()
             .map(|&mode| {

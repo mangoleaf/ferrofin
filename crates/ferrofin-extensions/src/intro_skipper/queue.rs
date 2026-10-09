@@ -172,7 +172,7 @@ fn in_folder(item: &BaseItemEntity, folder: &VirtualFolderInfo) -> bool {
 }
 
 /// The stored type's kind (the last dotted segment of the CLR name).
-fn kind(item: &BaseItemEntity) -> Option<BaseItemKind> {
+pub(super) fn kind(item: &BaseItemEntity) -> Option<BaseItemKind> {
     match item.type_.rsplit('.').next() {
         Some("Episode") => Some(BaseItemKind::Episode),
         Some("Movie") => Some(BaseItemKind::Movie),

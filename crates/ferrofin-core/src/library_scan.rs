@@ -6178,6 +6178,11 @@ impl LibraryScanner {
         }
         if let Ok(payload) = serde_json::to_string(&update) {
             let _ = events.publish("LibraryChanged", &payload).await;
+            // The scan's items reach in-process consumers the way the
+            // notifier's do (`ItemAdded`/`ItemRemoved` subscribers).
+            let _ = events
+                .publish(crate::library_changed_notifier::ITEMS_CHANGED, &payload)
+                .await;
         }
     }
 

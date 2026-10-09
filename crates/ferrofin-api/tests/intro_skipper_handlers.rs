@@ -386,6 +386,10 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
             removed_cache_entries: 4,
         })
     }
+    // The routes never drive automatic analysis.
+    async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
+    async fn task_completed(&self, _key: &str, _completed: bool) {}
+    async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
 }
 
 /// `ExcludedTimestamps/Clear` answers the dashboard's PascalCase counts.

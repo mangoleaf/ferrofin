@@ -1839,7 +1839,7 @@ mod tests {
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
-            intro_skipper_running: Arc::default(),
+            intro_skipper_runtime: Arc::default(),
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),

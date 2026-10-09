@@ -56,9 +56,10 @@ pub struct ExtensionContext {
     /// The Intro Skipper's own store (segments, season state, disabled
     /// episodes), which detection writes and honours.
     pub intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
-    /// The Intro Skipper's one-pass-at-a-time latch, shared by its scheduled
-    /// tasks and the routes' analysis handle.
-    pub intro_skipper_running: Arc<std::sync::atomic::AtomicBool>,
+    /// The Intro Skipper's run state (its one-pass latch, `AnalyzeAgain`, the
+    /// automatic analysis), shared by its scheduled tasks and the routes'
+    /// analysis handle.
+    pub intro_skipper_runtime: Arc<intro_skipper::Runtime>,
     /// The libraries and their options (which libraries an extension may
     /// analyse).
     pub virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
@@ -188,7 +189,7 @@ mod tests {
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
-            intro_skipper_running: Arc::default(),
+            intro_skipper_runtime: Arc::default(),
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
