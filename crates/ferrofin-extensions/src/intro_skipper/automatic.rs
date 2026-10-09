@@ -47,6 +47,10 @@ pub struct Runtime {
     /// and seasons.
     pub(super) queued: AtomicUsize,
     pub(super) seasons: AtomicUsize,
+    /// The parsed configuration (`Plugin.Configuration`), read once and again
+    /// after each save. A tokio lock held across the read, so a save landing
+    /// mid-read still ends with the cache empty, never stale.
+    pub(super) config: tokio::sync::Mutex<Option<Arc<super::IntroSkipperConfig>>>,
 }
 
 /// `PluginWarning.InvalidChromaprintFingerprint`: a fingerprint failed.
@@ -202,8 +206,9 @@ impl DetectSegmentsTask {
     }
 
     /// `OnSettingsChanged`: the next pass analyses everything again.
-    pub(super) fn plugin_configuration_changed(&self, plugin_id: Uuid) {
+    pub(super) async fn plugin_configuration_changed(&self, plugin_id: Uuid) {
         if plugin_id == EXTENSION_ID {
+            *self.runtime.config.lock().await = None;
             tracing::debug!(
                 "intro skipper: settings saved; the next pass analyses everything again"
             );
@@ -379,14 +384,16 @@ mod tests {
         let erase = || std::fs::remove_dir_all(&h.task.cache_dir).expect("drop the cache");
         erase();
         let first = h.calls.load(Ordering::SeqCst);
-        h.task.plugin_configuration_changed(Uuid::from_u128(1));
+        h.task
+            .plugin_configuration_changed(Uuid::from_u128(1))
+            .await;
         h.task
             .execute(&TaskProgress::default())
             .await
             .expect("second");
         assert_eq!(h.calls.load(Ordering::SeqCst), first, "already analysed");
 
-        h.task.plugin_configuration_changed(EXTENSION_ID);
+        h.task.plugin_configuration_changed(EXTENSION_ID).await;
         h.task
             .execute(&TaskProgress::default())
             .await

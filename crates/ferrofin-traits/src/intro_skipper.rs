@@ -383,6 +383,27 @@ pub trait IntroSkipperStore: Send + Sync {
 
 fn _assert_object_safe_intro_skipper_store(_: &dyn IntroSkipperStore) {}
 
+/// The plugin settings its routes read, from the extension's typed (and
+/// cached) configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroSkipperSettings {
+    /// `SkipButtonHideDelay`, seconds (upstream default 8).
+    pub skip_button_hide_delay: u64,
+    /// `UpdateMediaSegments`: publish segment-tier changes to `MediaSegments`
+    /// right away (upstream default on).
+    pub update_media_segments: bool,
+}
+
+impl Default for IntroSkipperSettings {
+    /// The plugin's defaults.
+    fn default() -> Self {
+        Self {
+            skip_button_hide_delay: 8,
+            update_media_segments: true,
+        }
+    }
+}
+
 /// The plugin's analysis runtime: its one-pass-at-a-time lock
 /// (`ScheduledTaskSemaphore`), on-demand season rescans and the detection
 /// cache — implemented by the Intro Skipper extension, so the routes reach
@@ -431,6 +452,12 @@ pub trait IntroSkipperAnalysis: Send + Sync {
     /// The analysis half of the plugin's support bundle (queue contents,
     /// warnings, the ffmpeg checks' output), as Markdown lines.
     async fn support_bundle(&self) -> String;
+
+    /// The settings the plugin's routes read. Defaults to the plugin's
+    /// defaults, for an analysis with no configuration behind it.
+    async fn settings(&self) -> IntroSkipperSettings {
+        IntroSkipperSettings::default()
+    }
 }
 
 fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}

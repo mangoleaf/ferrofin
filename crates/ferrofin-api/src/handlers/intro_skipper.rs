@@ -191,45 +191,17 @@ struct EraseSeasonQuery {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Reads the extension's `SkipbuttonHideDelay` config value (defaults to 8s).
-async fn skip_hide_delay(state: &AppState) -> u64 {
-    let bytes = state
-        .plugins
-        .get_plugin_configuration(INTRO_SKIPPER_ID)
-        .await
-        .unwrap_or_default();
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| {
-            v.get("SkipbuttonHideDelay")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(8)
-}
-
-/// The plugin's `UpdateMediaSegments` setting (default on): whether a change to
-/// its segment tier is published to `MediaSegments` right away.
-async fn update_media_segments(state: &AppState) -> bool {
-    let bytes = state
-        .plugins
-        .get_plugin_configuration(INTRO_SKIPPER_ID)
-        .await
-        .unwrap_or_default();
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| {
-            v.get("UpdateMediaSegments")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(true)
-}
-
 /// Publishes `items`' segments when `UpdateMediaSegments` is on
 /// (`MediaSegmentRefreshService.RefreshAsync`, `suppressErrors: true`: a
 /// failure is logged and the request still succeeds — the tier already
 /// changed, and the next refresh repairs the published rows).
 async fn publish(state: &AppState, items: &[Uuid]) {
-    if update_media_segments(state).await {
+    if state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .update_media_segments
+    {
         for &item_id in items {
             if let Err(err) = intro_store::refresh(
                 state.intro_skipper.as_ref(),
@@ -404,7 +376,12 @@ async fn erase_timestamps(
             .erase_cache(None, Some(mode))
             .await?;
     }
-    if update_media_segments(&state).await {
+    if state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .update_media_segments
+    {
         state
             .media_segments
             .delete_all_provider_segments(&intro_store::provider_id(), Some(kind))
@@ -741,7 +718,11 @@ async fn inject_css(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
-    let delay = skip_hide_delay(&state).await;
+    let delay = state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .skip_button_hide_delay;
     let mut branding = state.config.get_branding().await?;
     let mut css = branding.custom_css.clone().unwrap_or_default();
     let mut modified = false;
@@ -768,7 +749,11 @@ async fn update_skip_duration(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
-    let delay = skip_hide_delay(&state).await;
+    let delay = state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .skip_button_hide_delay;
     let mut branding = state.config.get_branding().await?;
     let css = branding.custom_css.clone().unwrap_or_default();
     if find_skip_duration_span(&css).is_none() {

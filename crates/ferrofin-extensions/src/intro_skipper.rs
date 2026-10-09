@@ -25,7 +25,9 @@ use ferrofin_chromaprint::AnalysisMode;
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::intro_skipper::{self as intro_store, IntroSkipperAnalysis};
+use ferrofin_traits::intro_skipper::{
+    self as intro_store, IntroSkipperAnalysis, IntroSkipperSettings,
+};
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
@@ -198,7 +200,17 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
     }
 
     async fn plugin_configuration_changed(&self, plugin_id: Uuid) {
-        DetectSegmentsTask::plugin_configuration_changed(self, plugin_id);
+        DetectSegmentsTask::plugin_configuration_changed(self, plugin_id).await;
+    }
+
+    async fn settings(&self) -> IntroSkipperSettings {
+        let config = self.load_config().await;
+        IntroSkipperSettings {
+            // A negative delay is no delay upstream's CSS can use: default.
+            skip_button_hide_delay: u64::try_from(config.skipbutton_hide_delay)
+                .unwrap_or(IntroSkipperSettings::default().skip_button_hide_delay),
+            update_media_segments: config.update_media_segments,
+        }
     }
 
     async fn hides_intros(&self, item_id: Uuid) -> bool {
@@ -1076,12 +1088,20 @@ impl DetectSegmentsTask {
         )
     }
 
-    /// Loads the persisted configuration, falling back to defaults.
-    async fn load_config(&self) -> IntroSkipperConfig {
-        match self.plugins.get_plugin_configuration(EXTENSION_ID).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => IntroSkipperConfig::default(),
+    /// The configuration: cached after the first read, until the next save
+    /// (`plugin_configuration_changed`); defaults when unreadable, which are
+    /// not cached, so a transient failure does not hide the saved settings.
+    async fn load_config(&self) -> Arc<IntroSkipperConfig> {
+        let mut cached = self.runtime.config.lock().await;
+        if let Some(config) = &*cached {
+            return Arc::clone(config);
         }
+        let Ok(bytes) = self.plugins.get_plugin_configuration(EXTENSION_ID).await else {
+            return Arc::new(IntroSkipperConfig::default());
+        };
+        let config = Arc::new(serde_json::from_slice(&bytes).unwrap_or_default());
+        *cached = Some(Arc::clone(&config));
+        config
     }
 
     /// The cache file of an episode window's fingerprint.
@@ -2233,13 +2253,7 @@ mod tests {
         let segments = h.actions.stored_item_ids().await.expect("ids").len();
         let cache = cache_files(&h, EP_A).len() + cache_files(&h, EP_B).len();
         assert!(segments == 2 && cache > 0);
-        let excluding = DetectSegmentsTask {
-            plugins: Arc::new(FakePlugins {
-                enabled: true,
-                config: br#"{"SeriesExclusions":["show"]}"#.to_vec(),
-            }),
-            ..h.task.clone()
-        };
+        let excluding = configured(&h, r#"{"SeriesExclusions":["show"]}"#);
         let cleared = excluding.clear_excluded().await.expect("clear");
         assert_eq!(cleared.affected_items, 2);
         assert!(cleared.removed_segments >= 2);
@@ -2295,13 +2309,7 @@ mod tests {
         );
         // A setting the intro hash reads: re-analysed (from the cached prints)
         // and stored under the new hash; the user's intro stays.
-        let changed = DetectSegmentsTask {
-            plugins: Arc::new(FakePlugins {
-                enabled: true,
-                config: br#"{"MaximumIntroDuration":119}"#.to_vec(),
-            }),
-            ..h.task.clone()
-        };
+        let changed = configured(&h, r#"{"MaximumIntroDuration":119}"#);
         changed
             .execute(&TaskProgress::default())
             .await
@@ -2794,6 +2802,32 @@ mod tests {
         }
     }
 
+    /// The configuration is read once and cached; a save (the
+    /// `PluginConfigurationChanged` event) makes the next read see it.
+    #[tokio::test]
+    async fn settings_are_cached_until_the_configuration_is_saved() {
+        let h = harness(&TWO_EPISODES, true, r#"{"SkipbuttonHideDelay":5}"#, true).await;
+        let saved = DetectSegmentsTask {
+            plugins: Arc::new(FakePlugins {
+                enabled: true,
+                config: br#"{"SkipbuttonHideDelay":12,"UpdateMediaSegments":false}"#.to_vec(),
+            }),
+            ..h.task.clone()
+        };
+        assert_eq!(h.task.settings().await.skip_button_hide_delay, 5);
+        assert_eq!(saved.settings().await.skip_button_hide_delay, 5, "cached");
+        saved.plugin_configuration_changed(Uuid::from_u128(1)).await;
+        assert_eq!(
+            saved.settings().await.skip_button_hide_delay,
+            5,
+            "another plugin's save"
+        );
+        saved.plugin_configuration_changed(EXTENSION_ID).await;
+        let settings = saved.settings().await;
+        assert_eq!(settings.skip_button_hide_delay, 12);
+        assert!(!settings.update_media_segments);
+    }
+
     /// A detection pass keeps the settings of seasons outside its queue (a
     /// library taken out of analysis, say): only the clean task drops them.
     #[tokio::test]
@@ -2897,9 +2931,16 @@ mod tests {
 
     /// The task over the harness with a plugin configuration.
     fn configured(h: &Harness, config: &str) -> DetectSegmentsTask {
+        with_plugins(h, true, config)
+    }
+
+    /// The harness task over another stored configuration, as after a save:
+    /// the cached copy is forgotten (a save's `PluginConfigurationChanged`).
+    fn with_plugins(h: &Harness, enabled: bool, config: &str) -> DetectSegmentsTask {
+        *h.task.runtime.config.try_lock().expect("config idle") = None;
         DetectSegmentsTask {
             plugins: Arc::new(FakePlugins {
-                enabled: true,
+                enabled,
                 config: config.as_bytes().to_vec(),
             }),
             ..h.task.clone()
@@ -3396,13 +3437,7 @@ mod tests {
         assert_eq!(intros_of(&h.segments, gone).await.len(), 1);
         move_out_of_the_libraries(&h, gone).await;
         let clean = CleanCacheTask {
-            detect: Arc::new(DetectSegmentsTask {
-                plugins: Arc::new(FakePlugins {
-                    enabled,
-                    config: config.as_bytes().to_vec(),
-                }),
-                ..h.task.clone()
-            }),
+            detect: Arc::new(with_plugins(&h, enabled, config)),
         };
         clean
             .execute(&TaskProgress::default())
@@ -3443,13 +3478,10 @@ mod tests {
             .await
             .expect("cache");
         let cached = h.calls.load(Ordering::SeqCst);
-        let off = DetectSegmentsTask {
-            plugins: Arc::new(FakePlugins {
-                enabled: true,
-                config: br#"{"CacheFingerprints":false,"MaximumIntroDuration":119}"#.to_vec(),
-            }),
-            ..h.task.clone()
-        };
+        let off = configured(
+            &h,
+            r#"{"CacheFingerprints":false,"MaximumIntroDuration":119}"#,
+        );
         off.execute(&TaskProgress::default())
             .await
             .expect("re-analyse");
