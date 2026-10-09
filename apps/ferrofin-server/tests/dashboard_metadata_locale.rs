@@ -2310,6 +2310,7 @@ async fn verify_nfo_image_path_setting(
             assert!(!after.contains(actor_path));
         }
     }
+    verify_nfo_path_substitution_option(api, id, actor_path, &nfo).await;
     // The existing saver logs a filesystem error without undoing the image.
     configuration["SaveImagePathsInNfo"] = json!(true);
     api.post("/System/Configuration/xbmcmetadata", &configuration)
@@ -2376,6 +2377,103 @@ async fn verify_nfo_image_path_setting(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+}
+
+// The pin retains EnablePathSubstitution as a persisted UI option, but its
+// saver always maps local image paths through the server substitutions.
+#[allow(clippy::too_many_lines)]
+async fn verify_nfo_path_substitution_option(
+    api: &Api,
+    id: &str,
+    actor_path: &str,
+    nfo: &std::path::Path,
+) {
+    let server = api.get("/System/Configuration").await;
+    let original = api.get("/System/Configuration/xbmcmetadata").await;
+    let images = api.get(&format!("/Items/{id}/Images")).await;
+    let poster = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|image| image["ImageType"] == "Primary")
+        .unwrap()["Path"]
+        .clone();
+    let backdrop = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|image| image["ImageType"] == "Backdrop")
+        .unwrap()["Path"]
+        .clone();
+    let mut mapped = server.clone();
+    mapped["PathSubstitutions"] = json!([
+        {"From":poster,"To":"/nfo-substitution/poster.png"},
+        {"From":backdrop,"To":"/nfo-substitution/fanart.png"},
+        {"From":actor_path,"To":"/nfo-substitution/actor.png"}
+    ]);
+    api.post("/System/Configuration", &mapped).await;
+    let mut configuration = original.clone();
+    configuration["SaveImagePathsInNfo"] = json!(true);
+    for (phase, enabled) in [false, true, false].into_iter().enumerate() {
+        configuration["EnablePathSubstitution"] = json!(enabled);
+        api.post("/System/Configuration/xbmcmetadata", &configuration)
+            .await;
+        assert_eq!(
+            api.get("/System/Configuration/xbmcmetadata").await["EnablePathSubstitution"],
+            enabled
+        );
+        let mut item = api.get(&format!("/Items/{id}")).await;
+        item["Name"] = json!(format!("NFO substitution {phase}"));
+        api.post(&format!("/Items/{id}"), &item).await;
+        let xml = std::fs::read_to_string(nfo).unwrap();
+        assert!(
+            xml.contains(&format!("<title>NFO substitution {phase}</title>")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<poster>/nfo-substitution/poster.png</poster>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<fanart>/nfo-substitution/fanart.png</fanart>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<thumb>/nfo-substitution/actor.png</thumb>"),
+            "{xml}"
+        );
+        assert_eq!(api.get(&format!("/Items/{id}/Images")).await, images);
+        for path in [
+            poster.as_str().unwrap(),
+            backdrop.as_str().unwrap(),
+            actor_path,
+        ] {
+            assert!(
+                std::path::Path::new(path).is_file(),
+                "mapping must only change exported XML"
+            );
+        }
+    }
+    configuration["SaveImagePathsInNfo"] = json!(false);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    let mut item = api.get(&format!("/Items/{id}")).await;
+    item["Name"] = json!("NFO substitution image fields disabled");
+    api.post(&format!("/Items/{id}"), &item).await;
+    let xml = std::fs::read_to_string(nfo).unwrap();
+    assert!(!xml.contains("<art>") && !xml.contains("<thumb>"), "{xml}");
+    api.post("/System/Configuration", &server).await;
+    configuration["SaveImagePathsInNfo"] = json!(true);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    item["Name"] = json!("NFO substitution mappings removed");
+    api.post(&format!("/Items/{id}"), &item).await;
+    let xml = std::fs::read_to_string(nfo).unwrap();
+    assert!(xml.contains(&format!("<poster>{}</poster>", poster.as_str().unwrap())));
+    assert!(xml.contains(&format!("<thumb>{actor_path}</thumb>")));
+    assert!(!xml.contains("/nfo-substitution/"));
+    api.post("/System/Configuration/xbmcmetadata", &original)
+        .await;
 }
 
 fn mapped_nfo_fanarts(xml: &str) -> Vec<String> {
