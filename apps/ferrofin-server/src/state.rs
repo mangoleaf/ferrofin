@@ -1197,7 +1197,12 @@ pub async fn build_app_state(
         .with_years(year_store)
         .with_by_name_store(by_name_store)
         // A stacked video's parts are found by the ids their paths derive to.
-        .with_id_derivation(id_derivation),
+        .with_id_derivation(id_derivation)
+        // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
+        // the data directory's collections/playlists folders a container's
+        // own folder lives in, the metadata root it cleans, and the
+        // `%AppDataPath%` expansion of an adopted row's path.
+        .with_app_paths(Arc::clone(&paths)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the
@@ -1654,7 +1659,10 @@ pub async fn build_app_state(
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
-    let _external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
+    // Every item delete removes the deleted rows' extracted data
+    // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
+    // manager is built before the chapter and segment managers this needs.
+    let external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
             Arc::clone(&keyframe_repository),
@@ -1662,6 +1670,7 @@ pub async fn build_app_state(
             Arc::clone(&trickplay),
             Arc::clone(&chapters),
         ));
+    library_impl.set_external_data(external_data);
 
     // ---- dto (consumes many of the above) ---------------------------------
     let dto_impl = Arc::new(

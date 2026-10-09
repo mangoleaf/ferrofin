@@ -5625,6 +5625,12 @@ mod tests {
         async fn delete_items(&self, _ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
             unimplemented!()
         }
+        async fn deletion_closure(
+            &self,
+            _ids: &[Uuid],
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            unimplemented!()
+        }
         async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
             self.saved.lock().expect("lock").extend_from_slice(items);
             Ok(())

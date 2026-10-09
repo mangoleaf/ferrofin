@@ -818,6 +818,14 @@ fn get_media_source_name_names_the_disc(
     "/m/Set"
 )]
 #[case::folder("/m/Show", true, r"{}", "/m/Show")]
+#[case::bluray_placeholder("/m/F", false, r#"{"VideoType":"BluRay","IsPlaceHolder":true}"#, "/m")]
+#[case::bluray_stack(
+    "/m/F-cd1",
+    false,
+    r#"{"VideoType":"BluRay","AdditionalParts":["/m/F-cd2"]}"#,
+    "/m"
+)]
+#[case::root_has_no_folder("/", false, r"{}", "")]
 fn containing_folder_path_follows_the_video_type(
     #[case] path: &str,
     #[case] is_folder: bool,

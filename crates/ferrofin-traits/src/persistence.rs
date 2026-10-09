@@ -591,6 +591,20 @@ pub trait ItemPersistenceService: Send + Sync {
     /// then.
     async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError>;
 
+    /// The rows [`Self::delete_items`] of `ids` would delete — the same
+    /// closure (the items, their `ParentId` descendants and the extras they
+    /// own, recursively) — each in full, read without deleting anything, in
+    /// discovery order (a row's descendants come after it). Ids with no
+    /// stored row are left out.
+    ///
+    /// A delete reads it first: it cleans each deleted row's metadata and
+    /// extracted data, which needs the rows' paths and kinds.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn deletion_closure(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
     /// Persists (inserts or updates) the given item rows.
     ///
     /// An update stamps `DateLastSaved` with the save time

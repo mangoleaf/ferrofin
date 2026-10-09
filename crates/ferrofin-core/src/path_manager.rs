@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
+use ferrofin_traits::system::{MediaLocation, PathManager, ServerApplicationPaths};
 use uuid::Uuid;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
@@ -65,11 +65,7 @@ impl FerrofinPathManager {
     /// The internal-metadata folder for an item
     /// (`{metadata}/library/{id2}/{idN}`), the non-channel layout.
     fn internal_metadata_path(&self, item_id: Uuid) -> PathBuf {
-        let dashless = id_dashless(item_id);
-        PathBuf::from(self.paths.internal_metadata_path())
-            .join("library")
-            .join(&dashless[..2])
-            .join(&dashless)
+        item_internal_metadata_path(&self.paths.internal_metadata_path(), item_id)
     }
 
     /// The two-level folder under `root` for a media-source GUID
@@ -93,20 +89,23 @@ impl PathManager for FerrofinPathManager {
     fn trickplay_directory(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
         save_with_media: bool,
     ) -> String {
         if save_with_media {
-            // Alongside the media file: {containing-folder}/{stem}.trickplay
-            let media = std::path::Path::new(media_path);
-            let folder = media.parent().unwrap_or_else(|| std::path::Path::new(""));
-            let stem = media.file_stem().map_or_else(
-                || std::ffi::OsString::from("trickplay"),
-                std::borrow::ToOwned::to_owned,
-            );
-            let mut file = PathBuf::from(stem);
-            file.set_extension("trickplay");
-            return folder.join(file).to_string_lossy().into_owned();
+            // `Path.Combine(item.ContainingFolderPath,
+            //  Path.ChangeExtension(Path.GetFileName(item.Path), ".trickplay"))`
+            // (PathManager.cs:96-103): `Alien.Resurrection.mkv` →
+            // `Alien.Resurrection.trickplay` beside the file, and a folder
+            // item's (or a disc rip's) inside the folder.
+            let file_name = std::path::Path::new(media.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return std::path::Path::new(media.containing_folder)
+                .join(change_extension(&file_name, ".trickplay"))
+                .to_string_lossy()
+                .into_owned();
         }
         let hyphenated = id_hyphenated(item_id);
         PathBuf::from(self.paths.trickplay_path())
@@ -174,7 +173,7 @@ impl PathManager for FerrofinPathManager {
             .into_owned()
     }
 
-    fn extracted_data_paths(&self, item_id: Uuid, media_path: &str) -> Vec<String> {
+    fn extracted_data_paths(&self, item_id: Uuid, media: MediaLocation<'_>) -> Vec<String> {
         // C# uses the dashless ("N") id as the media-source id for the folder
         // lookups here.
         let media_source_id = id_dashless(item_id);
@@ -185,11 +184,11 @@ impl PathManager for FerrofinPathManager {
         if let Some(folder) = self.subtitle_folder_path(&media_source_id) {
             paths.push(folder);
         }
-        paths.push(self.trickplay_directory(item_id, media_path, false));
-        if !media_path.is_empty() {
-            paths.push(self.trickplay_directory(item_id, media_path, true));
+        paths.push(self.trickplay_directory(item_id, media, false));
+        if !media.path.is_empty() {
+            paths.push(self.trickplay_directory(item_id, media, true));
         }
-        paths.push(self.chapter_image_folder_path(item_id, media_path));
+        paths.push(self.chapter_image_folder_path(item_id, media.path));
         paths
     }
 }
@@ -202,6 +201,28 @@ fn id_hyphenated(id: Uuid) -> String {
 /// The dashless (`N`) form of a GUID, matching C# `Id.ToString("N")`.
 fn id_dashless(id: Uuid) -> String {
     id.simple().to_string()
+}
+
+/// `Path.ChangeExtension(path, extension)` for a file name: everything from
+/// the last `.` is replaced by `extension` (which carries its own dot), or
+/// `extension` is appended when there is no `.`; an empty name stays empty.
+fn change_extension(name: &str, extension: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    let stem = name.rfind('.').map_or(name, |dot| &name[..dot]);
+    format!("{stem}{extension}")
+}
+
+/// `BaseItem.GetInternalMetadataPath(basePath)` for a non-channel item:
+/// `{metadata}/library/{idN[..2]}/{idN}` under the internal metadata root.
+#[must_use]
+pub(crate) fn item_internal_metadata_path(metadata_root: &str, item_id: Uuid) -> PathBuf {
+    let dashless = id_dashless(item_id);
+    PathBuf::from(metadata_root)
+        .join("library")
+        .join(&dashless[..2])
+        .join(&dashless)
 }
 
 /// A defensive leaf-file-name sanitizer, mirroring `PathHelper.GetSafeLeafFileName`.
@@ -256,11 +277,50 @@ mod tests {
     fn trickplay_directory_variants() {
         let (_tmp, m) = manager();
         let id = Uuid::parse_str("0a1b2c3d-4e5f-6789-abcd-ef0123456789").unwrap();
-        let internal = m.trickplay_directory(id, "/media/movie.mkv", false);
+        let internal = m.trickplay_directory(id, MediaLocation::of_file("/media/movie.mkv"), false);
         assert!(internal.ends_with("trickplay/0a/0a1b2c3d-4e5f-6789-abcd-ef0123456789"));
 
-        let with_media = m.trickplay_directory(id, "/media/movie.mkv", true);
+        let with_media =
+            m.trickplay_directory(id, MediaLocation::of_file("/media/movie.mkv"), true);
         assert_eq!(with_media, "/media/movie.trickplay");
+    }
+
+    /// `Path.Combine(item.ContainingFolderPath, Path.ChangeExtension(
+    /// Path.GetFileName(item.Path), ".trickplay"))` (`PathManager.cs:96-103`):
+    /// only the last extension is replaced, so two films whose names share a
+    /// first word never share a folder; a folder item's goes inside it.
+    #[rstest::rstest]
+    #[case::file("/m/movie.mkv", "/m", "/m/movie.trickplay")]
+    #[case::dotted_name("/m/Alien.Resurrection.mkv", "/m", "/m/Alien.Resurrection.trickplay")]
+    #[case::sibling("/m/Alien.mkv", "/m", "/m/Alien.trickplay")]
+    #[case::no_extension("/m/Film", "/m", "/m/Film.trickplay")]
+    #[case::trailing_dot("/m/Film.", "/m", "/m/Film.trickplay")]
+    #[case::folder_item("/m/Show", "/m/Show", "/m/Show/Show.trickplay")]
+    #[case::disc_rip(
+        "/m/Film (2000)",
+        "/m/Film (2000)",
+        "/m/Film (2000)/Film (2000).trickplay"
+    )]
+    fn a_trickplay_folder_saved_with_media_is_named_as_upstream(
+        #[case] path: &str,
+        #[case] containing_folder: &str,
+        #[case] expected: &str,
+    ) {
+        let (_tmp, m) = manager();
+        let media = MediaLocation {
+            path,
+            containing_folder,
+        };
+        assert_eq!(m.trickplay_directory(Uuid::nil(), media, true), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::replaces_last("a.b.mkv", "a.b.trickplay")]
+    #[case::appends("a", "a.trickplay")]
+    #[case::hidden(".hidden", ".trickplay")]
+    #[case::empty("", "")]
+    fn change_extension_matches_dotnet(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(super::change_extension(name, ".trickplay"), expected);
     }
 
     #[test]
@@ -277,7 +337,7 @@ mod tests {
     fn extracted_data_paths_include_all_folders() {
         let (_tmp, m) = manager();
         let id = Uuid::parse_str("0a1b2c3d-4e5f-6789-abcd-ef0123456789").unwrap();
-        let paths = m.extracted_data_paths(id, "/media/movie.mkv");
+        let paths = m.extracted_data_paths(id, MediaLocation::of_file("/media/movie.mkv"));
         // attachments, subtitles, trickplay(internal), trickplay(with-media), chapters
         assert_eq!(paths.len(), 5);
         assert!(paths.iter().any(|p| p.contains("attachments")));
@@ -290,7 +350,7 @@ mod tests {
     fn extracted_data_paths_skip_with_media_when_no_path() {
         let (_tmp, m) = manager();
         let id = Uuid::new_v4();
-        let paths = m.extracted_data_paths(id, "");
+        let paths = m.extracted_data_paths(id, MediaLocation::default());
         // No media path → no with-media trickplay folder.
         assert_eq!(paths.len(), 4);
     }

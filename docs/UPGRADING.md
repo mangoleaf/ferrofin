@@ -27,8 +27,9 @@ release changes what a refresh does once it runs:
   `album.nfo` or `artist.nfo` now wins over every remote provider:
   [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
 
-Apart from scans, who may delete an item now follows Jellyfin's rules:
-[who may delete an item](#unreleased--who-may-delete-an-item-follows-jellyfin-more-closely).
+Apart from scans, deleting an item now deletes its files, and who may delete one follows
+Jellyfin's rules:
+[deleting an item now deletes its files](#unreleased--deleting-an-item-now-deletes-its-files-as-in-jellyfin).
 
 **Upgrading from 1.3.x** causes no full pass: an unchanged item is still not reprocessed,
 and each change above reaches an item at its next refresh that asks its providers.
@@ -42,7 +43,6 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- Deleting an item leaves its media files on disk.
 - Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
   (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
   shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
@@ -50,14 +50,40 @@ Still open in this release:
 - The first scan of an adopted Jellyfin database saves every item once, as described in
   the 1.3.0 entry.
 
-## Unreleased — who may delete an item follows Jellyfin more closely
+## Unreleased — deleting an item now deletes its files, as in Jellyfin
 
-This applies to accounts that delete items: the **Delete media**, **Delete Series**,
-**Delete Episode** or **Delete** entry in an item's menu, and `DELETE /Items/{itemId}` /
-`DELETE /Items?ids=`.
+This applies to everyone who deletes media from Ferrofin: the **Delete media**,
+**Delete Series**, **Delete Episode** or **Delete** entry in an item's menu, and
+`DELETE /Items/{itemId}` / `DELETE /Items?ids=`.
 
-Ferrofin 1.3.0–1.3.2 already refused a delete from an account without deletion rights. Three
-things are refined, to match Jellyfin:
+**Deleting an item now deletes its files**, exactly as Jellyfin does. Before, Ferrofin
+removed only the item from its database: the files stayed on disk and the next scan
+brought the item back. Now:
+
+- A movie (or other video) in its own folder takes **the whole folder** and everything in
+  it: its extras, its other versions, its artwork and subtitles.
+- A movie that shares a folder with others takes its file and every `.nfo`, image,
+  subtitle or lyric file in that folder whose name **starts with** the movie's file name.
+  Deleting `Alien.mkv` therefore also deletes `Aliens.nfo` and `Aliens-poster.jpg`, as
+  Jellyfin does.
+- A trailer or other extra kept beside its film, in the film's own folder, is deleted the
+  way Jellyfin deletes it: **with the film's whole folder.** Remove such an extra from disk
+  yourself if you want to keep the film.
+- A series, season or album takes its folder; an episode takes only its own file.
+- A trickplay folder saved next to the media goes with the item.
+
+Check what a folder holds before deleting from it, and keep a backup of anything you are
+not sure about.
+
+**If your media is mounted read-only** (a read-only NFS or SMB mount, a container volume
+mounted `:ro`), a delete now fails: the server answers with an error and nothing of your
+media is deleted, the item stays in the library. As in Jellyfin, the artwork Ferrofin had
+downloaded for that item is cleared first and comes back on its next metadata refresh. To
+let Ferrofin delete media, mount it read-write for the server's user; otherwise untick
+**Allow media deletion from** for your accounts so the delete entry is not offered.
+
+**Who may delete** follows Jellyfin more closely. Ferrofin 1.3.0–1.3.2 already refused
+accounts without deletion rights; three things are refined:
 
 - An account allowed to delete in some libraries only is matched to an item's library
   through the library tree, as Jellyfin does, instead of by comparing folder paths.
@@ -76,20 +102,22 @@ from**: **All libraries** lets the account delete in every library, or tick indi
 libraries. New accounts have neither; an administrator needs one of them too (the
 administrator Ferrofin creates on first start has **All libraries**). Deleting a collection
 needs **Allow this user to manage collections** or an administrator. An account that may
-not delete an item gets `401 Unauthorized`, and nothing is deleted.
+not delete an item gets `401 Unauthorized`, and nothing is deleted; an item in a library
+the account cannot see answers `404 Not Found`, as in Jellyfin, whatever its deletion
+rights.
 
-**Deleting an item still removes it from the library database only: its media files stay
-on disk**, and the next scan finds them again. Jellyfin also deletes the files; a later
-release will too, the way Jellyfin does.
-
-One more difference from Jellyfin remains: an account with **All libraries** deletion that can
-see only some libraries can still delete, by id, an item in a library it cannot see, where
-Jellyfin answers `404`. A later release closes this.
-
+A delete now finishes even if the app that asked for it is closed half way, and
 `DELETE /Items?ids=` handles the ids one at a time, in order, as Jellyfin does: if it
 reaches an id the account may not delete, it stops with `401`, and the items before that
-one are already deleted. A delete finishes even if the app that asked for it is closed
-half way.
+one are already deleted.
+
+**Trickplay saved next to media** is now looked for where Jellyfin puts it. For a video
+whose file name has more than one dot (`Alien.Resurrection.mkv`), that is
+`Alien.Resurrection.trickplay`; Ferrofin looked for `Alien.trickplay`, which belongs to
+`Alien.mkv`. For a folder item it is inside the folder. Ferrofin itself only writes
+trickplay to its data folder, so nothing it made is left behind; trickplay a Jellyfin
+install saved next to such files is now found, moved by the trickplay move task, and
+deleted with its item.
 
 ## Unreleased — plugin metadata sources run at their rank
 

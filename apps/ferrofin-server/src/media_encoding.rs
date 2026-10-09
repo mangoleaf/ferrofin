@@ -708,7 +708,7 @@ mod tests {
         fn trickplay_directory(
             &self,
             _item_id: Uuid,
-            _media_path: &str,
+            _media: ferrofin_traits::system::MediaLocation<'_>,
             _save_with_media: bool,
         ) -> String {
             String::new()
@@ -741,7 +741,11 @@ mod tests {
         ) -> String {
             String::new()
         }
-        fn extracted_data_paths(&self, _item_id: Uuid, _media_path: &str) -> Vec<String> {
+        fn extracted_data_paths(
+            &self,
+            _item_id: Uuid,
+            _media_path: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Vec<String> {
             Vec::new()
         }
     }

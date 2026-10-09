@@ -15,10 +15,16 @@
 //!   service (the row upsert is idempotent); the `parent_id` argument is accepted
 //!   for API parity but the parent linkage is already carried on each row's
 //!   `ParentId` column.
-//! - `delete_item` deletes the item's row and its children's through the
-//!   persistence service. TODO(parity, open work item): upstream deletes the
-//!   media files (`DeleteFileLocation = true`); not ported yet, it waits on
-//!   scanner parity. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+//! - `delete_item` honors [`DeleteOptions`] in upstream's order: the item's
+//!   (and a folder's children's) internal metadata, then — with
+//!   `delete_file_location` — its files ([`crate::item_deletion`]; the
+//!   first path's failure stops the delete with every row in place), then
+//!   the rows and everything the persistence delete takes with them (`ParentId`
+//!   descendants, the extras, local versions and stacked parts it owns),
+//!   then the extracted data. TODO(parity, open work item — plan step 14):
+//!   upstream's alternate-version promotion (`LibraryManager.cs:461-552`) is
+//!   not ported yet, so deleting a primary takes its owned versions' rows
+//!   instead of promoting one. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -113,6 +119,17 @@ pub struct FerrofinLibraryManager {
     /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
     /// with no program-data path, which is the same for every media path.
     id_derivation: crate::item_type_lookup::IdDerivation,
+    /// The server's directories, for a delete that removes files: the
+    /// collections and playlists folders a delete may land in besides the
+    /// library locations, the internal metadata root it cleans, and the
+    /// `%AppDataPath%` expansion of an adopted row's path. Set by the
+    /// composition root; `None` (unit tests) confines a file delete to the
+    /// library locations and leaves stored paths as they are.
+    app_paths: Option<Arc<crate::app_paths::FerrofinServerApplicationPaths>>,
+    /// The extracted-data cleanup `DeleteItem` runs for every deleted row
+    /// (`IExternalDataManager.DeleteExternalItemFiles`). Late-bound: the
+    /// manager is built before the chapter and segment managers it needs.
+    external_data: std::sync::OnceLock<Arc<dyn ferrofin_traits::system::ExternalDataManager>>,
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -995,6 +1012,8 @@ impl FerrofinLibraryManager {
             },
             by_name: None,
             changed: None,
+            app_paths: None,
+            external_data: std::sync::OnceLock::new(),
         }
     }
 
@@ -1006,6 +1025,26 @@ impl FerrofinLibraryManager {
     ) -> Self {
         self.visibility = Some(visibility);
         self
+    }
+
+    /// Attaches the server's directories, which a file-deleting delete needs
+    /// (see the `app_paths` field).
+    #[must_use]
+    pub fn with_app_paths(
+        mut self,
+        paths: Arc<crate::app_paths::FerrofinServerApplicationPaths>,
+    ) -> Self {
+        self.app_paths = Some(paths);
+        self
+    }
+
+    /// Late-binds the extracted-data cleanup every delete runs. A second call
+    /// is ignored.
+    pub fn set_external_data(
+        &self,
+        external: Arc<dyn ferrofin_traits::system::ExternalDataManager>,
+    ) {
+        let _ = self.external_data.set(external);
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -1258,6 +1297,175 @@ impl FerrofinLibraryManager {
         self.scanner = Some(runner);
         self
     }
+}
+
+/// The file and metadata half of `LibraryManager.DeleteItem`
+/// (`LibraryManager.cs:421-625`); which paths go, and how a failure is
+/// handled, is [`crate::item_deletion`]'s.
+impl FerrofinLibraryManager {
+    /// A stored path with Jellyfin's `%AppDataPath%`/`%MetadataPath%` tokens
+    /// expanded (an adopted collection's or playlist's folder is stored that
+    /// way); Ferrofin's own rows carry resolved paths.
+    fn expand_path(&self, stored: &str) -> String {
+        self.app_paths.as_ref().map_or_else(
+            || stored.to_owned(),
+            |paths| {
+                crate::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(paths))
+                    .expand(stored)
+            },
+        )
+    }
+
+    /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
+    /// before the item's files: each row's internal metadata folder
+    /// (`{metadata}/library/{id2}/{id}`) and, for a video, its internal
+    /// extracted data (trickplay tiles, chapter images, subtitle and
+    /// attachment caches). A folder that cannot be removed is logged and
+    /// passed over, as upstream.
+    async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
+        if let Some(paths) = &self.app_paths {
+            use ferrofin_traits::system::ServerApplicationPaths as _;
+            let root = paths.internal_metadata_path();
+            let folders: Vec<std::path::PathBuf> = rows
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .map(|id| crate::path_manager::item_internal_metadata_path(&root, id))
+                .collect();
+            let removed = tokio::task::spawn_blocking(move || {
+                for folder in folders {
+                    match std::fs::remove_dir_all(&folder) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => tracing::warn!(
+                            path = %folder.display(),
+                            %err,
+                            "could not delete a deleted item's metadata folder"
+                        ),
+                    }
+                }
+            })
+            .await;
+            if let Err(err) = removed {
+                tracing::error!(%err, "deleting item metadata folders panicked");
+            }
+        }
+        if let Some(external) = self.external_data.get() {
+            for row in rows {
+                let kind = crate::item_type_lookup::kind_from_type_name(&row.type_)
+                    .unwrap_or(BaseItemKind::Folder);
+                let Ok(id) = Uuid::parse_str(&row.id) else {
+                    continue;
+                };
+                if crate::kinds::is_video(kind)
+                    && let Err(err) = external
+                        .delete_external_item_files(
+                            id,
+                            ferrofin_traits::system::MediaLocation::default(),
+                        )
+                        .await
+                {
+                    tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
+                }
+            }
+        }
+    }
+
+    /// `if ((options.DeleteFileLocation && item.IsFileProtocol) || …)`: the
+    /// item's `GetDeletePaths`, in order, through `DeleteItemPath`. A
+    /// channel item's media is its channel's (`options.DeleteFileLocation =
+    /// false`, `:425-440`), and an item with no path or a streamed one has
+    /// nothing to delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the item's directory cannot be listed
+    /// or its first path cannot be deleted — upstream's rethrown exception,
+    /// which leaves every row in place.
+    async fn delete_item_files(
+        &self,
+        id: Uuid,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+    ) -> Result<(), ServiceError> {
+        let channel = row
+            .channel_id
+            .as_deref()
+            .and_then(|c| Uuid::parse_str(c).ok())
+            .filter(|c| !c.is_nil());
+        let Some(stored) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let path = self.expand_path(stored);
+        if channel.is_some() || !crate::media_info_resolver::is_file_protocol(&path) {
+            return Ok(());
+        }
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || {
+            let paths = crate::item_deletion::delete_paths(&row, kind, &path)?;
+            crate::item_deletion::delete_item_paths(&paths)
+        })
+        .await
+        .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))?
+        .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))
+    }
+
+    /// `externalDataManager.DeleteExternalItemFiles` for the item and its
+    /// children (`:597-602`), after the rows: each one's extracted data,
+    /// with the trickplay folder saved beside its media.
+    async fn delete_external_files(&self, rows: &[&BaseItemEntity]) {
+        let Some(external) = self.external_data.get() else {
+            return;
+        };
+        for row in rows {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let path = row
+                .path
+                .as_deref()
+                .map(|p| self.expand_path(p))
+                .unwrap_or_default();
+            let containing_folder = if path.is_empty() {
+                String::new()
+            } else {
+                crate::video_versions::containing_folder_path_at(row, &path)
+            };
+            let media = ferrofin_traits::system::MediaLocation {
+                path: &path,
+                containing_folder: &containing_folder,
+            };
+            if let Err(err) = external.delete_external_item_files(id, media).await {
+                tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
+            }
+        }
+    }
+}
+
+/// `DeleteItem`'s `children`: `item.IsFolder ? GetRecursiveChildren(false) :
+/// []` — the rows below `item` by `ParentId`, out of its deletion `closure`
+/// (whose order puts each row after its parent).
+fn recursive_children<'a>(
+    item: &BaseItemEntity,
+    closure: &'a [BaseItemEntity],
+) -> Vec<&'a BaseItemEntity> {
+    if !item.is_folder {
+        return Vec::new();
+    }
+    let mut below: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    below.insert(item.id.as_str());
+    let mut children = Vec::new();
+    for row in closure {
+        if row.id != item.id
+            && row
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| below.contains(parent))
+        {
+            below.insert(row.id.as_str());
+            children.push(row);
+        }
+    }
+    children
 }
 
 #[async_trait]
@@ -1697,7 +1905,7 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
-    async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
+    async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError> {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
         }
@@ -1723,31 +1931,25 @@ impl LibraryManager for FerrofinLibraryManager {
         if !crate::kinds::can_delete(kind, has_parent) {
             return Err(ServiceError::unauthorized("Unauthorized access"));
         }
-        let mut ids = vec![id];
-        // C# `DeleteItem` cascades to a folder's children; gather the direct-child
-        // ids so the row deletion removes the subtree too.
-        //
-        // TODO(parity, open work item): upstream deletes the media files
-        // (`DeleteFileLocation = true`); not ported yet, it waits on scanner
-        // parity, so `options.delete_file_location` is not honoured and only
-        // rows go. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
-        if row.is_folder {
-            // Cascade to PHYSICAL children only. A box-set/playlist is a folder whose
-            // members are LinkedChildren (references), not owned children — deleting the
-            // container must never delete the referenced media (data loss). physical_children_only
-            // suppresses the LinkedChildren merge the browse path uses.
-            let child_query = InternalItemsQuery {
-                parent_id: id,
-                physical_children_only: true,
-                ..Default::default()
-            };
-            ids.extend(self.items.get_item_ids(&child_query).await?);
+        // `children`: a folder's rows below it, whose metadata and extracted
+        // data go with it (the persistence delete takes owned extras too).
+        let closure = self.persistence.deletion_closure(&[id]).await?;
+        let mut affected: Vec<&BaseItemEntity> = vec![&row];
+        affected.extend(recursive_children(&row, &closure));
+        // `GetMetadataPaths(item, children)` goes first (errors passed over),
+        // then the files — the first path's failure stops the delete here,
+        // with every row in place — then the rows, then the extracted data.
+        self.delete_metadata_paths(&affected).await;
+        if options.delete_file_location {
+            self.delete_item_files(id, &row, kind).await?;
         }
-        self.persistence.delete_items(&ids).await?;
-        // `ItemRemoved` (LibraryChangedNotifier). `ids[0]` is the item itself;
-        // the rest are the cascaded children, which have no rows left to read.
+        let removed = self.persistence.delete_items(&[id]).await?;
+        self.delete_external_files(&affected).await;
+        // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
+        // the delete took with it, which have no rows left to read.
         if let Some(changed) = &self.changed {
-            changed.record_removed_subtree(&row, &ids[1..]);
+            let others: Vec<Uuid> = removed.into_iter().filter(|r| *r != id).collect();
+            changed.record_removed_subtree(&row, &others);
         }
         Ok(())
     }
@@ -2317,6 +2519,9 @@ impl FerrofinLibraryManager {
             && queue.serving.is_empty()
     }
 }
+
+#[cfg(test)]
+mod delete_tests;
 
 #[cfg(test)]
 mod tests {

@@ -30,7 +30,7 @@ use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::persistence::KeyframeRepository;
-use ferrofin_traits::system::{ExternalDataManager, PathManager};
+use ferrofin_traits::system::{ExternalDataManager, MediaLocation, PathManager};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
@@ -127,8 +127,8 @@ impl FerrofinExternalDataManager {
 
     /// Removes every extracted-data folder for an item, logging and skipping
     /// failures (C# `DeleteExternalItemFiles`).
-    fn delete_files(&self, item_id: Uuid, media_path: &str) {
-        for path in self.path_manager.extracted_data_paths(item_id, media_path) {
+    fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
+        for path in self.path_manager.extracted_data_paths(item_id, media) {
             if !self.directory_remover.exists(&path) {
                 continue;
             }
@@ -144,10 +144,10 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_data(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
         // Filesystem first, then the four DB-side deletions (C# ordering).
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media);
         self.keyframe_repository
             .delete_keyframe_data(item_id)
             .await?;
@@ -162,9 +162,9 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_files(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media);
         Ok(())
     }
 }
@@ -203,7 +203,7 @@ mod tests {
         paths: Vec<String>,
     }
     impl PathManager for StubPathManager {
-        fn trickplay_directory(&self, _: Uuid, _: &str, _: bool) -> String {
+        fn trickplay_directory(&self, _: Uuid, _: MediaLocation<'_>, _: bool) -> String {
             String::new()
         }
         fn subtitle_path(&self, _: &str, _: i32, _: &str) -> Option<String> {
@@ -224,7 +224,7 @@ mod tests {
         fn chapter_image_path(&self, _: Uuid, _: &str, _: i64) -> String {
             String::new()
         }
-        fn extracted_data_paths(&self, _: Uuid, _: &str) -> Vec<String> {
+        fn extracted_data_paths(&self, _: Uuid, _: MediaLocation<'_>) -> Vec<String> {
             self.paths.clone()
         }
     }
@@ -413,7 +413,7 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_data(item, "/media/x.mkv")
+        mgr.delete_external_item_data(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete");
 
@@ -447,7 +447,7 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_files(item, "/media/x.mkv")
+        mgr.delete_external_item_files(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete files");
 

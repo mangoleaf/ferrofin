@@ -226,16 +226,50 @@ pub trait ServerApplicationPaths: Send + Sync {
 
 fn _assert_object_safe_server_application_paths(_: &dyn ServerApplicationPaths) {}
 
+/// Where an item's media sits on disk: the two `BaseItem` properties
+/// `IPathManager` reads off the item.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaLocation<'a> {
+    /// `BaseItem.Path`; empty for an item with no path.
+    pub path: &'a str,
+    /// `BaseItem.ContainingFolderPath`: the item's own folder for a folder
+    /// or a disc rip, else the directory its file is in.
+    pub containing_folder: &'a str,
+}
+
+impl<'a> MediaLocation<'a> {
+    /// The location of a file item, whose containing folder is the file's
+    /// directory (`BaseItem.ContainingFolderPath` when `!IsFolder`).
+    #[must_use]
+    pub fn of_file(path: &'a str) -> Self {
+        let containing_folder = std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or("");
+        Self {
+            path,
+            containing_folder,
+        }
+    }
+}
+
 /// Computes on-disk paths for an item's derived/extracted data.
 ///
 /// Port of `IPathManager`. The C# `BaseItem` arguments collapse to an
-/// `item_id: `[`Uuid`] plus the item's media path (`media_path`), which the C#
-/// implementation reads off the item. Methods return `Option<String>` where the
-/// C# returns `null` for an invalid media-source id.
+/// `item_id: `[`Uuid`] plus what the C# implementation reads off the item:
+/// its media path, or its [`MediaLocation`] where the containing folder
+/// matters. Methods return `Option<String>` where the C# returns `null` for
+/// an invalid media-source id.
 pub trait PathManager: Send + Sync {
-    /// The base folder for an item's trickplay tiles.
-    fn trickplay_directory(&self, item_id: Uuid, media_path: &str, save_with_media: bool)
-    -> String;
+    /// The base folder for an item's trickplay tiles: the internal one, or —
+    /// `save_with_media` — `{ContainingFolderPath}/{file name with the
+    /// extension .trickplay}` beside (or, for a folder, inside) the media.
+    fn trickplay_directory(
+        &self,
+        item_id: Uuid,
+        media: MediaLocation<'_>,
+        save_with_media: bool,
+    ) -> String;
 
     /// The path to a subtitle file for a media source + stream index.
     fn subtitle_path(
@@ -275,7 +309,7 @@ pub trait PathManager: Send + Sync {
     ) -> String;
 
     /// All folders holding an item's extracted data.
-    fn extracted_data_paths(&self, item_id: Uuid, media_path: &str) -> Vec<String>;
+    fn extracted_data_paths(&self, item_id: Uuid, media: MediaLocation<'_>) -> Vec<String>;
 }
 
 fn _assert_object_safe_path_manager(_: &dyn PathManager) {}
@@ -283,14 +317,15 @@ fn _assert_object_safe_path_manager(_: &dyn PathManager) {}
 /// Deletes an item's external (filesystem-side) data.
 ///
 /// Port of `IExternalDataManager`. The `BaseItem` argument collapses to an
-/// `item_id: `[`Uuid`] plus its media path; `CancellationToken` is dropped.
+/// `item_id: `[`Uuid`] plus its [`MediaLocation`]; `CancellationToken` is
+/// dropped.
 #[async_trait]
 pub trait ExternalDataManager: Send + Sync {
     /// Deletes all external data for an item (DB- and filesystem-side).
     async fn delete_external_item_data(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError>;
 
     /// Deletes only the filesystem-side external data (attachments, subtitles,
@@ -298,7 +333,7 @@ pub trait ExternalDataManager: Send + Sync {
     async fn delete_external_item_files(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError>;
 }
 

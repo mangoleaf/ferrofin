@@ -695,7 +695,14 @@ fn file_stem(path: &str) -> String {
 /// and the path itself for a disc rip that is no placeholder
 /// ([`crate::item_data::is_disc_folder`]).
 pub(crate) fn containing_folder_path(video: &BaseItemEntity) -> String {
-    let path = video.path.as_deref().unwrap_or_default();
+    containing_folder_path_at(video, video.path.as_deref().unwrap_or_default())
+}
+
+/// [`containing_folder_path`] for `video` stored at `path` — its row path
+/// with the `%AppDataPath%`-style prefixes expanded, as a delete removes it.
+/// A path with no parent (`/`) has none: .NET's `GetDirectoryName` is `null`
+/// there, so the result is empty.
+pub(crate) fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> String {
     if video.is_folder {
         return path.to_owned();
     }

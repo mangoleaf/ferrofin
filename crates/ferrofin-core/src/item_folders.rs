@@ -56,9 +56,11 @@ pub(crate) fn move_item_folders(
         ) {
             pairs.push((old, new));
         }
+        // The internal folder, which the media's location does not name.
+        let media = ferrofin_traits::system::MediaLocation::of_file(media_path);
         pairs.push((
-            paths.trickplay_directory(from, media_path, false),
-            paths.trickplay_directory(to, media_path, false),
+            paths.trickplay_directory(from, media, false),
+            paths.trickplay_directory(to, media, false),
         ));
         let (from_source, to_source) = (from.to_string(), to.to_string());
         for folder in [

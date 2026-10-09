@@ -1677,43 +1677,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        let mut closure: Vec<String> = Vec::new();
-        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for chunk in given.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let sql = format!(
-                r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({})"#,
-                numbered_placeholders(chunk.len())
-            );
-            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
-            for id in chunk {
-                query = query.bind(id);
-            }
-            for id in query.fetch_all(&mut *tx).await.map_err(db_err)? {
-                if known.insert(id.clone()) {
-                    closure.push(id);
-                }
-            }
-        }
-        let mut frontier = closure.clone();
-        while !frontier.is_empty() {
-            let mut next = Vec::new();
-            for chunk in frontier.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-                let sql = child_links_sql(chunk.len());
-                let mut query =
-                    sqlx::query_as::<_, ChildLinkRow>(sqlx::AssertSqlSafe(sql.as_str()));
-                for id in chunk {
-                    query = query.bind(id);
-                }
-                for (id, ..) in query.fetch_all(&mut *tx).await.map_err(db_err)? {
-                    // Only ids not seen yet go on, so ownership cycles end.
-                    if id != PLACEHOLDER_ID && known.insert(id.clone()) {
-                        next.push(id);
-                    }
-                }
-            }
-            closure.extend(next.iter().cloned());
-            frontier = next;
-        }
+        let closure: Vec<String> = deletion_closure_rows(&mut tx, &given).await?;
+        let known: std::collections::HashSet<String> = closure.iter().cloned().collect();
         detach_user_data(&mut tx, &closure).await?;
         // The containers whose membership shrinks, for their `Data` re-sync
         // after the commit (the deleted ones among them no-op there).
@@ -1763,6 +1728,34 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
             .collect())
+    }
+
+    async fn deletion_closure(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let given: Vec<String> = ids
+            .iter()
+            .map(|id| guid_to_db(*id))
+            .filter(|id| id != PLACEHOLDER_ID)
+            .collect();
+        if given.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        let closure = deletion_closure_rows(&mut conn, &given).await?;
+        let mut rows: HashMap<String, BaseItemEntity> = HashMap::with_capacity(closure.len());
+        for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = format!(
+                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
+                numbered_placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for row in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+                rows.insert(row.id.clone(), row);
+            }
+        }
+        Ok(closure.iter().filter_map(|id| rows.remove(id)).collect())
     }
 
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
@@ -5154,6 +5147,59 @@ pub(crate) fn child_links_sql(n: usize) -> String {
     )
 }
 
+/// The deletion closure of `given` (stored ids, the placeholder already
+/// dropped): the rows that exist among them, then their `ParentId` children
+/// and `OwnerId` extras, level by level to a fixed point — upstream's
+/// `ItemPersistenceService.DeleteItem` frontier loop
+/// (`ItemPersistenceService.cs:63-90`). In discovery order, so a row's
+/// descendants follow it.
+///
+/// Read on whatever connection the caller holds: [`ItemPersistenceService::
+/// delete_items`] runs it inside its transaction, and
+/// [`ItemPersistenceService::deletion_closure`] on a pooled reader.
+async fn deletion_closure_rows(
+    conn: &mut sqlx::SqliteConnection,
+    given: &[String],
+) -> Result<Vec<String>, ServiceError> {
+    let mut closure: Vec<String> = Vec::new();
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in given.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = format!(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({})"#,
+            numbered_placeholders(chunk.len())
+        );
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
+        for id in chunk {
+            query = query.bind(id);
+        }
+        for id in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+            if known.insert(id.clone()) {
+                closure.push(id);
+            }
+        }
+    }
+    let mut frontier = closure.clone();
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for chunk in frontier.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = child_links_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, ChildLinkRow>(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for (id, ..) in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+                // Only ids not seen yet go on, so ownership cycles end.
+                if id != PLACEHOLDER_ID && known.insert(id.clone()) {
+                    next.push(id);
+                }
+            }
+        }
+        closure.extend(next.iter().cloned());
+        frontier = next;
+    }
+    Ok(closure)
+}
+
 /// [`ItemPersistenceService::folder_run_time_sums`] over `n` folder ids
 /// (binds `?1..?n`) and `kinds` child types (binds after them): each folder
 /// by its primary key, and per folder a correlated sum over its non-folder
@@ -5359,6 +5405,20 @@ pub(crate) async fn seed_presentation_key(db: &Database, id: Uuid, key: &str) {
         .execute(db.writer())
         .await
         .expect("seed presentation key");
+}
+
+/// Test-only: makes every delete of row `id` abort (a `BEFORE DELETE`
+/// trigger), to prove a failed delete leaves everything as it was.
+#[cfg(test)]
+pub(crate) async fn fail_deletes_of(db: &Database, id: Uuid) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"CREATE TRIGGER "TestFailDelete" BEFORE DELETE ON "BaseItems"
+           WHEN old."Id" = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
+        guid_to_db(id)
+    )))
+    .execute(db.writer())
+    .await
+    .expect("trigger");
 }
 
 /// Test-only: plant the `Data` blob an ADOPTED Jellyfin row would carry, so the
@@ -11139,6 +11199,46 @@ mod tests {
         );
     }
 
+    /// `deletion_closure` reads exactly what `delete_items` deletes — the
+    /// same closure, with each row's path — and deletes nothing.
+    #[tokio::test]
+    async fn the_deletion_closure_is_what_delete_items_takes() {
+        let db = test_db().await;
+        let (series, season, episode, extra, season_extra, _, _) = season_with_links(&db).await;
+        crate::test_support::set_item_path(&db, episode, "/media/Show/S1/e1.mkv").await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let before = rows_and_links(&db).await;
+
+        let closure = svc
+            .deletion_closure(&[season, Uuid::new_v4()])
+            .await
+            .expect("closure");
+        assert_eq!(rows_and_links(&db).await, before, "nothing deleted");
+        assert_eq!(closure[0].id, guid_to_db(season), "the item first");
+        let mut ids: Vec<Uuid> = closure
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        ids.sort_unstable();
+        let mut deleted = svc.delete_items(&[season]).await.expect("delete");
+        deleted.sort_unstable();
+        assert_eq!(ids, deleted);
+        let mut expected = vec![season, episode, extra, season_extra];
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
+        assert!(
+            closure.iter().any(|row| row.id == guid_to_db(episode)
+                && row.path.as_deref() == Some("/media/Show/S1/e1.mkv")),
+            "each row in full"
+        );
+        assert!(svc.deletion_closure(&[]).await.expect("empty").is_empty());
+        assert!(
+            crate::test_support::fetch_item_opt(&db, series)
+                .await
+                .is_some()
+        );
+    }
+
     /// Upstream's `ItemPersistenceDeleteItemTests`
     /// (`tests/Jellyfin.Server.Implementations.Tests/Item/
     /// ItemPersistenceDeleteItemTests.cs`), transliterated: each seeds
@@ -11203,14 +11303,7 @@ mod tests {
                 .await
                 .unwrap();
         let before = rows_and_links(&db).await;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            r#"CREATE TRIGGER "TestFailDelete" BEFORE DELETE ON "BaseItems"
-               WHEN old."Id" = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
-            guid_to_db(extra)
-        )))
-        .execute(db.writer())
-        .await
-        .expect("trigger");
+        super::fail_deletes_of(&db, extra).await;
         let svc = FerrofinItemPersistenceService::new(db.clone());
         assert!(svc.delete_items(&[season]).await.is_err());
         assert_eq!(rows_and_links(&db).await, before, "nothing half-deleted");

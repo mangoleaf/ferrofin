@@ -1,17 +1,28 @@
-//! Who may delete a library item: `BaseItem.CanDelete(User)`
-//! (`BaseItem.cs:844-897`) with its overrides, the check upstream's
-//! `LibraryController.DeleteItem`/`DeleteItems` (`LibraryController.cs:362-445`
-//! at master `96bca6f0bd`) answer `401` on.
+//! Deleting a library item: who may, and which files go with it.
 //!
-//! [`can_delete`] is the one implementation: the DTO's per-user `CanDelete`
-//! (which jellyfin-web shows its "Delete" entry by) and the delete endpoints
-//! (through `DtoService::can_delete`) both read it, so they agree.
+//! Ports the two halves of upstream's `DELETE /Items/{itemId}`
+//! (`LibraryController.DeleteItem`/`DeleteItems`, `LibraryController.cs:362-445`
+//! at master `96bca6f0bd`), exactly — no Ferrofin correction (owner decision
+//! 2026-10-04):
 //!
-//! TODO(parity, open work item): what a delete removes is not here. Upstream
-//! deletes the media files (`DeleteFileLocation = true`); not ported yet, it
-//! waits on scanner parity. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+//! - **Who may** — `BaseItem.CanDelete(User)` (`BaseItem.cs:844-897`) with
+//!   its overrides. [`can_delete`] is the one implementation: the DTO's
+//!   per-user `CanDelete` (which jellyfin-web shows its "Delete" entry by) and
+//!   the endpoints' `401` both read it.
+//! - **What goes** — `LibraryManager.DeleteItem` with
+//!   `DeleteFileLocation = true` (`LibraryManager.cs:421-625`):
+//!   [`delete_paths`] is `BaseItem.GetDeletePaths` (`BaseItem.cs:2598-2618`,
+//!   `Video.cs:727-742`, `Episode.cs:288-298`) and [`delete_item_paths`] is
+//!   its `DeleteItemPath` loop (`:627-682`): the paths in order, only the
+//!   first one's failure rethrown, the rest swallowed.
+//!
+//! Upstream's behaviour is kept where it surprises: a video not in a mixed
+//! folder takes its whole containing folder (a trailer or another version
+//! beside it included), and a mixed-folder item's sidecars match by name
+//! prefix (`Alien.mkv` takes `Aliens.nfo`).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -190,6 +201,201 @@ pub(crate) fn can_delete(item: &BaseItemEntity, kind: BaseItemKind, facts: &Dele
             permissions,
             facts.libraries.get(&item_uuid(item)),
         )
+}
+
+/// The extensions `BaseItem.GetLocalMetadataFilesToDelete` removes beside a
+/// file in a mixed folder (`BaseItem._supportedExtensions`, `BaseItem.cs:58-77`:
+/// `SupportedImageExtensions` plus the metadata, subtitle and lyric ones).
+const SIDECAR_EXTENSIONS: [&str; 21] = [
+    "png", "jpg", "jpeg", "webp", "tbn", "gif", "svg", "nfo", "xml", "srt", "vtt", "sub", "sup",
+    "idx", "txt", "edl", "bif", "smi", "ttml", "lrc", "elrc",
+];
+
+/// One path `BaseItem.GetDeletePaths` names — a `FileSystemMetadata`'s
+/// `FullName` and `IsDirectory`, which decides `Directory.Delete(path, true)`
+/// or `File.Delete(path)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeletePath {
+    /// The file or folder.
+    pub(crate) path: PathBuf,
+    /// Whether it is removed as a folder, with everything in it.
+    pub(crate) is_directory: bool,
+}
+
+/// `IFileSystem.GetFileSystemInfo(path)` (`ManagedFileSystem.cs:185-215`): an
+/// existing path is what it is on disk; a missing one is a file when its
+/// name has an extension, else a folder.
+fn file_system_info(path: &Path) -> DeletePath {
+    let is_directory =
+        std::fs::metadata(path).map_or_else(|_| path.extension().is_none(), |meta| meta.is_dir());
+    DeletePath {
+        path: path.to_path_buf(),
+        is_directory,
+    }
+}
+
+/// `string.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`: the
+/// invariant simple uppercase mapping keeps every character one character,
+/// so comparing the mapped strings is comparing character by character.
+fn starts_with_ordinal_ignore_case(text: &str, prefix: &str) -> bool {
+    use ferrofin_util::string_extensions::upper_invariant;
+    upper_invariant(text).starts_with(&upper_invariant(prefix))
+}
+
+/// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): for a
+/// file in a mixed folder, every file in its directory with a supported
+/// extension whose name (without extension) starts with the item's — so
+/// `Alien.mkv` takes `Alien.nfo`, `Alien-poster.jpg` and `Aliens.nfo` alike.
+/// Nothing for a folder or for an item not in a mixed folder.
+///
+/// The listing is `GetFiles(dir, extensions, false, false)` with
+/// `IgnoreInaccessible`: a directory that is gone or unreadable lists
+/// nothing, and an entry that cannot be read is skipped.
+///
+/// # Errors
+///
+/// Any other failure to list the directory.
+fn local_metadata_files_to_delete(
+    item: &BaseItemEntity,
+    path: &Path,
+) -> std::io::Result<Vec<DeletePath>> {
+    if item.is_folder || !item.is_in_mixed_folder {
+        return Ok(Vec::new());
+    }
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_stem().and_then(|s| s.to_str()))
+    else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+    let mut out: Vec<DeletePath> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| candidate.is_file())
+        .filter(|candidate| {
+            candidate
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| {
+                    SIDECAR_EXTENSIONS
+                        .iter()
+                        .any(|s| ferrofin_util::string_extensions::equals_ordinal_ignore_case(s, e))
+                })
+        })
+        .filter(|candidate| {
+            candidate
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| starts_with_ordinal_ignore_case(stem, file_name))
+        })
+        .map(|candidate| DeletePath {
+            path: candidate,
+            is_directory: false,
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `BaseItem.GetDeletePaths` and its overrides — what deleting the item
+/// removes from disk, the one upstream calls required first:
+///
+/// - an `Episode` (`Episode.cs:288-298`): its path (a folder only if the
+///   row is one) and its local metadata files;
+/// - any other video not in a mixed folder (`Video.cs:727-742`): its whole
+///   [`crate::video_versions::containing_folder_path_at`], whatever else is in it;
+/// - anything else (`BaseItem.cs:2598-2604`): its path, as it is on disk,
+///   and its local metadata files ([`local_metadata_files_to_delete`]).
+///
+/// # Errors
+///
+/// A failure listing the item's directory for its sidecars.
+pub(crate) fn delete_paths(
+    item: &BaseItemEntity,
+    kind: BaseItemKind,
+    path: &str,
+) -> std::io::Result<Vec<DeletePath>> {
+    let file = Path::new(path);
+    let mut paths = if kind == BaseItemKind::Episode {
+        vec![DeletePath {
+            path: file.to_path_buf(),
+            is_directory: item.is_folder,
+        }]
+    } else if kinds::is_video(kind) && !item.is_in_mixed_folder {
+        return Ok(vec![DeletePath {
+            path: PathBuf::from(crate::video_versions::containing_folder_path_at(item, path)),
+            is_directory: true,
+        }]);
+    } else {
+        vec![file_system_info(file)]
+    };
+    paths.extend(local_metadata_files_to_delete(item, file)?);
+    Ok(paths)
+}
+
+/// `LibraryManager.DeleteItemPath` (`LibraryManager.cs:627-682`): an existing
+/// path is removed — recursively for a folder — and a path that is already
+/// gone only leaves the row to delete. Any other failure is returned when
+/// the path is `required`, and logged and passed over otherwise.
+///
+/// # Errors
+///
+/// The removal's failure, for a `required` path.
+fn delete_item_path(target: &DeletePath, required: bool) -> std::io::Result<()> {
+    let path = &target.path;
+    // `Directory.Exists(path) || File.Exists(path)`, both following links.
+    if !(path.is_dir() || path.is_file()) {
+        return Ok(());
+    }
+    tracing::info!(path = %path.display(), "deleting item path");
+    let removed = if target.is_directory {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                path = %path.display(),
+                "not found, only removing it from the database"
+            );
+            Ok(())
+        }
+        Err(err) if required => Err(std::io::Error::new(
+            err.kind(),
+            format!("{}: {err}", path.display()),
+        )),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "could not delete an item's file; deleting the item anyway");
+            Ok(())
+        }
+    }
+}
+
+/// `DeleteItem`'s loop over `GetDeletePaths` (`LibraryManager.cs:582-594`):
+/// "Assume only the first is required" — the first path's failure is
+/// returned (nothing after it, and no row, is deleted then); the others'
+/// failures are passed over.
+///
+/// # Errors
+///
+/// The first path's removal failure.
+pub(crate) fn delete_item_paths(paths: &[DeletePath]) -> std::io::Result<()> {
+    for (index, target) in paths.iter().enumerate() {
+        delete_item_path(target, index == 0)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -430,5 +636,249 @@ mod tests {
             BaseItemKind::Playlist,
             &DeleteFacts::default()
         ));
+    }
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("dir");
+        }
+        std::fs::write(path, b"x").expect("write");
+    }
+
+    fn rows(paths: &[DeletePath]) -> Vec<(PathBuf, bool)> {
+        paths
+            .iter()
+            .map(|p| (p.path.clone(), p.is_directory))
+            .collect()
+    }
+
+    /// `Video.GetDeletePaths` (`Video.cs:727-742`): a video not in a mixed
+    /// folder names its whole `ContainingFolderPath` — the trailer and the
+    /// other version beside it go with it, as upstream.
+    #[test]
+    fn a_video_not_in_a_mixed_folder_takes_its_whole_folder() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let folder = tmp.path().join("Film (2000)");
+        let file = folder.join("Film (2000).mkv");
+        touch(&file);
+        touch(&folder.join("Film (2000)-trailer.mkv"));
+        touch(&folder.join("Film (2000) - 4K.mkv"));
+        for kind in [
+            BaseItemKind::Movie,
+            BaseItemKind::Trailer,
+            BaseItemKind::Video,
+        ] {
+            let item = row(kind, file.to_str());
+            assert_eq!(
+                rows(&delete_paths(&item, kind, file.to_str().unwrap_or_default()).expect("paths")),
+                vec![(folder.clone(), true)],
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): a
+    /// mixed-folder item's sidecars match by name prefix, ignoring case —
+    /// `Alien.mkv` takes `Aliens.nfo` too — with a supported extension only.
+    #[test]
+    fn a_mixed_folder_item_takes_its_path_then_every_prefix_sidecar() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = tmp.path().join("Movies");
+        let file = dir.join("Alien.mkv");
+        for name in [
+            "Alien.mkv",
+            "Alien.nfo",
+            "Alien-poster.jpg",
+            "alien.EN.SRT",
+            "Aliens.nfo",
+            "Aliens.mkv",
+            "Alien.mp4",
+            "Predator.nfo",
+            "Alien",
+        ] {
+            touch(&dir.join(name));
+        }
+        std::fs::create_dir_all(dir.join("Alien.trickplay")).expect("dir");
+        let mut mixed = row(BaseItemKind::Movie, file.to_str());
+        mixed.is_in_mixed_folder = true;
+        let paths = delete_paths(
+            &mixed,
+            BaseItemKind::Movie,
+            file.to_str().unwrap_or_default(),
+        )
+        .expect("paths");
+        assert_eq!(
+            rows(&paths),
+            vec![
+                (file.clone(), false),
+                (dir.join("Alien-poster.jpg"), false),
+                (dir.join("Alien.nfo"), false),
+                (dir.join("Aliens.nfo"), false),
+                (dir.join("alien.EN.SRT"), false),
+            ]
+        );
+    }
+
+    /// `Episode.GetDeletePaths` (`Episode.cs:288-298`): the episode's own
+    /// path, never its season folder; its sidecars only in a mixed folder.
+    /// A folder item names its own path, as it is on disk.
+    #[test]
+    fn an_episode_keeps_its_folder_and_a_series_names_its_own() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("Show/Season 1/S01E01.mkv");
+        touch(&file);
+        touch(&tmp.path().join("Show/Season 1/S01E01.nfo"));
+        let episode = row(BaseItemKind::Episode, file.to_str());
+        assert_eq!(
+            rows(
+                &delete_paths(
+                    &episode,
+                    BaseItemKind::Episode,
+                    file.to_str().unwrap_or_default()
+                )
+                .expect("paths")
+            ),
+            vec![(file.clone(), false)],
+            "not in a mixed folder: no sidecars"
+        );
+        let mut mixed = episode.clone();
+        mixed.is_in_mixed_folder = true;
+        assert_eq!(
+            delete_paths(
+                &mixed,
+                BaseItemKind::Episode,
+                file.to_str().unwrap_or_default()
+            )
+            .expect("paths")
+            .len(),
+            2
+        );
+        let series_dir = tmp.path().join("Show");
+        let mut series = row(BaseItemKind::Series, series_dir.to_str());
+        series.is_folder = true;
+        assert_eq!(
+            rows(
+                &delete_paths(
+                    &series,
+                    BaseItemKind::Series,
+                    series_dir.to_str().unwrap_or_default()
+                )
+                .expect("paths")
+            ),
+            vec![(series_dir.clone(), true)]
+        );
+        // `GetFileSystemInfo`: a missing path with an extension is a file,
+        // one without is a folder.
+        let gone_book = row(BaseItemKind::Book, Some("/gone/a.epub"));
+        assert!(
+            !delete_paths(&gone_book, BaseItemKind::Book, "/gone/a.epub").expect("paths")[0]
+                .is_directory
+        );
+        let gone_folder = row(BaseItemKind::Folder, Some("/gone/folder"));
+        assert!(
+            delete_paths(&gone_folder, BaseItemKind::Folder, "/gone/folder").expect("paths")[0]
+                .is_directory
+        );
+    }
+
+    /// A stacked video in a mixed folder names its first part and its prefix
+    /// sidecars only (upstream deletes no other part); a disc rip not in a
+    /// mixed folder names its own folder.
+    #[test]
+    fn a_stack_and_a_disc_rip_follow_upstream() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cd1 = tmp.path().join("Film-cd1.avi");
+        let cd2 = tmp.path().join("Film-cd2.avi");
+        touch(&cd1);
+        touch(&cd2);
+        let mut stack = row(BaseItemKind::Movie, cd1.to_str());
+        stack.is_in_mixed_folder = true;
+        stack.data = Some(r#"{"AdditionalParts":["x"]}"#.to_owned());
+        assert_eq!(
+            rows(
+                &delete_paths(
+                    &stack,
+                    BaseItemKind::Movie,
+                    cd1.to_str().unwrap_or_default()
+                )
+                .expect("paths")
+            ),
+            vec![(cd1.clone(), false)]
+        );
+        let disc_dir = tmp.path().join("Disc (2000)");
+        std::fs::create_dir_all(disc_dir.join("BDMV")).expect("dir");
+        let mut disc = row(BaseItemKind::Movie, disc_dir.to_str());
+        disc.data = Some(r#"{"VideoType":"BluRay"}"#.to_owned());
+        assert_eq!(
+            rows(
+                &delete_paths(
+                    &disc,
+                    BaseItemKind::Movie,
+                    disc_dir.to_str().unwrap_or_default()
+                )
+                .expect("paths")
+            ),
+            vec![(disc_dir.clone(), true)]
+        );
+    }
+
+    /// `DeleteItemPath` (`LibraryManager.cs:627-682`): the first path's
+    /// failure is rethrown, the later ones' are swallowed; a missing path is
+    /// skipped; a folder goes with its contents.
+    #[test]
+    fn only_the_first_paths_failure_is_returned() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let folder = tmp.path().join("Film");
+        touch(&folder.join("sub/a.nfo"));
+        let file = tmp.path().join("b.nfo");
+        touch(&file);
+        let as_file = DeletePath {
+            path: folder.clone(),
+            is_directory: false,
+        };
+        // Removing a folder as a file fails: first → returned, nothing after
+        // it is touched.
+        let err = delete_item_paths(&[
+            as_file.clone(),
+            DeletePath {
+                path: file.clone(),
+                is_directory: false,
+            },
+        ])
+        .expect_err("required");
+        assert!(err.to_string().contains("Film"), "{err}");
+        assert!(folder.is_dir() && file.is_file());
+        // Later → swallowed, the rest still deleted.
+        delete_item_paths(&[
+            DeletePath {
+                path: file.clone(),
+                is_directory: false,
+            },
+            as_file,
+            DeletePath {
+                path: tmp.path().join("gone.srt"),
+                is_directory: false,
+            },
+        ])
+        .expect("only the first is required");
+        assert!(!file.exists() && folder.is_dir());
+        delete_item_paths(&[DeletePath {
+            path: folder.clone(),
+            is_directory: true,
+        }])
+        .expect("folder");
+        assert!(!folder.exists());
+        delete_item_paths(&[DeletePath {
+            path: folder,
+            is_directory: true,
+        }])
+        .expect("a missing first path is not a failure");
+    }
+
+    #[test]
+    fn ordinal_ignore_case_prefix_matches_dotnet() {
+        assert!(starts_with_ordinal_ignore_case("ALIENS", "alien"));
+        assert!(starts_with_ordinal_ignore_case("Élan vital", "élan"));
+        assert!(!starts_with_ordinal_ignore_case("Ali", "Alien"));
     }
 }
