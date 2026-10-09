@@ -56,6 +56,19 @@ pub struct StoredSegment {
     pub config_hash: String,
 }
 
+/// One mode's state for a season (`DbSeasonState`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeasonState {
+    /// The season's analyzer action for the mode.
+    pub action: AnalyzerAction,
+    /// The episodes the mode has analysed (with or without a result).
+    pub episode_ids: HashSet<Uuid>,
+    /// The configuration hash they were analysed under.
+    pub config_hash: String,
+    /// The episodes the last settled-season reanalysis covered.
+    pub settled_episode_ids: HashSet<Uuid>,
+}
+
 /// What `UpdateTimestampAsync` does with a new segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDecision {
@@ -294,6 +307,67 @@ pub trait IntroSkipperStore: Send + Sync {
     /// Every item with a stored segment.
     async fn stored_item_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
 
+    /// The season's state per mode (modes never touched are absent).
+    async fn season_states(
+        &self,
+        season_id: Uuid,
+    ) -> Result<HashMap<AnalysisMode, SeasonState>, ServiceError>;
+
+    /// Records the episodes `mode` analysed and the hash they were analysed
+    /// under, keeping the action (`SetEpisodeIdsAsync`).
+    async fn set_episode_ids(
+        &self,
+        season_id: Uuid,
+        mode: AnalysisMode,
+        episode_ids: &[Uuid],
+        config_hash: &str,
+    ) -> Result<(), ServiceError>;
+
+    /// Drops `episode_ids` from the season's analysed lists — of `mode`, or of
+    /// every mode (`RemoveEpisodeIdAsync`, `ClearExcludedTimestampsAsync`);
+    /// every season when `season_id` is `None`.
+    async fn remove_episode_ids(
+        &self,
+        season_id: Option<Uuid>,
+        mode: Option<AnalysisMode>,
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError>;
+
+    /// Empties the season's analysed lists, of `modes` or of every mode
+    /// (`EraseSeasonAsync`).
+    async fn clear_episode_ids(
+        &self,
+        season_id: Uuid,
+        modes: Option<&[AnalysisMode]>,
+    ) -> Result<(), ServiceError>;
+
+    /// Deletes the items' automatic `mode` segments analysed under another
+    /// hash (`CleanStaleAutomaticSegmentsAsync`); user-provided ones stay.
+    async fn clean_stale_automatic(
+        &self,
+        item_ids: &[Uuid],
+        mode: AnalysisMode,
+        config_hash: &str,
+    ) -> Result<u64, ServiceError>;
+
+    /// Records that a settled-season reanalysis of `modes` covered
+    /// `episode_ids` (`RecordSettleReanalysisAsync`).
+    async fn record_settled(
+        &self,
+        season_id: Uuid,
+        modes: &[AnalysisMode],
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError>;
+
+    /// Deletes the items' automatic segments of `modes` and empties those
+    /// modes' analysed lists, together (`ResetSeasonForReanalysisAsync`).
+    async fn reset_season(
+        &self,
+        season_id: Uuid,
+        episode_ids: &[Uuid],
+        modes: &[AnalysisMode],
+    ) -> Result<(), ServiceError>;
+
     /// Deletes every segment that is not valid (`End <= 0`) — what upstream's
     /// `RebuildDatabaseAsync` leaves behind when it restores its backup; how
     /// many went.
@@ -383,7 +457,7 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
 /// The [`InMemoryIntroSkipperStore`] state.
 #[derive(Debug, Default)]
 struct Memory {
-    actions: HashMap<(Uuid, AnalysisMode), AnalyzerAction>,
+    states: HashMap<(Uuid, AnalysisMode), SeasonState>,
     segments: Vec<StoredSegment>,
     disabled: HashSet<(Uuid, Uuid)>,
 }
@@ -409,10 +483,10 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
     ) -> Result<HashMap<AnalysisMode, AnalyzerAction>, ServiceError> {
         Ok(self
             .lock()?
-            .actions
+            .states
             .iter()
             .filter(|((season, _), _)| *season == season_id)
-            .map(|((_, mode), action)| (*mode, *action))
+            .map(|((_, mode), state)| (*mode, state.action))
             .collect())
     }
 
@@ -423,7 +497,7 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
     ) -> Result<(), ServiceError> {
         let mut memory = self.lock()?;
         for (mode, action) in actions {
-            memory.actions.insert((season_id, *mode), *action);
+            memory.states.entry((season_id, *mode)).or_default().action = *action;
         }
         Ok(())
     }
@@ -431,7 +505,7 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
     async fn retain_seasons(&self, season_ids: &[Uuid]) -> Result<(), ServiceError> {
         let mut memory = self.lock()?;
         memory
-            .actions
+            .states
             .retain(|(season, _), _| season_ids.contains(season));
         memory
             .disabled
@@ -567,6 +641,115 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
         let before = memory.segments.len();
         memory.segments.retain(|s| s.end > 0.0);
         Ok((before - memory.segments.len()) as u64)
+    }
+
+    async fn season_states(
+        &self,
+        season_id: Uuid,
+    ) -> Result<HashMap<AnalysisMode, SeasonState>, ServiceError> {
+        Ok(self
+            .lock()?
+            .states
+            .iter()
+            .filter(|((season, _), _)| *season == season_id)
+            .map(|((_, mode), state)| (*mode, state.clone()))
+            .collect())
+    }
+
+    async fn set_episode_ids(
+        &self,
+        season_id: Uuid,
+        mode: AnalysisMode,
+        episode_ids: &[Uuid],
+        config_hash: &str,
+    ) -> Result<(), ServiceError> {
+        let mut memory = self.lock()?;
+        let state = memory.states.entry((season_id, mode)).or_default();
+        state.episode_ids = episode_ids.iter().copied().collect();
+        config_hash.clone_into(&mut state.config_hash);
+        Ok(())
+    }
+
+    async fn remove_episode_ids(
+        &self,
+        season_id: Option<Uuid>,
+        mode: Option<AnalysisMode>,
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        for ((season, state_mode), state) in &mut self.lock()?.states {
+            if season_id.is_none_or(|s| s == *season) && mode.is_none_or(|m| m == *state_mode) {
+                state.episode_ids.retain(|id| !episode_ids.contains(id));
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_episode_ids(
+        &self,
+        season_id: Uuid,
+        modes: Option<&[AnalysisMode]>,
+    ) -> Result<(), ServiceError> {
+        for ((season, mode), state) in &mut self.lock()?.states {
+            if *season == season_id && modes.is_none_or(|m| m.contains(mode)) {
+                state.episode_ids.clear();
+            }
+        }
+        Ok(())
+    }
+
+    async fn clean_stale_automatic(
+        &self,
+        item_ids: &[Uuid],
+        mode: AnalysisMode,
+        config_hash: &str,
+    ) -> Result<u64, ServiceError> {
+        let mut memory = self.lock()?;
+        let before = memory.segments.len();
+        memory.segments.retain(|s| {
+            !(item_ids.contains(&s.item_id)
+                && s.mode == mode
+                && !s.is_user_provided
+                && s.config_hash != config_hash)
+        });
+        Ok((before - memory.segments.len()) as u64)
+    }
+
+    async fn record_settled(
+        &self,
+        season_id: Uuid,
+        modes: &[AnalysisMode],
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        let mut memory = self.lock()?;
+        for mode in modes {
+            memory
+                .states
+                .entry((season_id, *mode))
+                .or_default()
+                .settled_episode_ids = episode_ids.iter().copied().collect();
+        }
+        Ok(())
+    }
+
+    async fn reset_season(
+        &self,
+        season_id: Uuid,
+        episode_ids: &[Uuid],
+        modes: &[AnalysisMode],
+    ) -> Result<(), ServiceError> {
+        if episode_ids.is_empty() || modes.is_empty() {
+            return Ok(());
+        }
+        let mut memory = self.lock()?;
+        memory.segments.retain(|s| {
+            !(episode_ids.contains(&s.item_id) && modes.contains(&s.mode) && !s.is_user_provided)
+        });
+        for ((season, mode), state) in &mut memory.states {
+            if *season == season_id && modes.contains(mode) {
+                state.episode_ids.clear();
+            }
+        }
+        Ok(())
     }
 }
 

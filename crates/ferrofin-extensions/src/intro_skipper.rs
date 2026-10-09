@@ -184,8 +184,8 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
             return Ok(intro_store::ExcludedClear::default());
         }
         let removed_segments = self.actions.delete_items(&ids).await?;
-        // TODO(intro-skipper step 4): drop the ids from the seasons' analysed
-        // episode lists, as upstream does.
+        // Out of every season's analysed lists, as upstream edits each state.
+        self.actions.remove_episode_ids(None, None, &ids).await?;
         let removed_cache_entries = self.erase_cache_files(Some(&ids), None).await?;
         if config.update_media_segments {
             for &item_id in &ids {
@@ -795,6 +795,10 @@ impl DetectSegmentsTask {
         let ids: Vec<Uuid> = entries.iter().map(|e| e.episode_id).collect();
         if let Err(err) = self.actions.delete_items(&ids).await {
             tracing::error!(%err, %season_id, "intro skipper: could not erase the season to rescan");
+            return;
+        }
+        if let Err(err) = self.actions.clear_episode_ids(season_id, None).await {
+            tracing::error!(%err, %season_id, "intro skipper: could not reset the season to rescan");
             return;
         }
         if let Err(err) = self.erase_cache_files(Some(&ids), None).await {

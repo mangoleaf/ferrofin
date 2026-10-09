@@ -106,3 +106,57 @@ async fn published_segments_seed_the_tier_and_take_jellyfins_provider_id() {
         [JELLYFIN_ID, JELLYFIN_ID, JELLYFIN_ID, "SomeOtherProvider"]
     );
 }
+
+/// Migration 0038 moves 0036's analyzer actions into the full season-state
+/// table and drops the old one.
+#[tokio::test]
+async fn analyzer_actions_move_into_the_season_states() {
+    let db = ferrofin_db::Database::connect_in_memory()
+        .await
+        .expect("database");
+    let pool = db.pool().clone();
+    let full = sqlx::migrate!("./migrations");
+    let before = Migrator {
+        migrations: Cow::Owned(
+            full.migrations
+                .iter()
+                .filter(|m| m.version < 38)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate!("./migrations")
+    };
+    before.run(&pool).await.expect("migrations through 0037");
+    sqlx::query(
+        r#"INSERT INTO "FerrofinIntroSkipperAnalyzerActions" ("SeasonId", "Mode", "Action")
+           VALUES ('0000000a-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 1, 4)"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("seed action");
+    full.run(&pool).await.expect("migration 0038");
+    let rows: Vec<(String, i32, i32, String, String)> = sqlx::query_as(
+        r#"SELECT "SeasonId", "Type", "Action", "EpisodeIds", "ConfigHash"
+           FROM "FerrofinIntroSkipperSeasonStates""#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("states");
+    assert_eq!(
+        rows,
+        [(
+            "0000000a-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_owned(),
+            1,
+            4,
+            "[]".to_owned(),
+            String::new()
+        )]
+    );
+    let old: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE name = 'FerrofinIntroSkipperAnalyzerActions'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("master");
+    assert!(old.is_none());
+}

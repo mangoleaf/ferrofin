@@ -526,8 +526,8 @@ struct DeleteSegmentQuery {
 /// the plugin's tier goes first (by type, and by the published segment's
 /// bounds when it exists; a Commercial needs them), then the published
 /// segment.
-/// TODO(intro-skipper step 4): `RemoveEpisodeIdAsync` (the season state's
-/// analysed-episode list), so the episode is re-analysed.
+/// Then the episode leaves the mode's analysed list (`RemoveEpisodeIdAsync`),
+/// so the next analysis treats it as not analysed.
 async fn delete_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -590,6 +590,25 @@ async fn delete_segment(
         }
         return Err(err.into());
     }
+    // An episode's season, else the item itself (a movie is its own season).
+    let season_id = state
+        .library
+        .get_item_by_id(item_id)
+        .await?
+        .and_then(|item| {
+            (item.type_.rsplit('.').next() == Some("Episode"))
+                .then(|| {
+                    item.season_id
+                        .as_deref()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                })
+                .flatten()
+        })
+        .unwrap_or(item_id);
+    state
+        .intro_skipper
+        .remove_episode_ids(Some(season_id), Some(mode), &[item_id])
+        .await?;
     Ok(StatusCode::OK)
 }
 
@@ -867,15 +886,24 @@ async fn erase_season(
         .iter()
         .filter_map(|e| Uuid::parse_str(&e.id).ok())
         .collect();
-    erase_items(&state, &ids, query.erase_cache == Some(true)).await?;
+    erase_items(&state, season_id, &ids, query.erase_cache == Some(true)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `EraseSeasonAsync`'s body: every segment of `ids` goes, user-provided too,
 /// the cache with them when asked, then the (now empty) set is republished.
-/// TODO(intro-skipper step 4): clear the season state's analysed-episode lists.
-async fn erase_items(state: &AppState, ids: &[Uuid], erase_cache: bool) -> Result<(), ApiError> {
+/// The season's analysed-episode lists are emptied, so it is analysed afresh.
+async fn erase_items(
+    state: &AppState,
+    season_id: Uuid,
+    ids: &[Uuid],
+    erase_cache: bool,
+) -> Result<(), ApiError> {
     state.intro_skipper.delete_items(ids).await?;
+    state
+        .intro_skipper
+        .clear_episode_ids(season_id, None)
+        .await?;
     if erase_cache {
         state
             .intro_skipper_analysis
@@ -906,7 +934,13 @@ async fn erase_movie(
     if !is_movie {
         return Err(ApiError::NotFound(format!("movie {movie_id}")));
     }
-    erase_items(&state, &[movie_id], query.erase_cache == Some(true)).await?;
+    erase_items(
+        &state,
+        movie_id,
+        &[movie_id],
+        query.erase_cache == Some(true),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

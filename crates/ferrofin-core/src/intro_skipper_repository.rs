@@ -1,6 +1,6 @@
 //! The SQLite [`IntroSkipperStore`]: the Intro Skipper's own tier in
-//! Ferrofin-owned tables — per-season analyzer actions
-//! (`FerrofinIntroSkipperAnalyzerActions`, migration 0036), segments
+//! Ferrofin-owned tables — per-season state
+//! (`FerrofinIntroSkipperSeasonStates`, migration 0038), segments
 //! (`FerrofinIntroSkipperSegments`) and disabled episodes
 //! (`FerrofinIntroSkipperDisabledEpisodes`, migration 0037). Port of the
 //! plugin's `Plugin.cs` database methods; the update rules are
@@ -14,7 +14,8 @@ use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::json::enums::JsonEnum as _;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{
-    IntroSkipperStore, SEGMENT_COMPARISON_EPSILON, StoredSegment, UpdateDecision, decide_update,
+    IntroSkipperStore, SEGMENT_COMPARISON_EPSILON, SeasonState, StoredSegment, UpdateDecision,
+    decide_update,
 };
 use uuid::Uuid;
 
@@ -69,6 +70,16 @@ fn to_segment(
     })
 }
 
+/// A stored JSON id list (an unreadable one reads as empty, so the episodes
+/// are simply analysed again).
+fn id_set(json: &str) -> HashSet<Uuid> {
+    serde_json::from_str::<Vec<String>>(json)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect()
+}
+
 /// `ids` as a JSON array for `json_each`.
 fn json_ids(ids: &[Uuid]) -> Result<String, ServiceError> {
     let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
@@ -82,7 +93,7 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
         season_id: Uuid,
     ) -> Result<HashMap<AnalysisMode, AnalyzerAction>, ServiceError> {
         let rows: Vec<(i32, i32)> = sqlx::query_as(
-            r#"SELECT "Mode", "Action" FROM "FerrofinIntroSkipperAnalyzerActions"
+            r#"SELECT "Type", "Action" FROM "FerrofinIntroSkipperSeasonStates"
                WHERE "SeasonId" = ?1"#,
         )
         .bind(season_id.to_string())
@@ -109,9 +120,9 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for (mode, action) in actions {
             sqlx::query(
-                r#"INSERT INTO "FerrofinIntroSkipperAnalyzerActions" ("SeasonId", "Mode", "Action")
+                r#"INSERT INTO "FerrofinIntroSkipperSeasonStates" ("SeasonId", "Type", "Action")
                    VALUES (?1, ?2, ?3)
-                   ON CONFLICT ("SeasonId", "Mode") DO UPDATE SET "Action" = excluded."Action""#,
+                   ON CONFLICT ("SeasonId", "Type") DO UPDATE SET "Action" = excluded."Action""#,
             )
             .bind(season_id.to_string())
             .bind(mode.value())
@@ -127,7 +138,7 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
         let ids = json_ids(season_ids)?;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for table in [
-            "FerrofinIntroSkipperAnalyzerActions",
+            "FerrofinIntroSkipperSeasonStates",
             "FerrofinIntroSkipperDisabledEpisodes",
         ] {
             sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -320,6 +331,182 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
             .map_err(db_err)?;
         Ok(result.rows_affected())
     }
+    async fn season_states(
+        &self,
+        season_id: Uuid,
+    ) -> Result<HashMap<AnalysisMode, SeasonState>, ServiceError> {
+        let rows: Vec<(i32, i32, String, String, String)> = sqlx::query_as(
+            r#"SELECT "Type", "Action", "EpisodeIds", "ConfigHash", "SettledReanalysisEpisodeIds"
+               FROM "FerrofinIntroSkipperSeasonStates" WHERE "SeasonId" = ?1"#,
+        )
+        .bind(season_id.to_string())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(mode, action, episodes, config_hash, settled)| {
+                (
+                    AnalysisMode::from_discriminant(mode),
+                    SeasonState {
+                        action: AnalyzerAction::from_discriminant(action),
+                        episode_ids: id_set(&episodes),
+                        config_hash,
+                        settled_episode_ids: id_set(&settled),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn set_episode_ids(
+        &self,
+        season_id: Uuid,
+        mode: AnalysisMode,
+        episode_ids: &[Uuid],
+        config_hash: &str,
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinIntroSkipperSeasonStates" ("SeasonId", "Type", "EpisodeIds", "ConfigHash")
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT ("SeasonId", "Type") DO UPDATE SET
+                   "EpisodeIds" = excluded."EpisodeIds", "ConfigHash" = excluded."ConfigHash""#,
+        )
+        .bind(season_id.to_string())
+        .bind(mode.value())
+        .bind(json_ids(episode_ids)?)
+        .bind(config_hash)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn remove_episode_ids(
+        &self,
+        season_id: Option<Uuid>,
+        mode: Option<AnalysisMode>,
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"UPDATE "FerrofinIntroSkipperSeasonStates"
+               SET "EpisodeIds" = (
+                   SELECT coalesce(json_group_array(e.value), '[]') FROM json_each("EpisodeIds") e
+                   WHERE e.value NOT IN (SELECT value FROM json_each(?3)))
+               WHERE (?1 IS NULL OR "SeasonId" = ?1) AND (?2 IS NULL OR "Type" = ?2)"#,
+        )
+        .bind(season_id.map(|s| s.to_string()))
+        .bind(mode.map(AnalysisMode::value))
+        .bind(json_ids(episode_ids)?)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn clear_episode_ids(
+        &self,
+        season_id: Uuid,
+        modes: Option<&[AnalysisMode]>,
+    ) -> Result<(), ServiceError> {
+        let modes: Option<Vec<i32>> = modes.map(|m| m.iter().map(|mode| mode.value()).collect());
+        sqlx::query(
+            r#"UPDATE "FerrofinIntroSkipperSeasonStates" SET "EpisodeIds" = '[]'
+               WHERE "SeasonId" = ?1 AND (?2 IS NULL OR "Type" IN (SELECT value FROM json_each(?2)))"#,
+        )
+        .bind(season_id.to_string())
+        .bind(
+            modes
+                .map(|m| serde_json::to_string(&m))
+                .transpose()
+                .map_err(|e| ServiceError::backend(e.to_string()))?,
+        )
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn clean_stale_automatic(
+        &self,
+        item_ids: &[Uuid],
+        mode: AnalysisMode,
+        config_hash: &str,
+    ) -> Result<u64, ServiceError> {
+        let result = sqlx::query(
+            r#"DELETE FROM "FerrofinIntroSkipperSegments"
+               WHERE "ItemId" IN (SELECT value FROM json_each(?1)) AND "Type" = ?2
+                 AND "IsUserProvided" = 0 AND "ConfigHash" <> ?3"#,
+        )
+        .bind(json_ids(item_ids)?)
+        .bind(mode.value())
+        .bind(config_hash)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn record_settled(
+        &self,
+        season_id: Uuid,
+        modes: &[AnalysisMode],
+        episode_ids: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        let ids = json_ids(episode_ids)?;
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for mode in modes {
+            sqlx::query(
+                r#"INSERT INTO "FerrofinIntroSkipperSeasonStates"
+                   ("SeasonId", "Type", "SettledReanalysisEpisodeIds") VALUES (?1, ?2, ?3)
+                   ON CONFLICT ("SeasonId", "Type") DO UPDATE SET
+                       "SettledReanalysisEpisodeIds" = excluded."SettledReanalysisEpisodeIds""#,
+            )
+            .bind(season_id.to_string())
+            .bind(mode.value())
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn reset_season(
+        &self,
+        season_id: Uuid,
+        episode_ids: &[Uuid],
+        modes: &[AnalysisMode],
+    ) -> Result<(), ServiceError> {
+        if episode_ids.is_empty() || modes.is_empty() {
+            return Ok(());
+        }
+        let modes = serde_json::to_string(&modes.iter().map(|m| m.value()).collect::<Vec<_>>())
+            .map_err(|e| ServiceError::backend(e.to_string()))?;
+        // One transaction, so the episodes are re-analysed rather than left
+        // marked analysed without their segments.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(
+            r#"DELETE FROM "FerrofinIntroSkipperSegments"
+               WHERE "ItemId" IN (SELECT value FROM json_each(?1))
+                 AND "Type" IN (SELECT value FROM json_each(?2)) AND "IsUserProvided" = 0"#,
+        )
+        .bind(json_ids(episode_ids)?)
+        .bind(&modes)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "FerrofinIntroSkipperSeasonStates" SET "EpisodeIds" = '[]'
+               WHERE "SeasonId" = ?1 AND "Type" IN (SELECT value FROM json_each(?2))"#,
+        )
+        .bind(season_id.to_string())
+        .bind(&modes)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +671,106 @@ mod tests {
         assert_eq!(store.stored_item_ids().await.unwrap(), [item]);
         assert_eq!(store.delete_items(&[item]).await.unwrap(), 2);
         assert!(store.segments(item).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn season_state_tracks_analysed_episodes() {
+        use AnalysisMode::{Credits, Introduction};
+        let store = FerrofinIntroSkipperStore::new(test_db().await);
+        let season = Uuid::from_u128(9);
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        store
+            .set_analyzer_actions(season, &[(Credits, AnalyzerAction::BlackFrame)])
+            .await
+            .unwrap();
+        store
+            .set_episode_ids(season, Introduction, &[a, b, c], "H1")
+            .await
+            .unwrap();
+        store
+            .set_episode_ids(season, Credits, &[a, b], "H2")
+            .await
+            .unwrap();
+        let states = store.season_states(season).await.unwrap();
+        assert_eq!(states[&Introduction].episode_ids, HashSet::from([a, b, c]));
+        assert_eq!(states[&Introduction].config_hash, "H1");
+        assert_eq!(
+            states[&Credits].action,
+            AnalyzerAction::BlackFrame,
+            "the action is kept"
+        );
+        // One id from one mode, then from every mode.
+        store
+            .remove_episode_ids(Some(season), Some(Introduction), &[c])
+            .await
+            .unwrap();
+        store.remove_episode_ids(None, None, &[a]).await.unwrap();
+        let states = store.season_states(season).await.unwrap();
+        assert_eq!(states[&Introduction].episode_ids, HashSet::from([b]));
+        assert_eq!(states[&Credits].episode_ids, HashSet::from([b]));
+        store
+            .record_settled(season, &[Introduction], &[a, b])
+            .await
+            .unwrap();
+        store
+            .clear_episode_ids(season, Some(&[Credits]))
+            .await
+            .unwrap();
+        let states = store.season_states(season).await.unwrap();
+        assert!(states[&Credits].episode_ids.is_empty());
+        assert_eq!(
+            states[&Introduction].settled_episode_ids,
+            HashSet::from([a, b])
+        );
+
+        // A stale automatic segment goes, a user's and a current one stay.
+        store
+            .update_timestamp(seg(1, Introduction, 0.0, 30.0, false))
+            .await
+            .unwrap();
+        store
+            .update_timestamp(seg(2, Introduction, 0.0, 30.0, true))
+            .await
+            .unwrap();
+        store
+            .update_timestamp(seg(3, Credits, 900.0, 960.0, false))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .clean_stale_automatic(&[a, b], Introduction, "H9")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .clean_stale_automatic(&[c], Credits, "h1")
+                .await
+                .unwrap(),
+            0
+        );
+        // A reset deletes the automatic segments of its modes and empties
+        // their lists, together.
+        store
+            .set_episode_ids(season, Credits, &[c], "h1")
+            .await
+            .unwrap();
+        store
+            .reset_season(season, &[b, c], &[Credits])
+            .await
+            .unwrap();
+        assert!(store.segments(c).await.unwrap().is_empty());
+        assert_eq!(
+            store.segments(b).await.unwrap().len(),
+            1,
+            "user-provided stays"
+        );
+        assert!(
+            store.season_states(season).await.unwrap()[&Credits]
+                .episode_ids
+                .is_empty()
+        );
     }
 
     #[tokio::test]
