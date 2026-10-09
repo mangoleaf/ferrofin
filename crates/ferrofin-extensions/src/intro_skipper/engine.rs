@@ -761,10 +761,9 @@ impl DetectSegmentsTask {
                     }
                 }
                 Analyzer::Chapter => self.chapter_analyzer(items, mode, config).await?,
-                // TODO(intro-skipper step 9): `CreditsBlackFrameAnalyzer` when
-                // `UseAlternativeBlackFrameAnalyzer`; bump
-                // `config_hash::ANALYZERS` with it.
-                Analyzer::BlackFrame if config.use_alternative_black_frame_analyzer => {}
+                Analyzer::BlackFrame if config.use_alternative_black_frame_analyzer => {
+                    self.credit_scene_analyzer(items, config).await?;
+                }
                 Analyzer::BlackFrame => self.black_frame_analyzer(items, config).await?,
             }
         }

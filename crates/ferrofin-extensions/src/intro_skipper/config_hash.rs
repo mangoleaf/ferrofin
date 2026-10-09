@@ -16,13 +16,12 @@ use sha2::{Digest, Sha256};
 use super::IntroSkipperConfig;
 
 /// Which analyzers and adjustments this build runs, folded into every hash.
-/// Bump it when one lands — the chapter and black-frame analyzers, the recap
-/// path (steps 7–8), and the silence/keyframe snapping (step 6, which the
-/// stored `silence=`/`keyframe=` settings already claim) — so what earlier
-/// passes recorded is analysed again with it, rather than stranded under an
-/// unchanged hash. Ferrofin's hashes are its own (the plugin's database is
-/// not imported), so the token costs no compatibility.
-const ANALYZERS: &str = "chromaprint,silence,keyframes,chapters,blackframes,recap";
+/// Bumped as each landed (silence/keyframe snapping, the chapter, black-frame
+/// and credit-scene analyzers, recaps) — and to be bumped by any later one —
+/// so what earlier passes recorded is analysed again with it, rather than
+/// stranded under an unchanged hash. Ferrofin's hashes are its own (the
+/// plugin's database is not imported), so the token costs no compatibility.
+const ANALYZERS: &str = "chromaprint,silence,keyframes,chapters,blackframes,recap,creditscenes";
 
 /// C#'s `bool.ToString()`.
 fn b(value: bool) -> &'static str {
@@ -181,6 +180,8 @@ pub(super) enum Detection {
     Silence,
     Keyframe,
     BlackFrame(AnalysisMode),
+    BlackInterval,
+    KeyframeVisual,
 }
 
 /// `ConfigHasher.DetectionCache(config, type, mode)`: the settings a cached
@@ -198,6 +199,14 @@ pub(super) fn detection_cache(c: &IntroSkipperConfig, detection: Detection) -> S
             mode_name(mode),
             c.black_frame_threshold
         ),
+        // Both are Credits-only scans.
+        Detection::BlackInterval => format!(
+            "cache|v1|BlackInterval|Credits|blackdetect=v1|threshold={}|bfmin={}|duration={}",
+            c.black_frame_threshold,
+            c.black_frame_minimum_percentage,
+            crate::ffmpeg::BLACK_INTERVAL_MINIMUM_DURATION
+        ),
+        Detection::KeyframeVisual => "cache|v1|KeyframeVisual|Credits".to_owned(),
     })
 }
 

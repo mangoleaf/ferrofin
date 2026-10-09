@@ -37,6 +37,7 @@ use crate::fingerprint::Fingerprinter;
 mod black_frame;
 mod chapter_analyzer;
 mod config_hash;
+mod credit_scenes;
 mod engine;
 mod queue;
 use crate::{Extension, ExtensionContext};
@@ -783,8 +784,15 @@ impl DetectSegmentsTask {
             let path = entry.path();
             // Every detection's cache (`DeleteForItem`/`DeleteByMode`).
             if path.extension().is_none_or(|ext| {
-                !["fp", SILENCE_CACHE, KEYFRAME_CACHE, BLACK_FRAME_CACHE]
-                    .contains(&ext.to_str().unwrap_or_default())
+                ![
+                    "fp",
+                    SILENCE_CACHE,
+                    KEYFRAME_CACHE,
+                    BLACK_FRAME_CACHE,
+                    BLACK_INTERVAL_CACHE,
+                    KEYFRAME_VISUAL_CACHE,
+                ]
+                .contains(&ext.to_str().unwrap_or_default())
             }) {
                 continue;
             }
@@ -914,15 +922,35 @@ impl DetectSegmentsTask {
         .await
     }
 
-    /// `DetectBlackFramesAsync(episode, range, minimum, threshold, mode)`:
-    /// the window's frames at least `BlackFrameMinimumPercentage` black, times
-    /// relative to its start. The cache keeps every frame the filter reported,
-    /// as upstream, so the minimum applies on reading.
+    /// `DetectBlackFramesAsync(episode, range, minimum, threshold, mode)` at
+    /// `BlackFrameMinimumPercentage`.
     pub(super) async fn black_frames(
         &self,
         entry: &queue::QueuedEpisode,
         mode: WireMode,
         window: (f64, f64),
+        config: &IntroSkipperConfig,
+    ) -> Result<Vec<crate::ffmpeg::BlackFrame>, String> {
+        self.black_frames_at(
+            entry,
+            mode,
+            window,
+            config.black_frame_minimum_percentage,
+            config,
+        )
+        .await
+    }
+
+    /// `DetectBlackFramesAsync(episode, range, minimum, threshold, mode)`:
+    /// the window's frames at least `minimum` percent black, times relative
+    /// to its start. The cache keeps every frame the filter reported, as
+    /// upstream, so the minimum applies on reading.
+    pub(super) async fn black_frames_at(
+        &self,
+        entry: &queue::QueuedEpisode,
+        mode: WireMode,
+        window: (f64, f64),
+        minimum: i32,
         config: &IntroSkipperConfig,
     ) -> Result<Vec<crate::ffmpeg::BlackFrame>, String> {
         let options = ProcessOptions::new(&config.process_priority, config.process_threads);
@@ -942,8 +970,101 @@ impl DetectSegmentsTask {
             .await?;
         Ok(frames
             .into_iter()
-            .filter(|f| f.percentage >= config.black_frame_minimum_percentage)
+            .filter(|f| f.percentage >= minimum)
             .collect())
+    }
+
+    /// `DetectBlackFramesAsync(episode, threshold)`: every keyframe from the
+    /// credits window's start to the end, times relative to that start.
+    pub(super) async fn keyframe_black_frames(
+        &self,
+        entry: &queue::QueuedEpisode,
+        config: &IntroSkipperConfig,
+    ) -> Result<Vec<crate::ffmpeg::BlackFrame>, String> {
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let hash = config_hash::detection_cache(
+            config,
+            config_hash::Detection::BlackFrame(WireMode::Credits),
+        );
+        let start = entry.credits_fingerprint_start;
+        self.detection_cached(
+            (entry, WireMode::Credits, (start, 0.0)),
+            (BLACK_FRAME_CACHE, &hash, config.cache_fingerprints),
+            self.ffmpeg.detect_keyframe_black_frames(
+                &entry.path,
+                start,
+                config.black_frame_threshold,
+                options,
+            ),
+        )
+        .await
+    }
+
+    /// `DetectBlackIntervalsAsync`: `blackdetect`'s intervals in the window,
+    /// relative to the credits window's start.
+    pub(super) async fn black_intervals(
+        &self,
+        entry: &queue::QueuedEpisode,
+        window: (f64, f64),
+        (threshold, minimum): (i32, i32),
+        config: &IntroSkipperConfig,
+    ) -> Result<Vec<crate::ffmpeg::BlackInterval>, String> {
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let hash = config_hash::detection_cache(config, config_hash::Detection::BlackInterval);
+        let offset = entry.credits_fingerprint_start;
+        let detect = async {
+            let found = self
+                .ffmpeg
+                .detect_black_intervals(&entry.path, window, (threshold, minimum), options)
+                .await?;
+            Ok(found
+                .into_iter()
+                .map(|i| crate::ffmpeg::BlackInterval {
+                    start: i.start - offset,
+                    end: i.end - offset,
+                })
+                .collect())
+        };
+        self.detection_cached(
+            (entry, WireMode::Credits, window),
+            (BLACK_INTERVAL_CACHE, &hash, config.cache_fingerprints),
+            detect,
+        )
+        .await
+    }
+
+    /// `DetectKeyframeVisualsAsync`: the credits window's keyframe visuals,
+    /// clipped to it (ffmpeg reports keyframes past `-to` under
+    /// `-skip_frame nokey`), times relative to its start.
+    pub(super) async fn keyframe_visuals(
+        &self,
+        entry: &queue::QueuedEpisode,
+        config: &IntroSkipperConfig,
+    ) -> Result<Vec<crate::ffmpeg::KeyframeVisual>, String> {
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let hash = config_hash::detection_cache(config, config_hash::Detection::KeyframeVisual);
+        let start = entry.credits_fingerprint_start;
+        let end = if entry.credits_fingerprint_end > 0.0 {
+            entry.credits_fingerprint_end
+        } else {
+            entry.duration
+        };
+        let detect = async {
+            let found = self
+                .ffmpeg
+                .detect_keyframe_visuals(&entry.path, start, end, options)
+                .await?;
+            Ok(found
+                .into_iter()
+                .filter(|v| v.time >= 0.0 && v.time <= end - start)
+                .collect())
+        };
+        self.detection_cached(
+            (entry, WireMode::Credits, (start, end)),
+            (KEYFRAME_VISUAL_CACHE, &hash, config.cache_fingerprints),
+            detect,
+        )
+        .await
     }
 
     /// `DetectKeyFramesAsync` over the window.
@@ -970,6 +1091,8 @@ impl DetectSegmentsTask {
 const SILENCE_CACHE: &str = "silence";
 const KEYFRAME_CACHE: &str = "keyframes";
 const BLACK_FRAME_CACHE: &str = "blackframes";
+const BLACK_INTERVAL_CACHE: &str = "blackintervals";
+const KEYFRAME_VISUAL_CACHE: &str = "visuals";
 
 /// A plugin mode's cache-file tag: its print's for the fingerprinted modes,
 /// so erasing a mode reaches every cache of it.
@@ -1148,8 +1271,8 @@ mod tests {
     /// The series every harness episode belongs to.
     const SERIES: Uuid = Uuid::from_u128(0x5e_0001);
 
-    struct Harness {
-        task: DetectSegmentsTask,
+    pub(super) struct Harness {
+        pub(super) task: DetectSegmentsTask,
         segments: Arc<dyn MediaSegmentManager>,
         actions: Arc<ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore>,
         calls: Arc<AtomicUsize>,
@@ -1159,7 +1282,7 @@ mod tests {
 
     /// Builds the task over an in-memory database seeded with `episodes`
     /// (`(id, path, duration_secs)`), all in one season.
-    async fn harness(
+    pub(super) async fn harness(
         episodes: &[(Uuid, &str, f64)],
         plugin_enabled: bool,
         config: &str,
@@ -1382,7 +1505,7 @@ mod tests {
 
     const EP_A: Uuid = Uuid::from_u128(0xA1);
     const EP_B: Uuid = Uuid::from_u128(0xA2);
-    const TWO_EPISODES: [(Uuid, &str, f64); 2] = [
+    pub(super) const TWO_EPISODES: [(Uuid, &str, f64); 2] = [
         (EP_A, "/media/s01e01.mkv", 1800.0),
         (EP_B, "/media/s01e02.mkv", 1800.0),
     ];

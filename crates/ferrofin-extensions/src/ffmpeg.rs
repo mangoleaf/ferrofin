@@ -238,6 +238,61 @@ pub trait FfmpegService: Send + Sync {
         threshold: i32,
         options: ProcessOptions,
     ) -> Result<Vec<BlackFrame>, String>;
+
+    /// `DetectBlackFramesAsync(episode, threshold)`: the black percentage of
+    /// every keyframe from `start` to the end of `path`, times relative to
+    /// `start`.
+    async fn detect_keyframe_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String>;
+
+    /// `DetectBlackIntervalsAsync`'s detection: `blackdetect`'s black
+    /// intervals in `[start, end]`, in absolute times.
+    async fn detect_black_intervals(
+        &self,
+        path: &str,
+        (start, end): (f64, f64),
+        (threshold, minimum): (i32, i32),
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackInterval>, String>;
+
+    /// `DetectKeyframeVisualsAsync`'s detection: each keyframe's luma entropy
+    /// and mean saturation in `[start, end]`, times relative to `start` (not
+    /// clipped: ffmpeg may report keyframes past `end`).
+    async fn detect_keyframe_visuals(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        options: ProcessOptions,
+    ) -> Result<Vec<KeyframeVisual>, String>;
+}
+
+/// A black stretch `blackdetect` reported (`BlackInterval`), seconds.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlackInterval {
+    /// Its start.
+    pub start: f64,
+    /// Its end.
+    pub end: f64,
+}
+
+/// `BlackInterval.MinimumDetectionDuration`: `blackdetect`'s `d`.
+pub const BLACK_INTERVAL_MINIMUM_DURATION: f64 = 0.1;
+
+/// A keyframe's look (`KeyframeVisual`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeyframeVisual {
+    /// Its time, seconds.
+    pub time: f64,
+    /// The normalised entropy of its luma histogram.
+    pub entropy: f64,
+    /// Its mean saturation (`SATAVG`, 8-bit scale).
+    pub saturation: f64,
 }
 
 /// A frame the `blackframe` filter reported (`BlackFrame`).
@@ -375,6 +430,214 @@ impl FfmpegService for Ffmpeg {
         .await?;
         Ok(parse_black_frames(&String::from_utf8_lossy(&out.stderr)))
     }
+
+    async fn detect_keyframe_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String> {
+        let from = start.to_string();
+        let filter = format!("blackframe=amount=0:threshold={threshold}");
+        let out = ffmpeg(
+            &self.ffmpeg,
+            &[
+                "-skip_frame",
+                "nokey",
+                "-ss",
+                &from,
+                "-i",
+                path,
+                "-an",
+                "-dn",
+                "-sn",
+                "-vf",
+                &filter,
+                "-f",
+                "null",
+                "-",
+            ],
+            options,
+        )
+        .await?;
+        Ok(parse_black_frames(&String::from_utf8_lossy(&out.stderr)))
+    }
+
+    async fn detect_black_intervals(
+        &self,
+        path: &str,
+        (start, end): (f64, f64),
+        (threshold, minimum): (i32, i32),
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackInterval>, String> {
+        let (from, to) = (start.to_string(), (end - start).to_string());
+        let filter = format!(
+            "blackdetect=d={BLACK_INTERVAL_MINIMUM_DURATION}:pix_th={}:pic_th={}",
+            pixel_threshold(threshold),
+            picture_threshold(minimum)
+        );
+        let out = ffmpeg(
+            &self.ffmpeg,
+            &[
+                "-ss",
+                &from,
+                "-skip_frame",
+                "noref",
+                "-i",
+                path,
+                "-to",
+                &to,
+                "-an",
+                "-dn",
+                "-sn",
+                "-vf",
+                &filter,
+                "-f",
+                "null",
+                "-",
+            ],
+            options,
+        )
+        .await?;
+        Ok(parse_black_intervals(&String::from_utf8_lossy(&out.stderr))
+            .into_iter()
+            .map(|i| BlackInterval {
+                start: i.start + start,
+                end: i.end + start,
+            })
+            .collect())
+    }
+
+    async fn detect_keyframe_visuals(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        options: ProcessOptions,
+    ) -> Result<Vec<KeyframeVisual>, String> {
+        let (from, to) = (start.to_string(), (end - start).to_string());
+        // `format=yuv420p` keeps both measures on the 8-bit scale their
+        // thresholds are tuned for, 10-bit and HDR sources included.
+        let out = ffmpeg(
+            &self.ffmpeg,
+            &[
+                "-skip_frame",
+                "nokey",
+                "-ss",
+                &from,
+                "-i",
+                path,
+                "-to",
+                &to,
+                "-an",
+                "-dn",
+                "-sn",
+                "-vf",
+                "format=yuv420p,entropy,signalstats,metadata=print",
+                "-f",
+                "null",
+                "-",
+            ],
+            options,
+        )
+        .await?;
+        Ok(parse_keyframe_visuals(&String::from_utf8_lossy(
+            &out.stderr,
+        )))
+    }
+}
+
+/// The `blackframe` filter's cutoff as `blackdetect`'s `pix_th`: a fraction
+/// of the limited (16–235) luma range, so both filters agree on a black pixel
+/// (`FormatBlackDetectPixelThreshold`).
+fn pixel_threshold(threshold: i32) -> String {
+    invariant_4((f64::from(threshold) - 16.0) / 219.0)
+}
+
+/// The black-frame minimum percentage as `blackdetect`'s `pic_th`
+/// (`FormatBlackDetectPictureRatioThreshold`).
+fn picture_threshold(minimum: i32) -> String {
+    invariant_4(f64::from(minimum) / 100.0)
+}
+
+/// .NET's `ToString("0.####")` of a value clamped to `[0, 1]`.
+fn invariant_4(value: f64) -> String {
+    let text = format!("{:.4}", value.clamp(0.0, 1.0));
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text.is_empty() {
+        "0".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// `FFmpegOutputParser`'s expressions for `blackdetect` and the keyframe
+/// visuals, verbatim.
+static BLACK_INTERVAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"black_start:(?<start>[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s+black_end:(?<end>[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s+black_duration:(?<duration>[-+]?(?:\d+(?:\.\d*)?|\.\d+))")
+        .expect("black interval regex")
+});
+static VISUAL_TIME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"pts_time:(?<time>-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
+        .expect("visual time regex")
+});
+static VISUAL_ENTROPY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"lavfi\.entropy\.normalized_entropy\.normal\.Y=(?<value>-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
+        .expect("visual entropy regex")
+});
+static VISUAL_SATURATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"lavfi\.signalstats\.SATAVG=(?<value>-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)")
+        .expect("visual saturation regex")
+});
+
+/// `ParseBlackIntervals`: complete intervals of positive length.
+fn parse_black_intervals(raw: &str) -> Vec<BlackInterval> {
+    raw.split('\n')
+        .filter_map(|line| {
+            let found = BLACK_INTERVAL.captures(line)?;
+            let start: f64 = found["start"].parse().ok()?;
+            let end: f64 = found["end"].parse().ok()?;
+            let duration: f64 = found["duration"].parse().ok()?;
+            (end > start && duration > 0.0).then_some(BlackInterval { start, end })
+        })
+        .collect()
+}
+
+/// `ParseKeyframeVisuals`: one visual per `pts_time` block that reported
+/// both the luma entropy and the saturation.
+fn parse_keyframe_visuals(raw: &str) -> Vec<KeyframeVisual> {
+    let mut visuals = Vec::new();
+    let mut current: Option<(f64, Option<f64>, Option<f64>)> = None;
+    let mut flush = |current: Option<(f64, Option<f64>, Option<f64>)>| {
+        if let Some((time, Some(entropy), Some(saturation))) = current {
+            visuals.push(KeyframeVisual {
+                time,
+                entropy,
+                saturation,
+            });
+        }
+    };
+    for line in raw.split('\n') {
+        if let Some(found) = VISUAL_TIME.captures(line) {
+            flush(current.take());
+            current = found["time"].parse().ok().map(|time| (time, None, None));
+            continue;
+        }
+        if let Some(found) = VISUAL_ENTROPY.captures(line) {
+            if let Some(block) = current.as_mut() {
+                block.1 = found["value"].parse().ok();
+            }
+            continue;
+        }
+        if let Some(found) = VISUAL_SATURATION.captures(line)
+            && let Some(block) = current.as_mut()
+        {
+            block.2 = found["value"].parse().ok();
+        }
+    }
+    flush(current);
+    visuals
 }
 
 /// `FFmpegOutputParser`'s black-frame expression, verbatim.
@@ -385,7 +648,7 @@ static BLACK_FRAME: LazyLock<Regex> = LazyLock::new(|| {
 
 /// `ParseBlackFrames`: one frame per matching line. A number that does not
 /// parse skips its line (upstream's `int.Parse` would throw the result away).
-fn parse_black_frames(raw: &str) -> Vec<BlackFrame> {
+pub(crate) fn parse_black_frames(raw: &str) -> Vec<BlackFrame> {
     raw.split('\n')
         .filter_map(|line| {
             let found = BLACK_FRAME.captures(line)?;
@@ -489,6 +752,19 @@ pub(crate) struct FakeFfmpeg {
     pub black_from: Option<f64>,
     /// How black those frames are (100 when unset).
     pub black_percentage: Option<i32>,
+    /// Every range scan's frames instead, as given (upstream's fake probe
+    /// frames).
+    pub range_frames: Option<Vec<BlackFrame>>,
+    /// The keyframe black-frame scan's frames.
+    pub keyframe_frames: Vec<BlackFrame>,
+    /// The interval scan's intervals (absolute).
+    pub intervals: Vec<BlackInterval>,
+    /// The interval scan fails (`blackdetect` unavailable).
+    pub fail_intervals: bool,
+    /// The keyframe visual scan's visuals.
+    pub visuals: Vec<KeyframeVisual>,
+    /// The keyframe black-frame scan fails.
+    pub fail_keyframe_scan: bool,
     pub calls: std::sync::atomic::AtomicUsize,
     pub log: std::sync::Mutex<Vec<FakeCall>>,
 }
@@ -546,6 +822,9 @@ impl FfmpegService for FakeFfmpeg {
         options: ProcessOptions,
     ) -> Result<Vec<BlackFrame>, String> {
         self.record(("blackframe", path, start, end, threshold, options));
+        if let Some(frames) = &self.range_frames {
+            return Ok(frames.clone());
+        }
         let Some(from) = self.black_from else {
             return Ok(Vec::new());
         };
@@ -560,6 +839,45 @@ impl FfmpegService for FakeFfmpeg {
                 frame: n,
             })
             .collect())
+    }
+
+    async fn detect_keyframe_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String> {
+        self.record(("keyframe-blackframes", path, start, 0.0, threshold, options));
+        if self.fail_keyframe_scan {
+            return Err("keyframe scan failed".to_owned());
+        }
+        Ok(self.keyframe_frames.clone())
+    }
+
+    async fn detect_black_intervals(
+        &self,
+        path: &str,
+        (start, end): (f64, f64),
+        (threshold, _minimum): (i32, i32),
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackInterval>, String> {
+        self.record(("intervals", path, start, end, threshold, options));
+        if self.fail_intervals {
+            return Err("blackdetect unavailable".to_owned());
+        }
+        Ok(self.intervals.clone())
+    }
+
+    async fn detect_keyframe_visuals(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        options: ProcessOptions,
+    ) -> Result<Vec<KeyframeVisual>, String> {
+        self.record(("visuals", path, start, end, 0, options));
+        Ok(self.visuals.clone())
     }
 }
 
@@ -619,6 +937,94 @@ mod tests {
                    [Parsed_showinfo_0 @ 0x0] n:   1 pts:  1 pts_time:2.5 duration: 1\n\
                    [Parsed_showinfo_0 @ 0x0] n:   2 pts:  1 PTS_TIME:bad x\n";
         assert_eq!(parse_keyframes(raw, 10.0), [10.0, 12.5]);
+    }
+
+    /// .NET's `ToString("0.####")` of `blackdetect`'s thresholds; 32 is the
+    /// `pix_th=0.0731` upstream's `TestNoTrailingOptionsWithBlackIntervalDetection`
+    /// runs.
+    #[rstest::rstest]
+    #[case(32, "0.0731")]
+    #[case(28, "0.0548")]
+    #[case(16, "0")]
+    #[case(0, "0")]
+    #[case(300, "1")]
+    fn blackdetect_pixel_thresholds(#[case] threshold: i32, #[case] expected: &str) {
+        assert_eq!(pixel_threshold(threshold), expected);
+    }
+
+    #[test]
+    fn blackdetect_picture_thresholds() {
+        assert_eq!(picture_threshold(85), "0.85");
+        assert_eq!(picture_threshold(100), "1");
+    }
+
+    /// `TestParseBlackIntervals_*`.
+    #[test]
+    fn black_intervals_follow_parse_black_intervals() {
+        let raw = "[blackdetect @ 0000000000000000] black_start:3.04 black_end:9.96 black_duration:6.92\n\
+                   [blackdetect @ 0000000000000000] black_start:15 black_end:20.5 black_duration:5.5\n";
+        assert_eq!(
+            parse_black_intervals(raw),
+            [
+                BlackInterval {
+                    start: 3.04,
+                    end: 9.96
+                },
+                BlackInterval {
+                    start: 15.0,
+                    end: 20.5
+                }
+            ]
+        );
+        let invalid = "[blackdetect @ 0000000000000000] black_start:3.04\n\
+                       [blackdetect @ 0000000000000000] black_start:9 black_end:8 black_duration:1\n";
+        assert!(parse_black_intervals(invalid).is_empty());
+    }
+
+    /// `TestParseKeyframeVisuals_*`.
+    #[rstest::rstest]
+    #[case::entropy_and_saturation(
+        "[Parsed_metadata_2 @ 0x0] frame:0    pts:0       pts_time:0\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=0.531285\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=108.199\n\
+         [Parsed_metadata_2 @ 0x0] frame:1    pts:20480   pts_time:2\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=0.000000\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=33\n",
+        &[(0.0, 0.531_285, 108.199), (2.0, 0.0, 33.0)]
+    )]
+    #[case::luma_plane_only_and_blocks_without_entropy(
+        "[Parsed_metadata_3 @ 0x0] frame:0 pts:0 pts_time:5\n\
+         [Parsed_metadata_3 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=0.120000\n\
+         [Parsed_metadata_3 @ 0x0] lavfi.entropy.normalized_entropy.normal.U=0.400000\n\
+         [Parsed_metadata_3 @ 0x0] lavfi.entropy.normalized_entropy.normal.V=0.410000\n\
+         [Parsed_metadata_3 @ 0x0] lavfi.signalstats.SATAVG=12.5\n\
+         [Parsed_metadata_3 @ 0x0] frame:1 pts:1 pts_time:7\n",
+        &[(5.0, 0.12, 12.5)]
+    )]
+    #[case::blocks_without_saturation(
+        "[Parsed_metadata_2 @ 0x0] frame:0 pts:0 pts_time:5\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=0.120000\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=12.5\n\
+         [Parsed_metadata_2 @ 0x0] frame:1 pts:1 pts_time:7\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=0.050000\n",
+        &[(5.0, 0.12, 12.5)]
+    )]
+    #[case::exponent_notation(
+        "[Parsed_metadata_2 @ 0x0] frame:0 pts:0 pts_time:1e-05\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.entropy.normalized_entropy.normal.Y=1.5e-06\n\
+         [Parsed_metadata_2 @ 0x0] lavfi.signalstats.SATAVG=3.2e+01\n\
+         [Parsed_metadata_2 @ 0x0] frame:1 pts:1 pts_time:2\n",
+        &[(1e-05, 1.5e-06, 32.0)]
+    )]
+    fn keyframe_visuals_follow_parse_keyframe_visuals(
+        #[case] raw: &str,
+        #[case] expected: &[(f64, f64, f64)],
+    ) {
+        let parsed: Vec<(f64, f64, f64)> = parse_keyframe_visuals(raw)
+            .iter()
+            .map(|v| (v.time, v.entropy, v.saturation))
+            .collect();
+        assert_eq!(parsed, expected);
     }
 
     #[test]
@@ -758,6 +1164,79 @@ mod tests {
         assert!(
             frames.iter().all(|f| f.percentage == 100 && f.time < 2.05),
             "{frames:?}"
+        );
+    }
+
+    /// The alternative credits analyzer's scans against generated clips: a
+    /// test pattern and a black card (keyframe every second).
+    #[tokio::test]
+    async fn real_ffmpeg_credit_scans() {
+        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
+            eprintln!("skipped: set FERROFIN_FFMPEG_TESTS=1 to run");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let make = |name: &str, source: &str| {
+            let path = dir.path().join(name).to_string_lossy().into_owned();
+            let source = source.to_owned();
+            async move {
+                let made = output(
+                    "ffmpeg",
+                    &[
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-c:v", "libx264", "-g", "10",
+                        &path,
+                    ],
+                    ProcessOptions::default(),
+                )
+                .await
+                .expect("ffmpeg");
+                assert!(
+                    made.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&made.stderr)
+                );
+                path
+            }
+        };
+        let clip = make("clip.mkv", "testsrc=size=64x64:rate=10:duration=4").await;
+        let black = make("black.mkv", "color=c=black:s=64x64:r=10:d=4").await;
+        let (clip, black) = (clip.as_str(), black.as_str());
+        let service = Ffmpeg::new("ffmpeg", "ffprobe");
+        let options = ProcessOptions::new("Idle", 1);
+        // The credit scans: every keyframe of the card is black, and
+        // `blackdetect` sees one interval (absolute times).
+        let keyframes = service
+            .detect_keyframe_black_frames(black, 0.0, 32, options)
+            .await
+            .expect("keyframe black frames");
+        assert!(
+            !keyframes.is_empty() && keyframes.iter().all(|f| f.percentage == 100),
+            "{keyframes:?}"
+        );
+        let intervals = service
+            .detect_black_intervals(black, (1.0, 3.0), (32, 85), options)
+            .await
+            .expect("intervals");
+        assert!(
+            matches!(intervals[..], [i] if (i.start - 1.0).abs() < 0.15 && (i.end - 3.0).abs() < 0.15),
+            "{intervals:?}"
+        );
+        // A test pattern is busy; a black card is uniform and unsaturated.
+        let busy = service
+            .detect_keyframe_visuals(clip, 0.0, 4.0, options)
+            .await
+            .expect("visuals");
+        let card = service
+            .detect_keyframe_visuals(black, 0.0, 4.0, options)
+            .await
+            .expect("visuals");
+        assert!(
+            !busy.is_empty() && busy.iter().all(|v| v.entropy > 0.35),
+            "{busy:?}"
+        );
+        assert!(
+            !card.is_empty() && card.iter().all(|v| v.entropy < 0.35 && v.saturation < 96.0),
+            "{card:?}"
         );
     }
 
