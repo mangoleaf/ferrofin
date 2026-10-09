@@ -240,6 +240,11 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
         "IntroSkipper.Detect",
         "IntroSkipper.ScheduledTasks.DetectSegmentsTask",
     ),
+    // IntroSkipper/ScheduledTasks/CleanCacheTask.cs (upstream's own key).
+    (
+        "CPBIntroSkipperCleanCache",
+        "IntroSkipper.ScheduledTasks.CleanCacheTask",
+    ),
     // jellyfin-plugin-mergeversions @ e6f58d6 —
     // Jellyfin.Plugin.MergeVersions/ScheduledTasks/RefreshLibraryTask.cs.
     (

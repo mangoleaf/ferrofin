@@ -15,6 +15,7 @@
 //! self-gates on the plugin's enabled flag; without a Chromaprint backend it
 //! warns and runs the analyzers that do not need one.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,7 +117,10 @@ impl Extension for IntroSkipperExtension {
         let detect = Arc::new(detector(cx));
         vec![
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
-            Arc::new(MediaSegmentScanTask { detect }),
+            Arc::new(MediaSegmentScanTask {
+                detect: Arc::clone(&detect),
+            }),
+            Arc::new(CleanCacheTask { detect }),
         ]
     }
 }
@@ -257,6 +261,42 @@ impl ScheduledTask for MediaSegmentScanTask {
         if self.detect.enabled().await && !self.detect.load_config().await.update_media_segments {
             self.detect.publish_stored().await;
         }
+        Ok(())
+    }
+}
+
+/// The plugin's "Clean Intro Skipper Cache" task (`CleanCacheTask`): drops
+/// what nothing analysed needs any more — the segments of items no longer in
+/// an analysed library (unpublished first), the cache files of such items and
+/// those no current setting reads, and the state of vanished seasons. No
+/// default trigger, as upstream.
+struct CleanCacheTask {
+    detect: Arc<DetectSegmentsTask>,
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for CleanCacheTask {
+    fn key(&self) -> &str {
+        "CPBIntroSkipperCleanCache"
+    }
+    fn name(&self) -> &str {
+        "Clean Intro Skipper Cache"
+    }
+    fn description(&self) -> &str {
+        "Clear Intro Skipper cache of unused rows."
+    }
+    fn category(&self) -> &str {
+        "Intro Skipper"
+    }
+    fn default_triggers(&self) -> Vec<ferrofin_model::tasks::TaskTriggerInfo> {
+        Vec::new()
+    }
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        if self.detect.enabled().await {
+            self.detect.clean_cache().await?;
+        }
+        progress.report(100.0);
         Ok(())
     }
 }
@@ -674,6 +714,88 @@ impl DetectSegmentsTask {
         tracing::info!(analyzed = stored, "intro skipper: analysis complete");
     }
 
+    /// `CleanCacheTask.ExecuteAsync`, holding the analysis latch (waiting
+    /// out a running pass): upstream takes no lock, so a pass analysing a new
+    /// episode between the clean's queue snapshot and its delete could lose
+    /// that episode's segments — an accepted divergence.
+    async fn clean_cache(&self) -> Result<(), ServiceError> {
+        while self.running.swap(true, Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let _release = ReleaseOnDrop(Arc::clone(&self.running));
+        let config = self.load_config().await;
+        // Excluded items keep their state: only leaving a library is stale.
+        let queue = self.queue(&config).await?;
+        let live: HashSet<Uuid> = queue
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().map(|e| e.episode_id))
+            .collect();
+        let stale: Vec<Uuid> = self
+            .actions
+            .stored_item_ids()
+            .await?
+            .into_iter()
+            .filter(|id| !live.contains(id))
+            .collect();
+        if !stale.is_empty() {
+            // Unpublished first, so a failure leaves the segments for a
+            // later run to hand off again.
+            if config.update_media_segments {
+                for &item_id in &stale {
+                    intro_store::remove_published(self.media_segments.as_ref(), item_id).await?;
+                }
+            }
+            self.actions.delete_items(&stale).await?;
+        }
+        let removed = self.remove_stale_cache_files(&live, &config).await;
+        let seasons: Vec<Uuid> = queue.iter().map(|(season, _)| *season).collect();
+        self.actions.retain_seasons(&seasons).await?;
+        tracing::info!(
+            stale_items = stale.len(),
+            cache_files = removed,
+            "intro skipper: cache cleaned"
+        );
+        Ok(())
+    }
+
+    /// Deletes the cache files of items not in `live`, and those no current
+    /// setting reads — an older tag's, or a detection made under other
+    /// settings (upstream's one row per key is overwritten; files under a new
+    /// hash are new files). How many went.
+    async fn remove_stale_cache_files(
+        &self,
+        live: &HashSet<Uuid>,
+        config: &IntroSkipperConfig,
+    ) -> u64 {
+        let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::debug!(%err, "intro skipper: no cache to clean");
+                return 0;
+            }
+        };
+        let mut removed = 0;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(current) = name.to_str().map(|n| cache_file_current(n, live, config)) else {
+                continue;
+            };
+            if current != Some(false) {
+                continue;
+            }
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => {
+                    tracing::debug!(file = ?name, "intro skipper: stale cache file removed");
+                    removed += 1;
+                }
+                Err(err) => {
+                    tracing::debug!(%err, file = ?name, "intro skipper: stale cache file kept");
+                }
+            }
+        }
+        removed
+    }
+
     /// Publishes every stored item's segments (the plugin's `SegmentProvider`
     /// as the Media Segment Scan runs it), logging a failed item and going on.
     async fn publish_stored(&self) {
@@ -836,29 +958,38 @@ impl DetectSegmentsTask {
             .join(format!("{id}.{}.{start:.0}-{end:.0}.fp", mode_tag(mode)))
     }
 
-    /// Fingerprints an episode window, using an on-disk cache keyed by the window
-    /// so a re-run skips the (expensive) decode.
-    /// TODO(intro-skipper step 10): gate on `CacheFingerprints` and key by
-    /// `ConfigHasher.DetectionCache`, as [`Self::detection_cached`] does.
+    /// Fingerprints an episode window, through its cache file when
+    /// `CacheFingerprints`. Keyed by the item, the mode and the window in
+    /// whole seconds, without `ConfigHasher.DetectionCache`'s hash: the
+    /// settings it folds in (`AnalysisPercent`, `AnalysisLengthLimit`, the
+    /// credits maxima, `ProbeAudioDuration`) change a print by moving its
+    /// window — except by less than half a second (an audio stream barely
+    /// shorter than the container, a file replaced by one of nearly the same
+    /// length), when the old print is reused with its times off by that much.
+    /// Re-keying would re-fingerprint every library once for that exactness.
     async fn fingerprint_cached(
         &self,
         entry: &queue::QueuedEpisode,
         (start, end): (f64, f64),
         mode: AnalysisMode,
         fingerprinter: &dyn Fingerprinter,
-        options: ProcessOptions,
+        config: &IntroSkipperConfig,
     ) -> Result<Vec<u32>, String> {
         let cache = self.print_path(entry.episode_id, start, end, mode);
-        if let Ok(bytes) = tokio::fs::read(&cache).await
+        if config.cache_fingerprints
+            && let Ok(bytes) = tokio::fs::read(&cache).await
             && let Some(points) = decode_points(&bytes)
         {
             return Ok(points);
         }
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
         let points = fingerprinter
             .fingerprint(&entry.path, start, end, options)
             .await?;
-        let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
-        let _ = tokio::fs::write(&cache, encode_points(&points)).await;
+        if config.cache_fingerprints {
+            let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
+            let _ = tokio::fs::write(&cache, encode_points(&points)).await;
+        }
         Ok(points)
     }
 
@@ -1105,6 +1236,56 @@ fn cache_tag(mode: WireMode) -> &'static str {
         WireMode::Commercial => "commercial",
         WireMode::Unrecognized(_) => "unrecognized",
     }
+}
+
+/// The plugin mode a current cache tag stands for.
+fn tag_mode(tag: &str) -> Option<WireMode> {
+    [
+        WireMode::Introduction,
+        WireMode::Credits,
+        WireMode::Recap,
+        WireMode::Preview,
+        WireMode::Commercial,
+    ]
+    .into_iter()
+    .find(|mode| cache_tag(*mode) == tag)
+}
+
+/// Whether a cache file (`{item}.{tag}.{start}-{end}[.{hash}].{kind}`) is
+/// still read: its item is analysed, its tag current, and a detection's hash
+/// the current settings'. `None` for a file that is not a cache file.
+fn cache_file_current(
+    name: &str,
+    live: &HashSet<Uuid>,
+    config: &IntroSkipperConfig,
+) -> Option<bool> {
+    let (rest, kind) = name.rsplit_once('.')?;
+    let detection = match kind {
+        "fp" => None,
+        SILENCE_CACHE => Some(config_hash::Detection::Silence),
+        KEYFRAME_CACHE => Some(config_hash::Detection::Keyframe),
+        BLACK_INTERVAL_CACHE => Some(config_hash::Detection::BlackInterval),
+        KEYFRAME_VISUAL_CACHE => Some(config_hash::Detection::KeyframeVisual),
+        BLACK_FRAME_CACHE => Some(config_hash::Detection::BlackFrame(WireMode::Credits)),
+        _ => return None,
+    };
+    let mut parts = rest.splitn(3, '.');
+    let item = Uuid::parse_str(parts.next()?).ok()?;
+    let Some(mode) = parts.next().and_then(tag_mode) else {
+        return Some(false);
+    };
+    if !live.contains(&item) {
+        return Some(false);
+    }
+    let Some(detection) = detection else {
+        return Some(true);
+    };
+    let detection = match detection {
+        config_hash::Detection::BlackFrame(_) => config_hash::Detection::BlackFrame(mode),
+        other => other,
+    };
+    let hash = rest.rsplit_once('.').map(|(_, hash)| hash);
+    Some(hash == Some(&config_hash::detection_cache(config, detection)))
 }
 
 /// A short filename tag for an analysis mode (part of the fingerprint-cache
@@ -2701,6 +2882,273 @@ mod tests {
         };
         h.task.execute(&TaskProgress::default()).await.expect("run");
         assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    // ---- the Clean Intro Skipper Cache task ---------------------------------
+
+    /// Which cache files the clean keeps: an analysed item's, under a current
+    /// tag and (for a detection) the current settings' hash.
+    #[test]
+    fn cache_files_are_current_by_item_tag_and_hash() {
+        let c = IntroSkipperConfig::default();
+        let live = HashSet::from([EP_A]);
+        let silence = config_hash::detection_cache(&c, config_hash::Detection::Silence);
+        let recap_frames =
+            config_hash::detection_cache(&c, config_hash::Detection::BlackFrame(WireMode::Recap));
+        let current = |name: String| cache_file_current(&name, &live, &c);
+        assert_eq!(current(format!("{EP_A}.intro2.0-450.fp")), Some(true));
+        assert_eq!(
+            current(format!("{EP_A}.intro.0-450.fp")),
+            Some(false),
+            "an older tag"
+        );
+        assert_eq!(
+            current(format!("{EP_B}.intro2.0-450.fp")),
+            Some(false),
+            "not analysed"
+        );
+        assert_eq!(
+            current(format!("{EP_A}.intro2.44.5-51.5.{silence}.silence")),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.intro2.44.5-51.5.0123456789ABCDEF.silence")),
+            Some(false)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.recap2.0-120.{recap_frames}.blackframes")),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.credits3.0-120.{recap_frames}.blackframes")),
+            Some(false)
+        );
+        let credits_frames =
+            config_hash::detection_cache(&c, config_hash::Detection::BlackFrame(WireMode::Credits));
+        let keyframes = config_hash::detection_cache(&c, config_hash::Detection::Keyframe);
+        let intervals = config_hash::detection_cache(&c, config_hash::Detection::BlackInterval);
+        let visuals = config_hash::detection_cache(&c, config_hash::Detection::KeyframeVisual);
+        assert_eq!(
+            current(format!(
+                "{EP_A}.credits3.1350-0.{credits_frames}.blackframes"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.preview.1700-1702.{keyframes}.keyframes")),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.commercial.60-62.{silence}.silence")),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!(
+                "{EP_A}.credits3.1335-1450.{intervals}.blackintervals"
+            )),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.credits3.1350-1800.{visuals}.visuals")),
+            Some(true)
+        );
+        assert_eq!(
+            current(format!("{EP_A}.credits3.1350-1800.{silence}.visuals")),
+            Some(false)
+        );
+        assert_eq!(current("notes.txt".to_owned()), None);
+        assert_eq!(current(format!("{EP_A}.intro2.0-450.tmp")), None);
+    }
+
+    /// `CleanCacheTask`: an item gone from the libraries loses its segments
+    /// (published ones too) and cache; stale cache files of a live item go,
+    /// current ones stay; vanished seasons lose their state.
+    #[tokio::test]
+    async fn the_clean_task_drops_what_nothing_reads() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let gone = Uuid::from_u128(0x99);
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: gone,
+                mode: WireMode::Introduction,
+                start: 0.0,
+                end: 30.0,
+                is_user_provided: false,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("stale segment");
+        let vanished = Uuid::from_u128(0x5ea5_0099);
+        h.actions
+            .set_episode_ids(vanished, WireMode::Introduction, &[gone], "H")
+            .await
+            .expect("stale state");
+        let dir = &h.task.cache_dir;
+        let stale_files = [
+            format!("{gone}.intro2.0-450.fp"),
+            format!("{EP_A}.intro.0-450.fp"),
+            format!("{EP_A}.intro2.1-2.0123456789ABCDEF.silence"),
+        ];
+        for name in &stale_files {
+            std::fs::write(dir.join(name), b"x").expect("stale file");
+        }
+        let kept = cache_files(&h, EP_A)
+            .into_iter()
+            .filter(|f| !stale_files.contains(f))
+            .collect::<Vec<_>>();
+        assert!(
+            kept.iter().any(|f| std::path::Path::new(f)
+                .extension()
+                .is_some_and(|e| e == "fp")),
+            "{kept:?}"
+        );
+
+        let clean = CleanCacheTask {
+            detect: Arc::new(h.task.clone()),
+        };
+        assert_eq!(
+            (clean.key(), clean.name(), clean.category()),
+            (
+                "CPBIntroSkipperCleanCache",
+                "Clean Intro Skipper Cache",
+                "Intro Skipper"
+            )
+        );
+        assert!(clean.default_triggers().is_empty());
+        clean
+            .execute(&TaskProgress::default())
+            .await
+            .expect("clean");
+
+        assert!(h.actions.segments(gone).await.expect("tier").is_empty());
+        assert!(
+            !h.actions
+                .stored_item_ids()
+                .await
+                .expect("ids")
+                .contains(&gone)
+        );
+        for name in &stale_files {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        let mut left = cache_files(&h, EP_A);
+        left.sort();
+        let mut kept = kept;
+        kept.sort();
+        assert_eq!(left, kept);
+        assert!(
+            h.actions
+                .season_states(vanished)
+                .await
+                .expect("states")
+                .is_empty()
+        );
+        assert!(
+            !h.actions
+                .season_states(SEASON)
+                .await
+                .expect("states")
+                .is_empty()
+        );
+    }
+
+    /// Moves an episode out of every library (its file elsewhere).
+    async fn move_out_of_the_libraries(h: &Harness, id: Uuid) {
+        let mut item = h
+            .task
+            .library
+            .get_item_by_id(id)
+            .await
+            .expect("read")
+            .expect("item");
+        item.path = Some("/elsewhere/s01e03.mkv".to_owned());
+        h.persistence.save_items(&[item]).await.expect("move");
+    }
+
+    /// The clean unpublishes a gone item's segments only with
+    /// `UpdateMediaSegments` (the stored ones go either way), and a disabled
+    /// plugin's clean does nothing.
+    #[rstest]
+    #[case::publishing("{}", true, false)]
+    #[case::not_publishing(r#"{"UpdateMediaSegments":false}"#, true, true)]
+    #[case::disabled("{}", false, true)]
+    #[tokio::test]
+    async fn the_clean_task_unpublishes_with_update_media_segments(
+        #[case] config: &str,
+        #[case] enabled: bool,
+        #[case] still_published: bool,
+    ) {
+        let h = harness(&THREE_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let gone = THREE_EPISODES[2].0;
+        assert_eq!(intros_of(&h.segments, gone).await.len(), 1);
+        move_out_of_the_libraries(&h, gone).await;
+        let clean = CleanCacheTask {
+            detect: Arc::new(DetectSegmentsTask {
+                plugins: Arc::new(FakePlugins {
+                    enabled,
+                    config: config.as_bytes().to_vec(),
+                }),
+                ..h.task.clone()
+            }),
+        };
+        clean
+            .execute(&TaskProgress::default())
+            .await
+            .expect("clean");
+        assert_eq!(
+            intros_of(&h.segments, gone).await.len(),
+            usize::from(still_published)
+        );
+        assert_eq!(
+            h.actions.segments(gone).await.expect("tier").is_empty(),
+            enabled
+        );
+    }
+
+    /// Without `CacheFingerprints` nothing is cached and nothing cached is
+    /// read.
+    #[tokio::test]
+    async fn caching_follows_cache_fingerprints() {
+        let h = harness(&TWO_EPISODES, true, r#"{"CacheFingerprints":false}"#, true).await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(h.calls.load(Ordering::SeqCst) > 0);
+        assert!(
+            cache_files(&h, EP_A).is_empty(),
+            "{:?}",
+            cache_files(&h, EP_A)
+        );
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// Without `CacheFingerprints` a print already on disk is not read either:
+    /// the episodes are fingerprinted afresh.
+    #[tokio::test]
+    async fn a_cached_print_is_ignored_without_cache_fingerprints() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("cache");
+        let cached = h.calls.load(Ordering::SeqCst);
+        let off = DetectSegmentsTask {
+            plugins: Arc::new(FakePlugins {
+                enabled: true,
+                config: br#"{"CacheFingerprints":false,"MaximumIntroDuration":119}"#.to_vec(),
+            }),
+            ..h.task.clone()
+        };
+        off.execute(&TaskProgress::default())
+            .await
+            .expect("re-analyse");
+        assert!(h.calls.load(Ordering::SeqCst) > cached, "re-fingerprinted");
     }
 
     // ---- the Media Segment Scan task ---------------------------------------

@@ -814,7 +814,7 @@ impl DetectSegmentsTask {
         for (index, item) in items.iter().enumerate() {
             if item.needs_analysis(mode)
                 || (item.get(mode) == EpisodeState::Analyzed
-                    && self.has_cached_print(item, mode).await)
+                    && self.has_cached_print(item, mode, config).await)
             {
                 queue.push(index);
             }
@@ -837,9 +837,8 @@ impl DetectSegmentsTask {
                     .filter(|&i| i != lone && (items[i].entry.episode_number - number).abs() <= 1),
             );
         }
-        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
         let prints = self
-            .prints(items, &queue, mode, print, fingerprinter, options)
+            .prints(items, &queue, mode, print, fingerprinter, config)
             .await;
         let mut found: HashMap<usize, TimeRange> = HashMap::new();
         let mut recap_frames = HashMap::new();
@@ -922,14 +921,14 @@ impl DetectSegmentsTask {
         mode: Mode,
         print: PrintMode,
         fingerprinter: &dyn Fingerprinter,
-        options: ProcessOptions,
+        config: &IntroSkipperConfig,
     ) -> HashMap<usize, Arc<Vec<u32>>> {
         let mut prints = HashMap::new();
         for &index in queue {
             let item = &items[index];
             let fingerprint = match item.fingerprint_range(mode) {
                 Some((start, end)) => self
-                    .fingerprint_cached(&item.entry, (start, end), print, fingerprinter, options)
+                    .fingerprint_cached(&item.entry, (start, end), print, fingerprinter, config)
                     .await
                     .unwrap_or_else(|err| {
                         tracing::debug!(%err, path = item.entry.path, ?mode, "intro skipper: fingerprint failed — no segment for this window");
@@ -1087,12 +1086,16 @@ impl DetectSegmentsTask {
             .unwrap_or_default()
     }
 
-    /// `HasCachedFingerprint`: the window's print is on disk.
-    async fn has_cached_print(&self, item: &Item, mode: Mode) -> bool {
+    /// `HasCachedFingerprint`: with `CacheFingerprints`, the window's print is
+    /// on disk.
+    async fn has_cached_print(&self, item: &Item, mode: Mode, config: &IntroSkipperConfig) -> bool {
         let (Some((start, end)), Some(print)) = (item.fingerprint_range(mode), print_mode(mode))
         else {
             return false;
         };
+        if !config.cache_fingerprints {
+            return false;
+        }
         tokio::fs::try_exists(self.print_path(item.entry.episode_id, start, end, print))
             .await
             .unwrap_or(false)
