@@ -1153,6 +1153,7 @@ async fn verify_artwork_destinations(
             .to_string_lossy()
             .as_ref()
     );
+    verify_extra_thumbs_duplication(api, library, options, id, media).await;
     std::fs::remove_file(media.join("poster.png")).unwrap();
     std::fs::create_dir(media.join("poster.png")).unwrap();
     upload_artwork(api, id, "Primary").await;
@@ -1176,6 +1177,107 @@ async fn verify_artwork_destinations(
     config["ImageSavingConvention"] = json!("Legacy");
     api.post("/System/Configuration", &config).await;
     options["SaveLocalMetadata"] = json!(false);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+}
+
+// Verify the live option independently of L17's enabled-destination coverage.
+#[allow(clippy::too_many_lines)]
+async fn verify_extra_thumbs_duplication(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    let original = api.get("/System/Configuration/xbmcmetadata").await;
+    let server = api.get("/System/Configuration").await;
+    let original_options = options.clone();
+    let duplicate = media.join("extrathumbs/thumb1.png");
+    std::fs::write(&duplicate, b"existing duplicate").unwrap();
+    let mut configuration = original.clone();
+    configuration["EnableExtraThumbsDuplication"] = json!(false);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert_eq!(
+        std::fs::read(&duplicate).unwrap(),
+        b"existing duplicate",
+        "disabling retains existing duplicate bytes"
+    );
+    configuration["EnableExtraThumbsDuplication"] = json!(true);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert_eq!(std::fs::read(&duplicate).unwrap(), POSTER);
+    configuration["EnableExtraThumbsDuplication"] = json!(false);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    std::fs::remove_file(&duplicate).unwrap();
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert!(!duplicate.exists(), "disabling applies on the next upload");
+    configuration["EnableExtraThumbsDuplication"] = json!(true);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    upload_artwork(api, id, "Backdrop/0").await;
+    assert!(
+        !media.join("extrathumbs/thumb0.png").exists(),
+        "the first backdrop has a single output"
+    );
+    let mut config = server.clone();
+    config["ImageSavingConvention"] = json!("Legacy");
+    api.post("/System/Configuration", &config).await;
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert!(!duplicate.exists(), "Legacy uses one local output");
+    config["ImageSavingConvention"] = json!("Compatible");
+    api.post("/System/Configuration", &config).await;
+    options["SaveLocalMetadata"] = json!(false);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert!(
+        !duplicate.exists(),
+        "internal saving does not create a local duplicate"
+    );
+    options["SaveLocalMetadata"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    let images = api.get(&format!("/Items/{id}/Images")).await;
+    std::fs::create_dir(&duplicate).unwrap();
+    let response = api.client.post(format!("{}/Items/{id}/Images/Backdrop/1",api.base))
+        .header("Authorization", &api.auth).header("Content-Type","image/png")
+        .body("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==")
+        .send().await.unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed second output cannot silently fall back"
+    );
+    assert_eq!(
+        api.get(&format!("/Items/{id}/Images")).await,
+        images,
+        "failed duplication must not publish a new image path"
+    );
+    std::fs::remove_dir(&duplicate).unwrap();
+    upload_artwork(api, id, "Backdrop/1").await;
+    assert_eq!(
+        std::fs::read(&duplicate).unwrap(),
+        POSTER,
+        "a repaired destination succeeds without restart"
+    );
+    api.post("/System/Configuration/xbmcmetadata", &original)
+        .await;
+    api.post("/System/Configuration", &server).await;
+    *options = original_options;
     api.post(
         "/Library/VirtualFolders/LibraryOptions",
         &json!({"Id":library,"LibraryOptions":options}),
