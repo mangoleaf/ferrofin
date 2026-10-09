@@ -161,6 +161,13 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
     }
 
     async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError> {
+        // A disabled .NET plugin is not loaded, so upstream's route 404s; a
+        // stale dashboard tab must not erase a season or start ffmpeg here.
+        if !self.enabled().await {
+            return Err(ServiceError::NotFound(
+                "Intro Skipper is disabled".to_owned(),
+            ));
+        }
         if self.running.swap(true, Ordering::SeqCst) {
             return Ok(false);
         }
@@ -2030,6 +2037,27 @@ mod tests {
         );
         h.task.erase_cache(None, None).await.expect("all");
         assert!(cache_files(&h, EP_A).is_empty() && cache_files(&h, EP_B).is_empty());
+    }
+
+    /// With the plugin disabled a rescan is refused and erases nothing.
+    #[tokio::test]
+    async fn a_rescan_is_refused_while_disabled() {
+        let h = harness(&TWO_EPISODES, false, "{}", true).await;
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_A,
+                mode: WireMode::Recap,
+                start: 0.0,
+                end: 5.0,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("store");
+        let err = h.task.rescan(SEASON).await.expect_err("disabled");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(!h.task.is_running());
+        assert_eq!(h.actions.segments(EP_A).await.expect("read").len(), 1);
     }
 
     /// `ScanSeason`: the season is erased (segments + cache) and analysed again

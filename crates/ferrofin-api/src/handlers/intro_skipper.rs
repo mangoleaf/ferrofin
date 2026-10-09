@@ -1186,6 +1186,7 @@ async fn update_analyzer_actions(
 /// Port of `VisualizationController.ScanSeason`: 409 when a pass is already
 /// running; otherwise, in the background, the season's segments and cache are
 /// erased and only that season is analysed again (202).
+/// 404 while the plugin is disabled, as the route of an unloaded plugin.
 async fn scan_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
