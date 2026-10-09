@@ -53,7 +53,7 @@
 //! - `GET /Channels/{channelId}/Items` — a channel's items (400: no provider).
 //! - `GET /Channels/Items/Latest` — latest items across channels (empty).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::channels::ChannelFeatures;
@@ -63,6 +63,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
@@ -214,4 +215,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Channels/{channelId}/Features", get(get_channel_features))
         .route("/Channels/{channelId}/Items", get(get_channel_items))
         .route("/Channels/Items/Latest", get(get_latest_channel_items))
+}
+crate::query::query_parameters! {
+    ChannelUserQuery {} => [("get", "/Channels"), ("get", "/Channels/{channelId}/Items"), ("get", "/Channels/Items/Latest")];
 }

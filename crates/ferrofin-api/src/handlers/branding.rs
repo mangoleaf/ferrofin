@@ -22,7 +22,7 @@
 use std::path::Path;
 
 use axum::body::Body;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -33,6 +33,7 @@ use tower_http::services::ServeFile;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::image_upload::{decode_base64, image_extension_from_content_type};
 use crate::state::AppState;
 
@@ -240,4 +241,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(upload_splashscreen)
                 .delete(delete_splashscreen),
         )
+}
+crate::query::query_parameters! {
+    SplashscreenQuery {} => [("get", "/Branding/Css")];
 }

@@ -10,7 +10,7 @@
 //! persistable subset shared with `GET /Items` is honored here (the remainder is
 //! applied by the persistence layer where portable, exactly as for `/Items`).
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
@@ -188,4 +189,17 @@ async fn get_trailers(
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Trailers", get(get_trailers))
+}
+crate::query::query_parameters! {
+    TrailersQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "ids" => ',',
+        "excludeItemIds" => ',',
+        "locationTypes" => ',',
+        "excludeLocationTypes" => ',',
+    } => [("get", "/Trailers")];
 }

@@ -227,6 +227,9 @@ fn is_int_satisfied(condition: &ProfileCondition, current_value: Option<i32>) ->
             ProfileConditionType::LessThanEqual => current_value <= expected,
             ProfileConditionType::NotEquals => current_value != expected,
             ProfileConditionType::EqualsAny => unreachable!(),
+            ProfileConditionType::Unrecognized(value) => {
+                panic!("Unexpected ProfileConditionType: {value}")
+            }
         };
     }
 
@@ -290,6 +293,9 @@ fn is_double_satisfied(condition: &ProfileCondition, current_value: Option<f64>)
             ProfileConditionType::LessThanEqual => current_value <= expected,
             ProfileConditionType::NotEquals => current_value != expected,
             ProfileConditionType::EqualsAny => unreachable!(),
+            ProfileConditionType::Unrecognized(value) => {
+                panic!("Unexpected ProfileConditionType: {value}")
+            }
         };
     }
 

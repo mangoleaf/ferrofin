@@ -1284,14 +1284,9 @@ struct DirectPlayInfo {
     transcode_reasons: TranscodeReasons,
 }
 
-fn play_method_ord(pm: Option<PlayMethod>) -> i32 {
-    // C# orders by the PlayMethod? enum value; null sorts lowest.
-    match pm {
-        None => -1,
-        Some(PlayMethod::Transcode) => 0,
-        Some(PlayMethod::DirectStream) => 1,
-        Some(PlayMethod::DirectPlay) => 2,
-    }
+fn play_method_ord(pm: Option<PlayMethod>) -> Option<i32> {
+    // C# orders nullable enums by their underlying value; null sorts lowest.
+    pm.map(PlayMethod::json_value)
 }
 
 fn get_rank(reasons: TranscodeReasons, rankings: &[TranscodeReasons]) -> i32 {
@@ -1317,7 +1312,7 @@ fn sort_media_sources(mut streams: Vec<StreamInfo>, max_bitrate: i64) -> Vec<Str
         );
         let b = match i.play_method {
             PlayMethod::DirectStream | PlayMethod::DirectPlay => 0,
-            PlayMethod::Transcode => 1,
+            PlayMethod::Transcode | PlayMethod::Unrecognized(_) => 1,
         };
         let c = i32::from(protocol != Some(MediaProtocol::File));
         let d = if max_bitrate > 0 {

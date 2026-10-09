@@ -637,7 +637,7 @@ fn append_playlist_video_range_field(builder: &mut String, state: &EncodingJobIn
                 }
                 _ => builder.push_str(",VIDEO-RANGE=PQ"),
             },
-            VideoRange::Unknown => {}
+            VideoRange::Unknown | VideoRange::Unrecognized(_) => {}
         }
     } else {
         // Currently we only encode to SDR.

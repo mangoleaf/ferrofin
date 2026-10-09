@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-07",
+  "rust_sources_sha256": "0b7ab4820c9a03ce9427e3520755fa6c2d33635f2515c78d3f2ef165e7bb2b5b",
+  "jellyfin_oracle_version": "12.2.0.0",
+  "oracle_value_cases": 2398,
+  "additional_date_cases": 52,
+  "reflected_core_enum_types_checked": 65,
+  "numeric_request_fields_checked": 222,
+  "numeric_request_schemas_checked": 49,
+  "checks": {
+    "fmt": "passed",
+    "clippy_workspace_all_targets_all_features_warnings_denied": "passed",
+    "nextest_workspace": {
+      "passed": 7633,
+      "skipped": 5
+    },
+    "workspace_doctests": {
+      "passed": 3
+    },
+    "live_http_cases_matching_jellyfin": 20,
+    "line_coverage_percent": {
+      "ferrofin-api": 86.92,
+      "ferrofin-core": 94.4,
+      "ferrofin-db": 97.89,
+      "ferrofin-hls": 94.03,
+      "ferrofin-livetv": 93.83,
+      "ferrofin-mediaencoding": 93.71,
+      "ferrofin-model": 88.56,
+      "ferrofin-providers": 93.17
+    }
+  },
+  "performance": "performance.json",
+  "live_http_probe": "http_probe.py",
+  "live_http_results": "../../crates/ferrofin-api/tests/data/json-binding/ferrofin-http.json"
+}

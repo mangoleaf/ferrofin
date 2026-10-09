@@ -160,6 +160,9 @@ ferrofin:
     # How many ffprobe processes a library scan runs at once (default: 8, capped
     # at the core count). Lower it for libraries on NFS or spinning disks.
     # FERROFIN_SCAN_PROBE_CONCURRENCY: "4"
+    # How long TheTVDB lookups (episode ids, a series' season list) are reused,
+    # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
+    # FERROFIN_TVDB_CACHE_HOURS: "1"
 
     # Export sampled request traces over OTLP gRPC to your collector (→ Tempo/Jaeger).
     # Off unless set; stdout stays structured JSON with a trace_id on each line.

@@ -1,0 +1,313 @@
+{
+  "baseline": "60f29281",
+  "after": "per-user visibility implementation including final validation corrections",
+  "profile": "debug, unoptimized, local loopback, fresh synthetic data per run",
+  "samples_per_route_per_run": 100,
+  "warmup_requests": 10,
+  "library_items": 64,
+  "queue_items": 63,
+  "percentile_method": "p50 median; p95 nearest rank",
+  "first_sample": "after functional probes; not a cold cache measurement",
+  "runs": [
+    {
+      "trial": 1,
+      "build": "before",
+      "load_before": [
+        82.54541015625,
+        75.99267578125,
+        95.31640625
+      ],
+      "load_after": [
+        91.11474609375,
+        79.6171875,
+        95.9599609375
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 4.150616005063057,
+          "p50_ms": 4.796190187335014,
+          "p95_ms": 7.52417603507638,
+          "mean_ms": 4.949511345475912
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 3.9716651663184166,
+          "p50_ms": 2.060328144580126,
+          "p95_ms": 4.80102002620697,
+          "mean_ms": 2.4614318972453475
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 1.4317985624074936,
+          "p50_ms": 0.897509977221489,
+          "p95_ms": 1.825931016355753,
+          "mean_ms": 1.0452783619984984
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 2.087112981826067,
+          "p50_ms": 1.4696686994284391,
+          "p95_ms": 3.3370209857821465,
+          "mean_ms": 1.8340043630450964
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "build": "after",
+      "load_before": [
+        91.11474609375,
+        79.6171875,
+        95.9599609375
+      ],
+      "load_after": [
+        74.13330078125,
+        76.419921875,
+        94.6513671875
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 7.647986989468336,
+          "p50_ms": 5.583269754424691,
+          "p95_ms": 10.16175327822566,
+          "mean_ms": 6.263671135529876
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 4.9566710367798805,
+          "p50_ms": 3.050108440220356,
+          "p95_ms": 4.4180466793477535,
+          "mean_ms": 3.22240287438035
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 2.9524676501750946,
+          "p50_ms": 2.402310026809573,
+          "p95_ms": 4.364516120404005,
+          "mean_ms": 2.7310005575418472
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 7.8469980508089066,
+          "p50_ms": 9.228596929460764,
+          "p95_ms": 13.52007407695055,
+          "mean_ms": 9.472794579342008
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "build": "after",
+      "load_before": [
+        74.13330078125,
+        76.419921875,
+        94.6513671875
+      ],
+      "load_after": [
+        56.07568359375,
+        72.20068359375,
+        92.87646484375
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 4.993160255253315,
+          "p50_ms": 3.4623215906322002,
+          "p95_ms": 6.277839187532663,
+          "mean_ms": 3.8985141878947616
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 4.366007167845964,
+          "p50_ms": 2.665150910615921,
+          "p95_ms": 4.130645655095577,
+          "mean_ms": 2.836059257388115
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 2.143333200365305,
+          "p50_ms": 1.8876614049077034,
+          "p95_ms": 3.2186992466449738,
+          "mean_ms": 2.1065889997407794
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 9.57000907510519,
+          "p50_ms": 7.2197148110717535,
+          "p95_ms": 10.776335839182138,
+          "mean_ms": 7.868886175565422
+        }
+      ]
+    },
+    {
+      "trial": 4,
+      "build": "before",
+      "load_before": [
+        56.07568359375,
+        72.20068359375,
+        92.87646484375
+      ],
+      "load_after": [
+        46.279296875,
+        69.2373046875,
+        91.57421875
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 3.308109939098358,
+          "p50_ms": 2.4290899746119976,
+          "p95_ms": 3.119269385933876,
+          "mean_ms": 2.5450898008421063
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 2.2753840312361717,
+          "p50_ms": 1.1324870865792036,
+          "p95_ms": 1.532520167529583,
+          "mean_ms": 1.1910297814756632
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 1.1345171369612217,
+          "p50_ms": 0.753619009628892,
+          "p95_ms": 0.9648269042372704,
+          "mean_ms": 0.7742748502641916
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 1.7317798919975758,
+          "p50_ms": 1.263683196157217,
+          "p95_ms": 1.4598490670323372,
+          "mean_ms": 1.2728555593639612
+        }
+      ]
+    },
+    {
+      "trial": 5,
+      "build": "before",
+      "load_before": [
+        46.279296875,
+        69.2373046875,
+        91.57421875
+      ],
+      "load_after": [
+        35.90478515625,
+        65.3828125,
+        89.8291015625
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 4.782949108630419,
+          "p50_ms": 2.849012613296509,
+          "p95_ms": 5.4992143996059895,
+          "mean_ms": 3.2000583689659834
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 2.089063171297312,
+          "p50_ms": 1.262623118236661,
+          "p95_ms": 1.8989406526088715,
+          "mean_ms": 1.3514359341934323
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 1.0949871502816677,
+          "p50_ms": 0.8441200479865074,
+          "p95_ms": 1.13271689042449,
+          "mean_ms": 0.8893536729738116
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 2.0986427552998066,
+          "p50_ms": 1.60380476154387,
+          "p95_ms": 2.2132438607513905,
+          "mean_ms": 1.621020589955151
+        }
+      ]
+    },
+    {
+      "trial": 6,
+      "build": "after",
+      "load_before": [
+        35.90478515625,
+        65.3828125,
+        89.8291015625
+      ],
+      "load_after": [
+        30.96435546875,
+        62.84814453125,
+        88.607421875
+      ],
+      "library_items": 64,
+      "queue_items": 63,
+      "measurements": [
+        {
+          "route": "detail",
+          "requests": 100,
+          "first_ms": 5.554305389523506,
+          "p50_ms": 3.6344726104289293,
+          "p95_ms": 5.7634650729596615,
+          "mean_ms": 3.9544841554015875
+        },
+        {
+          "route": "PlaybackInfo",
+          "requests": 100,
+          "first_ms": 3.489831928163767,
+          "p50_ms": 2.620536368340254,
+          "p95_ms": 4.5976778492331505,
+          "mean_ms": 2.9000054858624935
+        },
+        {
+          "route": "image hit",
+          "requests": 100,
+          "first_ms": 2.0615519024431705,
+          "p50_ms": 1.9422669429332018,
+          "p95_ms": 3.0296379700303078,
+          "mean_ms": 2.1507030446082354
+        },
+        {
+          "route": "SyncPlay list",
+          "requests": 100,
+          "first_ms": 8.503411896526814,
+          "p50_ms": 7.5636261608451605,
+          "p95_ms": 10.336284060031176,
+          "mean_ms": 7.8369637578725815
+        }
+      ]
+    }
+  ]
+}

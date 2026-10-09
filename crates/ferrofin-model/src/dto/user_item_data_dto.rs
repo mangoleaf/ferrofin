@@ -12,14 +12,17 @@ use uuid::Uuid;
 pub struct UserItemDataDto {
     /// Gets or sets the rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rating: Option<f64>,
 
     /// Gets or sets the played percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub played_percentage: Option<f64>,
 
     /// Gets or sets the unplayed item count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub unplayed_item_count: Option<i32>,
 
     /// Gets or sets the playback position ticks.
@@ -33,6 +36,7 @@ pub struct UserItemDataDto {
 
     /// Gets or sets a value indicating whether the item is liked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub likes: Option<bool>,
 
     /// Gets or sets the last played date.
@@ -59,30 +63,37 @@ pub struct UserItemDataDto {
 pub struct UpdateUserItemDataDto {
     /// Gets or sets the rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rating: Option<f64>,
 
     /// Gets or sets the played percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub played_percentage: Option<f64>,
 
     /// Gets or sets the unplayed item count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub unplayed_item_count: Option<i32>,
 
     /// Gets or sets the playback position ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub playback_position_ticks: Option<i64>,
 
     /// Gets or sets the play count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub play_count: Option<i32>,
 
     /// Gets or sets a value indicating whether this instance is a favorite.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_favorite: Option<bool>,
 
     /// Gets or sets a value indicating whether the item is liked.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub likes: Option<bool>,
 
     /// Gets or sets the last played date.
@@ -93,6 +104,7 @@ pub struct UpdateUserItemDataDto {
 
     /// Gets or sets a value indicating whether the item is played.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub played: Option<bool>,
 
     /// Gets or sets the key.

@@ -112,6 +112,11 @@ struct FileConfig {
     studios_repo_url: Option<String>,
     tvdb_api_key: Option<String>,
     tvdb_subscriber_pin: Option<String>,
+    /// Read as text whatever its TOML type (`6`, `1.5`, `"6h"`, `true`): the
+    /// `config` crate would coerce a number into an integer field (`1.5` →
+    /// 2) and fail the whole file on a string, so every value goes through
+    /// [`Config::tvdb_cache_duration`]'s check and warning instead.
+    tvdb_cache_hours: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
@@ -267,6 +272,16 @@ pub struct Config {
     /// TheTVDB subscriber PIN (for a user's paid subscription tier). Empty =
     /// non-subscriber. From `FERROFIN_TVDB_PIN` or `config.toml`.
     pub tvdb_subscriber_pin: String,
+
+    /// How long TheTVDB lookups are reused, in whole hours, as written: the
+    /// TVDB plugin's `CacheDurationInHours` (default 1). It covers the
+    /// episode ids the TVDB episode provider resolves and the season list of
+    /// each series the season provider reads a season's id from. Resolved
+    /// `FERROFIN_TVDB_CACHE_HOURS` env > `tvdb_cache_hours` in `config.toml` >
+    /// unset; validated by [`tvdb_cache_duration`](Self::tvdb_cache_duration)
+    /// where the client is built, so a bad value warns (tracing is up by
+    /// then) and the default applies — it never stops the server.
+    pub tvdb_cache_hours: Option<String>,
 
     /// fanart.tv personal API key (`client_key`), raising rate limits and
     /// unlocking fresher artwork. Empty = the built-in key only. From
@@ -567,6 +582,11 @@ impl Config {
             .or(file.tvdb_subscriber_pin)
             .unwrap_or_default();
 
+        let tvdb_cache_hours = env
+            .var("FERROFIN_TVDB_CACHE_HOURS")
+            .filter(|raw| !raw.trim().is_empty())
+            .or(file.tvdb_cache_hours);
+
         let fanart_personal_api_key = env
             .var("FERROFIN_FANART_KEY")
             .or(file.fanart_personal_api_key)
@@ -631,6 +651,7 @@ impl Config {
             studios_repo_url,
             tvdb_api_key,
             tvdb_subscriber_pin,
+            tvdb_cache_hours,
             fanart_personal_api_key,
             musicbrainz_base_url,
             ffmpeg_path,
@@ -711,6 +732,31 @@ impl Config {
         ferrofin
     }
 
+    /// TheTVDB's cache duration ([`tvdb_cache_hours`](Self::tvdb_cache_hours)):
+    /// the configured whole hours, or the plugin's default of one hour
+    /// ([`ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION`]) when unset. A
+    /// value that is not a whole number of hours above zero is refused with
+    /// a warning and the default is used, as the sibling settings do; call
+    /// it once tracing is installed.
+    #[must_use]
+    pub fn tvdb_cache_duration(&self) -> std::time::Duration {
+        let default = ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION;
+        let Some(raw) = self.tvdb_cache_hours.as_deref() else {
+            return default;
+        };
+        match raw.trim().parse::<u32>() {
+            Ok(hours) if hours > 0 => std::time::Duration::from_hours(u64::from(hours)),
+            _ => {
+                tracing::warn!(
+                    value = raw,
+                    default_hours = default.as_secs() / 3600,
+                    "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours above zero; using the default"
+                );
+                default
+            }
+        }
+    }
+
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
     /// `ferrofin_db::Database::connect`.
     #[must_use]
@@ -746,6 +792,7 @@ impl Config {
             studios_repo_url: String::new(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
+            tvdb_cache_hours: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: String::new(),
             ffmpeg_path: None,
@@ -1192,6 +1239,81 @@ mod tests {
             Config::load_from(cli(), &env).unwrap().enable_metrics,
             Some(false)
         );
+    }
+
+    /// `FERROFIN_TVDB_CACHE_HOURS` beats `tvdb_cache_hours` in `config.toml`,
+    /// and unset is the plugin's one hour.
+    #[test]
+    fn tvdb_cache_hours_env_beats_file() {
+        let hours = |config: &Config| config.tvdb_cache_duration().as_secs() / 3600;
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.tvdb_cache_hours, None);
+        assert_eq!(hours(&unset), 1, "the plugin's CacheDurationInHours");
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "tvdb_cache_hours = 6\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            hours(&Config::load_from(cli(), &FakeEnv::new()).unwrap()),
+            6,
+            "the file's"
+        );
+        let env = FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", " 12 ");
+        assert_eq!(
+            hours(&Config::load_from(cli(), &env).unwrap()),
+            12,
+            "the env beats the file"
+        );
+        let blank = FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", "  ");
+        assert_eq!(
+            hours(&Config::load_from(cli(), &blank).unwrap()),
+            6,
+            "a blank env var is unset"
+        );
+    }
+
+    /// A value that is not a whole number of hours above zero — from the
+    /// env or the file — warns and falls back to the default, never stops
+    /// the server.
+    #[test]
+    fn a_bad_tvdb_cache_hours_falls_back_to_the_default() {
+        let cases: [(Option<&str>, &str); 9] = [
+            (Some("0"), ""),
+            (Some("-3"), ""),
+            (Some("1.5"), ""),
+            (Some("6h"), ""),
+            (None, "tvdb_cache_hours = 0\n"),
+            (None, "tvdb_cache_hours = -2\n"),
+            (None, "tvdb_cache_hours = 1.5\n"),
+            (None, "tvdb_cache_hours = \"6h\"\n"),
+            (None, "tvdb_cache_hours = true\n"),
+        ];
+        for (env_value, file) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let toml = dir.path().join("config.toml");
+            std::fs::write(&toml, file).unwrap();
+            let cli = Cli {
+                config_file: Some(toml),
+                ..Cli::default()
+            };
+            let env = match env_value {
+                Some(value) => FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", value),
+                None => FakeEnv::new(),
+            };
+            let config = Config::load_from(cli, &env).unwrap();
+            assert!(
+                config.tvdb_cache_hours.is_some(),
+                "kept as written: {env_value:?} {file:?}"
+            );
+            assert_eq!(
+                config.tvdb_cache_duration(),
+                ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION,
+                "{env_value:?} {file:?}"
+            );
+        }
     }
 
     #[test]

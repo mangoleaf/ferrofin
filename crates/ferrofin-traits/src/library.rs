@@ -271,6 +271,67 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Resolves an item as a user, returning `None` when it is missing or hidden.
+    /// A user-less request retains raw lookup semantics (for example API keys).
+    /// Storage and policy evaluation failures remain errors, never invisibility.
+    async fn get_item_by_id_for_user(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let Some(item) = self.get_item_by_id(id).await? else {
+            return Ok(None);
+        };
+        if let Some(user) = user
+            && !self.is_item_visible_standalone(&item, user).await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(item))
+    }
+
+    /// `BaseItem.IsVisible`: the item's own policy, used by parent browse gates.
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn is_item_visible(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Err(ServiceError::backend("item visibility is not configured"))
+    }
+
+    /// `IsVisibleStandalone`: item, ancestor and library access with kind overrides.
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Err(ServiceError::backend(
+            "standalone item visibility is not configured",
+        ))
+    }
+
+    /// Returns existing, standalone-visible IDs in input order.
+    /// Implementations can batch policy and hierarchy reads for queue checks.
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let mut visible = Vec::new();
+        for &id in ids {
+            if self
+                .get_item_by_id_for_user(id, Some(user))
+                .await?
+                .is_some()
+            {
+                visible.push(id);
+            }
+        }
+        Ok(visible)
+    }
+
     /// Resolve the distinct physical owners whose extras an item presents.
     /// Concrete managers batch movie-version links and grouped-series folders.
     async fn get_extra_owner_ids_batch(
@@ -1088,6 +1149,35 @@ pub struct PlaybackPermissions {
     pub remuxing: bool,
 }
 
+/// The user permissions `BaseItem.CanDelete(user)` and `CanDownload(user)`
+/// read, from [`UserDataManager::get_content_permissions`].
+///
+/// Upstream reads each with `user.HasPermission(PermissionKind.…)` and the
+/// folder list with `user.GetPreferenceValues<Guid>(PreferenceKind.
+/// EnableContentDeletionFromFolders)` (`BaseItem.cs:854-879`,
+/// `BoxSet.cs:107-110`, `Playlist.cs:273-276`, `BaseItem.cs:902-905`).
+// Each flag is one independent `Permissions` row, not a state to model.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentPermissions {
+    /// `PermissionKind.IsAdministrator` — deletes any playlist and any
+    /// collection. It grants nothing for ordinary media: an administrator
+    /// without "Allow media deletion" cannot delete a movie, as upstream.
+    pub is_administrator: bool,
+    /// `PermissionKind.EnableContentDeletion` — the dashboard's "Allow media
+    /// deletion" (any library).
+    pub enable_content_deletion: bool,
+    /// `PermissionKind.EnableContentDownloading`.
+    pub enable_content_downloading: bool,
+    /// `PermissionKind.EnableCollectionManagement` — deletes collections.
+    pub enable_collection_management: bool,
+    /// `PreferenceKind.EnableContentDeletionFromFolders` — the dashboard's
+    /// "Allow media deletion from" list: the libraries (`CollectionFolder`
+    /// ids) the user may delete from without the global permission. Values
+    /// that are not GUIDs are dropped.
+    pub content_deletion_folders: Vec<Uuid>,
+}
+
 impl PlaybackPermissions {
     /// Applies the overwrite to one media source, for an item of `media_type`.
     ///
@@ -1421,17 +1511,20 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// The user's `(EnableContentDeletion, EnableContentDownloading)`
-    /// permissions, for the DTO builder's per-user `CanDelete`/`CanDownload`
-    /// gating (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`).
+    /// The slice of the user's policy that `CanDelete(user)` and
+    /// `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
+    /// `BoxSet`/`Playlist` overrides, and `IsAuthorizedToDownload`), for the
+    /// DTO builder's per-user `CanDelete`/`CanDownload` and the delete
+    /// endpoints' check, which use the same value.
     ///
-    /// `None` means "no policy known" — the caller falls back to the
-    /// file-level fact. The default returns that; the concrete manager reads
-    /// the `Permissions` rows.
+    /// `None` means "no policy known". `CanDownload` then falls back to the
+    /// file-level fact, and `CanDelete` for a user is `false`: a deletion is
+    /// never granted on an unknown policy. The default returns `None`; the
+    /// concrete manager reads the `Permissions` and `Preferences` rows.
     async fn get_content_permissions(
         &self,
         user_id: Uuid,
-    ) -> Result<Option<(bool, bool)>, ServiceError> {
+    ) -> Result<Option<ContentPermissions>, ServiceError> {
         let _ = user_id;
         Ok(None)
     }

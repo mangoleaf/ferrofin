@@ -38,7 +38,10 @@ use ferrofin_model::providers::RemoteSearchResult;
 use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_traits::providers::{
+    DynamicMetadataLookup, DynamicMetadataProvider, DynamicMetadataResult, MetadataRefreshMode,
+    MetadataRefreshOptions,
+};
 use uuid::Uuid;
 
 /// The ids every stand-in MusicBrainz answer names.
@@ -194,6 +197,29 @@ struct Fixture {
 
 impl Fixture {
     async fn new(root: &Path, options: LibraryOptions) -> Self {
+        Self::build(root, options, Vec::new(), true).await
+    }
+
+    /// [`new`](Self::new), with the plugins' metadata sources `plugins`
+    /// registered on the scanner.
+    async fn with_plugins(
+        root: &Path,
+        options: LibraryOptions,
+        plugins: Vec<Arc<dyn DynamicMetadataProvider>>,
+    ) -> Self {
+        Self::build(root, options, plugins, true).await
+    }
+
+    /// The fixture's library, scanned by a scanner with the plugins'
+    /// metadata sources `plugins` and — with `built_in` — MusicBrainz,
+    /// TheAudioDB and the studio artwork wired (without it, no remote music
+    /// provider of the server's own).
+    async fn build(
+        root: &Path,
+        options: LibraryOptions,
+        plugins: Vec<Arc<dyn DynamicMetadataProvider>>,
+        built_in: bool,
+    ) -> Self {
         let media = root.join("music");
         let artist_dir = media.join("Miles Davis");
         let album_dir = artist_dir.join("Kind of Blue");
@@ -225,7 +251,19 @@ impl Fixture {
             Arc::new(ItemTypeLookup::new()),
         ));
         let music = Music::spawn();
-        let scanner = music_scanner(&vf, &persistence, &items, root, &music.base);
+        let scanner = if built_in {
+            music_scanner(&vf, &persistence, &items, root, &music.base)
+        } else {
+            LibraryScanner::new(
+                Arc::clone(&vf),
+                Arc::new(FerrofinFileSystem::new()),
+                persistence.clone(),
+            )
+            .with_items(Arc::clone(&items))
+            .with_metadata_dir(root.join("metadata"))
+            .with_progress_every(0)
+        }
+        .with_dynamic_providers(plugins);
         Self {
             db,
             items,
@@ -1597,6 +1635,354 @@ async fn musicbrainz_populates_albums_and_artists_ahead_of_theaudiodb() {
         Some("United States")
     );
     assert_eq!(artist.overview.as_deref(), Some("Artist bio."));
+}
+
+/// The provider name of [`PluginDb`].
+const PLUGIN: &str = "PluginDb";
+
+/// A plugin's metadata source for music: it answers for an album and for an
+/// artist with genres and an overview (which MusicBrainz and TheAudioDB
+/// answer too) and a tagline (which neither does), for a track with nothing,
+/// and records the kind and name of every item it is asked about.
+struct PluginDb {
+    asked: Mutex<Vec<(String, String)>>,
+}
+
+impl PluginDb {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The (kind, name) of every item asked about since the last call.
+    fn take(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.asked.lock().expect("lock"))
+    }
+
+    /// As a registered source.
+    fn source(self: &Arc<Self>) -> Vec<Arc<dyn DynamicMetadataProvider>> {
+        vec![Arc::clone(self) as Arc<dyn DynamicMetadataProvider>]
+    }
+}
+
+#[async_trait::async_trait]
+impl DynamicMetadataProvider for PluginDb {
+    fn name(&self) -> &'static str {
+        PLUGIN
+    }
+
+    fn library_gated(&self) -> bool {
+        true
+    }
+
+    async fn lookup(
+        &self,
+        item: &DynamicMetadataLookup,
+    ) -> Result<Option<DynamicMetadataResult>, ferrofin_traits::error::ServiceError> {
+        self.asked
+            .lock()
+            .expect("lock")
+            .push((item.kind.clone(), item.name.clone()));
+        let (overview, genre) = match item.kind.as_str() {
+            "MusicAlbum" => ("PluginDb album text.", "Cool jazz"),
+            "MusicArtist" => ("PluginDb artist text.", "Hard bop"),
+            _ => return Ok(None),
+        };
+        Ok(Some(DynamicMetadataResult {
+            overview: Some(overview.to_owned()),
+            genres: vec![genre.to_owned()],
+            tagline: Some("PluginDb tagline.".to_owned()),
+            ..DynamicMetadataResult::default()
+        }))
+    }
+}
+
+/// A library that ticked MusicBrainz, TheAudioDB and [`PluginDb`] for albums
+/// and artists and saved `order` as their order.
+fn music_order(order: &[&str]) -> LibraryOptions {
+    use ferrofin_providers::library_options::fetcher_names::{AUDIODB, MUSICBRAINZ};
+    let entry = |kind: &str| TypeOptions {
+        type_: Some(kind.to_owned()),
+        metadata_fetchers: vec![
+            MUSICBRAINZ.to_owned(),
+            AUDIODB.to_owned(),
+            PLUGIN.to_owned(),
+        ],
+        metadata_fetcher_order: order.iter().map(|n| (*n).to_owned()).collect(),
+        ..TypeOptions::default()
+    };
+    LibraryOptions {
+        type_options: vec![entry("MusicAlbum"), entry("MusicArtist")],
+        ..LibraryOptions::default()
+    }
+}
+
+/// [`music_order`] with the plugin ranked first, or left out of the order.
+fn plugin_ranked(first: bool) -> LibraryOptions {
+    use ferrofin_providers::library_options::fetcher_names::{AUDIODB, MUSICBRAINZ};
+    if first {
+        music_order(&[PLUGIN, MUSICBRAINZ, AUDIODB])
+    } else {
+        music_order(&[MUSICBRAINZ, AUDIODB])
+    }
+}
+
+/// A plugin's metadata source runs among an album's providers at its rank
+/// in the library's order, like any provider (`ExecuteRemoteProviders`):
+/// ranked before MusicBrainz and TheAudioDB its genres and overview win;
+/// left out of the order it ranks by its `IHasOrder` (50), after both, and
+/// only fills what they left (the tagline). An album asks it once, in the
+/// music pass, never also in the walk.
+#[rstest::rstest]
+#[case::ranked_first(true)]
+#[case::unranked(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_source_runs_at_its_rank_among_an_albums_providers(#[case] first: bool) {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(first), plugin.source()).await;
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    if first {
+        assert_eq!(album.genres.as_deref(), Some("Cool jazz"));
+        assert_eq!(album.overview.as_deref(), Some("PluginDb album text."));
+    } else {
+        assert_eq!(album.genres.as_deref(), Some("jazz|modal jazz"));
+        assert_eq!(album.overview.as_deref(), Some("Album text."));
+    }
+    assert_eq!(album.tagline.as_deref(), Some("PluginDb tagline."));
+    assert_eq!(
+        album.production_year,
+        Some(1959),
+        "MusicBrainz's year fills"
+    );
+    assert_eq!(
+        plugin
+            .take()
+            .iter()
+            .filter(|(kind, _)| kind == "MusicAlbum")
+            .count(),
+        1,
+        "the album asks its providers once, in the music pass"
+    );
+}
+
+/// The same for a folder artist's providers: ranked first, the plugin's
+/// overview and genres win over TheAudioDB's biography and MusicBrainz's
+/// genres; unranked, theirs stand and the plugin fills the tagline.
+#[rstest::rstest]
+#[case::ranked_first(true)]
+#[case::unranked(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_source_runs_at_its_rank_among_a_folder_artists_providers(#[case] first: bool) {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(first), plugin.source()).await;
+    fx.scan().await;
+    let artist = fx.row(fx.artist_id()).await;
+    if first {
+        assert_eq!(artist.overview.as_deref(), Some("PluginDb artist text."));
+        assert_eq!(artist.genres.as_deref(), Some("Hard bop"));
+    } else {
+        assert_eq!(artist.overview.as_deref(), Some("Artist bio."));
+        assert_eq!(artist.genres.as_deref(), Some("jazz"));
+    }
+    assert_eq!(artist.tagline.as_deref(), Some("PluginDb tagline."));
+    assert!(
+        plugin
+            .take()
+            .contains(&("MusicArtist".to_owned(), "Miles Davis".to_owned())),
+        "asked by the artist's name"
+    );
+}
+
+/// A library whose only metadata source for music is a plugin (neither
+/// MusicBrainz nor TheAudioDB wired) still runs the music pass's providers
+/// for its album and artist: the plugin's answer is all they get.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_only_music_library_still_asks_the_plugin() {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::build(
+        tmp.path(),
+        LibraryOptions::default(),
+        plugin.source(),
+        false,
+    )
+    .await;
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(album.overview.as_deref(), Some("PluginDb album text."));
+    assert_eq!(album.genres.as_deref(), Some("Cool jazz"));
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(artist.overview.as_deref(), Some("PluginDb artist text."));
+    assert!(
+        fx.music.take().is_empty(),
+        "no built-in music provider wired"
+    );
+}
+
+/// A plugin is asked once per refresh that runs the providers and never by
+/// an unchanged rescan: a first scan asks it about each track (the walk),
+/// the album and the artist; an unchanged rescan asks nothing; an artist
+/// known only by name (`ArtistsValidator`) is asked by its name on the next
+/// validation, with the server-wide options (no library): unranked, the
+/// plugin fills what MusicBrainz and TheAudioDB left; once stamped, a quiet
+/// rescan asks nothing again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_is_never_asked_by_an_unchanged_rescan() {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), LibraryOptions::default(), plugin.source()).await;
+    fx.scan().await;
+    let mut first: Vec<String> = plugin.take().into_iter().map(|(kind, _)| kind).collect();
+    first.sort();
+    assert_eq!(first, ["Audio", "Audio", "MusicAlbum", "MusicArtist"]);
+
+    fx.scan().await;
+    assert_eq!(plugin.take(), [], "an unchanged rescan asks no plugin");
+
+    let track = derive_item_id(
+        BaseItemKind::Audio,
+        &fx.album_dir.join("01 - So What.mp3").to_string_lossy(),
+    )
+    .expect("id");
+    fx.persistence
+        .save_item_values(track, &[(1, "Gil Evans".into())])
+        .await
+        .expect("materialize");
+    let gil = by_name_artist(&fx, "Gil Evans").await;
+    fx.scan().await;
+    assert_eq!(
+        plugin.take(),
+        [("MusicArtist".to_owned(), "Gil Evans".to_owned())],
+        "the by-name artist's first refresh asks it"
+    );
+    let artist = fx.row(gil).await;
+    assert_eq!(artist.tagline.as_deref(), Some("PluginDb tagline."));
+    assert_eq!(artist.overview.as_deref(), Some("Artist bio."), "unranked");
+
+    fx.scan().await;
+    assert_eq!(plugin.take(), [], "a stamped by-name artist asks nothing");
+}
+
+/// An `album.nfo` and an `artist.nfo` are the items' local metadata, merged
+/// into `temp` before any remote provider (`MetadataService.cs:803-850`), so
+/// MusicBrainz, TheAudioDB and a plugin ranked first only fill what the NFO
+/// left: the NFO's overview and genres stand over all three; the plugin's
+/// tagline and MusicBrainz's year fill the gaps. "Replace all metadata"
+/// keeps it so — upstream's local readers still seed `temp` there unless the
+/// item has a metadata saver (`isSavingMetadata`, `:803`), and Ferrofin
+/// runs none — and the NFO's values replace the stored ones.
+#[rstest::rstest]
+#[case::first_scan(false)]
+#[case::replace_all(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(true), plugin.source()).await;
+    std::fs::write(
+        fx.album_dir.join("album.nfo"),
+        "<album><title>Kind of Blue</title><plot>NFO album text.</plot>\
+         <genre>Bebop</genre></album>",
+    )
+    .expect("album.nfo");
+    std::fs::write(
+        fx.artist_dir.join("artist.nfo"),
+        "<artist><biography>NFO artist bio.</biography><genre>Trumpet jazz</genre></artist>",
+    )
+    .expect("artist.nfo");
+    fx.scan().await;
+    if replace {
+        fx.scan_with(&replace_all()).await;
+    }
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(album.overview.as_deref(), Some("NFO album text."));
+    assert_eq!(album.genres.as_deref(), Some("Bebop"));
+    assert_eq!(album.tagline.as_deref(), Some("PluginDb tagline."));
+    assert_eq!(
+        album.production_year,
+        Some(1959),
+        "MusicBrainz fills the year"
+    );
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(artist.overview.as_deref(), Some("NFO artist bio."));
+    assert_eq!(artist.genres.as_deref(), Some("Trumpet jazz"));
+    assert_eq!(artist.tagline.as_deref(), Some("PluginDb tagline."));
+    assert!(
+        plugin.take().iter().any(|(kind, _)| kind == "MusicAlbum"),
+        "the plugin still answered"
+    );
+}
+
+/// "Identify → Apply" on a folder artist refreshes the albums below it with
+/// the same options, chosen result included (`ProviderManager.RefreshItem`
+/// → `ValidateChildren(options)`), and a refresh with a search result runs
+/// no local reader (`options.SearchResult is null`, `MetadataService.cs:
+/// 803`) — the identified artist's nor its albums'. So the album's
+/// `album.nfo` does not start its providers' `temp`, and under the
+/// Identify's "Replace all metadata" the providers' overview and genres
+/// replace the NFO's that the first scan saved.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_album_under_an_identified_artist_reads_no_nfo() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    std::fs::write(
+        fx.album_dir.join("album.nfo"),
+        "<album><title>Kind of Blue</title><plot>NFO album text.</plot>\
+         <genre>Bebop</genre></album>",
+    )
+    .expect("album.nfo");
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(album.overview.as_deref(), Some("NFO album text."));
+    assert_eq!(album.genres.as_deref(), Some("Bebop"));
+
+    let options = MetadataRefreshOptions {
+        search_result: Some(RemoteSearchResult {
+            name: Some("Miles Davis".to_owned()),
+            provider_ids: Some(
+                [("MusicBrainzArtist".to_owned(), CHOSEN_ARTIST.to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..RemoteSearchResult::default()
+        }),
+        ..replace_all()
+    };
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.artist_dir.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("identify");
+    assert_eq!(
+        fx.id_of(fx.artist_id(), "MusicBrainzArtist")
+            .await
+            .as_deref(),
+        Some(CHOSEN_ARTIST),
+        "the artist took the chosen id"
+    );
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album.overview.as_deref(),
+        Some("Album text."),
+        "TheAudioDB's"
+    );
+    assert_eq!(
+        album.genres.as_deref(),
+        Some("jazz|modal jazz"),
+        "MusicBrainz's"
+    );
 }
 
 /// A refresh of an album served inside a scan after the walk decided the

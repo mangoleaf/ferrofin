@@ -21,7 +21,7 @@
 //! path through the library scan (its own path, or a folder's subtree), any
 //! other through the provider manager.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -40,7 +40,7 @@ use ferrofin_traits::error::ServiceError;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// `GET /Items/{itemId}/ExternalIdInfos` — the item's external-id descriptors.
@@ -60,10 +60,15 @@ use crate::state::AppState;
 )]
 async fn get_external_id_infos(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     let infos = state.providers.get_external_id_infos(item_id).await?;
@@ -305,12 +310,16 @@ fn default_true() -> bool {
 )]
 async fn apply_search_criteria(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    let Some(item) = state.library.get_item_by_id(item_id).await? else {
+    let Some(item) = state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+    else {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     };
     tracing::info!(
@@ -370,13 +379,16 @@ async fn apply_search_criteria(
             // the scan queue's priority lane — inside a running scan, between
             // two of its items — so it never waits for a library scan.
             let library = std::sync::Arc::clone(&state.library);
-            let ran = tokio::spawn(async move { library.run_refresh_scan(target, &options).await })
-                .await
-                .map_err(|err| {
-                    ApiError::Service(ServiceError::backend(format!(
-                        "identify refresh task failed: {err}"
-                    )))
-                })??;
+            // In the request's span: the request awaits it (LOGGING.md §4).
+            let ran = tokio::spawn(tracing::Instrument::in_current_span(async move {
+                library.run_refresh_scan(target, &options).await
+            }))
+            .await
+            .map_err(|err| {
+                ApiError::Service(ServiceError::backend(format!(
+                    "identify refresh task failed: {err}"
+                )))
+            })??;
             if !ran {
                 // Logged once, by the error boundary (a 5xx).
                 return Err(ApiError::ServiceUnavailable(format!(
@@ -457,4 +469,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Items/RemoteSearch/Apply/{itemId}",
             post(apply_search_criteria),
         )
+}
+crate::query::query_parameters! {
+    ApplyQuery {} => [("post", "/Items/RemoteSearch/Apply/{itemId}")];
 }

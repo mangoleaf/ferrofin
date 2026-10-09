@@ -34,7 +34,7 @@
 //! - The `PlaylistManager.RemovePlaylistsAsync` cleanup on delete is deferred
 //!   (no playlist manager at this layer); token revocation + user deletion run.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::routing::{get, post};
@@ -55,7 +55,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
@@ -1127,6 +1127,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Users/ForgotPassword", post(forgot_password))
         .route("/Users/ForgotPassword/Pin", post(forgot_password_pin))
         .route("/Users/Me", get(get_current_user))
+}
+
+crate::query::query_parameters! {
+    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
+    GetUsersQuery {} => [("get", "/Users")];
 }
 
 #[cfg(test)]

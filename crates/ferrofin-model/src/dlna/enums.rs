@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Enum `DlnaProfileType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DlnaProfileType {
     /// Audio.
     #[default]
@@ -21,11 +22,25 @@ pub enum DlnaProfileType {
     Subtitle = 3,
     /// Lyric.
     Lyric = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DlnaProfileType, None, {
+        Audio => ("Audio", 0),
+        Video => ("Video", 1),
+        Photo => ("Photo", 2),
+        Subtitle => ("Subtitle", 3),
+        Lyric => ("Lyric", 4),
+    }
 }
 
 /// The codec type of a codec profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum CodecType {
     /// The profile applies to a video codec.
     #[default]
@@ -34,17 +49,39 @@ pub enum CodecType {
     VideoAudio = 1,
     /// The profile applies to an audio codec.
     Audio = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    CodecType, None, {
+        Video => ("Video", 0),
+        VideoAudio => ("VideoAudio", 1),
+        Audio => ("Audio", 2),
+    }
 }
 
 /// The encoding context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum EncodingContext {
     /// The media is transcoded on the fly and delivered as a stream.
     #[default]
     Streaming = 0,
     /// The media is transcoded to a static file.
     Static = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    EncodingContext, None, {
+        Streaming => ("Streaming", 0),
+        Static => ("Static", 1),
+    }
 }
 
 /// The playback error code.
@@ -60,8 +97,9 @@ pub enum PlaybackErrorCode {
 }
 
 /// The comparison a profile condition applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProfileConditionType {
     /// Values must be equal.
     Equals = 0,
@@ -73,11 +111,25 @@ pub enum ProfileConditionType {
     GreaterThanEqual = 3,
     /// Value must equal any of the provided values.
     EqualsAny = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProfileConditionType, None, {
+        Equals => ("Equals", 0),
+        NotEquals => ("NotEquals", 1),
+        LessThanEqual => ("LessThanEqual", 2),
+        GreaterThanEqual => ("GreaterThanEqual", 3),
+        EqualsAny => ("EqualsAny", 4),
+    }
 }
 
 /// The stream property a profile condition constrains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ProfileConditionValue {
     /// Audio channel count.
     AudioChannels = 0,
@@ -131,11 +183,46 @@ pub enum ProfileConditionValue {
     NumStreams = 25,
     /// Video rotation.
     VideoRotation = 26,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ProfileConditionValue, None, {
+        AudioChannels => ("AudioChannels", 0),
+        AudioBitrate => ("AudioBitrate", 1),
+        AudioProfile => ("AudioProfile", 2),
+        Width => ("Width", 3),
+        Height => ("Height", 4),
+        Has64BitOffsets => ("Has64BitOffsets", 5),
+        PacketLength => ("PacketLength", 6),
+        VideoBitDepth => ("VideoBitDepth", 7),
+        VideoBitrate => ("VideoBitrate", 8),
+        VideoFramerate => ("VideoFramerate", 9),
+        VideoLevel => ("VideoLevel", 10),
+        VideoProfile => ("VideoProfile", 11),
+        VideoTimestamp => ("VideoTimestamp", 12),
+        IsAnamorphic => ("IsAnamorphic", 13),
+        RefFrames => ("RefFrames", 14),
+        NumAudioStreams => ("NumAudioStreams", 16),
+        NumVideoStreams => ("NumVideoStreams", 17),
+        IsSecondaryAudio => ("IsSecondaryAudio", 18),
+        VideoCodecTag => ("VideoCodecTag", 19),
+        IsAvc => ("IsAvc", 20),
+        IsInterlaced => ("IsInterlaced", 21),
+        AudioSampleRate => ("AudioSampleRate", 22),
+        AudioBitDepth => ("AudioBitDepth", 23),
+        VideoRangeType => ("VideoRangeType", 24),
+        NumStreams => ("NumStreams", 25),
+        VideoRotation => ("VideoRotation", 26),
+    }
 }
 
 /// Delivery method to use during playback of a specific subtitle format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SubtitleDeliveryMethod {
     /// Burn the subtitles into the video track.
     #[default]
@@ -148,15 +235,39 @@ pub enum SubtitleDeliveryMethod {
     Hls = 3,
     /// Drop the subtitle.
     Drop = 4,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SubtitleDeliveryMethod, None, {
+        Encode => ("Encode", 0),
+        Embed => ("Embed", 1),
+        External => ("External", 2),
+        Hls => ("Hls", 3),
+        Drop => ("Drop", 4),
+    }
 }
 
 /// The transcode seek info.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TranscodeSeekInfo {
     /// The seek method is chosen automatically.
     #[default]
     Auto = 0,
     /// Seeking is performed by byte position.
     Bytes = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TranscodeSeekInfo, None, {
+        Auto => ("Auto", 0),
+        Bytes => ("Bytes", 1),
+    }
 }

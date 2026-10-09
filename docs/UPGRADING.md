@@ -8,7 +8,232 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## Unreleased — extras no longer appear as library children
+## Unreleased — library scans in this release
+
+Library scans keep the rule 1.3.0 introduced: an item is processed again only when
+something about it changed, unless you choose **Search for missing metadata** or **Replace
+all metadata** ([what a library scan does](FEATURES.md#what-a-library-scan-does)). This
+release changes what a refresh does once it runs:
+
+- Every checked metadata downloader runs, in the library's order, instead of only the
+  first one that answers:
+  [every checked metadata provider runs, in order](#unreleased--every-checked-metadata-provider-runs-in-order).
+- Seasons get remote metadata, with TheTVDB first where the library saved no season order:
+  [seasons ask TheTVDB before TheMovieDb by default](#unreleased--seasons-ask-thetvdb-before-themoviedb-by-default),
+  and **Seasons get remote metadata** in the entry after it. An episode's TheTVDB id and
+  a series' TheTVDB season list are reused for `FERROFIN_TVDB_CACHE_HOURS` hours (a new
+  setting, default 1; see [`CONFIG.md`](CONFIG.md)).
+- WASM plugins that supply metadata run at their place in the library's order, and an
+  `album.nfo` or `artist.nfo` now wins over every remote provider:
+  [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
+
+Apart from scans, who may delete an item now follows Jellyfin's rules:
+[who may delete an item](#unreleased--who-may-delete-an-item-follows-jellyfin-more-closely).
+
+**Upgrading from 1.3.x** causes no full pass: an unchanged item is still not reprocessed,
+and each change above reaches an item at its next refresh that asks its providers.
+
+**Upgrading from 1.2.x or earlier:** also read the 1.3.0 entries below, starting with
+[library scans process only what changed](#130--library-scans-process-only-what-changed):
+the first scan after upgrading is one full pass, and every item's `Etag` changes once. That
+entry also lists the settings that decide what a scan does, by their names in the
+dashboard, including **Date added behavior for new content** and
+`FERROFIN_METRICS_SCAN_DURATION_BUCKETS`.
+
+Still open in this release:
+
+- Deleting an item leaves its media files on disk.
+- Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
+  (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
+  shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
+  updated by the disk watcher (where it can see the change) and by scheduled scans.
+- The first scan of an adopted Jellyfin database saves every item once, as described in
+  the 1.3.0 entry.
+
+## Unreleased — who may delete an item follows Jellyfin more closely
+
+This applies to accounts that delete items: the **Delete media**, **Delete Series**,
+**Delete Episode** or **Delete** entry in an item's menu, and `DELETE /Items/{itemId}` /
+`DELETE /Items?ids=`.
+
+Ferrofin 1.3.0–1.3.2 already refused a delete from an account without deletion rights. Three
+things are refined, to match Jellyfin:
+
+- An account allowed to delete in some libraries only is matched to an item's library
+  through the library tree, as Jellyfin does, instead of by comparing folder paths.
+- The server answers a delete exactly as the item's own `CanDelete` says, which is what
+  jellyfin-web shows its delete entry by, so the entry appears only where the delete is
+  allowed. A *list* of playlists reports every playlist deletable, as Jellyfin's does;
+  deleting a playlist still needs its owner or an administrator. A playlist with no owner
+  (made with an API key, or created before Ferrofin stored playlist owners) can now be
+  deleted by an administrator only; in 1.3.x any signed-in account could delete one.
+- Some items cannot be deleted at all, as in Jellyfin: an item with no file of its own (a
+  season Ferrofin groups from a series folder without season folders, a streamed item), a
+  missing (virtual) episode or season, and a video a DVR recording is still writing.
+
+The settings are under **Dashboard → Users → (user) → Profile → Allow media deletion
+from**: **All libraries** lets the account delete in every library, or tick individual
+libraries. New accounts have neither; an administrator needs one of them too (the
+administrator Ferrofin creates on first start has **All libraries**). Deleting a collection
+needs **Allow this user to manage collections** or an administrator. An account that may
+not delete an item gets `401 Unauthorized`, and nothing is deleted.
+
+**Deleting an item still removes it from the library database only: its media files stay
+on disk**, and the next scan finds them again. Jellyfin also deletes the files; a later
+release will too, the way Jellyfin does.
+
+One more difference from Jellyfin remains: an account with **All libraries** deletion that can
+see only some libraries can still delete, by id, an item in a library it cannot see, where
+Jellyfin answers `404`. A later release closes this.
+
+`DELETE /Items?ids=` handles the ids one at a time, in order, as Jellyfin does: if it
+reaches an id the account may not delete, it stops with `401`, and the items before that
+one are already deleted. A delete finishes even if the app that asked for it is closed
+half way.
+
+## Unreleased — plugin metadata sources run at their rank
+
+This applies only if you run WASM plugins that supply metadata (a plugin listed under
+**Metadata downloaders** in a library's settings, or one whose documentation says it
+fills metadata).
+
+A plugin's metadata now takes its place among the library's metadata downloaders like
+any provider, as in Jellyfin: the providers run in the order the library's settings
+list them, and the first one to supply a field wins it. Before, a plugin always ran
+after TheMovieDb, OMDb, TheTVDB, MusicBrainz and TheAudioDB and could only fill fields
+they left empty.
+
+- **Check the Metadata downloaders order of every library that uses a plugin.** A
+  plugin listed above TheMovieDb (or another built-in provider) now wins the fields
+  both supply: its overview, rating or genres replace TheMovieDb's on the next refresh
+  that asks the providers. **This is likely even if you never moved it:** the dashboard
+  shows a downloader that is missing from a library's saved order at the top of the
+  list, and saving the library's settings stores the order shown. So in a library
+  whose settings were saved before you installed the plugin, enabling the plugin put it
+  first. To keep the old behaviour, move the plugin below the built-in providers and
+  save.
+- Where nothing ranks a plugin (a library that never saved its settings for that kind
+  of item, or a plugin that does not appear in the list at all, which is never ranked),
+  it runs after the built-in providers that come first by default (TheMovieDb for
+  movies, series and episodes; OMDb; MusicBrainz; TheAudioDB) and only fills what they
+  left. **Seasons are the exception:** TheTVDB and TheMovieDb's season provider have no
+  default position either, and a plugin comes before them, so an unranked plugin runs
+  first for seasons and wins every season field it supplies. That includes a plugin
+  that does not list seasons among the kinds it supports: in a library with no saved
+  season settings it is still asked about seasons (the supported kinds are not enforced
+  yet, an open item). In a library with saved season settings, a plugin runs for
+  seasons only where it is ticked, at its saved position (the top, if the saved order
+  predates the plugin); one without `provider-info` (not in the list) runs after
+  TheTVDB and TheMovieDb.
+- Two things differ from before even where a plugin only fills gaps: its studios and
+  tags are added to the other providers', and in a library whose language is not
+  English its overview and tagline replace the English ones OMDb or TheAudioDB supplied
+  (a plugin reports no language, so it counts as answering in the library's language,
+  as in Jellyfin).
+- **In a library you create from the dashboard, a plugin starts unticked** under
+  *Metadata downloaders* and *Image fetchers*, as in Jellyfin: it is listed (for
+  seasons, first), but runs only once you tick it. Before, it started ticked.
+- For albums and artists, a plugin is now asked together with MusicBrainz and
+  TheAudioDB, in the library's order, instead of during the file walk (after which
+  MusicBrainz and TheAudioDB replaced whatever they also supplied). Artists that exist
+  only as names on tracks are now asked too.
+- An `album.nfo` or `artist.nfo` now wins over every remote provider, as in Jellyfin:
+  MusicBrainz, TheAudioDB and plugins only fill what the NFO leaves empty. Before,
+  MusicBrainz and TheAudioDB replaced the NFO's values (its genres, overview, year) on
+  every refresh that asked them, and "Replace all metadata" erased NFO values they did
+  not supply. Albums and artists refreshed before this release keep the replaced values
+  until their next refresh that replaces values. **Search for missing metadata** fills
+  only empty fields, so it does not bring them back; **Replace all metadata** on the
+  music library does, but it also replaces every unlocked value you edited, so lock
+  those first or refresh only the affected albums and artists.
+- A plugin that fails (its metadata lookup returns an error) counts as a failed
+  provider, as before: the item is asked again on the next scan, and the failure erases
+  nothing.
+- What a plugin can reach does not change: no filesystem, network only to the hosts it
+  declares, the same memory and time limits.
+
+For plugin authors: nothing to rebuild. The `ferrofin:plugin@0.5.0` world is unchanged
+and existing components load as they are. Return only values you are confident in: your
+plugin may well sit above TheMovieDb in a library's order (see above), and then your
+answer wins. Your lookup's `provider-ids` now include the ids that providers ranked
+before yours found in the same refresh (TheMovieDb's ids, for example). See
+`docs/EXTENSIONS.md`.
+
+No manual step is needed beyond checking the order.
+
+## Unreleased — seasons ask TheTVDB before TheMovieDb by default
+
+This affects TV libraries with no saved season settings: libraries created through the
+API without season options, or whose metadata settings were never saved. There, both
+TheTVDB and TheMovieDb are asked about seasons, and TheTVDB now goes first, as in Jellyfin
+(where TheTVDB is a plugin, and plugins come first when two providers have no order). So
+TheTVDB's season overview and id win, and TheMovieDb fills what it leaves (the dates, the
+year, the cast). This includes seasons without a folder of their own, which were filled
+from TheMovieDb alone before. Each season changes on its next refresh that replaces
+values (a file joining or leaving its folder, **Replace all metadata**, or its own
+**Refresh metadata** dialog); an unchanged scan changes nothing.
+
+The dashboard now lists TheTVDB before TheMovieDb for seasons, and a new library saves
+that order. Libraries whose settings were saved from the dashboard keep their saved order.
+To keep TheMovieDb first, move it above TheTVDB under the library's season downloaders
+and save.
+
+## Unreleased — every checked metadata provider runs, in order
+
+Metadata refreshes now ask every metadata downloader a library has checked, one
+after the other in the library's order, as Jellyfin does. Before, the first
+provider that answered was the only one asked. With the defaults that means
+TheTVDB (series and episodes) and OMDb are asked after TheMovieDb. Expect more
+provider requests on first scans and full refreshes, and on the scans that
+re-ask about titles still missing an overview, trailer or Rotten Tomatoes score.
+OMDb answers are cached for a day. To ask fewer providers, uncheck them in the
+library's metadata settings.
+
+- A later provider only fills what an earlier one left empty, cast included:
+  TheTVDB's characters fill a cast TheMovieDb left empty, for example.
+- An NFO's genres are no longer combined with the providers' genres; the NFO's
+  list stands on its own, as in Jellyfin.
+- The scans that re-ask about incomplete titles only fill empty fields. They no
+  longer overwrite stored values, so your edits (even unlocked ones) and the
+  stored cast and provider ids stay as they are. This is the automatic
+  re-asking only: **Search for missing metadata**, which you start, also fills
+  only empty fields but, as in Jellyfin, replaces an item's unlocked cast
+  wherever a provider credits someone.
+- **Seasons get remote metadata.** TheMovieDb's and TheTVDB's season providers
+  now fill a season, as in Jellyfin, in the library's order for seasons (with no
+  saved order, TheTVDB first: in Jellyfin it is a plugin, and plugins come first):
+  TheMovieDb its overview, premiere date and year, cast and ids; TheTVDB its
+  overview (in the library's language) and its TheTVDB id only, no date or
+  year. A new library checks only TheTVDB for seasons, so there a season gets
+  an overview and an id. A season keeps its folder's name unless TheMovieDb's
+  "Import season name" setting is on. TheMovieDb's season overviews are in
+  English for now, whatever the library's language (TheTVDB's follow it);
+  asking TheMovieDb in the library's language is open work.
+  - When: a season asks its providers when it is first scanned, when a file
+    joins or leaves its folder, on **Search for missing metadata** and
+    **Replace all metadata**, and when the library's refresh interval passes —
+    never on an unchanged scan. Seasons without a folder of their own get the
+    same from their **Refresh metadata** dialog.
+  - Requests: where the library also uses TheMovieDb for episodes or for
+    season images, the season's answer comes from the season request those
+    already make, so a first scan asks nothing more; where it uses
+    TheMovieDb for seasons only, each season's first scan costs one request.
+    A season refreshed on its own (a file joining or leaving its folder, or
+    its refresh dialog) costs one TheMovieDb request. TheTVDB asks one
+    request per season, plus the series' season list at most once per
+    `FERROFIN_TVDB_CACHE_HOURS` (default one hour; none when the series was
+    just refreshed).
+  - A season scanned before this release has no overview until one of those
+    refreshes runs. To fill them now, run **Search for missing metadata** on
+    the TV library once. Know what it costs first: it re-asks every checked
+    provider about every series, season and episode of the library and
+    re-reads every episode file. It only fills empty fields, except the cast:
+    as in Jellyfin, a provider that credits someone replaces an item's
+    unlocked cast. Lock the cast (or the item) where you have edited it.
+
+No manual step is needed beyond that optional refresh.
+
+## 1.3.2 — extras no longer appear as library children
 
 Run **Scan All Libraries** once after upgrading if extras or samples appeared as
 ordinary library items (#32). The scan repairs valid extras' ownership and library
@@ -23,7 +248,99 @@ sample extras such as `Movie-sample.mkv` remain; `sample.mkv` and
 `Movie.sample.mkv` are ignored. Only successfully scanned locations are cleaned.
 No database reset or forced metadata replacement is needed.
 
-## Unreleased — subtitles download during library scans
+## 1.3.0 — library scans process only what changed
+
+From 1.3.0 a library scan decides, item by item, what changed since the item was last
+saved, and does only that work, as Jellyfin does. The scheduled scan, **Scan All
+Libraries** and **Scan for new and updated files** probe, re-read and re-ask only new and
+changed items; **Search for missing metadata** and **Replace all metadata** still process
+everything they cover. A change the disk watcher or a webhook reports refreshes the nearest
+item already in the library; that item's other children are checked, not processed.
+[What a library scan does](FEATURES.md#what-a-library-scan-does) has the details, and
+[`verify/`](../verify/README.md) checks a running server.
+
+**The first scan after upgrading from 1.2.x or earlier is one full pass.** Those versions
+cleared, on every scan, the date an item was last refreshed, so this scan finds every item
+never refreshed. It probes every media file again, asks the metadata downloaders about every
+item, downloads artwork for items that have none, and saves every item. Expect it to take
+about as long as a scan took before. In 1.3.0–1.3.2 a refresh asked the checked
+downloaders in order and stopped at the first that answered. From this release it asks
+every checked downloader
+([every checked metadata provider runs, in order](#unreleased--every-checked-metadata-provider-runs-in-order)),
+so with several checked it can make more provider requests than one of those earlier scans
+did.
+
+From the second scan on, an unchanged item costs a stat. On the 20,497-item benchmark
+library (remote metadata downloaders off), a scan of the unchanged library went from 151 s
+to about 2 s, with no ffprobe run and no item written. With downloaders checked, which is
+the default, a scan also pays for the re-asking described below: a 14,098-item library on
+network storage, with its downloaders checked, took 133–158 s per scheduled scan on 1.3.2.
+Upgrading from 1.3.x does not repeat the full pass.
+
+**Each item's `Etag` changes once.** Jellyfin derives an item's `Etag` from the date the
+item was last saved (`DateLastSaved`). Ferrofin 1.2.x and earlier never stored that date
+(and a scan cleared the one an adopted Jellyfin database had), so every item reported the
+same `Etag`. From 1.3.0 the date is written whenever an item is saved: each `Etag` changes
+on the first scan above, and afterwards whenever the item is saved again. That is when a
+scan, a refresh or an edit changes it, and for every item a **Search for missing
+metadata** or **Replace all metadata** covers, since both save every item they cover. A
+client that caches items by `Etag` fetches each item once more, then only the items that
+were saved.
+
+**The first scan after adopting a Jellyfin database saves every item once.** Nothing on
+disk has to change for it: Ferrofin stores some values differently from Jellyfin, among
+them the library an item is filed under (`TopParentId`, see
+[the adoption entry](#130--a-database-adopted-from-jellyfin-shows-its-libraries-and-removes-deleted-media)),
+some parent links (`ParentId`), the format of premiere dates, the shared-folder flag
+(`IsInMixedFolder`), the movie flag (`IsMovie`) and folders' modification times. That scan
+probes no file and asks no metadata provider, with two exceptions: the re-asking described
+next, and an item Jellyfin never finished refreshing (no `DateLastRefreshed`), which is
+refreshed in full, probe and providers included. Otherwise it only rewrites rows, and each
+item's `Etag` changes once. It is a one-time cost: on the 20,497-item benchmark library (a
+database Jellyfin 10.11.8 scanned, remote metadata downloaders off), it took about 80 s and
+wrote about 9 GB, and every later scan of the unchanged library took about 2 s. With
+downloaders checked, both scans also pay for the re-asking described next. A Jellyfin
+database adopted and scanned by 1.2.x or earlier gets the full pass above instead. Storing
+these values as Jellyfin does, so that adoption needs no such pass, is open work.
+
+**Titles still missing metadata are asked about on every scan.** This is a Ferrofin rule
+that Jellyfin does not have, and the one kind of provider request a scan of an unchanged
+library still makes. A movie or series with no overview, no trailer or (with OMDb checked)
+no Rotten Tomatoes score, and an episode with no overview or only a placeholder title, is
+asked about again on every scan. In 1.3.0–1.3.2 that re-ask stopped at the first downloader
+that answered and merged by the Default rule, which replaces values: a provider value that
+had drifted since the last save, such as a TheMovieDb rating, re-saved the item on every
+scan. From this release
+([every checked metadata provider runs, in order](#unreleased--every-checked-metadata-provider-runs-in-order))
+every checked downloader is asked, the answer only fills empty fields, and the item is saved
+only when it fills something, so a title the providers have no trailer or score for costs
+its requests on every scan and nothing else.
+
+The settings that decide what a scan does, as the dashboard names them:
+
+- **Metadata downloaders** and **Image fetchers**, with their order, per kind of item
+  (**Dashboard → Libraries → Manage library**): which providers a refresh asks. A
+  library's own choices win; a kind it never saved choices for follows the server-wide
+  options (see
+  [that entry](#130--items-without-per-library-fetcher-choices-follow-the-server-wide-metadata-options)).
+- **Automatically refresh metadata from the internet** (same page): when set, an item last
+  refreshed longer ago than that is processed as if its file had changed. The default,
+  **Never**, leaves unchanged items alone.
+- **Enable real time monitoring** (same page): changes on disk are processed as they happen,
+  once the folder has been quiet for `LibraryMonitorDelay` seconds. That is a server
+  setting (default 60) with no field in the web client; set it through
+  `POST /System/Configuration`. The `*arr` webhooks wait for the same delay.
+- **Date added behavior for new content** (**Dashboard → Libraries → Display**): see
+  [its entry](#130--date-added-behavior-for-new-content-is-honoured).
+- `FERROFIN_SCAN_PROBE_CONCURRENCY`: how many ffprobe processes a scan runs at once.
+- `FERROFIN_METRICS_SCAN_DURATION_BUCKETS`: the buckets of the scan-duration histograms,
+  with metrics on (`FERROFIN_ENABLE_METRICS=true`). The scan metrics and the **Library
+  scans** Grafana dashboard are described in
+  [`contrib/metrics/README.md`](../contrib/metrics/README.md#library-scans-dashboard).
+
+Both variables are in [`CONFIG.md`](CONFIG.md).
+
+## 1.3.0 — subtitles download during library scans
 
 Libraries with subtitle download languages now fetch missing subtitles when a movie
 or episode is probed during a normal scan or full metadata refresh. Configure an
@@ -39,7 +356,7 @@ subtitles already embedded in a video satisfy their language, even when skipping
 embedded image subtitles is disabled. The audio-language skip checks default audio
 tracks, falling back to the first audio track when none is marked default.
 
-## Unreleased — a database adopted from Jellyfin shows its libraries and removes deleted media
+## 1.3.0 — a database adopted from Jellyfin shows its libraries and removes deleted media
 
 This applies only to a database adopted from a Jellyfin install (a
 `jellyfin.db.pre-ferrofin` copy sits next to the database). A database Ferrofin created
@@ -60,7 +377,9 @@ before that scan, make sure your media is where the libraries expect it: a file 
 moved or renamed is removed, then added again as a new item without its watched state. A
 scan never removes anything under a library location that is missing, empty or cannot be
 listed (an unmounted drive or share), nor an entry whose file or folder is still on disk,
-unless the scan replaced it with a new entry for the same file.
+unless the scan replaced it with a new entry for the same file. That first scan also saves
+every item once; see
+[library scans process only what changed](#130--library-scans-process-only-what-changed).
 
 Two things you may notice once an adopted library browses again, both gaps in how
 Ferrofin's scan groups files (they are open work, not intended behaviour):
@@ -79,7 +398,7 @@ Adoption is still one-way: going back to Jellyfin means restoring the
 `jellyfin.db.pre-ferrofin` copy taken at adoption, which predates every change Ferrofin
 made.
 
-## Unreleased — "Date added behavior for new content" is honoured
+## 1.3.0 — "Date added behavior for new content" is honoured
 
 **Dashboard → Libraries → Display → Date added behavior for new content** now decides how
 a new item's date added (`DateCreated`, what "Date Added" sorts and "Recently added"
@@ -115,7 +434,7 @@ choice, without any action from you. Items already in the library keep their dat
 back, choose **Use file creation date** under **Dashboard → Libraries → Display** and
 save.
 
-## Unreleased — items without per-library fetcher choices follow the server-wide metadata options
+## 1.3.0 — items without per-library fetcher choices follow the server-wide metadata options
 
 Scans and single-item refreshes (`POST /Items/{id}/Refresh`, Identify) now decide which
 remote providers run for an item, and in what order, the way Jellyfin does. This applies to
@@ -152,7 +471,7 @@ save: the library then has saved choices, and its next scan uses them. Artists k
 by name have no library: remove `TheAudioDB` from the `MusicArtist` entry's
 `DisabledMetadataFetchers` in the server-wide options to turn it back on for them.
 
-## Unreleased — editing an item no longer locks it
+## 1.3.0 — editing an item no longer locks it
 
 Earlier versions locked an item (`LockData`) whenever a metadata-editor save changed one of
 its fields, whether or not "Lock this item" was ticked. This version saves exactly what the
@@ -174,7 +493,7 @@ tell an automatic lock from one you set on purpose. For those items:
 
 To find them, list `GET /Items?Recursive=true&IsLocked=true`.
 
-## Unreleased — the schema moves to Jellyfin 12.0
+## 1.2.0 — the schema moves to Jellyfin 12.0
 
 Back up the data directory before starting this version. On first boot migration `0032`
 rebuilds `BaseItems`, `Users`, `Permissions`, `Preferences` and `MediaStreamInfos` into
@@ -212,7 +531,7 @@ Behaviour that changed with the shape:
   listings (144 episodes on the reference library), exactly as on Jellyfin 12.1. A 12.0 database keeps its `LinkedChildren` rows and
   is never re-imported from the frozen JSON copy in `Data`.
 
-## Unreleased — Unicode username matching
+## 1.1.0 — Unicode username matching
 
 Migration `0030_normalized_usernames.sql` owns the `Users.NormalizedUsername` column
 and unique index. Older databases run it; adopted Jellyfin 10.11.10/10.11.11 databases

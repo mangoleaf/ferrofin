@@ -358,11 +358,46 @@ struct OkLibrary {
     adopted_tree: bool,
     /// The last query `query_items` received.
     last_query: Arc<std::sync::Mutex<Option<InternalItemsQuery>>>,
+    /// Every `delete_item` call: the id and whether its files were asked to go
+    /// (`DeleteOptions::delete_file_location`).
+    deleted: Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>,
+    /// When set, `delete_item` signals it has started and waits to be
+    /// released before it records the delete.
+    gate: Option<Arc<DeleteGate>>,
+}
+
+/// Holds a fake delete half way, so a test can drop the request meanwhile.
+#[derive(Default)]
+struct DeleteGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == PLAYLIST_ID {
+            return Ok(Some(item_entity(
+                PLAYLIST_ID,
+                "Playlist",
+                BaseItemKind::Playlist,
+            )));
+        }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
             return Ok(Some(item_entity(
                 COLLECTION_FOLDER_ID,
@@ -458,7 +493,15 @@ impl LibraryManager for OkLibrary {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn delete_item(&self, _id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
+    async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
+        self.deleted
+            .lock()
+            .expect("lock")
+            .push((id, options.delete_file_location));
         Ok(())
     }
     async fn get_people(
@@ -616,6 +659,13 @@ impl DtoService for OkDto {
     ) -> Result<BaseItemDto, ServiceError> {
         Ok(entity_to_dto(item))
     }
+    async fn can_delete(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
 }
 
 /// A [`VirtualFolderManager`] listing one library whose locations include
@@ -670,6 +720,8 @@ fn ok_state(item_id: Uuid) -> AppState {
         item_id,
         adopted_tree: false,
         last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
 }
 
@@ -680,6 +732,25 @@ fn ok_state_with(library: OkLibrary) -> AppState {
 
 /// [`ok_state_with`] over a caller-chosen [`UserManager`] (a policy, say).
 fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppState {
+    ok_state_full(
+        library,
+        users,
+        Arc::new(OkDto),
+        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+    )
+}
+
+/// The request authentication a test state resolves callers with.
+type Auth = (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>);
+
+/// [`ok_state_with_users`] over a caller-chosen DTO service and
+/// authentication.
+fn ok_state_full(
+    library: OkLibrary,
+    users: Arc<dyn UserManager>,
+    dto: Arc<dyn DtoService>,
+    (auth_context, auth_service): Auth,
+) -> AppState {
     let item_id = library.item_id;
     AppState::new(
         Arc::new(library),
@@ -695,9 +766,9 @@ fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppSt
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(OkDto),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        dto,
+        auth_context,
+        auth_service,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -765,6 +836,21 @@ struct StubLibrary;
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         if id == ITEM_ID {
             let mut item = item_entity(ITEM_ID, "Movie", BaseItemKind::Movie);
@@ -1116,6 +1202,8 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
         item_id,
         adopted_tree: false,
         last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     };
     let get = |state: AppState, uri: &'static str| async move {
         let response = create_router(state)
@@ -1232,8 +1320,7 @@ async fn get_items_with_filters_returns_query_result() {
 /// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
 /// This), through both the query- and the path-scoped route. Each id set
 /// must reach the repository query: a dropped one answers the Albums section
-/// with every album in the library. (The keys are camelCase here because the
-/// server's outer layer folds the client's PascalCase before routing.)
+/// with every album in the library.
 #[tokio::test]
 async fn get_items_forwards_the_artist_id_filters() {
     let (album_artist, featured, excluded) = (
@@ -1253,6 +1340,8 @@ async fn get_items_forwards_the_artist_id_filters() {
             item_id: Uuid::from_u128(0x5A),
             adopted_tree: false,
             last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1274,6 +1363,49 @@ async fn get_items_forwards_the_artist_id_filters() {
     }
 }
 
+#[tokio::test]
+async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes() {
+    use ferrofin_model::data::BaseItemKind;
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{path}?includeItemTypes=Movie&INCLUDEITEMTYPES=Series\
+                &genres=News%2CSport&GENRES=Drama&tags=one&TAGS=two\
+                &limit=7&LIMIT=bad&recursive=true&Recursive=false\
+                &searchTerm=a%2Cb&SEARCHTERM=ignored&userId={USER_ID}&USERID=bad\
+                &genreIds={USER_ID}&GENREIDS={USER_ID}"
+                    ))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let query = seen.lock().unwrap().take().expect("query_items ran");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Movie, BaseItemKind::Series]
+        );
+        assert_eq!(query.genres, ["News,Sport", "Drama"]);
+        assert_eq!(query.tags, ["one", "two"]);
+        assert_eq!(query.genre_ids, [USER_ID, USER_ID]);
+        assert_eq!(query.limit, Some(7));
+        assert!(query.recursive);
+        assert_eq!(query.search_term.as_deref(), Some("a,b"));
+    }
+}
+
 /// Wholphin's genre grid asks each genre for one random item that has a
 /// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
 /// an item without a backdrop yields a null URL that crashes the whole grid
@@ -1282,9 +1414,11 @@ async fn get_items_forwards_the_artist_id_filters() {
 #[tokio::test]
 async fn get_items_forwards_the_image_types_filter() {
     let library = OkLibrary {
-        item_id: Uuid::from_u128(0x5B),
+        item_id: Uuid::from_u128(0x5C),
         adopted_tree: false,
         last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     };
     let seen = Arc::clone(&library.last_query);
     // Wholphin's request, verbatim apart from the ids.
@@ -1383,6 +1517,8 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
         item_id,
         adopted_tree: true,
         last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1438,6 +1574,8 @@ async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
         item_id: Uuid::from_u128(0x56),
         adopted_tree: true,
         last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1681,52 +1819,310 @@ async fn file_missing_item_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn deletion_respects_library_grants_and_path_boundaries() {
-    use ferrofin_api::test_support::{FakeVirtualFolders, PolicyUsers};
-    use ferrofin_model::entities_media::VirtualFolderInfo;
-    use ferrofin_model::users::UserPolicy;
-    let library_id = Uuid::from_u128(0xAB50);
-    let item_id = Uuid::from_u128(0xAB51);
-    for (location, granted_id, expected) in [
-        ("/synthetic", library_id, StatusCode::NO_CONTENT),
-        ("/synth", library_id, StatusCode::UNAUTHORIZED),
-        (
-            "/synthetic",
-            Uuid::from_u128(0xAB52),
-            StatusCode::UNAUTHORIZED,
-        ),
-    ] {
-        let state = ok_state_with_users(
-            OkLibrary {
-                item_id,
-                adopted_tree: false,
-                last_query: Arc::default(),
-            },
-            Arc::new(PolicyUsers(UserPolicy {
-                enable_content_deletion: false,
-                enable_content_deletion_from_folders: vec![granted_id.simple().to_string()],
-                ..Default::default()
-            })),
+/// A [`DtoService`] that projects like [`OkDto`] but whose `CanDelete`
+/// refuses the listed items — the per-user answer the delete endpoints ask
+/// for (`BaseItem.CanDelete(user)`).
+struct DenyingDto(Vec<Uuid>);
+
+#[async_trait]
+impl DtoService for DenyingDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items.iter().map(entity_to_dto).collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn can_delete(
+        &self,
+        item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(!self
+            .0
+            .contains(&Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())))
+    }
+}
+
+/// A [`DtoService`] whose projected `CanDelete` is fixed and which does NOT
+/// override `can_delete`, so the trait's default — the DTO's own field —
+/// answers the delete endpoints.
+struct DtoSays(Option<bool>);
+
+#[async_trait]
+impl DtoService for DtoSays {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        let mut dto = entity_to_dto(item);
+        if options.contains_field(ferrofin_model::querying::ItemFields::CanDelete) {
+            dto.can_delete = self.0;
+        }
+        Ok(dto)
+    }
+    async fn get_base_item_dtos(
+        &self,
+        _items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// An [`AuthService`] whose token is authenticated but names no user and is
+/// not an API key — a token whose user has gone.
+struct UserlessAuthService;
+
+#[async_trait]
+impl AuthService for UserlessAuthService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
+/// Sends `DELETE uri` through a router over `state`.
+async fn delete(state: AppState, uri: &str) -> StatusCode {
+    create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
         )
-        .with_virtual_folders(Arc::new(FakeVirtualFolders::seeded(vec![
-            VirtualFolderInfo {
-                item_id: Some(library_id.to_string()),
-                locations: vec![location.to_owned()],
-                ..Default::default()
-            },
-        ])));
-        let response = create_router(state)
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/Items/{item_id}"))
-                    .header("X-Emby-Token", "valid")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), expected, "library location: {location}");
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The authenticated user every other test runs as.
+fn alice() -> Auth {
+    (Arc::new(OkAuthContext), Arc::new(OkAuthService))
+}
+
+/// The delete log a [`two_item_state`] library keeps.
+type DeleteLog = Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>;
+
+/// A state over the adopted tree, so both `item_id` and
+/// [`COLLECTION_FOLDER_ID`] resolve, with the given DTO service and
+/// authentication — plus the library's delete log.
+fn two_item_state(item_id: Uuid, dto: Arc<dyn DtoService>, auth: Auth) -> (AppState, DeleteLog) {
+    let library = OkLibrary {
+        item_id,
+        adopted_tree: true,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let deleted = Arc::clone(&library.deleted);
+    (
+        ok_state_full(library, Arc::new(OkUsers), dto, auth),
+        deleted,
+    )
+}
+
+/// `LibraryController.DeleteItem`: `!item.CanDelete(user)` is `401
+/// Unauthorized access` and nothing is deleted; allowed, the item's rows are
+/// deleted — and only them: upstream's `DeleteFileLocation = true` is an open
+/// work item (`PLAN_ITEM_FILE_DELETION.md`), so the library is not asked to
+/// delete files.
+#[tokio::test]
+async fn delete_item_asks_can_delete_and_deletes_the_rows_only() {
+    let item_id = Uuid::from_u128(0xAB51);
+    let (state, deleted) = two_item_state(item_id, Arc::new(OkDto), alice());
+    assert_eq!(
+        delete(state, &format!("/Items/{item_id}")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+
+    let (state, deleted) = two_item_state(item_id, Arc::new(DenyingDto(vec![item_id])), alice());
+    assert_eq!(
+        delete(state, &format!("/Items/{item_id}")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+}
+
+/// With no `can_delete` override, the endpoints follow the DTO's own
+/// `CanDelete` — the field jellyfin-web shows its "Delete" entry by — and an
+/// absent one refuses.
+#[tokio::test]
+async fn the_default_can_delete_is_the_dtos_field() {
+    let item_id = Uuid::from_u128(0xAB52);
+    for (says, expected) in [
+        (Some(true), StatusCode::NO_CONTENT),
+        (Some(false), StatusCode::UNAUTHORIZED),
+        (None, StatusCode::UNAUTHORIZED),
+    ] {
+        let (state, _) = two_item_state(item_id, Arc::new(DtoSays(says)), alice());
+        assert_eq!(
+            delete(state, &format!("/Items/{item_id}")).await,
+            expected,
+            "{says:?}"
+        );
+    }
+}
+
+/// `LibraryController.DeleteItems` is per item, in order: the ids before a
+/// refused one are already deleted when the request answers `401`, and the
+/// ids after it are never reached.
+#[tokio::test]
+async fn delete_items_stops_at_the_first_refused_id() {
+    let item_id = Uuid::from_u128(0xAB53);
+    let forbidden = COLLECTION_FOLDER_ID;
+    let denying = || -> Arc<dyn DtoService> { Arc::new(DenyingDto(vec![forbidden])) };
+    let (state, deleted) = two_item_state(item_id, denying(), alice());
+    assert_eq!(
+        delete(
+            state,
+            &format!("/Items?ids={item_id},{forbidden},{item_id}")
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+
+    let (state, deleted) = two_item_state(item_id, denying(), alice());
+    assert_eq!(
+        delete(state, &format!("/Items?ids={forbidden},{item_id}")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(deleted.lock().unwrap().is_empty());
+
+    // A missing id stops the batch the same way, with a `404`.
+    let (state, deleted) = two_item_state(item_id, Arc::new(OkDto), alice());
+    let missing = Uuid::from_u128(0xBEEF);
+    assert_eq!(
+        delete(state, &format!("/Items?ids={item_id},{missing},{item_id}")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+}
+
+/// An API key has no user, so `CanDelete(user)` is not asked (upstream's
+/// `user is not null && …`); a token whose user is gone is `404` on the
+/// single delete and `401` on the batch, as upstream.
+#[tokio::test]
+async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
+    let item_id = Uuid::from_u128(0xAB54);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let (state, deleted) = two_item_state(
+            item_id,
+            Arc::new(DenyingDto(vec![item_id])),
+            (
+                Arc::new(ferrofin_api::test_support::FakeAuthContext),
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+            ),
+        );
+        assert_eq!(delete(state, &uri).await, StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+    }
+    for (uri, expected) in [
+        (format!("/Items/{item_id}"), StatusCode::NOT_FOUND),
+        (format!("/Items?ids={item_id}"), StatusCode::UNAUTHORIZED),
+    ] {
+        let (state, deleted) = two_item_state(
+            item_id,
+            Arc::new(OkDto),
+            (
+                Arc::new(ferrofin_api::test_support::FakeAuthContext),
+                Arc::new(UserlessAuthService),
+            ),
+        );
+        assert_eq!(delete(state, &uri).await, expected, "{uri}");
+        assert!(deleted.lock().unwrap().is_empty());
+    }
+}
+
+/// A client that goes away mid-delete does not stop the delete: the work
+/// runs on its own task (upstream's controller ignores `RequestAborted`), so
+/// the item is deleted even though the request future was dropped while the
+/// library was deleting.
+#[tokio::test]
+async fn a_dropped_request_still_finishes_its_delete() {
+    let item_id = Uuid::from_u128(0xAB55);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let gate = Arc::new(DeleteGate::default());
+        let library = OkLibrary {
+            item_id,
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: Some(Arc::clone(&gate)),
+        };
+        let deleted = Arc::clone(&library.deleted);
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
+        let request = tokio::spawn(async move { delete(state, &uri).await });
+        gate.started.notified().await;
+        request.abort();
+        assert!(
+            request.await.is_err_and(|e| e.is_cancelled()),
+            "the request was dropped"
+        );
+        gate.release.notify_one();
+        for _ in 0..200 {
+            if !deleted.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
     }
 }

@@ -432,6 +432,21 @@ pub struct FakeLibrary;
 
 #[async_trait]
 impl LibraryManager for FakeLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
@@ -1626,7 +1641,8 @@ impl SearchManager for FakeSearch {
     }
 }
 
-/// A fake [`DtoService`]; every method is unused by INFRA-level tests.
+/// A fake [`DtoService`]; every projection is unused by INFRA-level tests, and
+/// its `CanDelete(user)` never grants a delete.
 pub struct FakeDto;
 
 #[async_trait]
@@ -1664,6 +1680,13 @@ impl DtoService for FakeDto {
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
         unimplemented!("fake")
+    }
+    async fn can_delete(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(false)
     }
 }
 

@@ -282,6 +282,21 @@ struct StreamLibrary;
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Movie", "Movie")))
     }
@@ -640,7 +655,9 @@ async fn deletion_requires_permission_for_single_and_batch_routes() {
             },
         )
         .app;
-        // The stub's delete method panics, proving rejection happens first.
+        // `FakeDto`'s `CanDelete(user)` refuses, as the DTO service does for a
+        // user without "Allow media deletion"; the stub's delete method
+        // panics, proving the rejection happens first.
         let response = create_router(app)
             .oneshot(authed("DELETE", &uri))
             .await

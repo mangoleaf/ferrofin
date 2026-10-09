@@ -383,7 +383,8 @@ pub fn build_accelerated_trickplay_args(
         | HardwareAccelerationType::videotoolbox
         | HardwareAccelerationType::rkmpp
         | HardwareAccelerationType::v4l2m2m
-        | HardwareAccelerationType::none => return None,
+        | HardwareAccelerationType::none
+        | HardwareAccelerationType::Unrecognized(_) => return None,
     };
     // The interval, as a frame rate. Upstream computes it into
     // `BaseEncodingJobOptions.MaxFramerate`, which is a `float`, but reads it

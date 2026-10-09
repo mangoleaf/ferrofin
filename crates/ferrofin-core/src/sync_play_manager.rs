@@ -271,7 +271,7 @@ impl PlayQueue {
             playlist_item_id: Uuid::new_v4(),
         });
         match mode {
-            GroupQueueMode::Queue => self.items.extend(new_items),
+            GroupQueueMode::Queue | GroupQueueMode::Unrecognized(_) => self.items.extend(new_items),
             GroupQueueMode::QueueNext => {
                 let at = usize::try_from(self.playing_index + 1)
                     .unwrap_or(self.items.len())
@@ -771,7 +771,9 @@ impl Group {
                 }
                 self.queue.enqueue(item_ids, *mode);
                 let reason = match mode {
-                    GroupQueueMode::Queue => PlayQueueUpdateReason::Queue,
+                    GroupQueueMode::Queue | GroupQueueMode::Unrecognized(_) => {
+                        PlayQueueUpdateReason::Queue
+                    }
                     GroupQueueMode::QueueNext => PlayQueueUpdateReason::QueueNext,
                 };
                 vec![Outbound::all(self.play_queue_env(reason, now))]
@@ -1512,13 +1514,8 @@ impl FerrofinSyncPlayManager {
     /// `Group.HasAccessToQueue`, which rejects an item that does not resolve or
     /// is not `IsVisibleStandalone` for the user. An empty queue is accessible.
     ///
-    /// ponytail: routed through the repository's user-scoped query rather than a
-    /// second, SyncPlay-only visibility rule, so it enforces exactly what the
-    /// rest of the API enforces. Today that means "the item exists and the query
-    /// returns it for this user"; Ferrofin's query pipeline does not yet apply
-    /// parental-rating or enabled-folder predicates, so those parts of
-    /// `IsVisibleStandalone` are not checked here either — this tightens by
-    /// itself when they land in `translate_query`.
+    /// Uses the same standalone policy as by-ID endpoints. Explicit-ID browse
+    /// queries intentionally have different semantics and cannot authorize queues.
     async fn has_access_to_queue(&self, user_id: Uuid, items: &[Uuid]) -> bool {
         match self.visible_subset(user_id, items).await {
             None => true,
@@ -1526,7 +1523,7 @@ impl FerrofinSyncPlayManager {
         }
     }
 
-    /// Which of `ids` the user may see, in **one** query for the whole set.
+    /// Which of `ids` the user may see, using one batched policy evaluation.
     ///
     /// `None` means no access seam is wired, i.e. everything is visible. An
     /// unresolvable user or a failed query yields an empty set, so a non-empty
@@ -1559,16 +1556,9 @@ impl FerrofinSyncPlayManager {
                 return Some(std::collections::HashSet::new());
             }
         };
-        let query = InternalItemsQuery {
-            item_ids: ids.to_vec(),
-            user: Some(user),
-            ..InternalItemsQuery::default()
-        };
-        match access.library.get_item_ids(&query).await {
+        match access.library.get_visible_item_ids(ids, &user).await {
             Ok(visible) => Some(visible.into_iter().collect()),
             Err(err) => {
-                // One bound parameter per id, so a large enough aggregate queue
-                // trips SQLite's variable ceiling and lands here.
                 tracing::warn!(
                     %user_id,
                     items = ids.len(),
@@ -1846,7 +1836,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                 .collect()
         };
         candidates.sort_by_key(|(info, _)| info.group_id);
-        // One query for the union of every group's queue, not one per group —
+        // One batched evaluation of the union of every group's queue —
         // this route is polled by SyncPlay clients, so a per-group round trip
         // is a latency cliff as the server fills with groups.
         let union: Vec<Uuid> = {
@@ -3511,7 +3501,7 @@ mod tests {
     // ── library access (C# `Group.HasAccessToPlayQueue`) ───────────────────
 
     /// A manager wired to a real DB-backed library + user manager, so the
-    /// access checks run against the same query path the rest of the API uses.
+    /// access checks run through the real standalone visibility evaluator.
     async fn access_mgr() -> (
         FerrofinSyncPlayManager,
         Arc<RecordingBus>,
@@ -3522,12 +3512,18 @@ mod tests {
         let bus = Arc::new(RecordingBus::default());
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(crate::item_type_lookup::ItemTypeLookup::new());
-        let library: Arc<dyn LibraryManager> =
-            Arc::new(crate::library_manager::FerrofinLibraryManager::new(
-                Arc::new(crate::item_repository::FerrofinItemRepository::new(
-                    db.clone(),
-                    lookup,
-                )),
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+            crate::item_repository::FerrofinItemRepository::new(db.clone(), lookup),
+        );
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            items.clone(),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        ));
+        let library: Arc<dyn LibraryManager> = Arc::new(
+            crate::library_manager::FerrofinLibraryManager::new(
+                items,
                 Arc::new(crate::item_count_service::FerrofinItemCountService::new(
                     db.clone(),
                 )),
@@ -3539,7 +3535,9 @@ mod tests {
                 Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
                     db.clone(),
                 )),
-            ));
+            )
+            .with_visibility(visibility),
+        );
         let users: Arc<dyn UserManager> =
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
         let mgr = FerrofinSyncPlayManager::new(Arc::clone(&bus) as Arc<dyn SessionMessageBus>)
@@ -3713,6 +3711,118 @@ mod tests {
             m.get_group(&owner, info.group_id).await.unwrap().state,
             GroupStateType::Idle,
             "and leaves the group in its previous state"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn hidden_library_and_policy_changes_control_queue_access() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::users::UserPolicy;
+        let (m, bus, db, library) = access_mgr().await;
+        let owner = db_session(&db, "s1", "alice").await;
+        let guest = db_session(&db, "s2", "bob").await;
+        let folder_id = Uuid::new_v4();
+        crate::test_support::seed_folder_item(
+            &db,
+            folder_id,
+            BaseItemKind::CollectionFolder,
+            "Hidden",
+            None,
+        )
+        .await;
+        let mut folder = library.get_item_by_id(folder_id).await.unwrap().unwrap();
+        folder.path = Some("/views/hidden".into());
+        let movie_id = seed_movie(&db, "Hidden movie").await;
+        let mut movie = library.get_item_by_id(movie_id).await.unwrap().unwrap();
+        movie.parent_id = Some(folder.id.clone());
+        movie.top_parent_id = Some(folder.id.clone());
+        movie.path = Some("/media/hidden.mkv".into());
+        movie.tags = Some("Restricted".into());
+        library.update_items(&[folder, movie], None).await.unwrap();
+        let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+        users
+            .update_policy(
+                owner.user_id,
+                &UserPolicy {
+                    enable_all_folders: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        users
+            .update_policy(
+                guest.user_id,
+                &UserPolicy {
+                    enable_all_folders: false,
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        let guest_user = users.get_user_by_id(guest.user_id).await.unwrap().unwrap();
+        // Explicit-ID browse remains permissive, proving it cannot implement this gate.
+        assert_eq!(
+            library
+                .get_item_ids(&InternalItemsQuery {
+                    item_ids: vec![movie_id],
+                    user: Some(guest_user.clone()),
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .unwrap(),
+            vec![movie_id]
+        );
+        assert!(
+            library
+                .get_visible_item_ids(&vec![movie_id; 1200], &guest_user)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let group = m.new_group(&owner, "movie night").await.unwrap();
+        set_queue(&m, &owner, vec![movie_id]).await;
+        assert!(m.list_groups(&guest).await.unwrap().is_empty());
+        m.join_group(&guest, group.group_id).await.unwrap();
+        assert_eq!(update_types(&bus, "s2"), vec!["LibraryAccessDenied"]);
+        users
+            .update_policy(
+                guest.user_id,
+                &UserPolicy {
+                    enable_all_folders: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(m.list_groups(&guest).await.unwrap().len(), 1);
+        m.join_group(&guest, group.group_id).await.unwrap();
+        assert_eq!(
+            m.get_group(&owner, group.group_id)
+                .await
+                .unwrap()
+                .participants
+                .len(),
+            2
+        );
+        users
+            .update_policy(
+                guest.user_id,
+                &UserPolicy {
+                    enable_all_folders: true,
+                    blocked_tags: vec!["restricted".into()],
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(m.list_groups(&guest).await.unwrap().is_empty());
+        bus.sent.lock().unwrap().clear();
+        set_queue(&m, &owner, vec![movie_id]).await;
+        assert!(
+            bus.sent.lock().unwrap().is_empty(),
+            "a queue edit inaccessible to a member is refused"
         );
     }
 

@@ -24,7 +24,7 @@
 //! mirroring the `finally` block of each C# controller action.
 
 use axum::Router;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// Restarts the library monitor so its watch set matches the just-mutated
@@ -490,6 +490,7 @@ struct UpdateLibraryOptionsBody {
     /// The library item id.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
+    #[serde(with = "ferrofin_model::json::guid::option")]
     id: Option<Uuid>,
     /// The library name (Ferrofin's filesystem seam resolves by name; see below).
     #[serde(default)]
@@ -579,4 +580,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Library/VirtualFolders/Paths/Update",
             post(update_media_path),
         )
+}
+crate::query::query_parameters! {
+    AddVirtualFolderQuery {
+        "paths" => ',',
+    } => [("post", "/Library/VirtualFolders")];
+    RemoveVirtualFolderQuery {} => [("delete", "/Library/VirtualFolders")];
+    RenameVirtualFolderQuery {} => [("post", "/Library/VirtualFolders/Name")];
+    MediaPathQuery {} => [("post", "/Library/VirtualFolders/Paths"), ("delete", "/Library/VirtualFolders/Paths")];
 }

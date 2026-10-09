@@ -1,0 +1,90 @@
+controller,action,routes,line,lookup,classification
+ArtistsController.cs,GetArtists,GET /Artists,136,"BaseItem parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+ArtistsController.cs,GetAlbumArtists,GET /Artists/AlbumArtists,290,"BaseItem parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+FilterController.cs,GetQueryFiltersLegacy,GET /Items/Filters,71,"item = _libraryManager.GetParentItem(parentId, user?.Id);",parent resolution (unscoped)
+FilterController.cs,GetQueryFilters,GET /Items/Filters2,140,parentItem = _libraryManager.GetItemById<BaseItem>(parentId.Value);,unscoped
+GenresController.cs,GetGenres,GET /Genres,110,"var parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+ImageController.cs,DeleteItemImage,DELETE /Items/{itemId}/Images/{imageType},306,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,DeleteItemImageByIndex,DELETE /Items/{itemId}/Images/{imageType}/{imageIndex},334,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,SetItemImage,POST /Items/{itemId}/Images/{imageType},363,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,SetItemImageByIndex,POST /Items/{itemId}/Images/{imageType}/{imageIndex},407,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,UpdateItemImageIndex,POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index,450,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,GetItemImageInfos,GET /Items/{itemId}/Images,473,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,GetItemImage,GET /Items/{itemId}/Images/{imageType}; HEAD /Items/{itemId}/Images/{imageType},576,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,GetItemImageByIndex,GET /Items/{itemId}/Images/{imageType}/{imageIndex}; HEAD /Items/{itemId}/Images/{imageType}/{imageIndex},654,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ImageController.cs,GetItemImage2,GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}; HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount},732,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+InstantMixController.cs,GetInstantMixFromSong,GET /Songs/{itemId}/InstantMix,86,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+InstantMixController.cs,GetInstantMixFromAlbum,GET /Albums/{itemId}/InstantMix,129,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+InstantMixController.cs,GetInstantMixFromPlaylist,GET /Playlists/{itemId}/InstantMix,172,"var item = _libraryManager.GetItemById<Playlist>(itemId, user);",user-scoped
+InstantMixController.cs,GetInstantMixFromArtists,GET /Artists/{itemId}/InstantMix,251,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+InstantMixController.cs,GetInstantMixFromItem,GET /Items/{itemId}/InstantMix,294,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+InstantMixController.cs,GetInstantMixFromMusicGenreById,GET /MusicGenres/InstantMix,378,"var item = _libraryManager.GetItemById<BaseItem>(id, user);",user-scoped
+ItemLookupController.cs,GetExternalIdInfos,GET /Items/{itemId}/ExternalIdInfos,70,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemLookupController.cs,ApplySearchCriteria,POST /Items/RemoteSearch/Apply/{itemId},254,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemRefreshController.cs,RefreshItem,POST /Items/{itemId}/Refresh,70,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemUpdateController.cs,UpdateItem,POST /Items/{itemId},77,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemUpdateController.cs,GetMetadataEditorInfo,GET /Items/{itemId}/MetadataEditor,150,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemUpdateController.cs,UpdateItemContentType,POST /Items/{itemId}/ContentType,212,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+ItemsController.cs,GetItems,GET /Items,286,"var item = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+ItemsController.cs,GetResumeItems,GET /UserItems/Resume,971,.SelectMany(s => _libraryManager.GetItemById(s.NowPlayingItem.Id) is Video video,unscoped
+ItemsController.cs,GetItemUserData,GET /UserItems/{itemId}/UserData,1092,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+ItemsController.cs,UpdateItemUserData,POST /UserItems/{itemId}/UserData,1149,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,GetFile,GET /Items/{itemId}/File,116,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+LibraryController.cs,GetThemeSongs,GET /Items/{itemId}/ThemeSongs,167,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,GetThemeVideos,GET /Items/{itemId}/ThemeVideos,240,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,DeleteItem,DELETE /Items/{itemId},380,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,DeleteItems,DELETE /Items,426,"var item = _libraryManager.GetItemById<BaseItem>(i, user);",user-scoped
+LibraryController.cs,GetAncestors,GET /Items/{itemId}/Ancestors,497,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,GetDownload,GET /Items/{itemId}/Download,680,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,GetItemCollections,GET /Items/{itemId}/Collections,756,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryController.cs,GetSimilarItems,GET /Items/{itemId}/Similar,824,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+LibraryStructureController.cs,UpdateLibraryOptions,POST /Library/VirtualFolders/LibraryOptions,353,var item = _libraryManager.GetItemById<CollectionFolder>(request.Id);,unscoped
+LiveTvController.cs,GetChannel,GET /LiveTv/Channels/{channelId},230,": _libraryManager.GetItemById<BaseItem>(channelId, user);",user-scoped
+LiveTvController.cs,GetRecording,GET /LiveTv/Recordings/{recordingId},418,": _libraryManager.GetItemById<BaseItem>(recordingId, user);",user-scoped
+LiveTvController.cs,GetLiveTvPrograms,GET /LiveTv/Programs,606,var series = _libraryManager.GetItemById<Series>(librarySeriesId.Value);,unscoped
+LiveTvController.cs,GetPrograms,POST /LiveTv/Programs,660,var series = _libraryManager.GetItemById<Series>(body.LibrarySeriesId.Value);,unscoped
+LiveTvController.cs,DeleteRecording,DELETE /LiveTv/Recordings/{recordingId},784,"var item = _libraryManager.GetItemById<BaseItem>(recordingId, User.GetUserId());",user-scoped
+LyricsController.cs,GetLyrics,GET /Audio/{itemId}/Lyrics,73,"var item = _libraryManager.GetItemById<Audio>(itemId, User.GetUserId());",user-scoped
+LyricsController.cs,UploadLyrics,POST /Audio/{itemId}/Lyrics,107,"var item = _libraryManager.GetItemById<Audio>(itemId, User.GetUserId());",user-scoped
+LyricsController.cs,DeleteLyrics,DELETE /Audio/{itemId}/Lyrics,159,"var item = _libraryManager.GetItemById<Audio>(itemId, User.GetUserId());",user-scoped
+LyricsController.cs,SearchRemoteLyrics,GET /Audio/{itemId}/RemoteSearch/Lyrics,182,"var item = _libraryManager.GetItemById<Audio>(itemId, User.GetUserId());",user-scoped
+LyricsController.cs,DownloadRemoteLyrics,POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId},208,"var item = _libraryManager.GetItemById<Audio>(itemId, User.GetUserId());",user-scoped
+MediaInfoController.cs,GetPlaybackInfo,GET /Items/{itemId}/PlaybackInfo,81,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+MediaInfoController.cs,GetPostedPlaybackInfo,POST /Items/{itemId}/PlaybackInfo,171,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+MediaSegmentsController.cs,GetItemSegments,GET /MediaSegments/{itemId},53,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+MusicGenresController.cs,GetMusicGenres,GET /MusicGenres,111,"var parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+PlaystateController.cs,MarkPlayedItem,POST /UserPlayedItems/{itemId},88,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+PlaystateController.cs,MarkUnplayedItem,DELETE /UserPlayedItems/{itemId},154,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+RemoteImageController.cs,GetRemoteImages,GET /Items/{itemId}/RemoteImages,74,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+RemoteImageController.cs,GetRemoteImageProviders,GET /Items/{itemId}/RemoteImages/Providers,133,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+RemoteImageController.cs,DownloadRemoteImage,POST /Items/{itemId}/RemoteImages/Download,160,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+SearchController.cs,GetSearchHintResult,,215,var channel = _libraryManager.GetItemById<BaseItem>(item.ChannelId);,unscoped
+StudiosController.cs,GetStudios,GET /Studios,105,"var parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
+SubtitleController.cs,DeleteSubtitle,DELETE /Videos/{itemId}/Subtitles/{index},99,"var item = _libraryManager.GetItemById<BaseItem>(itemId, User.GetUserId());",user-scoped
+SubtitleController.cs,SearchRemoteSubtitles,GET /Items/{itemId}/RemoteSearch/Subtitles/{language},127,"var item = _libraryManager.GetItemById<Video>(itemId, User.GetUserId());",user-scoped
+SubtitleController.cs,DownloadRemoteSubtitles,POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId},152,"var item = _libraryManager.GetItemById<Video>(itemId, User.GetUserId());",user-scoped
+SubtitleController.cs,GetSubtitle,GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat},238,var item = _libraryManager.GetItemById<Video>(itemId.Value);,unscoped
+SubtitleController.cs,GetSubtitlePlaylist,GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8,350,"var item = _libraryManager.GetItemById<Video>(itemId, User.GetUserId());",user-scoped
+SubtitleController.cs,UploadSubtitle,POST /Videos/{itemId}/Subtitles,428,"var item = _libraryManager.GetItemById<Video>(itemId, User.GetUserId());",user-scoped
+SubtitleController.cs,EncodeSubtitles,,479,var item = _libraryManager.GetItemById<BaseItem>(id);,unscoped
+TrickplayController.cs,GetTrickplayTileImage,GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg,89,"var item = _libraryManager.GetItemById<BaseItem>(mediaSourceId ?? itemId, User.GetUserId());",user-scoped
+TvShowsController.cs,GetEpisodes,GET /Shows/{seriesId}/Episodes,235,"var item = _libraryManager.GetItemById<BaseItem>(seasonId.Value, user);",user-scoped
+TvShowsController.cs,GetEpisodes,GET /Shows/{seriesId}/Episodes,245,"var series = _libraryManager.GetItemById<Series>(seriesId, user);",user-scoped
+TvShowsController.cs,GetEpisodes,GET /Shows/{seriesId}/Episodes,261,"if (_libraryManager.GetItemById<BaseItem>(seriesId, user) is not Series series)",user-scoped
+TvShowsController.cs,GetEpisodes,GET /Shows/{seriesId}/Episodes,282,if (_libraryManager.GetItemById<Video>(startId)?.PrimaryVersionId is { } primaryVersionId),unscoped
+TvShowsController.cs,GetSeasons,GET /Shows/{seriesId}/Seasons,351,"var item = _libraryManager.GetItemById<Series>(seriesId, user);",user-scoped
+UniversalAudioController.cs,GetUniversalAudioStream,GET /Audio/{itemId}/universal,123,"var item = _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,GetItem,GET /Items/{itemId},97,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,GetIntros,GET /Items/{itemId}/Intros,184,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,MarkFavoriteItem,POST /UserFavoriteItems/{itemId},236,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,UnmarkFavoriteItem,DELETE /UserFavoriteItems/{itemId},284,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,DeleteUserItemRating,DELETE /UserItems/{itemId}/Rating,332,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,UpdateUserItemRating,POST /UserItems/{itemId}/Rating,382,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,GetLocalTrailers,GET /Items/{itemId}/LocalTrailers,431,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+UserLibraryController.cs,GetSpecialFeatures,GET /Items/{itemId}/SpecialFeatures,481,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+VideoAttachmentsController.cs,GetAttachment,GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index},61,"var item = _libraryManager.GetItemById<BaseItem>(videoId, User.GetUserId());",user-scoped
+VideosController.cs,GetAdditionalPart,GET /Videos/{itemId}/AdditionalParts,108,": _libraryManager.GetItemById<BaseItem>(itemId, user);",user-scoped
+VideosController.cs,DeleteAlternateSources,DELETE /Videos/{itemId}/AlternateSources,145,"var item = _libraryManager.GetItemById<Video>(itemId, User.GetUserId());",user-scoped
+VideosController.cs,DeleteAlternateSources,DELETE /Videos/{itemId}/AlternateSources,153,item = _libraryManager.GetItemById<Video>(item.PrimaryVersionId.Value);,unscoped
+VideosController.cs,MergeVersions,POST /Videos/MergeVersions,191,".Select(i => _libraryManager.GetItemById<BaseItem>(i, userId))",user-scoped
+YearsController.cs,GetYears,GET /Years,98,"BaseItem parentItem = _libraryManager.GetParentItem(parentId, userId);",parent resolution (unscoped)
