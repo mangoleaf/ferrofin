@@ -190,6 +190,7 @@ fn lookup(table: &'static RouteTable, method: &Method, route: &str) -> &'static 
 
 /// The query members upstream requires present on `method` + `route` (the
 /// table the extractor enforces), for tests that build valid requests.
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn required_members(method: &Method, route: &str) -> &'static [String] {
     lookup(&REQUIRED, method, route)
 }
