@@ -390,6 +390,9 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
     async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
     async fn task_completed(&self, _key: &str, _completed: bool) {}
     async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
+    async fn support_bundle(&self) -> String {
+        String::new()
+    }
     async fn hides_intros(&self, _item_id: Uuid) -> bool {
         false
     }
@@ -554,21 +557,12 @@ async fn plugin_metadata_and_support_bundle() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Plugin version: 1.2.3"));
     assert!(body.contains("Runs on:"));
-    // The fingerprinter probes still report, and report a bool — the ffmpeg one
-    // runs as a child process the handler awaits rather than blocks on.
-    for line in [
-        "Chromaprint (ffmpeg muxer) available: ",
-        "Chromaprint (fpcalc) available: ",
-    ] {
-        let at = body
-            .find(line)
-            .unwrap_or_else(|| panic!("{line:?} missing from bundle: {body:?}"));
-        let value = body[at + line.len()..].lines().next().unwrap_or_default();
-        assert!(
-            value == "true" || value == "false",
-            "{line:?} carries a bool, got {value:?}"
-        );
-    }
+    // The analysis reports the rest (the detached seam says it is absent).
+    assert!(body.contains("Jellyfin version: "), "{body}");
+    assert!(
+        body.ends_with("* The intro skipper extension is not attached\n"),
+        "{body}"
+    );
 }
 
 #[tokio::test]

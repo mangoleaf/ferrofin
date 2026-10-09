@@ -9,7 +9,7 @@
 //! `TaskCompleted` and the plugin manager's `PluginConfigurationChanged`.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,45 @@ pub struct Runtime {
     /// the next one analyses again what earlier ones recorded.
     pub(super) analyze_again: AtomicBool,
     automatic: Mutex<Automatic>,
+    /// `WarningManager`'s flags (`PluginWarning`).
+    warnings: AtomicU8,
+    /// `TotalQueued` / `TotalSeasons`: the last queue's analysable entries
+    /// and seasons.
+    pub(super) queued: AtomicUsize,
+    pub(super) seasons: AtomicUsize,
+}
+
+/// `PluginWarning.InvalidChromaprintFingerprint`: a fingerprint failed.
+pub(super) const INVALID_CHROMAPRINT_FINGERPRINT: u8 = 2;
+/// `PluginWarning.IncompatibleFFmpegBuild`: ffmpeg cannot fingerprint.
+pub(super) const INCOMPATIBLE_FFMPEG_BUILD: u8 = 4;
+
+impl Runtime {
+    /// `WarningManager.SetFlag`.
+    pub(super) fn warn(&self, warning: u8) {
+        self.warnings.fetch_or(warning, Ordering::Relaxed);
+    }
+
+    /// `WarningManager.GetWarnings`: the `[Flags]` enum's `ToString()`.
+    pub(super) fn warnings(&self) -> String {
+        let flags = self.warnings.load(Ordering::Relaxed);
+        let names: Vec<&str> = [
+            (
+                INVALID_CHROMAPRINT_FINGERPRINT,
+                "InvalidChromaprintFingerprint",
+            ),
+            (INCOMPATIBLE_FFMPEG_BUILD, "IncompatibleFFmpegBuild"),
+        ]
+        .into_iter()
+        .filter(|(flag, _)| flags & flag != 0)
+        .map(|(_, name)| name)
+        .collect();
+        if names.is_empty() {
+            "None".to_owned()
+        } else {
+            names.join(", ")
+        }
+    }
 }
 
 /// `Entrypoint`'s state.
@@ -304,7 +343,9 @@ mod tests {
     async fn a_finished_library_scan_starts_the_wait() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
         h.task.task_completed("RefreshLibrary", false).await;
-        h.task.task_completed("IntroSkipper.Detect", true).await;
+        h.task
+            .task_completed("IntroSkipperDetectSegmentsTask", true)
+            .await;
         assert!(!queued(&h.task).1);
         h.task.task_completed("RefreshLibrary", true).await;
         assert!(queued(&h.task).1);

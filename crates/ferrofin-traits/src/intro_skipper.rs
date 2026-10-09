@@ -427,6 +427,10 @@ pub trait IntroSkipperAnalysis: Send + Sync {
     /// (`MediaSegmentsFirstEpisodeFilter`: a season's first episode, with
     /// `SkipFirstEpisode`).
     async fn hides_intros(&self, item_id: Uuid) -> bool;
+
+    /// The analysis half of the plugin's support bundle (queue contents,
+    /// warnings, the ffmpeg checks' output), as Markdown lines.
+    async fn support_bundle(&self) -> String;
 }
 
 fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}
@@ -486,6 +490,10 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
 
     async fn hides_intros(&self, _item_id: Uuid) -> bool {
         false
+    }
+
+    async fn support_bundle(&self) -> String {
+        "* The intro skipper extension is not attached\n".to_owned()
     }
 }
 

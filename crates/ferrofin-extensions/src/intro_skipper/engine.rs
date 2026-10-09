@@ -934,6 +934,7 @@ impl DetectSegmentsTask {
                     .fingerprint_cached(&item.entry, (start, end), print, fingerprinter, config)
                     .await
                     .unwrap_or_else(|err| {
+                        self.runtime.warn(super::automatic::INVALID_CHROMAPRINT_FINGERPRINT);
                         tracing::debug!(%err, path = item.entry.path, ?mode, "intro skipper: fingerprint failed — no segment for this window");
                         Vec::new()
                     }),

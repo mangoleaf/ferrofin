@@ -235,9 +235,8 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
     ),
     // Tier-1a extensions: the upstream plugins' own task classes.
     // intro-skipper @ db09359 — IntroSkipper/ScheduledTasks/DetectSegmentsTask.cs.
-    // Ferrofin registers it under its own key, so the mapping is by key here.
     (
-        "IntroSkipper.Detect",
+        "IntroSkipperDetectSegmentsTask",
         "IntroSkipper.ScheduledTasks.DetectSegmentsTask",
     ),
     // IntroSkipper/ScheduledTasks/CleanCacheTask.cs (upstream's own key).

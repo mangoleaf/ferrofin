@@ -519,6 +519,9 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for HidesIntros {
     async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
     async fn task_completed(&self, _key: &str, _completed: bool) {}
     async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
+    async fn support_bundle(&self) -> String {
+        String::new()
+    }
     async fn hides_intros(&self, _item_id: Uuid) -> bool {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         true

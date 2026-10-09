@@ -2466,6 +2466,9 @@ mod tests {
                 .expect("lock")
                 .push(format!("settings {plugin_id}"));
         }
+        async fn support_bundle(&self) -> String {
+            String::new()
+        }
         async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
             false
         }

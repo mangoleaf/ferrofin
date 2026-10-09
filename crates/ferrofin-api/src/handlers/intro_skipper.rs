@@ -771,51 +771,74 @@ async fn troubleshooting_metadata(
     Json(serde_json::json!({ "version": plugin_version(&state).await }))
 }
 
-/// Whether an `fpcalc` binary (Chromaprint fingerprinter) is on `PATH`.
-fn fpcalc_available() -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("fpcalc").is_file()))
-}
-
-/// Whether the `ffmpeg` on `PATH` has the `chromaprint` muxer — the
-/// fingerprinter's preferred backend, and the only one in the release image.
-/// Probed here rather than read off the extension: the API layer holds managers,
-/// not the compiled-in extensions' collaborators.
-/// Spawned through `tokio::process` so the `ffmpeg -muxers` run does not block
-/// the worker thread this handler is polled on.
-async fn ffmpeg_chromaprint_available() -> bool {
-    tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-muxers"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .is_ok_and(|out| {
-            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("chromaprint")
-        })
-}
-
 /// `GET /IntroSkipper/SupportBundle` — a plain-text Markdown troubleshooting
-/// bundle. Port of `TroubleshootingController.GetSupportBundle`, reporting the
-/// facts Ferrofin can supply (server/plugin version, OS, fingerprinter presence).
+/// bundle (`TroubleshootingController.GetSupportBundle`): the versions and
+/// platform, then the analysis's own report (queue contents, warnings, the
+/// server ffmpeg's capability checks).
 async fn support_bundle(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> String {
     let version = plugin_version(&state).await;
+    // `ApplicationVersionString`: the version `/System/Info` reports.
+    let server = state
+        .system
+        .get_public_system_info(&ferrofin_traits::net::RequestContext::default())
+        .await
+        .ok()
+        .and_then(|info| info.version)
+        .unwrap_or_default();
     format!(
-        "* Server: Ferrofin {server}\n\
+        "* Jellyfin version: {server} (Ferrofin {ferrofin})\n\
          * Plugin version: {version}\n\
-         * Runs on: {os} ({arch})\n\
-         * Chromaprint (ffmpeg muxer) available: {muxer}\n\
-         * Chromaprint (fpcalc) available: {fpcalc}\n",
-        server = env!("CARGO_PKG_VERSION"),
-        os = std::env::consts::OS,
-        arch = std::env::consts::ARCH,
-        muxer = ffmpeg_chromaprint_available().await,
-        fpcalc = fpcalc_available(),
+         * Runs on: {os}\n\
+         {analysis}",
+        ferrofin = env!("CARGO_PKG_VERSION"),
+        os = operating_system(),
+        analysis = state.intro_skipper_analysis.support_bundle().await,
     )
+}
+
+/// .NET's `RuntimeInformation.OSDescription` on Linux: the kernel's
+/// `uname -srv`.
+fn os_description() -> String {
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("/proc/sys/kernel/{name}"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_default()
+    };
+    format!(
+        "{} {} {}",
+        read("ostype"),
+        read("osrelease"),
+        read("version")
+    )
+    .trim()
+    .to_owned()
+}
+
+/// `Helper.OperatingSystem.DetermineOperatingSystem`.
+fn operating_system() -> String {
+    match std::env::consts::OS {
+        "windows" => "Windows".to_owned(),
+        "macos" => "macOS".to_owned(),
+        "linux" => {
+            let docker = ["/.dockerenv", "/run/.containerenv"]
+                .iter()
+                .any(|marker| std::path::Path::new(marker).exists());
+            if !docker {
+                return os_description();
+            }
+            if std::env::var_os("ATTACHED_DEVICES_PERMS").is_some() {
+                "LinuxServer.io image (Docker)".to_owned()
+            } else if std::env::var_os("WEBUI_PORTS").is_some() {
+                "hotio image (Docker)".to_owned()
+            } else {
+                "Linux (Docker)".to_owned()
+            }
+        }
+        _ => "Unknown".to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------

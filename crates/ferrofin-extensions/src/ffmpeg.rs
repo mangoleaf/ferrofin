@@ -183,7 +183,15 @@ fn ffmpeg_args<'a>(args: &[&'a str], threads: &'a str) -> Vec<&'a str> {
         .iter()
         .any(|filter| a.contains(filter))
     });
-    let mut out = vec!["-hide_banner", "-threads", threads, "-loglevel"];
+    let mut out = vec!["-hide_banner"];
+    // `IsInfoQuery`: ffmpeg takes a `-threads` before `-version`, `-muxers`
+    // or `-h` as a trailing option, and warns about it.
+    if !args.first().is_some_and(|a| {
+        a.starts_with("-version") || a.starts_with("-muxers") || a.starts_with("-h")
+    }) {
+        out.extend(["-threads", threads]);
+    }
+    out.push("-loglevel");
     out.push(if info { "info" } else { "warning" });
     out.extend_from_slice(args);
     out
@@ -225,6 +233,10 @@ pub trait FfmpegService: Send + Sync {
 
     /// `ProbeAudioDurationAsync`: the first audio stream's duration, seconds.
     async fn probe_audio_duration(&self, path: &str, options: ProcessOptions) -> Option<f64>;
+
+    /// `CheckFFmpegVersionAsync`: whether this ffmpeg can fingerprint, with
+    /// each check's output.
+    async fn check(&self) -> FfmpegCheck;
 
     /// `DetectBlackFramesAsync(episode, range, …)`'s detection: every frame
     /// in `[start, end]` of `path` at least half black under `threshold`,
@@ -294,6 +306,72 @@ pub struct KeyframeVisual {
     /// Its mean saturation (`SATAVG`, 8-bit scale).
     pub saturation: f64,
 }
+
+/// `CheckFFmpegVersionAsync`'s result: the status the support bundle shows
+/// (`okay`, or what is missing) and each check's output (`_chromaprintLogs`),
+/// in the order they ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FfmpegCheck {
+    /// `okay`, `unknown_error`, `chromaprint_not_supported`,
+    /// `fp_format_not_supported` or `silencedetect_not_supported`.
+    pub status: &'static str,
+    /// `(name, output)` per check run.
+    pub logs: Vec<(&'static str, String)>,
+}
+
+impl FfmpegCheck {
+    /// `GetChromaprintLogs`: the status line, then each check's output in a
+    /// fenced block, the version first.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut report = format!("* FFmpeg: `{}`\n\n", self.status);
+        let version = self.logs.iter().find(|(name, _)| *name == "version");
+        let block = |name: &str, output: Option<&str>| {
+            let mut block = format!(
+                "FFmpeg {name}:\n```\n{}",
+                output.unwrap_or("(no output captured)")
+            );
+            if !block.ends_with('\n') {
+                block.push('\n');
+            }
+            block.push_str("```\n\n");
+            block
+        };
+        report.push_str(&block(
+            "version",
+            version.map(|(_, output)| output.as_str()),
+        ));
+        for (name, output) in self.logs.iter().filter(|(name, _)| *name != "version") {
+            report.push_str(&block(name, Some(output)));
+        }
+        report
+    }
+}
+
+/// `CheckFFmpegVersionAsync`'s requirements, in order: the arguments, what
+/// the output must contain, its name in the bundle, and the status a miss
+/// reports.
+const REQUIREMENTS: [(&str, &str, &str, &str); 4] = [
+    ("-version", "ffmpeg", "version", "unknown_error"),
+    (
+        "-muxers",
+        "chromaprint",
+        "muxer list",
+        "chromaprint_not_supported",
+    ),
+    (
+        "-h muxer=chromaprint",
+        "binary raw fingerprint",
+        "chromaprint options",
+        "fp_format_not_supported",
+    ),
+    (
+        "-h filter=silencedetect",
+        "noise tolerance",
+        "silencedetect options",
+        "silencedetect_not_supported",
+    ),
+];
 
 /// A frame the `blackframe` filter reported (`BlackFrame`).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -407,6 +485,37 @@ impl FfmpegService for Ffmpeg {
         )
         .ok()?;
         parse_audio_duration(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    async fn check(&self) -> FfmpegCheck {
+        let mut logs = Vec::new();
+        for (arguments, must_contain, name, missing) in REQUIREMENTS {
+            let args: Vec<&str> = arguments.split(' ').collect();
+            let output = match ffmpeg(&self.ffmpeg, &args, ProcessOptions::default()).await {
+                Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+                // Upstream throws before keeping any output (the bundle says
+                // "no output captured"); the spawn error says more.
+                Err(err) => {
+                    logs.push((name, err));
+                    return FfmpegCheck {
+                        status: "unknown_error",
+                        logs,
+                    };
+                }
+            };
+            let met = output.to_lowercase().contains(must_contain);
+            logs.push((name, output));
+            if !met {
+                return FfmpegCheck {
+                    status: missing,
+                    logs,
+                };
+            }
+        }
+        FfmpegCheck {
+            status: "okay",
+            logs,
+        }
     }
 
     async fn detect_black_frames(
@@ -813,6 +922,13 @@ impl FfmpegService for FakeFfmpeg {
         self.audio_duration
     }
 
+    async fn check(&self) -> FfmpegCheck {
+        FfmpegCheck {
+            status: "okay",
+            logs: vec![("version", "ffmpeg version test".to_owned())],
+        }
+    }
+
     async fn detect_black_frames(
         &self,
         path: &str,
@@ -902,6 +1018,17 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_follow_get_output_async() {
+        // `IsInfoQuery`: no `-threads` before an info query.
+        assert_eq!(
+            ffmpeg_args(&["-h", "muxer=chromaprint"], "4"),
+            [
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-h",
+                "muxer=chromaprint"
+            ]
+        );
         assert_eq!(
             ffmpeg_args(&["-i", "x", "-af", "silencedetect=noise=-50dB"], "4"),
             [
@@ -937,6 +1064,54 @@ mod tests {
                    [Parsed_showinfo_0 @ 0x0] n:   1 pts:  1 pts_time:2.5 duration: 1\n\
                    [Parsed_showinfo_0 @ 0x0] n:   2 pts:  1 PTS_TIME:bad x\n";
         assert_eq!(parse_keyframes(raw, 10.0), [10.0, 12.5]);
+    }
+
+    /// `GetChromaprintLogs`: the status, the version block first, each block
+    /// fenced on its own lines.
+    #[test]
+    fn the_check_report_follows_get_chromaprint_logs() {
+        let check = FfmpegCheck {
+            status: "chromaprint_not_supported",
+            logs: vec![
+                ("version", "ffmpeg version 7\n".to_owned()),
+                ("muxer list", "mp4".to_owned()),
+            ],
+        };
+        assert_eq!(
+            check.report(),
+            "* FFmpeg: `chromaprint_not_supported`\n\n\
+             FFmpeg version:\n```\nffmpeg version 7\n```\n\n\
+             FFmpeg muxer list:\n```\nmp4\n```\n\n"
+        );
+        let none = FfmpegCheck {
+            status: "unknown_error",
+            logs: Vec::new(),
+        };
+        assert!(
+            none.report()
+                .contains("FFmpeg version:\n```\n(no output captured)\n```")
+        );
+    }
+
+    /// The real checks against the system ffmpeg (gated).
+    #[tokio::test]
+    async fn real_ffmpeg_check() {
+        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
+            eprintln!("skipped: set FERROFIN_FFMPEG_TESTS=1 to run");
+            return;
+        }
+        let check = Ffmpeg::new("ffmpeg", "ffprobe").check().await;
+        assert!(check.logs[0].1.contains("ffmpeg version"), "{check:?}");
+        assert!(!check.logs[0].1.contains("Trailing option"), "{check:?}");
+        let has_muxer = check
+            .logs
+            .get(1)
+            .is_some_and(|(_, out)| out.contains("chromaprint"));
+        assert_eq!(
+            check.status == "chromaprint_not_supported",
+            !has_muxer,
+            "{check:?}"
+        );
     }
 
     /// .NET's `ToString("0.####")` of `blackdetect`'s thresholds; 32 is the

@@ -34,6 +34,11 @@ pub trait Fingerprinter: Send + Sync {
         end: f64,
         options: ProcessOptions,
     ) -> Result<Vec<u32>, String>;
+
+    /// The backend in use, for the support bundle.
+    fn backend(&self) -> &'static str {
+        "fingerprinter"
+    }
 }
 
 /// A Chromaprint fingerprinter over `ffmpeg -f chromaprint`, or `fpcalc` when
@@ -124,6 +129,10 @@ impl ChromaprintFingerprinter {
 
 #[async_trait]
 impl Fingerprinter for ChromaprintFingerprinter {
+    fn backend(&self) -> &'static str {
+        ChromaprintFingerprinter::backend(self)
+    }
+
     async fn fingerprint(
         &self,
         path: &str,

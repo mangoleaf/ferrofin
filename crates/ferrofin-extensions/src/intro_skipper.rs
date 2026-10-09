@@ -10,7 +10,7 @@
 //! what makes jellyfin-web show the "Skip Intro" / "Skip Credits" button.
 //!
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the
-//! `IntroSkipper.Detect` scheduled task and as the provider behind the
+//! `IntroSkipperDetectSegmentsTask` scheduled task and as the provider behind the
 //! "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`). The task
 //! self-gates on the plugin's enabled flag; without a Chromaprint backend it
 //! warns and runs the analyzers that do not need one.
@@ -196,6 +196,31 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
 
     async fn hides_intros(&self, item_id: Uuid) -> bool {
         self.hides_intros(item_id).await
+    }
+
+    async fn support_bundle(&self) -> String {
+        // `CheckFFmpegVersionAsync` (run at start upstream; here when asked).
+        let check = self.ffmpeg.check().await;
+        // Upstream's ffmpeg is its only fingerprinter; here `fpcalc` stands in
+        // for a muxer-less ffmpeg, so only no fingerprinter at all is a
+        // problem worth the warning.
+        if check.status != "okay" && self.fingerprinter.is_none() {
+            self.runtime.warn(automatic::INCOMPATIBLE_FFMPEG_BUILD);
+        }
+        let backend = self
+            .fingerprinter
+            .as_ref()
+            .map_or("none", |fingerprinter| fingerprinter.backend());
+        format!(
+            "* Queue contents: {} episodes, {} seasons\n\
+             * Warnings: `{}`\n\
+             * Chromaprint backend: {backend}\n\
+             {}",
+            self.runtime.queued.load(Ordering::Relaxed),
+            self.runtime.seasons.load(Ordering::Relaxed),
+            self.runtime.warnings(),
+            check.report(),
+        )
     }
 
     async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
@@ -636,14 +661,21 @@ struct DetectSegmentsTask {
 #[async_trait]
 impl ScheduledTask for DetectSegmentsTask {
     fn key(&self) -> &str {
-        "IntroSkipper.Detect"
+        "IntroSkipperDetectSegmentsTask"
     }
     fn name(&self) -> &str {
-        "Detect intros and credits"
+        "Detect and Analyze Media Segments"
     }
     fn description(&self) -> &str {
-        "Fingerprints episode audio to find shared intros and end credits, writing them as \
-         media segments (Skip Intro / Skip Credits)."
+        "Analyzes media to determine the timestamp and length of intros and credits."
+    }
+    /// Daily at midnight, as upstream.
+    fn default_triggers(&self) -> Vec<ferrofin_model::tasks::TaskTriggerInfo> {
+        vec![ferrofin_model::tasks::TaskTriggerInfo {
+            type_: ferrofin_model::tasks::TaskTriggerInfoType::DailyTrigger,
+            time_of_day_ticks: Some(0),
+            ..ferrofin_model::tasks::TaskTriggerInfo::default()
+        }]
     }
     fn category(&self) -> &str {
         "Intro Skipper"
@@ -696,14 +728,26 @@ impl DetectSegmentsTask {
     /// entry, excluded ones flagged.
     async fn queue(&self, config: &IntroSkipperConfig) -> Result<queue::Queue, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
-        queue::build(
+        let queue = queue::build(
             self.library.as_ref(),
             self.ffmpeg.as_ref(),
             &folders,
             config,
             true,
         )
-        .await
+        .await?;
+        // `TotalQueued` / `TotalSeasons`, for the support bundle.
+        let queued = queue
+            .iter()
+            .map(|(_, entries)| entries.iter().filter(|e| !e.is_excluded).count())
+            .sum();
+        self.runtime.queued.store(queued, Ordering::Relaxed);
+        let seasons = queue
+            .iter()
+            .filter(|(_, entries)| entries.iter().any(|e| !e.is_excluded))
+            .count();
+        self.runtime.seasons.store(seasons, Ordering::Relaxed);
+        Ok(queue)
     }
 
     /// The background analysis pass (`DetectSegmentsTask` →
@@ -3044,6 +3088,44 @@ mod tests {
         assert!(intros_of(&h.segments, EP_A).await.is_empty());
     }
 
+    /// The support bundle's analysis half: the last queue's counts, the
+    /// warnings raised, the backend and the ffmpeg checks.
+    #[tokio::test]
+    async fn the_support_bundle_reports_queue_warnings_and_ffmpeg() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        let bundle = IntroSkipperAnalysis::support_bundle(&h.task).await;
+        assert!(
+            bundle.starts_with("* Queue contents: 2 episodes, 1 seasons\n"),
+            "{bundle}"
+        );
+        assert!(bundle.contains("* Warnings: `None`\n"), "{bundle}");
+        assert!(bundle.contains("* FFmpeg: `okay`\n"), "{bundle}");
+        assert!(
+            bundle.contains("FFmpeg version:\n```\nffmpeg version test\n```"),
+            "{bundle}"
+        );
+
+        // `InvalidChromaprintFingerprint`: a fingerprint failed.
+        let fresh = harness(&TWO_EPISODES, true, "{}", true).await;
+        let failing = DetectSegmentsTask {
+            fingerprinter: Some(Arc::new(FakeFingerprinter {
+                prints: HashMap::new(),
+                calls: Arc::clone(&fresh.calls),
+            })),
+            ..fresh.task.clone()
+        };
+        failing
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        let bundle = IntroSkipperAnalysis::support_bundle(&fresh.task).await;
+        assert!(
+            bundle.contains("* Warnings: `InvalidChromaprintFingerprint`\n"),
+            "{bundle}"
+        );
+    }
+
     // ---- the Clean Intro Skipper Cache task ---------------------------------
 
     /// Which cache files the clean keeps: an analysed item's, under a current
@@ -3331,12 +3413,24 @@ mod tests {
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
     }
 
+    /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and
+    /// description, daily at midnight.
     #[tokio::test]
-    async fn detect_task_metadata_is_stable() {
+    async fn detect_task_metadata_follows_upstream() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
-        assert_eq!(h.task.key(), "IntroSkipper.Detect");
-        assert_eq!(h.task.name(), "Detect intros and credits");
-        assert!(h.task.description().contains("media segments"));
+        assert_eq!(h.task.key(), "IntroSkipperDetectSegmentsTask");
+        assert_eq!(h.task.name(), "Detect and Analyze Media Segments");
+        assert_eq!(
+            h.task.description(),
+            "Analyzes media to determine the timestamp and length of intros and credits."
+        );
         assert_eq!(h.task.category(), "Intro Skipper");
+        let triggers = h.task.default_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].type_,
+            ferrofin_model::tasks::TaskTriggerInfoType::DailyTrigger
+        );
+        assert_eq!(triggers[0].time_of_day_ticks, Some(0));
     }
 }
