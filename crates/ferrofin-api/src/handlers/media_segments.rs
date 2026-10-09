@@ -82,10 +82,16 @@ async fn get_item_segments(
         Some(types.as_slice())
     };
 
-    let segments = state
+    let mut segments = state
         .media_segments
         .get_segments(item_id, type_filter, false)
         .await?;
+    // The Intro Skipper's `MediaSegmentsFirstEpisodeFilter` (`SkipFirstEpisode`).
+    if segments.iter().any(|s| s.type_ == MediaSegmentType::Intro)
+        && state.intro_skipper_analysis.hides_intros(item_id).await
+    {
+        segments.retain(|s| s.type_ != MediaSegmentType::Intro);
+    }
     let count = i32::try_from(segments.len()).unwrap_or(i32::MAX);
     Ok(Json(QueryResult::new(Some(0), Some(count), segments)))
 }

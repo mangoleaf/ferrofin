@@ -194,6 +194,10 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         DetectSegmentsTask::plugin_configuration_changed(self, plugin_id);
     }
 
+    async fn hides_intros(&self, item_id: Uuid) -> bool {
+        self.hides_intros(item_id).await
+    }
+
     async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
         let config = self.load_config().await;
         // `GetExcludedInventoryAsync`: the queue with the excluded items in.
@@ -725,6 +729,79 @@ impl DetectSegmentsTask {
         }
         progress.report(100.0);
         tracing::info!(analyzed = stored, "intro skipper: analysis complete");
+    }
+
+    /// `MediaSegmentsFirstEpisodeFilter`: with `SkipFirstEpisode`, the Intro
+    /// segments of a season's first episode (by index, real episodes only)
+    /// are hidden — of an anime series only, with `SkipFirstEpisodeAnime`.
+    async fn hides_intros(&self, item_id: Uuid) -> bool {
+        if !self.enabled().await {
+            return false;
+        }
+        let config = self.load_config().await;
+        if !config.skip_first_episode {
+            return false;
+        }
+        let episode = match self.library.get_item_by_id(item_id).await {
+            Ok(Some(episode)) => episode,
+            Ok(None) => return false,
+            Err(err) => {
+                tracing::warn!(%err, %item_id, "intro skipper: item unreadable; its intros are shown");
+                return false;
+            }
+        };
+        if queue::kind(&episode) != Some(ferrofin_model::data::BaseItemKind::Episode) {
+            return false;
+        }
+        let Some(season_id) = episode
+            .season_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil())
+        else {
+            tracing::debug!(%item_id, "intro skipper: episode without a season; intros shown");
+            return false;
+        };
+        let query = ferrofin_traits::options::InternalItemsQuery {
+            parent_id: season_id,
+            include_item_types: vec![ferrofin_model::data::BaseItemKind::Episode],
+            recursive: false,
+            is_virtual_item: Some(false),
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::IndexNumber,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            limit: Some(1),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        let first = match self.library.get_item_list(&query).await {
+            Ok(items) => items
+                .into_iter()
+                .next()
+                .and_then(|first| Uuid::parse_str(&first.id).ok()),
+            Err(err) => {
+                tracing::warn!(%err, %item_id, %season_id, "intro skipper: season unreadable; its intros are shown");
+                return false;
+            }
+        };
+        if first != Some(item_id) {
+            return false;
+        }
+        if !config.skip_first_episode_anime {
+            tracing::debug!(%item_id, %season_id, "intro skipper: first episode's intros hidden");
+            return true;
+        }
+        let series = episode
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        match series {
+            Some(series) => matches!(
+                self.library.get_item_by_id(series).await,
+                Ok(Some(series)) if queue::is_anime(&series)
+            ),
+            None => false,
+        }
     }
 
     /// `CleanCacheTask.ExecuteAsync`, holding the analysis latch (waiting
@@ -1471,6 +1548,24 @@ mod tests {
         cache: tempfile::TempDir,
     }
 
+    /// The season the harness episodes are children of (`ParentId` is a key).
+    async fn seed_season(persistence: &ferrofin_core::FerrofinItemPersistenceService) {
+        let season = BaseItemEntity {
+            id: guid_to_db(SEASON),
+            type_: ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Season)
+                .expect("stored type name")
+                .to_owned(),
+            name: Some("Season 1".to_owned()),
+            index_number: Some(1),
+            is_folder: true,
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(&[season])
+            .await
+            .expect("seed season");
+    }
+
     /// Builds the task over an in-memory database seeded with `episodes`
     /// (`(id, path, duration_secs)`), all in one season.
     pub(super) async fn harness(
@@ -1515,10 +1610,14 @@ mod tests {
             .expect("stored type name");
         let rows: Vec<BaseItemEntity> = episodes
             .iter()
-            .map(|(id, path, secs)| BaseItemEntity {
+            .zip(1..)
+            .map(|((id, path, secs), index)| BaseItemEntity {
                 id: guid_to_db(*id),
                 type_: type_name.to_owned(),
                 path: Some(real(path)),
+                // Episodes of SEASON, in order.
+                parent_id: Some(guid_to_db(SEASON)),
+                index_number: Some(index),
                 #[allow(clippy::cast_possible_truncation)]
                 run_time_ticks: Some((secs * 10_000_000.0) as i64),
                 season_id: Some(guid_to_db(SEASON)),
@@ -1528,6 +1627,7 @@ mod tests {
                 ..BaseItemEntity::default()
             })
             .collect();
+        seed_season(&persistence).await;
         persistence.save_items(&rows).await.expect("seed episodes");
 
         let segments: Arc<dyn MediaSegmentManager> = Arc::new(
@@ -2622,6 +2722,47 @@ mod tests {
             }
             (got, want) => assert_eq!(got, want),
         }
+    }
+
+    /// `MediaSegmentsFirstEpisodeFilter`: only with `SkipFirstEpisode`, only
+    /// the season's first episode, and with `SkipFirstEpisodeAnime` only of an
+    /// anime series; never while the plugin is off.
+    #[rstest]
+    #[case::off("{}", true, false, [false, false])]
+    #[case::first_episode(r#"{"SkipFirstEpisode":true}"#, true, false, [true, false])]
+    #[case::anime_only_not_anime(r#"{"SkipFirstEpisode":true,"SkipFirstEpisodeAnime":true}"#, true, false, [false, false])]
+    #[case::anime_only_anime(r#"{"SkipFirstEpisode":true,"SkipFirstEpisodeAnime":true}"#, true, true, [true, false])]
+    #[case::disabled(r#"{"SkipFirstEpisode":true}"#, false, false, [false, false])]
+    #[tokio::test]
+    async fn first_episode_intros_are_hidden_when_asked(
+        #[case] config: &str,
+        #[case] enabled: bool,
+        #[case] anime: bool,
+        #[case] expected: [bool; 2],
+    ) {
+        let h = harness(&TWO_EPISODES, enabled, config, true).await;
+        if anime {
+            let series_type =
+                ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Series)
+                    .expect("stored type name");
+            h.persistence
+                .save_items(&[BaseItemEntity {
+                    id: guid_to_db(SERIES),
+                    type_: series_type.to_owned(),
+                    name: Some("Show".to_owned()),
+                    genres: Some("Anime".to_owned()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("anime series");
+        }
+        assert_eq!(
+            [
+                h.task.hides_intros(EP_A).await,
+                h.task.hides_intros(EP_B).await
+            ],
+            expected
+        );
     }
 
     /// `ProbeAudioDuration`: credits end where a shorter audio stream does.

@@ -441,7 +441,7 @@ fn episode_windows(
 }
 
 /// `SeriesHelper.IsAnime`: a tag or genre equal to "anime", in any case.
-fn is_anime(series: &BaseItemEntity) -> bool {
+pub(super) fn is_anime(series: &BaseItemEntity) -> bool {
     [series.tags.as_deref(), series.genres.as_deref()]
         .into_iter()
         .flatten()

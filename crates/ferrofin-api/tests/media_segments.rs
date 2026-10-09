@@ -432,6 +432,133 @@ async fn media_segments_returns_query_result() {
     assert_eq!(v["Items"][0]["Type"], "Intro");
 }
 
+/// An Intro Skipper whose `SkipFirstEpisode` hides every item's intros,
+/// counting how often it is asked.
+#[derive(Default)]
+struct HidesIntros(std::sync::atomic::AtomicUsize);
+
+/// An item with an Intro and an Outro.
+struct IntroAndOutro;
+
+#[async_trait]
+impl MediaSegmentManager for IntroAndOutro {
+    async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
+    async fn create_segment(
+        &self,
+        segment: &MediaSegmentDto,
+        _segment_provider_id: &str,
+    ) -> Result<MediaSegmentDto, ServiceError> {
+        Ok(segment.clone())
+    }
+    async fn delete_segment(&self, _segment_id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn delete_segments(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_segments(
+        &self,
+        item_id: Uuid,
+        type_filter: Option<&[MediaSegmentType]>,
+        _filter_by_provider: bool,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        Ok([MediaSegmentType::Intro, MediaSegmentType::Outro]
+            .into_iter()
+            .zip(1u128..)
+            .filter(|(type_, _)| type_filter.is_none_or(|types| types.contains(type_)))
+            .map(|(type_, n)| MediaSegmentDto {
+                id: Uuid::from_u128(n),
+                item_id,
+                type_,
+                start_ticks: 0,
+                end_ticks: 100,
+            })
+            .collect())
+    }
+    async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn delete_provider_segments(
+        &self,
+        _item_id: Uuid,
+        _provider_id: &str,
+        _type_filter: Option<MediaSegmentType>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for HidesIntros {
+    fn is_running(&self) -> bool {
+        false
+    }
+    async fn rescan(&self, _season_id: Uuid) -> Result<bool, ServiceError> {
+        Ok(false)
+    }
+    async fn erase_cache(
+        &self,
+        _items: Option<&[Uuid]>,
+        _mode: Option<ferrofin_model::intro_skipper::AnalysisMode>,
+    ) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
+    async fn clear_excluded(
+        &self,
+    ) -> Result<ferrofin_traits::intro_skipper::ExcludedClear, ServiceError> {
+        Ok(ferrofin_traits::intro_skipper::ExcludedClear::default())
+    }
+    async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
+    async fn task_completed(&self, _key: &str, _completed: bool) {}
+    async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
+    async fn hides_intros(&self, _item_id: Uuid) -> bool {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+}
+
+/// The Intro Skipper's `MediaSegmentsFirstEpisodeFilter`: hidden intros are
+/// left out — the rest stays, and the count follows. A response without an
+/// Intro never asks.
+#[tokio::test]
+async fn media_segments_hides_what_the_intro_skipper_hides() {
+    let analysis = Arc::new(HidesIntros::default());
+    let app = || {
+        state(
+            Arc::new(IntroAndOutro),
+            Arc::new(FakeTrickplay),
+            Arc::new(FakeLyrics),
+            Arc::new(FakeSubtitles),
+        )
+        .with_intro_skipper_analysis(Arc::clone(&analysis) as _)
+    };
+    let (status, body) = call(app(), "GET", &format!("/MediaSegments/{ITEM_ID}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(v["Items"][0]["Type"], "Outro");
+    assert_eq!(analysis.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let uri = format!("/MediaSegments/{ITEM_ID}?includeSegmentTypes=Outro");
+    let (status, body) = call(app(), "GET", &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["TotalRecordCount"], 1);
+    assert_eq!(
+        analysis.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "not asked"
+    );
+}
+
 #[tokio::test]
 async fn media_segments_type_filter_narrows() {
     let app = state(

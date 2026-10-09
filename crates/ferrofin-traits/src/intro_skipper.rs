@@ -422,6 +422,11 @@ pub trait IntroSkipperAnalysis: Send + Sync {
 
     /// A plugin's configuration was saved (`ConfigurationChanged`).
     async fn plugin_configuration_changed(&self, plugin_id: Uuid);
+
+    /// Whether `GET /MediaSegments/{itemId}` hides the item's Intro segments
+    /// (`MediaSegmentsFirstEpisodeFilter`: a season's first episode, with
+    /// `SkipFirstEpisode`).
+    async fn hides_intros(&self, item_id: Uuid) -> bool;
 }
 
 fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}
@@ -478,6 +483,10 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
     async fn task_completed(&self, _key: &str, _completed: bool) {}
 
     async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
+
+    async fn hides_intros(&self, _item_id: Uuid) -> bool {
+        false
+    }
 }
 
 /// The [`InMemoryIntroSkipperStore`] state.

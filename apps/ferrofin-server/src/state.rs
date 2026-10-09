@@ -2466,6 +2466,9 @@ mod tests {
                 .expect("lock")
                 .push(format!("settings {plugin_id}"));
         }
+        async fn hides_intros(&self, _item_id: uuid::Uuid) -> bool {
+            false
+        }
     }
 
     /// The bus events reach the Intro Skipper's automatic analysis parsed.
