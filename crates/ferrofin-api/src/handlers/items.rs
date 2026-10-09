@@ -1484,7 +1484,9 @@ async fn check_parent_visibility(
     if let Some(parent_id) = parent_id
         && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
     {
-        if !query.recursive {
+        if !query.recursive || kind_from(&query_parent) == Some(BaseItemKind::Season) {
+            // A default view delegates to that Season's GetItemsInternal even
+            // for recursive requests; its aired selection needs the real row.
             query.parent_id = parent_id;
             query.user_root_children = false;
         }

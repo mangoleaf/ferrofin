@@ -329,6 +329,8 @@ impl UserManager for OkUsers {
     }
 }
 
+const SEASON_VIEW_ID: Uuid = Uuid::from_u128(0x5EA0_0001);
+const SEASON_BROWSE_ID: Uuid = Uuid::from_u128(0x5EA0_0002);
 /// The physical library-root `Folder` an item scanned by Jellyfin parents to.
 const PHYSICAL_FOLDER_ID: Uuid = Uuid::from_u128(0xF01);
 /// The `AggregateFolder` (`{data}/root`) that physical folder parents to.
@@ -391,6 +393,18 @@ impl LibraryManager for OkLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == SEASON_VIEW_ID {
+            let mut view = item_entity(SEASON_VIEW_ID, "Season view", BaseItemKind::UserView);
+            view.data = Some(serde_json::json!({"DisplayParentId":SEASON_BROWSE_ID}).to_string());
+            return Ok(Some(view));
+        }
+        if id == SEASON_BROWSE_ID {
+            return Ok(Some(item_entity(
+                SEASON_BROWSE_ID,
+                "Season 1",
+                BaseItemKind::Season,
+            )));
+        }
         if id == PLAYLIST_ID {
             return Ok(Some(item_entity(
                 PLAYLIST_ID,
@@ -2124,6 +2138,64 @@ async fn a_dropped_request_still_finishes_its_delete() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+    }
+}
+
+#[tokio::test]
+async fn default_season_view_preserves_actual_parent_for_live_aired_selection_and_ids_bypass_it() {
+    for recursive in [false, true] {
+        for explicit in [false, true] {
+            let library = OkLibrary {
+                item_id: ITEM_ID,
+                adopted_tree: false,
+                last_query: Arc::default(),
+                deleted: Arc::default(),
+                gate: None,
+            };
+            let seen = library.last_query.clone();
+            let router = create_router(ok_state_with(library));
+            let path = format!(
+                "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}{}",
+                if explicit {
+                    format!("&ids={ITEM_ID}")
+                } else {
+                    String::new()
+                }
+            );
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("X-Emby-Token", "valid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let query = seen.lock().unwrap().clone().expect("repository query");
+            assert_eq!(
+                query.parent_id,
+                if explicit {
+                    Uuid::nil()
+                } else {
+                    SEASON_BROWSE_ID
+                }
+            );
+            assert_eq!(
+                query.parent_type,
+                if explicit {
+                    None
+                } else {
+                    Some(BaseItemKind::Season)
+                }
+            );
+            assert_eq!(query.apply_folder_display_options, !explicit);
+            assert!(
+                !query.folder_query_recursive,
+                "default delegation keeps the Season override instead of invoking Folder.QueryRecursive"
+            );
+        }
     }
 }
 

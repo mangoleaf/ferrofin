@@ -546,6 +546,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     }
     verify_local_reader_order(&api, tmp.path()).await;
     verify_media_segment_library_options(&api, id).await;
+    verify_special_episode_display(&api, tmp.path()).await;
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
@@ -1631,4 +1632,411 @@ async fn verify_subtitle_destinations(
         expected_paths.len(),
         "failed uploads must not append a stream: {item}"
     );
+}
+
+/// Live dashboard display policy positions physical specials in episode lists and NextUp.
+#[allow(clippy::too_many_lines)]
+async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
+    let tv = root.join("special-display");
+    let show = tv.join("Special Show");
+    std::fs::create_dir_all(&show).unwrap();
+    std::fs::write(
+        show.join("tvshow.nfo"),
+        "<tvshow><title>Special Show</title></tvshow>",
+    )
+    .unwrap();
+    for (season, episode, title, aired) in [
+        (
+            0,
+            1,
+            "Z Special",
+            "<airsbefore_season>1</airsbefore_season><airsbefore_episode>2</airsbefore_episode><tag>hidden-special</tag>",
+        ),
+        (1, 1, "One", ""),
+        (1, 2, "Two", ""),
+        (2, 1, "Other", ""),
+    ] {
+        let folder = show.join(format!("Season {season:02}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let stem = format!("Special Show S{season:02}E{episode:02}");
+        std::fs::write(folder.join(format!("{stem}.mkv")), b"fixture").unwrap();
+        std::fs::write(folder.join(format!("{stem}.nfo")), format!("<episodedetails><title>{title}</title><season>{season}</season><episode>{episode}</episode>{aired}</episodedetails>")).unwrap();
+    }
+    let options = json!({"PathInfos":[{"Path":tv}],"EnableInternetProviders":false,
+        "EnableRealtimeMonitor":false,"MetadataSavers":[],"EnableChapterImageExtraction":false,
+        "EnableTrickplayImageExtraction":false,
+        "TypeOptions":[{"Type":"Series","MetadataFetchers":[],"ImageFetchers":[]},
+            {"Type":"Season","MetadataFetchers":[],"ImageFetchers":[]},
+            {"Type":"Episode","MetadataFetchers":[],"ImageFetchers":[]}]});
+    api.post(
+        "/Library/VirtualFolders?name=Specials&collectionType=tvshows&refreshLibrary=false",
+        &json!({"LibraryOptions":options}),
+    )
+    .await;
+    let tasks = api.get("/ScheduledTasks").await;
+    let task = tasks["Items"]
+        .as_array()
+        .or_else(|| tasks.as_array())
+        .unwrap()
+        .iter()
+        .find(|task| task["Key"] == "RefreshLibrary")
+        .expect("registered refresh task");
+    let task_id = task["Id"].as_str().unwrap();
+    let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
+    api.post(&format!("/ScheduledTasks/Running/{task_id}"), &Value::Null)
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = api.get(&format!("/ScheduledTasks/{task_id}")).await;
+        if task["State"] == "Idle" && task["LastExecutionResult"]["EndTimeUtc"] != previous {
+            assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "specials refresh did not complete: {task}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let series = loop {
+        let rows = api
+            .get("/Items?recursive=true&includeItemTypes=Series")
+            .await;
+        if let Some(series) = rows["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["Name"] == "Special Show")
+        {
+            let episodes = api
+                .get(&format!(
+                    "/Items?recursive=true&includeItemTypes=Episode&seriesId={}",
+                    series["Id"].as_str().unwrap()
+                ))
+                .await;
+            if ["One", "Two", "Other", "Z Special"].iter().all(|name| {
+                episodes["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["Name"] == *name)
+            }) {
+                break series.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "special show metadata did not settle: {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let series_id = series["Id"].as_str().unwrap();
+    let seasons = api.get(&format!("/Shows/{series_id}/Seasons")).await;
+    let season_id = seasons["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|season| season["IndexNumber"] == 1)
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let names = |result: &Value| {
+        result["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["Name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let users = api.get("/Users").await;
+    let user = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["Name"] == "admin")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let first = api
+        .get(&format!("/Shows/{series_id}/Episodes?season=1"))
+        .await;
+    let first_id = first["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["Name"] == "One")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    api.post(
+        &format!("/Users/{user}/PlayedItems/{first_id}"),
+        &Value::Null,
+    )
+    .await;
+    let mut config = api.get("/System/Configuration").await;
+    for enabled in [false, true, false] {
+        config["DisplaySpecialsWithinSeasons"] = json!(enabled);
+        api.post("/System/Configuration", &config).await;
+        let wanted = if enabled {
+            vec!["One", "Z Special", "Two"]
+        } else {
+            vec!["One", "Two"]
+        };
+        for query in ["season=1".to_owned(), format!("seasonId={season_id}")] {
+            let result = api
+                .get(&format!("/Shows/{series_id}/Episodes?{query}"))
+                .await;
+            assert_eq!(names(&result), wanted, "{query}: {result}");
+            assert_eq!(result["TotalRecordCount"], wanted.len());
+        }
+        for recursive in [false, true] {
+            let result = api
+                .get(&format!(
+                    "/Items?parentId={season_id}&recursive={recursive}&collapseBoxSetItems=true"
+                ))
+                .await;
+            assert_eq!(names(&result), wanted, "Season.GetItemsInternal: {result}");
+            assert_eq!(result["TotalRecordCount"], wanted.len());
+            let page = api
+                .get(&format!(
+                    "/Items?parentId={season_id}&recursive={recursive}&startIndex=1&limit=1"
+                ))
+                .await;
+            assert_eq!(names(&page), [if enabled { "Z Special" } else { "Two" }]);
+            assert_eq!(page["TotalRecordCount"], wanted.len());
+        }
+        let unplayed = api
+            .get(&format!("/Items?parentId={season_id}&filters=IsUnplayed"))
+            .await;
+        assert_eq!(
+            names(&unplayed),
+            if enabled {
+                vec!["Z Special", "Two"]
+            } else {
+                vec!["Two"]
+            }
+        );
+        let wrong_kind = api
+            .get(&format!(
+                "/Items?parentId={season_id}&includeItemTypes=Movie"
+            ))
+            .await;
+        assert!(names(&wrong_kind).is_empty());
+        assert_eq!(wrong_kind["TotalRecordCount"], 0);
+        let descending = api
+            .get(&format!(
+                "/Items?parentId={season_id}&sortBy=AiredEpisodeOrder&sortOrder=Descending"
+            ))
+            .await;
+        assert_eq!(
+            names(&descending),
+            if enabled {
+                vec!["Two", "Z Special", "One"]
+            } else {
+                vec!["Two", "One"]
+            }
+        );
+        let all_ids = api
+            .get(&format!("/Shows/{series_id}/Episodes?season=0"))
+            .await;
+        let special_id = all_ids["Items"][0]["Id"].as_str().unwrap();
+        let explicit = api.get(&format!("/Items?parentId={season_id}&ids={first_id},{special_id}&collapseBoxSetItems=true&sortBy=SortName")).await;
+        let mut requested_names = names(&explicit);
+        requested_names.sort();
+        assert_eq!(
+            requested_names,
+            ["One", "Z Special"],
+            "HTTP explicit IDs bypass aired selection and parent scope"
+        );
+        assert_eq!(explicit["TotalRecordCount"], 2);
+        // SeasonId follows the season's actual Series, independent of route id.
+        let result = api
+            .get(&format!(
+                "/Shows/{}/Episodes?seasonId={season_id}",
+                uuid::Uuid::nil()
+            ))
+            .await;
+        assert_eq!(names(&result), wanted);
+        assert_eq!(
+            names(
+                &api.get(&format!("/Shows/{series_id}/Episodes?season=0"))
+                    .await
+            ),
+            ["Z Special"]
+        );
+        assert_eq!(
+            names(
+                &api.get(&format!("/Shows/{series_id}/Episodes?season=2"))
+                    .await
+            ),
+            ["Other"]
+        );
+        assert!(
+            api.get(&format!("/Shows/{series_id}/Episodes?season=99"))
+                .await["Items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let all = api.get(&format!("/Shows/{series_id}/Episodes")).await;
+        assert_eq!(
+            all["TotalRecordCount"], 4,
+            "positioned specials are not duplicated"
+        );
+        let nil_adjacent = api
+            .get(&format!(
+                "/Shows/{series_id}/Episodes?season=1&adjacentTo={}",
+                uuid::Uuid::nil()
+            ))
+            .await;
+        assert_eq!(names(&nil_adjacent), wanted);
+        assert_eq!(nil_adjacent["TotalRecordCount"], wanted.len());
+        assert_eq!(
+            names(&all),
+            if enabled {
+                vec!["One", "Z Special", "Two", "Other"]
+            } else {
+                vec!["Z Special", "One", "Two", "Other"]
+            }
+        );
+        let page = api
+            .get(&format!(
+                "/Shows/{series_id}/Episodes?season=1&startIndex=1&limit=1"
+            ))
+            .await;
+        assert_eq!(names(&page), [if enabled { "Z Special" } else { "Two" }]);
+        assert_eq!(page["TotalRecordCount"], wanted.len());
+        let next = api
+            .get(&format!("/Shows/NextUp?userId={user}&seriesId={series_id}"))
+            .await;
+        assert_eq!(names(&next), [if enabled { "Z Special" } else { "Two" }]);
+    }
+    api.post("/Users/New", &json!({"Name":"specials-restricted"}))
+        .await;
+    let restricted_users = api.get("/Users").await;
+    let restricted = restricted_users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["Name"] == "specials-restricted")
+        .unwrap();
+    let restricted_id = restricted["Id"].as_str().unwrap();
+    let mut restricted_policy = restricted["Policy"].clone();
+    restricted_policy["EnableAllFolders"] = json!(true);
+    restricted_policy["BlockedTags"] = json!(["hidden-special"]);
+    api.post(
+        &format!("/Users/{restricted_id}/Policy"),
+        &restricted_policy,
+    )
+    .await;
+    config["DisplaySpecialsWithinSeasons"] = json!(true);
+    api.post("/System/Configuration", &config).await;
+    for path in [
+        format!("/Items?parentId={season_id}&userId={restricted_id}"),
+        format!("/Shows/{series_id}/Episodes?seasonId={season_id}&userId={restricted_id}"),
+    ] {
+        let result = api.get(&path).await;
+        assert_eq!(
+            names(&result),
+            ["One", "Two"],
+            "hidden positioned specials stay hidden: {result}"
+        );
+        assert_eq!(result["TotalRecordCount"], 2);
+    }
+    config["DisplaySpecialsWithinSeasons"] = json!(false);
+    api.post("/System/Configuration", &config).await;
+    // Visibility applies to season resolution before its series episodes are read.
+    api.post("/Users/New", &json!({"Name":"specials-hidden"}))
+        .await;
+    let users = api.get("/Users").await;
+    let hidden = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["Name"] == "specials-hidden")
+        .unwrap();
+    let hidden_id = hidden["Id"].as_str().unwrap();
+    let mut policy = hidden["Policy"].clone();
+    policy["EnableAllFolders"] = json!(false);
+    policy["EnabledFolders"] = json!([]);
+    api.post(&format!("/Users/{hidden_id}/Policy"), &policy)
+        .await;
+    let response = api
+        .client
+        .get(format!(
+            "{}/Shows/{series_id}/Episodes?seasonId={season_id}&userId={hidden_id}",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    let response = api
+        .client
+        .get(format!(
+            "{}/Items?parentId={season_id}&userId={hidden_id}",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let result: Value = response.json().await.unwrap();
+    assert_eq!(
+        names(&result),
+        ["One", "Two"],
+        "Items checks the season's own visibility, not standalone library access: {result}"
+    );
+    assert_eq!(result["TotalRecordCount"], 2);
+
+    // A season is not ICollectionFolder: its own parent gate does not apply
+    // EnabledFolders. An inherited/own parental-policy block does apply, even
+    // when the request authenticates as admin and selects another user.
+    let mut season = api.get(&format!("/Items/{season_id}")).await;
+    season["Tags"] = json!(["hidden-season-parent"]);
+    api.post(&format!("/Items/{season_id}"), &season).await;
+    policy["EnableAllFolders"] = json!(true);
+    policy["BlockedTags"] = json!(["hidden-season-parent"]);
+    api.post(&format!("/Users/{hidden_id}/Policy"), &policy)
+        .await;
+    for (path, expected) in [
+        (
+            format!("/Items?parentId={season_id}&userId={hidden_id}"),
+            reqwest::StatusCode::UNAUTHORIZED,
+        ),
+        (
+            format!("/Shows/{series_id}/Episodes?seasonId={season_id}&userId={hidden_id}"),
+            reqwest::StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = api
+            .client
+            .get(format!("{}{path}", api.base))
+            .header("Authorization", &api.auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            expected,
+            "selected-user own-Season parental block must apply: {path}"
+        );
+    }
+    let result = api.get(&format!("/Items?parentId={season_id}")).await;
+    assert_eq!(names(&result), ["One", "Two"]);
+    assert_eq!(result["TotalRecordCount"], 2);
+    policy["BlockedTags"] = json!([]);
+    api.post(&format!("/Users/{hidden_id}/Policy"), &policy)
+        .await;
+    for path in [
+        format!("/Items?parentId={season_id}&userId={hidden_id}"),
+        format!("/Shows/{series_id}/Episodes?seasonId={season_id}&userId={hidden_id}"),
+    ] {
+        let result = api.get(&path).await;
+        assert_eq!(names(&result), ["One", "Two"], "{path}: {result}");
+        assert_eq!(result["TotalRecordCount"], 2);
+    }
 }

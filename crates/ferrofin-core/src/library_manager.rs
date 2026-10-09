@@ -212,6 +212,50 @@ fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> boo
             .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
 }
 
+fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
+    value
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|id| !id.is_nil())
+}
+
+fn episode_presentation_key(item: &BaseItemEntity) -> String {
+    item.presentation_unique_key
+        .as_ref()
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .unwrap_or_else(|| item.id.clone())
+}
+
+fn episode_virtual_location(item: &BaseItemEntity) -> bool {
+    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+    let channel = kind == "Channel"
+        || (!matches!(
+            kind,
+            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
+        ) && episode_relation_id(item.channel_id.as_deref()).is_some());
+    item.path.as_deref().is_none_or(str::is_empty) && !channel
+}
+
+fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
+    let data = item
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
+    let number = |key| {
+        data.as_ref()
+            .and_then(|data| data.get(key))
+            .and_then(serde_json::Value::as_i64)
+    };
+    ferrofin_model::entities_media::AiredEpisodeOrder {
+        season: item.parent_index_number,
+        episode: item.index_number,
+        premiere: item.premiere_date,
+        airs_before_season: number("AirsBeforeSeasonNumber"),
+        airs_after_season: number("AirsAfterSeasonNumber"),
+        airs_before_episode: number("AirsBeforeEpisodeNumber"),
+    }
+}
+
 /// One scan request: what it covers, the options its items refresh with,
 /// and why it was made.
 #[derive(Debug, Clone, PartialEq)]
@@ -1116,7 +1160,7 @@ impl FerrofinLibraryManager {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Option<QueryResult<BaseItemEntity>>, ServiceError> {
-        if !query.apply_folder_display_options {
+        if !query.apply_folder_display_options || !query.item_ids.is_empty() {
             return Ok(None);
         }
         let Some(config) = &self.dashboard_configuration else {
@@ -1161,15 +1205,17 @@ impl FerrofinLibraryManager {
         {
             return Ok(None);
         }
-        // Season.GetItemsInternal has its own episode selection and calls
-        // PostFilterAndSort; its parent exclusion never substitutes a collection.
-        // Keep that existing episode consumer (special selection belongs to D03).
+        // Season.GetItemsInternal calls its live GetEpisodes consumer, then
+        // Filter/PostFilterAndSort. It never substitutes a collection.
         if !resolved.folder_query_recursive
             && resolved.parent_type == Some(BaseItemKind::Season)
             && resolved.user.is_some()
         {
             resolved.collapse_box_set_items = None;
-            return self.items.get_items(&resolved).await.map(Some);
+            return self
+                .season_display_result(&resolved, config.display_specials_within_seasons)
+                .await
+                .map(Some);
         }
         // ItemsController's user-root shortcut and nonrecursive UserView
         // builders have their own GetResult contract, outside Folder's policy.
@@ -1223,6 +1269,146 @@ impl FerrofinLibraryManager {
             children
         };
         self.folder_post_filter_result(items, query).await.map(Some)
+    }
+
+    /// Season.GetItemsInternal: select aired episodes before Filter and paging.
+    /// The existing LibraryManager traits query seam keeps API independent of core.
+    #[allow(clippy::too_many_lines)] // source relation resolution, selection, then Filter/PostFilterAndSort
+    async fn season_display_result(
+        &self,
+        query: &InternalItemsQuery,
+        include_specials: bool,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let season = self.items.retrieve_item(query.parent_id).await?;
+        let series_id = season.as_ref().and_then(|season| {
+            episode_relation_id(season.series_id.as_deref())
+                .or_else(|| episode_relation_id(season.parent_id.as_deref()))
+        });
+        let series = match series_id {
+            Some(id) => self.items.retrieve_item(id).await?,
+            None => None,
+        }
+        .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
+        let mut episodes = Vec::new();
+        if let (Some(season), Some(series)) = (season, series) {
+            let rows = self
+                .items
+                .get_item_list(&InternalItemsQuery {
+                    user: query.user.clone(),
+                    series_presentation_unique_key: Some(episode_presentation_key(&series)),
+                    include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
+                    order_by: vec![(
+                        ferrofin_model::live_tv::ItemSortBy::SortName,
+                        ferrofin_model::dto::SortOrder::Ascending,
+                    )],
+                    dto_options: query.dto_options.clone(),
+                    // Season.GetItemsInternal passes shouldIncludeMissing=true.
+                    ..Default::default()
+                })
+                .await?;
+            let series_seasons: Vec<_> = rows
+                .iter()
+                .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
+                .cloned()
+                .collect();
+            let mut seasons: HashMap<_, _> = series_seasons
+                .iter()
+                .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+                .collect();
+            seasons.insert(query.parent_id, season.clone());
+            let mut unknown = std::collections::HashSet::new();
+            for row in &rows {
+                if row.type_.rsplit('.').next() == Some("Episode")
+                    && let Some(id) = episode_relation_id(row.season_id.as_deref())
+                        .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+                    && !seasons.contains_key(&id)
+                {
+                    unknown.insert(id);
+                }
+            }
+            if !unknown.is_empty() {
+                for row in self
+                    .items
+                    .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
+                    .await?
+                {
+                    if row.type_.rsplit('.').next() == Some("Season")
+                        && let Some(id) = episode_relation_id(Some(&row.id))
+                    {
+                        seasons.insert(id, row);
+                    }
+                }
+            }
+            let key = episode_presentation_key(&season);
+            let number = season.index_number;
+            let support_specials = include_specials && number.is_some_and(|number| number != 0);
+            let mut matches = Vec::new();
+            for row in rows
+                .into_iter()
+                .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
+            {
+                let parent = episode_relation_id(row.season_id.as_deref())
+                    .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+                    .and_then(|id| seasons.get(&id))
+                    .or_else(|| {
+                        (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                            .then(|| {
+                                series_seasons
+                                    .iter()
+                                    .find(|parent| parent.index_number == row.parent_index_number)
+                            })
+                            .flatten()
+                    });
+                let same_season = parent.is_some_and(|parent| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                        &episode_presentation_key(parent),
+                        &key,
+                    )
+                });
+                // The disabled source query is restricted to the season's
+                // presentation ancestry, before FilterEpisodesBySeason runs.
+                if !include_specials && !same_season {
+                    continue;
+                }
+                let order = episode_air_order(&row);
+                let current = if support_specials {
+                    order
+                        .airs_after_season
+                        .or(order.airs_before_season)
+                        .or(order.season)
+                } else {
+                    order.season
+                };
+                let matches_number = current.is_some() && number.is_some() && current == number;
+                let matches_virtual = current.is_none()
+                    && number.is_none()
+                    && episode_virtual_location(&season)
+                    && parent.is_none_or(episode_virtual_location);
+                if matches_number || matches_virtual || same_season {
+                    matches.push((order, row));
+                }
+            }
+            if number != Some(0) {
+                matches.sort_by(|(left, _), (right, _)| left.compare(right));
+            }
+            episodes = matches.into_iter().map(|(_, row)| row).collect();
+        }
+        let mut episodes = self.items.filter_folder_children(episodes, query).await?;
+        let mut post_query = query.clone();
+        if let [(ferrofin_model::live_tv::ItemSortBy::AiredEpisodeOrder, direction)] =
+            query.order_by.as_slice()
+        {
+            episodes.sort_by(|left, right| {
+                let ordering = episode_air_order(left).compare(&episode_air_order(right));
+                if *direction == ferrofin_model::dto::SortOrder::Descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+            post_query.order_by.clear();
+        }
+        self.folder_post_filter_result(episodes, &post_query).await
     }
 
     /// Load physical and linked Folder children with the existing access checks.
@@ -5165,6 +5351,256 @@ mod tests {
             _: &ferrofin_model::branding::BrandingOptions,
         ) -> Result<(), ServiceError> {
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn season_display_specials_is_live_and_precedes_filter_sort_count_and_page() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let config = Arc::new(CollapsingConfiguration::default());
+        let library = manager(&db).with_dashboard_configuration(config.clone());
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let series = Uuid::new_v4();
+        let zero = Uuid::new_v4();
+        let one = Uuid::new_v4();
+        let key = "display-series";
+        let mut rows = vec![BaseItemEntity {
+            id: guid_to_db(series),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("Display show".into()),
+            is_folder: true,
+            presentation_unique_key: Some(key.into()),
+            path: Some(tmp.path().join("show").to_string_lossy().into_owned()),
+            ..Default::default()
+        }];
+        for (id, number) in [(zero, 0), (one, 1)] {
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                name: Some(format!("Season {number}")),
+                sort_name: Some(format!("{number:04}")),
+                index_number: Some(number),
+                parent_id: Some(guid_to_db(series)),
+                // Guid.Empty must use the real Series parent.
+                series_id: Some(guid_to_db(Uuid::nil())),
+                series_presentation_unique_key: Some(key.into()),
+                presentation_unique_key: Some(format!("display-season-{number}")),
+                is_folder: true,
+                path: Some(
+                    tmp.path()
+                        .join(format!("show/season{number}"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            });
+        }
+        // Duplicate season numbers can exist in grouped/adopted series. The
+        // direct Series child's fallback must use the first saved season order,
+        // not the iteration order of the identity lookup map.
+        rows.push(BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some("Replica season 1".into()),
+            sort_name: Some("9999".into()),
+            index_number: Some(1),
+            parent_id: Some(guid_to_db(series)),
+            series_id: Some(guid_to_db(series)),
+            series_presentation_unique_key: Some(key.into()),
+            presentation_unique_key: Some("other-season-key".into()),
+            is_folder: true,
+            path: Some(tmp.path().join("replica").to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let mut episode_ids = Vec::new();
+        for (season_id, number, index, name, physical) in [
+            (one, 1, 1, "One", true),
+            (one, 1, 2, "Two", true),
+            (zero, 0, 1, "Z Special", true),
+            (one, 1, 3, "Missing", false),
+        ] {
+            let id = Uuid::new_v4();
+            episode_ids.push(id);
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                clean_name: Some(name.to_lowercase()),
+                parent_id: Some(guid_to_db(if name == "One" { series } else { season_id })),
+                // A direct Series child resolves its season by its number.
+                season_id: Some(guid_to_db(if name == "One" {
+                    Uuid::nil()
+                } else {
+                    season_id
+                })),
+                parent_index_number: Some(number),
+                index_number: Some(index),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.into()),
+                media_type: Some("Video".into()),
+                is_virtual_item: !physical,
+                path: physical.then(|| {
+                    tmp.path()
+                        .join(format!("{name}.mkv"))
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                data: (number == 0).then(|| {
+                    serde_json::json!({"AirsBeforeSeasonNumber":1,"AirsBeforeEpisodeNumber":2})
+                        .to_string()
+                }),
+                ..Default::default()
+            });
+        }
+        library.persistence.save_items(&rows).await.unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            parent_id: one,
+            parent_type: Some(BaseItemKind::Season),
+            apply_folder_display_options: true,
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|row| row.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for enabled in [false, true, false] {
+            config.0.lock().unwrap().display_specials_within_seasons = enabled;
+            let expected = if enabled {
+                vec!["One", "Z Special", "Two", "Missing"]
+            } else {
+                vec!["One", "Two", "Missing"]
+            };
+            for recursive in [false, true] {
+                let selected = InternalItemsQuery {
+                    recursive,
+                    ..query.clone()
+                };
+                let result = library.query_items(&selected).await.unwrap();
+                assert_eq!(
+                    result.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(result), expected);
+                let page = library
+                    .query_items(&InternalItemsQuery {
+                        start_index: Some(1),
+                        limit: Some(1),
+                        ..selected.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(page), [if enabled { "Z Special" } else { "Two" }]);
+            }
+            let physical = library
+                .query_items(&InternalItemsQuery {
+                    is_virtual_item: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(physical),
+                if enabled {
+                    vec!["One", "Z Special", "Two"]
+                } else {
+                    vec!["One", "Two"]
+                }
+            );
+            let prefix = library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some("Z".into()),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(prefix),
+                if enabled { vec!["Z Special"] } else { vec![] }
+            );
+            let sorted = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(sorted),
+                if enabled {
+                    vec!["Missing", "One", "Two", "Z Special"]
+                } else {
+                    vec!["Missing", "One", "Two"]
+                }
+            );
+            let descending = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Descending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(descending),
+                if enabled {
+                    vec!["Missing", "Two", "Z Special", "One"]
+                } else {
+                    vec!["Missing", "Two", "One"]
+                }
+            );
+            let adjacent = library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(episode_ids[1]),
+                    start_index: Some(1),
+                    limit: Some(1),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(adjacent.total_record_count, 3);
+            assert_eq!(names(adjacent), ["Two"]);
+            let zero_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: zero,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(names(zero_result), ["Z Special"]);
+            let orphan = Uuid::new_v4();
+            let orphan_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: orphan,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert!(orphan_result.items.is_empty());
+            for recursive in [false, true] {
+                let direct = library
+                    .query_items(&InternalItemsQuery {
+                        item_ids: vec![episode_ids[2]],
+                        recursive,
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    direct.items.is_empty(),
+                    "internal explicit IDs keep the supplied parent and bypass aired selection"
+                );
+            }
         }
     }
 

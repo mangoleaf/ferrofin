@@ -13249,6 +13249,15 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     if let Some(number) = n.parent_index_number {
         entity.parent_index_number = Some(i64::from(number));
     }
+    // EpisodeNfoParser supplies these nullable positions to the provider temp;
+    // the existing metadata merge handles stored fallback and replacement.
+    for (key, value) in [
+        ("AirsBeforeSeasonNumber", n.airs_before_season_number),
+        ("AirsAfterSeasonNumber", n.airs_after_season_number),
+        ("AirsBeforeEpisodeNumber", n.airs_before_episode_number),
+    ] {
+        fill_provider_data(entity, key, value.map(|value| serde_json::json!(value)));
+    }
     if entity.overview.is_none() {
         entity.overview.clone_from(&n.overview);
     }
@@ -28404,6 +28413,176 @@ mod tests {
             .unwrap(),
         );
         (db, cf)
+    }
+
+    struct NfoEpisodeAirsFixture {
+        _temporary: tempfile::TempDir,
+        episode_path: String,
+        nfo_path: std::path::PathBuf,
+        item_id: Uuid,
+        scanner: LibraryScanner,
+        items: Arc<dyn ItemRepository>,
+    }
+
+    impl NfoEpisodeAirsFixture {
+        async fn new(tags: &str) -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let media = temporary.path().join("tv");
+            let season = media.join("Show").join("Season 00");
+            std::fs::create_dir_all(&season).unwrap();
+            let episode = season.join("Show S00E01.mkv");
+            std::fs::write(&episode, b"").unwrap();
+            let db = crate::test_support::test_db().await;
+            let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+            let folders: Arc<dyn VirtualFolderManager> = Arc::new(
+                FerrofinVirtualFolderManager::new(temporary.path().join(".views"))
+                    .with_item_store(persistence.clone()),
+            );
+            folders
+                .add_virtual_folder(
+                    "Shows",
+                    Some(CollectionTypeOptions::tvshows),
+                    &LibraryOptions {
+                        path_infos: vec![MediaPathInfo {
+                            path: media.to_string_lossy().into_owned(),
+                        }],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let items = crate::test_support::item_repository_over(db);
+            let fixture = Self {
+                item_id: crate::item_type_lookup::derive_item_id(
+                    BaseItemKind::Episode,
+                    &episode.to_string_lossy(),
+                )
+                .unwrap(),
+                nfo_path: episode.with_extension("nfo"),
+                episode_path: episode.to_string_lossy().into_owned(),
+                scanner: LibraryScanner::new(
+                    folders,
+                    Arc::new(FerrofinFileSystem::new()),
+                    persistence,
+                )
+                .with_items(items.clone()),
+                items,
+                _temporary: temporary,
+            };
+            fixture.write_nfo(tags);
+            fixture.scanner.scan_all().await.unwrap();
+            fixture
+        }
+
+        fn write_nfo(&self, tags: &str) {
+            std::fs::write(
+                &self.nfo_path,
+                format!("<episodedetails><title>Local Special</title><season>0</season><episode>1</episode>{tags}</episodedetails>"),
+            )
+            .unwrap();
+        }
+
+        async fn row(&self) -> BaseItemEntity {
+            self.items
+                .retrieve_item(self.item_id)
+                .await
+                .unwrap()
+                .expect("scanned episode")
+        }
+
+        async fn refresh(&self, tags: &str, remove_old_metadata: bool) -> BaseItemEntity {
+            use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+            self.write_nfo(tags);
+            self.scanner
+                .scan_paths_with(
+                    std::slice::from_ref(&self.episode_path),
+                    &MetadataRefreshOptions {
+                        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                        image_refresh_mode: MetadataRefreshMode::None,
+                        replace_all_metadata: true,
+                        remove_old_metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            self.row().await
+        }
+    }
+
+    fn nfo_episode_airs_positions(row: &BaseItemEntity) -> [Option<i64>; 3] {
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(data["VideoType"], "VideoFile", "resolver facts survive");
+        assert_eq!(row.name.as_deref(), Some("Local Special"));
+        assert_eq!(row.parent_index_number, Some(0));
+        [
+            "AirsBeforeSeasonNumber",
+            "AirsAfterSeasonNumber",
+            "AirsBeforeEpisodeNumber",
+        ]
+        .map(|key| data.get(key).and_then(serde_json::Value::as_i64))
+    }
+
+    #[tokio::test]
+    async fn nfo_episode_airs_survive_real_scan_and_follow_refresh_replacement() {
+        let fixture = NfoEpisodeAirsFixture::new(
+            "<airsbefore_season>1</airsbefore_season><airsbefore_episode>2</airsbefore_episode>",
+        )
+        .await;
+        assert_eq!(
+            nfo_episode_airs_positions(&fixture.row().await),
+            [Some(1), None, Some(2)]
+        );
+        for number in [0, -1] {
+            let row = fixture
+                .refresh(
+                    &format!("<airsbefore_season>{number}</airsbefore_season><airsafter_season>{number}</airsafter_season><airsbefore_episode>{number}</airsbefore_episode>"),
+                    false,
+                )
+                .await;
+            assert_eq!(nfo_episode_airs_positions(&row), [Some(number); 3]);
+        }
+        let row = fixture.refresh("", false).await;
+        assert_eq!(
+            nfo_episode_airs_positions(&row),
+            [Some(-1); 3],
+            "missing provider properties retain stored values with fallback enabled"
+        );
+        let row = fixture.refresh("", true).await;
+        assert_eq!(
+            nfo_episode_airs_positions(&row),
+            [None; 3],
+            "ReplaceAllMetadata plus RemoveOldMetadata clears missing positions"
+        );
+    }
+
+    #[test]
+    fn nfo_episode_airs_local_positions_precede_the_remote_provider() {
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut nfo = NfoBaseItem::new(NfoItemKind::Episode);
+        nfo.airs_before_season_number = Some(1);
+        nfo.airs_after_season_number = Some(0);
+        nfo.airs_before_episode_number = Some(2);
+        let mut row = BaseItemEntity::default();
+        super::apply_nfo(&mut row, &nfo);
+        let before = row.clone();
+        super::apply_tvdb_episode(
+            &mut row,
+            &ferrofin_providers::TvdbEpisodeDetails {
+                airs_before_season: Some(5),
+                airs_after_season: Some(6),
+                airs_before_episode: Some(7),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            row, before,
+            "the first local provider owns supplied positions"
+        );
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        assert_eq!(data["AirsBeforeSeasonNumber"], 1);
+        assert_eq!(data["AirsAfterSeasonNumber"], 0);
+        assert_eq!(data["AirsBeforeEpisodeNumber"], 2);
     }
 
     #[tokio::test]
