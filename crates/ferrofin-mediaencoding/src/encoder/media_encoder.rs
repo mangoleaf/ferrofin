@@ -19,6 +19,7 @@ use std::sync::RwLock;
 
 use crate::error::MediaEncodingError;
 use async_trait::async_trait;
+use ferrofin_model::drawing::ImageResolution;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
@@ -75,6 +76,7 @@ struct Paths {
 pub struct MediaEncoderImpl<T: Transcoder> {
     transcoder: Arc<T>,
     image_encoding_pool: Arc<tokio::sync::Semaphore>,
+    chapter_image_resolution: Option<Arc<dyn Fn() -> ImageResolution + Send + Sync>>,
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
     normalizer: ProbeResultNormalizer<PassthroughLocalization>,
@@ -86,6 +88,17 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     #[must_use]
     pub fn with_image_encoding_pool(mut self, pool: Arc<tokio::sync::Semaphore>) -> Self {
         self.image_encoding_pool = pool;
+        self
+    }
+
+    /// Reads the live dashboard resolution before each video image extraction.
+    /// Audio cover extraction remains at source size, as in Jellyfin.
+    #[must_use]
+    pub fn with_chapter_image_resolution(
+        mut self,
+        read: impl Fn() -> ImageResolution + Send + Sync + 'static,
+    ) -> Self {
+        self.chapter_image_resolution = Some(Arc::new(read));
         self
     }
 
@@ -103,6 +116,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
             config,
+            chapter_image_resolution: None,
             paths: RwLock::new(Paths {
                 ffmpeg: ffmpeg_path.into(),
                 ffprobe: ffprobe_path.into(),
@@ -193,11 +207,8 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// filter chain, optional thumbnail sampling, stream `-map`, and `-ss`
     /// offset.
     ///
-    /// Two branches of the C# are missing here and are tracked separately: the
-    /// HDR tonemap branch belongs to the hardware-transcoding roadmap phase 2, and
-    /// `GetImageResolutionParameter` (the `ChapterImageResolution` setting →
-    /// `-s WxH`) is not hardware work at all — it is open work item 4 in that
-    /// plan's list, because the dashboard setting currently has no effect.
+    /// The HDR tonemap branch is tracked by the hardware-transcoding roadmap.
+    /// The dashboard's image resolution applies after the video filter chain.
     #[allow(clippy::too_many_arguments)]
     fn extract_image_arguments(
         input_path: &str,
@@ -210,6 +221,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         output_path: &str,
         ffmpeg_version: Option<FfmpegVersion>,
         threads: i32,
+        image_resolution: ImageResolution,
     ) -> String {
         let mut filters: Vec<String> = Vec::new();
 
@@ -260,8 +272,9 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // `-fps_mode auto` (`-vsync -1` below ffmpeg 5.1): let ffmpeg decide,
         // which is what upstream passes here.
         let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
+        let resolution = image_resolution_parameter(image_resolution);
         let mut args = format!(
-            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{sync} -f image2 \"{output_path}\""
+            "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 \"{output_path}\""
         );
 
         if let Some(offset) = offset_ticks {
@@ -279,6 +292,21 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// Parses ffprobe's captured JSON into an [`InternalMediaInfoResult`].
     fn parse_probe(output: &str) -> Result<InternalMediaInfoResult, ServiceError> {
         serde_json::from_str(output).map_err(|e| MediaEncodingError::probe_parse(e).into())
+    }
+}
+
+/// `GetImageResolutionParameter`: fixed output dimensions, including upscaling.
+fn image_resolution_parameter(resolution: ImageResolution) -> &'static str {
+    match resolution {
+        ImageResolution::P144 => " -s 256x144",
+        ImageResolution::P240 => " -s 426x240",
+        ImageResolution::P360 => " -s 640x360",
+        ImageResolution::P480 => " -s 854x480",
+        ImageResolution::P720 => " -s 1280x720",
+        ImageResolution::P1080 => " -s 1920x1080",
+        ImageResolution::P1440 => " -s 2560x1440",
+        ImageResolution::P2160 => " -s 3840x2160",
+        ImageResolution::MatchSource | ImageResolution::Unrecognized(_) => "",
     }
 }
 
@@ -401,6 +429,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             &output_path,
             self.config.ffmpeg_version,
             self.config.threads,
+            ImageResolution::MatchSource,
         );
         let ffmpeg = self.encoder_path();
         let _permit = self
@@ -500,6 +529,9 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             &output_path,
             self.config.ffmpeg_version,
             self.config.threads,
+            self.chapter_image_resolution
+                .as_ref()
+                .map_or(ImageResolution::MatchSource, |read| read()),
         );
         let ffmpeg = self.encoder_path();
         let _permit = self
@@ -572,6 +604,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use ferrofin_model::drawing::ImageResolution;
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
@@ -941,6 +974,7 @@ mod tests {
             "/tmp/out.jpg",
             None,
             0,
+            ImageResolution::MatchSource,
         );
         assert!(args.contains("-v error"), "got: {args}");
         assert!(!args.contains("-v quiet"), "got: {args}");
@@ -970,6 +1004,7 @@ mod tests {
             "/tmp/out.jpg",
             version,
             0,
+            ImageResolution::MatchSource,
         );
         assert!(args.contains(expected), "got: {args}");
     }
@@ -1012,6 +1047,7 @@ mod tests {
             "/tmp/out.jpg",
             None,
             0,
+            ImageResolution::MatchSource,
         );
         assert!(args.contains(expected_prefix), "got: {args}");
     }
@@ -1041,6 +1077,7 @@ mod tests {
                 "/tmp/out.jpg",
                 None,
                 0,
+                ImageResolution::MatchSource,
             );
             assert_eq!(
                 args.matches('(').count(),
@@ -1216,5 +1253,128 @@ mod tests {
         video.await.unwrap().unwrap();
         assert_eq!(trickplay.await.unwrap().unwrap().len(), 1);
         assert_eq!(pool.available_permits(), 2);
+    }
+    struct RecordingFrames(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl Transcoder for RecordingFrames {
+        async fn get_process_output(
+            &self,
+            path: &str,
+            arguments: &str,
+            read_stderr: bool,
+            test_key: Option<&str>,
+            env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            self.0.lock().unwrap().push(arguments.to_owned());
+            FrameWritingTranscoder
+                .get_process_output(path, arguments, read_stderr, test_key, env)
+                .await
+        }
+        async fn get_process_exit_code(&self, _: &str, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn live_chapter_resolution_changes_video_arguments_but_audio_keeps_source_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let resolution = Arc::new(std::sync::Mutex::new(ImageResolution::P144));
+        let reader = Arc::clone(&resolution);
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                ..Default::default()
+            },
+        )
+        .with_chapter_image_resolution(move || *reader.lock().unwrap());
+        for (setting, expected) in [
+            (ImageResolution::P144, Some("256x144")),
+            (ImageResolution::P480, Some("854x480")),
+            (ImageResolution::MatchSource, None),
+            (ImageResolution::Unrecognized(99), None),
+        ] {
+            *resolution.lock().unwrap() = setting;
+            let frame = encoder
+                .extract_video_image(
+                    "movie.mkv",
+                    "mkv",
+                    &MediaSourceInfo::default(),
+                    &video_stream(),
+                    None,
+                    Some(0),
+                )
+                .await
+                .unwrap();
+            std::fs::remove_file(frame).unwrap();
+            let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+            if let Some(expected) = expected {
+                assert!(
+                    arguments.contains(&format!(" -s {expected} ")),
+                    "{arguments}"
+                );
+            } else {
+                assert!(!arguments.contains(" -s "), "{arguments}");
+            }
+        }
+        *resolution.lock().unwrap() = ImageResolution::P2160;
+        let audio = encoder
+            .extract_audio_image("track.flac", Some(1))
+            .await
+            .unwrap();
+        std::fs::remove_file(audio).unwrap();
+        assert!(
+            !transcoder
+                .0
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains(" -s ")
+        );
+    }
+
+    #[test]
+    fn every_dashboard_resolution_uses_its_pinned_output_dimensions() {
+        use super::image_resolution_parameter;
+
+        for (resolution, dimensions) in [
+            (ImageResolution::P144, "256x144"),
+            (ImageResolution::P240, "426x240"),
+            (ImageResolution::P360, "640x360"),
+            (ImageResolution::P480, "854x480"),
+            (ImageResolution::P720, "1280x720"),
+            (ImageResolution::P1080, "1920x1080"),
+            (ImageResolution::P1440, "2560x1440"),
+            (ImageResolution::P2160, "3840x2160"),
+        ] {
+            let arguments = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "movie.mkv",
+                "mkv",
+                Some(&video_stream()),
+                None,
+                None,
+                Some(150_000_000),
+                true,
+                "frame.jpg",
+                None,
+                0,
+                resolution,
+            );
+            assert!(
+                arguments.contains(&format!(" -s {dimensions} ")),
+                "{resolution:?}: {arguments}"
+            );
+            assert!(arguments.contains("-ss 00:00:15.000"));
+        }
+        assert_eq!(image_resolution_parameter(ImageResolution::MatchSource), "");
+        assert_eq!(
+            image_resolution_parameter(ImageResolution::Unrecognized(-1)),
+            ""
+        );
     }
 }
