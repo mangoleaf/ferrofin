@@ -37,6 +37,7 @@ struct KeyRow {
     extra_type: Option<String>,
     run_time_ticks: Option<i64>,
     series_id: Option<Uuid>,
+    parent_id: Option<Uuid>,
 }
 
 impl KeyRow {
@@ -108,6 +109,24 @@ pub(crate) async fn load_keys_for_items(
         .collect())
 }
 
+/// Resolve each child's actual Series once for a browse page, regardless of
+/// its own provider hydration. Empty/nil SeriesId follows the nearest Series
+/// parent; a nonempty missing/non-Series ID does not fall back to parents.
+pub(crate) async fn load_child_series_keys(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<String>>, ServiceError> {
+    let rows = identity_rows(conn, ids).await?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            let row = rows.get(id)?;
+            let series = resolve_series(row, &rows)?;
+            Some((id.clone(), user_data_keys(&series.as_source(), None)))
+        })
+        .collect())
+}
+
 pub(crate) struct StoredIdentity {
     pub id: String,
     pub keys: Vec<String>,
@@ -118,25 +137,12 @@ pub(crate) async fn load_identities(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<Vec<StoredIdentity>, ServiceError> {
-    let mut rows = key_rows(conn, ids).await?;
-    let mut series: Vec<String> = rows
-        .values()
-        .filter_map(|row| {
-            matches!(row.kind, BaseItemKind::Season | BaseItemKind::Episode)
-                .then_some(row.series_id)
-                .flatten()
-                .map(guid_to_db)
-        })
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    series.sort_unstable();
-    series.dedup();
-    rows.extend(key_rows(conn, &series).await?);
+    let rows = identity_rows(conn, ids).await?;
     Ok(ids
         .iter()
         .filter_map(|id| {
             let row = rows.get(id)?;
-            let series = row.series_id.and_then(|id| rows.get(&guid_to_db(id)));
+            let series = resolve_series(row, &rows);
             let series_source = series.map(KeyRow::as_source);
             Some(StoredIdentity {
                 id: id.clone(),
@@ -145,6 +151,54 @@ pub(crate) async fn load_identities(
             })
         })
         .collect())
+}
+
+/// Reuse the two existing SQL statement nodes for both page and write reads.
+/// The identity query includes only necessary fallback parents; explicit Series
+/// pointers are loaded together in a second batch if they were not on the page.
+async fn identity_rows(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, KeyRow>, ServiceError> {
+    let mut rows = key_rows(conn, ids).await?;
+    let mut series: Vec<String> = ids
+        .iter()
+        .filter_map(|id| rows.get(id))
+        .filter(|row| matches!(row.kind, BaseItemKind::Season | BaseItemKind::Episode))
+        .filter_map(|row| row.series_id.filter(|id| !id.is_nil()).map(guid_to_db))
+        .filter(|id| !rows.contains_key(id))
+        .collect();
+    series.sort_unstable();
+    series.dedup();
+    rows.extend(key_rows(conn, &series).await?);
+    Ok(rows)
+}
+
+fn resolve_series<'a>(
+    row: &KeyRow,
+    rows: &'a std::collections::HashMap<String, KeyRow>,
+) -> Option<&'a KeyRow> {
+    if !matches!(row.kind, BaseItemKind::Season | BaseItemKind::Episode) {
+        return None;
+    }
+    if let Some(series) = row.series_id.filter(|id| !id.is_nil()) {
+        return rows
+            .get(&guid_to_db(series))
+            .filter(|parent| parent.kind == BaseItemKind::Series);
+    }
+    let mut next = row.parent_id.filter(|id| !id.is_nil());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            break;
+        }
+        let parent = rows.get(&guid_to_db(id))?;
+        if parent.kind == BaseItemKind::Series {
+            return Some(parent);
+        }
+        next = parent.parent_id.filter(|id| !id.is_nil());
+    }
+    None
 }
 
 /// Only the identity fields, excluding large Data blobs and artwork metadata.
@@ -161,8 +215,13 @@ type RawKeyRow = (
     Option<i64>,
     Option<String>,
     bool,
+    Option<String>,
 );
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one repository boundary loads compact identity rows and providers together"
+)]
 async fn key_rows(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
@@ -172,12 +231,26 @@ async fn key_rows(
     }
     let json = serde_json::to_string(ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
     let raw: Vec<RawKeyRow> = sqlx::query_as(
-        r#"SELECT "Id", "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
+        r#"WITH RECURSIVE identity_ids("Id", "WalkParents") AS (
+               SELECT "Id", CASE WHEN "Type" IN (?2, ?3)
+                   AND ("SeriesId" IS NULL OR "SeriesId" = ?4) THEN 1 ELSE 0 END
+               FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
+               UNION
+               SELECT parent."Id", 1 FROM identity_ids AS current
+               JOIN "BaseItems" AS child ON child."Id" = current."Id"
+               JOIN "BaseItems" AS parent ON parent."Id" = upper(child."ParentId")
+               WHERE current."WalkParents" = 1 AND child."Type" <> ?5
+           )
+           SELECT "Id", "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
                   "AlbumArtists", "SeriesId", "ExtraType", "RunTimeTicks",
-                  "EpisodeTitle", "IsSeries"
-           FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))"#,
+                  "EpisodeTitle", "IsSeries", "ParentId"
+           FROM "BaseItems" WHERE "Id" IN (SELECT "Id" FROM identity_ids)"#,
     )
     .bind(&json)
+    .bind(BaseItemKind::Episode.stored_type_name())
+    .bind(BaseItemKind::Season.stored_type_name())
+    .bind(guid_to_db(Uuid::nil()))
+    .bind(BaseItemKind::Series.stored_type_name())
     .fetch_all(&mut *conn)
     .await
     .map_err(db_err)?;
@@ -219,6 +292,7 @@ async fn key_rows(
         run_time_ticks,
         episode_title,
         is_series,
+        parent_id,
     ) in raw
     {
         let item_id = Uuid::parse_str(&id).map_err(|e| ServiceError::Backend(e.to_string()))?;
@@ -254,6 +328,7 @@ async fn key_rows(
             extra_type: extra_type.and_then(extra_type_name).map(str::to_owned),
             run_time_ticks,
             series_id: series_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
+            parent_id: parent_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()),
         };
         result.insert(id, row);
     }

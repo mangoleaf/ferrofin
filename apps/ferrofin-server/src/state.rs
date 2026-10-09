@@ -731,9 +731,11 @@ pub async fn build_app_state(
             .with_configuration(Arc::clone(&config_trait)),
     );
     let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
-    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
-        FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
-    );
+    let user_data_impl = Arc::new(FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::clone(&config_trait),
+    ));
+    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = user_data_impl.clone();
     // Live TV. Built after `users` (EnabledUsers needs the user manager) and
     // kept concrete: the DTO service the channel/programme projections need is
     // built later — it consumes the media-source manager, which consumes this
@@ -917,20 +919,23 @@ pub async fn build_app_state(
         Arc::clone(&config_trait),
         metadata_library.clone(),
     ));
+    let nfo_saver = Arc::new(
+        ferrofin_providers::nfo_save::NfoSaver::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&people_repository),
+            Arc::clone(&media_stream_repository),
+            Arc::clone(&virtual_folders),
+            Arc::clone(&config_trait),
+        )
+        .with_users(Arc::clone(&users), Arc::clone(&user_data)),
+    );
+    let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
+    user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
-            .with_nfo_saver(Arc::new(
-                ferrofin_providers::nfo_save::NfoSaver::new(
-                    Arc::clone(&item_repository),
-                    Arc::clone(&item_persistence_service),
-                    Arc::clone(&people_repository),
-                    Arc::clone(&media_stream_repository),
-                    Arc::clone(&virtual_folders),
-                    Arc::clone(&config_trait),
-                )
-                .with_users(Arc::clone(&users), Arc::clone(&user_data)),
-            ))
+            .with_nfo_saver(Arc::clone(&nfo_saver))
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),

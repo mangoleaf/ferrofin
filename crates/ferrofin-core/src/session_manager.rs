@@ -1242,7 +1242,12 @@ impl SessionManager for FerrofinSessionManager {
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
-                    .update_play_state(user_id, info.item_id, info.position_ticks)
+                    .update_play_state_with_reason(
+                        user_id,
+                        info.item_id,
+                        info.position_ticks,
+                        ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
+                    )
                     .await?;
                 self.push_user_data_changed(user_id, info.item_id).await;
             }

@@ -1374,11 +1374,24 @@ pub trait UserManager: Send + Sync {
 
 fn _assert_object_safe_user_manager(_: &dyn UserManager) {}
 
+/// Observes a committed user-data write with its pinned save reason.
+/// The NFO consumer subscribes weakly so it may retain the user-data manager.
+#[async_trait]
+pub trait UserDataSaveListener: Send + Sync {
+    /// Handles a successfully persisted write. Listener failures must not undo it.
+    async fn user_data_saved(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError>;
+}
+
 /// Reads and writes per-user, per-item playback/rating data.
 ///
 /// Port of `IUserDataManager`. User/item arguments become [`Uuid`] identities;
-/// results are the [`UserItemDataDto`] presentation DTO. The C# `event
-/// UserDataSaved` is dropped (events are wired separately in `ferrofin-core`).
+/// results are the [`UserItemDataDto`] presentation DTO. The committed-write
+/// listener carries the source `UserDataSaved` reason to its NFO consumer.
 #[async_trait]
 pub trait UserDataManager: Send + Sync {
     /// Saves user data supplied as an update DTO.
@@ -1388,6 +1401,19 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
         user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError>;
+
+    /// Saves user data with the caller's source event reason.
+    /// The default preserves compatibility with implementations without listeners.
+    async fn save_user_data_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &UpdateUserItemDataDto,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        let _ = reason;
+        self.save_user_data(user_id, item_id, user_data).await
+    }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
     async fn get_user_data_dto(
@@ -1492,6 +1518,19 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
         reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError>;
+
+    /// Updates play state with PlaybackProgress or PlaybackFinished preserved.
+    async fn update_play_state_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<bool, ServiceError> {
+        let _ = reason;
+        self.update_play_state(user_id, item_id, reported_position_ticks)
+            .await
+    }
 
     /// Records that playback of an item just started for a user.
     ///

@@ -364,22 +364,62 @@ impl NfoSaver {
         row: &BaseItemEntity,
         options: &XbmcMetadataOptions,
     ) -> Result<Option<ferrofin_model::dto::UserItemDataDto>, ServiceError> {
-        if row.is_folder {
-            return Ok(None);
-        }
-        let Some(user) = options
+        let Some(selected) = options
             .user_id
             .as_deref()
-            .and_then(|user| Uuid::parse_str(user).ok())
+            .filter(|selected| !selected.trim().is_empty())
         else {
             return Ok(None);
         };
+        // Source Guid.Parse throws for a malformed nonempty selection. Failing
+        // before atomic replacement preserves the existing user export rather
+        // than silently replacing it with a document that drops those fields.
+        let user = ferrofin_util::guid_extensions::parse_dotnet_guid(selected)
+            .ok_or_else(|| ServiceError::invalid_input("invalid NFO UserId selection"))?;
+        // Pinned UserManager.GetUserById throws for Guid.Empty, before the
+        // folder guard. It is a failing selection, not an unknown user.
+        if user.is_nil() {
+            return Err(ServiceError::invalid_input("NFO UserId cannot be empty"));
+        }
         let Some((users, data)) = &self.users else {
             return Ok(None);
         };
-        if users.get_user_by_id(user).await?.is_none() {
+        if users.get_user_by_id(user).await?.is_none() || row.is_folder {
             return Ok(None);
         }
         data.get_user_data_dto(id, user).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::UserDataSaveListener for NfoSaver {
+    async fn user_data_saved(
+        &self,
+        _user_id: Uuid,
+        item_id: Uuid,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::entities::UserDataSaveReason;
+        // Pinned NfoUserDataSaver observes these three reasons from any user;
+        // the writer still exports the configured selected user's data.
+        if !matches!(
+            reason,
+            UserDataSaveReason::PlaybackFinished
+                | UserDataSaveReason::TogglePlayed
+                | UserDataSaveReason::UpdateUserRating
+        ) {
+            return Ok(());
+        }
+        let options = self.options().await?;
+        if options
+            .user_id
+            .as_deref()
+            .is_none_or(|selected| selected.trim().is_empty())
+        {
+            return Ok(());
+        }
+        // Save applies live owning-library saver selection and the source
+        // filesystem/local-metadata eligibility before writing Nfo alone.
+        self.save(item_id, ItemUpdateType::MetadataDownload).await
     }
 }

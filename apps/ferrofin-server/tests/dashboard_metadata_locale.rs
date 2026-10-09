@@ -484,6 +484,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     }
     verify_movie_image_options(&api, library, &mut options, id).await;
     verify_nfo_savers(&api, library, &mut options, id, &media).await;
+    verify_selected_nfo_user(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
@@ -1684,6 +1685,474 @@ async fn verify_subtitle_destinations(
         expected_paths.len(),
         "failed uploads must not append a stream: {item}"
     );
+}
+
+async fn nfo_delete(api: &Api, route: &str) {
+    api.client
+        .delete(format!("{}{route}", api.base))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+}
+
+async fn await_nfo_contents(path: &std::path::Path, predicate: impl Fn(&str) -> bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let xml = std::fs::read_to_string(path).unwrap();
+        if predicate(&xml) {
+            return xml;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "user-data mutation did not update the NFO: {xml}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// No item metadata edit occurs between these mutations and their sidecar
+// assertions. Generic UserData updates/start/progress intentionally do not
+// trigger the pinned hosted saver; rating/played/finished events do.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn verify_nfo_user_data_notifications(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    user_a: &str,
+    user_b: &str,
+    nfo: &std::path::Path,
+    configuration: &mut Value,
+) {
+    configuration["UserId"] = json!(user_a);
+    api.post("/System/Configuration/xbmcmetadata", configuration)
+        .await;
+    let baseline = std::fs::read_to_string(nfo).unwrap();
+    let before_invalid_rating = api
+        .get(&format!("/UserItems/{id}/UserData?userId={user_a}"))
+        .await;
+    let invalid = api
+        .client
+        .post(format!(
+            "{}/UserItems/{id}/UserData?userId={user_a}",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .json(&json!({"Rating":11.0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        api.get(&format!("/UserItems/{id}/UserData?userId={user_a}"))
+            .await,
+        before_invalid_rating
+    );
+    api.post(
+        &format!("/UserItems/{id}/UserData?userId={user_a}"),
+        &json!({"PlayCount":11,"Rating":6.5,"Played":false,"PlaybackPositionTicks":300_000_000}),
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(nfo).unwrap(),
+        baseline,
+        "UpdateUserData does not trigger an automatic export"
+    );
+    nfo_delete(api, &format!("/UserFavoriteItems/{id}?userId={user_a}")).await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<playcount>11</playcount>")
+            && xml.contains("<isuserfavorite>false</isuserfavorite>")
+            && xml.contains("<userrating>6.5</userrating>")
+            && xml.contains("<position>30</position>")
+    })
+    .await;
+    for (likes, rating) in [(true, "10"), (false, "1")] {
+        api.post(
+            &format!("/UserItems/{id}/Rating?userId={user_a}&likes={likes}"),
+            &Value::Null,
+        )
+        .await;
+        await_nfo_contents(nfo, |xml| {
+            xml.contains(&format!("<userrating>{rating}</userrating>"))
+        })
+        .await;
+    }
+    nfo_delete(api, &format!("/UserItems/{id}/Rating?userId={user_a}")).await;
+    await_nfo_contents(nfo, |xml| !xml.contains("<userrating>")).await;
+    api.post(
+        &format!("/UserPlayedItems/{id}?userId={user_a}&datePlayed=2022-03-04T05%3A06%3A07Z"),
+        &Value::Null,
+    )
+    .await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<watched>true</watched>")
+            && xml.contains("<playcount>12</playcount>")
+            && xml.contains("<lastplayed>2022-03-04 05:06:07</lastplayed>")
+            && xml.contains("<position>0</position>")
+    })
+    .await;
+    nfo_delete(api, &format!("/UserPlayedItems/{id}?userId={user_a}")).await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<watched>false</watched>")
+            && xml.contains("<playcount>0</playcount>")
+            && !xml.contains("<lastplayed>")
+    })
+    .await;
+    // Events from another user still export the configured hidden/disabled user.
+    configuration["UserId"] = json!(user_b);
+    api.post("/System/Configuration/xbmcmetadata", configuration)
+        .await;
+    api.post(
+        &format!("/UserFavoriteItems/{id}?userId={user_a}"),
+        &Value::Null,
+    )
+    .await;
+    let selected_b = await_nfo_contents(nfo, |xml| {
+        xml.contains("<playcount>2</playcount>") && xml.contains("<userrating>2.5</userrating>")
+    })
+    .await;
+    configuration["UserId"] = json!(" \t\r\n");
+    api.post("/System/Configuration/xbmcmetadata", configuration)
+        .await;
+    api.post(
+        &format!("/UserItems/{id}/Rating?userId={user_a}&likes=true"),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(nfo).unwrap(),
+        selected_b,
+        "a blank live selection disables the notification consumer"
+    );
+    configuration["UserId"] = json!(user_a);
+    api.post("/System/Configuration/xbmcmetadata", configuration)
+        .await;
+    options["MetadataSavers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    nfo_delete(api, &format!("/UserFavoriteItems/{id}?userId={user_a}")).await;
+    assert_eq!(
+        std::fs::read_to_string(nfo).unwrap(),
+        selected_b,
+        "the event still honors the live owning-library saver selection"
+    );
+    options["MetadataSavers"] = json!(["Nfo"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    api.post(
+        &format!("/UserFavoriteItems/{id}?userId={user_a}"),
+        &Value::Null,
+    )
+    .await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<isuserfavorite>true</isuserfavorite>")
+            && xml.contains("<playcount>0</playcount>")
+    })
+    .await;
+    // The authenticated admin's playback supplies a real finished event. Start
+    // and progress may persist state but must leave the previous NFO untouched.
+    let admin = api.get("/Users/Me").await["Id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    configuration["UserId"] = json!(admin);
+    api.post("/System/Configuration/xbmcmetadata", configuration)
+        .await;
+    let prior_playback = std::fs::read_to_string(nfo).unwrap();
+    let runtime = api.get(&format!("/Items/{id}")).await["RunTimeTicks"]
+        .as_i64()
+        .unwrap_or_default();
+    api.post("/Sessions/Playing", &json!({"ItemId":id,"MediaSourceId":id,"PlayMethod":"DirectPlay","PositionTicks":0,"CanSeek":true})).await;
+    assert_eq!(
+        std::fs::read_to_string(nfo).unwrap(),
+        prior_playback,
+        "PlaybackStart is not an NFO save reason"
+    );
+    api.post("/Sessions/Playing/Progress", &json!({"ItemId":id,"MediaSourceId":id,"PlayMethod":"DirectPlay","PositionTicks":runtime / 2,"IsPaused":false})).await;
+    assert_eq!(
+        std::fs::read_to_string(nfo).unwrap(),
+        prior_playback,
+        "PlaybackProgress is not an NFO save reason"
+    );
+    api.post(
+        "/Sessions/Playing/Stopped",
+        &json!({"ItemId":id,"MediaSourceId":id,"PositionTicks":runtime / 2,"Failed":false}),
+    )
+    .await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<playcount>1</playcount>")
+            && xml.contains("<isuserfavorite>false</isuserfavorite>")
+    })
+    .await;
+    let finished = std::fs::read_to_string(nfo).unwrap();
+    api.post("/Sessions/Playing", &json!({"ItemId":id,"MediaSourceId":id,"PlayMethod":"DirectPlay","PositionTicks":0,"CanSeek":true})).await;
+    assert_eq!(std::fs::read_to_string(nfo).unwrap(), finished);
+    api.post(
+        "/Sessions/Playing/Stopped",
+        &json!({"ItemId":id,"MediaSourceId":id,"Failed":false}),
+    )
+    .await;
+    await_nfo_contents(nfo, |xml| {
+        xml.contains("<playcount>3</playcount>")
+            && xml.contains("<watched>true</watched>")
+            && xml.contains("<position>0</position>")
+    })
+    .await;
+    // Detached saver failures are proven with a held/erroring core listener
+    // and the native fixture's actual error receipt. Restoring a blocked NFO
+    // immediately after HTTP would race the source async-void consumer.
+}
+
+// Named UserId is an export selection. The normal pinned NFO provider parses
+// into an empty-ID temporary item, so its watched/playcount/lastplayed imports
+// cannot persist into the real item's user data.
+#[allow(clippy::too_many_lines)]
+async fn verify_selected_nfo_user(
+    api: &Api,
+    library: &Value,
+    options: &mut Value,
+    id: &str,
+    media: &std::path::Path,
+) {
+    let original_options = options.clone();
+    let original_nfo_options = api.get("/System/Configuration/xbmcmetadata").await;
+    options["MetadataSavers"] = json!(["Nfo"]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    for name in ["NFO selected A", "NFO selected B"] {
+        api.post("/Users/New", &json!({"Name":name})).await;
+    }
+    let users = api.get("/Users").await;
+    let user_a = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["Name"] == "NFO selected A")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let user_b = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["Name"] == "NFO selected B")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    api.post(&format!("/UserItems/{id}/UserData?userId={user_a}"), &json!({"IsFavorite":true,"Rating":8.5,"Played":true,"PlayCount":7,"PlaybackPositionTicks":42_000_000,"LastPlayedDate":"2020-01-02T03:04:05Z"})).await;
+    api.post(
+        &format!("/UserItems/{id}/UserData?userId={user_b}"),
+        &json!({"IsFavorite":false,"Rating":2.5,"Played":false,"PlayCount":2}),
+    )
+    .await;
+    let original_user_b_policy = api.get(&format!("/Users/{user_b}")).await["Policy"].clone();
+    let mut policy = original_user_b_policy.clone();
+    policy["IsHidden"] = json!(true);
+    policy["IsDisabled"] = json!(true);
+    policy["EnableAllFolders"] = json!(false);
+    policy["EnabledFolders"] = json!([]);
+    api.post(&format!("/Users/{user_b}/Policy"), &policy).await;
+    let nfo = media.join("movie.nfo");
+    let mut item = api.get(&format!("/Items/{id}")).await;
+    let mut configuration = original_nfo_options.clone();
+    let guid = uuid::Uuid::parse_str(user_a).unwrap();
+    let (first, second, third, bytes) = guid.as_fields();
+    let hex_bytes = bytes
+        .iter()
+        .map(|byte| format!("0x{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let hex_guid = format!("{{0x{first:08x},0x{second:04x},0x{third:04x},{{{hex_bytes}}}}}");
+    for (index, (selected, count, favorite)) in [
+        (user_a.to_owned(), 7, "true"),
+        (user_b.to_owned(), 2, "false"),
+        (user_a.to_owned(), 7, "true"),
+        (format!("\u{0085} \t{user_a}\r\n"), 7, "true"),
+        (guid.simple().to_string(), 7, "true"),
+        (format!("{{{guid}}}"), 7, "true"),
+        (format!("({guid})"), 7, "true"),
+        (hex_guid, 7, "true"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        configuration["UserId"] = json!(selected);
+        api.post("/System/Configuration/xbmcmetadata", &configuration)
+            .await;
+        item["Name"] = json!(format!("NFO user selection {index}"));
+        api.post(&format!("/Items/{id}"), &item).await;
+        let xml = std::fs::read_to_string(&nfo).unwrap();
+        assert!(
+            xml.contains(&format!("<playcount>{count}</playcount>")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&format!("<isuserfavorite>{favorite}</isuserfavorite>")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&format!("<watched>{favorite}</watched>")),
+            "{xml}"
+        );
+        let (rating, position) = if count == 7 {
+            ("8.5", "4.2")
+        } else {
+            ("2.5", "0")
+        };
+        assert!(
+            xml.contains(&format!("<userrating>{rating}</userrating>")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&format!("<position>{position}</position>")),
+            "{xml}"
+        );
+        let total: f64 = xml
+            .split("<total>")
+            .nth(1)
+            .unwrap()
+            .split("</total>")
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let runtime = item["RunTimeTicks"].as_f64().unwrap_or_default();
+        assert!((total - runtime / 10_000_000.0).abs() < 1e-9, "{xml}");
+        if count == 7 {
+            assert!(
+                xml.contains("<lastplayed>2020-01-02 03:04:05</lastplayed>"),
+                "{xml}"
+            );
+        } else {
+            assert!(
+                !xml.contains("<lastplayed>"),
+                "the preceding selected user's date must be removed: {xml}"
+            );
+        }
+    }
+    verify_nfo_user_data_notifications(
+        api,
+        library,
+        options,
+        id,
+        user_a,
+        user_b,
+        &nfo,
+        &mut configuration,
+    )
+    .await;
+    let saved = std::fs::read_to_string(&nfo).unwrap();
+    for selected in [
+        "invalid-user-id".to_owned(),
+        format!("urn:uuid:{guid}"),
+        uuid::Uuid::nil().to_string(),
+    ] {
+        configuration["UserId"] = json!(selected);
+        api.post("/System/Configuration/xbmcmetadata", &configuration)
+            .await;
+        item["Name"] = json!(format!(
+            "Metadata edit survives failing selection {selected}"
+        ));
+        api.post(&format!("/Items/{id}"), &item).await;
+        assert_eq!(api.get(&format!("/Items/{id}")).await["Name"], item["Name"]);
+        assert_eq!(
+            std::fs::read_to_string(&nfo).unwrap(),
+            saved,
+            "failing selection must preserve the complete existing NFO"
+        );
+    }
+    for selected in [
+        "",
+        " \t\u{0085}\u{00a0}\r\n",
+        "00000000-0000-0000-0000-000000000001",
+    ] {
+        configuration["UserId"] = json!(selected);
+        api.post("/System/Configuration/xbmcmetadata", &configuration)
+            .await;
+        api.post(&format!("/Items/{id}"), &item).await;
+        let xml = std::fs::read_to_string(&nfo).unwrap();
+        for field in [
+            "playcount",
+            "isuserfavorite",
+            "watched",
+            "userrating",
+            "lastplayed",
+            "resume",
+        ] {
+            assert!(
+                !xml.contains(&format!("<{field}>")),
+                "no user export for absent/unknown selection: {xml}"
+            );
+        }
+    }
+    // Restore B's access before its user-scoped API snapshots: the export
+    // intentionally bypasses visibility, while these API reads do not.
+    api.post(&format!("/Users/{user_b}/Policy"), &original_user_b_policy)
+        .await;
+    // Preserve both real users while a deliberately conflicting sidecar is
+    // imported through the actual metadata refresh and local reader.
+    configuration["UserId"] = json!(user_a);
+    api.post("/System/Configuration/xbmcmetadata", &configuration)
+        .await;
+    let a = api
+        .get(&format!("/UserItems/{id}/UserData?userId={user_a}"))
+        .await;
+    let b = api
+        .get(&format!("/UserItems/{id}/UserData?userId={user_b}"))
+        .await;
+    options["MetadataSavers"] = json!([]);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    item["LockData"] = json!(false);
+    api.post(&format!("/Items/{id}"), &item).await;
+    std::fs::write(&nfo, "<movie><title>NFO import probe</title><isuserfavorite>false</isuserfavorite><userrating>1</userrating><resume><position>999</position><total>999</total></resume><watched>false</watched><playcount>99</playcount><lastplayed>2025-06-07 08:09:10</lastplayed></movie>").unwrap();
+    let previous = api.get(&format!("/Items/{id}")).await["Etag"].clone();
+    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"), &Value::Null).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = api.get(&format!("/Items/{id}")).await;
+        if current["Etag"] != previous && current["Name"] == "NFO import probe" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "NFO import must apply the actual title before checking unchanged user data"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        api.get(&format!("/UserItems/{id}/UserData?userId={user_a}"))
+            .await,
+        a
+    );
+    assert_eq!(
+        api.get(&format!("/UserItems/{id}/UserData?userId={user_b}"))
+            .await,
+        b
+    );
+    api.post("/System/Configuration/xbmcmetadata", &original_nfo_options)
+        .await;
+    *options = original_options;
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
 }
 
 /// A language-only save reaches an existing inherited item without restarting.
