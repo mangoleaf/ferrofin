@@ -68,7 +68,7 @@ pinned upstream revision; the pins and the full delta live in
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
-| **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Chromaprint audio-fingerprint intro/credit detection, exposed as media segments |
+| **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
 
@@ -76,8 +76,9 @@ pinned upstream revision; the pins and the full delta live in
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
 internal `OwnerId`/`LinkedAlternateVersions` machinery, which is representation, not API
 surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpeg is built with
-that muxer), falling back to `fpcalc`, and reports unavailable when neither exists. The precise
-per-plugin list is in [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+that muxer), falling back to `fpcalc`; without either, the analyzers that need no fingerprint
+(chapters, black frames) still run. The precise per-plugin list is in
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
 
 ## Adding an extension
 
