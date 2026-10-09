@@ -43,6 +43,7 @@ use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
+use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -66,14 +67,17 @@ const IMPORT_STRING: &str = r#"@import url("https://cdn.jsdelivr.net/gh/intro-sk
 // Mode ↔ segment-type ↔ name helpers
 // ---------------------------------------------------------------------------
 
-/// Whether a stored item `type_` names an Episode or Movie — the item kinds the
-/// plugin's timestamp routes accept. The persisted value is the full CLR type
-/// name (e.g. `MediaBrowser.Controller.Entities.TV.Episode`), so match its last
-/// dotted segment.
-fn is_episode_or_movie(type_name: &str) -> bool {
+/// The kind a stored item names (its full CLR type name).
+fn kind_of(item: &BaseItemEntity) -> Option<BaseItemKind> {
+    BaseItemKind::from_stored_type_name(&item.type_)
+}
+
+/// Whether an item is an Episode or Movie — the kinds the plugin's timestamp
+/// routes accept.
+fn is_episode_or_movie(item: &BaseItemEntity) -> bool {
     matches!(
-        type_name.rsplit('.').next().unwrap_or(type_name),
-        "Episode" | "Movie"
+        kind_of(item),
+        Some(BaseItemKind::Episode | BaseItemKind::Movie)
     )
 }
 
@@ -187,45 +191,17 @@ struct EraseSeasonQuery {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Reads the extension's `SkipbuttonHideDelay` config value (defaults to 8s).
-async fn skip_hide_delay(state: &AppState) -> u64 {
-    let bytes = state
-        .plugins
-        .get_plugin_configuration(INTRO_SKIPPER_ID)
-        .await
-        .unwrap_or_default();
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| {
-            v.get("SkipbuttonHideDelay")
-                .and_then(serde_json::Value::as_u64)
-        })
-        .unwrap_or(8)
-}
-
-/// The plugin's `UpdateMediaSegments` setting (default on): whether a change to
-/// its segment tier is published to `MediaSegments` right away.
-async fn update_media_segments(state: &AppState) -> bool {
-    let bytes = state
-        .plugins
-        .get_plugin_configuration(INTRO_SKIPPER_ID)
-        .await
-        .unwrap_or_default();
-    serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|v| {
-            v.get("UpdateMediaSegments")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(true)
-}
-
 /// Publishes `items`' segments when `UpdateMediaSegments` is on
 /// (`MediaSegmentRefreshService.RefreshAsync`, `suppressErrors: true`: a
 /// failure is logged and the request still succeeds — the tier already
 /// changed, and the next refresh repairs the published rows).
 async fn publish(state: &AppState, items: &[Uuid]) {
-    if update_media_segments(state).await {
+    if state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .update_media_segments
+    {
         for &item_id in items {
             if let Err(err) = intro_store::refresh(
                 state.intro_skipper.as_ref(),
@@ -301,7 +277,7 @@ async fn update_timestamps(
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
     };
-    if !is_episode_or_movie(&item.type_) {
+    if !is_episode_or_movie(&item) {
         return Err(ApiError::NotFound(format!(
             "item {id} is not an episode/movie"
         )));
@@ -346,7 +322,7 @@ async fn get_timestamps(
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
     };
-    if !is_episode_or_movie(&item.type_) {
+    if !is_episode_or_movie(&item) {
         return Err(ApiError::NotFound(format!(
             "item {id} is not an episode/movie"
         )));
@@ -400,7 +376,12 @@ async fn erase_timestamps(
             .erase_cache(None, Some(mode))
             .await?;
     }
-    if update_media_segments(&state).await {
+    if state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .update_media_segments
+    {
         state
             .media_segments
             .delete_all_provider_segments(&intro_store::provider_id(), Some(kind))
@@ -444,9 +425,7 @@ async fn segment_editor_metadata(
 /// plugin's provider id — replacing the item's other segments of that type
 /// (any provider), or, for a Commercial, skipping an identical one. The
 /// `providerId` query is `[Required]` (400 when absent) but not used for the
-/// write. Upstream serialises concurrent edits of one item with a per-item
-/// lock; Ferrofin does not, so two simultaneous POSTs of one type can both
-/// publish (the next refresh collapses them).
+/// write.
 async fn create_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -477,8 +456,37 @@ async fn create_segment(
             config_hash: String::new(),
         })
         .await?;
-    let existing = state
-        .media_segments
+    publish_edit(state.media_segments.as_ref(), item_id, &segment).await?;
+    Ok(StatusCode::OK)
+}
+
+/// `MediaSegmentEditorService._itemLocks`: one lock per edited item, kept for
+/// the process's lifetime.
+// ponytail: never evicted, as upstream ("re-add eviction if touched item count
+// becomes measurable") — one small entry per item ever edited by hand.
+fn item_lock(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut locks = LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(locks.entry(item_id).or_default())
+}
+
+/// `MediaSegmentEditorService.CreateOrReplaceSegmentAsync`, under the item's
+/// lock so two simultaneous edits publish one segment: a Commercial identical
+/// to one already published is skipped; any other type replaces the item's
+/// segments of that type (any provider); then the edit is published under the
+/// plugin's provider id.
+async fn publish_edit(
+    segments: &dyn MediaSegmentManager,
+    item_id: Uuid,
+    segment: &SegmentInput,
+) -> Result<(), ApiError> {
+    let lock = item_lock(item_id);
+    let _held = lock.lock().await;
+    let existing = segments
         .get_segments(item_id, Some(&[segment.type_]), false)
         .await?;
     if segment.type_ == MediaSegmentType::Commercial {
@@ -486,12 +494,12 @@ async fn create_segment(
             .iter()
             .any(|e| e.start_ticks == segment.start_ticks && e.end_ticks == segment.end_ticks)
         {
-            return Ok(StatusCode::OK);
+            return Ok(());
         }
     } else {
         for e in existing {
             // Upstream logs a failed delete and carries on with the others.
-            if let Err(err) = state.media_segments.delete_segment(e.id).await {
+            if let Err(err) = segments.delete_segment(e.id).await {
                 tracing::warn!(%err, segment_id = %e.id, "intro skipper: could not delete a replaced segment");
             }
         }
@@ -503,11 +511,10 @@ async fn create_segment(
         start_ticks: segment.start_ticks,
         end_ticks: segment.end_ticks,
     };
-    state
-        .media_segments
+    segments
         .create_segment(&dto, &intro_store::provider_id())
         .await?;
-    Ok(StatusCode::OK)
+    Ok(())
 }
 
 /// Query for `DELETE /MediaSegmentsApi/{segmentId}` (both `[Required]`).
@@ -596,7 +603,7 @@ async fn delete_segment(
         .get_item_by_id(item_id)
         .await?
         .and_then(|item| {
-            (item.type_.rsplit('.').next() == Some("Episode"))
+            (kind_of(&item) == Some(BaseItemKind::Episode))
                 .then(|| {
                     item.season_id
                         .as_deref()
@@ -711,7 +718,11 @@ async fn inject_css(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
-    let delay = skip_hide_delay(&state).await;
+    let delay = state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .skip_button_hide_delay;
     let mut branding = state.config.get_branding().await?;
     let mut css = branding.custom_css.clone().unwrap_or_default();
     let mut modified = false;
@@ -738,7 +749,11 @@ async fn update_skip_duration(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
-    let delay = skip_hide_delay(&state).await;
+    let delay = state
+        .intro_skipper_analysis
+        .settings()
+        .await
+        .skip_button_hide_delay;
     let mut branding = state.config.get_branding().await?;
     let css = branding.custom_css.clone().unwrap_or_default();
     if find_skip_duration_span(&css).is_none() {
@@ -953,7 +968,7 @@ async fn erase_movie(
         .library
         .get_item_by_id(movie_id)
         .await?
-        .is_some_and(|item| item.type_.rsplit('.').next() == Some("Movie"));
+        .is_some_and(|item| kind_of(&item) == Some(BaseItemKind::Movie));
     if !is_movie {
         return Err(ApiError::NotFound(format!("movie {movie_id}")));
     }
@@ -1029,7 +1044,7 @@ async fn update_disabled_episode(
         .get_item_by_id(request.episode_id)
         .await?
         .is_some_and(|item| {
-            item.type_.rsplit('.').next() == Some("Episode")
+            kind_of(&item) == Some(BaseItemKind::Episode)
                 && item
                     .season_id
                     .as_deref()
@@ -1099,14 +1114,20 @@ async fn clear_excluded_timestamps(
 /// Port of `VisualizationController.GetAnalyzerAction` →
 /// `Plugin.GetAllAnalyzerActionsAsync`: every mode in declaration order, the
 /// stored action or `Default`. Elevated, as the whole controller is upstream.
-/// 404 unless the id is a season with episodes — upstream's
-/// `QueuedMediaItems.ContainsKey`, the queue `season_episodes` mirrors.
+/// 404 unless the id is a season with episodes or a movie — upstream's
+/// `QueuedMediaItems.ContainsKey`, whose queue keys a movie by its own id.
 async fn get_analyzer_actions(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Path(season_id): Path<Uuid>,
 ) -> Result<Json<std::collections::BTreeMap<AnalysisMode, AnalyzerAction>>, ApiError> {
-    if season_episodes(&state, season_id).await?.is_empty() {
+    if season_episodes(&state, season_id).await?.is_empty()
+        && !state
+            .library
+            .get_item_by_id(season_id)
+            .await?
+            .is_some_and(|item| kind_of(&item) == Some(BaseItemKind::Movie))
+    {
         return Err(ApiError::NotFound(format!("season {season_id}")));
     }
     let stored = state.intro_skipper.analyzer_actions(season_id).await?;
@@ -1159,6 +1180,7 @@ async fn update_analyzer_actions(
 /// Port of `VisualizationController.ScanSeason`: 409 when a pass is already
 /// running; otherwise, in the background, the season's segments and cache are
 /// erased and only that season is analysed again (202).
+/// 404 while the plugin is disabled, as the route of an unloaded plugin.
 async fn scan_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
@@ -1326,6 +1348,22 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn items_are_told_apart_by_their_stored_type_name() {
+        use ferrofin_model::data::BaseItemKind;
+        let item = |kind: BaseItemKind| BaseItemEntity {
+            type_: kind.stored_type_name().expect("stored name").to_owned(),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(
+            super::kind_of(&item(BaseItemKind::Movie)),
+            Some(BaseItemKind::Movie)
+        );
+        assert!(super::is_episode_or_movie(&item(BaseItemKind::Episode)));
+        assert!(super::is_episode_or_movie(&item(BaseItemKind::Movie)));
+        assert!(!super::is_episode_or_movie(&item(BaseItemKind::Season)));
+    }
+
+    #[test]
     fn episode_visualizations_drop_rows_whose_id_is_not_a_guid() {
         let good = Uuid::from_u128(0x5EA5);
         let episodes = vec![
@@ -1472,5 +1510,105 @@ mod numeric_contract_tests {
             ),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_lock_tests {
+    use super::{SegmentInput, publish_edit};
+    use async_trait::async_trait;
+    use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProviderInfo};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    /// Segments in memory; each read yields after taking its snapshot, as a
+    /// real store awaits there, so a concurrent edit reads the same snapshot.
+    #[derive(Default)]
+    struct YieldingSegments(Mutex<Vec<MediaSegmentDto>>);
+
+    #[async_trait]
+    impl MediaSegmentManager for YieldingSegments {
+        async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn create_segment(
+            &self,
+            segment: &MediaSegmentDto,
+            _provider: &str,
+        ) -> Result<MediaSegmentDto, ServiceError> {
+            let mut rows = self.0.lock().expect("lock");
+            let created = MediaSegmentDto {
+                id: Uuid::from_u128(rows.len() as u128 + 1),
+                ..segment.clone()
+            };
+            rows.push(created.clone());
+            Ok(created)
+        }
+        async fn delete_segment(&self, segment_id: Uuid) -> Result<(), ServiceError> {
+            self.0.lock().expect("lock").retain(|s| s.id != segment_id);
+            Ok(())
+        }
+        async fn delete_segments(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn delete_provider_segments(
+            &self,
+            _item_id: Uuid,
+            _provider_id: &str,
+            _type_filter: Option<MediaSegmentType>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_segments(
+            &self,
+            item_id: Uuid,
+            types: Option<&[MediaSegmentType]>,
+            _by_provider: bool,
+        ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+            let found = self
+                .0
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|s| s.item_id == item_id && types.is_none_or(|t| t.contains(&s.type_)))
+                .cloned()
+                .collect();
+            tokio::task::yield_now().await;
+            Ok(found)
+        }
+        async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(false)
+        }
+        async fn get_supported_providers(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `MediaSegmentEditorService`'s per-item lock: two simultaneous edits of
+    /// one item's Intro publish one segment, the later one.
+    #[tokio::test]
+    async fn simultaneous_edits_of_an_item_publish_one_segment() {
+        let segments = Arc::new(YieldingSegments::default());
+        let item = Uuid::from_u128(0x5d);
+        let edit = |end_ticks| SegmentInput {
+            type_: MediaSegmentType::Intro,
+            start_ticks: 0,
+            end_ticks,
+        };
+        let (first, second) = (edit(10), edit(20));
+        let (a, b) = tokio::join!(
+            publish_edit(segments.as_ref(), item, &first),
+            publish_edit(segments.as_ref(), item, &second),
+        );
+        a.expect("first");
+        b.expect("second");
+        let rows = segments.0.lock().expect("lock").clone();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].end_ticks, 20);
     }
 }

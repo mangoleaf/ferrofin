@@ -114,6 +114,7 @@ pub(super) async fn build(
         .await?;
     let mut queue = QueueBuilder {
         queue: Vec::new(),
+        positions: HashMap::new(),
         anime: HashMap::new(),
     };
     let mut seen = HashSet::new();
@@ -213,17 +214,19 @@ fn aired_season_number(item: &BaseItemEntity) -> Option<i64> {
 /// The queue under construction, with the anime lookups it caches per series.
 struct QueueBuilder {
     queue: Queue,
+    /// Each season's index in `queue`, so a large library's queue builds in
+    /// linear time (the queue keeps upstream's insertion order).
+    positions: HashMap<Uuid, usize>,
     anime: HashMap<Uuid, bool>,
 }
 
 impl QueueBuilder {
     fn season(&mut self, id: Uuid) -> &mut Vec<QueuedEpisode> {
-        let index = if let Some(index) = self.queue.iter().position(|(key, _)| *key == id) {
-            index
-        } else {
-            self.queue.push((id, Vec::new()));
-            self.queue.len() - 1
-        };
+        let queue = &mut self.queue;
+        let index = *self.positions.entry(id).or_insert_with(|| {
+            queue.push((id, Vec::new()));
+            queue.len() - 1
+        });
         &mut self.queue[index].1
     }
 
@@ -317,8 +320,8 @@ impl QueueBuilder {
         series_id: Uuid,
         season_id: Uuid,
     ) -> Category {
-        if let Some((_, episodes)) = self.queue.iter().find(|(key, _)| *key == season_id)
-            && let Some(first) = episodes.first()
+        if let Some(&index) = self.positions.get(&season_id)
+            && let Some(first) = self.queue[index].1.first()
             && first.category != Category::Movie
         {
             return first.category;

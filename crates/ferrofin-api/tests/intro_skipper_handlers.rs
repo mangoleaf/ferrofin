@@ -393,6 +393,14 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
     async fn support_bundle(&self) -> String {
         String::new()
     }
+    /// The extension's typed settings, as its parse of the plugin config
+    /// above (`SkipbuttonHideDelay` 11) gives them.
+    async fn settings(&self) -> ferrofin_traits::intro_skipper::IntroSkipperSettings {
+        ferrofin_traits::intro_skipper::IntroSkipperSettings {
+            skip_button_hide_delay: 11,
+            ..Default::default()
+        }
+    }
     async fn hides_intros(&self, _item_id: Uuid) -> bool {
         false
     }
@@ -888,14 +896,15 @@ async fn inject_css_writes_import_and_duration_then_updates() {
             started: Mutex::new(Vec::new()),
         }),
         config.clone(),
-    );
+    )
+    .with_intro_skipper_analysis(Arc::new(FakeAnalysis::default()));
 
     // Update-only with no prior injection is a no-op success (nothing to update).
     let (status, _) = send(app.clone(), "POST", "/SkipButtonCss/UpdateSkipDuration", "").await;
     assert_eq!(status, StatusCode::OK);
     assert!(config.branding.lock().unwrap().custom_css.is_none());
 
-    // Inject writes the import + the duration variable (from config's delay=11).
+    // Inject writes the import + the duration variable (the settings' delay, 11).
     let (status, _) = send(app.clone(), "POST", "/SkipButtonCss/InjectCss", "").await;
     assert_eq!(status, StatusCode::OK);
     let css = config.branding.lock().unwrap().custom_css.clone().unwrap();
