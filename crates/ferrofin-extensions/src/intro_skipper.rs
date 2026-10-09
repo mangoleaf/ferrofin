@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::ffmpeg::{FfmpegService, ProcessOptions};
 use crate::fingerprint::Fingerprinter;
 
+mod black_frame;
 mod chapter_analyzer;
 mod config_hash;
 mod engine;
@@ -781,10 +782,10 @@ impl DetectSegmentsTask {
         {
             let path = entry.path();
             // Every detection's cache (`DeleteForItem`/`DeleteByMode`).
-            if path
-                .extension()
-                .is_none_or(|ext| ext != "fp" && ext != SILENCE_CACHE && ext != KEYFRAME_CACHE)
-            {
+            if path.extension().is_none_or(|ext| {
+                !["fp", SILENCE_CACHE, KEYFRAME_CACHE, BLACK_FRAME_CACHE]
+                    .contains(&ext.to_str().unwrap_or_default())
+            }) {
                 continue;
             }
             let name = entry.file_name();
@@ -913,6 +914,38 @@ impl DetectSegmentsTask {
         .await
     }
 
+    /// `DetectBlackFramesAsync(episode, range, minimum, threshold, mode)`:
+    /// the window's frames at least `BlackFrameMinimumPercentage` black, times
+    /// relative to its start. The cache keeps every frame the filter reported,
+    /// as upstream, so the minimum applies on reading.
+    pub(super) async fn black_frames(
+        &self,
+        entry: &queue::QueuedEpisode,
+        mode: WireMode,
+        window: (f64, f64),
+        config: &IntroSkipperConfig,
+    ) -> Result<Vec<crate::ffmpeg::BlackFrame>, String> {
+        let options = ProcessOptions::new(&config.process_priority, config.process_threads);
+        let hash = config_hash::detection_cache(config, config_hash::Detection::BlackFrame(mode));
+        let frames = self
+            .detection_cached(
+                (entry, mode, window),
+                (BLACK_FRAME_CACHE, &hash, config.cache_fingerprints),
+                self.ffmpeg.detect_black_frames(
+                    &entry.path,
+                    window.0,
+                    window.1,
+                    config.black_frame_threshold,
+                    options,
+                ),
+            )
+            .await?;
+        Ok(frames
+            .into_iter()
+            .filter(|f| f.percentage >= config.black_frame_minimum_percentage)
+            .collect())
+    }
+
     /// `DetectKeyFramesAsync` over the window.
     async fn keyframes(
         &self,
@@ -936,6 +969,7 @@ impl DetectSegmentsTask {
 /// The cache-file extensions of the detections besides the prints (`.fp`).
 const SILENCE_CACHE: &str = "silence";
 const KEYFRAME_CACHE: &str = "keyframes";
+const BLACK_FRAME_CACHE: &str = "blackframes";
 
 /// A plugin mode's cache-file tag: its print's for the fingerprinted modes,
 /// so erasing a mode reaches every cache of it.
@@ -1530,8 +1564,8 @@ mod tests {
                 .erase_cache(None, Some(WireMode::Recap))
                 .await
                 .expect("recap"),
-            0,
-            "nothing analysed as a recap"
+            2,
+            "both episodes' recap prints"
         );
         h.task.erase_cache(None, None).await.expect("all");
         assert!(cache_files(&h, EP_A).is_empty() && cache_files(&h, EP_B).is_empty());
@@ -1817,8 +1851,9 @@ mod tests {
         // Silence and keyframes for each episode's intro and credits, over
         // the window around the matched end, with the configured noise and
         // process settings.
-        assert_eq!(ffmpeg.calls.load(Ordering::SeqCst), 8);
         let log = ffmpeg.log.lock().expect("log").clone();
+        let log: Vec<_> = log.into_iter().filter(|c| c.0 != "blackframe").collect();
+        assert_eq!(log.len(), 8, "{log:?}");
         let intro_calls: Vec<_> = log.iter().filter(|c| c.2 < 100.0).collect();
         assert_eq!(intro_calls.len(), 4, "{log:?}");
         for (kind, _, start, end, noise, options) in intro_calls {
@@ -2014,6 +2049,260 @@ mod tests {
             previews(h.actions.segments(EP_B).await.expect("tier")),
             [(1700.0, 1800.0, false)]
         );
+    }
+
+    /// The task over the harness with these ffmpeg detections (and chapters).
+    fn with_ffmpeg(
+        h: &Harness,
+        ffmpeg: crate::ffmpeg::FakeFfmpeg,
+        chapters: Vec<(&'static str, i64)>,
+    ) -> DetectSegmentsTask {
+        DetectSegmentsTask {
+            ffmpeg: Arc::new(ffmpeg),
+            chapters: Arc::new(FakeChapters(chapters)),
+            ..h.task.clone()
+        }
+    }
+
+    async fn segment_of(h: &Harness, id: Uuid, mode: WireMode) -> Option<(f64, f64)> {
+        h.actions
+            .segments(id)
+            .await
+            .expect("tier")
+            .into_iter()
+            .find(|s| s.mode == mode)
+            .map(|s| (s.start, s.end))
+    }
+
+    /// `BlackFrameAnalyzer`: credits on a black card are found by bisection
+    /// (to within a two-second window), or exactly from a chapter that starts
+    /// on black (`UseChapterMarkersBlackFrame`), and stored unadjusted.
+    #[rstest]
+    #[case::bisection(vec![("Episode", 0)], 2.1)]
+    #[case::chapter_marker(vec![("Part A", 0), ("Part B", 1700)], 0.0)]
+    #[tokio::test]
+    async fn credits_on_black_are_found(
+        #[case] chapters: Vec<(&'static str, i64)>,
+        #[case] tolerance: f64,
+    ) {
+        let h = harness(&TWO_EPISODES, true, "{}", false).await;
+        let black = crate::ffmpeg::FakeFfmpeg {
+            black_from: Some(1700.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        };
+        with_ffmpeg(&h, black, chapters)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        for id in [EP_A, EP_B] {
+            let (start, end) = segment_of(&h, id, WireMode::Credits)
+                .await
+                .expect("credits");
+            assert!((1700.0..=1700.0 + tolerance).contains(&start), "{start}");
+            assert_eq!(end, 1800.0);
+        }
+    }
+
+    /// The bisection probes as upstream's `AnalyzeMediaFileAsync`: the first
+    /// episode finds its search start (45, 75, 105 s from the end), bisects,
+    /// and widens its upper bound; the second starts from the first's credits
+    /// (`duration - start + MinimumCreditsDuration`).
+    #[tokio::test]
+    async fn credits_bisection_probes_as_upstream() {
+        let h = harness(&TWO_EPISODES, true, "{}", false).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            black_from: Some(1700.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        task.execute(&TaskProgress::default()).await.expect("run");
+        let probes = |episode: &str| {
+            ffmpeg
+                .log
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|c| c.0 == "blackframe" && c.1.ends_with(episode))
+                .map(|c| c.2)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            probes("s01e01.mkv"),
+            [
+                1754.0, 1724.0, 1694.0, 1710.0, 1702.5, 1698.75, 1689.375, 1695.0625
+            ]
+        );
+        assert_eq!(probes("s01e02.mkv"), [1700.0, 1692.5, 1697.25]);
+        for id in [EP_A, EP_B] {
+            assert_eq!(
+                segment_of(&h, id, WireMode::Credits).await,
+                Some((1700.0, 1800.0))
+            );
+        }
+    }
+
+    /// `TestBlackFrames.TestEndCreditDetection`: a 5:30 episode whose credits
+    /// go black at 300 s, bisected from 240 s from the end, is found within
+    /// 3 s — against the fake, and (`FERROFIN_FFMPEG_TESTS`) a generated clip.
+    #[tokio::test]
+    async fn end_credit_detection() {
+        let h = harness(&TWO_EPISODES, true, "{}", false).await;
+        let config = IntroSkipperConfig {
+            black_frame_minimum_percentage: 85,
+            black_frame_threshold: 32,
+            ..IntroSkipperConfig::default()
+        };
+        let queued = h.task.queue(&config).await.expect("queue");
+        let entry = queue::QueuedEpisode {
+            duration: 330.0,
+            credits_fingerprint_start: 0.0,
+            ..queued[0].1[0].clone()
+        };
+        let fake = with_ffmpeg(
+            &h,
+            crate::ffmpeg::FakeFfmpeg {
+                black_from: Some(300.0),
+                ..crate::ffmpeg::FakeFfmpeg::default()
+            },
+            Vec::new(),
+        );
+        let (start, _) = fake
+            .bisect_credits(&entry, 240.0, &config)
+            .await
+            .expect("bisect")
+            .expect("credits");
+        assert!((297.0..=303.0).contains(&start), "{start}");
+
+        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
+            return;
+        }
+        let clip = h.cache.path().join("credits.mkv");
+        let clip = clip.to_str().expect("utf-8").to_owned();
+        let made = crate::ffmpeg::output(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=32x32:rate=5:duration=300",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=32x32:r=5:d=30",
+                "-filter_complex",
+                "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                "-map",
+                "[v]",
+                "-c:v",
+                "libx264",
+                "-g",
+                "5",
+                &clip,
+            ],
+            ProcessOptions::default(),
+        )
+        .await
+        .expect("ffmpeg");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let real = DetectSegmentsTask {
+            ffmpeg: Arc::new(crate::ffmpeg::Ffmpeg::new("ffmpeg", "ffprobe")),
+            ..h.task.clone()
+        };
+        let entry = queue::QueuedEpisode {
+            path: clip,
+            ..entry
+        };
+        let (start, _) = real
+            .bisect_credits(&entry, 240.0, &config)
+            .await
+            .expect("bisect")
+            .expect("credits");
+        assert!((297.0..=303.0).contains(&start), "{start}");
+    }
+
+    /// Black frames are cached as ffmpeg reported them; the
+    /// `BlackFrameMinimumPercentage` applies on reading, so a changed minimum
+    /// needs no new detection.
+    #[tokio::test]
+    async fn black_frames_are_filtered_on_reading() {
+        let h = harness(&TWO_EPISODES, true, "{}", false).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            black_from: Some(0.0),
+            black_percentage: Some(80),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        let base = IntroSkipperConfig::default();
+        let queued = task.queue(&base).await.expect("queue");
+        let entry = &queued[0].1[0];
+        let read = |minimum| {
+            let config = IntroSkipperConfig {
+                black_frame_minimum_percentage: minimum,
+                ..base.clone()
+            };
+            let task = task.clone();
+            async move {
+                task.black_frames(entry, WireMode::Credits, (10.0, 12.0), &config)
+                    .await
+                    .expect("frames")
+                    .len()
+            }
+        };
+        assert_eq!(read(85).await, 0);
+        assert_eq!(read(75).await, 20);
+        assert_eq!(
+            ffmpeg.calls.load(Ordering::SeqCst),
+            1,
+            "the second read is the cache's"
+        );
+    }
+
+    /// A recap runs from the start to the last black frame before the recap
+    /// detection limit (120 s): from a shared Chromaprint card, or — with
+    /// `DetectRecapUsingBlackFrames` and no Chromaprint — from black frames
+    /// alone. A stored intro bounds it, so one at 0 leaves no recap.
+    #[rstest]
+    #[case::chromaprint_card(r#"{"ScanIntroduction":false}"#, true, Some((0.0, 119.9)))]
+    #[case::black_frames_alone(
+        r#"{"ScanIntroduction":false,"DetectRecapUsingBlackFrames":true}"#,
+        false,
+        Some((0.0, 119.9))
+    )]
+    #[case::before_the_intro("{}", true, None)]
+    #[tokio::test]
+    async fn recaps_end_on_black(
+        #[case] config: &str,
+        #[case] chromaprint: bool,
+        #[case] expected: Option<(f64, f64)>,
+    ) {
+        let h = harness(&TWO_EPISODES, true, config, chromaprint).await;
+        let black = crate::ffmpeg::FakeFfmpeg {
+            black_from: Some(60.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        };
+        with_ffmpeg(&h, black, Vec::new())
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        let recap = segment_of(&h, EP_A, WireMode::Recap).await;
+        match (recap, expected) {
+            (Some((s, e)), Some((xs, xe))) => {
+                assert!((s - xs).abs() < 1e-6 && (e - xe).abs() < 1e-6, "{recap:?}");
+            }
+            (got, want) => assert_eq!(got, want),
+        }
     }
 
     /// `ProbeAudioDuration`: credits end where a shorter audio stream does.
@@ -2248,7 +2537,7 @@ mod tests {
         let h = harness(
             &TWO_EPISODES,
             true,
-            r#"{"ScanIntroduction":false,"ScanCredits":false}"#,
+            r#"{"ScanIntroduction":false,"ScanCredits":false,"ScanRecap":false}"#,
             true,
         )
         .await;

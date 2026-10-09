@@ -225,6 +225,30 @@ pub trait FfmpegService: Send + Sync {
 
     /// `ProbeAudioDurationAsync`: the first audio stream's duration, seconds.
     async fn probe_audio_duration(&self, path: &str, options: ProcessOptions) -> Option<f64>;
+
+    /// `DetectBlackFramesAsync(episode, range, …)`'s detection: every frame
+    /// in `[start, end]` of `path` at least half black under `threshold`,
+    /// with times relative to `start` (the caller keeps those at its own
+    /// minimum percentage).
+    async fn detect_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String>;
+}
+
+/// A frame the `blackframe` filter reported (`BlackFrame`).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BlackFrame {
+    /// How much of the frame is black, percent.
+    pub percentage: i32,
+    /// Its time, seconds.
+    pub time: f64,
+    /// Its frame number.
+    pub frame: i64,
 }
 
 /// The real [`FfmpegService`] over the server's ffmpeg and ffprobe.
@@ -329,6 +353,49 @@ impl FfmpegService for Ffmpeg {
         .ok()?;
         parse_audio_duration(&String::from_utf8_lossy(&out.stdout))
     }
+
+    async fn detect_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String> {
+        let (from, to) = (start.to_string(), (end - start).to_string());
+        let filter = format!("blackframe=amount=50:threshold={threshold}");
+        let out = ffmpeg(
+            &self.ffmpeg,
+            &[
+                "-ss", &from, "-i", path, "-to", &to, "-an", "-dn", "-sn", "-vf", &filter, "-f",
+                "null", "-",
+            ],
+            options,
+        )
+        .await?;
+        Ok(parse_black_frames(&String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// `FFmpegOutputParser`'s black-frame expression, verbatim.
+static BLACK_FRAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[Parsed_blackframe_0 @ [^\]]+\] frame:(\d+) pblack:(\d+) .*? t:([\d.]+)")
+        .expect("black frame regex")
+});
+
+/// `ParseBlackFrames`: one frame per matching line. A number that does not
+/// parse skips its line (upstream's `int.Parse` would throw the result away).
+fn parse_black_frames(raw: &str) -> Vec<BlackFrame> {
+    raw.split('\n')
+        .filter_map(|line| {
+            let found = BLACK_FRAME.captures(line)?;
+            Some(BlackFrame {
+                frame: found[1].parse().ok()?,
+                percentage: found[2].parse().ok()?,
+                time: found[3].parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 /// `FFmpegOutputParser`'s silence expression, verbatim.
@@ -417,6 +484,11 @@ pub(crate) struct FakeFfmpeg {
     pub silences: Vec<(f64, f64)>,
     pub keyframes: Vec<f64>,
     pub audio_duration: Option<f64>,
+    /// Frames are wholly black from this time on (a black credits card),
+    /// one every tenth of a second.
+    pub black_from: Option<f64>,
+    /// How black those frames are (100 when unset).
+    pub black_percentage: Option<i32>,
     pub calls: std::sync::atomic::AtomicUsize,
     pub log: std::sync::Mutex<Vec<FakeCall>>,
 }
@@ -463,6 +535,31 @@ impl FfmpegService for FakeFfmpeg {
 
     async fn probe_audio_duration(&self, _path: &str, _options: ProcessOptions) -> Option<f64> {
         self.audio_duration
+    }
+
+    async fn detect_black_frames(
+        &self,
+        path: &str,
+        start: f64,
+        end: f64,
+        threshold: i32,
+        options: ProcessOptions,
+    ) -> Result<Vec<BlackFrame>, String> {
+        self.record(("blackframe", path, start, end, threshold, options));
+        let Some(from) = self.black_from else {
+            return Ok(Vec::new());
+        };
+        // Tenths of a second, in whole numbers to keep the times exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let tenth = |t: f64| (t * 10.0).round() as i64;
+        #[allow(clippy::cast_precision_loss)]
+        Ok((tenth(start.max(from))..tenth(end))
+            .map(|n| BlackFrame {
+                percentage: self.black_percentage.unwrap_or(100),
+                time: n as f64 / 10.0 - start,
+                frame: n,
+            })
+            .collect())
     }
 }
 
@@ -522,6 +619,28 @@ mod tests {
                    [Parsed_showinfo_0 @ 0x0] n:   1 pts:  1 pts_time:2.5 duration: 1\n\
                    [Parsed_showinfo_0 @ 0x0] n:   2 pts:  1 PTS_TIME:bad x\n";
         assert_eq!(parse_keyframes(raw, 10.0), [10.0, 12.5]);
+    }
+
+    #[test]
+    fn black_frames_follow_parse_black_frames() {
+        let raw = "[Parsed_blackframe_0 @ 0x0000000] frame:1 pblack:99 pts:43 t:0.043000 type:B last_keyframe:0\n\
+                   [Parsed_blackframe_0 @ 0x0000000] frame:2 pblack:85 pts:85 t:0.085000 type:B last_keyframe:0\n\
+                   [Parsed_showinfo_0 @ 0x0] frame:3 pblack:99 t:1\n";
+        assert_eq!(
+            parse_black_frames(raw),
+            [
+                BlackFrame {
+                    percentage: 99,
+                    time: 0.043,
+                    frame: 1
+                },
+                BlackFrame {
+                    percentage: 85,
+                    time: 0.085,
+                    frame: 2
+                },
+            ]
+        );
     }
 
     #[rstest::rstest]
@@ -584,25 +703,62 @@ mod tests {
             .detect_silence(clip, 1.0, 7.0, -50, options)
             .await
             .expect("silence");
+        // Absolute times, within the window (`-to` is its duration).
         assert!(
-            silences
-                .iter()
-                .any(|(s, e)| (*s - 3.0).abs() < 0.2 && (*e - 5.0).abs() < 0.2),
+            matches!(silences[..], [(s, e)] if (s - 3.0).abs() < 0.2 && (e - 5.0).abs() < 0.2),
             "{silences:?}"
         );
         let keyframes = service
             .detect_keyframes(clip, 2.0, 6.0, options)
             .await
             .expect("keyframes");
-        assert!(
-            keyframes.iter().any(|k| (*k - 4.0).abs() < 0.05),
-            "{keyframes:?}"
-        );
+        let (first, last) = (keyframes[0], keyframes[keyframes.len() - 1]);
+        assert!((first - 2.0).abs() < 0.05 && last <= 6.05, "{keyframes:?}");
         let audio = service
             .probe_audio_duration(clip, options)
             .await
             .expect("duration");
         assert!((audio - 8.0).abs() < 0.2, "{audio}");
+        // A test pattern has no black frame; a black card is all black, with
+        // times relative to the window.
+        let none = service
+            .detect_black_frames(clip, 0.0, 2.0, 32, options)
+            .await
+            .expect("black frames");
+        assert!(none.is_empty(), "{none:?}");
+        let black = dir.path().join("black.mkv");
+        let black = black.to_str().expect("utf-8");
+        let made = output(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=10:d=4",
+                "-c:v",
+                "libx264",
+                black,
+            ],
+            ProcessOptions::default(),
+        )
+        .await
+        .expect("ffmpeg");
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let frames = service
+            .detect_black_frames(black, 1.0, 3.0, 32, options)
+            .await
+            .expect("black frames");
+        assert!(frames.len() >= 15, "{frames:?}");
+        assert!(
+            frames.iter().all(|f| f.percentage == 100 && f.time < 2.05),
+            "{frames:?}"
+        );
     }
 
     /// The process runs at the priority's nice value (lowering it needs no

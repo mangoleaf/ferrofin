@@ -229,27 +229,32 @@ impl DetectSegmentsTask {
     ) -> Result<(), ServiceError> {
         let sponsor_block = config.enable_sponsor_block_chapter_detection;
         let expression = pattern(config, mode);
-        // TODO(intro-skipper step 8): with `DetectRecapUsingBlackFrames`, a
-        // recap without a matching chapter falls back to black frames
-        // (`DetectRecapUsingBlackFramesAsync`), and that also keeps this
-        // analyzer running when there is no pattern.
-        if expression.trim().is_empty() && !sponsor_block {
+        // A recap no chapter names falls back to black frames.
+        let black_frame_recap = mode == Mode::Recap && config.detect_recap_using_black_frames;
+        if expression.trim().is_empty() && !sponsor_block && !black_frame_recap {
             return Ok(());
         }
         let regex = compile(expression);
         for item in items.iter_mut().filter(|i| i.needs_analysis(mode)) {
             let chapters = self.item_chapters(item.entry.episode_id).await;
-            let Some(range) = find_matching_chapter(
+            let mut found = find_matching_chapter(
                 &item.entry,
                 &chapters,
                 regex.as_ref(),
                 mode,
                 (config, sponsor_block),
             )
-            .filter(|(_, end)| *end > 0.0) else {
+            .filter(|(_, end)| *end > 0.0);
+            if found.is_none() && black_frame_recap {
+                found = self
+                    .recap_from_black_frames(&item.entry, config)
+                    .await?
+                    .filter(|(_, end)| *end > 0.0);
+            }
+            let Some(range) = found else {
                 continue;
             };
-            // No chapter snapping: the bounds are chapters already.
+            // No chapter snapping: chapters or black frames bound it already.
             self.store_found(item, mode, range, config, false).await?;
         }
         Ok(())

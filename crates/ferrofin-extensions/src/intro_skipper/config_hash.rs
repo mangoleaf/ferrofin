@@ -22,7 +22,7 @@ use super::IntroSkipperConfig;
 /// passes recorded is analysed again with it, rather than stranded under an
 /// unchanged hash. Ferrofin's hashes are its own (the plugin's database is
 /// not imported), so the token costs no compatibility.
-const ANALYZERS: &str = "chromaprint,silence,keyframes,chapters";
+const ANALYZERS: &str = "chromaprint,silence,keyframes,chapters,blackframes,recap";
 
 /// C#'s `bool.ToString()`.
 fn b(value: bool) -> &'static str {
@@ -180,6 +180,7 @@ fn adjustment(c: &IntroSkipperConfig) -> String {
 pub(super) enum Detection {
     Silence,
     Keyframe,
+    BlackFrame(AnalysisMode),
 }
 
 /// `ConfigHasher.DetectionCache(config, type, mode)`: the settings a cached
@@ -192,6 +193,11 @@ pub(super) fn detection_cache(c: &IntroSkipperConfig, detection: Detection) -> S
             c.silence_detection_maximum_noise, c.silence_detection_minimum_duration
         ),
         Detection::Keyframe => "cache|v1|Keyframe".to_owned(),
+        Detection::BlackFrame(mode) => format!(
+            "cache|v1|BlackFrame|{}|threshold={}",
+            mode_name(mode),
+            c.black_frame_threshold
+        ),
     })
 }
 

@@ -761,10 +761,11 @@ impl DetectSegmentsTask {
                     }
                 }
                 Analyzer::Chapter => self.chapter_analyzer(items, mode, config).await?,
-                // TODO(intro-skipper step 8): `BlackFrameAnalyzer` /
-                // `CreditsBlackFrameAnalyzer` — the chain is ordered for them
-                // already. Bump `config_hash::ANALYZERS` when it lands.
-                Analyzer::BlackFrame => {}
+                // TODO(intro-skipper step 9): `CreditsBlackFrameAnalyzer` when
+                // `UseAlternativeBlackFrameAnalyzer`; bump
+                // `config_hash::ANALYZERS` with it.
+                Analyzer::BlackFrame if config.use_alternative_black_frame_analyzer => {}
+                Analyzer::BlackFrame => self.black_frame_analyzer(items, config).await?,
             }
         }
         if mode == Mode::Credits
@@ -810,12 +811,6 @@ impl DetectSegmentsTask {
         let Some(print) = print_mode(mode) else {
             return Ok(());
         };
-        if mode == Mode::Recap {
-            // TODO(intro-skipper step 8): a recap is built from the matched
-            // card and the black frames after it
-            // (`BuildRecapFromChromaprintCandidateAsync`).
-            return Ok(());
-        }
         let mut queue: Vec<usize> = Vec::new();
         for (index, item) in items.iter().enumerate() {
             if item.needs_analysis(mode)
@@ -848,6 +843,7 @@ impl DetectSegmentsTask {
             .prints(items, &queue, mode, print, fingerprinter, options)
             .await;
         let mut found: HashMap<usize, TimeRange> = HashMap::new();
+        let mut recap_frames = HashMap::new();
         while !queue.is_empty() {
             let current = queue.remove(0);
             for &remaining in &queue {
@@ -864,10 +860,25 @@ impl DetectSegmentsTask {
                 let (Some(mut lhs), Some(mut rhs)) = (lhs, rhs) else {
                     continue;
                 };
-                if rhs.end <= 0.0
-                    || rhs.duration() > maximum_duration(&items[remaining].entry, mode, config)
-                {
+                let maximum = maximum_duration(&items[remaining].entry, mode, config);
+                if rhs.end <= 0.0 || rhs.duration() > maximum {
                     continue;
+                }
+                // A shared recap card is the recap's start; its end is the
+                // last black frame after the card.
+                if mode == Mode::Recap {
+                    let pair = self
+                        .recap_pair(
+                            (&items[current].entry, &items[remaining].entry),
+                            ((lhs.start, lhs.end), (rhs.start, rhs.end)),
+                            (maximum, config),
+                            &mut recap_frames,
+                        )
+                        .await?;
+                    let Some((l, r)) = pair else {
+                        continue;
+                    };
+                    (lhs, rhs) = (TimeRange::new(l.0, l.1), TimeRange::new(r.0, r.1));
                 }
                 // The prints start at the credits window, not at 0.
                 if mode == Mode::Credits {
@@ -978,9 +989,20 @@ impl DetectSegmentsTask {
         config: &IntroSkipperConfig,
         snap_to_chapters: bool,
     ) -> Result<(), ServiceError> {
-        let (start, end) = self
+        let adjusted = self
             .adjust_intro_times(&item.entry, mode, found, config, snap_to_chapters)
             .await;
+        self.store_segment(item, mode, adjusted).await
+    }
+
+    /// A find stored as it is, under the mode's hash, and the item marked
+    /// analysed.
+    pub(super) async fn store_segment(
+        &self,
+        item: &mut Item,
+        mode: Mode,
+        (start, end): (f64, f64),
+    ) -> Result<(), ServiceError> {
         self.actions
             .update_timestamp(StoredSegment {
                 item_id: item.entry.episode_id,
