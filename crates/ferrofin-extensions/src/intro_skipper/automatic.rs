@@ -25,11 +25,11 @@ const ADDED_DELAY: Duration = Duration::from_secs(120);
 /// The wait after an item is updated, a library scan ends, or a run ended with
 /// more queued (`StartTimer`'s default).
 const UPDATED_DELAY: Duration = Duration::from_secs(60);
-/// How often a run waiting for the one-pass latch looks again.
+/// How often a run waiting for the one-pass latch looks again: the wait is
+/// a whole analysis pass (minutes), so a second's lag is noise.
+// TODO: wake waiters through a `tokio::sync::Notify` on release instead of
+// polling, if latch waits ever matter (many queued runs, or tests).
 const LATCH_POLL: Duration = Duration::from_secs(1);
-/// Changed ids looked up per query: under SQLite's 32,766 bound-parameter
-/// limit (`SQLITE_MAX_VARIABLE_NUMBER`), with room for the query's others.
-const LOOKUP_CHUNK: usize = 32_000;
 
 /// The Intro Skipper's run state, shared by every handle on it (the plugin's
 /// statics and `Plugin.Instance` flags).
@@ -151,7 +151,7 @@ impl DetectSegmentsTask {
         let mut seasons = HashSet::new();
         // One lookup per chunk, not per item: a first import announces a
         // whole library at once.
-        for chunk in ids.chunks(LOOKUP_CHUNK) {
+        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let query = ferrofin_traits::options::InternalItemsQuery {
                 item_ids: chunk.to_vec(),
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
@@ -161,7 +161,7 @@ impl DetectSegmentsTask {
             let items = match self.library.get_item_list(&query).await {
                 Ok(items) => items,
                 Err(err) => {
-                    tracing::debug!(%err, "intro skipper: changed items unreadable");
+                    tracing::warn!(%err, "intro skipper: changed items unreadable; they wait for the next pass");
                     continue;
                 }
             };
