@@ -9471,4 +9471,65 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn country_overrides_are_independent_from_the_inherited_language() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("language=es-AR", r#"{"id":2344,"name":"Argentina","overview":"Collection es-AR","biography":"Person es-AR"}"#.to_owned()),
+            ("language=es-MX", r#"{"id":2344,"name":"Mexico","overview":"Collection es-MX","biography":"Person es-MX"}"#.to_owned()),
+        ]).await;
+        let library_id = Uuid::from_u128(0x4d05);
+        for kind in ["Person", "Movies.BoxSet"] {
+            for (index, (country, library_country, own_country, expected)) in [
+                ("AR", None, None, "es-AR"),
+                ("FR", None, None, "es-MX"),
+                ("AR", Some("FR"), None, "es-MX"),
+                ("FR", Some("AR"), None, "es-AR"),
+                ("FR", Some("FR"), Some("AR"), "es-AR"),
+                ("AR", Some("AR"), Some("FR"), "es-MX"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut item = row(kind, "Original");
+                item.top_parent_id = library_country.map(|_| library_id.to_string());
+                item.preferred_metadata_country_code = own_country.map(str::to_owned);
+                let store = Arc::new(RecordingStore::default());
+                let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+                let (id, manager) = box_set_manager(item, tmdb, store.clone());
+                store
+                    .stored_ids
+                    .lock()
+                    .unwrap()
+                    .insert(id, vec![("Tmdb".to_owned(), (70_000 + index).to_string())]);
+                let library = Arc::new(OneLibrary(
+                    ferrofin_model::entities_media::VirtualFolderInfo {
+                        item_id: Some(library_id.to_string()),
+                        library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                            metadata_country_code: library_country.map(str::to_owned),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ));
+                let manager = manager
+                    .with_metadata_language(library, Arc::new(|| "es-419".to_owned()))
+                    .with_metadata_country(Arc::new(move || country.to_owned()));
+                manager
+                    .refresh_single_item(id, &full_metadata_refresh())
+                    .await
+                    .unwrap();
+                let label = if kind == "Person" {
+                    "Person"
+                } else {
+                    "Collection"
+                };
+                assert_eq!(
+                    store.saved.lock().unwrap().last().unwrap().overview,
+                    Some(format!("{label} {expected}")),
+                    "{kind}/{country}/{library_country:?}/{own_country:?}"
+                );
+            }
+        }
+    }
 }

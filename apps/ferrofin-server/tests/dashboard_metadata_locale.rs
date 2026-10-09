@@ -443,6 +443,8 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     }
     verify_server_metadata_language(&api, &mut config, &refresh).await;
     verify_by_name_metadata_languages(&api, &mut config, &requests).await;
+    verify_server_metadata_country(&api, &mut config, &refresh).await;
+    verify_by_name_metadata_countries(&api, &mut config).await;
     // L12: Identify uses the same saved enable lists and exact-name order as
     // automatic refresh. Shared IMDb ids make the first provider's result win.
     for (fetchers, order, expected) in [
@@ -1866,6 +1868,76 @@ async fn verify_by_name_metadata_languages(
         );
     }
     persistence.delete_items(&ids).await.unwrap();
+}
+
+/// Country-only changes reach both provider certificates and the live rating list.
+async fn verify_server_metadata_country(api: &Api, config: &mut Value, refresh: &str) {
+    config["PreferredMetadataLanguage"] = json!("fr");
+    api.post("/System/Configuration", config).await;
+    for (country, rating, listed) in [
+        ("DE", "FSK-12", "FSK-12"),
+        ("FR", "FR-12", "TP"),
+        ("AR", "AR-13", "ATP"),
+    ] {
+        config["MetadataCountryCode"] = json!(country);
+        api.post("/System/Configuration", config).await;
+        let ratings = api.get("/Localization/ParentalRatings").await;
+        assert!(
+            ratings
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["Name"] == listed),
+            "{country}: {ratings}"
+        );
+        if country != "DE" {
+            assert!(
+                ratings
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry["Name"] != "FSK-12"),
+                "stale German dataset: {ratings}"
+            );
+        }
+        api.post(refresh, &Value::Null).await;
+        api.await_movie("Locale fr", rating).await;
+        assert_eq!(
+            api.get("/System/Configuration").await["PreferredMetadataLanguage"],
+            "fr"
+        );
+    }
+    config["PreferredMetadataLanguage"] = json!("es-419");
+    api.post("/System/Configuration", config).await;
+    api.post(refresh, &Value::Null).await;
+    api.await_movie("Locale es-AR", "AR-13").await;
+}
+
+/// Cold provider IDs prove the country input to regional language resolution.
+/// The pinned client's warm cache omits country from its key; keep that broader
+/// cache behavior separate from the setting's actual metadata lookup input.
+async fn verify_by_name_metadata_countries(api: &Api, config: &mut Value) {
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    assert_eq!(config["PreferredMetadataLanguage"], "es-419");
+    for (offset, country, expected) in [(70_000, "AR", "es-AR"), (71_000, "FR", "es-MX")] {
+        config["MetadataCountryCode"] = json!(country);
+        api.post("/System/Configuration", config).await;
+        let (persistence, ids) = seed_by_name_locale_items(api, offset).await;
+        for (id, label) in ids
+            .into_iter()
+            .zip(["Person biography", "Collection overview"])
+        {
+            api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=ValidationOnly&replaceAllMetadata=true"), &Value::Null).await;
+            await_by_name_overview(api, id, &format!("{label} {expected}")).await;
+        }
+        assert_eq!(
+            api.get("/System/Configuration").await["PreferredMetadataLanguage"],
+            "es-419"
+        );
+        persistence.delete_items(&ids).await.unwrap();
+    }
+    config["MetadataCountryCode"] = json!("AR");
+    api.post("/System/Configuration", config).await;
 }
 
 /// Live dashboard display policy positions physical specials in episode lists and NextUp.
