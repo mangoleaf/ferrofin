@@ -301,6 +301,12 @@ pub async fn build_app_state(
             .await
             .context("failed to load server configuration")?,
     );
+    if let Some(display) = ffmpeg.encoder_app_path_display.as_ref() {
+        config_mgr
+            .set_encoder_app_path_display(&display.to_string_lossy())
+            .await
+            .context("failed to persist resolved ffmpeg path")?;
+    }
     let server_config = config_mgr.snapshot();
     let metadata_root = {
         let paths = Arc::clone(&paths);
@@ -2479,6 +2485,7 @@ mod tests {
         db.run_migrations().await.expect("migrations apply");
 
         let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
             ffmpeg: PathBuf::from("ffmpeg"),
             ffprobe: PathBuf::from("ffprobe"),
             capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),

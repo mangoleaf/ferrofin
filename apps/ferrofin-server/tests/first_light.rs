@@ -186,6 +186,7 @@ async fn boot() -> Harness {
     db.run_migrations().await.expect("migrations");
 
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),

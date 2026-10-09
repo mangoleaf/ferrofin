@@ -123,6 +123,9 @@ fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
                 "ffmpeg unavailable — transcoding/playback will be disabled until configured",
             );
             FfmpegPaths {
+                encoder_app_path_display: e
+                    .downcast_ref::<bootstrap::ValidatedFfmpegPath>()
+                    .map(|validated| validated.path.clone()),
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
                 capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -961,6 +964,23 @@ mod tests {
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    #[test]
+    fn disabled_encoder_retains_only_a_successfully_validated_ffmpeg_display() {
+        let validated = std::path::PathBuf::from("/owned/ffmpeg");
+        let partial = anyhow::anyhow!("ffprobe validation failed").context(
+            super::bootstrap::ValidatedFfmpegPath {
+                path: validated.clone(),
+            },
+        );
+        let disabled = super::encoder_or_disabled(Err(partial));
+        assert_eq!(disabled.encoder_app_path_display, Some(validated));
+        assert_eq!(disabled.ffmpeg, std::path::PathBuf::from("ffmpeg"));
+        assert_eq!(disabled.ffprobe, std::path::PathBuf::from("ffprobe"));
+        assert!(!disabled.chromaprint_muxer);
+        let invalid = super::encoder_or_disabled(Err(anyhow::anyhow!("ffmpeg validation failed")));
+        assert_eq!(invalid.encoder_app_path_display, None);
+    }
 
     #[tokio::test]
     async fn background_teardown_releases_sockets_before_returning() {

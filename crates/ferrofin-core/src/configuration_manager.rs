@@ -428,6 +428,48 @@ impl FerrofinServerConfigurationManager {
         })
     }
 
+    /// Persists the validated startup executable for the dashboard's read-only display.
+    ///
+    /// Executable selection remains a startup operation. Failed ffmpeg validation
+    /// must not call this method; a later ffprobe failure still preserves the display.
+    /// A failed legacy XML adoption leaves JSON absent for its next-boot retry, so
+    /// the display remains unavailable until that configuration can be imported.
+    ///
+    /// # Errors
+    /// Returns an error if the encoding document cannot be serialized or saved.
+    pub async fn set_encoder_app_path_display(&self, path: &str) -> Result<(), ServiceError> {
+        let _save = self.write_lock.lock().await;
+        let legacy_encoding = self.config_file.with_file_name("encoding.xml");
+        if !self.encoding_file.exists() && legacy_encoding.exists() {
+            tracing::warn!(
+                legacy_path = %legacy_encoding.display(),
+                "resolved encoder display was not saved while legacy encoding adoption is pending; repair the XML and restart to retry"
+            );
+            return Ok(());
+        }
+        let mut options = match self.get_encoding_options().await {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(%error, "loading encoding configuration failed; using defaults");
+                EncodingOptions::default()
+            }
+        };
+        options.encoder_app_path_display = Some(path.to_owned());
+        let json = serde_json::to_string_pretty(&options).map_err(|error| {
+            ServiceError::backend(format!("serialize encoding configuration: {error}"))
+        })?;
+        let file = self.encoding_file.clone();
+        let committed: Arc<str> = json.clone().into();
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&file, json.as_bytes())
+                .map_err(|error| io_err("write resolved encoder path", &file, &error))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("encoding writer: {error}")))??;
+        self.named_configuration_updated("encoding", committed);
+        Ok(())
+    }
+
     /// Subscribes to successful main, branding, and named-store saves.
     ///
     /// The host registers listeners while constructing its services. A
@@ -1225,6 +1267,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_encoder_display_preserves_options_and_persists_across_restart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut options = EncodingOptions {
+            encoding_thread_count: 7,
+            encoder_app_path: Some("configured-executable".into()),
+            encoder_app_path_display: Some("old-display".into()),
+            ..EncodingOptions::default()
+        };
+        ferrofin_util::file_helper::atomic_write(
+            &mgr.encoding_file,
+            &serde_json::to_vec(&options).expect("serialize"),
+        )
+        .expect("save original");
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display");
+        options.encoder_app_path_display = Some("/resolved/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+        let restarted = FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("restart");
+        assert_eq!(
+            restarted.get_encoding_options().await.expect("encoding"),
+            options
+        );
+        mgr.set_encoder_app_path_display("/new/ffmpeg")
+            .await
+            .expect("changed executable");
+        options.encoder_app_path_display = Some("/new/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_initializes_absent_or_malformed_encoding_config() {
+        for malformed in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .expect("load");
+            if malformed {
+                ferrofin_util::file_helper::atomic_write(&mgr.encoding_file, b"bad json")
+                    .expect("corrupt config");
+            }
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .expect("display");
+            assert_eq!(
+                mgr.get_encoding_options().await.expect("encoding"),
+                EncodingOptions {
+                    encoder_app_path_display: Some("/resolved/ffmpeg".into()),
+                    ..EncodingOptions::default()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_reports_persistence_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        std::fs::create_dir_all(&mgr.encoding_file).expect("block destination");
+        assert!(
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .is_err()
+        );
+        assert!(mgr.encoding_file.is_dir());
+    }
+
+    #[tokio::test]
     async fn encoding_options_default_then_reads_persisted_document() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
@@ -1669,6 +1787,42 @@ mod tests {
         assert!(
             !mgr.encoding_file.exists(),
             "nothing was written, so the next boot tries again"
+        );
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("pending adoption is preserved");
+        assert!(
+            !mgr.encoding_file.exists(),
+            "display update must not suppress a later XML import"
+        );
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("encoding"),
+            EncodingOptions::default()
+        );
+        std::fs::write(dir.join("encoding.xml"),
+            "<EncodingOptions><EncodingThreadCount>7</EncodingThreadCount><DownMixAudioBoost>1.5</DownMixAudioBoost></EncodingOptions>")
+            .expect("repair XML");
+        let restarted = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("retry import");
+        assert_eq!(
+            restarted
+                .get_encoding_options()
+                .await
+                .expect("adopted")
+                .encoding_thread_count,
+            7
+        );
+        restarted
+            .set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display after import");
+        let actual = restarted.get_encoding_options().await.expect("updated");
+        assert_eq!(actual.encoding_thread_count, 7);
+        assert_eq!(actual.down_mix_audio_boost.to_bits(), 1.5_f64.to_bits());
+        assert_eq!(
+            actual.encoder_app_path_display.as_deref(),
+            Some("/resolved/ffmpeg")
         );
     }
 

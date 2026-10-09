@@ -825,6 +825,7 @@ mod tests {
         });
         // The trio builds without panicking; every slot is a real trait object.
         let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -1118,6 +1119,7 @@ mod tests {
             root: "/cache/att".to_owned(),
         });
         let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),

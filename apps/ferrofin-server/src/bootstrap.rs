@@ -41,7 +41,12 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegPaths {
-    /// The validated `ffmpeg` executable path.
+    /// The validated startup ffmpeg path to persist in the dashboard display.
+    ///
+    /// Independent of ffprobe/runtime availability: native SetFFmpegPath saves
+    /// this value as soon as ffmpeg validates, before later probing.
+    pub encoder_app_path_display: Option<PathBuf>,
+    /// The `ffmpeg` executable path (a bare fallback when discovery failed).
     pub ffmpeg: PathBuf,
     /// The validated `ffprobe` executable path.
     pub ffprobe: PathBuf,
@@ -62,6 +67,22 @@ pub struct FfmpegPaths {
     /// path — that second spawn was 34 ms of an 88 ms cold start. The test is
     /// the same substring match the extension performed itself.
     pub chromaprint_muxer: bool,
+}
+
+/// Context retained when ffmpeg validates but the later ffprobe validation fails.
+#[derive(Debug)]
+pub(crate) struct ValidatedFfmpegPath {
+    pub(crate) path: PathBuf,
+}
+
+impl std::fmt::Display for ValidatedFfmpegPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "validated ffmpeg executable `{}`",
+            self.path.display()
+        )
+    }
 }
 
 impl FfmpegPaths {
@@ -526,12 +547,16 @@ pub async fn discover_ffmpeg(
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
         .with_context(|| format!("ffmpeg validation failed (resolved via {method})"))?;
-    ffprobe_ok.with_context(|| {
-        format!(
-            "ffprobe validation failed (derived from `{}`)",
-            ffmpeg.display()
-        )
-    })?;
+    ffprobe_ok
+        .with_context(|| {
+            format!(
+                "ffprobe validation failed (derived from `{}`)",
+                ffmpeg.display()
+            )
+        })
+        .context(ValidatedFfmpegPath {
+            path: ffmpeg.clone(),
+        })?;
 
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
@@ -573,6 +598,7 @@ pub async fn discover_ffmpeg(
     // path was not taken.
     tracing::debug!(capabilities = ?capabilities, "media encoder capabilities");
     Ok(FfmpegPaths {
+        encoder_app_path_display: Some(ffmpeg.clone()),
         ffmpeg,
         ffprobe,
         capabilities,
@@ -1365,6 +1391,7 @@ mod tests {
             .await
             .expect("discovery succeeds");
         assert_eq!(paths.ffmpeg, ffmpeg);
+        assert_eq!(paths.encoder_app_path_display.as_ref(), Some(&ffmpeg));
         assert_eq!(paths.ffprobe, tmp.path().join("ffprobe"));
         // Every leg of the capability round parsed the fake's tables.
         let caps = &paths.capabilities;
@@ -1413,6 +1440,52 @@ mod tests {
             cfg!(target_os = "linux"),
             "the OS version is read on Linux and, until phase 6, nowhere else"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovered_ffmpeg_display_survives_missing_or_failing_ffprobe() {
+        for missing in [true, false] {
+            let tmp = tempfile::tempdir().expect("owned binaries");
+            let ffmpeg = write_fake_ffmpeg(tmp.path(), "ffmpeg", "ffmpeg");
+            if !missing {
+                // Validating this executable as ffprobe rejects its ffmpeg banner.
+                write_fake_ffmpeg(tmp.path(), "ffprobe", "ffmpeg");
+            }
+            let mut cfg = config_with_ffmpeg(Some(ffmpeg.to_str().expect("path")));
+            cfg.ffprobe_path = None;
+            let error = discover_ffmpeg(&cfg, None)
+                .await
+                .expect_err("probe validation fails");
+            assert_eq!(
+                error
+                    .downcast_ref::<ValidatedFfmpegPath>()
+                    .map(|validated| &validated.path),
+                Some(&ffmpeg)
+            );
+            assert!(
+                format!("{error:#}").contains("ffprobe validation failed"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_ffmpeg_never_attaches_a_display_even_when_ffprobe_also_fails() {
+        let tmp = tempfile::tempdir().expect("owned binaries");
+        let invalid_ffmpeg = write_fake_ffmpeg(tmp.path(), "ffmpeg", "ffprobe");
+        let mut cfg = config_with_ffmpeg(Some(invalid_ffmpeg.to_str().expect("path")));
+        cfg.ffprobe_path = None;
+        let error = discover_ffmpeg(&cfg, None)
+            .await
+            .expect_err("ffmpeg validation fails first");
+        assert!(error.downcast_ref::<ValidatedFfmpegPath>().is_none());
+        assert!(
+            format!("{error:#}").contains("ffmpeg validation failed"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("ffprobe validation failed"));
     }
 
     #[cfg(unix)]

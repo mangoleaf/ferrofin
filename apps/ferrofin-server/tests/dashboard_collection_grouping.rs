@@ -81,6 +81,7 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     let db = Database::connect(&config.database_url()).await.unwrap();
     db.run_migrations().await.unwrap();
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: "ffmpeg".into(),
         ffprobe: "ffprobe".into(),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
