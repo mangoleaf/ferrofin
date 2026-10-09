@@ -412,7 +412,7 @@ impl ScheduledTask for DeleteTranscodeFileTask {
             tracing::info!("skipping transcode-directory sweep: playback is active");
             return Ok(());
         }
-        let dir = PathBuf::from(self.paths.transcode_path());
+        let dir = PathBuf::from(self.paths.prepare_transcode_path()?);
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let cutoff = SystemTime::now() - std::time::Duration::from_hours(24);

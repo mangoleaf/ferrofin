@@ -4381,6 +4381,12 @@ impl FerrofinLiveTvManager {
                 "live tv transcode path not wired".to_owned(),
             ));
         }
+        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
+            ServiceError::backend(format!(
+                "prepare transcode directory {}: {error}",
+                path.display()
+            ))
+        })?;
         Ok(path)
     }
 

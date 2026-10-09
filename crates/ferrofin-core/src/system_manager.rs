@@ -307,23 +307,21 @@ impl FerrofinSystemManager {
         self
     }
 
-    /// The transcode temp path.
-    ///
-    /// In C# this is `EncodingOptions.TranscodingTempPath` (a separate config
-    /// store owned by the encoding layer, out of this unit's scope). The
-    /// override is injected via [`SystemHostFacts::transcoding_temp_path`]; absent
-    /// that, it defaults to `{cache}/transcodes`, matching Jellyfin's default.
-    fn transcode_path(&self) -> String {
-        self.facts
+    /// Resolves and prepares the same live transcode root as the media consumers.
+    fn transcode_path(&self) -> Result<String, ServiceError> {
+        if let Some(path) = self
+            .facts
             .transcoding_temp_path
-            .clone()
-            .filter(|p| !p.trim().is_empty())
-            .unwrap_or_else(|| {
-                std::path::Path::new(&self.paths.cache_path())
-                    .join("transcodes")
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .as_ref()
+            .filter(|path| !path.is_empty())
+        {
+            ferrofin_util::directory_path::prepare_transcode_directory(std::path::Path::new(path))
+                .map_err(|error| {
+                    ServiceError::backend(format!("prepare transcode directory {path}: {error}"))
+                })?;
+            return Ok(path.clone());
+        }
+        self.paths.prepare_transcode_path()
     }
 }
 
@@ -348,7 +346,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
         let cfg = self.configuration_manager.configuration().await?;
         let local_address = self.application_host.get_smart_api_url(request).await.ok();
-        let transcode = self.transcode_path();
+        let transcode = self.transcode_path()?;
         let internal_metadata = self.paths.internal_metadata_path();
 
         #[allow(deprecated)]
@@ -424,7 +422,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             self.paths.cache_path(),
             self.paths.log_directory_path(),
             self.paths.internal_metadata_path(),
-            self.transcode_path(),
+            self.transcode_path()?,
         ];
         for (_, _, folders) in &library_folders {
             paths.extend(folders.iter().cloned());
@@ -540,6 +538,38 @@ mod tests {
         )
         .with_storage_probe(Arc::new(SizedProbe));
         (mgr, lifecycle)
+    }
+
+    #[tokio::test]
+    #[allow(
+        deprecated,
+        reason = "verify the legacy SystemInfo path beside the current storage projection"
+    )]
+    async fn system_reports_the_live_transcode_root_and_storage_together() {
+        let (mgr, _) = build().await;
+        let root = tempfile::tempdir().expect("transcode root");
+        for child in ["first", "second"] {
+            let transcode = root.path().join(child);
+            mgr.paths
+                .set_transcode_path(Some(transcode.to_str().expect("path")));
+            let info = mgr
+                .get_system_info(&RequestContext::default())
+                .await
+                .expect("info");
+            let storage = mgr.get_system_storage_info().await.expect("storage");
+            assert_eq!(info.transcoding_temp_path.as_deref(), transcode.to_str());
+            assert_eq!(
+                storage.transcoding_temp_folder.path,
+                transcode.to_string_lossy()
+            );
+            assert!(transcode.join(".jellyfin-transcode").is_file());
+        }
+        mgr.paths.set_transcode_path(None);
+        let info = mgr
+            .get_system_info(&RequestContext::default())
+            .await
+            .expect("default info");
+        assert_eq!(info.transcoding_temp_path, Some(mgr.paths.transcode_path()));
     }
 
     #[tokio::test]

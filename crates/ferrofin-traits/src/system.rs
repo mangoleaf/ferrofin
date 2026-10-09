@@ -209,6 +209,19 @@ pub trait ServerApplicationPaths: Send + Sync {
             .into_owned()
     }
 
+    /// Resolves and prepares the current transcode directory (`GetTranscodePath`).
+    ///
+    /// # Errors
+    /// Returns directory/marker creation errors or a conflicting ownership marker.
+    fn prepare_transcode_path(&self) -> Result<String, ServiceError> {
+        let path = self.transcode_path();
+        ferrofin_util::directory_path::prepare_transcode_directory(std::path::Path::new(&path))
+            .map_err(|error| {
+                ServiceError::backend(format!("prepare transcode directory {path}: {error}"))
+            })?;
+        Ok(path)
+    }
+
     /// The scratch directory single-frame extractions write to before the
     /// result is moved into place (the C# `TempDirectory`). A `temp`
     /// subdirectory of [`cache_path`](Self::cache_path).

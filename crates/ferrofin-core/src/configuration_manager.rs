@@ -412,6 +412,8 @@ impl FerrofinServerConfigurationManager {
         }
 
         initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
+        initialize_transcode_path(&paths, &encoding_file).await?;
+
         prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
 
@@ -620,6 +622,17 @@ impl FerrofinServerConfigurationManager {
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        if key.eq_ignore_ascii_case("encoding") {
+            match serde_json::from_str::<EncodingOptions>(&json) {
+                Ok(options) => self
+                    .paths
+                    .set_transcode_path(options.transcoding_temp_path.as_deref()),
+                Err(error) => {
+                    tracing::warn!(%error, "committed encoding configuration could not update transcode path");
+                }
+            }
+        }
+
         notify_listeners(
             &self.listeners,
             &ConfigurationUpdate::Named {
@@ -772,6 +785,31 @@ fn initialize_cache_path(
     FerrofinServerApplicationPaths::prepare_cache_path(&cache)
         .map_err(|e| io_err("prepare cache directory", &cache, &e))?;
     paths.set_cache_path(configured);
+    Ok(())
+}
+
+/// Loads the named encoding path after cache initialization and prepares it.
+/// Read/parse failures retain defaults; filesystem preparation still fails startup.
+async fn initialize_transcode_path(
+    paths: &FerrofinServerApplicationPaths,
+    encoding_file: &std::path::Path,
+) -> Result<(), ServiceError> {
+    let encoding = match tokio::fs::read(encoding_file).await {
+        Ok(bytes) => match serde_json::from_slice::<EncodingOptions>(&bytes) {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(%error, "loading encoding configuration for transcode path failed; using defaults");
+                EncodingOptions::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => EncodingOptions::default(),
+        Err(error) => {
+            tracing::warn!(%error, "reading encoding configuration for transcode path failed; using defaults");
+            EncodingOptions::default()
+        }
+    };
+    paths.set_transcode_path(encoding.transcoding_temp_path.as_deref());
+    paths.prepare_transcode_path()?;
     Ok(())
 }
 
@@ -1340,6 +1378,73 @@ mod tests {
                 .is_err()
         );
         assert!(mgr.encoding_file.is_dir());
+    }
+
+    #[tokio::test]
+    async fn transcode_path_loads_saved_root_and_publishes_committed_updates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let encoding_file =
+            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        let first = tmp.path().join("first-transcodes");
+        let first_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(first.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, first_json.as_bytes())
+            .expect("save startup configuration");
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        assert_eq!(PathBuf::from(paths.transcode_path()), first);
+        assert!(first.join(".jellyfin-transcode").is_file());
+        let operation = paths.transcode_path();
+        let second = tmp.path().join("second-transcodes");
+        let second_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(second.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, second_json.as_bytes())
+            .expect("persist named update");
+        mgr.named_configuration_updated("ENCODING", second_json.into());
+        assert_eq!(PathBuf::from(paths.transcode_path()), second);
+        assert_eq!(PathBuf::from(operation), first);
+        assert!(
+            !second.exists(),
+            "save publication does not create the directory"
+        );
+        paths.prepare_transcode_path().expect("operation starts");
+        assert!(second.join(".jellyfin-transcode").is_file());
+        let restarted = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("restart");
+        assert_eq!(
+            PathBuf::from(restarted.concrete_paths().transcode_path()),
+            second
+        );
+        mgr.named_configuration_updated("encoding", Arc::from(r#"{"TranscodingTempPath":""}"#));
+        assert_eq!(
+            PathBuf::from(paths.transcode_path()),
+            PathBuf::from(paths.cache_path()).join("transcodes")
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_path_rejects_conflicting_startup_markers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let transcode = PathBuf::from(paths.cache_path()).join("transcodes");
+        let nested = transcode.join("nested");
+        std::fs::create_dir_all(&nested).expect("directory");
+        std::fs::write(nested.join(".jellyfin-data"), b"").expect("wrong owner");
+        assert!(
+            FerrofinServerConfigurationManager::load(paths)
+                .await
+                .is_err()
+        );
+        assert!(!transcode.join(".jellyfin-transcode").exists());
     }
 
     #[tokio::test]

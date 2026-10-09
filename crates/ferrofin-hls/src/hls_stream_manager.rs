@@ -737,8 +737,8 @@ where
     }
 
     /// The transcode cache directory (`GetTranscodePath`).
-    fn transcode_dir(&self) -> PathBuf {
-        PathBuf::from(self.paths.transcode_path())
+    fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
+        Ok(PathBuf::from(self.paths.prepare_transcode_path()?))
     }
 
     /// Resolves `file_name` inside the transcode cache, guarding traversal.
@@ -751,7 +751,7 @@ where
         file_name: &str,
         require_m3u8: bool,
     ) -> Result<PathBuf, ServiceError> {
-        let dir = self.transcode_dir();
+        let dir = self.transcode_dir()?;
         let candidate = dir.join(file_name);
         // Reject any name that escapes the transcode dir (`..`, absolute, etc.).
         let escapes = Path::new(file_name).components().any(|c| {

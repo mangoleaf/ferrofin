@@ -861,7 +861,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // The deterministic output id (StreamingHelpers hash): a re-request with
         // the same item/source/session/device/container reuses the same job.
         let output_id = output_id(request, &segment_container, is_audio);
-        let transcode_root = PathBuf::from(self.paths.transcode_path());
+        let transcode_root = PathBuf::from(self.paths.prepare_transcode_path()?);
         let playlist_path = transcode_root.join(format!("{output_id}.m3u8"));
         let wait_for_path = segment_path(
             &playlist_path,
@@ -2155,15 +2155,16 @@ mod tests {
     ) -> FerrofinStreamStatePlanner {
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
         let helper = EncodingHelper::with_processor_count(caps, 8);
+        let temp = tempfile::tempdir().expect("owned transcode cache");
         let paths = Arc::new(FerrofinServerApplicationPaths::new(
             "/data",
             std::path::PathBuf::from("/data/log"),
             "/config",
-            "/cache",
+            temp.path().join("cache"),
             "/web",
         ));
         let config: Arc<dyn ServerConfigurationManager> =
-            Arc::new(FakeConfig(Arc::clone(&paths), options));
+            Arc::new(FakeConfig(Arc::clone(&paths), options, temp));
         // The disabled stub always errors, exercising the `si=` burn fallback.
         let subtitles: Arc<dyn SubtitleEncoder> =
             Arc::new(ferrofin_traits::stubs::DisabledSubtitleEncoder);
@@ -2179,7 +2180,11 @@ mod tests {
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
-    struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
+    struct FakeConfig(
+        Arc<FerrofinServerApplicationPaths>,
+        EncodingOptions,
+        #[allow(dead_code)] tempfile::TempDir,
+    );
 
     #[async_trait]
     impl ServerConfigurationManager for FakeConfig {

@@ -763,7 +763,12 @@ pub async fn build_app_state(
         // the dashboard's Live TV options live (C# `GetTranscodePath()`,
         // `CommonApplicationPaths.DataPath`, the `livetv` named config).
         .with_paths(ferrofin_livetv::LiveTvPaths {
-            transcode_dir: cache_root.child("transcodes"),
+            transcode_dir: {
+                let paths = Arc::clone(&paths);
+                ferrofin_util::directory_path::DirectoryPath::live(move || {
+                    paths.transcode_path().into()
+                })
+            },
             data_dir: std::path::PathBuf::from(paths.data_path()),
             options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
                 .join("named")

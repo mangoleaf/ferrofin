@@ -44,6 +44,7 @@ pub struct FerrofinServerApplicationPaths {
     log_directory_path: PathBuf,
     configuration_directory_path: PathBuf,
     cache_path: RwLock<PathBuf>,
+    transcoding_temp_path: RwLock<Option<PathBuf>>,
     web_path: PathBuf,
     data_path: PathBuf,
     root_folder_path: PathBuf,
@@ -101,6 +102,7 @@ impl FerrofinServerApplicationPaths {
             log_directory_path: log_directory_path.into(),
             configuration_directory_path: configuration_directory_path.into(),
             cache_path: RwLock::new(cache_path.into()),
+            transcoding_temp_path: RwLock::new(None),
             web_path: web_path.into(),
             program_data_path,
         }
@@ -136,6 +138,16 @@ impl FerrofinServerApplicationPaths {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = path.into();
         }
+    }
+
+    /// Selects the live transcode root, resetting to the current cache root for null/empty.
+    /// Whitespace is a configured path, matching `GetTranscodePath`'s empty check.
+    pub fn set_transcode_path(&self, path: Option<&str>) {
+        *self
+            .transcoding_temp_path
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            path.filter(|path| !path.is_empty()).map(PathBuf::from);
     }
 
     /// Prepares a cache root, rejecting conflicting Jellyfin directory markers.
@@ -321,6 +333,18 @@ impl ServerApplicationPaths for FerrofinServerApplicationPaths {
         )
     }
 
+    fn transcode_path(&self) -> String {
+        let configured = self
+            .transcoding_temp_path
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        configured.map_or_else(
+            || path_string(&PathBuf::from(self.cache_path()).join("transcodes")),
+            |path| path_string(&path),
+        )
+    }
+
     fn log_directory_path(&self) -> String {
         path_string(&self.log_directory_path)
     }
@@ -385,6 +409,25 @@ mod tests {
         p.set_internal_metadata_path(Some("/mnt/meta"));
         p.set_internal_metadata_path(None);
         assert_eq!(p.internal_metadata_path(), "/srv/jellyfin/metadata");
+    }
+
+    #[test]
+    fn transcode_root_follows_configured_path_and_live_cache_fallback() {
+        let paths = paths();
+        assert_eq!(paths.transcode_path(), "/var/cache/jf/transcodes");
+        paths.set_transcode_path(Some("/mnt/transcode"));
+        let operation = paths.transcode_path();
+        paths.set_cache_path(Some("/new/cache"));
+        assert_eq!(paths.transcode_path(), "/mnt/transcode");
+        paths.set_transcode_path(Some("/other/transcode"));
+        assert_eq!(operation, "/mnt/transcode");
+        assert_eq!(paths.transcode_path(), "/other/transcode");
+        paths.set_transcode_path(Some(""));
+        assert_eq!(paths.transcode_path(), "/new/cache/transcodes");
+        paths.set_transcode_path(Some("   "));
+        assert_eq!(paths.transcode_path(), "   ");
+        paths.set_transcode_path(None);
+        assert_eq!(paths.transcode_path(), "/new/cache/transcodes");
     }
 
     #[test]
