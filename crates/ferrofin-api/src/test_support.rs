@@ -2999,3 +2999,42 @@ pub fn elevated_state_with_library_and_providers(
         Arc::new(FakeTasks),
     )
 }
+
+/// `name=value` pairs for every query member upstream requires on `method`
+/// `path` (any template spelling), except `except`. The value suits the
+/// member's OpenAPI `schema` type when `operation` gives one, so a probe
+/// request is not refused for a missing required member first.
+#[must_use]
+pub fn required_query(
+    method: &str,
+    path: &str,
+    operation: &serde_json::Value,
+    except: &str,
+) -> String {
+    let method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+        .unwrap_or(axum::http::Method::GET);
+    crate::query::required_members(&method, path)
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(except))
+        .map(|name| {
+            let schema = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                })
+                .map(|p| &p["schema"]);
+            let value = match schema.map(|s| (s["type"].as_str(), s["format"].as_str())) {
+                Some((_, Some("uuid"))) => "00000000000000000000000000000001",
+                Some((Some("integer" | "number"), _)) => "1",
+                Some((Some("boolean"), _)) => "true",
+                _ => "x",
+            };
+            format!("{name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}

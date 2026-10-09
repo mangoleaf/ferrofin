@@ -1273,6 +1273,34 @@ async fn item_by_id_returns_base_item_dto() {
     assert_eq!(json["Name"], "Test Item");
 }
 
+/// An empty query value is `null` (`ConvertEmptyStringToNull`), which
+/// `CheckModel` rejects only for a member whose C# type is non-nullable —
+/// `GetItems`' `bool enableTotalRecordCount = true` — and accepts for a
+/// nullable one (`bool? isFavorite`). Measured on a live Jellyfin 12.2.
+#[tokio::test]
+async fn an_empty_value_is_rejected_only_for_a_non_nullable_member() {
+    let item_id = Uuid::from_u128(0xABCD);
+    for (query, expected) in [
+        ("enableTotalRecordCount=", StatusCode::BAD_REQUEST),
+        ("ENABLETOTALRECORDCOUNT=%20", StatusCode::BAD_REQUEST),
+        ("enableTotalRecordCount=False", StatusCode::OK),
+        ("isFavorite=", StatusCode::OK),
+        ("limit=&recursive=", StatusCode::OK),
+    ] {
+        let response = create_router(ok_state(item_id))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{query}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{query}");
+    }
+}
+
 #[tokio::test]
 async fn item_by_id_missing_is_404() {
     // The library knows only `item_id`; a different id resolves to `None` → 404.

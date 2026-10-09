@@ -62,6 +62,11 @@ impl Pending {
     }
 }
 
+/// The in-process event every debounced change set is published as, its
+/// payload the unfiltered `LibraryUpdateInfo`; never forwarded to clients
+/// (`LibraryChanged` is, filtered per user).
+pub const ITEMS_CHANGED: &str = "ItemsChanged";
+
 /// Accumulates library changes and pushes a folded `LibraryChanged` once the
 /// changes stop arriving.
 pub struct LibraryChangedNotifier {
@@ -204,11 +209,18 @@ impl LibraryChangedNotifier {
         if folded.info.is_empty {
             return;
         }
+        // The whole change set for in-process consumers (the server's own
+        // `ILibraryManager.ItemAdded`/`ItemUpdated`/`ItemRemoved` subscribers,
+        // such as the intro skipper), before any per-user filtering.
+        let payload = serde_json::to_string(&folded.info).ok();
+        if let Some(payload) = &payload {
+            let _ = self.events.publish(ITEMS_CHANGED, payload).await;
+        }
         let Some(audience) = self.audience.get() else {
             // No fan-out wired: one payload to everyone, the pre-existing
             // scan-end behaviour.
-            if let Ok(payload) = serde_json::to_string(&folded.info) {
-                let _ = self.events.publish("LibraryChanged", &payload).await;
+            if let Some(payload) = &payload {
+                let _ = self.events.publish("LibraryChanged", payload).await;
             }
             return;
         };
@@ -666,6 +678,36 @@ mod tests {
             events.library_updates().is_empty(),
             "with an audience wired the push goes per-user, not to the broadcast bus"
         );
+    }
+
+    /// In-process consumers get the whole change set, audience or not, as
+    /// [`ITEMS_CHANGED`] — never as a client push.
+    #[tokio::test(start_paused = true)]
+    async fn in_process_consumers_get_every_change_unfiltered() {
+        let (n, events) = notifier(Duration::from_secs(30));
+        n.set_audience(Arc::new(SplitAudience {
+            visible: Vec::new(),
+            delivered: Mutex::new(Vec::new()),
+        }) as Arc<dyn LibraryChangeAudience>);
+        let item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        n.record_added(std::slice::from_ref(&item));
+        n.record_removed(&[movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())]);
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let published = events.published.lock().expect("lock");
+        let changes: Vec<LibraryUpdateInfo> = published
+            .iter()
+            .filter(|(t, _)| t == ITEMS_CHANGED)
+            .map(|(_, p)| serde_json::from_str(p).expect("payload parses"))
+            .collect();
+        assert_eq!(changes.len(), 1);
+        let id = Uuid::parse_str(&item.id)
+            .expect("uuid")
+            .simple()
+            .to_string();
+        assert_eq!(changes[0].items_added, [id]);
+        assert_eq!(changes[0].items_removed.len(), 1);
+        assert!(published.iter().all(|(t, _)| t != "LibraryChanged"));
     }
 
     // Real clock, not `start_paused`: sqlx's pool acquire times out instantly

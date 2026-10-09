@@ -257,6 +257,34 @@ async fn without_an_item_repository_a_rescan_announces_nothing() {
     assert_eq!(added(&changes).len(), 2, "a rescan announces no additions");
 }
 
+// The scan's changes also reach in-process consumers (the intro skipper's
+// automatic analysis) as `ItemsChanged`, the same set the clients are told.
+#[tokio::test]
+async fn a_scan_announces_its_items_in_process_too() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    std::fs::create_dir_all(&media).expect("mkdir");
+    std::fs::write(media.join("Alien (1979).mkv"), b"").expect("write");
+    let (_db, persistence, vf) = movie_library(tmp.path(), &[&media]).await;
+    let (events, changes) = recording_events();
+    let in_process: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&in_process);
+    events.subscribe(
+        ferrofin_core::library_changed_notifier::ITEMS_CHANGED,
+        Arc::new(move |payload: &str| {
+            sink.lock()
+                .expect("sink")
+                .push(serde_json::from_str(payload).expect("json"));
+            consumer_done()
+        }),
+    );
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_events(events);
+    scanner.scan_all().await.expect("scan");
+    assert_eq!(added(&changes).len(), 1);
+    assert_eq!(added(&in_process), added(&changes));
+}
+
 // Overlapping library locations plan the same kind+path id twice, each copy
 // with its own parent. Only the last copy is refreshed — the one whose row
 // always won — so the file is created and announced once, and a rescan is

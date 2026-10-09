@@ -461,6 +461,31 @@ async fn media_updated_reports_each_body_path() {
     );
 }
 
+/// Sonarr (v5-develop) and Radarr (develop) `MediaBrowserProxy.Update` post
+/// this exact body: Newtonsoft's `CamelCasePropertyNamesContractResolver`,
+/// `Formatting.Indented`, nulls omitted. Jellyfin's binder ignores member-name
+/// case, so it scans; before the shared binder folded names, Ferrofin answered
+/// 204 and scanned nothing.
+#[tokio::test]
+async fn media_updated_binds_the_arr_camel_case_webhook() {
+    for (body, path) in [
+        (
+            "{\n  \"updates\": [\n    {\n      \"path\": \"/tv/The Wire\",\n      \"updateType\": \"Created\"\n    }\n  ]\n}",
+            "/tv/The Wire",
+        ),
+        // `updateType` is null (omitted) when a batch mixes change kinds.
+        (
+            "{\n  \"updates\": [\n    {\n      \"path\": \"/movies/Heat\"\n    }\n  ]\n}",
+            "/movies/Heat",
+        ),
+    ] {
+        let (router, monitor) = router_with(seeded_items());
+        let status = post(router, "/Library/Media/Updated", Some(body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(reported(&monitor), vec![path.to_owned()], "{body}");
+    }
+}
+
 #[tokio::test]
 async fn media_updated_rejects_null_path() {
     let (router, monitor) = router_with(seeded_items());

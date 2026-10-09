@@ -59,13 +59,6 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
-/// TODO(PLAN_JSON_BODY_CASE_INSENSITIVE F11): port the remaining typed
-/// `DynamicHlsController` members — `audioChannels`, `maxAudioChannels`,
-/// `maxRefFrames`, `maxVideoBitDepth`, `maxAudioBitDepth`, `audioSampleRate`,
-/// `deInterlace`, `audioStreamIndex` — through `HlsStreamRequest` into the
-/// planner's `BaseEncodingJobOptions` (whose fields already exist). Until then
-/// only their camelCase spelling reaches the encoder, via the stream-option
-/// fallback; PascalCase is dropped.
 ///
 /// Keys bind ignoring case ([`crate::extract::Query`]): the PlaybackInfo-
 /// negotiated `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase
@@ -107,6 +100,33 @@ struct HlsQuery {
     /// The transcoding profile's max audio channels (drives the `-ac` downmix).
     #[serde(default)]
     transcoding_max_audio_channels: Option<i32>,
+    /// The requested output audio channels (`audioChannels`).
+    #[serde(default)]
+    audio_channels: Option<i32>,
+    /// The maximum output audio channels (`maxAudioChannels`).
+    #[serde(default)]
+    max_audio_channels: Option<i32>,
+    /// The maximum output audio bit depth (`maxAudioBitDepth`).
+    #[serde(default)]
+    max_audio_bit_depth: Option<i32>,
+    /// The maximum reference-frame count (`maxRefFrames`).
+    #[serde(default)]
+    max_ref_frames: Option<i32>,
+    /// The maximum output video bit depth (`maxVideoBitDepth`).
+    #[serde(default)]
+    max_video_bit_depth: Option<i32>,
+    /// Whether the input is force-deinterlaced (`deInterlace`).
+    #[serde(default)]
+    de_interlace: Option<bool>,
+    /// The audio track to transcode (`audioStreamIndex`, a media-stream index).
+    #[serde(default)]
+    audio_stream_index: Option<i32>,
+    /// The video track to transcode (`videoStreamIndex`, a media-stream index).
+    #[serde(default)]
+    video_stream_index: Option<i32>,
+    /// The requested output audio sample rate (`audioSampleRate`).
+    #[serde(default)]
+    audio_sample_rate: Option<i32>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
     /// The contract (and every Jellyfin client) spells this `videoBitRate`
@@ -248,6 +268,15 @@ fn build_request(
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
+        audio_channels: query.audio_channels,
+        max_audio_channels: query.max_audio_channels,
+        max_audio_bit_depth: query.max_audio_bit_depth,
+        max_ref_frames: query.max_ref_frames,
+        max_video_bit_depth: query.max_video_bit_depth,
+        deinterlace: query.de_interlace.unwrap_or(false),
+        audio_stream_index: query.audio_stream_index,
+        video_stream_index: query.video_stream_index,
+        audio_sample_rate: query.audio_sample_rate,
         video_bitrate: query.video_bitrate,
         audio_bitrate: query.audio_bitrate,
         max_width: query.max_width,
@@ -737,6 +766,59 @@ mod tests {
         assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
         let lower: HlsQuery = parse("audioBitrate=96000").expect("parses");
         assert_eq!(lower.audio_bitrate, Some(96_000));
+    }
+
+    /// `DynamicHlsController`'s typed members bind in any casing and reach the
+    /// stream request (upstream reads them before any per-codec stream option).
+    #[test]
+    fn typed_encoding_members_reach_the_request_in_any_casing() {
+        for query in [
+            "AudioChannels=6&MaxAudioChannels=8&MaxAudioBitDepth=24&\
+             MaxRefFrames=4&MaxVideoBitDepth=10&DeInterlace=True&\
+             AudioStreamIndex=3&VideoStreamIndex=0&AudioSampleRate=44100",
+            "audioChannels=6&maxAudioChannels=8&maxAudioBitDepth=24&\
+             maxRefFrames=4&maxVideoBitDepth=10&deInterlace=true&\
+             audioStreamIndex=3&videoStreamIndex=0&audioSampleRate=44100",
+        ] {
+            let req = build_request(
+                uuid::Uuid::from_u128(7),
+                parse(query).expect(query),
+                None,
+                HlsRequestContext::default(),
+            );
+            assert_eq!(req.audio_channels, Some(6), "{query}");
+            assert_eq!(req.max_audio_channels, Some(8), "{query}");
+            assert_eq!(req.max_audio_bit_depth, Some(24), "{query}");
+            assert_eq!(req.max_ref_frames, Some(4), "{query}");
+            assert_eq!(req.max_video_bit_depth, Some(10), "{query}");
+            assert!(req.deinterlace, "{query}");
+            assert_eq!(req.audio_stream_index, Some(3), "{query}");
+            assert_eq!(req.video_stream_index, Some(0), "{query}");
+            assert_eq!(req.audio_sample_rate, Some(44_100), "{query}");
+        }
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            parse("").expect("empty"),
+            None,
+            HlsRequestContext::default(),
+        );
+        assert!(!req.deinterlace);
+        assert_eq!(req.audio_channels, None);
+    }
+
+    /// ASP.NET's `bool.TryParse`: any case, surrounding whitespace, and an
+    /// empty value as unset. `StreamInfo::to_url` emits `True`/`False`.
+    #[test]
+    fn hls_bools_bind_like_bool_try_parse() {
+        let query =
+            parse("EnableSubtitlesInManifest=True&Static=FALSE&AllowVideoStreamCopy=%20true%20")
+                .expect("binds");
+        assert_eq!(query.enable_subtitles_in_manifest, Some(true));
+        assert_eq!(query.is_static, Some(false));
+        assert_eq!(query.allow_video_stream_copy, Some(true));
+        let query = parse("deInterlace=").expect("empty binds");
+        assert_eq!(query.de_interlace, None);
+        assert!(parse("deInterlace=yes").is_err());
     }
 
     #[test]

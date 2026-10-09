@@ -7,13 +7,17 @@
 //! deserialization, so a comma in a scalar is never split.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
 
-use axum::extract::FromRequestParts;
-use axum::http::{StatusCode, Uri, request::Parts};
+use axum::extract::{FromRequestParts, MatchedPath};
+use axum::http::{Method, StatusCode, Uri, request::Parts};
 use axum::response::{IntoResponse, Response};
 use serde::de::{self, DeserializeOwned, Visitor};
+
+pub(crate) mod value;
 
 /// Case-insensitive query binding with first-value scalars and merged collections.
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,18 +74,36 @@ impl<T: QueryParameters> Query<T> {
     /// # Errors
     /// Returns an HTTP 400 query rejection when a value cannot bind to `T`.
     pub fn try_from_uri(uri: &Uri) -> Result<Self, QueryRejection> {
+        Self::bind(uri, &[], &[])
+    }
+
+    /// Binds `uri`'s query, treating an empty value of a `non_nullable` member
+    /// as invalid and an absent `required` one as missing.
+    fn bind(
+        uri: &Uri,
+        non_nullable: &[String],
+        required: &[String],
+    ) -> Result<Self, QueryRejection> {
         let fields = fields::<T>();
         let query = uri.query().unwrap_or_default();
         let normalized = normalize(query, fields, T::COLLECTIONS);
         // Bind directly: adding '=' to bare parameters can grow an otherwise
         // valid request beyond http::Uri's size limit. Use the same deserializer
         // and error paths as axum without constructing another URI.
-        let deserializer = serde_urlencoded::Deserializer::new(form_urlencoded::parse(
-            normalized.as_deref().unwrap_or(query).as_bytes(),
-        ));
-        serde_path_to_error::deserialize(deserializer)
-            .map(Self)
-            .map_err(QueryRejection)
+        let pairs = form_urlencoded::parse(normalized.as_deref().unwrap_or(query).as_bytes());
+        // A struct DTO's values convert like ASP.NET's `SimpleTypeModelBinder`
+        // (`value.rs`); raw pairs (no members) keep `serde_urlencoded`.
+        if fields.is_empty() {
+            serde_path_to_error::deserialize(serde_urlencoded::Deserializer::new(pairs))
+        } else {
+            serde_path_to_error::deserialize(value::Pairs {
+                input: pairs,
+                non_nullable,
+                required,
+            })
+        }
+        .map(Self)
+        .map_err(QueryRejection)
     }
 }
 
@@ -92,7 +114,17 @@ impl<T: QueryParameters + Send, S: Send + Sync> FromRequestParts<S> for Query<T>
         parts: &mut Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready(Self::try_from_uri(&parts.uri))
+        let (non_nullable, required) =
+            parts
+                .extensions
+                .get::<MatchedPath>()
+                .map_or((&[][..], &[][..]), |route| {
+                    (
+                        lookup(&NON_NULLABLE, &parts.method, route.as_str()),
+                        lookup(&REQUIRED, &parts.method, route.as_str()),
+                    )
+                });
+        std::future::ready(Self::bind(&parts.uri, non_nullable, required))
     }
 }
 
@@ -108,6 +140,75 @@ impl<T> DerefMut for Query<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.0
     }
+}
+
+/// A generated per-action table of query member names
+/// (`contracts/gen_query_nullability.py`, which reads every upstream action's
+/// own route attributes).
+struct RouteTable {
+    /// The generated JSON, keyed `METHOD /Upstream/{route}`.
+    json: &'static str,
+    /// Parsed on first use, keyed by [`route_shape`].
+    parsed: OnceLock<HashMap<String, Vec<String>>>,
+}
+
+/// Members whose C# type refuses an empty value (a non-nullable value type,
+/// `[Required]`, or a non-nullable `string`).
+static NON_NULLABLE: RouteTable = RouteTable {
+    json: include_str!("query/non_nullable.json"),
+    parsed: OnceLock::new(),
+};
+
+/// Members that must also be present (`[Required]`, or a non-nullable `string`
+/// without a default): absent, `CheckModel` answers "The X field is required.".
+static REQUIRED: RouteTable = RouteTable {
+    json: include_str!("query/required.json"),
+    parsed: OnceLock::new(),
+};
+
+/// The `table` members of the action at `method` + `route` (an axum route
+/// template). Routes are compared by [`route_shape`]; a route upstream does
+/// not serve has none.
+fn lookup(table: &'static RouteTable, method: &Method, route: &str) -> &'static [String] {
+    let table = table.parsed.get_or_init(|| {
+        let generated: HashMap<String, Vec<String>> =
+            serde_json::from_str(table.json).expect("generated query table is valid");
+        generated
+            .into_iter()
+            .filter_map(|(operation, names)| {
+                let (method, path) = operation.split_once(' ')?;
+                Some((format!("{method} {}", route_shape(path)), names))
+            })
+            .collect()
+    });
+    // ponytail: one small String per typed-query request; a cache keyed by
+    // the matched template is the upgrade if it ever shows in a profile.
+    table
+        .get(&format!("{} {}", method.as_str(), route_shape(route)))
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The query members upstream requires present on `method` + `route` (the
+/// table the extractor enforces), for tests that build valid requests.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn required_members(method: &Method, route: &str) -> &'static [String] {
+    lookup(&REQUIRED, method, route)
+}
+
+/// A route template with every parameter segment erased and literals
+/// case-folded (`/Users/{userId}/Items` and `/Users/{user_id}/items` are one
+/// shape), so upstream's templates match the router's.
+fn route_shape(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.contains('{') {
+                "{}".to_owned()
+            } else {
+                segment.to_ascii_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Serde calls `deserialize_struct` with aliases as well as declared names.
@@ -320,6 +421,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_generated_non_nullable_table_resolves_router_templates() {
+        use axum::http::Method;
+        // `GetItems`: `bool enableTotalRecordCount = true` (non-nullable);
+        // `GetLatestMedia`: `int limit = 20`, `bool groupItems = true`.
+        assert!(
+            super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items")
+                .contains(&"enableTotalRecordCount".to_owned())
+        );
+        let latest = super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items/Latest");
+        assert!(latest.contains(&"limit".to_owned()) && latest.contains(&"groupItems".to_owned()));
+        // Obsolete actions the OpenAPI document omits, under the router's own
+        // parameter names and literal case, and HEAD aliases.
+        assert!(
+            super::lookup(&super::NON_NULLABLE, &Method::GET, "/users/{user_id}/items")
+                .contains(&"enableTotalRecordCount".to_owned())
+        );
+        assert!(
+            super::lookup(
+                &super::NON_NULLABLE,
+                &Method::HEAD,
+                "/Audio/{item_id}/universal"
+            )
+            .contains(&"enableRedirection".to_owned())
+        );
+        // A nullable member is never listed; an unknown route has none.
+        assert!(
+            !super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items")
+                .contains(&"isFavorite".to_owned())
+        );
+        assert!(super::lookup(&super::NON_NULLABLE, &Method::GET, "/NotAContractRoute").is_empty());
+    }
+
+    #[test]
     fn wrappers_capture_the_inner_fields() {
         #[derive(serde::Deserialize)]
         struct Wrapper(#[allow(dead_code)] Parameters);
@@ -387,24 +521,24 @@ pub(crate) mod tests {
 
     #[test]
     fn first_scalar_wins_in_wire_order_including_empty_and_encoded_values() {
+        // An empty or whitespace-only first value is `null`, not "" —
+        // `SimpleTypeModelBinder`'s `ConvertEmptyStringToNull` (measured on a
+        // live Jellyfin 12.2: `?recursive=`, `?limit=`, `?isFavorite=` are 200
+        // and unfiltered).
         for (query, expected) in [
-            ("name=a&name=b&name=c", "a"),
-            ("NAME=b&name=a", "b"),
-            ("name=&NAME=second", ""),
-            ("name&name=second", ""),
-            ("name=%20&name=second", " "),
-            ("name=a,b&name=c", "a,b"),
-            ("name=a%2Cb&NAME=c", "a,b"),
-            ("na%6De=a%26b%3Dc%2Bd&name=second", "a&b=c+d"),
-            ("name=a+b&name=second", "a b"),
-            ("name=%252C&name=second", "%2C"),
-            ("unknown=x&NAME=%C3%A9&name=second&unknown=y", "é"),
+            ("name=a&name=b&name=c", Some("a")),
+            ("NAME=b&name=a", Some("b")),
+            ("name=&NAME=second", None),
+            ("name&name=second", None),
+            ("name=%20&name=second", None),
+            ("name=a,b&name=c", Some("a,b")),
+            ("name=a%2Cb&NAME=c", Some("a,b")),
+            ("na%6De=a%26b%3Dc%2Bd&name=second", Some("a&b=c+d")),
+            ("name=a+b&name=second", Some("a b")),
+            ("name=%252C&name=second", Some("%2C")),
+            ("unknown=x&NAME=%C3%A9&name=second&unknown=y", Some("é")),
         ] {
-            assert_eq!(
-                mixed(query).unwrap().name.as_deref(),
-                Some(expected),
-                "{query}"
-            );
+            assert_eq!(mixed(query).unwrap().name.as_deref(), expected, "{query}");
         }
     }
 
@@ -470,9 +604,10 @@ pub(crate) mod tests {
             .parse()
             .unwrap();
         let query = Query::<Mixed>::try_from_uri(&uri).unwrap();
-        assert_eq!(query.name.as_deref(), Some(""));
-        assert_eq!(query.fields.as_deref(), Some(""));
-        assert_eq!(query.genres.as_deref(), Some(""));
+        // Bare keys carry empty values, which bind as `null`.
+        assert_eq!(query.name.as_deref(), None);
+        assert_eq!(query.fields.as_deref(), None);
+        assert_eq!(query.genres.as_deref(), None);
     }
 
     #[test]
@@ -503,12 +638,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // axum's own binder is the oracle for the rejection shape here.
+    #[allow(clippy::disallowed_types)]
     async fn invalid_queries_preserve_axums_rejection_response() {
         use axum::response::IntoResponse;
 
         for (input, first_only) in [
             ("LIMIT=bad&limit=7", "limit=bad"),
-            ("RECURSIVE=&recursive=true", "recursive="),
+            ("RECURSIVE=maybe&recursive=true", "recursive=maybe"),
             ("USERID=invalid&userId=", "userId=invalid"),
         ] {
             let actual = mixed(input).unwrap_err().into_response();

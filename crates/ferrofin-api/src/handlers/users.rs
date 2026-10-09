@@ -360,13 +360,54 @@ async fn authenticate_by_name(
     parts: Parts,
     JsonBody(body): JsonBody<AuthenticateByNameRequest>,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
-    let auth = auth_info(&parts);
+    Box::pin(authenticate(&state, &parts, body)).await
+}
+
+/// The query of `POST /Users/{userId}/Authenticate` (`[FromQuery, Required]
+/// string pw`; an absent one is refused by the extractor's required table).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthenticateByIdQuery {
+    /// The plaintext password.
+    #[serde(default)]
+    pw: Option<Secret>,
+}
+
+/// `POST /Users/{userId}/Authenticate` — authenticate by user id + password.
+///
+/// Port of the obsolete `UserController.AuthenticateUser`
+/// (`[ApiExplorerSettings(IgnoreApi = true)]`, so absent from the OpenAPI
+/// contract, but still served upstream and anonymous): 404 "User not found",
+/// else exactly `AuthenticateUserByName` with that user's name.
+async fn authenticate_by_id(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<AuthenticateByIdQuery>,
+    parts: Parts,
+) -> Result<Json<AuthenticationResult>, ApiError> {
+    let Some(user) = state.users.get_user_by_id(user_id).await? else {
+        return Err(ApiError::NotFound("User not found".to_owned()));
+    };
+    let body = AuthenticateByNameRequest {
+        username: Some(user.username),
+        pw: query.pw,
+    };
+    Box::pin(authenticate(&state, &parts, body)).await
+}
+
+/// `UserController.AuthenticateUserByName`'s body, shared by both login routes.
+async fn authenticate(
+    state: &AppState,
+    parts: &Parts,
+    body: AuthenticateByNameRequest,
+) -> Result<Json<AuthenticationResult>, ApiError> {
+    let auth = auth_info(parts);
     // C# `UserController.AuthenticateUserByName` sets
     // `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()`. It ends
     // up on `SessionInfo.RemoteEndPoint`, which is what `GET /Sessions` reports
     // and what every activity-log `ShortOverview` ("IP address: …") is built
     // from — so a `None` here silently blanks both.
-    let remote_ip = state.client_address(&parts).to_string();
+    let remote_ip = state.client_address(parts).to_string();
     let request = AuthenticationRequest {
         username: body.username,
         user_id: None,
@@ -384,7 +425,7 @@ async fn authenticate_by_name(
             // Port of `AuthenticationFailedLogger`: failed logins land in the
             // dashboard's Alerts feed (no user id, Error severity).
             log_activity(
-                &state,
+                state,
                 ferrofin_traits::activity::ActivityLogCreate {
                     name: format!("Failed login attempt from {username}"),
                     type_: "AuthenticationFailed".to_owned(),
@@ -405,7 +446,7 @@ async fn authenticate_by_name(
     // handler instead put it before the (spawned) SessionStarted row and showed
     // the dashboard's login pair backwards. The consumer lives beside the
     // SessionStarted one in the composition root.
-    Ok(Json(authentication_result(&state, result).await))
+    Ok(Json(authentication_result(state, result).await))
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -1100,6 +1141,7 @@ async fn update_user_password_for_user(
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Users/AuthenticateByName", post(authenticate_by_name))
+        .route("/Users/{userId}/Authenticate", post(authenticate_by_id))
         .route(
             "/Users/AuthenticateWithQuickConnect",
             post(authenticate_with_quick_connect),
@@ -1132,6 +1174,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 crate::query::query_parameters! {
     UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
     GetUsersQuery {} => [("get", "/Users")];
+    AuthenticateByIdQuery {} => [];
 }
 
 #[cfg(test)]

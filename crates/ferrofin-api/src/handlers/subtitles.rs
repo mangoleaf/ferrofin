@@ -316,9 +316,11 @@ struct SubtitleStreamQuery {
     /// Optional. Whether to prepend a WebVTT `X-TIMESTAMP-MAP` header.
     #[serde(default)]
     add_vtt_time_map: bool,
-    /// The start position of the subtitle in ticks.
+    /// The start position of the subtitle in ticks. Nullable: upstream's
+    /// route-ticks action takes `long? startPositionTicks` (an empty value is
+    /// unset there), the other `long startPositionTicks = 0`.
     #[serde(default)]
-    start_position_ticks: i64,
+    start_position_ticks: Option<i64>,
 }
 
 /// Serves an encoded subtitle: converts the stream, then wraps the bytes with the
@@ -338,7 +340,7 @@ async fn encode_subtitle_response(
             media_source_id,
             index,
             format,
-            query.start_position_ticks,
+            query.start_position_ticks.unwrap_or(0),
             query.end_position_ticks.unwrap_or(0),
             query.copy_timestamps,
         )
@@ -429,12 +431,11 @@ async fn get_subtitle_with_ticks(
     )>,
     Query(mut query): Query<SubtitleStreamQuery>,
 ) -> Result<Response, ApiError> {
-    // The route-supplied start position wins unless the query overrides it (the
-    // C# `startPositionTicks ?? routeStartPositionTicks`); serde defaults the
-    // query field to 0, so a 0 there yields the route value.
-    if query.start_position_ticks == 0 {
-        query.start_position_ticks = start_position_ticks;
-    }
+    // The route-supplied start position applies unless the query names one
+    // (the C# `startPositionTicks ?? routeStartPositionTicks`).
+    query
+        .start_position_ticks
+        .get_or_insert(start_position_ticks);
     let format = parse_subtitle_format(&route_format);
     encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
 }
@@ -707,16 +708,40 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// the provider. `200` means the credentials work; a rejected login is `401`, a
 /// missing account and API key override `400`. The API key is optional when
 /// account credentials are provided (Jellyfin's shared key is used).
+///
+/// The body binds like every MVC body (member names ignoring case), then
+/// reaches the provider in its canonical PascalCase.
 async fn validate_open_subtitles_login(
     RequireAuth(_auth): RequireAuth,
     State(state): State<AppState>,
-    body: axum::body::Bytes,
+    JsonBody(body): JsonBody<LoginInfoBody>,
 ) -> Result<StatusCode, ApiError> {
+    let canonical =
+        serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
     state
         .subtitles
-        .validate_provider_login("opensubtitles", &body)
+        .validate_provider_login("opensubtitles", &canonical)
         .await?;
     Ok(StatusCode::OK)
+}
+
+/// The `ValidateLoginInfo` body: upstream's `LoginInfoInput`
+/// (`Username`/`Password`, bound by the MVC binder) plus Ferrofin's optional
+/// `ApiKey` override.
+///
+/// No `Debug`: it carries a plaintext password.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LoginInfoBody {
+    /// The optional API key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    /// The account username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    /// The account password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
 }
 
 crate::query::query_parameters! {

@@ -10,6 +10,10 @@ description = "Curated, compiled-in extensions (Jellyfin plugins) for Ferrofin, 
 workspace = true
 
 [dependencies]
+chrono.workspace = true
+sha2.workspace = true
+futures-util.workspace = true
+fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
@@ -24,6 +28,13 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+
+# `ProcessPriority`: the OS priority of analysis processes.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

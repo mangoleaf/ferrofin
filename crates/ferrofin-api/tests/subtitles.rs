@@ -339,9 +339,15 @@ impl SubtitleEncoder for StubEncoder {
     }
 }
 
-/// A [`SubtitleManager`] recording deletes and returning empty search results.
+/// The `(provider, config bytes)` of each `validate_provider_login` call.
+type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A [`SubtitleManager`] recording deletes and provider-login validations, and
+/// returning empty search results.
+#[derive(Default)]
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+    logins: Logins,
 }
 
 #[async_trait]
@@ -378,6 +384,17 @@ impl SubtitleManager for CannedSubtitles {
         _item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::providers::SubtitleProviderInfo>, ServiceError> {
         Ok(Vec::new())
+    }
+    async fn validate_provider_login(
+        &self,
+        provider_name: &str,
+        config_json: &[u8],
+    ) -> Result<(), ServiceError> {
+        self.logins
+            .lock()
+            .unwrap()
+            .push((provider_name.to_owned(), config_json.to_vec()));
+        Ok(())
     }
 }
 
@@ -665,14 +682,52 @@ async fn subtitle_playlist_unknown_source_is_not_found() {
 
 #[tokio::test]
 async fn subtitle_remote_search_is_empty_list() {
-    let app = remote_search_state(Arc::new(CannedSubtitles {
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    }));
+    let app = remote_search_state(Arc::new(CannedSubtitles::default()));
     let (status, body, _) =
         call(app, &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng")).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.as_array().unwrap().is_empty());
+}
+
+// ---- OpenSubtitles login validation ----------------------------------------
+
+/// Upstream binds `[FromBody] LoginInfoInput` through the MVC binder, so member
+/// names bind ignoring case; the provider receives the canonical PascalCase
+/// shape it deserializes (`OpenSubtitlesConfig`).
+#[tokio::test]
+async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let app = remote_search_state(subtitles.clone());
+    let post = |content_type: Option<&'static str>, body: &'static str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo");
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
+        create_router(app.clone()).oneshot(request.body(Body::from(body)).unwrap())
+    };
+    let response = post(
+        Some("application/json"),
+        r#"{"username":"u","PASSWORD":"p","apiKey":"k"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let logins = subtitles.logins.lock().unwrap().clone();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].0, "opensubtitles");
+    let forwarded: serde_json::Value = serde_json::from_slice(&logins[0].1).unwrap();
+    assert_eq!(
+        forwarded,
+        serde_json::json!({"ApiKey": "k", "Username": "u", "Password": "p"})
+    );
+
+    // `[ApiController]`: no JSON content type is 415, before any login.
+    let response = post(None, r#"{"Username":"u"}"#).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(subtitles.logins.lock().unwrap().len(), 1);
 }
 
 // ---- FallbackFont ----------------------------------------------------------

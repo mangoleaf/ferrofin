@@ -125,7 +125,10 @@ struct AddVirtualFolderQuery {
     #[serde(default)]
     name: Option<String>,
     /// The collection type of the library.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     collection_type: Option<CollectionTypeOptions>,
     /// The media paths (comma-delimited).
     #[serde(default)]

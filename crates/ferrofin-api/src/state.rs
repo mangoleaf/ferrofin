@@ -192,6 +192,16 @@ pub struct Inner {
     /// composition root injects the watcher-backed `FerrofinLibraryMonitor` via
     /// [`AppState::with_library_monitor`].
     pub library_monitor: Arc<dyn LibraryMonitor>,
+    /// The Intro Skipper's per-season analyzer actions
+    /// (`/Intros/AnalyzerActions/*`). Defaults to a process-local store; the
+    /// composition root injects the database-backed one via
+    /// [`AppState::with_intro_skipper_store`].
+    pub intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    /// The Intro Skipper's analysis runtime (season rescans, the scan latch,
+    /// the detection cache). Defaults to a detached handle; the composition
+    /// root injects the extension's via
+    /// [`AppState::with_intro_skipper_analysis`].
+    pub intro_skipper_analysis: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperAnalysis>,
 
     /// The Tier-1 (compile-time) plugin manager backing `/Plugins/*`,
     /// `/Packages/*` and `/Repositories`. Defaults to the disabled stub (no
@@ -354,6 +364,12 @@ impl AppState {
             // Default to the no-op library monitor; the composition root overrides
             // it via `with_library_monitor` once the filesystem watcher is wired.
             library_monitor: Arc::new(NoopLibraryMonitor),
+            intro_skipper: Arc::new(
+                ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
+            ),
+            intro_skipper_analysis: Arc::new(
+                ferrofin_traits::intro_skipper::DetachedIntroSkipperAnalysis,
+            ),
             // Default to the disabled plugin manager; the composition root injects
             // the registry-backed `FerrofinPluginManager` via `with_plugins`.
             plugins: Arc::new(DisabledPluginManager),
@@ -422,6 +438,42 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_virtual_folders must be called before the state is shared");
         inner.virtual_folders = virtual_folders;
+        self
+    }
+
+    /// Replaces the Intro Skipper's analyzer-action store with the
+    /// database-backed one ([`new`](Self::new) installs a process-local store
+    /// so every test constructor keeps compiling).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_intro_skipper_store(
+        mut self,
+        store: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_intro_skipper_store must be called before the state is shared");
+        inner.intro_skipper = store;
+        self
+    }
+
+    /// Replaces the Intro Skipper's analysis runtime with the extension's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_intro_skipper_analysis(
+        mut self,
+        analysis: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperAnalysis>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_intro_skipper_analysis must be called before the state is shared");
+        inner.intro_skipper_analysis = analysis;
         self
     }
 

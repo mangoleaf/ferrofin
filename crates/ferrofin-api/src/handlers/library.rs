@@ -414,7 +414,10 @@ async fn get_physical_paths(
 #[serde(rename_all = "camelCase")]
 struct AvailableOptionsQuery {
     /// Optional. The library content (collection) type to scope the options to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     library_content_type: Option<ferrofin_model::data::CollectionType>,
     /// Optional. Whether this is a new library (jellyfin-web's add-library
     /// dialog sends `true`): it decides which fetchers and savers report

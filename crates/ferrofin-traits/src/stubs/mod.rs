@@ -17,6 +17,7 @@
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
 pub mod channels;
+pub mod chapters;
 pub mod hls_stream;
 pub mod library_monitor;
 pub mod live_tv;
