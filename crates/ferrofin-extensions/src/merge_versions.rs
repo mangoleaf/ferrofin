@@ -1842,6 +1842,7 @@ mod tests {
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
+            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

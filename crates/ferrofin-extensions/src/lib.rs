@@ -58,6 +58,8 @@ pub struct ExtensionContext {
     /// The libraries and their options (which libraries an extension may
     /// analyse).
     pub virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    /// Items' chapters (analysis snaps segment bounds to them).
+    pub chapters: Arc<dyn ferrofin_traits::chapters::ChapterManager>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -185,6 +187,7 @@ mod tests {
             virtual_folders: Arc::new(
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
+            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
         }
     }
 

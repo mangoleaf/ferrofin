@@ -268,6 +268,13 @@ pub trait IntroSkipperStore: Send + Sync {
     /// Every stored segment of the item (`GetSegmentsAsync`).
     async fn segments(&self, item_id: Uuid) -> Result<Vec<StoredSegment>, ServiceError>;
 
+    /// Every stored segment of the items, by item, in one read (the segment
+    /// half of `GetSeasonQueueSnapshotAsync`); items without one are absent.
+    async fn segments_of(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<StoredSegment>>, ServiceError>;
+
     /// The item's segments, or none when it is a disabled episode
     /// (`GetSegmentsUnlessExcludedAsync`).
     async fn segments_unless_excluded(
@@ -460,6 +467,7 @@ struct Memory {
     states: HashMap<(Uuid, AnalysisMode), SeasonState>,
     segments: Vec<StoredSegment>,
     disabled: HashSet<(Uuid, Uuid)>,
+    read_only: bool,
 }
 
 /// A process-local [`IntroSkipperStore`]: the default of a state built without
@@ -472,6 +480,14 @@ impl InMemoryIntroSkipperStore {
         self.0
             .lock()
             .map_err(|_| ServiceError::backend("intro skipper store poisoned"))
+    }
+
+    /// Makes segment writes fail (or succeed again), as a full disk or a
+    /// locked database would — for tests of the failure paths.
+    pub fn set_read_only(&self, read_only: bool) {
+        if let Ok(mut memory) = self.0.lock() {
+            memory.read_only = read_only;
+        }
     }
 }
 
@@ -515,6 +531,9 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
 
     async fn update_timestamp(&self, segment: StoredSegment) -> Result<bool, ServiceError> {
         let mut memory = self.lock()?;
+        if memory.read_only {
+            return Err(ServiceError::backend("intro skipper store is read-only"));
+        }
         let existing: Vec<StoredSegment> = memory
             .segments
             .iter()
@@ -546,6 +565,22 @@ impl IntroSkipperStore for InMemoryIntroSkipperStore {
             .filter(|s| s.item_id == item_id)
             .cloned()
             .collect())
+    }
+
+    async fn segments_of(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<StoredSegment>>, ServiceError> {
+        let mut by_item: HashMap<Uuid, Vec<StoredSegment>> = HashMap::new();
+        for segment in &self.lock()?.segments {
+            if item_ids.contains(&segment.item_id) {
+                by_item
+                    .entry(segment.item_id)
+                    .or_default()
+                    .push(segment.clone());
+            }
+        }
+        Ok(by_item)
     }
 
     async fn segments_unless_excluded(

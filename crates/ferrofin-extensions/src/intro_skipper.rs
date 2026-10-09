@@ -12,20 +12,19 @@
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the
 //! `IntroSkipper.Detect` scheduled task and as the provider behind the
 //! "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`). The task
-//! self-gates on the plugin's enabled flag and no-ops when no Chromaprint
-//! backend is available.
+//! self-gates on the plugin's enabled flag; without a Chromaprint backend it
+//! warns and runs the analyzers that do not need one.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ferrofin_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episodes};
+use ferrofin_chromaprint::AnalysisMode;
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
-use ferrofin_model::intro_skipper::{AnalysisMode as WireMode, AnalyzerAction};
+use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::intro_skipper::{self as intro_store, IntroSkipperAnalysis, StoredSegment};
+use ferrofin_traits::intro_skipper::{self as intro_store, IntroSkipperAnalysis};
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
@@ -34,6 +33,8 @@ use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
 
+mod config_hash;
+mod engine;
 mod queue;
 use crate::{Extension, ExtensionContext};
 
@@ -129,6 +130,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
         running: Arc::clone(&cx.intro_skipper_running),
         actions: Arc::clone(&cx.intro_skipper),
         virtual_folders: Arc::clone(&cx.virtual_folders),
+        chapters: Arc::clone(&cx.chapters),
     }
 }
 
@@ -543,47 +545,6 @@ impl Default for IntroSkipperConfig {
     }
 }
 
-impl IntroSkipperConfig {
-    /// The [`CompareConfig`] for a given mode.
-    fn compare_config(&self, mode: AnalysisMode) -> CompareConfig {
-        let min_seconds = match mode {
-            AnalysisMode::Credits => self.minimum_credits_duration,
-            AnalysisMode::Recap => self.minimum_recap_duration,
-            AnalysisMode::Introduction => self.minimum_intro_duration,
-        };
-        CompareConfig {
-            inverted_index_shift: self.inverted_index_shift,
-            max_bit_diff: u32::try_from(self.maximum_fingerprint_point_differences).unwrap_or(6),
-            max_time_skip: self.maximum_time_skip,
-            min_region_duration: f64::from(min_seconds),
-        }
-    }
-}
-
-/// A single episode reduced to what the analyzer needs.
-struct Episode {
-    id: Uuid,
-    path: String,
-    /// The intro window's end (`QueuedEpisode.IntroFingerprintEnd`).
-    intro_end: f64,
-    /// The credits window (`CreditsFingerprintStart`/`End`).
-    credits: (f64, f64),
-}
-
-impl From<&queue::QueuedEpisode> for Episode {
-    fn from(entry: &queue::QueuedEpisode) -> Self {
-        Self {
-            id: entry.episode_id,
-            path: entry.path.clone(),
-            intro_end: entry.intro_fingerprint_end,
-            credits: (
-                entry.credits_fingerprint_start,
-                entry.credits_fingerprint_end,
-            ),
-        }
-    }
-}
-
 /// The scheduled task that detects intros/credits across the library.
 #[derive(Clone)]
 struct DetectSegmentsTask {
@@ -599,6 +560,8 @@ struct DetectSegmentsTask {
     actions: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
     /// The libraries, whose options decide which ones are analysed.
     virtual_folders: Arc<dyn VirtualFolderManager>,
+    /// Items' chapters (segment bounds snap to them).
+    chapters: Arc<dyn ferrofin_traits::chapters::ChapterManager>,
 }
 
 #[allow(clippy::unnecessary_literal_bound)]
@@ -624,14 +587,16 @@ impl ScheduledTask for DetectSegmentsTask {
             tracing::debug!("intro skipper disabled; skipping analysis");
             return Ok(());
         }
-        let Some(fingerprinter) = self.fingerprinter.clone() else {
+        // Upstream analyses without Chromaprint too: the other analyzers still
+        // run, and the season state records it (a later Chromaprint changes
+        // the configuration hash, so those episodes are analysed again).
+        if self.fingerprinter.is_none() {
             tracing::warn!(
                 "intro skipper: no Chromaprint backend — use an ffmpeg built with the \
                  `chromaprint` muxer (jellyfin-ffmpeg is), or install `chromaprint`/`fpcalc`, \
                  to enable intro/credits detection"
             );
-            return Ok(());
-        };
+        }
         // One pass at a time (belt to the task manager's Running guard, since
         // `/Intros/ScanSeason` can also start the task).
         if self.running.swap(true, Ordering::SeqCst) {
@@ -647,7 +612,7 @@ impl ScheduledTask for DetectSegmentsTask {
         // task, so this body's runtime IS the dashboard's Running state — a
         // fire-and-forget here would flip the task back to Idle in
         // milliseconds and the run button would appear to do nothing.
-        self.run_analysis(progress, &fingerprinter, &config).await;
+        self.run_analysis(progress, &config).await;
         Ok(())
     }
 }
@@ -670,15 +635,11 @@ impl DetectSegmentsTask {
         queue::build(self.library.as_ref(), &folders, config, true).await
     }
 
-    /// The background analysis pass: build the queue, then detect + write
-    /// segments for each season the Chromaprint analyzer can compare.
+    /// The background analysis pass (`DetectSegmentsTask` →
+    /// `AnalyzeItemsAsync`): build the queue, analyse it, then drop the state
+    /// of seasons no longer in it.
     #[tracing::instrument(name = "extension_run", skip_all, fields(extension = "intro_skipper"))]
-    async fn run_analysis(
-        &self,
-        progress: &TaskProgress,
-        fingerprinter: &Arc<dyn Fingerprinter>,
-        config: &IntroSkipperConfig,
-    ) {
+    async fn run_analysis(&self, progress: &TaskProgress, config: &IntroSkipperConfig) {
         let queue = match self.queue(config).await {
             Ok(queue) => queue,
             Err(err) => {
@@ -686,54 +647,7 @@ impl DetectSegmentsTask {
                 return;
             }
         };
-        // Only seasons with a comparable pair do work; drive progress off those
-        // so the percentage tracks the fingerprinting rather than the skipped
-        // singletons.
-        let analyzable: Vec<(Uuid, Vec<Episode>)> = queue
-            .iter()
-            .filter_map(|(season, entries)| Some((*season, analyzable(entries, config)?)))
-            .collect();
-        let total = analyzable.len();
-        tracing::info!(
-            seasons = queue.len(),
-            analyzable = total,
-            "intro skipper: analysis started"
-        );
-        let mut written = 0usize;
-        let mut unreadable = 0usize;
-        let mut first_error = None;
-        for (idx, (season_id, episodes)) in analyzable.iter().enumerate() {
-            // Log + report BEFORE the season's fingerprinting (the slow part), so
-            // a stall shows up as the last "analyzing season N" line with silence
-            // after — pinpointing which season's media reads wedged.
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(100.0 * idx as f64 / total.max(1) as f64);
-            tracing::info!(
-                season = idx + 1,
-                of = total,
-                episodes = episodes.len(),
-                segments = written,
-                "intro skipper: analyzing season"
-            );
-            let actions = match self.actions.analyzer_actions(*season_id).await {
-                Ok(actions) => Some(actions),
-                Err(err) => {
-                    first_error.get_or_insert(err);
-                    None
-                }
-            };
-            unreadable += usize::from(actions.is_none());
-            written += self
-                .analyze_season(actions.as_ref(), episodes, config, fingerprinter.as_ref())
-                .await;
-        }
-        if unreadable > 0 {
-            tracing::warn!(
-                seasons = unreadable,
-                err = %first_error.map(|e| e.to_string()).unwrap_or_default(),
-                "intro skipper: seasons skipped, their analyzer actions could not be read"
-            );
-        }
+        let stored = self.analyze_queue(&queue, config, progress).await;
         // `CleanCacheTask` → `CleanSeasonStateAsync` over the whole queue
         // (excluded seasons included): drop the state of seasons that no
         // longer have items, so a season re-created under the same id does not
@@ -743,7 +657,7 @@ impl DetectSegmentsTask {
             tracing::warn!(%err, "intro skipper: could not drop stale season state");
         }
         progress.report(100.0);
-        tracing::info!(segments = written, "intro skipper: analysis complete");
+        tracing::info!(analyzed = stored, "intro skipper: analysis complete");
     }
 
     /// Publishes every stored item's segments (the plugin's `SegmentProvider`
@@ -817,25 +731,11 @@ impl DetectSegmentsTask {
                 }
             }
         }
-        let Some(fingerprinter) = self.fingerprinter.clone() else {
-            tracing::warn!("intro skipper: no Chromaprint backend to rescan with");
-            return;
-        };
-        let actions = match self.actions.analyzer_actions(season_id).await {
-            Ok(actions) => actions,
-            Err(err) => {
-                tracing::error!(%err, %season_id, "intro skipper: could not read the season's analyzer actions");
-                return;
-            }
-        };
-        let Some(episodes) = analyzable(&entries, &config) else {
-            tracing::info!(%season_id, "intro skipper: nothing in the season to compare");
-            return;
-        };
-        let written = self
-            .analyze_season(Some(&actions), &episodes, &config, fingerprinter.as_ref())
+        // `AnalyzeItemsAsync(seasonsToAnalyze: [seasonId])`.
+        let stored = self
+            .analyze_queue(&[(season_id, entries)], &config, &TaskProgress::default())
             .await;
-        tracing::info!(%season_id, segments = written, "intro skipper: season rescanned");
+        tracing::info!(%season_id, analyzed = stored, "intro skipper: season rescanned");
     }
 
     /// Deletes fingerprint files (`{item}.{mode tag}.{start}-{end}.fp`) of
@@ -849,9 +749,9 @@ impl DetectSegmentsTask {
     ) -> Result<u64, ServiceError> {
         let tags: Option<&[&str]> = match mode {
             None => None,
-            Some(WireMode::Introduction) => Some(&["intro"]),
-            // `credits` is the tag of the orphaned v1 cache (see `mode_tag`).
-            Some(WireMode::Credits) => Some(&["credits2", "credits"]),
+            // Older tags are orphaned caches of the same mode (see `mode_tag`).
+            Some(WireMode::Introduction) => Some(&["intro2", "intro"]),
+            Some(WireMode::Credits) => Some(&["credits3", "credits2", "credits"]),
             Some(_) => return Ok(0),
         };
         let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
@@ -903,289 +803,33 @@ impl DetectSegmentsTask {
         }
     }
 
-    /// Fingerprints, compares and writes segments for one season's episodes,
-    /// returning how many segments were written.
-    async fn analyze_season(
-        &self,
-        actions: Option<&HashMap<WireMode, AnalyzerAction>>,
-        episodes: &[Episode],
-        config: &IntroSkipperConfig,
-        fingerprinter: &dyn Fingerprinter,
-    ) -> usize {
-        // `BaseItemAnalyzerTask.AnalyzeItemsAsync`: a mode whose per-season
-        // action is `None` is not analysed for the season. Upstream throws on a
-        // failed read; the season is skipped (and counted by the caller), never
-        // analysed against a `None` it could not see.
-        // TODO: `Chapter`/`BlackFrame`/`Chromaprint` pick which analyzer leads
-        // upstream's chain (`BaseItemAnalyzerTask.cs:392-412`); Ferrofin has
-        // only the Chromaprint analyzer, so every non-`None` action runs it.
-        // Un-defer by porting `ChapterAnalyzer` + `BlackFrameAnalyzer` and
-        // building the chain from the action here.
-        let Some(actions) = actions else {
-            return 0;
-        };
-        let skip = |mode: WireMode| {
-            let none = actions.get(&mode) == Some(&AnalyzerAction::None);
-            if none {
-                tracing::debug!(
-                    ?mode,
-                    "intro skipper: mode skipped by the season's analyzer action"
-                );
-            }
-            none
-        };
-        let mut intros = 0;
-        if config.scan_introduction && !skip(WireMode::Introduction) {
-            let mut best = self
-                .detect(episodes, config, fingerprinter, AnalysisMode::Introduction)
-                .await;
-            apply_intro_offsets(&mut best, config);
-            intros = self
-                .write_segments(
-                    &best,
-                    WireMode::Introduction,
-                    f64::from(config.maximum_intro_duration),
-                    config,
-                )
-                .await;
-        }
-        let mut credits = 0;
-        if config.scan_credits && !skip(WireMode::Credits) {
-            let best = self
-                .detect(episodes, config, fingerprinter, AnalysisMode::Credits)
-                .await;
-            credits = self
-                .write_segments(
-                    &best,
-                    WireMode::Credits,
-                    f64::from(config.maximum_credits_duration),
-                    config,
-                )
-                .await;
-        }
-        // Per-mode counts, so "intros land but credits never do" is one log
-        // line instead of an investigation (the two windows fingerprint by
-        // different routes — the credits one decodes an intermediate WAV).
-        tracing::info!(
-            episodes = episodes.len(),
-            intros,
-            credits,
-            "intro skipper: season analyzed"
-        );
-        intros + credits
-    }
-
-    /// Fingerprints each episode's window for `mode`, compares every pair, and
-    /// returns the longest valid shared region found per episode.
-    async fn detect(
-        &self,
-        episodes: &[Episode],
-        config: &IntroSkipperConfig,
-        fingerprinter: &dyn Fingerprinter,
-        mode: AnalysisMode,
-    ) -> HashMap<Uuid, TimeRange> {
-        // Fingerprint (cached) each episode's window for this mode.
-        struct Print<'a> {
-            episode: &'a Episode,
-            start: f64,
-            fp: Vec<u32>,
-        }
-        let mut fingerprints: Vec<Print> = Vec::new();
-        for ep in episodes {
-            let (start, end) = window(ep, mode);
-            let min_window = f64::from(
-                config
-                    .minimum_intro_duration
-                    .min(config.minimum_credits_duration),
-            );
-            if end - start < min_window {
-                continue;
-            }
-            match self
-                .fingerprint_cached(ep, start, end, mode, fingerprinter)
-                .await
-            {
-                Ok(fp) => fingerprints.push(Print {
-                    episode: ep,
-                    start,
-                    fp,
-                }),
-                // Warn, not debug: a window that never fingerprints silently
-                // removes a whole segment type (the credits decode failing on a
-                // full container /tmp looked exactly like "Skip Credits is not
-                // implemented").
-                Err(err) => tracing::warn!(
-                    %err,
-                    path = ep.path,
-                    ?mode,
-                    "intro skipper: fingerprint failed — no segment for this window"
-                ),
-            }
-        }
-
-        let cmp = config.compare_config(mode);
-        let mut best: HashMap<Uuid, TimeRange> = HashMap::new();
-        for i in 0..fingerprints.len() {
-            for j in (i + 1)..fingerprints.len() {
-                let a = &fingerprints[i];
-                let b = &fingerprints[j];
-                let (seg_a, seg_b) = compare_episodes(&a.fp, &b.fp, mode, &cmp);
-                consider(&mut best, a.episode.id, seg_a, a.start);
-                consider(&mut best, b.episode.id, seg_b, b.start);
-            }
-        }
-        best
-    }
-
-    /// Stores the detected regions as `mode` segments in the plugin's tier
-    /// (`Plugin.UpdateTimestampAsync`: a user-provided segment is never
-    /// replaced, analysed credits overlapping the intro are dropped), then
-    /// publishes each stored item to `MediaSegments` when `UpdateMediaSegments`
-    /// is on (`BaseItemAnalyzerTask` → `MediaSegmentRefreshService`). Skips
-    /// regions over `max_duration`; returns how many were stored.
-    async fn write_segments(
-        &self,
-        regions: &HashMap<Uuid, TimeRange>,
-        mode: WireMode,
-        max_duration: f64,
-        config: &IntroSkipperConfig,
-    ) -> usize {
-        let mut count = 0;
-        for (&item_id, range) in regions {
-            if range.duration() > max_duration || range.duration() <= 0.0 {
-                continue;
-            }
-            let segment = StoredSegment {
-                item_id,
-                mode,
-                start: range.start,
-                end: range.end,
-                is_user_provided: false,
-                // TODO(intro-skipper step 4): `episode.AnalysisConfigHash`, so
-                // a config change re-analyses only what it affects.
-                config_hash: String::new(),
-            };
-            match self.actions.update_timestamp(segment).await {
-                Ok(true) => count += 1,
-                Ok(false) => {}
-                Err(err) => {
-                    tracing::error!(%err, %item_id, "intro skipper: storing a detected segment failed");
-                    continue;
-                }
-            }
-            if config.update_media_segments
-                && let Err(err) = intro_store::refresh(
-                    self.actions.as_ref(),
-                    self.media_segments.as_ref(),
-                    item_id,
-                )
-                .await
-            {
-                tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
-            }
-        }
-        count
+    /// The cache file of an episode window's fingerprint.
+    fn print_path(&self, id: Uuid, start: f64, end: f64, mode: AnalysisMode) -> PathBuf {
+        self.cache_dir
+            .join(format!("{id}.{}.{start:.0}-{end:.0}.fp", mode_tag(mode)))
     }
 
     /// Fingerprints an episode window, using an on-disk cache keyed by the window
     /// so a re-run skips the (expensive) decode.
     async fn fingerprint_cached(
         &self,
-        ep: &Episode,
+        id: Uuid,
+        path: &str,
         start: f64,
         end: f64,
         mode: AnalysisMode,
         fingerprinter: &dyn Fingerprinter,
     ) -> Result<Vec<u32>, String> {
-        let cache = self.cache_dir.join(format!(
-            "{}.{}.{start:.0}-{end:.0}.fp",
-            ep.id,
-            mode_tag(mode),
-        ));
+        let cache = self.print_path(id, start, end, mode);
         if let Ok(bytes) = tokio::fs::read(&cache).await
             && let Some(points) = decode_points(&bytes)
         {
             return Ok(points);
         }
-        let points = fingerprinter.fingerprint(&ep.path, start, end).await?;
+        let points = fingerprinter.fingerprint(path, start, end).await?;
         let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
         let _ = tokio::fs::write(&cache, encode_points(&points)).await;
         Ok(points)
-    }
-}
-
-/// Records `segment` as episode `id`'s best region if it is the first found or
-/// longer than the prior one, shifting credits times by the fingerprint start.
-fn consider(
-    best: &mut HashMap<Uuid, TimeRange>,
-    id: Uuid,
-    segment: Option<TimeRange>,
-    fingerprint_start: f64,
-) {
-    let Some(mut seg) = segment else {
-        return;
-    };
-    // The fingerprint began at `fingerprint_start` (0 for intros), so shift the
-    // reported times back into episode time (the C# credits offset fix-up).
-    seg.start += fingerprint_start;
-    seg.end += fingerprint_start;
-    if best
-        .get(&id)
-        .is_none_or(|prev| seg.duration() > prev.duration())
-    {
-        best.insert(id, seg);
-    }
-}
-
-/// Applies the configured intro offsets to each detected intro: play
-/// `IntroStartOffset` seconds before skipping, and resume `IntroEndOffset` seconds
-/// before the intro ends (Intro Skipper's `IntroStartOffset`/`IntroEndOffset`).
-fn apply_intro_offsets(regions: &mut HashMap<Uuid, TimeRange>, config: &IntroSkipperConfig) {
-    let start_offset = f64::from(config.intro_start_offset).max(0.0);
-    let end_offset = f64::from(config.intro_end_offset).max(0.0);
-    if start_offset == 0.0 && end_offset == 0.0 {
-        return;
-    }
-    for range in regions.values_mut() {
-        let new_start = range.start + start_offset;
-        let new_end = range.end - end_offset;
-        if new_end > new_start {
-            range.start = new_start;
-            range.end = new_end;
-        }
-    }
-}
-
-/// The items of one queue entry the Chromaprint analyzer can compare, or
-/// `None`: excluded items are dropped; a movie needs the chapter/black-frame
-/// analyzers (TODO(intro-skipper steps 7–8)); season 0 is skipped unless
-/// `AnalyzeSeasonZero` (`BaseItemAnalyzerTask.AnalyzeItemsAsync`); a pair is
-/// the least that compares.
-fn analyzable(
-    entries: &[queue::QueuedEpisode],
-    config: &IntroSkipperConfig,
-) -> Option<Vec<Episode>> {
-    let first = entries.first()?;
-    if first.category == queue::Category::Movie
-        || (first.season_number == 0 && !config.analyze_season_zero)
-    {
-        return None;
-    }
-    let episodes: Vec<Episode> = entries
-        .iter()
-        .filter(|e| !e.is_excluded && e.duration > 0.0)
-        .map(Episode::from)
-        .collect();
-    (episodes.len() >= 2).then_some(episodes)
-}
-
-/// The episode's fingerprint window for `mode`: the queue's credits window,
-/// else the start up to its intro window's end.
-fn window(episode: &Episode, mode: AnalysisMode) -> (f64, f64) {
-    if mode == AnalysisMode::Credits {
-        episode.credits
-    } else {
-        (0.0, episode.intro_end)
     }
 }
 
@@ -1193,12 +837,14 @@ fn window(episode: &Episode, mode: AnalysisMode) -> (f64, f64) {
 /// key).
 fn mode_tag(mode: AnalysisMode) -> &'static str {
     match mode {
-        AnalysisMode::Introduction => "intro",
-        // "credits2": the v1 cache was fingerprinted under fpcalc's default
-        // 120 s `-length` cap (a truncated tail window); the tag bump orphans
-        // those files so a re-run re-fingerprints the full window.
-        AnalysisMode::Credits => "credits2",
-        AnalysisMode::Recap => "recap",
+        // Each bump orphans prints made by an older command, which would
+        // otherwise be compared with new ones: "credits2" left fpcalc's
+        // default 120 s `-length` cap (a truncated tail window); "intro2",
+        // "credits3" and "recap2" the mono downmix and rounded-up `-t` that
+        // preceded upstream's `-ac 2` and exact `-to`.
+        AnalysisMode::Introduction => "intro2",
+        AnalysisMode::Credits => "credits3",
+        AnalysisMode::Recap => "recap2",
     }
 }
 
@@ -1236,11 +882,14 @@ mod tests {
 
     use super::*;
     use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
     use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
+    use ferrofin_traits::intro_skipper::{SeasonState, StoredSegment};
+    use std::collections::HashMap;
 
     #[test]
     fn default_config_round_trips_json() {
@@ -1260,64 +909,6 @@ mod tests {
         assert_eq!(cfg.analysis_percent, 40);
     }
 
-    fn queued(
-        season_number: i64,
-        category: queue::Category,
-        excluded: bool,
-        n: u128,
-    ) -> queue::QueuedEpisode {
-        queue::QueuedEpisode {
-            series_name: "Show".to_owned(),
-            season_number,
-            series_id: Uuid::from_u128(1),
-            season_id: Uuid::from_u128(2),
-            episode_number: 1,
-            episode_id: Uuid::from_u128(n),
-            name: String::new(),
-            category,
-            is_excluded: excluded,
-            path: "/media/e.mkv".to_owned(),
-            duration: 1800.0,
-            date_added: None,
-            intro_fingerprint_end: 450.0,
-            credits_fingerprint_start: 1350.0,
-            credits_fingerprint_end: 1800.0,
-        }
-    }
-
-    #[test]
-    fn analyzable_follows_analyze_items_async() {
-        use queue::Category::{Episode as Ep, Movie};
-        let cfg = IntroSkipperConfig::default();
-        let pair = [queued(1, Ep, false, 10), queued(1, Ep, false, 11)];
-        let episodes = analyzable(&pair, &cfg).expect("a pair compares");
-        assert_eq!(
-            window(&episodes[0], AnalysisMode::Introduction),
-            (0.0, 450.0)
-        );
-        assert_eq!(
-            window(&episodes[0], AnalysisMode::Credits),
-            (1350.0, 1800.0)
-        );
-        // An excluded item drops out, leaving nothing to compare.
-        assert!(analyzable(&[queued(1, Ep, false, 10), queued(1, Ep, true, 11)], &cfg).is_none());
-        // Season 0 only with AnalyzeSeasonZero; a movie needs other analyzers.
-        let specials = [queued(0, Ep, false, 10), queued(0, Ep, false, 11)];
-        assert!(analyzable(&specials, &cfg).is_none());
-        let with_zero = IntroSkipperConfig {
-            analyze_season_zero: true,
-            ..IntroSkipperConfig::default()
-        };
-        assert!(analyzable(&specials, &with_zero).is_some());
-        assert!(
-            analyzable(
-                &[queued(0, Movie, false, 10), queued(0, Movie, false, 11)],
-                &cfg
-            )
-            .is_none()
-        );
-    }
-
     #[test]
     fn points_cache_round_trips() {
         let points = vec![1u32, 2, 3, u32::MAX, 0];
@@ -1325,98 +916,12 @@ mod tests {
         assert_eq!(decode_points(&[1, 2, 3]), None); // not a multiple of 4
     }
 
-    #[test]
-    fn consider_keeps_the_longest_and_shifts_credits() {
-        let mut best = HashMap::new();
-        let id = Uuid::from_u128(1);
-        consider(&mut best, id, Some(TimeRange::new(0.0, 20.0)), 0.0);
-        consider(&mut best, id, Some(TimeRange::new(0.0, 10.0)), 0.0); // shorter → ignored
-        assert_eq!(best[&id].end, 20.0);
-        // A credits region fingerprinted from t=3000 is shifted into episode time.
-        let cid = Uuid::from_u128(2);
-        consider(&mut best, cid, Some(TimeRange::new(5.0, 40.0)), 3000.0);
-        assert_eq!(best[&cid].start, 3005.0);
-        assert_eq!(best[&cid].end, 3040.0);
-    }
-
-    #[test]
-    fn consider_ignores_a_missing_segment() {
-        let mut best = HashMap::new();
-        consider(&mut best, Uuid::from_u128(1), None, 0.0);
-        assert!(best.is_empty());
-    }
-
     #[rstest]
-    #[case(AnalysisMode::Introduction, "intro")]
-    // "credits2" orphans the v1 cache fingerprinted under fpcalc's 120 s default.
-    #[case(AnalysisMode::Credits, "credits2")]
-    #[case(AnalysisMode::Recap, "recap")]
+    #[case(AnalysisMode::Introduction, "intro2")]
+    #[case(AnalysisMode::Credits, "credits3")]
+    #[case(AnalysisMode::Recap, "recap2")]
     fn mode_tag_is_the_cache_key_discriminator(#[case] mode: AnalysisMode, #[case] tag: &str) {
         assert_eq!(mode_tag(mode), tag);
-    }
-
-    #[rstest]
-    #[case(AnalysisMode::Introduction, 20.0)]
-    #[case(AnalysisMode::Credits, 40.0)]
-    #[case(AnalysisMode::Recap, 30.0)]
-    fn compare_config_takes_the_modes_minimum_duration(
-        #[case] mode: AnalysisMode,
-        #[case] expected: f64,
-    ) {
-        let cfg = IntroSkipperConfig {
-            minimum_intro_duration: 20,
-            minimum_credits_duration: 40,
-            minimum_recap_duration: 30,
-            ..IntroSkipperConfig::default()
-        };
-        let cmp = cfg.compare_config(mode);
-        assert_eq!(cmp.min_region_duration, expected);
-        assert_eq!(cmp.inverted_index_shift, 2);
-        assert_eq!(cmp.max_bit_diff, 6);
-    }
-
-    #[test]
-    fn compare_config_falls_back_when_the_bit_diff_is_negative() {
-        let cfg = IntroSkipperConfig {
-            maximum_fingerprint_point_differences: -1,
-            ..IntroSkipperConfig::default()
-        };
-        assert_eq!(
-            cfg.compare_config(AnalysisMode::Introduction).max_bit_diff,
-            6
-        );
-    }
-
-    // ---- intro offsets -----------------------------------------------------
-
-    fn one_region(start: f64, end: f64) -> HashMap<Uuid, TimeRange> {
-        HashMap::from([(Uuid::from_u128(1), TimeRange::new(start, end))])
-    }
-
-    #[rstest]
-    // (start_offset, end_offset) → the resulting (start, end) of a 10..70 intro.
-    #[case::no_offsets(0, 0, (10.0, 70.0))]
-    #[case::start_only(5, 0, (15.0, 70.0))]
-    #[case::end_only(0, 5, (10.0, 65.0))]
-    #[case::both(5, 5, (15.0, 65.0))]
-    // Offsets that would invert (or empty) the region are refused wholesale.
-    #[case::inverting(40, 40, (10.0, 70.0))]
-    // Negative offsets clamp to zero rather than widening the region.
-    #[case::negative_clamps(-5, -5, (10.0, 70.0))]
-    fn apply_intro_offsets_shifts_within_bounds(
-        #[case] start_offset: i32,
-        #[case] end_offset: i32,
-        #[case] expected: (f64, f64),
-    ) {
-        let cfg = IntroSkipperConfig {
-            intro_start_offset: start_offset,
-            intro_end_offset: end_offset,
-            ..IntroSkipperConfig::default()
-        };
-        let mut regions = one_region(10.0, 70.0);
-        apply_intro_offsets(&mut regions, &cfg);
-        let r = &regions[&Uuid::from_u128(1)];
-        assert_eq!((r.start, r.end), expected);
     }
 
     // ---- extension surface -------------------------------------------------
@@ -1488,6 +993,8 @@ mod tests {
 
     /// The season every harness episode belongs to.
     const SEASON: Uuid = Uuid::from_u128(0x5ea5_0001);
+    /// The series every harness episode belongs to.
+    const SERIES: Uuid = Uuid::from_u128(0x5e_0001);
 
     struct Harness {
         task: DetectSegmentsTask,
@@ -1495,7 +1002,7 @@ mod tests {
         actions: Arc<ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore>,
         calls: Arc<AtomicUsize>,
         persistence: Arc<ferrofin_core::FerrofinItemPersistenceService>,
-        _cache: tempfile::TempDir,
+        cache: tempfile::TempDir,
     }
 
     /// Builds the task over an in-memory database seeded with `episodes`
@@ -1506,6 +1013,16 @@ mod tests {
         config: &str,
         with_fingerprinter: bool,
     ) -> Harness {
+        // Real (empty) files: the queue's verification skips a missing one,
+        // as upstream's `File.Exists` does. `/media/...` maps under `media`.
+        let cache = tempfile::tempdir().expect("cache dir");
+        let media = cache.path().join("media");
+        let real = |path: &str| -> String {
+            let file = media.join(path.trim_start_matches("/media/"));
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("media dir");
+            std::fs::write(&file, b"").expect("media file");
+            file.to_string_lossy().into_owned()
+        };
         let db = ferrofin_db::Database::connect_in_memory()
             .await
             .expect("connect");
@@ -1533,13 +1050,13 @@ mod tests {
         let rows: Vec<BaseItemEntity> = episodes
             .iter()
             .map(|(id, path, secs)| BaseItemEntity {
-                id: id.to_string(),
+                id: guid_to_db(*id),
                 type_: type_name.to_owned(),
-                path: Some((*path).to_owned()),
+                path: Some(real(path)),
                 #[allow(clippy::cast_possible_truncation)]
                 run_time_ticks: Some((secs * 10_000_000.0) as i64),
-                season_id: Some(SEASON.to_string()),
-                series_id: Some(Uuid::from_u128(0x5e_0001).to_string()),
+                season_id: Some(guid_to_db(SEASON)),
+                series_id: Some(guid_to_db(SERIES)),
                 series_name: Some("Show".to_owned()),
                 parent_index_number: Some(1),
                 ..BaseItemEntity::default()
@@ -1556,12 +1073,7 @@ mod tests {
         let prints = episodes
             .iter()
             .enumerate()
-            .map(|(i, (_, path, _))| {
-                (
-                    (*path).to_owned(),
-                    if i % 2 == 0 { a.clone() } else { b.clone() },
-                )
-            })
+            .map(|(i, (_, path, _))| (real(path), if i % 2 == 0 { a.clone() } else { b.clone() }))
             .collect();
         let fingerprinter: Option<Arc<dyn Fingerprinter>> = with_fingerprinter.then(|| {
             Arc::new(FakeFingerprinter {
@@ -1570,7 +1082,6 @@ mod tests {
             }) as Arc<dyn Fingerprinter>
         });
 
-        let cache = tempfile::tempdir().expect("cache dir");
         let actions =
             Arc::new(ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default());
         Harness {
@@ -1584,7 +1095,8 @@ mod tests {
                 fingerprinter,
                 cache_dir: cache.path().join("introskipper"),
                 running: Arc::new(AtomicBool::new(false)),
-                virtual_folders: Arc::new(MediaLibrary),
+                virtual_folders: Arc::new(MediaLibrary(media.to_string_lossy().into_owned())),
+                chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
                 actions: Arc::clone(&actions)
                     as Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
             },
@@ -1592,12 +1104,12 @@ mod tests {
             actions,
             persistence,
             calls,
-            _cache: cache,
+            cache,
         }
     }
 
     /// One library holding everything under `/media`.
-    struct MediaLibrary;
+    struct MediaLibrary(String);
 
     #[async_trait]
     impl VirtualFolderManager for MediaLibrary {
@@ -1606,7 +1118,7 @@ mod tests {
         ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
             Ok(vec![ferrofin_model::entities_media::VirtualFolderInfo {
                 name: Some("TV".to_owned()),
-                locations: vec!["/media".to_owned()],
+                locations: vec![self.0.clone()],
                 ..Default::default()
             }])
         }
@@ -1791,12 +1303,9 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            h.actions
-                .analyzer_actions(SEASON)
-                .await
-                .expect("read")
-                .len(),
-            1
+            h.actions.analyzer_actions(SEASON).await.expect("read")[&AnalysisMode::Introduction],
+            AnalyzerAction::Chromaprint,
+            "a live season keeps its state"
         );
     }
 
@@ -1884,7 +1393,7 @@ mod tests {
             .expect("detect");
         let before_a = cache_files(&h, EP_A);
         assert!(
-            before_a.iter().any(|f| f.contains(".intro.")),
+            before_a.iter().any(|f| f.contains(".intro2.")),
             "{before_a:?}"
         );
         assert_eq!(
@@ -1895,7 +1404,7 @@ mod tests {
             1
         );
         let after_a = cache_files(&h, EP_A);
-        assert!(!after_a.iter().any(|f| f.contains(".intro.")));
+        assert!(!after_a.iter().any(|f| f.contains(".intro2.")));
         assert_eq!(after_a.len(), before_a.len() - 1, "the credits print stays");
         assert_eq!(
             h.task
@@ -2090,6 +1599,228 @@ mod tests {
         );
     }
 
+    /// `VerifyQueueAsync` + the configuration hash: an analysed season is not
+    /// analysed again (no fingerprinting at all), until a setting the mode
+    /// reads changes; a user-provided segment survives both.
+    #[tokio::test]
+    async fn analysis_is_incremental_under_the_config_hash() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("first");
+        let first = h.calls.load(Ordering::SeqCst);
+        let intro = |segments: Vec<StoredSegment>| {
+            segments
+                .into_iter()
+                .find(|s| s.mode == WireMode::Introduction)
+                .expect("intro")
+        };
+        let hash = intro(h.actions.segments(EP_A).await.expect("tier")).config_hash;
+        assert!(first > 0 && !hash.is_empty());
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_B,
+                mode: WireMode::Introduction,
+                start: 1.0,
+                end: 2.0,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("user edit");
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("second");
+        assert_eq!(
+            h.calls.load(Ordering::SeqCst),
+            first,
+            "nothing to analyse again"
+        );
+        // A setting the intro hash reads: re-analysed (from the cached prints)
+        // and stored under the new hash; the user's intro stays.
+        let changed = DetectSegmentsTask {
+            plugins: Arc::new(FakePlugins {
+                enabled: true,
+                config: br#"{"MaximumIntroDuration":119}"#.to_vec(),
+            }),
+            ..h.task.clone()
+        };
+        changed
+            .execute(&TaskProgress::default())
+            .await
+            .expect("third");
+        let rehashed = intro(h.actions.segments(EP_A).await.expect("tier"));
+        assert_ne!(rehashed.config_hash, hash);
+        let user = intro(h.actions.segments(EP_B).await.expect("tier"));
+        assert!(user.is_user_provided && user.start == 1.0);
+    }
+
+    const THREE_EPISODES: [(Uuid, &str, f64); 3] = [
+        (EP_A, "/media/s01e01.mkv", 1800.0),
+        (EP_B, "/media/s01e02.mkv", 1800.0),
+        (Uuid::from_u128(0xA3), "/media/s01e03.mkv", 1800.0),
+    ];
+
+    /// The task over the harness with a plugin configuration.
+    fn configured(h: &Harness, config: &str) -> DetectSegmentsTask {
+        DetectSegmentsTask {
+            plugins: Arc::new(FakePlugins {
+                enabled: true,
+                config: config.as_bytes().to_vec(),
+            }),
+            ..h.task.clone()
+        }
+    }
+
+    async fn intro_state(h: &Harness) -> SeasonState {
+        h.actions
+            .season_states(SEASON)
+            .await
+            .expect("states")
+            .remove(&WireMode::Introduction)
+            .unwrap_or_default()
+    }
+
+    /// A failed segment write ends the season's pass without recording the
+    /// episodes as analysed (upstream's exception), so the next pass retries
+    /// them instead of taking them for "analysed, nothing found".
+    #[tokio::test]
+    async fn a_failed_write_is_retried_on_the_next_pass() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.actions.set_read_only(true);
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("failing pass");
+        assert!(h.actions.segments(EP_A).await.expect("tier").is_empty());
+        assert!(intro_state(&h).await.episode_ids.is_empty());
+
+        h.actions.set_read_only(false);
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("retry");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        assert_eq!(intro_state(&h).await.episode_ids.len(), 2);
+    }
+
+    /// A match longer than the mode's maximum is rejected; the episodes are
+    /// still recorded as analysed without a result, so the next pass skips
+    /// them.
+    #[tokio::test]
+    async fn an_over_long_match_is_not_stored() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        // The fixture's shared region is ~49.5 s.
+        let task = configured(&h, r#"{"MaximumIntroDuration":30}"#);
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        assert_eq!(intro_state(&h).await.episode_ids.len(), 2);
+        let calls = h.calls.load(Ordering::SeqCst);
+        task.execute(&TaskProgress::default()).await.expect("rerun");
+        assert_eq!(
+            h.calls.load(Ordering::SeqCst),
+            calls,
+            "NoSegments is cached"
+        );
+    }
+
+    /// An item whose file is gone leaves the queue (`File.Exists`); a lone
+    /// remaining episode has nothing to be compared with.
+    #[tokio::test]
+    async fn an_item_without_its_file_is_skipped() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        std::fs::remove_file(h.cache.path().join("media/s01e02.mkv")).expect("remove");
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+    }
+
+    /// The only episode still needing analysis is compared with its analysed
+    /// (here user-provided) neighbour, whose segment stays.
+    #[tokio::test]
+    async fn a_lone_episode_is_compared_with_its_neighbour() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_B,
+                mode: WireMode::Introduction,
+                start: 1.0,
+                end: 2.0,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("user edit");
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        let a = h.actions.segments(EP_A).await.expect("tier");
+        assert!(
+            a.iter()
+                .any(|s| s.mode == WireMode::Introduction && !s.is_user_provided)
+        );
+        let b = h.actions.segments(EP_B).await.expect("tier");
+        assert!(
+            b.iter()
+                .any(|s| s.mode == WireMode::Introduction && s.is_user_provided && s.end == 2.0)
+        );
+    }
+
+    /// A settled season (no new episode for the delay; an unknown date counts
+    /// as long settled) is analysed again once, and the episodes it covered
+    /// are recorded so the next pass does not repeat it.
+    #[tokio::test]
+    async fn a_settled_season_is_reanalysed_once() {
+        let h = harness(&THREE_EPISODES, true, "{}", true).await;
+        let task = configured(&h, r#"{"ReanalyzeSettledSeasons":true}"#);
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(intro_state(&h).await.settled_episode_ids.len(), 3);
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        let before = h.actions.segments(EP_A).await.expect("tier");
+        task.execute(&TaskProgress::default()).await.expect("rerun");
+        assert_eq!(h.actions.segments(EP_A).await.expect("tier"), before);
+    }
+
+    /// An anime preview derived from the credits survives the Preview mode's
+    /// stale-segment cleanup that follows it (upstream stores it under the
+    /// Credits hash, so that cleanup deletes it — a bug not ported).
+    #[tokio::test]
+    async fn an_anime_preview_survives_the_preview_pass() {
+        let h = harness(
+            &TWO_EPISODES,
+            true,
+            r#"{"AnimePreviewFromCreditsEnd":true}"#,
+            true,
+        )
+        .await;
+        let series_type = ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Series)
+            .expect("stored type name");
+        h.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(SERIES),
+                type_: series_type.to_owned(),
+                name: Some("Show".to_owned()),
+                genres: Some("Anime".to_owned()),
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("anime series");
+        h.task.execute(&TaskProgress::default()).await.expect("run");
+        let preview = |segments: Vec<StoredSegment>| {
+            segments.into_iter().find(|s| s.mode == WireMode::Preview)
+        };
+        let first = preview(h.actions.segments(EP_A).await.expect("tier")).expect("anime preview");
+        assert_eq!(first.end, 1800.0);
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("rerun");
+        assert_eq!(
+            preview(h.actions.segments(EP_A).await.expect("tier")),
+            Some(first)
+        );
+    }
+
     #[tokio::test]
     async fn a_rerun_reuses_the_fingerprint_cache() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
@@ -2151,55 +1882,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_over_long_region_is_not_written() {
-        let h = harness(&TWO_EPISODES, true, "{}", true).await;
-        // MaximumIntroDuration is the write-side veto; 0 rejects everything.
-        let regions = HashMap::from([(EP_A, TimeRange::new(0.0, 30.0))]);
-        assert_eq!(
-            h.task
-                .write_segments(
-                    &regions,
-                    WireMode::Introduction,
-                    0.0,
-                    &IntroSkipperConfig::default()
-                )
-                .await,
-            0
-        );
-        // A zero-length region is rejected too.
-        let empty = HashMap::from([(EP_A, TimeRange::new(5.0, 5.0))]);
-        assert_eq!(
-            h.task
-                .write_segments(
-                    &empty,
-                    WireMode::Introduction,
-                    600.0,
-                    &IntroSkipperConfig::default()
-                )
-                .await,
-            0
-        );
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
-    }
-
-    #[tokio::test]
     async fn a_malformed_stored_config_falls_back_to_defaults() {
         let h = harness(&TWO_EPISODES, true, "not json", true).await;
         assert_eq!(h.task.load_config().await.analysis_percent, 25);
-    }
-
-    #[tokio::test]
-    async fn an_unfingerprintable_episode_is_skipped() {
-        // A 1 s episode: the intro window is shorter than the minimum, so it is
-        // never fingerprinted and the season has no comparable pair.
-        let eps = [
-            (EP_A, "/media/short1.mkv", 1.0),
-            (EP_B, "/media/short2.mkv", 1.0),
-        ];
-        let h = harness(&eps, true, "{}", true).await;
-        h.task.execute(&TaskProgress::default()).await.expect("run");
-        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
     }
 
     #[tokio::test]

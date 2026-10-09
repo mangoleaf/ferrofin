@@ -129,12 +129,16 @@ impl Fingerprinter for ChromaprintFingerprinter {
                     "error",
                     "-ss",
                     &format!("{start}"),
-                    "-t",
-                    &format!("{length:.0}"),
                     "-i",
                     path,
+                    // `FFmpegService.FingerprintAsync`'s own: an output `-to`
+                    // of exactly the window and a stereo downmix (Chromaprint
+                    // mixes to mono itself; feeding it mono changes the
+                    // points).
+                    "-to",
+                    &format!("{}", end - start),
                     "-ac",
-                    "1",
+                    "2",
                     "-vn",
                     "-sn",
                     "-dn",

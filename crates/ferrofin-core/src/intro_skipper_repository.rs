@@ -212,6 +212,25 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
         Ok(rows.into_iter().filter_map(to_segment).collect())
     }
 
+    async fn segments_of(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<StoredSegment>>, ServiceError> {
+        let rows: Vec<SegmentRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            r#"SELECT {SEGMENT_COLUMNS} FROM "FerrofinIntroSkipperSegments"
+               WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#
+        )))
+        .bind(json_ids(item_ids)?)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let mut by_item: HashMap<Uuid, Vec<StoredSegment>> = HashMap::new();
+        for segment in rows.into_iter().filter_map(to_segment) {
+            by_item.entry(segment.item_id).or_default().push(segment);
+        }
+        Ok(by_item)
+    }
+
     async fn segments_unless_excluded(
         &self,
         item_id: Uuid,
@@ -771,6 +790,30 @@ mod tests {
                 .episode_ids
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn segments_of_reads_many_items_at_once() {
+        use AnalysisMode::{Credits, Introduction};
+        let store = FerrofinIntroSkipperStore::new(test_db().await);
+        store
+            .update_timestamp(seg(1, Introduction, 0.0, 30.0, false))
+            .await
+            .unwrap();
+        store
+            .update_timestamp(seg(1, Credits, 900.0, 960.0, false))
+            .await
+            .unwrap();
+        store
+            .update_timestamp(seg(2, Introduction, 0.0, 30.0, false))
+            .await
+            .unwrap();
+        let by_item = store
+            .segments_of(&[Uuid::from_u128(1), Uuid::from_u128(77)])
+            .await
+            .unwrap();
+        assert_eq!(by_item.len(), 1);
+        assert_eq!(by_item[&Uuid::from_u128(1)].len(), 2);
     }
 
     #[tokio::test]
