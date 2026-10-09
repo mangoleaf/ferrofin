@@ -478,6 +478,8 @@ pub struct HlsStreamRequest {
     pub video_bitrate: Option<i32>,
     /// The negotiated audio bitrate cap in bit/s (`audioBitRate`).
     pub audio_bitrate: Option<i32>,
+    /// The per-request encoding thread limit (`cpuCoreLimit`), overriding the server setting.
+    pub cpu_core_limit: Option<i32>,
     /// The maximum output width in pixels (`maxWidth`) — bounds the scale
     /// filter on re-encode.
     pub max_width: Option<i32>,
@@ -573,6 +575,7 @@ impl Default for HlsStreamRequest {
             transcoding_max_audio_channels: None,
             video_bitrate: None,
             audio_bitrate: None,
+            cpu_core_limit: None,
             max_width: None,
             max_height: None,
             max_framerate: None,

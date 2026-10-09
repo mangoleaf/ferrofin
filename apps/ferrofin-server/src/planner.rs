@@ -707,6 +707,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // the copy veto.
             video_bit_rate: requested_video_bitrate,
             audio_bit_rate: request.audio_bitrate,
+            cpu_core_limit: request.cpu_core_limit,
             max_width: request.max_width,
             max_height: request.max_height,
             max_framerate: request.max_framerate,
@@ -2230,6 +2231,82 @@ mod tests {
             segment_container: Some("ts".to_owned()),
             query_string: "?x=1".to_owned(),
             ..HlsStreamRequest::default()
+        }
+    }
+
+    /// A planner with actual persisted encoding configuration and owned paths.
+    async fn planner_with_persisted_encoding(
+        sources: Vec<MediaSourceInfo>,
+        root: &std::path::Path,
+    ) -> (FerrofinStreamStatePlanner, PathBuf) {
+        let mut planner = planner(sources);
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            root.join("data"),
+            root.join("log"),
+            root.join("config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        let file =
+            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        planner.config = Arc::new(
+            ferrofin_core::FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+                .await
+                .expect("persisted configuration"),
+        );
+        planner.paths = paths;
+        (planner, file)
+    }
+
+    #[tokio::test]
+    async fn saved_encoding_threads_and_request_limit_reach_new_job_arguments() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        for (configured, limit, expected) in [
+            (-1, None, 0),
+            (0, None, 0),
+            (3, None, 3),
+            (i32::MAX, None, 8),
+            (7, Some(2), 2),
+            (7, Some(0), 0),
+            (7, Some(-1), 0),
+            (0, Some(3), 3),
+        ] {
+            let options = EncodingOptions {
+                encoding_thread_count: configured,
+                ..EncodingOptions::default()
+            };
+            ferrofin_util::file_helper::atomic_write(
+                &file,
+                &serde_json::to_vec(&options).expect("serialize"),
+            )
+            .expect("save encoding options");
+            let mut req = request("abc");
+            req.video_codec = Some("h264".into());
+            req.cpu_core_limit = limit;
+            let plan = planner
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .expect("plan");
+            let index = plan
+                .arguments
+                .iter()
+                .position(|argument| argument == "-threads")
+                .expect("threads");
+            assert_eq!(
+                plan.arguments[index + 1],
+                expected.to_string(),
+                "configured={configured} limit={limit:?}"
+            );
+            assert_eq!(plan.encoding_options.encoding_thread_count, configured);
+            assert_eq!(plan.state.base_request.cpu_core_limit, limit);
         }
     }
 

@@ -52,6 +52,51 @@ use crate::state::AppState;
 // still advertises `application/x-mpegURL` — that is the attribute, not the runtime.)
 const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
+/// Binds only the CPU-limit query as ASP.NET's nullable `Int32` converter does.
+/// Empty/whitespace input is absent; nonempty input is trimmed before numeric
+/// conversion. `BaseNumberConverter` also accepts #, 0x and &h hexadecimal forms.
+fn optional_cpu_core_limit<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    let Some(value) = raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let hex = value.strip_prefix('#').or_else(|| {
+        value
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("0x") || prefix.eq_ignore_ascii_case("&h"))
+            .and_then(|_| value.get(2..))
+    });
+    if let Some(hex) = hex {
+        // Convert.ToInt32(base16) permits one plus before an optional 0x, and
+        // interprets the full unsigned bit pattern as a signed 32-bit value.
+        let digits = hex.strip_prefix('+').unwrap_or(hex);
+        let digits = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+            .unwrap_or(digits);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom("invalid CPU core limit"));
+        }
+        return u32::from_str_radix(digits, 16)
+            .map(|bits| Some(i32::from_be_bytes(bits.to_be_bytes())))
+            .map_err(serde::de::Error::custom);
+    }
+    // NumberStyles.Integer retains the framework's trailing-NUL compatibility.
+    value
+        .trim_end_matches('\0')
+        .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
+        .parse()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 /// The `?static` / segment-shaping query parameters common to every HLS route.
 ///
 /// Only the fields the software transcode path consumes are captured; the full
@@ -121,6 +166,9 @@ struct HlsQuery {
     /// contract; see [`Self::video_bitrate`] for the spellings).
     #[serde(default)]
     audio_bitrate: Option<i32>,
+    /// The per-request encoding thread limit, overriding EncodingThreadCount.
+    #[serde(default, deserialize_with = "optional_cpu_core_limit")]
+    cpu_core_limit: Option<i32>,
     /// The maximum output width in pixels (bounds the scale filter).
     #[serde(default)]
     max_width: Option<i32>,
@@ -253,6 +301,7 @@ fn build_request(
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
         video_bitrate: query.video_bitrate,
         audio_bitrate: query.audio_bitrate,
+        cpu_core_limit: query.cpu_core_limit,
         max_width: query.max_width,
         max_height: query.max_height,
         max_framerate: query.max_framerate,
@@ -708,6 +757,66 @@ mod tests {
             .parse()
             .expect("uri");
         Query::try_from_uri(&uri).map(|Query(query)| query)
+    }
+
+    /// The nullable CPU override follows the source Int32 query binder.
+    #[test]
+    fn hls_cpu_core_limit_binds_all_cases_and_reaches_the_request() {
+        for spelling in ["CpuCoreLimit", "cpuCoreLimit", "CPUCORELIMIT"] {
+            for value in [-1, 0, 1, i32::MAX] {
+                let raw = format!("{spelling}={value}");
+                let query = parse(&raw).expect("integer limit");
+                let request =
+                    build_request(Uuid::nil(), query, Some(raw), HlsRequestContext::default());
+                assert_eq!(request.cpu_core_limit, Some(value));
+            }
+        }
+        assert_eq!(parse("").expect("absent").cpu_core_limit, None);
+        assert_eq!(
+            parse("CpuCoreLimit")
+                .expect("bare nullable integer")
+                .cpu_core_limit,
+            None
+        );
+        for blank in ["", "%20", "%09%0D%0A", "%C2%A0"] {
+            assert_eq!(
+                parse(&format!("CpuCoreLimit={blank}"))
+                    .expect("blank nullable query")
+                    .cpu_core_limit,
+                None
+            );
+        }
+        for (encoded, expected) in [
+            ("%20%2B2%20", 2),
+            ("%09-02%0A", -2),
+            ("0x2", 2),
+            ("0X7fffffff", i32::MAX),
+            ("0x80000000", i32::MIN),
+            ("0xffffffff", -1),
+            ("%23%2B0x2", 2),
+            ("%26H2", 2),
+            ("2%00%00", 2),
+            ("2%20%00", 2),
+        ] {
+            let query = parse(&format!("CpuCoreLimit={encoded}")).expect("native Int32 form");
+            let request = build_request(Uuid::nil(), query, None, HlsRequestContext::default());
+            assert_eq!(request.cpu_core_limit, Some(expected));
+        }
+
+        for value in [
+            "bad",
+            "2147483648",
+            "-2147483649",
+            "2.5",
+            "0x100000000",
+            "%23-1",
+            "%23%2B%2B2",
+            "%230x%2B2",
+            "1%002",
+            "2%C2%A0%00",
+        ] {
+            assert!(parse(&format!("CpuCoreLimit={value}")).is_err());
+        }
     }
 
     /// The PlaybackInfo-negotiated `TranscodingUrl` uses PascalCase parameters

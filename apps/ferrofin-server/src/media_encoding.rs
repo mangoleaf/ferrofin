@@ -1114,7 +1114,15 @@ mod tests {
             attachments: Vec::new(),
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
-        let (config, paths) = config_and_paths();
+        let directory = tempfile::tempdir().expect("owned composition paths");
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            directory.path().join("data"),
+            directory.path().join("log"),
+            directory.path().join("config"),
+            directory.path().join("cache"),
+            directory.path().join("web"),
+        ));
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
             root: "/cache/att".to_owned(),
         });
