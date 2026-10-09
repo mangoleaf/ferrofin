@@ -230,7 +230,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         // No providers are registered here, so nothing runs — and nothing
         // pretends to. Ferrofin's segment *producers* do not plug in per item:
         // the Intro Skipper extension fingerprints a whole season at a time to
-        // find a shared intro (its own `IntroSkipper.Detect` pass, which also
+        // find a shared intro (its own `IntroSkipperDetectSegmentsTask` pass, which also
         // claims the upstream `TaskExtractMediaSegments` key while it is
         // loaded), and WASM analyzer plugins write segments from their own
         // analysis pass. What is missing versus upstream is the per-item

@@ -33,8 +33,11 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct RemoteImagesQuery {
     /// Restrict candidates to this image type.
-    #[serde(default)]
-    #[serde(rename = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     image_type: Option<ImageType>,
     /// The first record to return (records before it are dropped).
     #[serde(default)]

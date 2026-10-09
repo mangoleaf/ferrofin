@@ -1833,8 +1833,17 @@ mod tests {
             )),
             plugins,
             fingerprinter: None,
+            ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
             cache_dir: std::env::temp_dir(),
             merge_versions: svc,
+            intro_skipper: Arc::new(
+                ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
+            ),
+            intro_skipper_runtime: Arc::default(),
+            virtual_folders: Arc::new(
+                ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
+            ),
+            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

@@ -24,12 +24,72 @@ Conventions:
 ## Per-plugin notes
 
 ### Intro Skipper
-- Ferrofin files: `crates/ferrofin-extensions/src/intro_skipper.rs`,
-  `crates/ferrofin-extensions/src/fingerprint.rs`,
-  `crates/ferrofin-api/tests/intro_skipper_handlers.rs`,
-  vendored assets `crates/ferrofin-extensions/assets/introskipper/`.
-- Phase 5 (its own API routes) deliberately deferred — see
-  the extension seam docs (`crates/ferrofin-extensions/src/lib.rs`).
+- Ferrofin files:
+  - the extension: `crates/ferrofin-extensions/src/intro_skipper.rs` (tasks,
+    config, caches, the analysis seam) and `intro_skipper/` —
+    `queue.rs` (`QueueManager`), `engine.rs` (`BaseItemAnalyzerTask`,
+    `ChromaprintAnalyzer`, `TimeAdjustmentHelper`), `chapter_analyzer.rs`,
+    `black_frame.rs` (`BlackFrameAnalyzer`, recaps), `credit_scenes.rs`
+    (`CreditsBlackFrameAnalyzer` and `Analyzers/Credits`), `automatic.rs`
+    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), test data `testdata/`;
+  - processes: `crates/ferrofin-extensions/src/ffmpeg.rs` (`FFmpegService`,
+    `FFmpegOutputParser`), `fingerprint.rs` (Chromaprint);
+  - storage: `crates/ferrofin-core/src/intro_skipper_repository.rs`, migrations
+    `0036`–`0038` (`Ferrofin*` tables), the seam
+    `crates/ferrofin-traits/src/intro_skipper.rs`;
+  - routes: `crates/ferrofin-api/src/handlers/intro_skipper.rs`, the
+    first-episode filter in `handlers/media_segments.rs`; tests
+    `crates/ferrofin-api/tests/intro_skipper_handlers.rs`;
+  - vendored assets `crates/ferrofin-extensions/assets/introskipper/`.
+- Ported: the segment store and its routes, the queue, incremental analysis
+  under `ConfigHasher`, settled-season reanalysis, every analyzer (Chromaprint,
+  chapters, black frames, credit scenes, recaps, anime previews), silence and
+  keyframe snapping, `ProbeAudioDuration`, `ProcessPriority`/`ProcessThreads`,
+  the detection cache, the Clean Intro Skipper Cache task, automatic analysis
+  (`Entrypoint`) and `AnalyzeAgain`, `MediaSegmentsFirstEpisodeFilter`, the task
+  identities and the support bundle. The upstream xUnit suites are
+  transliterated beside the code they test.
+- Accepted divergences (do NOT "fix" during sync):
+  - **Storage:** the plugin's own database is not imported (owner decision D3);
+    Ferrofin keeps its segments in `FerrofinIntroSkipperSegments` and publishes
+    them to `MediaSegments` under the plugin's MD5 provider id (D1, D2). The
+    detection cache is files beside the fingerprints (D7), not SQLite: prints
+    are keyed by window in whole seconds without a settings hash (re-keying
+    would re-fingerprint every library; a sub-second window change reuses the
+    old print), and the clean task deletes cache files no current read hits.
+    Migration `0037` seeds the segment store from the segments already
+    published, as automatic rows with an empty hash (upstream's schema upgrade
+    does the same): the first pass replaces each with what it detects, or
+    deletes it. Hand edits made before `0037`, and the plugin's own records of
+    them on an adopted database, are therefore not kept; nor are the plugin's
+    settings (`IntroSkipper.xml`). `docs/UPGRADING.md` tells operators.
+  - **Hashes:** Ferrofin's analysis hashes carry an analyzer-set token
+    (`config_hash::ANALYZERS`), bumped when an analyzer lands, so earlier
+    results are analysed again with it.
+  - **Fingerprinting:** ffmpeg's `chromaprint` muxer, falling back to `fpcalc`
+    (upstream has only the muxer); `IncompatibleFFmpegBuild` is raised only
+    when neither exists.
+  - **Upstream bugs not ported:** an anime preview is stored under the Preview
+    hash (upstream's Credits hash lets the Preview pass delete it for good);
+    Matroska `DURATION` tags parse at any fraction length (.NET's `TimeSpan`
+    stops at seven digits).
+  - **Failures:** a store write failure fails the season, retried next pass,
+    in every analyzer (upstream's black-frame analyzers log it per episode and
+    go on, the episode left analysed in memory); a failed keyframe
+    detection keeps the end; an invalid or runaway chapter pattern matches
+    nothing, reported once per pattern (upstream fails the pass); a negative
+    adjustment window is logged once, not per segment.
+  - **Concurrency:** the clean task holds the one-pass latch (upstream takes no
+    lock and can delete segments a concurrent pass just stored).
+  - **Automatic analysis:** library changes arrive through the event bus (D8),
+    debounced by `LibraryUpdateDuration` and batched, so a batch with any
+    addition waits as an addition, and image-only updates are not told apart.
+  - **Media Segment Scan** (`TaskExtractMediaSegments`) runs detection (D5).
+  - **Support bundle:** the version line also names Ferrofin's; the ffmpeg
+    checks run when the bundle is asked for (upstream: at start); the bundle
+    names the Chromaprint backend.
+  - **Task keys:** the detection task was `IntroSkipper.Detect` before D6; the
+    task manager adopts what was saved under that key.
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,

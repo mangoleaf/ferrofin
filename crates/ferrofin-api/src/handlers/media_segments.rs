@@ -16,7 +16,7 @@ use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
@@ -82,10 +82,16 @@ async fn get_item_segments(
         Some(types.as_slice())
     };
 
-    let segments = state
+    let mut segments = state
         .media_segments
         .get_segments(item_id, type_filter, false)
         .await?;
+    // The Intro Skipper's `MediaSegmentsFirstEpisodeFilter` (`SkipFirstEpisode`).
+    if segments.iter().any(|s| s.type_ == MediaSegmentType::Intro)
+        && state.intro_skipper_analysis.hides_intros(item_id).await
+    {
+        segments.retain(|s| s.type_ != MediaSegmentType::Intro);
+    }
     let count = i32::try_from(segments.len()).unwrap_or(i32::MAX);
     Ok(Json(QueryResult::new(Some(0), Some(count), segments)))
 }
@@ -99,11 +105,17 @@ struct ProviderEraseQuery {
 }
 
 /// `DELETE /MediaSegments/Provider/{providerId}` — erases every segment a provider
-/// wrote, optionally limited to one type. Backs a provider's bulk "erase
-/// timestamps" tool (e.g. Intro Skipper). Not a Jellyfin contract route; additive.
+/// wrote, optionally limited to one type. Not a Jellyfin contract route;
+/// additive. (Intro Skipper's erase goes through its own tier, `POST
+/// /Intros/EraseTimestamps`; rows removed here would be republished from it.)
+///
+/// Elevated: a server-wide erase, as every bulk segment erase upstream is
+/// (`SkipIntroController.ResetIntroTimestamps`, `EraseSeasonAsync` are
+/// `RequiresElevation`). It took a bare `RequireAuth`, so any account could
+/// wipe every provider's segments.
 async fn erase_provider_segments(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(provider_id): Path<String>,
     Query(query): Query<ProviderEraseQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -132,6 +144,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(erase_provider_segments),
         )
 }
+
 crate::query::query_parameters! {
     ProviderEraseQuery {} => [];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::include_segment_types;
+
+    #[test]
+    fn include_segment_types_matches_the_key_ignoring_case() {
+        let pairs = [
+            ("IncludeSegmentTypes".to_owned(), "Intro".to_owned()),
+            ("includesegmenttypes".to_owned(), "Outro".to_owned()),
+            ("other".to_owned(), "x".to_owned()),
+        ];
+        assert_eq!(
+            include_segment_types(&pairs).as_deref(),
+            Some("Intro,Outro")
+        );
+        assert_eq!(include_segment_types(&[]), None);
+    }
 }

@@ -655,7 +655,7 @@ async fn hls_binds_first_scalars_and_forwards_the_original_query() {
         }),
         Arc::new(ItemLibrary { present: true }),
     );
-    let raw = "DEVICEID=first&deviceId=second&MaxWidth=1280&maxwidth=bad&VideoBitRate=1000000&videobitrate=bad";
+    let raw = "DEVICEID=first&deviceId=second&MaxWidth=1280&maxwidth=bad&VideoBitRate=1000000&videobitrate=bad&mediaSourceId=src";
     let response = router
         .oneshot(authed(
             "GET",
@@ -733,7 +733,7 @@ async fn video_master_playlist_parses_contract_spellings() {
         .oneshot(authed(
             "GET",
             &format!(
-                "/Videos/{ITEM_ID}/master.m3u8?videoBitRate=1000000&audioBitRate=128000&\
+                "/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src&videoBitRate=1000000&audioBitRate=128000&\
                  enableAdaptiveBitrateStreaming=true&enableTrickplay=false&\
                  enableSubtitlesInManifest=true&subtitleStreamIndex=3&subtitleMethod=Hls&\
                  profile=high&level=41&framerate=30&width=640&height=360&minSegments=2&\
@@ -774,7 +774,10 @@ async fn video_master_head_is_ok() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("HEAD", &format!("/Videos/{ITEM_ID}/master.m3u8")))
+        .oneshot(authed(
+            "HEAD",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -798,7 +801,10 @@ async fn video_main_and_live_and_audio_playlists() {
     for (uri, marker) in [
         (format!("/Videos/{ITEM_ID}/main.m3u8"), "#VARIANT"),
         (format!("/Videos/{ITEM_ID}/live.m3u8"), "#LIVE"),
-        (format!("/Audio/{ITEM_ID}/master.m3u8"), "#MASTER"),
+        (
+            format!("/Audio/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+            "#MASTER",
+        ),
         (format!("/Audio/{ITEM_ID}/main.m3u8"), "#VARIANT"),
     ] {
         let router = router_with(
@@ -839,7 +845,7 @@ async fn dynamic_video_segment_serves_file_with_seam_content_type() {
     let resp = router
         .oneshot(authed(
             "GET",
-            &format!("/Videos/{ITEM_ID}/hls1/main/3.ts?runtimeTicks=0"),
+            &format!("/Videos/{ITEM_ID}/hls1/main/3.ts?runtimeTicks=0&actualSegmentLengthTicks=0"),
         ))
         .await
         .unwrap();
@@ -861,7 +867,10 @@ async fn dynamic_audio_segment_serves_file() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/hls1/main/0.aac")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Audio/{ITEM_ID}/hls1/main/0.aac?runtimeTicks=0&actualSegmentLengthTicks=0"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1058,7 +1067,10 @@ async fn playlist_seam_error_maps_to_status() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/master.m3u8")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);

@@ -32,7 +32,8 @@ impl TryFrom<ActivityLogEntity> for ActivityLogEntry {
             date: entity.date_created,
             user_id: parse_guid("ActivityLogs.UserId", &entity.user_id)?,
             user_primary_image_tag: None,
-            severity: log_level_from_i32(entity.log_severity)?,
+            // C# reads any stored integer back, named or not.
+            severity: LogLevel::from_json_value(entity.log_severity),
         })
     }
 }
@@ -62,30 +63,4 @@ impl TryFrom<ImageInfoEntity> for ImageInfo {
             size: 0,
         })
     }
-}
-
-/// Reads a [`LogLevel`] from its stored `INTEGER` discriminant.
-///
-/// Discriminants match `Microsoft.Extensions.Logging.LogLevel` declaration
-/// order (0-based), mirrored by the target enum.
-///
-/// # Errors
-/// Returns [`DbError::InvalidEnumValue`] for a discriminant outside `0..=6`.
-fn log_level_from_i32(value: i32) -> Result<LogLevel, DbError> {
-    let level = match value {
-        0 => LogLevel::Trace,
-        1 => LogLevel::Debug,
-        2 => LogLevel::Information,
-        3 => LogLevel::Warning,
-        4 => LogLevel::Error,
-        5 => LogLevel::Critical,
-        6 => LogLevel::None,
-        other => {
-            return Err(DbError::InvalidEnumValue {
-                enum_name: "LogLevel",
-                value: other,
-            });
-        }
-    };
-    Ok(level)
 }

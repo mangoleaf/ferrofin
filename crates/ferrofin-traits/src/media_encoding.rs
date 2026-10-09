@@ -551,6 +551,24 @@ pub struct HlsStreamRequest {
     /// The raw request query string (including the leading `?`), forwarded into
     /// the generated playlist's segment URLs (`Request.QueryString`).
     pub query_string: String,
+    /// The requested output audio channels (`audioChannels`).
+    pub audio_channels: Option<i32>,
+    /// The maximum output audio channels (`maxAudioChannels`).
+    pub max_audio_channels: Option<i32>,
+    /// The maximum output audio bit depth (`maxAudioBitDepth`).
+    pub max_audio_bit_depth: Option<i32>,
+    /// The maximum reference-frame count (`maxRefFrames`).
+    pub max_ref_frames: Option<i32>,
+    /// The maximum output video bit depth (`maxVideoBitDepth`).
+    pub max_video_bit_depth: Option<i32>,
+    /// Whether the input is force-deinterlaced (`deInterlace`).
+    pub deinterlace: bool,
+    /// The audio track to transcode (`audioStreamIndex`); a video request only.
+    pub audio_stream_index: Option<i32>,
+    /// The video track to transcode (`videoStreamIndex`).
+    pub video_stream_index: Option<i32>,
+    /// The requested output audio sample rate (`audioSampleRate`).
+    pub audio_sample_rate: Option<i32>,
 }
 
 impl Default for HlsStreamRequest {
@@ -594,6 +612,15 @@ impl Default for HlsStreamRequest {
             api_key: None,
             is_in_local_network: false,
             query_string: String::new(),
+            audio_channels: None,
+            max_audio_channels: None,
+            max_audio_bit_depth: None,
+            max_ref_frames: None,
+            max_video_bit_depth: None,
+            deinterlace: false,
+            audio_stream_index: None,
+            video_stream_index: None,
+            audio_sample_rate: None,
         }
     }
 }

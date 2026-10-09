@@ -18,8 +18,8 @@
 //!   descending (the C# `ApplyOrdering` default), so a bare query returns the
 //!   most recent entries first.
 //! - `LogSeverity` is stored as the `Microsoft.Extensions.Logging.LogLevel`
-//!   integer discriminant (`Trace`=0 … `None`=6); [`severity_to_int`] /
-//!   [`int_to_severity`] map it to the [`LogLevel`] model.
+//!   integer discriminant (`Trace`=0 … `None`=6), which the [`LogLevel`] wire
+//!   enum maps (an undefined stored value is kept, as C# reads it).
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -63,37 +63,6 @@ impl FerrofinActivityManager {
     }
 }
 
-/// Maps a stored `LogSeverity` discriminant to the model [`LogLevel`].
-///
-/// Mirrors `Microsoft.Extensions.Logging.LogLevel`; unknown values fall back to
-/// `Information` (the neutral default).
-#[must_use]
-pub fn int_to_severity(value: i32) -> LogLevel {
-    match value {
-        0 => LogLevel::Trace,
-        1 => LogLevel::Debug,
-        3 => LogLevel::Warning,
-        4 => LogLevel::Error,
-        5 => LogLevel::Critical,
-        6 => LogLevel::None,
-        _ => LogLevel::Information,
-    }
-}
-
-/// Maps a model [`LogLevel`] to its stored `LogSeverity` discriminant.
-#[must_use]
-pub fn severity_to_int(level: LogLevel) -> i32 {
-    match level {
-        LogLevel::Trace => 0,
-        LogLevel::Debug => 1,
-        LogLevel::Information => 2,
-        LogLevel::Warning => 3,
-        LogLevel::Error => 4,
-        LogLevel::Critical => 5,
-        LogLevel::None => 6,
-    }
-}
-
 /// Projects a stored [`ActivityLogEntity`] into an [`ActivityLogEntry`] DTO.
 ///
 /// Mirrors the C# `Select` projection: name/type/user/overviews/date/severity
@@ -110,7 +79,7 @@ fn to_entry(row: ActivityLogEntity) -> ActivityLogEntry {
         date: row.date_created,
         user_id: Uuid::parse_str(&row.user_id).unwrap_or_default(),
         user_primary_image_tag: None,
-        severity: int_to_severity(row.log_severity),
+        severity: LogLevel::from_json_value(row.log_severity),
     }
 }
 
@@ -122,10 +91,15 @@ fn order_by_clause(order_by: &[(ActivityLogSortBy, SortOrder)]) -> String {
     }
     let mut clauses = Vec::with_capacity(order_by.len());
     for (key, dir) in order_by {
+        // `ActivityManager.MapOrderBy`.
         let column = match key {
+            ActivityLogSortBy::Name => r#"a."Name""#,
+            ActivityLogSortBy::Overview => r#"a."Overview""#,
+            ActivityLogSortBy::ShortOverview => r#"a."ShortOverview""#,
+            ActivityLogSortBy::Type => r#"a."Type""#,
             ActivityLogSortBy::DateCreated => r#"a."DateCreated""#,
-            ActivityLogSortBy::LogLevel => r#"a."LogSeverity""#,
-            ActivityLogSortBy::Id => r#"a."Id""#,
+            ActivityLogSortBy::Username => r#"u."Username""#,
+            ActivityLogSortBy::LogSeverity => r#"a."LogSeverity""#,
         };
         let direction = match dir {
             SortOrder::Ascending => "ASC",
@@ -183,7 +157,7 @@ impl ActivityManager for FerrofinActivityManager {
         }
         if let Some(severity) = query.severity {
             wheres.push(r#"a."LogSeverity" = ?"#.to_owned());
-            binds.push(severity_to_int(severity).to_string());
+            binds.push(severity.json_value().to_string());
         }
 
         let where_sql = if wheres.is_empty() {
@@ -245,7 +219,7 @@ impl ActivityManager for FerrofinActivityManager {
         .bind(entry.overview)
         .bind(entry.short_overview)
         .bind(item_id)
-        .bind(severity_to_int(entry.severity))
+        .bind(entry.severity.json_value())
         .bind(datetime_to_db(Utc::now()))
         .execute(self.db.writer())
         .await
@@ -306,6 +280,66 @@ mod tests {
             .expect("open in-memory db");
         db.run_migrations().await.expect("run migrations");
         db
+    }
+
+    #[tokio::test]
+    async fn orders_by_every_upstream_key_and_keeps_undefined_severities() {
+        let db = memory_db().await;
+        let user = "11111111-1111-1111-1111-111111111111";
+        insert_entry(
+            &db,
+            "b",
+            "T2",
+            user,
+            99,
+            "2024-01-01 00:00:00.0000000",
+            None,
+        )
+        .await;
+        insert_entry(&db, "a", "T2", user, 1, "2024-01-02 00:00:00.0000000", None).await;
+        insert_entry(&db, "c", "T1", user, 3, "2024-01-03 00:00:00.0000000", None).await;
+        let manager = FerrofinActivityManager::new(db);
+        let names = |order_by: Vec<(ActivityLogSortBy, SortOrder)>| {
+            let manager = &manager;
+            async move {
+                let query = ActivityLogQuery {
+                    order_by,
+                    ..ActivityLogQuery::default()
+                };
+                let page = manager.get_paged_result(&query).await.expect("query");
+                page.items.into_iter().map(|e| e.name).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            names(vec![(ActivityLogSortBy::Name, SortOrder::Ascending)]).await,
+            ["a", "b", "c"]
+        );
+        // `ThenBy`: type first, then name descending within a type.
+        assert_eq!(
+            names(vec![
+                (ActivityLogSortBy::Type, SortOrder::Ascending),
+                (ActivityLogSortBy::Name, SortOrder::Descending),
+            ])
+            .await,
+            ["c", "b", "a"]
+        );
+        assert_eq!(
+            names(vec![(
+                ActivityLogSortBy::LogSeverity,
+                SortOrder::Descending
+            )])
+            .await,
+            ["b", "c", "a"]
+        );
+        // A severity no `LogLevel` member names reads back and filters as C#
+        // keeps it, instead of turning into `Information`.
+        let query = ActivityLogQuery {
+            severity: Some(LogLevel::from_json_value(99)),
+            ..ActivityLogQuery::default()
+        };
+        let page = manager.get_paged_result(&query).await.expect("query");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].severity, LogLevel::Unrecognized(99));
     }
 
     #[tokio::test]

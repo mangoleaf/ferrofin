@@ -1499,12 +1499,18 @@ async fn get_sessions_returns_list() {
 
 #[tokio::test]
 async fn repeated_session_scalars_forward_only_the_first_value() {
+    // An empty first value is `null` (`ConvertEmptyStringToNull`), so the
+    // filter is absent — a live Jellyfin 12.2 lists every session for
+    // `?deviceId=&deviceId=probe1`.
     for (query, expected) in [
-        ("deviceId=probe1&deviceId=nope", "probe1"),
-        ("DeviceId=nope&deviceid=probe1", "nope"),
-        ("DEVICEID=probe1&deviceId=nope&deviceid=third", "probe1"),
-        ("deviceId=a%2Cb&deviceId=c", "a,b"),
-        ("deviceId=&deviceId=probe1", ""),
+        ("deviceId=probe1&deviceId=nope", Some("probe1")),
+        ("DeviceId=nope&deviceid=probe1", Some("nope")),
+        (
+            "DEVICEID=probe1&deviceId=nope&deviceid=third",
+            Some("probe1"),
+        ),
+        ("deviceId=a%2Cb&deviceId=c", Some("a,b")),
+        ("deviceId=&deviceId=probe1", None),
     ] {
         let (sessions, user_data) = recording();
         let (status, _) = send(
@@ -1517,7 +1523,7 @@ async fn repeated_session_scalars_forward_only_the_first_value() {
         assert_eq!(status, StatusCode::OK, "{query}");
         assert_eq!(
             sessions.calls.lock().unwrap().listed,
-            Some((Some(expected.to_owned()), Some(7))),
+            Some((expected.map(str::to_owned), Some(7))),
             "{query}"
         );
     }

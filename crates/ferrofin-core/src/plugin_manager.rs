@@ -438,7 +438,15 @@ pub struct FerrofinPluginManager {
     /// Runs the one-shot `state.json` → `ServerConfiguration` repository
     /// migration at most once, on first use.
     legacy_repositories_migrated: tokio::sync::OnceCell<()>,
+    /// Where a saved configuration is announced (`BasePlugin`'s
+    /// `ConfigurationChanged`), as the in-process
+    /// [`PLUGIN_CONFIGURATION_CHANGED`] event.
+    events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
 }
+
+/// The in-process event a plugin configuration save publishes, with
+/// `{"Id": "<plugin id>"}`; never forwarded to clients.
+pub const PLUGIN_CONFIGURATION_CHANGED: &str = "PluginConfigurationChanged";
 
 impl std::fmt::Debug for FerrofinPluginManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -472,7 +480,16 @@ impl FerrofinPluginManager {
             config: None,
             application_version: DEFAULT_APPLICATION_VERSION.to_owned(),
             legacy_repositories_migrated: tokio::sync::OnceCell::new(),
+            events: None,
         }
+    }
+
+    /// Announces configuration saves on `events` (see
+    /// [`PLUGIN_CONFIGURATION_CHANGED`]). Called once by the composition root.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     /// Attaches the server configuration — the store the package repositories
@@ -1179,7 +1196,16 @@ impl PluginManager for FerrofinPluginManager {
             serde_json::Value::Null => Ok(()),
             serde_json::Value::Object(map) => {
                 let projected = project_config(&defaults, &map)?;
-                Self::atomic_write(&self.config_path(id), &projected)
+                Self::atomic_write(&self.config_path(id), &projected)?;
+                // `UpdateConfiguration` raises `ConfigurationChanged` after the
+                // save; a consumer's failure is its own.
+                if let Some(events) = &self.events {
+                    let payload = serde_json::json!({ "Id": id.simple().to_string() }).to_string();
+                    if let Err(err) = events.publish(PLUGIN_CONFIGURATION_CHANGED, &payload).await {
+                        tracing::debug!(%err, plugin_id = %id, "plugin configuration change not announced");
+                    }
+                }
+                Ok(())
             }
             // The C# deserializes into the plugin's own `ConfigurationType`, so
             // an array or a scalar throws and the request fails. Jellyfin's
@@ -1631,6 +1657,57 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = FerrofinPluginManager::new(plugins, dir.path().to_path_buf());
         (mgr, dir)
+    }
+
+    /// Records every published event.
+    #[derive(Default)]
+    struct Published(std::sync::Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::events::EventManager for Published {
+        async fn publish(&self, event_type: &str, payload: &str) -> Result<(), ServiceError> {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((event_type.to_owned(), payload.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// A saved configuration is announced (`ConfigurationChanged`); a `null`
+    /// body changes nothing and announces nothing, a refused one neither.
+    #[tokio::test]
+    async fn a_configuration_save_is_announced() {
+        let id = Uuid::from_u128(0x77);
+        let events = Arc::new(Published::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinPluginManager::new(
+            vec![
+                RegisteredPlugin::new(descriptor(id, "Demo", true), None)
+                    .with_default_config(br#"{"k":1}"#.to_vec()),
+            ],
+            dir.path().to_path_buf(),
+        )
+        .with_events(Arc::clone(&events) as Arc<dyn ferrofin_traits::events::EventManager>);
+        mgr.set_plugin_configuration(id, b"null".to_vec())
+            .await
+            .expect("null");
+        assert!(
+            mgr.set_plugin_configuration(id, b"[1]".to_vec())
+                .await
+                .is_err()
+        );
+        assert!(events.0.lock().expect("lock").is_empty());
+        mgr.set_plugin_configuration(id, br#"{"k":2}"#.to_vec())
+            .await
+            .expect("save");
+        assert_eq!(
+            *events.0.lock().expect("lock"),
+            [(
+                super::PLUGIN_CONFIGURATION_CHANGED.to_owned(),
+                format!(r#"{{"Id":"{}"}}"#, id.simple())
+            )]
+        );
     }
 
     #[tokio::test]

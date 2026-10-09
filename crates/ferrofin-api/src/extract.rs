@@ -227,8 +227,11 @@ fn bind_doc<T: DeserializeOwned>(doc: Doc, want: TopLevel) -> Result<T, ProblemD
 /// The 400 for a member the DTO's types cannot take, keyed by its JSON path.
 fn member_error<E: std::fmt::Display>(e: serde_path_to_error::Error<E>) -> ProblemDetails {
     let path = e.path().to_string();
+    // `$.Member`, `$[0].Member` — the JSON path ASP.NET keys the error by.
     let key = if path.is_empty() || path == "." {
         "$".to_owned()
+    } else if path.starts_with('[') {
+        format!("${path}")
     } else {
         format!("$.{path}")
     };
@@ -544,6 +547,20 @@ mod tests {
                 .errors
                 .as_ref()
                 .is_some_and(|e| e.contains_key("body"))
+        );
+    }
+
+    #[test]
+    fn a_list_body_member_is_keyed_without_a_dot_before_the_index() {
+        let rejected =
+            bind::<Vec<Dto>>(br#"[{"Names":[{}]}]"#, TopLevel::Array).expect_err("rejected");
+        assert!(
+            rejected
+                .errors
+                .as_ref()
+                .is_some_and(|e| e.keys().any(|k| k.starts_with("$[0].Names"))),
+            "{:?}",
+            rejected.errors
         );
     }
 

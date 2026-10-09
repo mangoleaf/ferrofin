@@ -430,18 +430,33 @@ fn supported_codecs(codecs: &[String], source: Option<&MediaStream>, target: &st
     }
 }
 
-/// The default stream of `stream_type` from `streams`: the first flagged
-/// `is_default`, else the first of that type.
-///
-/// Port of the `GetDefaultStream` selection `StreamingHelpers` applies to pick
-/// the video/audio stream to transcode.
-fn default_stream(streams: &[MediaStream], stream_type: MediaStreamType) -> Option<MediaStream> {
-    streams
+/// The `stream_type` stream to transcode. Port of `EncodingHelper.GetMediaStream`
+/// (`returnFirstIfNoIndex: true`), as `AttachMediaSourceInfo` calls it: the
+/// stream at `desired_index` when the request names one that exists, else — by
+/// stream index — the first audio stream with channels (then any audio), or
+/// the first stream of another type. `IsDefault` plays no part: the client's
+/// choice reaches the server as the index (`StreamInfo::to_url`).
+fn media_stream(
+    streams: &[MediaStream],
+    desired_index: Option<i32>,
+    stream_type: MediaStreamType,
+) -> Option<MediaStream> {
+    let mut of_type: Vec<&MediaStream> = streams
         .iter()
         .filter(|s| s.stream_type == stream_type)
-        .find(|s| s.is_default)
-        .or_else(|| streams.iter().find(|s| s.stream_type == stream_type))
-        .cloned()
+        .collect();
+    of_type.sort_by_key(|s| s.index);
+    if let Some(index) = desired_index
+        && let Some(stream) = of_type.iter().find(|s| s.index == index)
+    {
+        return Some((*stream).clone());
+    }
+    if stream_type == MediaStreamType::Audio
+        && let Some(stream) = of_type.iter().find(|s| s.channels.is_some_and(|c| c > 0))
+    {
+        return Some((*stream).clone());
+    }
+    of_type.first().map(|s| (*s).clone())
 }
 
 /// The subtitle stream at `index` from `streams`, if present.
@@ -586,12 +601,17 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             .ok_or_else(|| ServiceError::backend("media source has no path"))?;
         let run_time_ticks = media_source.run_time_ticks.unwrap_or(0);
 
-        let video_stream = if is_audio {
-            None
+        // `AttachMediaSourceInfo`: a video request picks its tracks by the
+        // requested indexes; an audio request takes the first audio stream.
+        let streams = &media_source.media_streams;
+        let (video_stream, audio_stream) = if is_audio {
+            (None, media_stream(streams, None, MediaStreamType::Audio))
         } else {
-            default_stream(&media_source.media_streams, MediaStreamType::Video)
+            (
+                media_stream(streams, request.video_stream_index, MediaStreamType::Video),
+                media_stream(streams, request.audio_stream_index, MediaStreamType::Audio),
+            )
         };
-        let audio_stream = default_stream(&media_source.media_streams, MediaStreamType::Audio);
         // The transcode URL carries both the subtitle index and the negotiated
         // delivery (`SubtitleMethod`, written by `StreamInfo::to_url`). Honour
         // the method: only `Encode` burns the track into the video. Treating a
@@ -681,6 +701,15 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let base_request = BaseEncodingJobOptions {
             audio_codec: Some(requested_audio_codec.clone()),
             transcoding_max_audio_channels: request.transcoding_max_audio_channels,
+            // The typed `DynamicHlsController` members `GetRequested*` read
+            // before falling back to a per-codec stream option.
+            audio_channels: request.audio_channels,
+            max_audio_channels: request.max_audio_channels,
+            max_audio_bit_depth: request.max_audio_bit_depth,
+            max_ref_frames: request.max_ref_frames,
+            max_video_bit_depth: request.max_video_bit_depth,
+            deinterlace: request.deinterlace,
+            audio_sample_rate: request.audio_sample_rate,
             is_static: request.is_static,
             subtitle_stream_index: subtitle_index,
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
@@ -1568,6 +1597,31 @@ impl FerrofinStreamStatePlanner {
                     push_split(&mut args, "-ac");
                     args.push(channels.to_string());
                 }
+                // `DynamicHlsController.GetAudioArguments`: the output sample
+                // rate, else (video output only) 48 kHz for ac-4, whose odd
+                // native rates most encoders refuse. An opus encode snaps the
+                // rate to one libopus accepts, as upstream's progressive path
+                // does (`GetProgressiveAudioFullCommandLine`); upstream's HLS
+                // arm passes it unsnapped and libopus then fails to start
+                // ("sample rate … is not supported"), which is not ported.
+                if let Some(rate) = state.output_audio_sample_rate() {
+                    let rate = if audio_encoder.contains("opus") {
+                        opus_sample_rate(rate)
+                    } else {
+                        rate
+                    };
+                    push_split(&mut args, "-ar");
+                    args.push(rate.to_string());
+                } else if state.is_input_video
+                    && state
+                        .audio_stream
+                        .as_ref()
+                        .and_then(|a| a.codec_tag.as_deref())
+                        == Some("ac-4")
+                {
+                    push_split(&mut args, "-ar");
+                    args.push("48000".to_owned());
+                }
                 // Downmix volume boost (GetAudioFilterParam): a >stereo →
                 // stereo downmix is roughly half as loud, so boost it back.
                 if let Some(af) =
@@ -1804,6 +1858,18 @@ fn escape_subtitle_filter_path(path: &str) -> String {
         .replace('\'', "'\\\\\\''")
 }
 
+/// The libopus sample rate for a requested `rate` — the snapping upstream's
+/// `GetProgressiveAudioFullCommandLine` applies (opus encodes only these).
+fn opus_sample_rate(rate: i32) -> i32 {
+    match rate {
+        ..=8_000 => 8_000,
+        8_001..=12_000 => 12_000,
+        12_001..=16_000 => 16_000,
+        16_001..=24_000 => 24_000,
+        _ => 48_000,
+    }
+}
+
 /// Pushes each whitespace-separated token of `fragment` as its own arg.
 ///
 /// The [`EncodingHelper`] methods return space-joined fragments (e.g.
@@ -1839,6 +1905,12 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     // produces different video.
     query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
     query_param(&request.query_string, "SubtitleMethod").hash(&mut hasher);
+    // The chosen tracks and the output rate shape the output as well: a
+    // re-request on the same session naming another audio track must not
+    // replay the previous track's segments.
+    request.audio_stream_index.hash(&mut hasher);
+    request.video_stream_index.hash(&mut hasher);
+    request.audio_sample_rate.hash(&mut hasher);
     segment_container.hash(&mut hasher);
     is_audio.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -1856,10 +1928,33 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[test]
+    fn raw_query_params_match_keys_ignoring_case() {
+        // The transcode URL reaches the planner as sent (the server no longer
+        // folds query keys), and ASP.NET's `IQueryCollection` ignores case.
+        for query in [
+            "?SubtitleStreamIndex=3&SubtitleMethod=Encode",
+            "?subtitleStreamIndex=3&subtitleMethod=Encode",
+            "?SUBTITLESTREAMINDEX=3&subtitlemethod=Encode",
+        ] {
+            assert_eq!(
+                query_param_i32(query, "SubtitleStreamIndex"),
+                Some(3),
+                "{query}"
+            );
+            assert_eq!(
+                query_param(query, "SubtitleMethod"),
+                Some("Encode"),
+                "{query}"
+            );
+        }
+    }
 
     /// A fake [`MediaSourceManager`] returning a fixed source list, plus the
     /// open live streams `get_live_stream` can hand back.
@@ -2337,6 +2432,155 @@ mod tests {
             pos.map(|i| plan.arguments[i + 1].as_str()),
             Some("2"),
             "expected `-ac 2`, got: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn media_stream_follows_get_media_stream() {
+        let mut first = audio_stream("aac");
+        first.index = 1;
+        first.channels = Some(0);
+        first.is_default = true;
+        let mut second = audio_stream("ac3");
+        second.index = 2;
+        second.channels = Some(6);
+        second.is_default = false;
+        let mut third = audio_stream("eac3");
+        third.index = 3;
+        third.channels = Some(2);
+        third.is_default = false;
+        // Out of index order, so only the sort makes stream 2 the first with
+        // channels.
+        let streams = vec![video_stream("h264"), third, second.clone(), first];
+        // The requested index wins.
+        assert_eq!(
+            media_stream(&streams, Some(2), MediaStreamType::Audio).map(|s| s.index),
+            Some(2)
+        );
+        // Without one (or with one that does not exist): the first audio stream
+        // with channels, by index — not the `IsDefault` one.
+        for desired in [None, Some(9)] {
+            assert_eq!(
+                media_stream(&streams, desired, MediaStreamType::Audio).map(|s| s.index),
+                Some(2)
+            );
+        }
+        assert_eq!(
+            media_stream(&streams, Some(5), MediaStreamType::Video).map(|s| s.index),
+            Some(0)
+        );
+        assert!(media_stream(&streams, None, MediaStreamType::Subtitle).is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_transcodes_the_requested_audio_track_at_the_requested_rate() {
+        let mut eng = audio_stream("aac");
+        eng.index = 1;
+        eng.channels = Some(2);
+        let mut fra = audio_stream("ac3");
+        fra.index = 2;
+        fra.channels = Some(6);
+        fra.is_default = false;
+        let src = source("abc", vec![video_stream("hevc"), eng, fra]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_stream_index = Some(2);
+        req.audio_sample_rate = Some(44_100);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.state.audio_stream.as_ref().map(|a| a.index), Some(2));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-ar 44100"), "{args}");
+    }
+
+    #[test]
+    fn opus_rates_snap_to_what_libopus_encodes() {
+        for (rate, snapped) in [
+            (8_000, 8_000),
+            (11_025, 12_000),
+            (16_000, 16_000),
+            (22_050, 24_000),
+            (44_100, 48_000),
+            (96_000, 48_000),
+        ] {
+            assert_eq!(opus_sample_rate(rate), snapped, "{rate}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_audio_request_ignores_the_requested_audio_track() {
+        // `AttachMediaSourceInfo`: only a video request reads `AudioStreamIndex`.
+        let mut first = audio_stream("flac");
+        first.index = 0;
+        first.channels = Some(2);
+        let mut second = audio_stream("mp3");
+        second.index = 1;
+        second.channels = Some(2);
+        second.is_default = false;
+        let src = source("abc", vec![first, second]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_stream_index = Some(1);
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.state.audio_stream.as_ref().map(|a| a.index), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_different_audio_track_is_a_different_job() {
+        let req = request("abc");
+        let mut other = req.clone();
+        other.audio_stream_index = Some(2);
+        assert_ne!(output_id(&req, "ts", false), output_id(&other, "ts", false));
+    }
+
+    #[tokio::test]
+    async fn plan_resamples_ac4_to_48k_without_a_requested_rate() {
+        let mut audio = audio_stream("ac4");
+        audio.codec_tag = Some("ac-4".to_owned());
+        audio.channels = Some(2);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-ar 48000"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn plan_honours_the_typed_audio_channels_member() {
+        // `audioChannels` is a typed `DynamicHlsController` member: it reaches
+        // `GetRequestedAudioChannels` through the base request, not only as a
+        // lower-case per-codec stream option (casing: hls.rs binding tests).
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_channels = Some(2);
+        req.max_audio_channels = Some(6);
+        req.max_audio_bit_depth = Some(24);
+        req.max_ref_frames = Some(4);
+        req.max_video_bit_depth = Some(10);
+        req.deinterlace = true;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        // Every typed member lands on the base request…
+        let base = &plan.state.base_request;
+        assert_eq!(base.audio_channels, Some(2));
+        assert_eq!(base.max_audio_channels, Some(6));
+        assert_eq!(base.max_audio_bit_depth, Some(24));
+        assert_eq!(base.max_ref_frames, Some(4));
+        assert_eq!(base.max_video_bit_depth, Some(10));
+        assert!(base.deinterlace);
+        // …and `GetRequestedAudioChannels` takes MaxAudioChannels first.
+        let pos = plan.arguments.iter().position(|a| a == "-ac");
+        assert_eq!(
+            pos.map(|i| plan.arguments[i + 1].as_str()),
+            Some("6"),
+            "expected `-ac 6`, got: {:?}",
             plan.arguments
         );
     }

@@ -409,6 +409,29 @@ fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Task keys Ferrofin once registered under another name: `(old, new, new
+/// name)`. A store entry under the old key is adopted by the new one, so a
+/// rename keeps a task's saved schedule and history.
+const RENAMED_TASK_KEYS: &[(&str, &str, &str)] = &[(
+    "IntroSkipper.Detect",
+    "IntroSkipperDetectSegmentsTask",
+    "Detect and Analyze Media Segments",
+)];
+
+/// Moves `map`'s entries under a renamed task's old key to its new one
+/// (unless the new one has its own); `adopt` relabels a moved value with the
+/// new key and name.
+fn adopt_renamed_keys<T>(map: &mut HashMap<String, T>, adopt: impl Fn(&mut T, &str, &str)) {
+    for (old, new, name) in RENAMED_TASK_KEYS {
+        if let Some(mut value) = map.remove(*old)
+            && !map.contains_key(*new)
+        {
+            adopt(&mut value, new, name);
+            map.insert((*new).to_owned(), value);
+        }
+    }
+}
+
 /// Reads a JSON store written by [`write_store`], returning an empty map when
 /// the file does not exist (a first boot) and warning — loudly, as upstream's
 /// `Error deserializing {File}` does — when it exists but cannot be parsed, so
@@ -461,7 +484,10 @@ impl FerrofinTaskManager {
     /// empty (first boot); an unparseable one is warned about and treated as
     /// empty, rather than silently resetting every configured schedule.
     pub fn set_trigger_store(&self, path: PathBuf) {
-        *lock(&self.stored_overrides) = read_store(&path, "task triggers");
+        let mut overrides: HashMap<String, Vec<TaskTriggerInfo>> =
+            read_store(&path, "task triggers");
+        adopt_renamed_keys(&mut overrides, |_, _, _| {});
+        *lock(&self.stored_overrides) = overrides;
         *lock(&self.store_path) = Some(path);
     }
 
@@ -494,7 +520,12 @@ impl FerrofinTaskManager {
     /// task fills it in on its first Ferrofin run. Nothing is lost: Jellyfin's
     /// own files stay untouched for a swap back.
     pub fn set_result_store(&self, path: PathBuf) {
-        *lock(&self.stored_results) = read_store(&path, "task history");
+        let mut results: HashMap<String, TaskResult> = read_store(&path, "task history");
+        adopt_renamed_keys(&mut results, |result, key, name| {
+            result.key = Some(key.to_owned());
+            result.name = Some(name.to_owned());
+        });
+        *lock(&self.stored_results) = results;
         *lock(&self.result_store_path) = Some(path);
     }
 
@@ -1922,6 +1953,41 @@ mod tests {
         mgr.run_now("counting").await.expect("run");
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    /// A renamed task keeps what was saved under its old key; an entry the
+    /// new key already has wins.
+    #[test]
+    fn a_renamed_task_adopts_its_old_entries() {
+        use super::adopt_renamed_keys;
+        use std::collections::HashMap;
+        let mut overrides: HashMap<String, Vec<u8>> =
+            HashMap::from([("IntroSkipper.Detect".to_owned(), vec![1])]);
+        adopt_renamed_keys(&mut overrides, |_, _, _| {});
+        assert_eq!(
+            overrides,
+            HashMap::from([("IntroSkipperDetectSegmentsTask".to_owned(), vec![1])])
+        );
+
+        let mut both: HashMap<String, Vec<u8>> = HashMap::from([
+            ("IntroSkipper.Detect".to_owned(), vec![1]),
+            ("IntroSkipperDetectSegmentsTask".to_owned(), vec![2]),
+        ]);
+        adopt_renamed_keys(&mut both, |_, _, _| {});
+        assert_eq!(
+            both,
+            HashMap::from([("IntroSkipperDetectSegmentsTask".to_owned(), vec![2])])
+        );
+
+        let mut results: HashMap<String, Option<String>> = HashMap::from([(
+            "IntroSkipper.Detect".to_owned(),
+            Some("IntroSkipper.Detect".to_owned()),
+        )]);
+        adopt_renamed_keys(&mut results, |key, new, _| *key = Some(new.to_owned()));
+        assert_eq!(
+            results["IntroSkipperDetectSegmentsTask"].as_deref(),
+            Some("IntroSkipperDetectSegmentsTask")
+        );
     }
 
     #[tokio::test]

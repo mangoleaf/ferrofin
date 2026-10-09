@@ -23,6 +23,7 @@ pub mod entities_media;
 pub mod environment_dtos;
 pub mod extensions;
 pub mod globalization;
+pub mod intro_skipper;
 pub mod io;
 pub mod json;
 pub mod library;

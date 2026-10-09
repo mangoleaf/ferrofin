@@ -1,0 +1,110 @@
+{
+ "DELETE /Library/VirtualFolders": [
+  "name"
+ ],
+ "DELETE /Library/VirtualFolders/Paths": [
+  "name",
+  "path"
+ ],
+ "DELETE /Videos/ActiveEncodings": [
+  "deviceId",
+  "playSessionId"
+ ],
+ "GET /Artists/InstantMix": [
+  "id"
+ ],
+ "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": [
+  "actualSegmentLengthTicks",
+  "runtimeTicks"
+ ],
+ "GET /Audio/{itemId}/master.m3u8": [
+  "mediaSourceId"
+ ],
+ "GET /Devices/Info": [
+  "id"
+ ],
+ "GET /Devices/Options": [
+  "id"
+ ],
+ "GET /DisplayPreferences/{displayPreferencesId}": [
+  "client"
+ ],
+ "GET /Environment/DirectoryContents": [
+  "path"
+ ],
+ "GET /Environment/ParentPath": [
+  "path"
+ ],
+ "GET /MusicGenres/InstantMix": [
+  "id"
+ ],
+ "GET /QuickConnect/Connect": [
+  "secret"
+ ],
+ "GET /Search/Hints": [
+  "searchTerm"
+ ],
+ "GET /System/Logs/Log": [
+  "name"
+ ],
+ "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": [
+  "actualSegmentLengthTicks",
+  "runtimeTicks"
+ ],
+ "GET /Videos/{itemId}/master.m3u8": [
+  "mediaSourceId"
+ ],
+ "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": [
+  "segmentLength"
+ ],
+ "HEAD /Audio/{itemId}/master.m3u8": [
+  "mediaSourceId"
+ ],
+ "HEAD /Videos/{itemId}/master.m3u8": [
+  "mediaSourceId"
+ ],
+ "POST /Audio/{itemId}/Lyrics": [
+  "fileName"
+ ],
+ "POST /Auth/Keys": [
+  "app"
+ ],
+ "POST /Devices/Options": [
+  "id"
+ ],
+ "POST /DisplayPreferences/{displayPreferencesId}": [
+  "client"
+ ],
+ "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": [
+  "newIndex"
+ ],
+ "POST /Items/{itemId}/RemoteImages/Download": [
+  "type"
+ ],
+ "POST /Library/VirtualFolders": [
+  "name"
+ ],
+ "POST /LiveStreams/Close": [
+  "liveStreamId"
+ ],
+ "POST /QuickConnect/Authorize": [
+  "code"
+ ],
+ "POST /Sessions/Playing/Ping": [
+  "playSessionId"
+ ],
+ "POST /Sessions/Viewing": [
+  "itemId"
+ ],
+ "POST /Sessions/{sessionId}/Playing": [
+  "playCommand"
+ ],
+ "POST /Sessions/{sessionId}/Viewing": [
+  "itemId",
+  "itemName",
+  "itemType"
+ ],
+ "POST /Users/{userId}/Authenticate": [
+  "pw"
+ ]
+}

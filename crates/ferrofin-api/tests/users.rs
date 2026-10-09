@@ -1660,6 +1660,42 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["AccessToken"], "canned-token");
 }
 
+/// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/
+/// Authenticate?pw=`, hidden from the OpenAPI document but served): anonymous,
+/// 404 for an unknown user, `[Required] pw`, else `AuthenticateUserByName`.
+#[tokio::test]
+async fn authenticate_by_id_signs_in_as_that_user() {
+    let post = |uri: String| async move {
+        create_router(ok_state(Uuid::from_u128(1), ""))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let response = post(format!("/Users/{USER_ID}/Authenticate?pw=secret")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["User"]["Name"], "alice");
+    assert_eq!(json["AccessToken"], "canned-token");
+    let response = post(format!(
+        "/Users/{}/Authenticate?pw=secret",
+        Uuid::from_u128(0xdead)
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post(format!("/Users/{USER_ID}/Authenticate")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "pw is [Required]"
+    );
+}
+
 /// C# `UserController.AuthenticateUserByName` sets
 /// `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()` on the
 /// authentication request. Ferrofin passed `None`, so `SessionInfo.RemoteEndPoint`
