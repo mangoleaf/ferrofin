@@ -10,6 +10,7 @@ description = "Curated, compiled-in extensions (Jellyfin plugins) for Ferrofin, 
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 ferrofin-chromaprint.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true

@@ -1351,6 +1351,7 @@ name = "ferrofin-extensions"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "ferrofin-chromaprint",
  "ferrofin-core",
  "ferrofin-db",

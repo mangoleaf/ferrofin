@@ -1839,6 +1839,9 @@ mod tests {
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
             intro_skipper_running: Arc::default(),
+            virtual_folders: Arc::new(
+                ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

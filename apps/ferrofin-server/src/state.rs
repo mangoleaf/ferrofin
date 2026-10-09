@@ -1478,6 +1478,7 @@ pub async fn build_app_state(
         merge_versions: Arc::clone(&merge_versions),
         intro_skipper: Arc::clone(&intro_skipper),
         intro_skipper_running: Arc::default(),
+        virtual_folders: Arc::clone(&virtual_folders),
     };
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     // "Media Segment Scan" (Library category): upstream registers this one in

@@ -23,35 +23,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use ferrofin_chromaprint::{AnalysisMode, CompareConfig, TimeRange, compare_episodes};
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
-use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode as WireMode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, IntroSkipperAnalysis, StoredSegment};
-use ferrofin_traits::library::LibraryManager;
+use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::MediaSegmentManager;
-use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
+
+mod queue;
 use crate::{Extension, ExtensionContext};
 
 /// The Intro Skipper's stable plugin id (also its `/Plugins` id) — the
 /// **upstream plugin's GUID**, because the vendored dashboard app and third-party
 /// client integrations address the plugin by that id.
 const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
-
-/// 100-nanosecond ticks per second (Jellyfin's `MediaSegment` time unit).
-const TICKS_PER_SECOND: f64 = 10_000_000.0;
-
-/// Converts 100-nanosecond ticks to seconds (episode runtimes are well within
-/// `f64`'s exact-integer range).
-#[allow(clippy::cast_precision_loss)]
-fn ticks_to_secs(ticks: i64) -> f64 {
-    ticks as f64 / TICKS_PER_SECOND
-}
 
 /// The Intro Skipper extension.
 #[derive(Debug, Default, Clone, Copy)]
@@ -139,6 +128,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
         cache_dir: cx.cache_dir.join("introskipper"),
         running: Arc::clone(&cx.intro_skipper_running),
         actions: Arc::clone(&cx.intro_skipper),
+        virtual_folders: Arc::clone(&cx.virtual_folders),
     }
 }
 
@@ -224,6 +214,29 @@ impl ScheduledTask for MediaSegmentScanTask {
     }
 }
 
+/// `ExclusionListJsonConverter`: an array of strings (nulls skipped), or the
+/// legacy comma-separated string (trimmed, empties dropped). Anything else is
+/// refused, as upstream throws.
+fn exclusion_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum List {
+        Legacy(String),
+        Items(Vec<Option<String>>),
+    }
+    Ok(match List::deserialize(deserializer)? {
+        List::Legacy(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        List::Items(items) => items.into_iter().flatten().collect(),
+    })
+}
+
 /// The Intro Skipper's configuration — the full schema of the upstream plugin
 /// (`IntroSkipper/Configuration/PluginConfiguration.cs`), so the settings page is
 /// 1:1 with it. Field names (via `PascalCase`) and defaults match the C# exactly;
@@ -251,10 +264,13 @@ pub struct IntroSkipperConfig {
     /// Legacy comma-separated excluded series (superseded by `SeriesExclusions`).
     pub exclude_series: String,
     /// Series excluded from analysis (exact, case-insensitive names).
+    #[serde(deserialize_with = "exclusion_list")]
     pub series_exclusions: Vec<String>,
     /// Movies excluded from analysis.
+    #[serde(deserialize_with = "exclusion_list")]
     pub movie_exclusions: Vec<String>,
     /// Paths excluded from analysis.
+    #[serde(deserialize_with = "exclusion_list")]
     pub path_exclusions: Vec<String>,
     /// Detect introductions.
     pub scan_introduction: bool,
@@ -508,7 +524,24 @@ impl IntroSkipperConfig {
 struct Episode {
     id: Uuid,
     path: String,
-    duration_secs: f64,
+    /// The intro window's end (`QueuedEpisode.IntroFingerprintEnd`).
+    intro_end: f64,
+    /// The credits window (`CreditsFingerprintStart`/`End`).
+    credits: (f64, f64),
+}
+
+impl From<&queue::QueuedEpisode> for Episode {
+    fn from(entry: &queue::QueuedEpisode) -> Self {
+        Self {
+            id: entry.episode_id,
+            path: entry.path.clone(),
+            intro_end: entry.intro_fingerprint_end,
+            credits: (
+                entry.credits_fingerprint_start,
+                entry.credits_fingerprint_end,
+            ),
+        }
+    }
 }
 
 /// The scheduled task that detects intros/credits across the library.
@@ -524,6 +557,8 @@ struct DetectSegmentsTask {
     running: Arc<AtomicBool>,
     /// The per-season analyzer actions (`POST /Intros/AnalyzerActions/UpdateSeason`).
     actions: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    /// The libraries, whose options decide which ones are analysed.
+    virtual_folders: Arc<dyn VirtualFolderManager>,
 }
 
 #[allow(clippy::unnecessary_literal_bound)]
@@ -588,8 +623,15 @@ impl Drop for ReleaseOnDrop {
 }
 
 impl DetectSegmentsTask {
-    /// The background analysis pass: enumerate episodes by season, then detect +
-    /// write segments for each season with enough episodes to compare.
+    /// The queue (`QueueManager.GetMediaItems(includeExcluded: true)`): every
+    /// entry, excluded ones flagged.
+    async fn queue(&self, config: &IntroSkipperConfig) -> Result<queue::Queue, ServiceError> {
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        queue::build(self.library.as_ref(), &folders, config, true).await
+    }
+
+    /// The background analysis pass: build the queue, then detect + write
+    /// segments for each season the Chromaprint analyzer can compare.
     #[tracing::instrument(name = "extension_run", skip_all, fields(extension = "intro_skipper"))]
     async fn run_analysis(
         &self,
@@ -597,28 +639,30 @@ impl DetectSegmentsTask {
         fingerprinter: &Arc<dyn Fingerprinter>,
         config: &IntroSkipperConfig,
     ) {
-        let seasons = match self.episodes_by_season().await {
-            Ok(seasons) => seasons,
+        let queue = match self.queue(config).await {
+            Ok(queue) => queue,
             Err(err) => {
-                tracing::warn!(%err, "intro skipper: could not enumerate episodes");
+                tracing::warn!(%err, "intro skipper: could not build the analysis queue");
                 return;
             }
         };
         // Only seasons with a comparable pair do work; drive progress off those
         // so the percentage tracks the fingerprinting rather than the skipped
         // singletons.
-        let analyzable: Vec<(&String, &Vec<Episode>)> =
-            seasons.iter().filter(|(_, eps)| eps.len() >= 2).collect();
+        let analyzable: Vec<(Uuid, Vec<Episode>)> = queue
+            .iter()
+            .filter_map(|(season, entries)| Some((*season, analyzable(entries, config)?)))
+            .collect();
         let total = analyzable.len();
         tracing::info!(
-            seasons = seasons.len(),
+            seasons = queue.len(),
             analyzable = total,
             "intro skipper: analysis started"
         );
         let mut written = 0usize;
         let mut unreadable = 0usize;
         let mut first_error = None;
-        for (idx, (season_id, episodes)) in analyzable.into_iter().enumerate() {
+        for (idx, (season_id, episodes)) in analyzable.iter().enumerate() {
             // Log + report BEFORE the season's fingerprinting (the slow part), so
             // a stall shows up as the last "analyzing season N" line with silence
             // after — pinpointing which season's media reads wedged.
@@ -631,16 +675,12 @@ impl DetectSegmentsTask {
                 segments = written,
                 "intro skipper: analyzing season"
             );
-            // A season id that is no GUID has no stored actions.
-            let actions = match Uuid::parse_str(season_id) {
-                Ok(season) => match self.actions.analyzer_actions(season).await {
-                    Ok(actions) => Some(actions),
-                    Err(err) => {
-                        first_error.get_or_insert(err);
-                        None
-                    }
-                },
-                Err(_) => Some(HashMap::new()),
+            let actions = match self.actions.analyzer_actions(*season_id).await {
+                Ok(actions) => Some(actions),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                    None
+                }
             };
             unreadable += usize::from(actions.is_none());
             written += self
@@ -654,15 +694,13 @@ impl DetectSegmentsTask {
                 "intro skipper: seasons skipped, their analyzer actions could not be read"
             );
         }
-        // `CleanCacheTask` → `CleanSeasonStateAsync`: drop the actions of
-        // seasons that no longer have episodes, so a season re-created under
-        // the same id does not inherit them.
-        let live: Vec<Uuid> = seasons
-            .keys()
-            .filter_map(|id| Uuid::parse_str(id).ok())
-            .collect();
+        // `CleanCacheTask` → `CleanSeasonStateAsync` over the whole queue
+        // (excluded seasons included): drop the state of seasons that no
+        // longer have items, so a season re-created under the same id does not
+        // inherit it.
+        let live: Vec<Uuid> = queue.iter().map(|(season, _)| *season).collect();
         if let Err(err) = self.actions.retain_seasons(&live).await {
-            tracing::warn!(%err, "intro skipper: could not drop stale analyzer actions");
+            tracing::warn!(%err, "intro skipper: could not drop stale season state");
         }
         progress.report(100.0);
         tracing::info!(segments = written, "intro skipper: analysis complete");
@@ -692,22 +730,29 @@ impl DetectSegmentsTask {
     /// (segments, cache, republish), then `AnalyzeItemsAsync([seasonId])`.
     async fn rescan_season(&self, season_id: Uuid) {
         let config = self.load_config().await;
-        let seasons = match self.episodes_by_season().await {
-            Ok(seasons) => seasons,
+        let queue = match self.queue(&config).await {
+            Ok(queue) => queue,
             Err(err) => {
                 tracing::error!(%err, %season_id, "intro skipper: could not enumerate the season to rescan");
                 return;
             }
         };
-        let Some(episodes) = seasons
+        // `EraseSeasonAsync` works on the queued (not excluded) items.
+        let Some(entries) = queue
             .into_iter()
-            .find(|(key, _)| Uuid::parse_str(key).ok() == Some(season_id))
-            .map(|(_, episodes)| episodes)
+            .find(|(key, _)| *key == season_id)
+            .map(|(_, entries)| {
+                entries
+                    .into_iter()
+                    .filter(|e| !e.is_excluded)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|entries| !entries.is_empty())
         else {
-            tracing::info!(%season_id, "intro skipper: the season to rescan has no episodes");
+            tracing::info!(%season_id, "intro skipper: the season to rescan has no queued items");
             return;
         };
-        let ids: Vec<Uuid> = episodes.iter().map(|e| e.id).collect();
+        let ids: Vec<Uuid> = entries.iter().map(|e| e.episode_id).collect();
         if let Err(err) = self.actions.delete_items(&ids).await {
             tracing::error!(%err, %season_id, "intro skipper: could not erase the season to rescan");
             return;
@@ -738,6 +783,10 @@ impl DetectSegmentsTask {
                 tracing::error!(%err, %season_id, "intro skipper: could not read the season's analyzer actions");
                 return;
             }
+        };
+        let Some(episodes) = analyzable(&entries, &config) else {
+            tracing::info!(%season_id, "intro skipper: nothing in the season to compare");
+            return;
         };
         let written = self
             .analyze_season(Some(&actions), &episodes, &config, fingerprinter.as_ref())
@@ -808,31 +857,6 @@ impl DetectSegmentsTask {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => IntroSkipperConfig::default(),
         }
-    }
-
-    /// Every non-virtual episode grouped by season id (episodes without a season
-    /// or a path are skipped).
-    async fn episodes_by_season(&self) -> Result<HashMap<String, Vec<Episode>>, ServiceError> {
-        let rows = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::Episode],
-                recursive: true,
-                is_virtual_item: Some(false),
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-
-        let mut by_season: HashMap<String, Vec<Episode>> = HashMap::new();
-        for row in rows {
-            if let Some(ep) = to_episode(&row) {
-                by_season
-                    .entry(row.season_id.unwrap_or_default())
-                    .or_default()
-                    .push(ep);
-            }
-        }
-        Ok(by_season)
     }
 
     /// Fingerprints, compares and writes segments for one season's episodes,
@@ -924,7 +948,7 @@ impl DetectSegmentsTask {
         }
         let mut fingerprints: Vec<Print> = Vec::new();
         for ep in episodes {
-            let (start, end) = window(ep.duration_secs, config, mode);
+            let (start, end) = window(ep, mode);
             let min_window = f64::from(
                 config
                     .minimum_intro_duration
@@ -1088,30 +1112,37 @@ fn apply_intro_offsets(regions: &mut HashMap<Uuid, TimeRange>, config: &IntroSki
     }
 }
 
-/// The `[start, end]` seconds window to fingerprint for an episode + mode.
-fn window(duration_secs: f64, config: &IntroSkipperConfig, mode: AnalysisMode) -> (f64, f64) {
-    if mode == AnalysisMode::Credits {
-        // The tail of the episode (a little longer than the max credits).
-        let win = f64::from(config.maximum_credits_duration) + 30.0;
-        ((duration_secs - win).max(0.0), duration_secs)
-    } else {
-        // The first AnalysisPercent of the episode, capped by the limit.
-        let by_percent = duration_secs * f64::from(config.analysis_percent) / 100.0;
-        let cap = f64::from(config.analysis_length_limit) * 60.0;
-        (0.0, by_percent.min(cap).min(duration_secs))
+/// The items of one queue entry the Chromaprint analyzer can compare, or
+/// `None`: excluded items are dropped; a movie needs the chapter/black-frame
+/// analyzers (TODO(intro-skipper steps 7–8)); season 0 is skipped unless
+/// `AnalyzeSeasonZero` (`BaseItemAnalyzerTask.AnalyzeItemsAsync`); a pair is
+/// the least that compares.
+fn analyzable(
+    entries: &[queue::QueuedEpisode],
+    config: &IntroSkipperConfig,
+) -> Option<Vec<Episode>> {
+    let first = entries.first()?;
+    if first.category == queue::Category::Movie
+        || (first.season_number == 0 && !config.analyze_season_zero)
+    {
+        return None;
     }
+    let episodes: Vec<Episode> = entries
+        .iter()
+        .filter(|e| !e.is_excluded && e.duration > 0.0)
+        .map(Episode::from)
+        .collect();
+    (episodes.len() >= 2).then_some(episodes)
 }
 
-/// Projects an episode row into the analyzer's [`Episode`] (or `None` when it
-/// lacks a path or a known duration).
-fn to_episode(row: &BaseItemEntity) -> Option<Episode> {
-    let path = row.path.clone().filter(|p| !p.is_empty())?;
-    let ticks = row.run_time_ticks.filter(|t| *t > 0)?;
-    Some(Episode {
-        id: Uuid::parse_str(&row.id).ok()?,
-        path,
-        duration_secs: ticks_to_secs(ticks),
-    })
+/// The episode's fingerprint window for `mode`: the queue's credits window,
+/// else the start up to its intro window's end.
+fn window(episode: &Episode, mode: AnalysisMode) -> (f64, f64) {
+    if mode == AnalysisMode::Credits {
+        episode.credits
+    } else {
+        (0.0, episode.intro_end)
+    }
 }
 
 /// A short filename tag for an analysis mode (part of the fingerprint-cache
@@ -1160,6 +1191,10 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 
     #[test]
@@ -1180,27 +1215,62 @@ mod tests {
         assert_eq!(cfg.analysis_percent, 40);
     }
 
-    #[test]
-    fn intro_window_is_capped_by_percent_and_limit() {
-        let cfg = IntroSkipperConfig::default();
-        // 2000 s episode, 25% = 500 s, capped at 10 min (600) → 500.
-        assert_eq!(
-            window(2000.0, &cfg, AnalysisMode::Introduction),
-            (0.0, 500.0)
-        );
-        // 4000 s episode, 25% = 1000 s, capped at 600.
-        assert_eq!(
-            window(4000.0, &cfg, AnalysisMode::Introduction),
-            (0.0, 600.0)
-        );
+    fn queued(
+        season_number: i64,
+        category: queue::Category,
+        excluded: bool,
+        n: u128,
+    ) -> queue::QueuedEpisode {
+        queue::QueuedEpisode {
+            series_name: "Show".to_owned(),
+            season_number,
+            series_id: Uuid::from_u128(1),
+            season_id: Uuid::from_u128(2),
+            episode_number: 1,
+            episode_id: Uuid::from_u128(n),
+            name: String::new(),
+            category,
+            is_excluded: excluded,
+            path: "/media/e.mkv".to_owned(),
+            duration: 1800.0,
+            date_added: None,
+            intro_fingerprint_end: 450.0,
+            credits_fingerprint_start: 1350.0,
+            credits_fingerprint_end: 1800.0,
+        }
     }
 
     #[test]
-    fn credits_window_is_the_tail() {
+    fn analyzable_follows_analyze_items_async() {
+        use queue::Category::{Episode as Ep, Movie};
         let cfg = IntroSkipperConfig::default();
-        let (start, end) = window(3600.0, &cfg, AnalysisMode::Credits);
-        assert_eq!(end, 3600.0);
-        assert_eq!(start, 3600.0 - (450.0 + 30.0));
+        let pair = [queued(1, Ep, false, 10), queued(1, Ep, false, 11)];
+        let episodes = analyzable(&pair, &cfg).expect("a pair compares");
+        assert_eq!(
+            window(&episodes[0], AnalysisMode::Introduction),
+            (0.0, 450.0)
+        );
+        assert_eq!(
+            window(&episodes[0], AnalysisMode::Credits),
+            (1350.0, 1800.0)
+        );
+        // An excluded item drops out, leaving nothing to compare.
+        assert!(analyzable(&[queued(1, Ep, false, 10), queued(1, Ep, true, 11)], &cfg).is_none());
+        // Season 0 only with AnalyzeSeasonZero; a movie needs other analyzers.
+        let specials = [queued(0, Ep, false, 10), queued(0, Ep, false, 11)];
+        assert!(analyzable(&specials, &cfg).is_none());
+        let with_zero = IntroSkipperConfig {
+            analyze_season_zero: true,
+            ..IntroSkipperConfig::default()
+        };
+        assert!(analyzable(&specials, &with_zero).is_some());
+        assert!(
+            analyzable(
+                &[queued(0, Movie, false, 10), queued(0, Movie, false, 11)],
+                &cfg
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1270,45 +1340,6 @@ mod tests {
             cfg.compare_config(AnalysisMode::Introduction).max_bit_diff,
             6
         );
-    }
-
-    // ---- to_episode --------------------------------------------------------
-
-    fn row(id: &str, path: Option<&str>, ticks: Option<i64>) -> BaseItemEntity {
-        BaseItemEntity {
-            id: id.to_owned(),
-            path: path.map(str::to_owned),
-            run_time_ticks: ticks,
-            ..BaseItemEntity::default()
-        }
-    }
-
-    #[rstest]
-    #[case::no_path(row("00000000-0000-0000-0000-000000000001", None, Some(10)))]
-    #[case::empty_path(row("00000000-0000-0000-0000-000000000001", Some(""), Some(10)))]
-    #[case::no_runtime(row("00000000-0000-0000-0000-000000000001", Some("/a.mkv"), None))]
-    #[case::zero_runtime(row("00000000-0000-0000-0000-000000000001", Some("/a.mkv"), Some(0)))]
-    #[case::bad_uuid(row("not-a-uuid", Some("/a.mkv"), Some(10)))]
-    fn to_episode_rejects_unanalyzable_rows(#[case] row: BaseItemEntity) {
-        assert!(to_episode(&row).is_none());
-    }
-
-    #[test]
-    fn to_episode_converts_ticks_to_seconds() {
-        let ep = to_episode(&row(
-            "00000000-0000-0000-0000-00000000002a",
-            Some("/media/s01e01.mkv"),
-            Some(1_800 * 10_000_000),
-        ))
-        .expect("episode");
-        assert_eq!(ep.id, Uuid::from_u128(42));
-        assert_eq!(ep.path, "/media/s01e01.mkv");
-        assert_eq!(ep.duration_secs, 1800.0);
-    }
-
-    #[test]
-    fn ticks_convert_to_seconds() {
-        assert_eq!(ticks_to_secs(15_000_000), 1.5);
     }
 
     // ---- intro offsets -----------------------------------------------------
@@ -1418,6 +1449,7 @@ mod tests {
         segments: Arc<dyn MediaSegmentManager>,
         actions: Arc<ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore>,
         calls: Arc<AtomicUsize>,
+        persistence: Arc<ferrofin_core::FerrofinItemPersistenceService>,
         _cache: tempfile::TempDir,
     }
 
@@ -1460,8 +1492,11 @@ mod tests {
                 type_: type_name.to_owned(),
                 path: Some((*path).to_owned()),
                 #[allow(clippy::cast_possible_truncation)]
-                run_time_ticks: Some((secs * TICKS_PER_SECOND) as i64),
+                run_time_ticks: Some((secs * 10_000_000.0) as i64),
                 season_id: Some(SEASON.to_string()),
+                series_id: Some(Uuid::from_u128(0x5e_0001).to_string()),
+                series_name: Some("Show".to_owned()),
+                parent_index_number: Some(1),
                 ..BaseItemEntity::default()
             })
             .collect();
@@ -1504,13 +1539,73 @@ mod tests {
                 fingerprinter,
                 cache_dir: cache.path().join("introskipper"),
                 running: Arc::new(AtomicBool::new(false)),
+                virtual_folders: Arc::new(MediaLibrary),
                 actions: Arc::clone(&actions)
                     as Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
             },
             segments,
             actions,
+            persistence,
             calls,
             _cache: cache,
+        }
+    }
+
+    /// One library holding everything under `/media`.
+    struct MediaLibrary;
+
+    #[async_trait]
+    impl VirtualFolderManager for MediaLibrary {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+            Ok(vec![ferrofin_model::entities_media::VirtualFolderInfo {
+                name: Some("TV".to_owned()),
+                locations: vec!["/media".to_owned()],
+                ..Default::default()
+            }])
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<CollectionTypeOptions>,
+            _options: &LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn rename_virtual_folder(
+            &self,
+            _name: &str,
+            _new_name: &str,
+        ) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn add_media_path(
+            &self,
+            _folder: &str,
+            _path: &MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn update_media_path(
+            &self,
+            _folder: &str,
+            _path: &MediaPathInfo,
+        ) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn remove_media_path(&self, _folder: &str, _path: &str) -> Result<(), ServiceError> {
+            unreachable!("read-only")
+        }
+        async fn update_library_options(
+            &self,
+            _folder: &str,
+            _options: &LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            unreachable!("read-only")
         }
     }
 
@@ -1826,6 +1921,94 @@ mod tests {
             "{modes:?}"
         );
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// `QueueManager.GetMediaItems`: a disabled library is skipped, an
+    /// in-season special joins the season it aired in, an excluded series is
+    /// flagged, a movie is queued under its own id, and anime is read off the
+    /// series.
+    #[tokio::test]
+    async fn the_queue_follows_queue_manager() {
+        let h = harness(&[], true, "{}", true).await;
+        let ty = |kind| ferrofin_core::item_type_lookup::stored_type_name(kind).expect("type");
+        let id = |n: u128| Uuid::from_u128(n);
+        let (series, season, specials, other) = (id(0x51), id(0x52), id(0x53), id(0x54));
+        let episode =
+            |n: u128, path: &str, season_id: Uuid, series_id: Uuid, number: i64| BaseItemEntity {
+                id: id(n).to_string(),
+                type_: ty(BaseItemKind::Episode).to_owned(),
+                path: Some(path.to_owned()),
+                run_time_ticks: Some(1_800 * 10_000_000),
+                season_id: Some(season_id.to_string()),
+                series_id: Some(series_id.to_string()),
+                series_name: Some(if series_id == other { "Other" } else { "Show" }.to_owned()),
+                parent_index_number: Some(number),
+                ..BaseItemEntity::default()
+            };
+        let mut special = episode(0x63, "/media/show/s00e01.mkv", specials, series, 0);
+        special.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
+        let rows = vec![
+            BaseItemEntity {
+                id: series.to_string(),
+                type_: ty(BaseItemKind::Series).to_owned(),
+                genres: Some("Anime".to_owned()),
+                ..BaseItemEntity::default()
+            },
+            episode(0x61, "/media/show/s01e01.mkv", season, series, 1),
+            episode(0x62, "/media/show/s01e02.mkv", season, series, 1),
+            special,
+            episode(0x64, "/media/other/s01e01.mkv", id(0x55), other, 1),
+            episode(0x65, "/disabled/show/s01e01.mkv", id(0x56), series, 1),
+            BaseItemEntity {
+                id: id(0x66).to_string(),
+                type_: ty(BaseItemKind::Movie).to_owned(),
+                path: Some("/media/movies/film.mkv".to_owned()),
+                name: Some("Film".to_owned()),
+                run_time_ticks: Some(6_000 * 10_000_000),
+                ..BaseItemEntity::default()
+            },
+        ];
+        h.persistence.save_items(&rows).await.expect("seed");
+        let folders = vec![
+            ferrofin_model::entities_media::VirtualFolderInfo {
+                locations: vec!["/media".to_owned()],
+                ..Default::default()
+            },
+            ferrofin_model::entities_media::VirtualFolderInfo {
+                locations: vec!["/disabled".to_owned()],
+                library_options: Some(LibraryOptions {
+                    disabled_media_segment_providers: vec!["Intro Skipper".to_owned()],
+                    ..LibraryOptions::default()
+                }),
+                ..Default::default()
+            },
+        ];
+        let config: IntroSkipperConfig =
+            serde_json::from_str(r#"{"SeriesExclusions":"Other"}"#).expect("legacy string list");
+        let queue = queue::build(h.task.library.as_ref(), &folders, &config, true)
+            .await
+            .expect("queue");
+        let find = |key: Uuid| queue.iter().find(|(k, _)| *k == key).map(|(_, v)| v);
+        let shows = find(season).expect("season 1");
+        let ids: Vec<Uuid> = shows.iter().map(|e| e.episode_id).collect();
+        assert_eq!(ids.len(), 3, "the special joined season 1: {ids:?}");
+        assert!(ids.contains(&id(0x63)));
+        assert!(
+            shows
+                .iter()
+                .all(|e| e.category == queue::Category::AnimeEpisode)
+        );
+        assert!(find(specials).is_none());
+        assert!(find(id(0x55)).expect("excluded, flagged")[0].is_excluded);
+        assert!(find(id(0x56)).is_none(), "the library disables the plugin");
+        let movie = &find(id(0x66)).expect("movie")[0];
+        assert_eq!(movie.category, queue::Category::Movie);
+        assert_eq!(movie.credits_fingerprint_start, 6_000.0 - 900.0);
+        // Excluded items stay out unless asked for.
+        let strict = queue::build(h.task.library.as_ref(), &folders, &config, false)
+            .await
+            .expect("queue");
+        assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
     }
 
     #[tokio::test]
