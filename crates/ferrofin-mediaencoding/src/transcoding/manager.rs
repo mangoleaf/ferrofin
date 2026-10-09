@@ -284,11 +284,9 @@ struct RunningJob {
     run_time_ticks: Option<i64>,
     start_time_ticks: Option<i64>,
     /// Exact segment duration for download tracking and cleanup.
-    #[allow(
-        dead_code,
-        reason = "shared per-job metadata consumed by the segment cleaner follow-up"
-    )]
     segment_length_secs: i32,
+    /// The rolling deletion timer, canceled when this job is removed.
+    segment_cleaner: Option<super::segment_cleaner::SegmentCleanerTask>,
     /// Dashboard details updated by stderr statistics.
     info: TranscodingInfo,
     /// Dynamic segment paths waiting for response completion.
@@ -331,6 +329,7 @@ impl RunningJob {
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
             segment_length_secs: state.segment_length_secs,
+            segment_cleaner: None,
             info: transcoding_info(state, hardware_acceleration_type),
             segment_endings: std::collections::HashMap::new(),
             output_dir,
@@ -947,8 +946,42 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
             }
         }
+        self.start_segment_cleaner(state, &handle);
         // 10. Return the handle.
         Ok(handle)
+    }
+
+    fn start_segment_cleaner(&self, state: &EncodingJobInfo, handle: &TranscodingJobHandle) {
+        // Rolling retention has its own twenty-second timer. Enroll eligible
+        // live jobs even when the switch is initially off; each tick rereads it.
+        if super::segment_cleaner::eligible(state)
+            && let Some(config) = &self.encoding_config
+        {
+            let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+            if let Some(running) = jobs
+                .iter_mut()
+                .find(|job| {
+                    job.handle.job_type == handle.job_type
+                        && job.handle.path.eq_ignore_ascii_case(&handle.path)
+                })
+                .and_then(|job| job.running.as_mut())
+                && !running.child.has_exited()
+            {
+                let progress = std::sync::Arc::clone(&running.progress);
+                running.segment_cleaner = Some(super::segment_cleaner::SegmentCleanerTask::start(
+                    std::sync::Arc::clone(&running.child),
+                    std::sync::Arc::clone(config),
+                    running.playlist_path.clone(),
+                    running.segment_length_secs,
+                    std::sync::Arc::new(move || {
+                        progress
+                            .lock()
+                            .expect("progress lock poisoned")
+                            .download_position_ticks
+                    }),
+                ));
+            }
+        }
     }
 
     /// Performs the progressive-video buffer waits before controller enrollment.
@@ -1090,7 +1123,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             }
         };
         let playing_label = display;
-        if let Some(running) = running {
+        if let Some(mut running) = running {
+            // Stop rolling deletion before process and partial-file teardown.
+            drop(running.segment_cleaner.take());
             tracing::info!(
                 play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
                 playing = %playing_label,
@@ -2529,6 +2564,147 @@ mod start_ffmpeg_tests {
             m.begin_request_guard_for_file(&playlist, TranscodingJobType::Progressive)
                 .is_none()
         );
+    }
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source enrollment matrix includes every exclusion and child lifecycle state"
+    )]
+    async fn rolling_retention_enrolls_only_eligible_live_jobs_after_startup() {
+        use super::throttle_tests::LiveOptions;
+        use ferrofin_model::configuration::EncodingOptions;
+        use ferrofin_model::media_info::MediaProtocol;
+
+        for (runtime, protocol, kind, video, exited, configured, expected) in [
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                Some(300),
+                MediaProtocol::Http,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                true,
+                true,
+            ),
+            (
+                Some(299),
+                MediaProtocol::File,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                None,
+                MediaProtocol::Http,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::Rtsp,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Hls,
+                false,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Dash,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Progressive,
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Hls,
+                true,
+                true,
+                true,
+                false,
+            ),
+            (
+                Some(300),
+                MediaProtocol::File,
+                TranscodingJobType::Hls,
+                true,
+                false,
+                false,
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let playlist = tmp.path().join("out.m3u8");
+            let config = Arc::new(LiveOptions::new(EncodingOptions::default()));
+            let manager = if configured {
+                manager().with_encoding_configuration(config.clone())
+            } else {
+                manager()
+            };
+            let fake = FakeSegmentTranscoder::new(FakeScript {
+                extra_files: vec!["out.m3u8".to_owned()],
+                exits_immediately: exited,
+                ..FakeScript::default()
+            });
+            let mut state = state(&playlist, Some(&playlist));
+            state.run_time_ticks = runtime.map(|seconds| seconds * 10_000_000);
+            state.media_source.protocol = protocol;
+            state.transcoding_type = kind;
+            state.is_input_video = video;
+            let handle = manager
+                .start_ffmpeg(&fake, ffmpeg_req(&state, &playlist, Vec::new()))
+                .await
+                .unwrap();
+            assert_eq!(
+                manager.with_running(&handle, |running| running.segment_cleaner.is_some()),
+                Some(expected)
+            );
+            assert_eq!(
+                config.reads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the first callback is twenty seconds after startup"
+            );
+            manager.kill_and_remove(&handle, false, false).await;
+            assert_eq!(manager.active_job_count(), 0);
+            assert!(
+                playlist.is_file(),
+                "rolling cancellation must not imply final file deletion"
+            );
+        }
     }
 }
 

@@ -1379,18 +1379,13 @@ impl FerrofinStreamStatePlanner {
         args.push("200M".to_owned());
         push_split(&mut args, "-probesize");
         args.push("1G".to_owned());
-        if state.media_source.read_at_native_framerate
-            && ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state)
-                != ferrofin_model::media_info::MediaProtocol::Rtsp
-        {
-            push_split(&mut args, "-re");
-            if caps
-                .ffmpeg_version()
-                .is_some_and(|version| version >= ferrofin_mediaencoding::FfmpegVersion::new(8, 0))
-            {
-                push_split(&mut args, "-readrate_catchup 100");
-            }
-        }
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_rate_arguments(
+                state,
+                options,
+                caps.ffmpeg_version(),
+            ),
+        );
         push_split(&mut args, "-i");
         let mut input_source = state.media_source.clone();
         input_source.protocol =
@@ -3478,6 +3473,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.segment_length_ms, 3000);
+    }
+
+    #[tokio::test]
+    async fn deletion_copy_pacing_is_a_version_gated_input_option() {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        for (version, enabled, native, expected) in [
+            (None, true, false, Vec::new()),
+            (Some(FfmpegVersion::new(4, 4)), true, false, Vec::new()),
+            (
+                Some(FfmpegVersion::new(5, 0)),
+                true,
+                false,
+                vec!["-readrate", "10"],
+            ),
+            (
+                Some(FfmpegVersion::new(7, 1)),
+                true,
+                false,
+                vec!["-readrate", "10"],
+            ),
+            (
+                Some(FfmpegVersion::new(8, 0)),
+                true,
+                false,
+                vec!["-readrate", "10", "-readrate_catchup", "1000"],
+            ),
+            (Some(FfmpegVersion::new(8, 0)), false, false, Vec::new()),
+            (
+                Some(FfmpegVersion::new(8, 0)),
+                false,
+                true,
+                vec!["-re", "-readrate_catchup", "100"],
+            ),
+        ] {
+            let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+            src.read_at_native_framerate = native;
+            let mut capabilities = FfmpegCapabilities::builder();
+            if let Some(version) = version {
+                capabilities = capabilities.ffmpeg_version(version);
+            }
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![src],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                capabilities.build(),
+                EncodingOptions {
+                    enable_segment_deletion: enabled,
+                    ..EncodingOptions::default()
+                },
+            );
+            let plan = p
+                .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert!(plan.is_remuxing_video);
+            let input = plan
+                .arguments
+                .iter()
+                .position(|argument| argument == "-i")
+                .unwrap();
+            let actual: Vec<_> = plan.arguments[..input]
+                .iter()
+                .filter(|argument| {
+                    matches!(
+                        argument.as_str(),
+                        "-re" | "-readrate" | "-readrate_catchup" | "10" | "100" | "1000"
+                    )
+                })
+                .map(String::as_str)
+                .collect();
+            assert_eq!(actual, expected, "{:?}", plan.arguments);
+            assert!(!plan.arguments[input + 1..].iter().any(|argument| matches!(
+                argument.as_str(),
+                "-re" | "-readrate" | "-readrate_catchup"
+            )));
+        }
     }
 
     #[tokio::test]
