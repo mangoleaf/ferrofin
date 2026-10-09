@@ -903,23 +903,18 @@ fn codec_specific_quality_args(
 /// software branches of `GetEncoderParam` (libx264/libx265/libsvtav1).
 fn encoder_param(
     preset: EncoderPreset,
-    default_preset: EncoderPreset,
+    _default_preset: EncoderPreset,
     encoding_options: &EncodingOptions,
     video_encoder: &str,
     is_libx265: bool,
 ) -> String {
     let mut param = String::new();
-    // C# uses `preset ?? defaultPreset`; the Rust preset is non-optional, so an
-    // explicit `auto` request defers to the encoder-specific default below.
-    let encoder_preset = if preset == EncoderPreset::auto {
-        default_preset
-    } else {
-        preset
-    };
+    // EncodingOptions.EncoderPreset is non-nullable and defaults to auto.
+    // It reaches the native helper as a present value, including explicit auto.
+    let encoder_preset = preset;
 
     if video_encoder.eq_ignore_ascii_case("libx264") || is_libx265 {
-        // An `auto` preset that survived the remap (default was also `auto`)
-        // becomes `veryfast`, matching the C# `EncoderPreset.auto` arm.
+        // The explicit auto arm always chooses veryfast.
         let preset_string = if encoder_preset == EncoderPreset::auto {
             preset_name(EncoderPreset::veryfast)
         } else {
@@ -2028,21 +2023,16 @@ mod tests {
     }
 
     #[test]
-    fn video_quality_param_nvenc_auto_preset_defers_to_the_default() {
-        // This is Ferrofin's model, not a transliteration: C#'s `preset ??
-        // defaultPreset` applies to a NULL preset, and `EncoderPreset.auto` is
-        // a real enum value there that would reach the `p1` catch-all. Ferrofin
-        // models null AS `auto` (jellyfin-web sends null for "Auto"), so `auto`
-        // resolves to the caller's default first. No observable difference on
-        // this path — both planner defaults also land on p1 — but the two
-        // spellings are not the same statement.
+    fn video_quality_param_nvenc_auto_reaches_the_native_auto_arm() {
+        // The configuration property is non-nullable; auto is a real value
+        // and reaches the p1 switch arm regardless of the caller's default.
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_codec = Some("h264".to_owned());
         let mut opts = default_encoding_options(0);
         opts.encoder_preset = EncoderPreset::auto;
         let param =
             helper(vec![]).video_quality_param(&state, "h264_nvenc", &opts, EncoderPreset::slow);
-        assert!(param.contains(" -preset p5"), "{param}");
+        assert!(param.contains(" -preset p1"), "{param}");
     }
 
     #[test]
@@ -2213,14 +2203,81 @@ mod tests {
     }
 
     #[test]
-    fn video_quality_param_libx264_auto_preset_falls_back_to_default() {
+    fn video_quality_param_libx264_auto_reaches_the_native_auto_arm() {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_codec = Some("h264".to_owned());
         let mut opts = default_encoding_options(0);
         opts.encoder_preset = EncoderPreset::auto;
         let param =
             helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::medium);
-        assert!(param.contains(" -preset medium"), "{param}");
+        assert!(param.contains(" -preset veryfast"), "{param}");
+    }
+
+    #[test]
+    fn configured_auto_uses_each_native_encoder_arm_independent_of_default() {
+        let mut state = job(&[video_stream("h264", 0)]);
+        let options = EncodingOptions::default();
+        for default in [
+            EncoderPreset::medium,
+            EncoderPreset::veryfast,
+            EncoderPreset::superfast,
+        ] {
+            for (encoder, expected) in [
+                ("libx264", "veryfast"),
+                ("libx265", "veryfast"),
+                ("libsvtav1", "10"),
+                ("h264_nvenc", "p1"),
+                ("hevc_nvenc", "p1"),
+                ("av1_nvenc", "p1"),
+            ] {
+                state.output_video_codec = Some(
+                    if encoder.contains("265") || encoder.contains("hevc") {
+                        "hevc"
+                    } else if encoder.contains("av1") {
+                        "av1"
+                    } else {
+                        "h264"
+                    }
+                    .into(),
+                );
+                let quality =
+                    helper(vec![]).video_quality_param(&state, encoder, &options, default);
+                assert!(
+                    quality.contains(&format!(" -preset {expected}")),
+                    "{encoder} default={default:?}: {quality}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn software_crf_bounds_match_native_codec_specific_defaults() {
+        for crf in [-1, 0, 51, 52] {
+            let options = EncodingOptions {
+                h264_crf: crf,
+                h265_crf: crf,
+                ..EncodingOptions::default()
+            };
+            for (encoder, codec, fallback) in [("libx264", "h264", 23), ("libx265", "hevc", 28)] {
+                let mut state = job(&[video_stream(codec, 0)]);
+                state.output_video_codec = Some(codec.into());
+                let quality = helper(vec![]).video_quality_param(
+                    &state,
+                    encoder,
+                    &options,
+                    EncoderPreset::superfast,
+                );
+                let expected = if (0..=51).contains(&crf) {
+                    crf
+                } else {
+                    fallback
+                };
+                assert!(
+                    quality.contains(&format!(" -crf {expected}")),
+                    "{encoder} CRF={crf}: {quality}"
+                );
+            }
+        }
     }
 
     // ----- can_stream_copy_video ---------------------------------------------

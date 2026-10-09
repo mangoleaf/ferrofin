@@ -90,7 +90,7 @@ const DEFAULT_VIDEO_CODEC: &str = "h264";
 const DEFAULT_AUDIO_CODEC: &str = "aac";
 
 /// The default encoder preset handed to [`EncodingHelper::video_quality_param`]
-/// when the configured preset is `auto`, for a VOD job. Port of
+/// for a VOD job. A configured non-nullable preset, including auto, wins. Port of
 /// `DynamicHlsController.DefaultVodEncoderPreset = EncoderPreset.veryfast`.
 const DEFAULT_ENCODER_PRESET: EncoderPreset = EncoderPreset::veryfast;
 
@@ -2307,6 +2307,56 @@ mod tests {
             );
             assert_eq!(plan.encoding_options.encoding_thread_count, configured);
             assert_eq!(plan.state.base_request.cpu_core_limit, limit);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_auto_and_explicit_presets_reach_event_and_vod_jobs() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        for (preset, expected) in [
+            (EncoderPreset::auto, "veryfast"),
+            (EncoderPreset::superfast, "superfast"),
+            (EncoderPreset::medium, "medium"),
+        ] {
+            let options = EncodingOptions {
+                encoder_preset: preset,
+                h264_crf: 18,
+                ..EncodingOptions::default()
+            };
+            ferrofin_util::file_helper::atomic_write(
+                &file,
+                &serde_json::to_vec(&options).expect("serialize"),
+            )
+            .expect("save encoding options");
+            for kind in [PlaylistKind::Vod, PlaylistKind::Event] {
+                let mut req = request("abc");
+                req.video_codec = Some("h264".into());
+                let plan = planner
+                    .plan(&req, false, Some(0), kind)
+                    .await
+                    .expect("plan");
+                let preset_index = plan
+                    .arguments
+                    .iter()
+                    .position(|argument| argument == "-preset")
+                    .expect("preset");
+                let crf_index = plan
+                    .arguments
+                    .iter()
+                    .position(|argument| argument == "-crf")
+                    .expect("CRF");
+                assert_eq!(plan.arguments[preset_index + 1], expected);
+                assert_eq!(plan.arguments[crf_index + 1], "18");
+                assert_eq!(plan.encoding_options.encoder_preset, preset);
+            }
         }
     }
 
@@ -4635,8 +4685,8 @@ mod tests {
     }
 
     /// An EVENT plan (`live.m3u8`) writes an event playlist with routed
-    /// segment URIs, the `superfast` preset and, for mpegts, no global header;
-    /// a VOD plan keeps `vod`/`veryfast` and neither flag.
+    /// segment URIs and, for mpegts, no global header. The configured auto
+    /// preset is veryfast on both EVENT and VOD jobs.
     #[tokio::test]
     async fn plan_event_playlist_args_follow_get_live_hls_stream() {
         let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
@@ -4655,8 +4705,8 @@ mod tests {
             "{args}"
         );
         assert!(args.contains("-flags -global_header"), "{args}");
-        assert!(args.contains("-preset superfast"), "{args}");
-        assert!(!args.contains("-preset veryfast"), "{args}");
+        assert!(args.contains("-preset veryfast"), "{args}");
+        assert!(!args.contains("-preset superfast"), "{args}");
 
         let p = planner(vec![src.clone()]);
         let plan = p
