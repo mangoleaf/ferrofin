@@ -325,9 +325,25 @@ pub trait IntroSkipperAnalysis: Send + Sync {
         items: Option<&[Uuid]>,
         mode: Option<AnalysisMode>,
     ) -> Result<u64, ServiceError>;
+
+    /// Deletes the segments and cache of every item the exclusion policy now
+    /// matches, then republishes them (`ClearExcludedTimestampsAsync`).
+    async fn clear_excluded(&self) -> Result<ExcludedClear, ServiceError>;
 }
 
 fn _assert_object_safe_intro_skipper_analysis(_: &dyn IntroSkipperAnalysis) {}
+
+/// What clearing the excluded items' data removed
+/// (`ClearExcludedTimestampsResponse`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExcludedClear {
+    /// The excluded items found.
+    pub affected_items: u64,
+    /// Their stored segments deleted.
+    pub removed_segments: u64,
+    /// Their cache entries deleted.
+    pub removed_cache_entries: u64,
+}
 
 /// An [`IntroSkipperAnalysis`] with nothing behind it: the default of a state
 /// built without the extension (tests), never the server's — it is never
@@ -352,6 +368,12 @@ impl IntroSkipperAnalysis for DetachedIntroSkipperAnalysis {
         _items: Option<&[Uuid]>,
         _mode: Option<AnalysisMode>,
     ) -> Result<u64, ServiceError> {
+        Err(ServiceError::backend(
+            "the intro skipper extension is not attached",
+        ))
+    }
+
+    async fn clear_excluded(&self) -> Result<ExcludedClear, ServiceError> {
         Err(ServiceError::backend(
             "the intro skipper extension is not attached",
         ))

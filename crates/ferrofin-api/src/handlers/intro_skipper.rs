@@ -41,6 +41,7 @@ use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
 use ferrofin_traits::options::InternalItemsQuery;
 use serde::{Deserialize, Serialize};
@@ -1001,6 +1002,40 @@ async fn update_disabled_episode(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `ClearExcludedTimestampsResponse` (PascalCase, as the dashboard reads it).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ClearExcludedTimestampsResponse {
+    affected_items: u64,
+    removed_segments: u64,
+    removed_cache_entries: u64,
+}
+
+/// `POST /Intros/ExcludedTimestamps/Clear` — clear the data of items the
+/// exclusion policy now matches.
+///
+/// Port of `VisualizationController.ClearExcludedTimestampsAsync`: their
+/// stored segments and cache go and they are republished; a failure is a 500,
+/// as upstream answers.
+async fn clear_excluded_timestamps(
+    State(state): State<AppState>,
+    RequireAdmin(_auth): RequireAdmin,
+) -> Result<Json<ClearExcludedTimestampsResponse>, ApiError> {
+    match state.intro_skipper_analysis.clear_excluded().await {
+        Ok(cleared) => Ok(Json(ClearExcludedTimestampsResponse {
+            affected_items: cleared.affected_items,
+            removed_segments: cleared.removed_segments,
+            removed_cache_entries: cleared.removed_cache_entries,
+        })),
+        Err(err) => {
+            tracing::error!(%err, "intro skipper: failed to clear excluded timestamp data");
+            Err(ApiError::Service(ServiceError::backend(
+                "An unexpected error occurred while clearing excluded timestamp data.",
+            )))
+        }
+    }
+}
+
 /// `GET /Intros/AnalyzerActions/{SeasonId}` — the per-mode analyzer actions for
 /// a season.
 ///
@@ -1196,6 +1231,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Intros/DisabledEpisodes/Update",
             post(update_disabled_episode),
+        )
+        .route(
+            "/Intros/ExcludedTimestamps/Clear",
+            post(clear_excluded_timestamps),
         )
         .route(
             "/Intros/Show/{SeriesId}/{SeasonId}",

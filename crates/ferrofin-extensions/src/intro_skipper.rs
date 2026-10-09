@@ -166,6 +166,46 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
     ) -> Result<u64, ServiceError> {
         self.erase_cache_files(items, mode).await
     }
+
+    async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
+        let config = self.load_config().await;
+        // `GetExcludedInventoryAsync`: the queue with the excluded items in.
+        let mut ids: Vec<Uuid> = self
+            .queue(&config)
+            .await?
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
+            .filter(|e| e.is_excluded)
+            .map(|e| e.episode_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(intro_store::ExcludedClear::default());
+        }
+        let removed_segments = self.actions.delete_items(&ids).await?;
+        // TODO(intro-skipper step 4): drop the ids from the seasons' analysed
+        // episode lists, as upstream does.
+        let removed_cache_entries = self.erase_cache_files(Some(&ids), None).await?;
+        if config.update_media_segments {
+            for &item_id in &ids {
+                if let Err(err) = intro_store::refresh(
+                    self.actions.as_ref(),
+                    self.media_segments.as_ref(),
+                    item_id,
+                )
+                .await
+                {
+                    tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
+                }
+            }
+        }
+        Ok(intro_store::ExcludedClear {
+            affected_items: ids.len() as u64,
+            removed_segments,
+            removed_cache_entries,
+        })
+    }
 }
 
 /// The "Media Segment Scan" task — port of Jellyfin's
@@ -1196,6 +1236,7 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+    use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
 
     #[test]
     fn default_config_round_trips_json() {
@@ -1704,7 +1745,6 @@ mod tests {
     #[tokio::test]
     async fn a_season_whose_intro_action_is_none_is_not_analysed() {
         use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
-        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
         h.actions
             .set_analyzer_actions(
@@ -1761,7 +1801,6 @@ mod tests {
     /// to be clobbered: both wrote the same provider's `MediaSegments` row).
     #[tokio::test]
     async fn a_user_provided_intro_survives_detection() {
-        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
         h.actions
             .update_timestamp(StoredSegment {
@@ -1790,7 +1829,6 @@ mod tests {
     /// `SegmentProvider` does when that task runs it.
     #[tokio::test]
     async fn the_segment_scan_publishes_when_detection_does_not() {
-        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
         let h = harness(
             &TWO_EPISODES,
             true,
@@ -1871,7 +1909,6 @@ mod tests {
     /// is refused.
     #[tokio::test]
     async fn a_rescan_erases_then_reanalyses_the_season() {
-        use ferrofin_traits::intro_skipper::IntroSkipperStore as _;
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
         h.task
             .execute(&TaskProgress::default())
@@ -2009,6 +2046,44 @@ mod tests {
             .await
             .expect("queue");
         assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
+    }
+
+    /// `ClearExcludedTimestampsAsync`: the items the exclusion policy now
+    /// matches lose their stored segments and cache, and are republished.
+    #[tokio::test]
+    async fn clearing_excluded_items_removes_their_data() {
+        // Detect first, then exclude the series.
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        assert_eq!(
+            h.task.clear_excluded().await.expect("nothing excluded"),
+            intro_store::ExcludedClear::default()
+        );
+        let segments = h.actions.stored_item_ids().await.expect("ids").len();
+        let cache = cache_files(&h, EP_A).len() + cache_files(&h, EP_B).len();
+        assert!(segments == 2 && cache > 0);
+        let excluding = DetectSegmentsTask {
+            plugins: Arc::new(FakePlugins {
+                enabled: true,
+                config: br#"{"SeriesExclusions":["show"]}"#.to_vec(),
+            }),
+            ..h.task.clone()
+        };
+        let cleared = excluding.clear_excluded().await.expect("clear");
+        assert_eq!(cleared.affected_items, 2);
+        assert!(cleared.removed_segments >= 2);
+        assert_eq!(
+            usize::try_from(cleared.removed_cache_entries).unwrap(),
+            cache
+        );
+        assert!(h.actions.stored_item_ids().await.expect("ids").is_empty());
+        assert!(
+            intros_of(&h.segments, EP_A).await.is_empty(),
+            "republished as empty"
+        );
     }
 
     #[tokio::test]

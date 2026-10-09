@@ -377,6 +377,36 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
             .push((items.map(<[Uuid]>::to_vec), mode));
         Ok(0)
     }
+    async fn clear_excluded(
+        &self,
+    ) -> Result<ferrofin_traits::intro_skipper::ExcludedClear, ServiceError> {
+        Ok(ferrofin_traits::intro_skipper::ExcludedClear {
+            affected_items: 2,
+            removed_segments: 3,
+            removed_cache_entries: 4,
+        })
+    }
+}
+
+/// `ExcludedTimestamps/Clear` answers the dashboard's PascalCase counts.
+#[tokio::test]
+async fn clear_excluded_reports_its_counts() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    let (status, body) = send(
+        with_analysis(&analysis),
+        "POST",
+        "/Intros/ExcludedTimestamps/Clear",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        r#"{"AffectedItems":2,"RemovedSegments":3,"RemovedCacheEntries":4}"#
+    );
+    // Detached (no extension): a 500.
+    let (status, _) = send(state().1, "POST", "/Intros/ExcludedTimestamps/Clear", "").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 fn with_analysis(analysis: &Arc<FakeAnalysis>) -> AppState {
@@ -797,6 +827,7 @@ async fn plugin_routes_are_elevated_as_upstream() {
         ("GET", format!("/Intros/DisabledEpisodes/{id}")),
         ("POST", "/Intros/DisabledEpisodes/Update".to_owned()),
         ("DELETE", format!("/Intros/Show/{id}")),
+        ("POST", "/Intros/ExcludedTimestamps/Clear".to_owned()),
     ] {
         let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
