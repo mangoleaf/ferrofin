@@ -8755,6 +8755,49 @@ impl LibraryScanner {
         )
     }
 
+    /// A by-name person has its own metadata locale, independent of the movie
+    /// credit that caused it to be refreshed. Reuse the batched person row and
+    /// the normal ancestor resolver; a pathless row inherits live server defaults.
+    async fn person_metadata_language(
+        &self,
+        row: Option<&BaseItemEntity>,
+        server_locale: &(String, String),
+        folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
+        cache: &mut ArtworkCache,
+    ) -> Result<Option<String>, ServiceError> {
+        let fallback = BaseItemEntity::default();
+        let row = row.unwrap_or(&fallback);
+        let lookup = ResolverGuesses {
+            own_language: own_language(row.preferred_metadata_language.as_deref()),
+            own_country: own_language(row.preferred_metadata_country_code.as_deref()),
+            ..Default::default()
+        };
+        let owner = ferrofin_model::entities_media::owning_library(
+            folders,
+            row.top_parent_id.as_deref(),
+            row.path.as_deref(),
+        );
+        let locale = self
+            .resolve_metadata_locale(
+                row,
+                &lookup,
+                FetcherPolicy {
+                    options: owner.and_then(|owner| owner.library_options.as_ref()),
+                    collection_folder: owner
+                        .and_then(|owner| owner.item_id.as_deref())
+                        .and_then(parse_id),
+                    locale: Some(server_locale),
+                    ..Default::default()
+                },
+                cache,
+            )
+            .await?;
+        Ok(ferrofin_providers::tmdb::normalize_language(
+            Some(&locale.0),
+            Some(&locale.1),
+        ))
+    }
+
     /// Enriches credited people: downloads each one's TMDB profile image as their
     /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
     /// for each *newly-created* person. Best-effort and cached — images skip
@@ -8763,6 +8806,7 @@ impl LibraryScanner {
     /// ponytail: runs serially — a large cast makes the first scan slower, but the
     /// per-file / new-only guards make re-scans cheap. Batch if first-scan latency
     /// on huge libraries becomes a problem.
+    #[allow(clippy::too_many_lines)]
     async fn enrich_people(
         &self,
         repo: &dyn ferrofin_traits::persistence::PeopleRepository,
@@ -8778,6 +8822,19 @@ impl LibraryScanner {
         // items themselves. One read per credited cast, not one per person.
         let stored = self.stored_person_image_metadata(&written).await;
         let person_locks = self.person_locks(&written).await;
+        let server_locale = self.server_metadata_locale();
+        let folders = if written.iter().any(|person| person.needs_details) {
+            match self.virtual_folders.get_virtual_folders().await {
+                Ok(folders) => Some(folders),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read credited people's library locale");
+                    None
+                }
+            }
+        } else {
+            Some(Vec::new())
+        };
+        let mut locale_cache = ArtworkCache::default();
         for person in written {
             let id = person.id.to_string();
             if let Some(url) = person.image_url {
@@ -8816,15 +8873,33 @@ impl LibraryScanner {
             if person.needs_details
                 && let Some(person_locks) = &person_locks
                 && let Some(tmdb_id) = person.provider_id
-                && let Some(details) = tmdb.person_details(tmdb_id).await
+                && let Some(folders) = &folders
             {
-                // A locked person takes no remote provider's answer; a field
-                // lock keeps that field as stored (`MergeData(…,
-                // item.LockedFields, …)`).
                 let lock = person_locks.get(&person.id);
-                if lock.is_some_and(|l| l.row.is_locked) {
+                if lock.is_some_and(|lock| lock.row.is_locked) {
                     continue;
                 }
+                let language = match self
+                    .person_metadata_language(
+                        lock.map(|lock| &lock.row),
+                        &server_locale,
+                        folders,
+                        &mut locale_cache,
+                    )
+                    .await
+                {
+                    Ok(language) => language,
+                    Err(error) => {
+                        tracing::warn!(%error, person = %id, "could not resolve person metadata locale");
+                        continue;
+                    }
+                };
+                let Some(details) = tmdb
+                    .person_details_for_language(tmdb_id, language.as_deref())
+                    .await
+                else {
+                    continue;
+                };
                 let keeps = |field: MetadataField| lock.is_some_and(|l| l.fields.contains(&field));
                 let metadata = ferrofin_traits::persistence::PersonMetadata {
                     overview: if keeps(MetadataField::Overview) {
@@ -31174,5 +31249,136 @@ mod chapter_image_refresh_tests {
             crate::item_data::parse_data(video.data.as_deref())["DefaultVideoStreamIndex"]
                 .is_null()
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_default_person_locale_tests {
+    use super::*;
+    use ferrofin_traits::persistence::WrittenPerson;
+    use std::sync::RwLock;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    struct PersonProvider(tokio::task::JoinHandle<()>);
+    impl Drop for PersonProvider {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn person_provider() -> (PersonProvider, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let url = reqwest::Url::parse(&format!("http://mock{path}")).unwrap();
+                let language = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "language")
+                    .map_or_else(|| "missing".to_owned(), |(_, value)| value.into_owned());
+                let body =
+                    serde_json::json!({"id":287,"biography":format!("Biography {language}")})
+                        .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (PersonProvider(task), base)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn person_biography_uses_live_server_defaults_and_its_own_ancestor_overrides() {
+        let (_provider, endpoint) = person_provider().await;
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(crate::FerrofinItemPersistenceService::new(db.clone()));
+        let items = Arc::new(crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::ItemTypeLookup::new()),
+        ));
+        let people = crate::FerrofinPeopleRepository::new(db);
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        let locale = Arc::new(RwLock::new(("fr".to_owned(), "AR".to_owned())));
+        let source = Arc::clone(&locale);
+        let scanner = LibraryScanner::new(
+            folders,
+            Arc::new(crate::FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(items)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&endpoint)),
+            tmp.path().join("metadata"),
+        )
+        .with_metadata_locale(move || source.read().unwrap().clone());
+        let id = Uuid::from_u128(0x4d01);
+        let parent = Uuid::from_u128(0x4d02);
+        let mut row = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: "MediaBrowser.Controller.Entities.Person".to_owned(),
+            name: Some("Locale Person".to_owned()),
+            ..Default::default()
+        };
+        for (language, country, own, ancestor, expected) in [
+            ("fr", "AR", None, false, "fr"),
+            ("es-419", "AR", None, false, "es-AR"),
+            ("fr", "FR", Some(("de", "DE")), false, "de"),
+            ("fr", "FR", None, true, "pt-BR"),
+        ] {
+            *locale.write().unwrap() = (language.to_owned(), country.to_owned());
+            row.overview = None;
+            row.preferred_metadata_language = own.map(|value| value.0.to_owned());
+            row.preferred_metadata_country_code = own.map(|value| value.1.to_owned());
+            row.parent_id = ancestor.then(|| guid_to_db(parent));
+            persistence
+                .save_items(&[
+                    row.clone(),
+                    BaseItemEntity {
+                        id: guid_to_db(parent),
+                        type_: "MediaBrowser.Controller.Entities.Folder".to_owned(),
+                        preferred_metadata_language: Some("pt-br".to_owned()),
+                        preferred_metadata_country_code: Some("BR".to_owned()),
+                        ..Default::default()
+                    },
+                ])
+                .await
+                .unwrap();
+            scanner
+                .enrich_people(
+                    &people,
+                    vec![WrittenPerson {
+                        id,
+                        needs_details: true,
+                        image_url: None,
+                        provider_id: Some(287),
+                    }],
+                )
+                .await;
+            let refreshed = scanner
+                .item_repository
+                .as_ref()
+                .unwrap()
+                .retrieve_item(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(refreshed.overview, Some(format!("Biography {expected}")));
+        }
     }
 }

@@ -1747,17 +1747,18 @@ impl LocalProviderManager {
         name: &str,
         collection_id: Option<i64>,
         fetch: Fetch,
+        language: Option<&str>,
     ) -> Option<Fetched> {
         let collection_id = if let Some(id) = collection_id {
             id
         } else {
-            tmdb.search_collection(name, None)
+            tmdb.search_collection(name, language)
                 .await
                 .into_iter()
                 .next()?
                 .tmdb_id
         };
-        let collection = tmdb.collection(collection_id, None).await?;
+        let collection = tmdb.collection(collection_id, language).await?;
         let mut fetched = Fetched::default();
         if fetch.metadata {
             fetched.item = Some(BaseItemEntity {
@@ -1790,6 +1791,7 @@ impl LocalProviderManager {
         name: &str,
         tmdb_id: Option<i64>,
         fetch: Fetch,
+        language: Option<&str>,
     ) -> Option<Fetched> {
         let tmdb_id = if let Some(id) = tmdb_id {
             id
@@ -1798,7 +1800,7 @@ impl LocalProviderManager {
         };
         let mut fetched = Fetched::default();
         if fetch.metadata
-            && let Some(details) = tmdb.person_details(tmdb_id).await
+            && let Some(details) = tmdb.person_details_for_language(tmdb_id, language).await
         {
             fetched.item = Some(BaseItemEntity {
                 // `Name = info.Name`: the name it was looked up by.
@@ -1813,7 +1815,7 @@ impl LocalProviderManager {
         }
         if fetch.images
             && let Some(url) = tmdb
-                .person_lookup(tmdb_id, None)
+                .person_lookup(tmdb_id, language)
                 .await
                 .and_then(|p| p.profile_url)
         {
@@ -2033,10 +2035,12 @@ impl LocalProviderManager {
             provider_id_of_pairs(provider_ids, "Tmdb").and_then(parse_numeric_provider_id);
         match target {
             RefreshTarget::BoxSet { name } => {
-                Self::fetch_box_set(tmdb, chosen_name.unwrap_or(&name), tmdb_id, fetch).await
+                Self::fetch_box_set(tmdb, chosen_name.unwrap_or(&name), tmdb_id, fetch, language)
+                    .await
             }
             RefreshTarget::Person { name } => {
-                Self::fetch_person(tmdb, chosen_name.unwrap_or(&name), tmdb_id, fetch).await
+                Self::fetch_person(tmdb, chosen_name.unwrap_or(&name), tmdb_id, fetch, language)
+                    .await
             }
             // The season arm runs every season provider; `refresh_item`
             // routes it to `fetch_season_providers`.
@@ -3153,7 +3157,26 @@ impl LocalProviderManager {
             {
                 continue;
             }
-            let images = self.images_from(source, entity, ids).await;
+            let mut images = self.images_from(source, entity, ids).await;
+            if matches!(
+                source,
+                RemoteImageSource::TmdbTitle(_)
+                    | RemoteImageSource::TmdbBoxSet
+                    | RemoteImageSource::TmdbPerson
+                    | RemoteImageSource::TmdbSeason
+                    | RemoteImageSource::TmdbEpisode
+            ) {
+                for image in &mut images {
+                    image.language = adjust_tmdb_image_language(image.language.take(), &preferred);
+                    if matches!(image.image_type, ImageType::Backdrop | ImageType::Thumb) {
+                        image.image_type = if image.language.is_some() {
+                            ImageType::Thumb
+                        } else {
+                            ImageType::Backdrop
+                        };
+                    }
+                }
+            }
             // `GetImages` runs PER PROVIDER, and so must the language filter and
             // the sort: C# concatenates each provider's already-ordered block
             // (`results.SelectMany`), it does not sort the union. Sorting the
@@ -3378,8 +3401,12 @@ impl LocalProviderManager {
                 if collection_id.is_none()
                     && let Some(name) = name
                 {
+                    let language = crate::tmdb::normalize_language(
+                        Some(&self.preferred_metadata_language(entity).await),
+                        Some(&self.preferred_metadata_country_code(entity).await),
+                    );
                     collection_id = tmdb
-                        .search_collection(name, None)
+                        .search_collection(name, language.as_deref())
                         .await
                         .into_iter()
                         .next()
@@ -3388,15 +3415,7 @@ impl LocalProviderManager {
                 let Some(collection_id) = collection_id else {
                     return Vec::new();
                 };
-                tmdb.collection(collection_id, None)
-                    .await
-                    .map(|c| {
-                        c.images
-                            .into_iter()
-                            .map(|img| plain_image(img.image_type, img.url))
-                            .collect()
-                    })
-                    .unwrap_or_default()
+                tmdb.collection_images(collection_id).await
             }
             RemoteImageSource::TmdbSeason | RemoteImageSource::TmdbEpisode => {
                 // `TmdbSeason/EpisodeImageProvider`: both hop to the PARENT
@@ -3440,15 +3459,24 @@ impl LocalProviderManager {
             _ => {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
-                let person = match (stored_tmdb_id, name) {
-                    (Some(id), _) => tmdb.person_lookup(id, None).await,
-                    (None, Some(name)) => tmdb.search_person(name).await.into_iter().next(),
+                let language = crate::tmdb::normalize_language(
+                    Some(&self.preferred_metadata_language(entity).await),
+                    Some(&self.preferred_metadata_country_code(entity).await),
+                );
+                let id = match (stored_tmdb_id, name) {
+                    (Some(id), _) => Some(id),
+                    (None, Some(name)) => tmdb
+                        .search_person(name)
+                        .await
+                        .into_iter()
+                        .next()
+                        .map(|person| person.tmdb_id),
                     (None, None) => None,
                 };
-                person
-                    .and_then(|p| p.profile_url)
-                    .map(|url| vec![plain_image(ImageType::Primary, url)])
-                    .unwrap_or_default()
+                match id {
+                    Some(id) => tmdb.person_images(id, language.as_deref()).await,
+                    None => Vec::new(),
+                }
             }
         }
     }
@@ -3613,6 +3641,25 @@ fn order_by_language_descending(images: &mut [RemoteImageInfo], requested: &str)
             })
             .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
     });
+}
+
+/// `TmdbUtils.AdjustImageLanguage`: expose regional requested tags when the
+/// provider reports only their language prefix, and treat TMDB's xx as untagged.
+fn adjust_tmdb_image_language(language: Option<String>, requested: &str) -> Option<String> {
+    let language = language.filter(|language| !language.is_empty())?;
+    if requested.len() > 2
+        && language.len() == 2
+        && requested
+            .get(..2)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&language))
+    {
+        return Some(requested.to_owned());
+    }
+    if language.eq_ignore_ascii_case("xx") {
+        None
+    } else {
+        Some(language)
+    }
 }
 
 pub(crate) fn order_tmdb_images(images: &mut [TmdbImage], requested: &str) {
@@ -4874,6 +4921,35 @@ mod tests {
         assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
     }
 
+    #[tokio::test]
+    async fn movie_find_sends_the_pinned_regional_and_null_language_lists() {
+        use super::{TmdbKind, TmdbSearchProvider};
+
+        let body = r#"{"movie_results":[{"id":603,"title":"Resolved movie"}]}"#;
+        let server = crate::mock_http::MockServer::start(vec![
+            ("language=pt-BR%2Cnull%2Cen", body.to_owned()),
+            ("language=es-AR%2Cnull%2Cen", body.to_owned()),
+            ("language=null%2Cen", body.to_owned()),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        for (language, country) in [
+            (Some("pt-br"), Some("BR")),
+            (Some("es-419"), Some("AR")),
+            (None, None),
+        ] {
+            let mut request = id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]);
+            request.search_info.metadata_language = language.map(str::to_owned);
+            request.search_info.metadata_country_code = country.map(str::to_owned);
+            let results = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie)
+                .get_search_results(&request)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "{language:?}/{country:?}: {results:?}");
+            assert_eq!(results[0].name.as_deref(), Some("Resolved movie"));
+        }
+    }
+
     /// `TmdbUtils.GetImageLanguagesParam` — the value `TmdbMovieProvider` hands to
     /// `FindByExternalIdAsync`, which is NOT the bare language the series provider sends.
     #[test]
@@ -4881,10 +4957,10 @@ mod tests {
         use crate::tmdb::image_languages_param;
         assert_eq!(image_languages_param(Some("en"), Some("US")), "en,null");
         assert_eq!(image_languages_param(Some("fr"), Some("FR")), "fr,null,en");
-        // A 5-letter code supplies both halves; the region is upper-cased first.
+        // The pinned helper preserves the normalized regional code without an extra bare prefix.
         assert_eq!(
             image_languages_param(Some("pt-br"), Some("BR")),
-            "pt-BR,pt,null,en"
+            "pt-BR,null,en"
         );
         // `NormalizeLanguage` runs first: de-CH degrades to de.
         assert_eq!(
@@ -4894,6 +4970,16 @@ mod tests {
         // Blank preference is not "en", so English is still appended.
         assert_eq!(image_languages_param(None, Some("US")), "null,en");
         assert_eq!(image_languages_param(Some(""), None), "null,en");
+        assert_eq!(
+            image_languages_param(Some("es-419"), Some("AR")),
+            "es-AR,null,en"
+        );
+        assert_eq!(
+            image_languages_param(Some("es-419"), Some("FR")),
+            "es-MX,null,en"
+        );
+        assert_eq!(image_languages_param(Some("EN"), None), "EN,null");
+        assert_eq!(image_languages_param(Some("fr-ca"), None), "fr-CA,null,en");
     }
 
     #[tokio::test]
@@ -7448,12 +7534,12 @@ mod tests {
     #[tokio::test]
     async fn box_set_remote_images_come_from_the_tmdb_collection() {
         // "Choose Image" on a box set searches TMDB's collections, then lists
-        // that collection's artwork — TMDB's own pick first.
+        // that collection's appended candidate lists, without the single default pick.
         let search = r#"{"results":[{"id":2344,"name":"The Matrix Collection",
                          "poster_path":"/c.jpg","overview":"Neo."}]}"#;
         let collection = r#"{"id":2344,"name":"The Matrix Collection","overview":"Neo.",
             "poster_path":"/pick.jpg","backdrop_path":"/back.jpg",
-            "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#;
+            "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[{"file_path":"/alt-back.jpg"}]}}"#;
         let server = crate::mock_http::MockServer::start(vec![
             ("/search/collection", search.to_owned()),
             ("/collection/", collection.to_owned()),
@@ -7478,9 +7564,8 @@ mod tests {
         assert_eq!(
             urls,
             [
-                "https://image.tmdb.org/t/p/original/pick.jpg",
-                "https://image.tmdb.org/t/p/original/back.jpg",
                 "https://image.tmdb.org/t/p/original/alt.jpg",
+                "https://image.tmdb.org/t/p/original/alt-back.jpg",
             ]
         );
         assert_eq!(images[0].type_, ImageType::Primary);
@@ -9198,6 +9283,192 @@ mod tests {
             assert_eq!(images.len(), 1, "{id}: {images:?}");
             assert_eq!(images[0].url.as_deref(), Some(url));
             assert_eq!(images[0].language.as_deref(), language);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_server_defaults_reach_pathless_person_and_collection_metadata() {
+        use std::sync::RwLock;
+        let server = crate::mock_http::MockServer::start(
+            ["fr", "de", "es-AR"]
+                .into_iter()
+                .map(|language| {
+                    let key = match language {
+                        "fr" => "language=fr",
+                        "de" => "language=de",
+                        _ => "language=es-AR",
+                    };
+                    (
+                        key,
+                        serde_json::json!({
+                            "id":2344,"name":format!("Collection {language}"),
+                            "overview":format!("Collection overview {language}"),
+                            "biography":format!("Person biography {language}")
+                        })
+                        .to_string(),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let locale = Arc::new(RwLock::new(("fr".to_owned(), "AR".to_owned())));
+        for kind in ["Person", "Movies.BoxSet"] {
+            let store = Arc::new(RecordingStore::default());
+            let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+            let (id, manager) = box_set_manager(row(kind, "Original"), tmdb, store.clone());
+            store
+                .stored_ids
+                .lock()
+                .unwrap()
+                .insert(id, vec![("Tmdb".to_owned(), "2344".to_owned())]);
+            let lang_source = Arc::clone(&locale);
+            let country_source = Arc::clone(&locale);
+            let library = Arc::new(OneLibrary(
+                ferrofin_model::entities_media::VirtualFolderInfo::default(),
+            ));
+            let manager = manager
+                .with_metadata_language(
+                    library,
+                    Arc::new(move || lang_source.read().unwrap().0.clone()),
+                )
+                .with_metadata_country(Arc::new(move || country_source.read().unwrap().1.clone()));
+            for (language, expected) in [("fr", "fr"), ("de", "de"), ("es-419", "es-AR")] {
+                *locale.write().unwrap() = (language.to_owned(), "AR".to_owned());
+                manager
+                    .refresh_single_item(id, &full_metadata_refresh())
+                    .await
+                    .unwrap();
+                let saved = store.saved.lock().unwrap();
+                let saved = saved.last().unwrap();
+                let label = if kind == "Person" {
+                    "Person biography"
+                } else {
+                    "Collection overview"
+                };
+                assert_eq!(saved.overview, Some(format!("{label} {expected}")));
+                if kind != "Person" {
+                    assert_eq!(saved.name, Some(format!("Collection {expected}")));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_locale_preserves_independent_library_and_item_overrides() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "language=de",
+                r#"{"id":2344,"name":"German","overview":"Library de"}"#.to_owned(),
+            ),
+            (
+                "language=pt-BR",
+                r#"{"id":2344,"name":"Brazilian","overview":"Item pt-BR"}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let library_id = Uuid::from_u128(0x4d03);
+        for own in [false, true] {
+            let store = Arc::new(RecordingStore::default());
+            let mut stored = row("Movies.BoxSet", "Original");
+            stored.top_parent_id = Some(library_id.to_string());
+            stored.preferred_metadata_language = own.then(|| "pt-br".to_owned());
+            stored.preferred_metadata_country_code = own.then(|| "BR".to_owned());
+            let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+            let (id, manager) = box_set_manager(stored, tmdb, store.clone());
+            store
+                .stored_ids
+                .lock()
+                .unwrap()
+                .insert(id, vec![("Tmdb".to_owned(), "2344".to_owned())]);
+            let library = Arc::new(OneLibrary(
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    item_id: Some(library_id.to_string()),
+                    library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                        preferred_metadata_language: Some("de".to_owned()),
+                        metadata_country_code: Some("DE".to_owned()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ));
+            let manager = manager
+                .with_metadata_language(library, Arc::new(|| "fr".to_owned()))
+                .with_metadata_country(Arc::new(|| "AR".to_owned()));
+            manager
+                .refresh_single_item(id, &full_metadata_refresh())
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .saved
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .overview
+                    .as_deref(),
+                Some(if own { "Item pt-BR" } else { "Library de" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn by_name_artwork_keeps_language_candidates_and_updates_regional_preference() {
+        use std::sync::RwLock;
+        let body = r#"{"id":2344,"name":"Collection", "poster_path":"/default.jpg", "images":{
+            "posters":[{"file_path":"/fr.jpg","iso_639_1":"fr","width":1600,"height":2400,"vote_average":7,"vote_count":9},
+                       {"file_path":"/en.jpg","iso_639_1":"en","width":1500},
+                       {"file_path":"/de.jpg","iso_639_1":"de","width":1700},
+                       {"file_path":"/none.jpg","iso_639_1":"xx","width":1800}],
+            "profiles":[{"file_path":"/fr.jpg","iso_639_1":"fr","width":1600,"height":2400,"vote_average":7,"vote_count":9},
+                        {"file_path":"/en.jpg","iso_639_1":"en","width":1500},
+                        {"file_path":"/de.jpg","iso_639_1":"de","width":1700},
+                        {"file_path":"/none.jpg","iso_639_1":"xx","width":1800}]}}"#;
+        let server = crate::mock_http::MockServer::always(body).await;
+        let preferred = Arc::new(RwLock::new("fr-CA".to_owned()));
+        for kind in ["Person", "Movies.BoxSet"] {
+            let source = Arc::clone(&preferred);
+            let library = Arc::new(OneLibrary(
+                ferrofin_model::entities_media::VirtualFolderInfo::default(),
+            ));
+            let (id, manager) = image_manager(
+                kind,
+                "Original",
+                &[("Tmdb", "2344")],
+                Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url)),
+                |manager| {
+                    manager.with_metadata_language(
+                        library,
+                        Arc::new(move || source.read().unwrap().clone()),
+                    )
+                },
+            );
+            for language in ["fr-CA", "de"] {
+                *preferred.write().unwrap() = language.to_owned();
+                let images = manager
+                    .get_available_remote_images(id, &RemoteImageQuery::default())
+                    .await
+                    .unwrap();
+                assert_eq!(images.len(), 3, "{kind}: {images:?}");
+                assert_eq!(images[0].language.as_deref(), Some(language));
+                assert!(
+                    images[0]
+                        .url
+                        .as_ref()
+                        .unwrap()
+                        .ends_with(if language == "de" {
+                            "/de.jpg"
+                        } else {
+                            "/fr.jpg"
+                        })
+                );
+                assert_eq!(images[1].language, None, "xx is untagged");
+                if language == "fr-CA" {
+                    assert_eq!(images[0].width, Some(1600));
+                    assert_eq!(images[0].height, Some(2400));
+                    assert_eq!(images[0].vote_count, Some(9));
+                }
+            }
         }
     }
 }

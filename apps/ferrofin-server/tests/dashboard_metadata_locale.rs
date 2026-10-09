@@ -21,6 +21,10 @@ const POSTER: &[u8] = &[
 const CLIENT: &str =
     r#"MediaBrowser Client="locale-test", Device="fixture", DeviceId="locale-test", Version="1""#;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one offline HTTP provider fixture serves the locale and artwork request matrix"
+)]
 async fn provider(
     State(requests): State<Arc<Mutex<Vec<String>>>>,
     headers: HeaderMap,
@@ -97,6 +101,31 @@ async fn provider(
     if let Some(artwork) = artwork {
         return Json(artwork).into_response();
     }
+    if uri.path().starts_with("/person/") || uri.path().starts_with("/collection/") {
+        let url = reqwest::Url::parse(&format!("http://fixture{uri}")).unwrap();
+        let language = url
+            .query_pairs()
+            .find(|(key, _)| key == "language")
+            .map_or_else(|| "missing".to_owned(), |(_, value)| value.into_owned());
+        let images: Vec<_> = ["fr", "de", "es", "en", "xx"]
+            .into_iter()
+            .map(|tag| {
+                json!({
+                    "file_path":format!("/locale-{tag}.png"), "iso_639_1":tag,
+                    "width":1600,"height":2400,"vote_average":7,"vote_count":9
+                })
+            })
+            .collect();
+        return Json(json!({
+            "id": uri.path().rsplit('/').next().unwrap().parse::<i64>().unwrap(),
+            "name":format!("Collection {language}"),"overview":format!("Collection overview {language}"),
+            "biography":format!("Person biography {language}"),
+            "images":{"posters":images,"profiles":images,"backdrops":[]}
+        })).into_response();
+    }
+    if image_path.starts_with("/locale-") && image_path.strip_suffix(".png").is_some() {
+        return ([("content-type", "image/png")], POSTER).into_response();
+    }
     if uri.path() == "/movie/603" {
         let url = reqwest::Url::parse(&format!("http://fixture{uri}")).unwrap();
         let language = url
@@ -127,6 +156,7 @@ struct Api {
     client: reqwest::Client,
     base: String,
     auth: String,
+    database_url: String,
 }
 
 impl Api {
@@ -165,7 +195,7 @@ impl Api {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let items = self
-                .get("/Items?recursive=true&includeItemTypes=Movie")
+                .get("/Items?recursive=true&includeItemTypes=Movie&fields=Overview")
                 .await;
             if let Some(item) = items["Items"]
                 .as_array()
@@ -296,6 +326,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         musicbrainz_base_url: endpoint,
         ..Config::test_stub(tmp.path())
     };
+    let database_url = config.database_url();
     let server = std::thread::spawn(move || {
         tokio::runtime::Runtime::new()
             .unwrap()
@@ -309,6 +340,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             .unwrap(),
         base: format!("http://127.0.0.1:{port}"),
         auth: CLIENT.to_owned(),
+        database_url,
     };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -389,11 +421,28 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     let observed = requests.lock().unwrap().clone();
     for language in ["fr", "de", "es-AR"] {
         assert!(
-            observed.iter().any(|uri| uri.starts_with("/movie/603?")
-                && uri.contains(&format!("language={language}"))),
+            observed.iter().any(|uri| {
+                if !uri.starts_with("/movie/603?") {
+                    return false;
+                }
+                let url = reqwest::Url::parse(&format!("http://fixture{uri}")).unwrap();
+                let query = url
+                    .query_pairs()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<std::collections::HashMap<_, _>>();
+                query.get("language").map(String::as_str) == Some(language)
+                    && query
+                        .get("include_image_language")
+                        .is_some_and(|value| value == &format!("{language},null,en"))
+                    && query
+                        .get("append_to_response")
+                        .is_some_and(|value| value.split(',').any(|method| method == "images"))
+            }),
             "{observed:?}"
         );
     }
+    verify_server_metadata_language(&api, &mut config, &refresh).await;
+    verify_by_name_metadata_languages(&api, &mut config, &requests).await;
     // L12: Identify uses the same saved enable lists and exact-name order as
     // automatic refresh. Shared IMDb ids make the first provider's result win.
     for (fetchers, order, expected) in [
@@ -1633,6 +1682,190 @@ async fn verify_subtitle_destinations(
         expected_paths.len(),
         "failed uploads must not append a stream: {item}"
     );
+}
+
+/// A language-only save reaches an existing inherited item without restarting.
+async fn verify_server_metadata_language(api: &Api, config: &mut Value, refresh: &str) {
+    assert_eq!(config["MetadataCountryCode"], "AR");
+    for (language, name) in [("fr", "Locale fr"), ("es-419", "Locale es-AR")] {
+        config["PreferredMetadataLanguage"] = json!(language);
+        api.post("/System/Configuration", config).await;
+        api.post(refresh, &Value::Null).await;
+        let item = api.await_movie(name, "AR-13").await;
+        assert_eq!(item["Overview"], name.replace("Locale", "Overview"));
+        assert_eq!(
+            api.get("/System/Configuration").await["MetadataCountryCode"],
+            "AR"
+        );
+    }
+}
+
+async fn seed_by_name_locale_items(
+    api: &Api,
+    provider_offset: u32,
+) -> (
+    ferrofin_core::FerrofinItemPersistenceService,
+    [uuid::Uuid; 2],
+) {
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    let db = ferrofin_db::Database::connect(&api.database_url)
+        .await
+        .unwrap();
+    let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db);
+    let ids = [uuid::Uuid::new_v4(), uuid::Uuid::new_v4()];
+    for ((id, kind), provider) in ids
+        .into_iter()
+        .zip(["Person", "Movies.BoxSet"])
+        .zip([287 + provider_offset, 2344 + provider_offset])
+    {
+        persistence
+            .save_items(&[ferrofin_db::entities::base_items::BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+                name: Some(format!("Locale {kind}")),
+                is_folder: kind == "Movies.BoxSet",
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        persistence
+            .replace_provider_ids(id, &[("Tmdb".to_owned(), provider.to_string())])
+            .await
+            .unwrap();
+    }
+    (persistence, ids)
+}
+
+async fn await_by_name_overview(api: &Api, id: uuid::Uuid, expected: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let item = api.get(&format!("/Items/{id}")).await;
+        if item["Overview"] == expected {
+            return item;
+        }
+        assert!(Instant::now() < deadline, "expected {expected}: {item}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Pathless people/collections use the live server pair. Artwork tags survive
+/// parsing and change the first selection, including regional prefix matching.
+#[allow(clippy::too_many_lines)]
+async fn verify_by_name_metadata_languages(
+    api: &Api,
+    config: &mut Value,
+    requests: &Mutex<Vec<String>>,
+) {
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    let (persistence, ids) = seed_by_name_locale_items(api, 0).await;
+    for (language, resolved, image_tag) in [
+        ("fr", "fr", "fr"),
+        ("de", "de", "de"),
+        ("es-419", "es-AR", "es-419"),
+    ] {
+        config["PreferredMetadataLanguage"] = json!(language);
+        api.post("/System/Configuration", config).await;
+        for (id, label) in ids
+            .into_iter()
+            .zip(["Person biography", "Collection overview"])
+        {
+            requests.lock().unwrap().clear();
+            api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=FullRefresh&replaceAllMetadata=true&replaceAllImages=true"), &Value::Null).await;
+            let item = await_by_name_overview(api, id, &format!("{label} {resolved}")).await;
+            assert_eq!(
+                item["Id"]
+                    .as_str()
+                    .map(|raw| uuid::Uuid::parse_str(raw).unwrap()),
+                Some(id)
+            );
+            assert!(item["ImageTags"]["Primary"].is_string(), "{item}");
+            let expected_image = if language == "es-419" { "es" } else { language };
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|uri| uri.starts_with(&format!("/original/locale-{expected_image}.png"))),
+                "automatic acquisition must select the newly requested language"
+            );
+            let provider_path = if label == "Person biography" {
+                "/person/"
+            } else {
+                "/collection/"
+            };
+            let provider_queries: Vec<_> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|uri| uri.starts_with(provider_path))
+                .map(|uri| {
+                    reqwest::Url::parse(&format!("http://fixture{uri}"))
+                        .unwrap()
+                        .query_pairs()
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .collect();
+            let provider_languages: Vec<_> = provider_queries
+                .iter()
+                .map(|query| query.get("language").cloned())
+                .collect();
+            assert!(
+                provider_languages
+                    .iter()
+                    .any(|language| language.as_deref() == Some(resolved)),
+                "metadata request must carry the resolved locale: {provider_languages:?}"
+            );
+            if label == "Collection overview" {
+                assert!(
+                    provider_queries
+                        .iter()
+                        .any(
+                            |query| query.get("language").map(String::as_str) == Some(resolved)
+                                && query.get("include_image_language").map(String::as_str)
+                                    == Some(format!("{resolved},null,en").as_str())
+                        ),
+                    "metadata collection image list: {provider_queries:?}"
+                );
+                assert!(
+                    provider_queries
+                        .iter()
+                        .any(|query| !query.contains_key("language")
+                            && !query.contains_key("include_image_language")),
+                    "BoxSet artwork must request all languages: {provider_queries:?}"
+                );
+            } else {
+                assert!(
+                    provider_queries
+                        .iter()
+                        .all(|query| !query.contains_key("include_image_language")),
+                    "Person uses normalized language without an image-language list: {provider_queries:?}"
+                );
+            }
+            let images = api
+                .get(&format!("/Items/{id}/RemoteImages?providerName=TheMovieDb"))
+                .await;
+            let images = images["Images"].as_array().unwrap();
+            assert_eq!(images.len(), 3, "preferred/untagged/English: {images:?}");
+            assert_eq!(images[0]["Language"], image_tag);
+            assert_eq!(images[0]["Width"], 1600);
+            assert!(images[1]["Language"].is_null() || images[1]["Language"] == "");
+            let image = api
+                .client
+                .get(format!("{}/Items/{id}/Images/Primary", api.base))
+                .header("Authorization", &api.auth)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(image.status(), reqwest::StatusCode::OK);
+            assert_eq!(image.bytes().await.unwrap().as_ref(), POSTER);
+        }
+        assert_eq!(
+            api.get("/System/Configuration").await["MetadataCountryCode"],
+            "AR"
+        );
+    }
+    persistence.delete_items(&ids).await.unwrap();
 }
 
 /// Live dashboard display policy positions physical specials in episode lists and NextUp.

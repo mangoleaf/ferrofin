@@ -946,8 +946,8 @@ pub fn normalize_language(language: Option<&str>, country_code: Option<&str>) ->
     Some(language)
 }
 
-/// `TmdbUtils.GetImageLanguagesParam`: the normalized preferred language, its bare
-/// two-letter half when it carried a region, `null`, and `en` as the final fallback —
+/// `TmdbUtils.GetImageLanguagesParam` at pin4910aafa1a: the normalized preferred
+/// language, `null`, and `en` as the final fallback —
 /// comma separated (`"fr,null,en"`, `"en,null"`).
 ///
 /// `TmdbMovieProvider` hands exactly this string to `FindByExternalIdAsync`'s
@@ -963,10 +963,6 @@ pub fn image_languages_param(language: Option<&str>, country_code: Option<&str>)
     let mut languages = Vec::new();
     if !preferred.is_empty() {
         languages.push(preferred.clone());
-        // TMDB carries two-letter codes only, so a 5-letter code supplies both halves.
-        if preferred.len() == 5 {
-            languages.push(preferred[..2].to_owned());
-        }
     }
     languages.push("null".to_owned());
     // English is always the final fallback (and a blank preference is not "en", so it
@@ -1039,6 +1035,16 @@ struct CollectionImages {
 struct CollectionImage {
     #[serde(default)]
     file_path: Option<String>,
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    #[serde(default)]
+    iso_639_1: Option<String>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    vote_count: Option<i32>,
 }
 
 /// One TMDB collection search candidate (the box-set Identify row).
@@ -1350,8 +1356,12 @@ impl TmdbClient {
         let url = format!("{}/tv/{tmdb_id}/season/{season_number}", self.base_url);
         let req = self.http.get(url).query(&[
             ("api_key", key),
-            ("append_to_response", "credits,external_ids"),
+            ("append_to_response", "credits,images,external_ids,videos"),
         ]);
+        let req = req.query(&[(
+            "include_image_language",
+            image_languages_param(language, None),
+        )]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
@@ -1418,22 +1428,17 @@ impl TmdbClient {
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let req = self
-            .http
-            .get(format!("{}/collection/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key), ("append_to_response", "images")]);
-        let resp = with_language(req, language)
-            .send_limited(&self.limiter)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let parsed: CollectionResponse = resp.counted_json().await.ok()?;
-        // The single `poster_path`/`backdrop_path` come first (they are TMDB's
-        // own pick), then the rest of the `images` lists — same order the C#
-        // `ConvertPostersToRemoteImageInfo`/`ConvertBackdrops…` pair yields.
+        let parsed = self
+            .collection_response(
+                tmdb_id,
+                language,
+                Some(image_languages_param(language, None)),
+                &cfg,
+            )
+            .await?;
+        // Preserve the legacy metadata result's single default images. The
+        // remote image provider uses `collection_images` instead, because the
+        // pinned source converts only the appended candidate lists.
         let mut images = Vec::new();
         let mut push = |path: Option<String>, image_type: ImageType| {
             if let Some(path) = non_empty(path) {
@@ -1458,6 +1463,66 @@ impl TmdbClient {
             overview: non_empty(parsed.overview),
             images,
         })
+    }
+
+    /// The collection image provider deliberately fetches all languages and
+    /// returns the appended poster/backdrop lists, rather than the metadata
+    /// endpoint's single default poster. Locale ranking is applied afterward.
+    pub async fn collection_images(&self, tmdb_id: i64) -> Vec<TmdbImage> {
+        let cfg = self.settings().await;
+        let Some(parsed) = self.collection_response(tmdb_id, None, None, &cfg).await else {
+            return Vec::new();
+        };
+        let cfg = &cfg;
+        let map = |images: Vec<CollectionImage>, kind: ImageType| {
+            images.into_iter().filter_map(move |image| {
+                let size = image_type_size(kind);
+                let scaled = cfg
+                    .image_size(size)
+                    .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+                Some(TmdbImage {
+                    image_type: kind,
+                    url: cfg.image_url(size, &non_empty(image.file_path)?),
+                    width: if scaled { None } else { image.width },
+                    height: if scaled { None } else { image.height },
+                    community_rating: image.vote_average,
+                    vote_count: image.vote_count,
+                    language: non_empty(image.iso_639_1),
+                })
+            })
+        };
+        map(parsed.images.posters, ImageType::Primary)
+            .chain(map(parsed.images.backdrops, ImageType::Backdrop))
+            .collect()
+    }
+
+    async fn collection_response(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+        image_languages: Option<String>,
+        cfg: &crate::plugin_config::TmdbConfig,
+    ) -> Option<CollectionResponse> {
+        let req = self
+            .http
+            .get(format!("{}/collection/{tmdb_id}", self.base_url))
+            .query(&[
+                ("api_key", cfg.api_key(self.api_key.expose_secret())),
+                ("append_to_response", "images"),
+            ]);
+        let req = if let Some(image_languages) = image_languages {
+            req.query(&[("include_image_language", image_languages)])
+        } else {
+            req
+        };
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.counted_json().await.ok()
     }
 
     /// Searches TMDB by name/year and returns the candidate list (the "Identify"
@@ -1737,8 +1802,12 @@ impl TmdbClient {
             ))
             .query(&[
                 ("api_key", key),
-                ("append_to_response", "external_ids,videos,credits"),
+                ("append_to_response", "external_ids,videos,credits,images"),
             ]);
+        let req = req.query(&[(
+            "include_image_language",
+            image_languages_param(language, None),
+        )]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
@@ -1865,13 +1934,20 @@ impl TmdbClient {
         let (path, append) = match kind {
             // The movie Identify branch needs `external_ids` too — `/movie/{id}`
             // carries `imdb_id` directly, so only the series arm asks for it.
-            TmdbKind::Movie => ("movie", "credits,release_dates,videos,keywords"),
-            TmdbKind::Series => ("tv", "credits,content_ratings,videos,external_ids,keywords"),
+            TmdbKind::Movie => ("movie", "credits,release_dates,images,videos,keywords"),
+            TmdbKind::Series => (
+                "tv",
+                "credits,images,content_ratings,videos,external_ids,keywords",
+            ),
         };
         let req = self
             .http
             .get(format!("{}/{path}/{tmdb_id}", self.base_url))
             .query(&[("api_key", key), ("append_to_response", append)]);
+        let req = req.query(&[(
+            "include_image_language",
+            image_languages_param(language, country),
+        )]);
         let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
@@ -1881,11 +1957,21 @@ impl TmdbClient {
         }
         let d = resp.counted_json::<DetailsResponse>().await.ok()?;
 
+        Some(Self::details_from_response(d, kind, &cfg, country))
+    }
+
+    /// Convert the parsed title payload with the selected plugin settings and country.
+    fn details_from_response(
+        d: DetailsResponse,
+        kind: TmdbKind,
+        cfg: &crate::plugin_config::TmdbConfig,
+        country: Option<&str>,
+    ) -> TmdbDetails {
         let premiere = d
             .release_date
             .or(d.first_air_date)
             .filter(|s| !s.is_empty());
-        let people = credits_to_people(d.credits, &cfg);
+        let people = credits_to_people(d.credits, cfg);
 
         let trailers = youtube_trailers(d.videos);
 
@@ -1894,7 +1980,7 @@ impl TmdbClient {
             .or(d.original_name)
             .filter(|s| !s.is_empty());
         let external_ids = d.external_ids;
-        Some(TmdbDetails {
+        TmdbDetails {
             name: d
                 .title
                 .or(d.name)
@@ -1959,7 +2045,7 @@ impl TmdbClient {
                 TmdbKind::Series => non_empty(d.status),
                 TmdbKind::Movie => None,
             },
-        })
+        }
     }
 
     /// Searches TMDB's people by name (`/search/person`) — port of
@@ -2021,22 +2107,7 @@ impl TmdbClient {
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let req = self
-            .http
-            .get(format!("{}/person/{tmdb_id}", self.base_url))
-            .query(&[
-                ("api_key", key),
-                ("append_to_response", "images,external_ids"),
-            ]);
-        let resp = with_language(req, language)
-            .send_limited(&self.limiter)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let p = resp.counted_json::<PersonLookupResponse>().await.ok()?;
+        let p = self.person_response(tmdb_id, language, &cfg).await?;
         Some(TmdbPersonHit {
             tmdb_id: p.id.unwrap_or(tmdb_id),
             name: non_empty(p.name),
@@ -2051,18 +2122,93 @@ impl TmdbClient {
         })
     }
 
+    /// Every profile candidate, including the language, dimensions and vote
+    /// information used by `TmdbPersonImageProvider`'s selection ordering.
+    pub async fn person_images(&self, tmdb_id: i64, language: Option<&str>) -> Vec<TmdbImage> {
+        let cfg = self.settings().await;
+        let Some(person) = self.person_response(tmdb_id, language, &cfg).await else {
+            return Vec::new();
+        };
+        let scaled = cfg
+            .image_size(crate::plugin_config::TmdbImageKind::Profile)
+            .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
+        person
+            .images
+            .into_iter()
+            .flat_map(|images| images.profiles)
+            .filter_map(|image| {
+                Some(TmdbImage {
+                    image_type: ImageType::Primary,
+                    url: cfg.image_url(
+                        crate::plugin_config::TmdbImageKind::Profile,
+                        &non_empty(image.file_path)?,
+                    ),
+                    width: if scaled { None } else { image.width },
+                    height: if scaled { None } else { image.height },
+                    community_rating: image.vote_average,
+                    vote_count: image.vote_count,
+                    language: non_empty(image.iso_639_1),
+                })
+            })
+            .collect()
+    }
+
+    async fn person_response(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+        cfg: &crate::plugin_config::TmdbConfig,
+    ) -> Option<PersonLookupResponse> {
+        let req = self
+            .http
+            .get(format!("{}/person/{tmdb_id}", self.base_url))
+            .query(&[
+                ("api_key", cfg.api_key(self.api_key.expose_secret())),
+                (
+                    "append_to_response",
+                    "images,external_ids,tv_credits,movie_credits",
+                ),
+            ]);
+        let resp = with_language(req, language)
+            .send_limited(&self.limiter)
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.counted_json().await.ok()
+    }
+
     /// Fetches a person's biography via `/person/{id}`, or `None` on any
     /// network/parse error or when TMDB has no biographical text.
     pub async fn person_details(&self, tmdb_id: i64) -> Option<TmdbPersonDetails> {
+        self.person_details_for_language(tmdb_id, None).await
+    }
+
+    /// Fetches the biography in the resolved item/server metadata language.
+    /// The caller normalizes regional codes with the item's country, as
+    /// `TmdbPersonProvider.GetMetadata` does before `GetPersonAsync`.
+    pub async fn person_details_for_language(
+        &self,
+        tmdb_id: i64,
+        language: Option<&str>,
+    ) -> Option<TmdbPersonDetails> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
         let key = cfg.api_key(self.api_key.expose_secret());
-        let resp = self
+        let req = self
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
-            .query(&[("api_key", key)])
+            .query(&[
+                ("api_key", key),
+                (
+                    "append_to_response",
+                    "images,external_ids,tv_credits,movie_credits",
+                ),
+            ]);
+        let resp = with_language(req, language)
             .send_limited(&self.limiter)
             .await
             .ok()?;
@@ -2163,6 +2309,16 @@ struct PersonImages {
 struct PersonProfileImage {
     #[serde(default)]
     file_path: Option<String>,
+    #[serde(default)]
+    width: Option<i32>,
+    #[serde(default)]
+    height: Option<i32>,
+    #[serde(default)]
+    iso_639_1: Option<String>,
+    #[serde(default)]
+    vote_average: Option<f64>,
+    #[serde(default)]
+    vote_count: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2271,6 +2427,217 @@ mod tests {
                 .people
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn person_and_collection_candidates_keep_original_dimensions_case_insensitively() {
+        let server = crate::mock_http::MockServer::always(r#"{"id":1,"images":{
+            "profiles":[{"file_path":"/profile.jpg","width":900,"height":1200,"vote_average":8.2,"vote_count":3}],
+            "posters":[{"file_path":"/poster.jpg","width":900,"height":1200,"vote_average":8.2,"vote_count":3}],
+            "backdrops":[{"file_path":"/backdrop.jpg","width":1600,"height":900}]}}"#).await;
+        for size in ["original", "ORIGINAL", "w185"] {
+            let client = TmdbClient::new().with_base_url(&server.base_url);
+            let config =
+                serde_json::json!({"ProfileSize":size,"PosterSize":size,"BackdropSize":size});
+            client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+                crate::builtin_plugins::TMDB.id,
+                serde_json::to_vec(&config).unwrap(),
+            ));
+            let profiles = client.person_images(1, Some("fr-CA")).await;
+            let collections = client.collection_images(1).await;
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(collections.len(), 2);
+            let expected = if size.eq_ignore_ascii_case("original") {
+                Some(900)
+            } else {
+                None
+            };
+            assert_eq!(profiles[0].width, expected, "profile {size}");
+            assert_eq!(collections[0].width, expected, "collection {size}");
+            let expected_height = expected.map(|_| 1200);
+            assert_eq!(profiles[0].height, expected_height, "profile {size}");
+            assert_eq!(collections[0].height, expected_height, "collection {size}");
+            assert_eq!(profiles[0].community_rating, Some(8.2));
+            assert_eq!(collections[0].community_rating, Some(8.2));
+            assert_eq!(profiles[0].vote_count, Some(3));
+            assert_eq!(collections[0].vote_count, Some(3));
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_metadata_keeps_image_language_param_separate_from_all_language_artwork() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        let handle = tokio::spawn(async move {
+            for _ in 0..7 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let length = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(length, 0);
+                    bytes.extend_from_slice(&chunk[..length]);
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                captured.lock().unwrap().push(path);
+                let body = r#"{"id":1,"name":"Collection","biography":"fixture","images":{"profiles":[{"file_path":"/p.jpg"}],"posters":[{"file_path":"/p.jpg"}]}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let client = TmdbClient::new().with_base_url(&format!("http://{address}"));
+        assert!(client.collection(1, Some("fr-CA")).await.is_some());
+        assert!(client.collection(1, None).await.is_some());
+        assert_eq!(client.collection_images(1).await.len(), 1);
+        assert_eq!(client.person_images(1, Some("fr-CA")).await.len(), 1);
+        assert!(client.person_details_for_language(1, None).await.is_some());
+        assert_eq!(client.person_images(1, None).await.len(), 1);
+        assert!(client.person_lookup(1, Some("fr-CA")).await.is_some());
+        handle.await.unwrap();
+        let seen = seen.lock().unwrap();
+        let values: Vec<_> = seen
+            .iter()
+            .map(|path| {
+                reqwest::Url::parse(&format!("http://fixture{path}"))
+                    .unwrap()
+                    .query_pairs()
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .collect();
+        assert_eq!(values[0].get("language").map(String::as_str), Some("fr-CA"));
+        assert_eq!(
+            values[0].get("include_image_language").map(String::as_str),
+            Some("fr-CA,null,en")
+        );
+        assert!(!values[1].contains_key("language"));
+        assert_eq!(
+            values[1].get("include_image_language").map(String::as_str),
+            Some("null,en")
+        );
+        assert!(!values[2].contains_key("language"));
+        assert!(!values[2].contains_key("include_image_language"));
+        assert_eq!(values[3].get("language").map(String::as_str), Some("fr-CA"));
+        assert!(!values[3].contains_key("include_image_language"));
+        assert!(!values[4].contains_key("language"));
+        assert!(!values[4].contains_key("include_image_language"));
+        assert!(!values[5].contains_key("language"));
+        assert!(!values[5].contains_key("include_image_language"));
+        assert_eq!(values[6].get("language").map(String::as_str), Some("fr-CA"));
+        assert!(!values[6].contains_key("include_image_language"));
+    }
+
+    /// Source metadata clients append Images and use the same exact normalized
+    /// fallback list, while direct artwork requests remain all-language.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Four real request consumers and three locale phases.
+    async fn metadata_title_season_episode_requests_include_pinned_image_languages() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..12 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0; 4096];
+                    let length = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(length, 0);
+                    bytes.extend_from_slice(&chunk[..length]);
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let path = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+                seen.push((
+                    url.path().to_owned(),
+                    url.query_pairs()
+                        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ));
+                let body = r#"{"id":1,"name":"Fixture","title":"Fixture","episodes":[],"external_ids":{},"credits":{"cast":[],"crew":[]},"videos":{"results":[]}}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            seen
+        });
+        let client = TmdbClient::new().with_base_url(&format!("http://{address}"));
+        for language in [Some("fr-CA"), Some("es-AR"), None] {
+            assert!(
+                client
+                    .details_for_locale(TmdbKind::Movie, 1, language, None)
+                    .await
+                    .is_some()
+            );
+            assert!(
+                client
+                    .details_for_locale(TmdbKind::Series, 1, language, None)
+                    .await
+                    .is_some()
+            );
+            assert!(
+                client
+                    .season_details_for_language(1, 2, language)
+                    .await
+                    .is_some()
+            );
+            assert!(
+                client
+                    .episode_extras_for_language(1, 2, 3, language)
+                    .await
+                    .is_some()
+            );
+        }
+        let seen = handle.await.unwrap();
+        for (phase, rows) in seen.as_chunks::<4>().0.iter().enumerate() {
+            let (language, images) = [
+                (Some("fr-CA"), "fr-CA,null,en"),
+                (Some("es-AR"), "es-AR,null,en"),
+                (None, "null,en"),
+            ][phase];
+            for ((path, query), expected_path) in rows.iter().zip([
+                "/movie/1",
+                "/tv/1",
+                "/tv/1/season/2",
+                "/tv/1/season/2/episode/3",
+            ]) {
+                assert_eq!(path, expected_path);
+                assert_eq!(
+                    query.get("language").map(String::as_str),
+                    language,
+                    "{path}: {query:?}"
+                );
+                assert_eq!(
+                    query.get("include_image_language").map(String::as_str),
+                    Some(images),
+                    "{path}: {query:?}"
+                );
+                assert!(
+                    query["append_to_response"]
+                        .split(',')
+                        .any(|method| method == "images"),
+                    "{path}: {query:?}"
+                );
+            }
+        }
     }
 
     #[test]
