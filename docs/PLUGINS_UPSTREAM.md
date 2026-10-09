@@ -57,6 +57,12 @@ Conventions:
     are keyed by window in whole seconds without a settings hash (re-keying
     would re-fingerprint every library; a sub-second window change reuses the
     old print), and the clean task deletes cache files no current read hits.
+    Migration `0037` seeds the segment store from the segments already
+    published, as automatic rows with an empty hash (upstream's schema upgrade
+    does the same): the first pass replaces each with what it detects, or
+    deletes it. Hand edits made before `0037`, and the plugin's own records of
+    them on an adopted database, are therefore not kept; nor are the plugin's
+    settings (`IntroSkipper.xml`). `docs/UPGRADING.md` tells operators.
   - **Hashes:** Ferrofin's analysis hashes carry an analyzer-set token
     (`config_hash::ANALYZERS`), bumped when an analyzer lands, so earlier
     results are analysed again with it.
