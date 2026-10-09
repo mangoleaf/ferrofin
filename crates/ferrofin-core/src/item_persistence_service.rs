@@ -26,7 +26,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LocalVersionGroup, StoredImageMetadata, StoredItemLinks,
+    LocalVersionGroup, StoredImageMetadata, StoredItemLinks, VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -2834,6 +2834,178 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(true)
     }
 
+    async fn version_links(&self, primary: Uuid) -> Result<Vec<(Uuid, i32)>, ServiceError> {
+        let rows: Vec<(String, i32)> = sqlx::query_as(
+            r#"SELECT "ChildId", "ChildType" FROM "LinkedChildren"
+               WHERE "ParentId" = ?1 AND "ChildType" IN (?2, ?3)
+               ORDER BY "ChildType", "SortOrder""#,
+        )
+        .bind(guid_to_db(primary))
+        .bind(LOCAL_ALTERNATE_VERSION)
+        .bind(LINKED_ALTERNATE_VERSION)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, child_type)| Uuid::parse_str(&id).ok().map(|id| (id, child_type)))
+            .collect())
+    }
+
+    async fn promote_version(&self, promotion: &VersionPromotion) -> Result<(), ServiceError> {
+        let old = guid_to_db(promotion.old_primary);
+        let new = guid_to_db(promotion.new_primary);
+        let new_key = promotion.new_primary.as_simple().to_string();
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let data: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&new)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let Some(data) = data else {
+            tx.commit().await.map_err(db_err)?;
+            return Ok(());
+        };
+        // `newPrimary.SetPrimaryVersionId(null); newPrimary.OwnerId = Guid.Empty;`
+        // and the `LocalAlternateVersions` it takes over.
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "OwnerId" = NULL, "PrimaryVersionId" = NULL,
+                   "PresentationUniqueKey" = ?2, "Data" = ?3
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&new)
+        .bind(&new_key)
+        .bind(with_local_versions(data.as_deref(), &promotion.local_versions).or(data))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // Its save writes the version rows it took over, under itself and in
+        // their order; it is no version of anything any more.
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren" WHERE "ChildId" = ?1 AND "ChildType" IN (?2, ?3)"#,
+        )
+        .bind(&new)
+        .bind(LOCAL_ALTERNATE_VERSION)
+        .bind(LINKED_ALTERNATE_VERSION)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // Appended after any row it has, in the old order; a child it lists
+        // already keeps its row (the table's key is `(ParentId, SortOrder)`).
+        sqlx::query(
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+               SELECT ?2,
+                   (SELECT COALESCE(MAX("SortOrder"), -1) FROM "LinkedChildren"
+                    WHERE "ParentId" = ?2)
+                   + ROW_NUMBER() OVER (ORDER BY "ChildType", "SortOrder"),
+                   "ChildId", "ChildType"
+               FROM "LinkedChildren" moved
+               WHERE "ParentId" = ?1 AND "ChildType" IN (?3, ?4)
+                 AND NOT EXISTS (SELECT 1 FROM "LinkedChildren" listed
+                     WHERE listed."ParentId" = ?2 AND listed."ChildId" = moved."ChildId")"#,
+        )
+        .bind(&old)
+        .bind(&new)
+        .bind(LOCAL_ALTERNATE_VERSION)
+        .bind(LINKED_ALTERNATE_VERSION)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildType" IN (?2, ?3)"#,
+        )
+        .bind(&old)
+        .bind(LOCAL_ALTERNATE_VERSION)
+        .bind(LINKED_ALTERNATE_VERSION)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // `alternate.SetPrimaryVersionId(newPrimary.Id); alternate.OwnerId =
+        // localAlternateIds.Contains(alternate.Id) ? newPrimary.Id : Guid.Empty;`
+        for &(other, local) in &promotion.others {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2,
+                       "PresentationUniqueKey" = ?3, "OwnerId" = ?4
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(other))
+            .bind(&new)
+            .bind(&new_key)
+            .bind(local.then_some(new.as_str()))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        let mut written: Vec<BaseItemEntity> = Vec::new();
+        if self.changed.get().is_some() {
+            let ids = std::iter::once(promotion.new_primary)
+                .chain(promotion.others.iter().map(|(id, _)| *id));
+            for id in ids {
+                written.extend(
+                    sqlx::query_as::<_, BaseItemEntity>(
+                        r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+                    )
+                    .bind(guid_to_db(id))
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+                );
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        if let Some(changed) = self.changed.get() {
+            changed.record_updated(&written);
+        }
+        Ok(())
+    }
+
+    async fn drop_version(
+        &self,
+        primary: Uuid,
+        version: Uuid,
+        version_path: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let primary = guid_to_db(primary);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(
+            r#"DELETE FROM "LinkedChildren"
+               WHERE "ParentId" = ?1 AND "ChildId" = ?2 AND "ChildType" = ?3"#,
+        )
+        .bind(&primary)
+        .bind(guid_to_db(version))
+        .bind(LINKED_ALTERNATE_VERSION)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if let Some(path) = version_path.filter(|p| !p.is_empty()) {
+            let data: Option<Option<String>> =
+                sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(&primary)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+            if let Some(data) = data {
+                let listed = crate::video_versions::local_alternate_versions(data.as_deref());
+                if listed.iter().any(|p| equals_ignore_case(p, path)) {
+                    let kept: Vec<String> = listed
+                        .into_iter()
+                        .filter(|p| !equals_ignore_case(p, path))
+                        .collect();
+                    if let Some(text) = with_local_versions(data.as_deref(), &kept) {
+                        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                            .bind(&primary)
+                            .bind(text)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db_err)?;
+                    }
+                }
+            }
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
         rekey_rows(&self.db, moves, RekeyKind::Changed).await
     }
@@ -3204,7 +3376,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
 
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
         let id = Uuid::parse_str(&item.id).map_err(|e| ServiceError::Backend(e.to_string()))?;
-        if guid_to_db(id) == PLACEHOLDER_ID {
+        // A local version or a stacked part shares its primary's provider ids
+        // and so its keys: retained history goes back to the primary, never
+        // to one of the videos it owns.
+        if guid_to_db(id) == PLACEHOLDER_ID || is_owned_video(item) {
             return Ok(());
         }
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
@@ -3256,8 +3431,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             // Release the single writer between pages. No metadata read here
             // can become stale before its recovery write in this transaction.
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-            let ids: Vec<String> = sqlx::query_scalar(
-                r#"SELECT "Id" FROM "BaseItems" WHERE "Id" > ?1 AND "Id" <> ?2
+            // Every row, paged by id; the videos another one owns (local
+            // versions, stacked parts: owned, no extra) are no destination —
+            // their primary is ([`is_owned_video`]).
+            let page: Vec<(String, bool)> = sqlx::query_as(
+                r#"SELECT "Id", ("OwnerId" IS NOT NULL AND "ExtraType" IS NULL)
+                   FROM "BaseItems" WHERE "Id" > ?1 AND "Id" <> ?2
                    ORDER BY "Id" LIMIT 500"#,
             )
             .bind(&after)
@@ -3265,11 +3444,16 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
-            let Some(last) = ids.last() else {
+            let Some((last, _)) = page.last() else {
                 tx.commit().await.map_err(db_err)?;
                 break;
             };
             after.clone_from(last);
+            let ids: Vec<String> = page
+                .into_iter()
+                .filter(|(_, owned)| !owned)
+                .map(|(id, _)| id)
+                .collect();
             for identity in crate::user_data_key_repository::load_identities(&mut tx, &ids).await? {
                 if retained.contains(&identity.id.to_lowercase())
                     || identity
@@ -3880,6 +4064,46 @@ async fn move_one(
             .await?;
     }
     Ok(true)
+}
+
+/// Whether `item` is a video another one owns — a local alternate version
+/// or a stacked part (`OwnerId` set, no `ExtraType`) — which retained user
+/// data never recovers onto: it shares its primary's provider ids, and so
+/// the keys history is matched by.
+fn is_owned_video(item: &BaseItemEntity) -> bool {
+    item.extra_type.is_none()
+        && item
+            .owner_id
+            .as_deref()
+            .and_then(|o| Uuid::parse_str(o).ok())
+            .is_some_and(|o| !o.is_nil())
+}
+
+/// `data` with its `LocalAlternateVersions` set to `paths`, every other key
+/// kept; `None` for a blob that is not a JSON object (never rewritten).
+fn with_local_versions(data: Option<&str>, paths: &[String]) -> Option<String> {
+    let mut object = match data.filter(|d| !d.is_empty()) {
+        None => serde_json::Map::new(),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(text).ok()? {
+            serde_json::Value::Object(map) => map,
+            _ => return None,
+        },
+    };
+    object.insert(
+        "LocalAlternateVersions".to_owned(),
+        serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|p| serde_json::Value::String(p.clone()))
+                .collect(),
+        ),
+    );
+    serde_json::to_string(&serde_json::Value::Object(object)).ok()
+}
+
+/// .NET `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`.
+fn equals_ignore_case(a: &str, b: &str) -> bool {
+    ferrofin_util::string_extensions::equals_ordinal_ignore_case(a, b)
 }
 
 /// `LinkedChildren.ChildType` of a file-based version
@@ -6074,6 +6298,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((item.as_str(), favorite), (super::PLACEHOLDER_ID, true));
+    }
+
+    /// Retained history comes back to a primary, never to the local version
+    /// or stacked part it owns, though they share its provider ids — by the
+    /// item's own recovery and by the scan's sweep alike.
+    #[tokio::test]
+    async fn retained_history_skips_owned_versions_and_parts() {
+        let db = test_db().await;
+        let (old, primary, version, part) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let user = Uuid::new_v4();
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        for item in [old, primary, version, part] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            svc.save_provider_id(item, "Tmdb", "owned-versions")
+                .await
+                .unwrap();
+        }
+        for owned in [version, part] {
+            let mut row = crate::test_support::fetch_item(&db, owned).await;
+            row.owner_id = Some(guid_to_db(primary));
+            if owned == version {
+                row.primary_version_id = Some(guid_to_db(primary));
+            }
+            crate::test_support::save_item(&db, &row).await;
+        }
+        crate::test_support::seed_named_user(&db, user, "watcher").await;
+        crate::test_support::seed_user_data(&db, user, old, true, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = 'owned-versions'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        svc.delete_items(&[old]).await.unwrap();
+        let rows_of = |item: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1"#,
+                )
+                .bind(guid_to_db(item))
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+            }
+        };
+        for owned in [version, part] {
+            svc.reattach_user_data(&crate::test_support::fetch_item(&db, owned).await)
+                .await
+                .unwrap();
+            assert_eq!(rows_of(owned).await, 0, "an owned video recovers nothing");
+        }
+        svc.reattach_all_user_data().await.unwrap();
+        assert_eq!(rows_of(version).await, 0);
+        assert_eq!(rows_of(part).await, 0);
+        assert!(rows_of(primary).await > 0, "the primary gets the history");
     }
 
     #[tokio::test]

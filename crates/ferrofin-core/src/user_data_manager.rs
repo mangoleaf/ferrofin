@@ -1073,6 +1073,16 @@ impl FerrofinUserDataManager {
     }
 }
 
+/// Test-only: how many `UserData` rows item `item` holds.
+#[cfg(test)]
+pub(crate) async fn user_data_row_count(db: &Database, item: Uuid) -> i64 {
+    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(item))
+        .fetch_one(db.pool())
+        .await
+        .expect("count user data")
+}
+
 /// Test-only: grants `user` the given permission rows and, when `folders` is
 /// not empty, the "Allow media deletion from" list — the rows
 /// [`UserDataManager::get_content_permissions`] reads — keeping the raw SQL

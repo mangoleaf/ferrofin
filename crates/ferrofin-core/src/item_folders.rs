@@ -29,20 +29,10 @@ pub(crate) fn move_item_folders(
 ) -> (MovedFolders, Vec<(String, String)>) {
     let mut pairs: Vec<(String, String)> = Vec::new();
     if let Some(art) = art_root {
-        for (old, new) in [
-            (guid_to_db(from), guid_to_db(to)),
-            (from.simple().to_string(), to.simple().to_string()),
-        ] {
-            let old = if old.len() == 32 {
-                art.join(&old[..2]).join(&old)
-            } else {
-                art.join(&old)
-            };
-            let new = if new.len() == 32 {
-                art.join(&new[..2]).join(&new)
-            } else {
-                art.join(&new)
-            };
+        for (old, new) in item_art_folders(art, from)
+            .into_iter()
+            .zip(item_art_folders(art, to))
+        {
             pairs.push((
                 old.to_string_lossy().into_owned(),
                 new.to_string_lossy().into_owned(),
@@ -91,6 +81,18 @@ pub(crate) fn move_item_folders(
         }
     }
     (folders, prefixes)
+}
+
+/// The two folders an item's art and internal metadata live in under the
+/// item art root `art_root` (`{metadata}/library`): Ferrofin's
+/// `{art_root}/{GUID}`, and Jellyfin's `{art_root}/{idN[..2]}/{idN}`
+/// (`BaseItem.GetInternalMetadataPath`), which an adopted item carries.
+pub(crate) fn item_art_folders(art_root: &Path, id: Uuid) -> [std::path::PathBuf; 2] {
+    let dashless = id.simple().to_string();
+    [
+        art_root.join(guid_to_db(id)),
+        art_root.join(&dashless[..2]).join(&dashless),
+    ]
 }
 
 /// What [`move_folders`] did, to be confirmed or undone once the database

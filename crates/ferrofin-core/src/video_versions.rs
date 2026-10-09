@@ -72,6 +72,13 @@ pub fn additional_parts(data: Option<&str>) -> Vec<String> {
     data_paths(data, ADDITIONAL_PARTS)
 }
 
+/// A primary's local alternate versions' paths
+/// (`Video.LocalAlternateVersions`).
+#[must_use]
+pub fn local_alternate_versions(data: Option<&str>) -> Vec<String> {
+    data_paths(data, LOCAL_ALTERNATE_VERSIONS)
+}
+
 /// How many other parts a stacked video has — the DTO's `PartCount` reads
 /// it for every video on a page.
 ///

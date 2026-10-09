@@ -1199,9 +1199,10 @@ pub async fn build_app_state(
         // A stacked video's parts are found by the ids their paths derive to.
         .with_id_derivation(id_derivation)
         // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
-        // the data directory's collections/playlists folders a container's
-        // own folder lives in, the metadata root it cleans, and the
-        // `%AppDataPath%` expansion of an adopted row's path.
+        // the internal metadata root whose per-item folders it cleans, and
+        // the `%AppDataPath%` expansion of a stored path (an adopted
+        // collection's or playlist's folder). Nothing confines the delete to
+        // the library locations, as upstream.
         .with_app_paths(Arc::clone(&paths)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();

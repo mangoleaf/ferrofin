@@ -15,16 +15,15 @@
 //!   service (the row upsert is idempotent); the `parent_id` argument is accepted
 //!   for API parity but the parent linkage is already carried on each row's
 //!   `ParentId` column.
-//! - `delete_item` honors [`DeleteOptions`] in upstream's order: the item's
-//!   (and a folder's children's) internal metadata, then — with
-//!   `delete_file_location` — its files ([`crate::item_deletion`]; the
-//!   first path's failure stops the delete with every row in place), then
-//!   the rows and everything the persistence delete takes with them (`ParentId`
-//!   descendants, the extras, local versions and stacked parts it owns),
-//!   then the extracted data. TODO(parity, open work item — plan step 14):
-//!   upstream's alternate-version promotion (`LibraryManager.cs:461-552`) is
-//!   not ported yet, so deleting a primary takes its owned versions' rows
-//!   instead of promoting one. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+//! - `delete_item` honors [`DeleteOptions`] in upstream's order: a primary
+//!   video's versions first (a missing one deleted, the first remaining one
+//!   promoted in its place) or an alternate version's references moved to
+//!   its primary, then the item's (and a folder's children's) internal
+//!   metadata, then — with `delete_file_location` — its files
+//!   ([`crate::item_deletion`]; the first path's failure stops the delete
+//!   with every row in place), then the extracted data, then the rows and
+//!   everything the persistence delete takes with them (`ParentId`
+//!   descendants, the extras and stacked parts it owns).
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -119,12 +118,14 @@ pub struct FerrofinLibraryManager {
     /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
     /// with no program-data path, which is the same for every media path.
     id_derivation: crate::item_type_lookup::IdDerivation,
-    /// The server's directories, for a delete that removes files: the
-    /// collections and playlists folders a delete may land in besides the
-    /// library locations, the internal metadata root it cleans, and the
-    /// `%AppDataPath%` expansion of an adopted row's path. Set by the
-    /// composition root; `None` (unit tests) confines a file delete to the
-    /// library locations and leaves stored paths as they are.
+    /// The server's directories, which a delete reads twice: the internal
+    /// metadata root whose per-item folders it removes, and the
+    /// `%AppDataPath%`/`%MetadataPath%` expansion of a stored path (an
+    /// adopted collection's or playlist's folder) before its files are
+    /// deleted. A file delete is never confined to the library locations —
+    /// as upstream, whatever path the item names goes. Set by the
+    /// composition root; `None` (unit tests) removes no metadata folder and
+    /// takes stored paths as they are.
     app_paths: Option<Arc<crate::app_paths::FerrofinServerApplicationPaths>>,
     /// The extracted-data cleanup `DeleteItem` runs for every deleted row
     /// (`IExternalDataManager.DeleteExternalItemFiles`). Late-bound: the
@@ -1318,18 +1319,21 @@ impl FerrofinLibraryManager {
 
     /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
     /// before the item's files: each row's internal metadata folder
-    /// (`{metadata}/library/{id2}/{id}`) and, for a video, its internal
+    /// (`{metadata}/library/{id2}/{id}`, and Ferrofin's own
+    /// `{metadata}/library/{GUID}`) and, for a video, its internal
     /// extracted data (trickplay tiles, chapter images, subtitle and
     /// attachment caches). A folder that cannot be removed is logged and
     /// passed over, as upstream.
     async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
         if let Some(paths) = &self.app_paths {
             use ferrofin_traits::system::ServerApplicationPaths as _;
-            let root = paths.internal_metadata_path();
+            // Both layouts: Ferrofin's `{metadata}/library/{GUID}` and
+            // Jellyfin's `{metadata}/library/{xx}/{idN}` an adopted item has.
+            let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
             let folders: Vec<std::path::PathBuf> = rows
                 .iter()
                 .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .map(|id| crate::path_manager::item_internal_metadata_path(&root, id))
+                .flat_map(|id| crate::item_folders::item_art_folders(&art_root, id))
                 .collect();
             let removed = tokio::task::spawn_blocking(move || {
                 for folder in folders {
@@ -1410,7 +1414,7 @@ impl FerrofinLibraryManager {
     }
 
     /// `externalDataManager.DeleteExternalItemFiles` for the item and its
-    /// children (`:597-602`), after the rows: each one's extracted data,
+    /// children (`:597-602`), before the rows: each one's extracted data,
     /// with the trickplay folder saved beside its media.
     async fn delete_external_files(&self, rows: &[&BaseItemEntity]) {
         let Some(external) = self.external_data.get() else {
@@ -1438,6 +1442,180 @@ impl FerrofinLibraryManager {
                 tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
             }
         }
+    }
+}
+
+impl FerrofinLibraryManager {
+    /// The rest of `LibraryManager.DeleteItem` (`LibraryManager.cs:554-625`)
+    /// once its version handling is done: the internal metadata (the
+    /// item's and a folder's children's), then — with
+    /// `delete_file_location` — its files (the first path's failure stops
+    /// the delete with every row in place), then the extracted data, then
+    /// the rows and everything the persistence delete takes with them.
+    async fn delete_row(
+        &self,
+        id: Uuid,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+        options: &DeleteOptions,
+    ) -> Result<(), ServiceError> {
+        // `children`: a folder's rows below it, whose metadata and extracted
+        // data go with it (the persistence delete takes owned extras too).
+        let closure = self.persistence.deletion_closure(&[id]).await?;
+        let mut affected: Vec<&BaseItemEntity> = vec![row];
+        affected.extend(recursive_children(row, &closure));
+        // `GetMetadataPaths(item, children)` goes first (errors passed over),
+        // then the files — the first path's failure stops the delete here,
+        // with every row in place — then the extracted data
+        // (`DeleteExternalItemFiles`, `:597-602`), then the rows (`:604`).
+        self.delete_metadata_paths(&affected).await;
+        if options.delete_file_location {
+            self.delete_item_files(id, row, kind).await?;
+        }
+        self.delete_external_files(&affected).await;
+        let removed = self.persistence.delete_items(&[id]).await?;
+        // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
+        // the delete took with it, which have no rows left to read.
+        if let Some(changed) = &self.changed {
+            let others: Vec<Uuid> = removed.into_iter().filter(|r| *r != id).collect();
+            changed.record_removed_subtree(row, &others);
+        }
+        Ok(())
+    }
+
+    /// `DeleteItem` of a primary video (no `PrimaryVersionId`, owned by
+    /// nothing; `LibraryManager.cs:461-537`): its versions — local first,
+    /// then linked by `SortName` — whose files are gone are deleted (their
+    /// rows only), and the first remaining one takes its place
+    /// ([`ItemPersistenceService::promote_version`]): the old primary's
+    /// playlist and collection entries move to it
+    /// (`RerouteLinkedChildReferencesAsync`), and the deletion that follows
+    /// no longer reaches it or the other versions through `OwnerId`. Stacked
+    /// parts and extras stay owned by the old primary and go with it.
+    ///
+    /// Promotion comes before any file is deleted, as upstream: deleting a
+    /// primary not in a mixed folder then removes its whole folder — the
+    /// promoted version's file included — and the next scan removes that
+    /// row, its file gone.
+    ///
+    /// One divergence: upstream counts a version as gone when
+    /// `FileExists(Path)` is false, which is also the case for a DVD or
+    /// Blu-ray rip (a folder), whose row it then deletes; here a version
+    /// whose path exists as a file or a folder is kept.
+    async fn promote_alternate_version(
+        &self,
+        id: Uuid,
+        primary: &BaseItemEntity,
+    ) -> Result<(), ServiceError> {
+        let links = self.persistence.version_links(id).await?;
+        if links.is_empty() {
+            return Ok(());
+        }
+        let local: std::collections::HashSet<Uuid> = links
+            .iter()
+            .filter(|(_, child_type)| *child_type == 2)
+            .map(|(child, _)| *child)
+            .collect();
+        // `GetLocalAlternateVersionIds(video)` in `SortOrder`, then
+        // `GetLinkedAlternateVersions(video)` (existing videos, by
+        // `SortName`), distinct, each `GetItemById(...).OfType<Video>()`.
+        let mut ordered: Vec<BaseItemEntity> = Vec::new();
+        let mut linked: Vec<BaseItemEntity> = Vec::new();
+        for &(child, child_type) in &links {
+            if child == id {
+                continue;
+            }
+            let Some(version) = self.items.retrieve_item(child).await? else {
+                continue;
+            };
+            let is_video = crate::item_type_lookup::kind_from_type_name(&version.type_)
+                .is_some_and(crate::kinds::is_video);
+            if !is_video {
+                continue;
+            }
+            if child_type == 2 {
+                ordered.push(version);
+            } else {
+                linked.push(version);
+            }
+        }
+        linked.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        for version in linked {
+            if !ordered.iter().any(|known| known.id == version.id) {
+                ordered.push(version);
+            }
+        }
+        let mut remaining: Vec<BaseItemEntity> = Vec::new();
+        for version in ordered {
+            let gone = match version.path.as_deref().filter(|p| !p.is_empty()) {
+                Some(path) => tokio::fs::metadata(self.expand_path(path)).await.is_err(),
+                None => false,
+            };
+            if gone {
+                // "Deleting missing alternate version": its row, no files.
+                let Ok(missing) = Uuid::parse_str(&version.id) else {
+                    continue;
+                };
+                tracing::info!(item_id = %missing, "deleting a missing alternate version");
+                let missing_kind = crate::item_type_lookup::kind_from_type_name(&version.type_)
+                    .unwrap_or(BaseItemKind::Video);
+                self.delete_row(missing, &version, missing_kind, &DeleteOptions::default())
+                    .await?;
+            } else {
+                remaining.push(version);
+            }
+        }
+        let Some((first, rest)) = remaining.split_first() else {
+            return Ok(());
+        };
+        let Ok(new_primary) = Uuid::parse_str(&first.id) else {
+            return Ok(());
+        };
+        let new_path = first.path.as_deref().unwrap_or_default();
+        let promotion = ferrofin_traits::persistence::VersionPromotion {
+            old_primary: id,
+            new_primary,
+            local_versions: crate::video_versions::local_alternate_versions(
+                primary.data.as_deref(),
+            )
+            .into_iter()
+            .filter(|p| !ferrofin_util::string_extensions::equals_ordinal_ignore_case(p, new_path))
+            .collect(),
+            others: rest
+                .iter()
+                .filter_map(|other| Uuid::parse_str(&other.id).ok())
+                .map(|other| (other, local.contains(&other)))
+                .collect(),
+        };
+        tracing::info!(
+            item_id = %id,
+            new_primary = %new_primary,
+            versions = rest.len() + 1,
+            "promoting an alternate version of a deleted primary"
+        );
+        self.persistence.promote_version(&promotion).await?;
+        if let Some(linked) = &self.linked_children {
+            linked.reroute_linked_children(id, new_primary).await?;
+        }
+        Ok(())
+    }
+
+    /// `DeleteItem` of an alternate version (`LibraryManager.cs:539-552`):
+    /// its playlist and collection entries move to its primary
+    /// (`RerouteLinkedChildReferencesAsync`), and the primary no longer
+    /// lists it ([`ItemPersistenceService::drop_version`]).
+    async fn detach_alternate_version(
+        &self,
+        id: Uuid,
+        version: &BaseItemEntity,
+        primary: Uuid,
+    ) -> Result<(), ServiceError> {
+        if let Some(linked) = &self.linked_children {
+            linked.reroute_linked_children(id, primary).await?;
+        }
+        self.persistence
+            .drop_version(primary, id, version.path.as_deref())
+            .await
     }
 }
 
@@ -1931,27 +2109,24 @@ impl LibraryManager for FerrofinLibraryManager {
         if !crate::kinds::can_delete(kind, has_parent) {
             return Err(ServiceError::unauthorized("Unauthorized access"));
         }
-        // `children`: a folder's rows below it, whose metadata and extracted
-        // data go with it (the persistence delete takes owned extras too).
-        let closure = self.persistence.deletion_closure(&[id]).await?;
-        let mut affected: Vec<&BaseItemEntity> = vec![&row];
-        affected.extend(recursive_children(&row, &closure));
-        // `GetMetadataPaths(item, children)` goes first (errors passed over),
-        // then the files — the first path's failure stops the delete here,
-        // with every row in place — then the rows, then the extracted data.
-        self.delete_metadata_paths(&affected).await;
-        if options.delete_file_location {
-            self.delete_item_files(id, &row, kind).await?;
+        if crate::kinds::is_video(kind) {
+            let version_of = row
+                .primary_version_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok())
+                .filter(|p| !p.is_nil());
+            let owned = row
+                .owner_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok())
+                .is_some_and(|p| !p.is_nil());
+            match version_of {
+                None if !owned => self.promote_alternate_version(id, &row).await?,
+                Some(primary) => self.detach_alternate_version(id, &row, primary).await?,
+                None => {}
+            }
         }
-        let removed = self.persistence.delete_items(&[id]).await?;
-        self.delete_external_files(&affected).await;
-        // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
-        // the delete took with it, which have no rows left to read.
-        if let Some(changed) = &self.changed {
-            let others: Vec<Uuid> = removed.into_iter().filter(|r| *r != id).collect();
-            changed.record_removed_subtree(&row, &others);
-        }
-        Ok(())
+        self.delete_row(id, &row, kind, options).await
     }
 
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {

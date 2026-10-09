@@ -15,7 +15,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::options::DeleteOptions;
-use ferrofin_traits::persistence::ItemPersistenceService;
+use ferrofin_traits::persistence::{ItemPersistenceService, LinkedChildrenService as _};
 use ferrofin_traits::system::{ExternalDataManager, MediaLocation};
 use uuid::Uuid;
 
@@ -38,10 +38,13 @@ struct Fixture {
 }
 
 /// Records each `DeleteExternalItemFiles` call: the id, the path and the
-/// containing folder it was given.
+/// containing folder it was given, and whether the item's row was still
+/// stored then.
 #[derive(Default)]
 struct RecordingExternalData {
     deleted: Mutex<Vec<(Uuid, String, String)>>,
+    db: std::sync::OnceLock<Database>,
+    row_stored: Mutex<Vec<(Uuid, bool)>>,
 }
 
 #[async_trait]
@@ -64,6 +67,15 @@ impl ExternalDataManager for RecordingExternalData {
             media.path.to_owned(),
             media.containing_folder.to_owned(),
         ));
+        if let Some(db) = self.db.get() {
+            let stored = crate::test_support::fetch_item_opt(db, item_id)
+                .await
+                .is_some();
+            self.row_stored
+                .lock()
+                .expect("lock")
+                .push((item_id, stored));
+        }
         Ok(())
     }
 }
@@ -88,8 +100,12 @@ async fn fixture() -> Fixture {
         Arc::new(FerrofinItemPersistenceService::new(db.clone())),
         Arc::new(FerrofinPeopleRepository::new(db.clone())),
     )
-    .with_app_paths(paths);
+    .with_app_paths(paths)
+    .with_linked_children(Arc::new(
+        crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
+    ));
     let external = Arc::new(RecordingExternalData::default());
+    let _ = external.db.set(db.clone());
     manager.set_external_data(external.clone());
     Fixture {
         db,
@@ -160,7 +176,7 @@ fn names(dir: &Path) -> Vec<String> {
 
 /// `BaseItem.GetDeletePaths` for a file in a mixed folder: the file, then
 /// every sidecar whose name starts with its own — `Aliens.nfo` included —
-/// and, after the rows, its extracted data (`DeleteExternalItemFiles`) with
+/// and, before the rows, its extracted data (`DeleteExternalItemFiles`) with
 /// the file's directory as its containing folder.
 #[tokio::test]
 async fn a_mixed_folder_movie_takes_every_prefix_sidecar() {
@@ -208,9 +224,14 @@ async fn a_mixed_folder_movie_takes_every_prefix_sidecar() {
         vec![
             // `GetInternalMetadataPaths` of a video, before the files.
             (alien, String::new(), String::new()),
-            // `DeleteExternalItemFiles`, after the rows.
+            // `DeleteExternalItemFiles`, before the rows.
             (alien, path, folder),
         ]
+    );
+    assert_eq!(
+        f.external.row_stored.lock().expect("lock").clone(),
+        vec![(alien, true), (alien, true)],
+        "the extracted data goes while the row is still stored (`:597-604`)"
     );
 }
 
@@ -240,6 +261,13 @@ async fn a_movie_in_its_own_folder_takes_the_whole_folder() {
         movie,
     );
     touch(&metadata.join("poster.jpg"));
+    // Ferrofin's own art folder, `{metadata}/library/{GUID}`.
+    let art = f
+        .root
+        .path()
+        .join("server/metadata/library")
+        .join(guid_to_db(movie));
+    touch(&art.join("poster.jpg"));
 
     f.manager
         .delete_item(movie, &with_files())
@@ -250,6 +278,7 @@ async fn a_movie_in_its_own_folder_takes_the_whole_folder() {
     assert!(!exists(&f, movie).await);
     assert!(!exists(&f, trailer).await, "the owned extra's row goes too");
     assert!(!metadata.exists(), "the internal metadata folder goes too");
+    assert!(!art.exists(), "and Ferrofin's art folder");
 }
 
 /// Upstream resolves a suffix extra beside its film with `IsInMixedFolder =
@@ -325,7 +354,7 @@ async fn a_series_takes_its_directory_and_an_episode_only_its_file() {
     for id in [series, season, episode_two] {
         assert!(!exists(&f, id).await);
     }
-    // The children's extracted data is cleaned after the rows, the season
+    // The children's extracted data is cleaned before the rows, the season
     // with its own folder as its containing folder.
     let recorded = f.external.deleted.lock().expect("lock").clone();
     let season_dir = series_dir.join("Season 1").to_string_lossy().into_owned();
@@ -502,4 +531,269 @@ async fn a_streamed_or_channel_item_deletes_no_file() {
         assert!(!exists(&f, id).await);
     }
     assert!(file.is_file(), "a channel item's media is its channel's");
+}
+
+/// The linked-children service the fixture's manager reroutes through.
+fn linked(db: &Database) -> crate::linked_children_service::FerrofinLinkedChildrenService {
+    crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone())
+}
+
+/// A `LinkedChildren` row: `child` listed under `parent` as `child_type`,
+/// appended after the parent's other rows.
+async fn link(db: &Database, parent: Uuid, child: Uuid, child_type: i32) {
+    linked(db)
+        .upsert_linked_child(parent, child, child_type)
+        .await
+        .expect("link");
+}
+
+/// The `(child, type)` rows under `parent`: manual, local-version, then
+/// linked-version rows, each in `SortOrder`.
+async fn links_of(db: &Database, parent: Uuid) -> Vec<(Uuid, i32)> {
+    let mut out = Vec::new();
+    for child_type in [0, 2, 3] {
+        for child in linked(db)
+            .get_linked_children_ids(parent, Some(child_type))
+            .await
+            .expect("links")
+        {
+            out.push((child, child_type));
+        }
+    }
+    out
+}
+
+/// A film with two local versions beside it, a merged version elsewhere, a
+/// stacked part and a trailer, and a playlist that lists the film.
+struct VersionGroup {
+    folder: PathBuf,
+    primary: Uuid,
+    first: Uuid,
+    second: Uuid,
+    merged: Uuid,
+    part: Uuid,
+    trailer: Uuid,
+    playlist: Uuid,
+    second_path: String,
+}
+
+async fn version_group(f: &Fixture) -> VersionGroup {
+    let folder = f.library.join("Film (2000)");
+    let primary_file = folder.join("Film (2000) - 1080p.mkv");
+    let first_file = folder.join("Film (2000) - 4K.mkv");
+    let second_file = folder.join("Film (2000) - 720p.mkv");
+    let part_file = folder.join("Film (2000) - 1080p-cd2.mkv");
+    let trailer_file = folder.join("Film (2000)-trailer.mkv");
+    let merged_file = f.library.join("Elsewhere/Film.mkv");
+    for path in [
+        &primary_file,
+        &first_file,
+        &second_file,
+        &part_file,
+        &trailer_file,
+        &merged_file,
+    ] {
+        touch(path);
+    }
+    let first_path = first_file.to_string_lossy().into_owned();
+    let second_path = second_file.to_string_lossy().into_owned();
+    let data = serde_json::json!({
+        "LocalAlternateVersions": [first_path, second_path.clone()],
+        "AdditionalParts": [part_file.to_string_lossy()],
+    })
+    .to_string();
+    let primary = row(&f.db, BaseItemKind::Movie, Some(&primary_file), |e| {
+        e.data = Some(data);
+    })
+    .await;
+    let primary_key = primary.as_simple().to_string();
+    let version = |e: &mut BaseItemEntity| {
+        e.owner_id = Some(guid_to_db(primary));
+        e.primary_version_id = Some(guid_to_db(primary));
+        e.presentation_unique_key = Some(primary_key.clone());
+    };
+    let first = row(&f.db, BaseItemKind::Movie, Some(&first_file), version).await;
+    let second = row(&f.db, BaseItemKind::Movie, Some(&second_file), version).await;
+    let merged = row(&f.db, BaseItemKind::Movie, Some(&merged_file), |e| {
+        e.primary_version_id = Some(guid_to_db(primary));
+        e.presentation_unique_key = Some(primary_key.clone());
+    })
+    .await;
+    let part = row(&f.db, BaseItemKind::Video, Some(&part_file), |e| {
+        e.owner_id = Some(guid_to_db(primary));
+    })
+    .await;
+    let trailer = row(&f.db, BaseItemKind::Trailer, Some(&trailer_file), |e| {
+        e.owner_id = Some(guid_to_db(primary));
+        e.extra_type = Some(1);
+    })
+    .await;
+    link(&f.db, primary, first, 2).await;
+    link(&f.db, primary, second, 2).await;
+    link(&f.db, primary, merged, 3).await;
+    let playlist = row(&f.db, BaseItemKind::Playlist, None, |_| {}).await;
+    link(&f.db, playlist, primary, 0).await;
+    VersionGroup {
+        folder,
+        primary,
+        first,
+        second,
+        merged,
+        part,
+        trailer,
+        playlist,
+        second_path,
+    }
+}
+
+/// `LibraryManager.DeleteItem` of a primary video (`LibraryManager.cs:
+/// 461-537`): the first remaining local version takes its place — no
+/// version and owned by nothing, its own presentation key, the old
+/// primary's other versions under it — the other versions point at it (the
+/// local one owned by it, the merged one by nothing), the playlist entry
+/// names it, and its user data stays. The stacked part and the trailer
+/// stay the old primary's and go with it.
+#[tokio::test]
+async fn deleting_a_primary_promotes_its_first_version() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    let user = Uuid::new_v4();
+    crate::test_support::seed_named_user(&f.db, user, "watcher").await;
+    crate::test_support::seed_user_data(&f.db, user, g.first, true, None).await;
+
+    f.manager
+        .delete_item(g.primary, &DeleteOptions::default())
+        .await
+        .expect("delete");
+
+    for gone in [g.primary, g.part, g.trailer] {
+        assert!(!exists(&f, gone).await, "{gone} goes with the primary");
+    }
+    let new_key = g.first.as_simple().to_string();
+    let promoted = crate::test_support::fetch_item(&f.db, g.first).await;
+    assert_eq!(promoted.owner_id, None);
+    assert_eq!(promoted.primary_version_id, None);
+    assert_eq!(
+        promoted.presentation_unique_key.as_deref(),
+        Some(new_key.as_str())
+    );
+    assert_eq!(
+        crate::video_versions::local_alternate_versions(promoted.data.as_deref()),
+        vec![g.second_path.clone()]
+    );
+    let second = crate::test_support::fetch_item(&f.db, g.second).await;
+    assert_eq!(
+        second.owner_id,
+        Some(guid_to_db(g.first)),
+        "a local version"
+    );
+    assert_eq!(second.primary_version_id, Some(guid_to_db(g.first)));
+    assert_eq!(
+        second.presentation_unique_key.as_deref(),
+        Some(new_key.as_str())
+    );
+    let merged = crate::test_support::fetch_item(&f.db, g.merged).await;
+    assert_eq!(
+        merged.owner_id, None,
+        "a linked version is owned by nothing"
+    );
+    assert_eq!(merged.primary_version_id, Some(guid_to_db(g.first)));
+    assert_eq!(
+        links_of(&f.db, g.first).await,
+        vec![(g.second, 2), (g.merged, 3)]
+    );
+    assert_eq!(
+        links_of(&f.db, g.playlist).await,
+        vec![(g.first, 0)],
+        "the playlist entry is rerouted to the new primary"
+    );
+    assert_eq!(
+        crate::user_data_manager::user_data_row_count(&f.db, g.first).await,
+        1,
+        "the promoted version keeps its user data"
+    );
+}
+
+/// A version whose file is gone is deleted (its row only, no file), and the
+/// next one is promoted (`missingAlternates`, `LibraryManager.cs:468-500`).
+#[tokio::test]
+async fn a_version_whose_file_is_gone_is_deleted_and_the_next_promoted() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    std::fs::remove_file(g.folder.join("Film (2000) - 4K.mkv")).expect("remove");
+
+    f.manager
+        .delete_item(g.primary, &DeleteOptions::default())
+        .await
+        .expect("delete");
+
+    assert!(!exists(&f, g.first).await, "the missing version's row goes");
+    let promoted = crate::test_support::fetch_item(&f.db, g.second).await;
+    assert_eq!(promoted.primary_version_id, None);
+    assert_eq!(promoted.owner_id, None);
+    let merged = crate::test_support::fetch_item(&f.db, g.merged).await;
+    assert_eq!(merged.primary_version_id, Some(guid_to_db(g.second)));
+    assert_eq!(links_of(&f.db, g.playlist).await, vec![(g.second, 0)]);
+}
+
+/// With the files, upstream promotes first and deletes after: a primary not
+/// in a mixed folder takes its whole folder — the promoted version's file
+/// too — while the promoted row stays until a scan finds its file gone.
+/// The merged version elsewhere keeps its file.
+#[tokio::test]
+async fn with_files_the_promotion_comes_first_and_the_folder_goes_after() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+
+    f.manager
+        .delete_item(g.primary, &with_files())
+        .await
+        .expect("delete");
+
+    assert!(!g.folder.exists(), "the primary's whole folder goes");
+    assert!(exists(&f, g.first).await, "the promoted row stays");
+    assert!(exists(&f, g.second).await);
+    assert!(f.library.join("Elsewhere/Film.mkv").is_file());
+    assert_eq!(
+        crate::test_support::fetch_item(&f.db, g.first)
+            .await
+            .primary_version_id,
+        None
+    );
+}
+
+/// `LibraryManager.DeleteItem` of an alternate version (`:539-552`): its
+/// playlist entries name the primary instead, and the primary lists it no
+/// more — a local one out of its `LocalAlternateVersions`, a merged one out
+/// of its linked versions. The primary and its other versions stay.
+#[tokio::test]
+async fn deleting_a_version_reroutes_it_to_its_primary() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    let other_list = row(&f.db, BaseItemKind::Playlist, None, |_| {}).await;
+    link(&f.db, other_list, g.second, 0).await;
+    link(&f.db, other_list, g.merged, 0).await;
+
+    for version in [g.second, g.merged] {
+        f.manager
+            .delete_item(version, &DeleteOptions::default())
+            .await
+            .expect("delete");
+        assert!(!exists(&f, version).await);
+    }
+
+    assert_eq!(
+        links_of(&f.db, other_list).await,
+        vec![(g.primary, 0)],
+        "both entries name the primary; a parent lists it once"
+    );
+    let primary = crate::test_support::fetch_item(&f.db, g.primary).await;
+    assert!(
+        !crate::video_versions::local_alternate_versions(primary.data.as_deref())
+            .contains(&g.second_path)
+    );
+    assert_eq!(links_of(&f.db, g.primary).await, vec![(g.first, 2)]);
+    for kept in [g.primary, g.first, g.part, g.trailer] {
+        assert!(exists(&f, kept).await);
+    }
 }

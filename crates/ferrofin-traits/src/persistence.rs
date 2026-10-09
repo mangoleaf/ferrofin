@@ -1100,6 +1100,70 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// A video's version rows — the `LinkedChildren` rows under `primary`
+    /// of `ChildType` 2 (`LocalAlternateVersion`) and 3
+    /// (`LinkedAlternateVersion`) — as `(child id, child type)`, each type in
+    /// `SortOrder` (`LinkedChildrenService.GetLinkedChildrenIds`, which
+    /// upstream's `GetLocalAlternateVersionIds` / `GetLinkedAlternateVersions`
+    /// read). The default (stub/fake services) knows none.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn version_links(&self, primary: Uuid) -> Result<Vec<(Uuid, i32)>, ServiceError> {
+        let _ = primary;
+        Ok(Vec::new())
+    }
+
+    /// Promotes one of a deleted primary video's versions in its place —
+    /// the writes `LibraryManager.DeleteItem` makes before it deletes a
+    /// primary (`LibraryManager.cs:461-537`), in one transaction:
+    ///
+    /// - the new primary is no version and owned by nothing any more
+    ///   (`PrimaryVersionId` and `OwnerId` cleared, its presentation key its
+    ///   own "N" id, `SetPrimaryVersionId(null)`), and its `Data`
+    ///   `LocalAlternateVersions` is [`VersionPromotion::local_versions`];
+    /// - the old primary's version rows (`ChildType` 2 and 3) move under it,
+    ///   in their order, except the one naming itself — what its save writes
+    ///   from the `LocalAlternateVersions` / `LinkedAlternateVersions` it took
+    ///   over;
+    /// - every other version points at it (`PrimaryVersionId`, presentation
+    ///   key), and is owned by it when it is a local version, by nothing
+    ///   otherwise.
+    ///
+    /// So deleting the old primary, which follows `OwnerId`, no longer takes
+    /// them. Each written row is announced as updated (`ItemUpdated`). The
+    /// default (stub/fake services) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn promote_version(&self, promotion: &VersionPromotion) -> Result<(), ServiceError> {
+        let _ = promotion;
+        Ok(())
+    }
+
+    /// Takes a deleted version out of its primary's lists — what
+    /// `LibraryManager.DeleteItem` does before deleting an alternate version
+    /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
+    /// row for it goes, and so does `version_path` from the primary's `Data`
+    /// `LocalAlternateVersions` (compared ignoring case). The default
+    /// (stub/fake services) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn drop_version(
+        &self,
+        primary: Uuid,
+        version: Uuid,
+        version_path: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let _ = (primary, version, version_path);
+        Ok(())
+    }
+
     /// Moves each stored item of `moves` to its new id and type — the row
     /// and every row that references it (user data, links, streams, images,
     /// …) — so what is keyed to the old id follows the item: what a scan asks
@@ -1834,6 +1898,22 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// A deleted primary video's version promoted in its place
+/// ([`ItemPersistenceService::promote_version`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionPromotion {
+    /// The primary being deleted.
+    pub old_primary: Uuid,
+    /// The version that takes its place.
+    pub new_primary: Uuid,
+    /// The new primary's `LocalAlternateVersions`: the old primary's less
+    /// the new primary's own path.
+    pub local_versions: Vec<String>,
+    /// The other remaining versions, each with whether it is a local
+    /// version (owned by the new primary) or a linked one (owned by nothing).
+    pub others: Vec<(Uuid, bool)>,
 }
 
 /// One primary video's local alternate versions, as a scan resolved them

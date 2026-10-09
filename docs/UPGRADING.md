@@ -69,6 +69,21 @@ brought the item back. Now:
 - A trailer or other extra kept beside its film, in the film's own folder, is deleted the
   way Jellyfin deletes it: **with the film's whole folder.** Remove such an extra from disk
   yourself if you want to keep the film.
+- The same rule reaches further than you might expect, exactly as in Jellyfin:
+  - a trailer or other extra kept **directly in a series folder** takes **the whole
+    series folder** with it, every season and episode included;
+  - one kept **directly in a season folder** takes **that season's folder**;
+  - a home video that is the only clip in a subfolder of a home-videos library takes
+    **that subfolder**, photos and anything else in it included.
+
+  Delete such items from disk yourself if you want to keep what is around them.
+- An item with other versions (another cut or resolution of the same film, kept beside
+  it or merged into it with **Group versions**) is replaced by its first remaining
+  version, as in Jellyfin: that version keeps its own watch history, the item's playlist
+  and collection entries move to it, and the other versions now belong to it. A film in
+  its own folder still takes the whole folder, the versions beside it included; the next
+  scan then removes those versions from the library. Deleting one version moves its
+  playlist and collection entries to the item it is a version of.
 - A series, season or album takes its folder; an episode takes only its own file.
 - A trickplay folder saved next to the media goes with the item.
 

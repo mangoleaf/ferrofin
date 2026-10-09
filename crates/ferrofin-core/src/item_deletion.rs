@@ -313,7 +313,8 @@ fn local_metadata_files_to_delete(
 /// - an `Episode` (`Episode.cs:288-298`): its path (a folder only if the
 ///   row is one) and its local metadata files;
 /// - any other video not in a mixed folder (`Video.cs:727-742`): its whole
-///   [`crate::video_versions::containing_folder_path_at`], whatever else is in it;
+///   [`crate::video_versions::containing_folder_path_at`], whatever else is
+///   in it — nothing for a path with no parent folder (`/`);
 /// - anything else (`BaseItem.cs:2598-2604`): its path, as it is on disk,
 ///   and its local metadata files ([`local_metadata_files_to_delete`]).
 ///
@@ -332,8 +333,15 @@ pub(crate) fn delete_paths(
             is_directory: item.is_folder,
         }]
     } else if kinds::is_video(kind) && !item.is_in_mixed_folder {
+        // A path with no parent (`/`) has no containing folder: .NET's
+        // `GetDirectoryName` is `null` there, which `DeleteItemPath` finds
+        // neither a file nor a folder — nothing is deleted.
+        let folder = crate::video_versions::containing_folder_path_at(item, path);
+        if folder.is_empty() {
+            return Ok(Vec::new());
+        }
         return Ok(vec![DeletePath {
-            path: PathBuf::from(crate::video_versions::containing_folder_path_at(item, path)),
+            path: PathBuf::from(folder),
             is_directory: true,
         }]);
     } else {
@@ -675,6 +683,16 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// A video at the root (`/`) has no containing folder (.NET's
+    /// `GetDirectoryName("/")` is `null`): nothing is named, never `/`.
+    #[rstest]
+    #[case::movie(BaseItemKind::Movie)]
+    #[case::video(BaseItemKind::Video)]
+    fn a_video_at_the_root_names_no_folder(#[case] kind: BaseItemKind) {
+        let item = row(kind, Some("/"));
+        assert!(delete_paths(&item, kind, "/").expect("paths").is_empty());
     }
 
     /// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): a
