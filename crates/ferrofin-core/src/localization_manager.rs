@@ -96,81 +96,9 @@ fn core_dictionary(culture: &str) -> Option<&'static HashMap<String, String>> {
         .map(|(_, dict)| dict)
 }
 
-/// The fixed UI-language option list, ported verbatim from Jellyfin's
-/// `LocalizationManager.GetLocalizationOptions` (v10.11.8). `(name, value)`.
-const LOCALIZATION_OPTIONS: &[(&str, &str)] = &[
-    ("Afrikaans", "af"),
-    ("العربية", "ar"),
-    ("Беларуская", "be"),
-    ("Български", "bg-BG"),
-    ("বাংলা (বাংলাদেশ)", "bn"),
-    ("Català", "ca"),
-    ("Čeština", "cs"),
-    ("Cymraeg", "cy"),
-    ("Dansk", "da"),
-    ("Deutsch", "de"),
-    ("English (United Kingdom)", "en-GB"),
-    ("English", "en-US"),
-    ("Ελληνικά", "el"),
-    ("Esperanto", "eo"),
-    ("Español", "es"),
-    ("Español americano", "es_419"),
-    ("Español (Argentina)", "es-AR"),
-    ("Español (Dominicana)", "es_DO"),
-    ("Español (México)", "es-MX"),
-    ("Eesti", "et"),
-    ("Basque", "eu"),
-    ("فارسی", "fa"),
-    ("Suomi", "fi"),
-    ("Filipino", "fil"),
-    ("Français", "fr"),
-    ("Français (Canada)", "fr-CA"),
-    ("Galego", "gl"),
-    ("Schwiizerdütsch", "gsw"),
-    ("עִבְרִית", "he"),
-    ("हिन्दी", "hi"),
-    ("Hrvatski", "hr"),
-    ("Magyar", "hu"),
-    ("Bahasa Indonesia", "id"),
-    ("Íslenska", "is"),
-    ("Italiano", "it"),
-    ("日本語", "ja"),
-    ("Qazaqşa", "kk"),
-    ("한국어", "ko"),
-    ("Lietuvių", "lt"),
-    ("Latviešu", "lv"),
-    ("Македонски", "mk"),
-    ("മലയാളം", "ml"),
-    ("मराठी", "mr"),
-    ("Bahasa Melayu", "ms"),
-    ("Norsk bokmål", "nb"),
-    ("नेपाली", "ne"),
-    ("Nederlands", "nl"),
-    ("Norsk nynorsk", "nn"),
-    ("ਪੰਜਾਬੀ", "pa"),
-    ("Polski", "pl"),
-    ("Pirate", "pr"),
-    ("Português", "pt"),
-    ("Português (Brasil)", "pt-BR"),
-    ("Português (Portugal)", "pt-PT"),
-    ("Românește", "ro"),
-    ("Русский", "ru"),
-    ("Slovenčina", "sk"),
-    ("Slovenščina", "sl-SI"),
-    ("Shqip", "sq"),
-    ("Српски", "sr"),
-    ("Svenska", "sv"),
-    ("தமிழ்", "ta"),
-    ("తెలుగు", "te"),
-    ("ภาษาไทย", "th"),
-    ("Türkçe", "tr"),
-    ("Українська", "uk"),
-    ("اُردُو", "ur_PK"),
-    ("Tiếng Việt", "vi"),
-    ("汉语 (简体字)", "zh-CN"),
-    ("漢語 (繁體字)", "zh-TW"),
-    ("廣東話 (香港)", "zh-HK"),
-];
+/// Native labels captured from .NET 10 `CultureInfo.NativeName` for the pinned
+/// core-resource catalog, including the explicit English label for `en-US`.
+const LOCALIZATION_OPTIONS_JSON: &str = include_str!("data/localization_options.json");
 
 /// One country row as stored in `countries.json` (PascalCase keys).
 #[derive(serde::Deserialize)]
@@ -200,15 +128,32 @@ static COUNTRIES: LazyLock<Vec<CountryInfo>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The UI-language option list, materialized once from [`LOCALIZATION_OPTIONS`].
+/// The dropdown follows the shipped resources, with .NET native labels and
+/// ordinal-ignore-case label ordering (`BuildLocalizationData`).
 static LOCALIZATION_OPTION_LIST: LazyLock<Vec<LocalizationOption>> = LazyLock::new(|| {
-    LOCALIZATION_OPTIONS
+    let labels: Vec<LocalizationOption> = serde_json::from_str(LOCALIZATION_OPTIONS_JSON)
+        .expect("embedded localization labels are valid JSON");
+    let mut options: Vec<_> = core_dictionaries::CORE_DICTIONARIES
         .iter()
-        .map(|(name, value)| LocalizationOption {
-            name: (*name).to_owned(),
-            value: (*value).to_owned(),
+        .filter(|(code, _)| !code.eq_ignore_ascii_case(DEFAULT_CULTURE))
+        .map(|(code, _)| LocalizationOption {
+            name: labels
+                .iter()
+                .find(|option| option.value == *code)
+                .map_or_else(|| (*code).to_owned(), |option| option.name.clone()),
+            value: (*code).to_owned(),
         })
-        .collect()
+        .collect();
+    options.push(LocalizationOption {
+        name: "English".to_owned(),
+        value: DEFAULT_CULTURE.to_owned(),
+    });
+    options.sort_by_cached_key(|option| {
+        ferrofin_util::string_extensions::upper_invariant(&option.name)
+            .encode_utf16()
+            .collect::<Vec<_>>()
+    });
+    options
 });
 
 /// The parsed ISO 639-2 dataset, built once.
@@ -391,17 +336,10 @@ impl LocalizationManager {
         COUNTRIES.clone()
     }
 
-    /// The available UI-language localization options (C# `GetLocalizationOptions`).
-    ///
-    /// Jellyfin derives this from the embedded translation-catalog resource files;
-    /// that catalog is a `ferrofin-server` asset that this minimal port omits, so
-    /// the list is built from the embedded culture dataset's display names
-    /// (truncated at the first delimiter), always including the base `en-US`
-    /// entry the C# adds explicitly.
+    /// The available UI-language options, derived from bundled core resources
+    /// with native labels and .NET ordinal-ignore-case label ordering.
     #[must_use]
     pub fn get_localization_options(&self) -> Vec<LocalizationOption> {
-        // Port of C# GetLocalizationOptions: a fixed list of UI-language options (the translation
-        // catalogs Jellyfin ships), not derived from the culture dataset.
         LOCALIZATION_OPTION_LIST.clone()
     }
 
@@ -1117,9 +1055,9 @@ mod tests {
         assert_eq!(nc17.rating_score.map(|s| s.score), Some(17));
         assert_eq!(nc17.rating_score.and_then(|s| s.sub_score), Some(1));
 
-        // Localization options: the fixed 71-entry UI-language list, incl. es_419.
+        // Localization options cover every bundled translation, including es_419.
         let options = m.get_localization_options();
-        assert_eq!(options.len(), 71);
+        assert_eq!(options.len(), 105);
         assert!(options.iter().any(|o| o.value == "es_419"));
         assert!(
             options
@@ -1282,19 +1220,36 @@ mod tests {
         );
     }
 
-    /// The UI-language list keeps its declared order (clients render it as given).
+    /// No bundled language disappears from the dropdown; native labels and
+    /// order match the pinned .NET catalog rather than the old web labels.
     #[test]
-    fn localization_options_preserve_declared_order() {
-        let m = shipped(DEFAULT_METADATA_COUNTRY_CODE);
-        let options = m.get_localization_options();
-        assert_eq!(options.len(), LOCALIZATION_OPTIONS.len());
-        let head: Vec<&str> = options.iter().take(4).map(|o| o.value.as_str()).collect();
-        assert_eq!(head, ["af", "ar", "be", "bg-BG"]);
-        assert_eq!(options.last().map(|o| o.value.as_str()), Some("zh-HK"));
-        for (option, (name, value)) in options.iter().zip(LOCALIZATION_OPTIONS) {
-            assert_eq!(option.name, *name);
-            assert_eq!(option.value, *value);
+    fn localization_options_cover_resources_and_native_order() {
+        let options = shipped(DEFAULT_METADATA_COUNTRY_CODE).get_localization_options();
+        let expected: Vec<LocalizationOption> =
+            serde_json::from_str(LOCALIZATION_OPTIONS_JSON).unwrap();
+        assert_eq!(
+            options, expected,
+            "complete .NET catalog and label ordering"
+        );
+        let mut values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        let mut resources: Vec<_> = core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        resources.sort_unstable();
+        assert_eq!(values, resources, "exactly one option for each resource");
+        for (code, name) in [
+            ("lt-LT", "lietuvių (Lietuva)"),
+            ("pr", "pr"),
+            ("es_419", "español (Latinoamérica)"),
+            ("ar_SA", "العربية (المملكة العربية السعودية)"),
+        ] {
+            assert_eq!(options.iter().find(|o| o.value == code).unwrap().name, name);
         }
+        assert!(!values.contains(&"lt"));
+        assert_eq!(options.first().unwrap().value, "ab");
+        assert_eq!(options.last().unwrap().value, "ko");
     }
 
     /// Cultures come from the shared static but are still the full list, in file order.
