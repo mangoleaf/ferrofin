@@ -195,10 +195,13 @@ fn csharp_enums() -> &'static HashMap<String, Vec<(String, i64)>> {
             name: String,
             members: serde_json::Map<String, serde_json::Value>,
         }
-        // A malformed row would silently fall back to declaration order, which
-        // is wrong for a gapped enum, so the fixture must parse whole (the
+        // Jellyfin 12.2's C# enum values, one enum per line. It lives in
+        // `src/`, not `tests/data/`, because the server reads it: the release
+        // image's build context leaves test data out. A malformed row would
+        // silently fall back to declaration order, which is wrong for a gapped
+        // enum, so the table must parse whole (the
         // `query_enums_bind_every_inventory_value` test runs this).
-        include_str!("../../tests/data/json-binding/jellyfin-12.2-enums.jsonl")
+        include_str!("csharp_enums.jsonl")
             .lines()
             .map(|line| {
                 let row: Row = serde_json::from_str(line).expect("enum inventory row");
@@ -561,9 +564,7 @@ mod tests {
         check::<ferrofin_model::entities::CollectionTypeOptions>("CollectionTypeOptions");
         check::<ferrofin_model::session::PlayCommand>("PlayCommand");
         check::<ferrofin_traits::activity::ActivityLogSortBy>("ActivityLogSortBy");
-        let lines = include_str!("../../tests/data/json-binding/jellyfin-12.2-enums.jsonl")
-            .lines()
-            .count();
+        let lines = include_str!("csharp_enums.jsonl").lines().count();
         assert_eq!(
             super::csharp_enums().len(),
             lines,

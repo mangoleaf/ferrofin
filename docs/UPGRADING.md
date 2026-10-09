@@ -8,6 +8,33 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Intro Skipper analyses your library again, once
+
+This applies if Intro Skipper is enabled (Dashboard → Plugins), or if you are adopting a
+Jellyfin database whose Intro Skipper plugin stored segments.
+
+Intro Skipper now keeps its own record of every segment it found or you edited, and
+publishes it to the skip buttons. On the upgrade, the segments already published are
+copied into that record as automatic results with no settings fingerprint, as the
+upstream plugin's own schema upgrade does. What follows:
+
+- **The first analysis pass after the upgrade redoes the whole library**, and new
+  fingerprints are taken (the fingerprint command now matches upstream's, and old prints
+  are not reused). On a large library that is hours of ffmpeg time. It starts by itself
+  at the task's next scheduled run (daily at 00:00 unless you changed it); run **Detect and Analyze
+  Media Segments** from Dashboard → Scheduled Tasks to choose the time yourself.
+- **Each copied segment is replaced by what that pass detects, or removed if it detects
+  nothing.** Removed means the skip button for it disappears. With the same settings,
+  detection finds the same intros again, so most libraries see no change.
+- **Timestamps you corrected by hand are not kept.** Corrections made in Ferrofin before
+  this upgrade were never recorded as yours, so they are treated as automatic. After the
+  upgrade, a correction is recorded as yours and no later analysis replaces it.
+- **Adopting a Jellyfin database:** the plugin's own database (which records your hand
+  edits) and its settings file (`plugins/configurations/IntroSkipper.xml`) are not
+  imported. Ferrofin's Intro Skipper starts on default settings, so set them again on
+  its settings page before the first pass, or segments the plugin found under your old
+  settings may not be found again. Your hand edits do not carry over.
+
 ## Unreleased — library scans in this release
 
 Library scans keep the rule 1.3.0 introduced: an item is processed again only when

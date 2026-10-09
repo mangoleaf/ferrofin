@@ -114,16 +114,12 @@ impl<T: QueryParameters + Send, S: Send + Sync> FromRequestParts<S> for Query<T>
         parts: &mut Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        let (non_nullable, required) =
-            parts
-                .extensions
-                .get::<MatchedPath>()
-                .map_or((&[][..], &[][..]), |route| {
-                    (
-                        lookup(&NON_NULLABLE, &parts.method, route.as_str()),
-                        lookup(&REQUIRED, &parts.method, route.as_str()),
-                    )
-                });
+        let (non_nullable, required) = parts
+            .extensions
+            .get::<MatchedPath>()
+            .map_or((&[][..], &[][..]), |route| {
+                members(&parts.method, route.as_str())
+            });
         std::future::ready(Self::bind(&parts.uri, non_nullable, required))
     }
 }
@@ -181,11 +177,43 @@ fn lookup(table: &'static RouteTable, method: &Method, route: &str) -> &'static 
             })
             .collect()
     });
-    // ponytail: one small String per typed-query request; a cache keyed by
-    // the matched template is the upgrade if it ever shows in a profile.
     table
         .get(&format!("{} {}", method.as_str(), route_shape(route)))
         .map_or(&[], Vec::as_slice)
+}
+
+/// A route's (non-nullable, required) members.
+type Members = (&'static [String], &'static [String]);
+
+/// Route members by method and the router's own template.
+type ByTemplate = HashMap<Method, HashMap<Box<str>, Members>>;
+
+/// [`lookup`]'s answers by method and the router's own template, so a request
+/// resolves its route without allocating; bounded by the routes registered.
+static BY_TEMPLATE: std::sync::LazyLock<std::sync::RwLock<ByTemplate>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Both tables' members for the action at `method` + `route` (the matched
+/// axum template), computed once per template.
+fn members(method: &Method, route: &str) -> Members {
+    let cached = BY_TEMPLATE
+        .read()
+        .ok()
+        .and_then(|by_method| by_method.get(method)?.get(route).copied());
+    if let Some(found) = cached {
+        return found;
+    }
+    let found = (
+        lookup(&NON_NULLABLE, method, route),
+        lookup(&REQUIRED, method, route),
+    );
+    if let Ok(mut by_method) = BY_TEMPLATE.write() {
+        by_method
+            .entry(method.clone())
+            .or_default()
+            .insert(route.into(), found);
+    }
+    found
 }
 
 /// The query members upstream requires present on `method` + `route` (the
@@ -418,6 +446,24 @@ pub(crate) mod tests {
 
     impl super::QueryParameters for Parameters {
         const COLLECTIONS: &'static [(&'static str, char)] = &[];
+    }
+
+    #[test]
+    fn a_route_resolves_once_then_from_its_template() {
+        use axum::http::Method;
+        let route = "/Users/{userId}/Items/Latest";
+        let first = super::members(&Method::GET, route);
+        assert_eq!(
+            first,
+            (
+                super::lookup(&super::NON_NULLABLE, &Method::GET, route),
+                super::lookup(&super::REQUIRED, &Method::GET, route),
+            )
+        );
+        assert!(!first.0.is_empty());
+        let cached = super::BY_TEMPLATE.read().expect("cache")[&Method::GET][route];
+        assert!(std::ptr::eq(cached.0, first.0) && std::ptr::eq(cached.1, first.1));
+        assert_eq!(super::members(&Method::GET, route), first);
     }
 
     #[test]
