@@ -48,33 +48,41 @@ pub struct RemoteSubtitleInfo {
 
     /// Gets or sets the community rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub community_rating: Option<f32>,
 
     /// Gets or sets the frame rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub frame_rate: Option<f32>,
 
     /// Gets or sets the download count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub download_count: Option<i32>,
 
     /// Gets or sets a value indicating whether this is a hash match.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_hash_match: Option<bool>,
 
     /// Gets or sets a value indicating whether the subtitle is AI-translated.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub ai_translated: Option<bool>,
 
     /// Gets or sets a value indicating whether the subtitle is machine-translated.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub machine_translated: Option<bool>,
 
     /// Gets or sets a value indicating whether the subtitle is forced.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub forced: Option<bool>,
 
     /// Gets or sets a value indicating whether the subtitle is hearing-impaired.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub hearing_impaired: Option<bool>,
 }

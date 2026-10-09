@@ -11,7 +11,7 @@
 //! instant-mix / similar / per-name image routes stay on the `501` stub (later
 //! batches).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -21,6 +21,7 @@ use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;

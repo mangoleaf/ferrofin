@@ -18,7 +18,7 @@
 //! composition root, matching the other admin controllers; every handler here
 //! takes [`RequireAuth`] so an unauthenticated request still gets `401`.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,7 +26,7 @@ use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::JsonSeqBody;
+use crate::extract::{JsonSeqBody, Query};
 use crate::state::AppState;
 
 /// Query parameters for `GET /ScheduledTasks` — the hidden/enabled filters.
@@ -196,4 +196,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/ScheduledTasks/{taskId}/Triggers",
             post(update_task_triggers),
         )
+}
+crate::query::query_parameters! {
+    GetTasksQuery {} => [("get", "/ScheduledTasks")];
 }

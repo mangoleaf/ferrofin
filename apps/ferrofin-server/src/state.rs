@@ -1159,6 +1159,17 @@ pub async fn build_app_state(
             std::time::Duration::from_secs(library_update_duration),
         ),
     );
+    // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
+    // user-scoped lookups and the media sources' per-user version filter.
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
     let library_impl = Arc::new(
         FerrofinLibraryManager::new(
             Arc::clone(&item_repository),
@@ -1166,6 +1177,7 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
+        .with_visibility(Arc::clone(&item_visibility))
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)
@@ -1290,9 +1302,10 @@ pub async fn build_app_state(
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.
         .with_user_data(Arc::clone(&user_data))
-        // A user is offered only the versions their parental rules let them
-        // see (`GetStaticMediaSources`' per-user filter).
+        // A user is offered only the versions they may see standalone
+        // (`GetStaticMediaSources`' per-user filter).
         .with_users(Arc::clone(&users))
+        .with_visibility(Arc::clone(&item_visibility))
         .with_localization(Arc::clone(&localization)),
     );
 

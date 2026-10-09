@@ -7,7 +7,7 @@
 //! `IImageProcessor` are left unset here (the image processor is a later wave);
 //! the search manager already fills the textual hint fields.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -150,4 +151,11 @@ async fn get_search_hints(
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router.route("/Search/Hints", get(get_search_hints))
+}
+crate::query::query_parameters! {
+    SearchHintsQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+    } => [("get", "/Search/Hints")];
 }

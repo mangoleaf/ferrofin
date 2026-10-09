@@ -782,7 +782,8 @@ fn enable_metrics_endpoint(
     ))
 }
 
-/// Rewrites a request's path to its canonical Jellyfin case before routing.
+/// Rewrites a request's path to its canonical Jellyfin case before routing
+/// (the query string is passed through unchanged).
 ///
 /// Jellyfin's API is case-insensitive (ASP.NET); axum's router is case-sensitive,
 /// and clients call some paths in non-canonical case (e.g. `/Localization/countries`).
@@ -795,53 +796,25 @@ async fn canonicalize_path_case(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     // Path: re-case to the registered route where recognized (asset/unknown paths
-    // return `None` and keep their significant case).
-    let path = request.uri().path().to_owned();
-    let new_path = ferrofin_api::routes::canonicalize_path(&path).unwrap_or_else(|| path.clone());
-    // Query keys: case-fold unconditionally. Jellyfin's API is case-insensitive,
-    // but our `Query<T>` structs are `rename_all = "camelCase"`. Clients send a mix —
-    // the SDK emits PascalCase (`ParentId`, `IncludeItemTypes`), legacy jQuery paths
-    // camelCase. PascalCase and camelCase differ only in the first character, so
-    // lowercasing each key's first char maps both onto the camelCase field names
-    // (values untouched). Without this, SDK-cased filters bind to `None` and silently
-    // drop — e.g. a library's own CollectionFolder leaking into an
-    // `IncludeItemTypes=Movie` grid query. Applied to every request (harmless for
-    // asset routes, which ignore the query) so it also covers extra, non-contract
-    // routes like `/Users/{userId}/Items` that `canonicalize_path` doesn't know.
-    let target = match request.uri().query() {
-        Some(q) => format!("{new_path}?{}", normalize_query_keys(q)),
-        None => new_path,
-    };
-    // Origin-form request URI (path + query, no scheme/authority) → rebuilding from
-    // the parts is lossless; the rewrite is idempotent when nothing changed.
-    if let Ok(uri) = target.parse() {
-        *request.uri_mut() = uri;
+    // return `None` and keep their significant case). Query keys are left as
+    // sent: `ferrofin_api::extract::Query` binds them to each handler's members
+    // ignoring case, as ASP.NET does. Preserve the original query for
+    // authentication, streaming URLs and plugin forwarding.
+    let path = request.uri().path();
+    if let Some(new_path) = ferrofin_api::routes::canonicalize_path(path)
+        && new_path != path
+    {
+        let target = match request.uri().query() {
+            Some(q) => format!("{new_path}?{q}"),
+            None => new_path,
+        };
+        // Origin-form request URI (path + query, no scheme/authority), so
+        // rebuilding it from the parts is lossless.
+        if let Ok(uri) = target.parse() {
+            *request.uri_mut() = uri;
+        }
     }
     next.run(request).await
-}
-
-/// Lowercases the first character of each `&`-separated query param's key,
-/// preserving values verbatim. Idempotent for already-camelCase keys.
-fn normalize_query_keys(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| {
-            let (key, value) = match pair.split_once('=') {
-                Some((k, v)) => (k, Some(v)),
-                None => (pair, None),
-            };
-            let mut chars = key.chars();
-            let key = match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_lowercase(), chars.as_str()),
-                None => String::new(),
-            };
-            match value {
-                Some(v) => format!("{key}={v}"),
-                None => key,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 /// Mounts a static web client at `/web` (with an SPA `index.html` fallback) and
@@ -1306,23 +1279,6 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(out.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn normalizes_pascal_query_keys_to_camel() {
-        use super::normalize_query_keys;
-        // PascalCase (SDK) keys fold to camelCase; values (incl. their case) survive.
-        assert_eq!(
-            normalize_query_keys("ParentId=AbC-123&IncludeItemTypes=Movie&Recursive=true"),
-            "parentId=AbC-123&includeItemTypes=Movie&recursive=true"
-        );
-        // Already-camelCase keys are untouched (idempotent).
-        assert_eq!(
-            normalize_query_keys("parentId=x&sortBy=y"),
-            "parentId=x&sortBy=y"
-        );
-        // Valueless flags and empty segments don't panic.
-        assert_eq!(normalize_query_keys("Foo&bar"), "foo&bar");
     }
 
     /// The listener `run` binds really clears Nagle on the sockets it serves.

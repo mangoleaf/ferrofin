@@ -328,3 +328,113 @@ async fn a_nested_location_has_no_folder_of_its_own() {
     assert!(folder.is_none(), "{folder:?}");
     assert!(lib.row(lib.location()).await.is_some());
 }
+
+/// A removed location's movie goes with its folder (the stale-row prune and
+/// `prune_orphan_locations` both reach it): its history is detached once —
+/// one placeholder copy, one snapshot — and the location coming back
+/// recovers it onto the movie's same id, consuming both.
+#[tokio::test]
+async fn a_removed_locations_history_is_detached_once_and_recovered() {
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let more = lib.media.with_file_name("more");
+    std::fs::create_dir_all(more.join("Ronin (1998)")).expect("mkdir");
+    std::fs::write(more.join("Ronin (1998)/Ronin (1998).mkv"), b"").expect("write");
+    let more_path = more.to_string_lossy().into_owned();
+    let location = MediaPathInfo {
+        path: more_path.clone(),
+    };
+    lib.vf
+        .add_media_path("Movies", &location)
+        .await
+        .expect("add location");
+    lib.scanner.scan_all().await.expect("scan");
+    let ronin = derive_item_id(
+        BaseItemKind::Movie,
+        &more.join("Ronin (1998)/Ronin (1998).mkv").to_string_lossy(),
+    )
+    .expect("id");
+    assert!(lib.row(ronin).await.is_some());
+    let user = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2, upper(?2))"#,
+    )
+    .bind(guid_to_db(user))
+    .bind(user.simple().to_string())
+    .execute(lib.db.writer())
+    .await
+    .expect("user");
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+           "PlayCount", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, 1, 2, 77, 1)"#,
+    )
+    .bind(guid_to_db(ronin))
+    .bind(guid_to_db(user))
+    .bind(ronin.to_string())
+    .execute(lib.db.writer())
+    .await
+    .expect("user data");
+    let history = || async {
+        sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+            r#"SELECT "ItemId", "CustomDataKey", "PlaybackPositionTicks", "RetentionDate"
+               FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_all(lib.db.pool())
+        .await
+        .expect("history")
+    };
+    let snapshots = || async {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(ronin))
+        .fetch_one(lib.db.pool())
+        .await
+        .expect("snapshots")
+    };
+
+    lib.vf
+        .remove_media_path("Movies", &more_path)
+        .await
+        .expect("remove location");
+    lib.scanner.scan_all().await.expect("prune");
+    assert!(lib.row(ronin).await.is_none(), "the movie went with it");
+    let detached = history().await;
+    assert_eq!(detached.len(), 1, "detached once: {detached:?}");
+    assert_eq!(
+        (
+            detached[0].0.as_str(),
+            detached[0].1.as_str(),
+            detached[0].2
+        ),
+        (
+            ferrofin_db::PLACEHOLDER_ITEM_ID,
+            ronin.to_string().as_str(),
+            77
+        )
+    );
+    assert!(detached[0].3.is_some(), "with a retention date");
+    assert_eq!(snapshots().await, 1);
+
+    lib.vf
+        .add_media_path("Movies", &location)
+        .await
+        .expect("re-add location");
+    lib.scanner.scan_all().await.expect("rescan");
+    assert!(lib.row(ronin).await.is_some(), "the movie is back");
+    assert_eq!(
+        history().await,
+        vec![(guid_to_db(ronin), ronin.to_string(), 77, None)],
+        "recovered once onto its id"
+    );
+    assert_eq!(snapshots().await, 0, "the snapshot is consumed");
+}

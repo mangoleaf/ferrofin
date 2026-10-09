@@ -11,7 +11,7 @@
 //! manager. `Initiate` reads the caller's parsed [`AuthorizationInfo`]; `Authorize`
 //! is behind `[Authorize]` and targets `userId` (or the caller when omitted).
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::request::Parts;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
@@ -161,4 +162,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/QuickConnect/Initiate", post(initiate))
         .route("/QuickConnect/Connect", get(connect))
         .route("/QuickConnect/Authorize", post(authorize))
+}
+crate::query::query_parameters! {
+    ConnectQuery {} => [("get", "/QuickConnect/Connect")];
+    AuthorizeQuery {} => [("post", "/QuickConnect/Authorize")];
 }

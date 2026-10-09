@@ -11,6 +11,7 @@ use super::{PlayMethod, PlaybackOrder, RepeatMode};
 pub struct PlayerStateInfo {
     /// Gets or sets the now-playing position ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub position_ticks: Option<i64>,
 
     /// Gets or sets a value indicating whether this instance can seek.
@@ -24,14 +25,17 @@ pub struct PlayerStateInfo {
 
     /// Gets or sets the volume level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub volume_level: Option<i32>,
 
     /// Gets or sets the index of the now-playing audio stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
 
     /// Gets or sets the index of the now-playing subtitle stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
 
     /// Gets or sets the now-playing media version identifier.
@@ -40,6 +44,7 @@ pub struct PlayerStateInfo {
 
     /// Gets or sets the play method.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub play_method: Option<PlayMethod>,
 
     /// Gets or sets the repeat mode.

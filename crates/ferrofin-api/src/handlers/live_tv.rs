@@ -24,7 +24,7 @@
 //! not expose).
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -45,11 +45,11 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
-use crate::handlers::items::{effective_user_id, resolve_user_opt};
+use crate::extract::{JsonBody, Query};
+use crate::handlers::items::{effective_user_id, require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
-    de_comma_delimited, de_pipe_delimited, parse_csv_enums_lenient, parse_csv_uuids,
-    parse_pipe_strings,
+    de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
+    parse_csv_uuids, parse_pipe_strings,
 };
 use crate::state::AppState;
 
@@ -217,6 +217,7 @@ async fn get_channel(
         return Err(ApiError::NotFound("channel".into()));
     };
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_item(&state, channel_id, user.as_ref()).await?;
     m.get_channel(channel_id, user.as_ref(), &DtoOptions::default())
         .await?
         .map(Json)
@@ -360,42 +361,53 @@ impl ProgramsQuery {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per contract property
+#[cfg_attr(test, derive(serde::Serialize))]
 struct GetProgramsDto {
     /// The channels to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "de_comma_delimited_guids")]
     channel_ids: Option<Vec<Uuid>>,
     /// The target user. Unlike the query-string form this does *not* fall back
     /// to the authenticated caller (upstream reads the body id only).
+    #[serde(with = "ferrofin_model::json::guid::option")]
     user_id: Option<Uuid>,
     /// The minimum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     min_start_date: Option<DateTime<Utc>>,
     /// Filter by programmes that have finished airing.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     has_aired: Option<bool>,
     /// Filter by programmes airing right now.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_airing: Option<bool>,
     /// The maximum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     max_start_date: Option<DateTime<Utc>>,
     /// The minimum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     min_end_date: Option<DateTime<Utc>>,
     /// The maximum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(with = "ferrofin_model::json::datetime::option")]
     max_end_date: Option<DateTime<Utc>>,
     /// Filter for movies.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_movie: Option<bool>,
     /// Filter for series.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_series: Option<bool>,
     /// Filter for news.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_news: Option<bool>,
     /// Filter for kids' programmes.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_kids: Option<bool>,
     /// Filter for sports.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     is_sports: Option<bool>,
     /// The index of the first record to return.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     start_index: Option<i32>,
     /// The maximum number of records to return.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     limit: Option<i32>,
     /// The sort columns.
     #[serde(deserialize_with = "de_comma_delimited")]
@@ -408,25 +420,30 @@ struct GetProgramsDto {
     #[serde(deserialize_with = "de_pipe_delimited")]
     genres: Option<Vec<String>>,
     /// The genre ids to return guide information for.
-    #[serde(deserialize_with = "de_comma_delimited")]
+    #[serde(deserialize_with = "de_comma_delimited_guids")]
     genre_ids: Option<Vec<Uuid>>,
     /// Whether image information is included.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_images: Option<bool>,
     /// The maximum number of images returned per image type.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     image_type_limit: Option<i32>,
     /// The image types to include.
     #[serde(deserialize_with = "de_comma_delimited")]
     enable_image_types: Option<Vec<ImageType>>,
     /// Whether user data is included.
+    #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_user_data: Option<bool>,
     /// Filter to the programmes a series timer records.
     series_timer_id: Option<String>,
     /// Filter to the programmes of one library series.
+    #[serde(with = "ferrofin_model::json::guid::option")]
     library_series_id: Option<Uuid>,
     /// Additional DTO fields.
     #[serde(deserialize_with = "de_comma_delimited")]
     fields: Option<Vec<ItemFields>>,
     /// Whether the total record count is computed (schema default `true`).
+    #[serde(deserialize_with = "ferrofin_model::json::value::nullable")]
     enable_total_record_count: Option<bool>,
 }
 
@@ -1075,7 +1092,8 @@ async fn get_recording(
     Path(recording_id): Path<Uuid>,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    effective_user_id(&state, &auth, query.user_id).await?;
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_recording(&state, recording_id, user.as_ref()).await?;
     live_tv(&state)?
         .get_recording(recording_id)
         .await?
@@ -1083,12 +1101,39 @@ async fn get_recording(
         .ok_or_else(|| ApiError::NotFound("recording".into()))
 }
 
+/// DVR recordings have an entity even before the scanner inserts BaseItems.
+/// Prefer a scanned row so its inherited metadata and library membership apply.
+async fn require_visible_recording(
+    state: &AppState,
+    id: Uuid,
+    user: Option<&UserEntity>,
+) -> Result<(), ApiError> {
+    let manager = live_tv(state)?;
+    let item = match state.library.get_item_by_id(id).await? {
+        Some(item) => item,
+        None => manager
+            .get_recording_item(id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("recording".into()))?,
+    };
+    if let Some(user) = user
+        && !state
+            .library
+            .is_item_visible_standalone(&item, user)
+            .await?
+    {
+        return Err(ApiError::NotFound("recording".into()));
+    }
+    Ok(())
+}
+
 /// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
 async fn delete_recording(
     State(state): State<AppState>,
-    RequireLiveTvManagement(_auth): RequireLiveTvManagement,
+    RequireLiveTvManagement(auth): RequireLiveTvManagement,
     Path(recording_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    require_visible_recording(&state, recording_id, auth.user.as_ref()).await?;
     live_tv(&state)?.delete_recording(recording_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1870,6 +1915,41 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/LiveTv/Tuners/Discover", get(discover_tuners))
         .route("/LiveTv/Tuners/Discvover", get(discover_tuners))
         .route("/LiveTv/Tuners/{tunerId}/Reset", post(reset_tuner))
+}
+
+crate::query::query_parameters! {
+    ChannelsQuery {
+        "enableImageTypes" => ',',
+        "fields" => ',',
+        "sortBy" => ',',
+    } => [("get", "/LiveTv/Channels")];
+    UserIdQuery {} => [("get", "/LiveTv/Channels/{channelId}"), ("get", "/LiveTv/Programs/{programId}")];
+    ProgramsQuery {
+        "channelIds" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "enableImageTypes" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs")];
+    RecommendedProgramsQuery {
+        "enableImageTypes" => ',',
+        "genreIds" => ',',
+        "fields" => ',',
+    } => [("get", "/LiveTv/Programs/Recommended")];
+    IdQuery {} => [("delete", "/LiveTv/TunerHosts"), ("delete", "/LiveTv/ListingProviders")];
+    RecordingsQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/LiveTv/Recordings")];
+    LiveTvUserQuery {} => [("get", "/LiveTv/Recordings/{recordingId}"), ("get", "/LiveTv/Recordings/Folders")];
+    TimersQuery {} => [("get", "/LiveTv/Timers")];
+    TimerDefaultsQuery {} => [("get", "/LiveTv/Timers/Defaults")];
+    SeriesTimersQuery {} => [("get", "/LiveTv/SeriesTimers")];
+    ChannelMappingOptionsQuery {} => [("get", "/LiveTv/ChannelMappingOptions")];
+    LineupsQuery {} => [("get", "/LiveTv/ListingProviders/Lineups")];
+    DiscoverTunersQuery {} => [("get", "/LiveTv/Tuners/Discover")];
 }
 
 #[cfg(test)]
@@ -3250,5 +3330,19 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    #[test]
+    fn all_contract_numbers_accept_quoted_values() {
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "GetProgramsDto",
+                super::GetProgramsDto::default()
+            ),
+            3
+        );
     }
 }

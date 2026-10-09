@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, JsonValueBody};
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// The compiled-in Intro Skipper extension id (mirrors `EXTENSION_ID` in
@@ -91,7 +91,7 @@ fn segment_type_mode_name(type_: MediaSegmentType) -> Option<&'static str> {
         MediaSegmentType::Preview => Some("Preview"),
         MediaSegmentType::Recap => Some("Recap"),
         MediaSegmentType::Commercial => Some("Commercial"),
-        MediaSegmentType::Unknown => None,
+        MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => None,
     }
 }
 
@@ -277,7 +277,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
             MediaSegmentType::Recap => ts.recap = Some(seg),
             MediaSegmentType::Preview => ts.preview = Some(seg),
             MediaSegmentType::Commercial => ts.commercial = Some(seg),
-            MediaSegmentType::Unknown => {}
+            MediaSegmentType::Unknown | MediaSegmentType::Unrecognized(_) => {}
         }
     }
     Ok(ts)
@@ -755,17 +755,93 @@ async fn get_analyzer_actions(
     Ok(Json(actions))
 }
 
+/// The analysis an analyzer action applies to. Port of `IntroSkipper.Data.AnalysisMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AnalysisMode {
+    /// The intro.
+    Introduction,
+    /// The end credits.
+    Credits,
+    /// The next-episode preview.
+    Preview,
+    /// The previously-on recap.
+    Recap,
+    /// A commercial break.
+    Commercial,
+    /// An unnamed underlying integer accepted by JsonStringEnumConverter.
+    Unrecognized(i32),
+}
+
+/// How a season's analysis runs. Port of `IntroSkipper.Data.AnalyzerAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyzerAction {
+    /// The configured default.
+    Default,
+    /// Chapter names.
+    Chapter,
+    /// Audio fingerprints.
+    Chromaprint,
+    /// Black frames.
+    BlackFrame,
+    /// No analysis.
+    None,
+    /// An unnamed underlying integer accepted by JsonStringEnumConverter.
+    Unrecognized(i32),
+}
+
+// These extension enums are absent from Jellyfin's core assembly reflection
+// inventory. Discriminants are copied from IntroSkipper/Data/{AnalysisMode,
+// AnalyzerAction}.cs; values and map keys share the core enum converter.
+macro_rules! analyzer_enum {
+    ($name:ident { $($variant:ident = $value:literal),* $(,)? }) => {
+        impl ferrofin_model::json::enums::JsonEnum for $name {
+            fn from_discriminant(value: i32) -> Self {
+                match value { $($value => Self::$variant,)* other => Self::Unrecognized(other) }
+            }
+            fn members() -> &'static [(&'static str, i32)] { &[$((stringify!($variant), $value)),*] }
+            fn json_default() -> Option<i32> { None }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                ferrofin_model::json::enums::deserialize(d)
+            }
+        }
+    };
+}
+analyzer_enum!(AnalysisMode { Introduction=0, Credits=1, Preview=2, Recap=3, Commercial=4 });
+analyzer_enum!(AnalyzerAction { Default=0, Chapter=1, Chromaprint=2, BlackFrame=3, None=4 });
+
+/// The body of `POST /Intros/AnalyzerActions/UpdateSeason`. Port of
+/// `IntroSkipper.Data.UpdateAnalyzerActionsRequest`, bound by the MVC binder
+/// upstream (`VisualizationController.UpdateAnalyzerActions([FromBody] …)`), so
+/// it takes an object only and its names and enum values bind ignoring case.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct UpdateAnalyzerActionsRequest {
+    /// The season. `null` is the empty id, as Jellyfin's `JsonGuidConverter` reads it.
+    #[serde(default, with = "ferrofin_model::json::guid")]
+    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
+    id: Uuid,
+    /// The action per analysis mode.
+    #[serde(default)]
+    #[allow(dead_code)] // TODO(F10): read once per-season actions persist.
+    analyzer_actions: HashMap<AnalysisMode, AnalyzerAction>,
+}
+
 /// `POST /Intros/AnalyzerActions/UpdateSeason` — accept per-season analyzer
 /// actions.
 ///
-/// Accepted for contract compatibility; Ferrofin's detection uses the global
-/// config and does not persist per-season analyzer overrides, so this reports
-/// success without storing anything.
-// ponytail: no per-season analyzer-action store; detection is global-config driven.
+/// Binds the body as upstream does, then reports success without storing it:
+/// Ferrofin's detection uses the global config only.
+///
+/// TODO(F10): upstream persists the actions (`Plugin.SetAnalyzerActionAsync`)
+/// and detection honours them per season. The open work item is finding F10 of
+/// `brain/plans/PLAN_JSON_BODY_CASE_INSENSITIVE.md`: add a per-season store, read
+/// it in detection and in `GetAnalyzerActions`.
 async fn update_analyzer_actions(
     State(_state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    JsonValueBody(_request): JsonValueBody<serde_json::Value>,
+    JsonBody(_request): JsonBody<UpdateAnalyzerActionsRequest>,
 ) -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -803,6 +879,7 @@ async fn scan_season(
 #[serde(rename_all = "camelCase", default)]
 struct TransformationRegistration {
     /// The registering plugin's id.
+    #[serde(with = "ferrofin_model::json::guid")]
     id: Uuid,
     /// The exact web-root-relative path or regex to transform.
     file_name_pattern: String,
@@ -934,6 +1011,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/FileTransformation/RegisterTransformation",
             post(register_transformation),
         )
+}
+
+crate::query::query_parameters! {
+    CreateSegmentQuery {} => [];
+    EraseQuery {} => [];
 }
 
 #[cfg(test)]
@@ -1080,5 +1162,43 @@ mod tests {
         // The span finder matches whitespace variants.
         assert!(find_skip_duration_span("--skip-hide-duration:   12.5s;").is_some());
         assert!(find_skip_duration_span("--skip-hide-duration: ;").is_none());
+    }
+}
+
+#[cfg(test)]
+mod numeric_contract_tests {
+    #[test]
+    fn analyzer_enums_accept_numbers_in_values_and_dictionary_keys() {
+        use super::{AnalysisMode as Mode, AnalyzerAction as Action, UpdateAnalyzerActionsRequest};
+        let body: UpdateAnalyzerActionsRequest = crate::extract::deserialize_mvc(
+            r#"{"AnalyzerActions":{"0":"2","Credits":3,"999":-1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            body.analyzer_actions[&Mode::Introduction],
+            Action::Chromaprint
+        );
+        assert_eq!(body.analyzer_actions[&Mode::Credits], Action::BlackFrame);
+        assert_eq!(
+            body.analyzer_actions[&Mode::Unrecognized(999)],
+            Action::Unrecognized(-1)
+        );
+        for bad in [
+            r#"{"AnalyzerActions":{"Introduction":2.0}}"#,
+            r#"{"AnalyzerActions":{"no-such-mode":2}}"#,
+            r#"{"AnalyzerActions":{"0":"no-such-action"}}"#,
+        ] {
+            assert!(crate::extract::deserialize_mvc::<UpdateAnalyzerActionsRequest>(bad).is_err());
+        }
+    }
+    #[test]
+    fn segment_contract_numbers_accept_quoted_values() {
+        assert_eq!(
+            crate::extract::contract_numbers::check_model(
+                "Segment",
+                super::Segment::output(uuid::Uuid::nil(), 0.0, 0.0)
+            ),
+            2
+        );
     }
 }

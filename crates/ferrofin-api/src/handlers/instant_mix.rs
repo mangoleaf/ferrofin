@@ -21,7 +21,7 @@
 //! list — not [`DtoOptions::default`], which is Jellyfin's *parameterless*
 //! constructor with all 47 fields on.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::by_name::additional_dto_options;
 use crate::handlers::items::resolve_user_opt;
 use crate::state::AppState;
@@ -155,7 +156,7 @@ async fn instant_mix_from_item(
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     let entity = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     if let Some(kind) = require_kind
@@ -365,4 +366,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/MusicGenres/{genreName}/InstantMix",
             get(from_music_genre_name),
         )
+}
+crate::query::query_parameters! {
+    InstantMixQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Songs/{itemId}/InstantMix"), ("get", "/Albums/{itemId}/InstantMix"), ("get", "/Playlists/{itemId}/InstantMix"), ("get", "/Artists/{itemId}/InstantMix"), ("get", "/Items/{itemId}/InstantMix"), ("get", "/MusicGenres/{name}/InstantMix"), ("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
+    InstantMixIdQuery {} => [("get", "/Artists/InstantMix"), ("get", "/MusicGenres/InstantMix")];
 }

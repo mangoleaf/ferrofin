@@ -1225,6 +1225,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "flate2",
+ "form_urlencoded",
  "futures-core",
  "futures-util",
  "opentelemetry",

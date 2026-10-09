@@ -23,8 +23,9 @@ use crate::media_info::audio_codec;
 ///
 /// Upstream this lives in `Jellyfin.Data.Enums`, but it is pulled in here
 /// because [`MediaStream`] derives it from the codec profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum AudioSpatialFormat {
     /// None audio spatial format.
     #[default]
@@ -34,6 +35,17 @@ pub enum AudioSpatialFormat {
     /// DTS:X audio spatial format.
     #[serde(rename = "DTSX")]
     Dtsx,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    AudioSpatialFormat, None, {
+        None => ("None", 0),
+        DolbyAtmos => ("DolbyAtmos", 1),
+        Dtsx => ("DTSX", 2),
+    }
 }
 
 /// Enum `MetadataProvider` — well-known external metadata sources.
@@ -197,6 +209,7 @@ pub struct ParentalRatingScore {
     pub score: i32,
     /// The sub score.
     #[serde(rename = "subScore", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sub_score: Option<i32>,
 }
 
@@ -243,6 +256,7 @@ pub struct ParentalRating {
     ///
     /// Deprecated: mirrors the score for backwards compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub value: Option<i32>,
     /// The rating score.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,6 +360,7 @@ pub struct VirtualFolderInfo {
     pub primary_image_item_id: Option<String>,
     /// The refresh progress.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub refresh_progress: Option<f64>,
     /// The refresh status.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -487,30 +502,39 @@ pub struct MediaStream {
     pub color_primaries: Option<String>,
     /// The Dolby Vision version major.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_version_major: Option<i32>,
     /// The Dolby Vision version minor.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_version_minor: Option<i32>,
     /// The Dolby Vision profile.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_profile: Option<i32>,
     /// The Dolby Vision level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_level: Option<i32>,
     /// The Dolby Vision rpu present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rpu_present_flag: Option<i32>,
     /// The Dolby Vision el present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub el_present_flag: Option<i32>,
     /// The Dolby Vision bl present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bl_present_flag: Option<i32>,
     /// The Dolby Vision bl signal compatibility id.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_bl_signal_compatibility_id: Option<i32>,
     /// The rotation in degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rotation: Option<i32>,
     /// The comment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,6 +556,7 @@ pub struct MediaStream {
     pub display_title: Option<String>,
     /// The HDR10+ present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub hdr10_plus_present_flag: Option<bool>,
     /// The localized "undefined" label.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,27 +594,34 @@ pub struct MediaStream {
     pub is_interlaced: bool,
     /// A value indicating whether this instance is AVC.
     #[serde(rename = "IsAVC", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_avc: Option<bool>,
     /// The channel layout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_layout: Option<String>,
     /// The bit rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bit_rate: Option<i32>,
     /// The bit depth.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bit_depth: Option<i32>,
     /// The reference frames.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub ref_frames: Option<i32>,
     /// The length of the packet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub packet_length: Option<i32>,
     /// The channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channels: Option<i32>,
     /// The sample rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sample_rate: Option<i32>,
     /// A value indicating whether this instance is default.
     pub is_default: bool,
@@ -605,21 +637,25 @@ pub struct MediaStream {
     pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
     /// The width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
     /// The average frame rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub average_frame_rate: Option<f32>,
     /// The real frame rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub real_frame_rate: Option<f32>,
     /// The profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// The type.
-    #[serde(rename = "Type", deserialize_with = "deserialize_media_stream_type")]
+    #[serde(rename = "Type")]
     pub stream_type: MediaStreamType,
     /// The aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -628,17 +664,20 @@ pub struct MediaStream {
     pub index: i32,
     /// The score.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub score: Option<i32>,
     /// A value indicating whether this instance is external.
     pub is_external: bool,
     /// The delivery method.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub delivery_method: Option<SubtitleDeliveryMethod>,
     /// The delivery URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_url: Option<String>,
     /// A value indicating whether this instance is an external URL.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_external_url: Option<bool>,
     /// A value indicating whether external streams are supported.
     pub supports_external_stream: bool,
@@ -650,30 +689,37 @@ pub struct MediaStream {
     pub pixel_format: Option<String>,
     /// The level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub level: Option<f64>,
     /// A value indicating whether this instance is anamorphic.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_anamorphic: Option<bool>,
     /// The video color range (SDR/HDR), derived from the color / Dolby-Vision
     /// metadata by [`video_range`](Self::video_range). Populated when the wire DTO
     /// is built (Jellyfin serializes it as a computed property).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_range: Option<VideoRange>,
     /// The specific video range type (HDR10/HLG/DOVI/…), from
     /// [`video_range_type`](Self::video_range_type). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_range_type: Option<VideoRangeType>,
     /// The spatial audio format (Dolby Atmos / DTS:X), from
     /// [`audio_spatial_format`](Self::audio_spatial_format). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_spatial_format: Option<AudioSpatialFormat>,
     /// Whether this is a text-based subtitle stream (from the codec), from
     /// [`is_text_subtitle_stream`](Self::is_text_subtitle_stream). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_text_subtitle_stream: Option<bool>,
     /// The reference frame rate (average, or real when average is missing/unrealistic),
     /// from [`reference_frame_rate`](Self::reference_frame_rate). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub reference_frame_rate: Option<f32>,
 }
 
@@ -825,7 +871,7 @@ impl MediaStream {
                 } else {
                     let video_range = self.video_range();
                     if video_range != VideoRange::Unknown {
-                        attributes.push(video_range_to_string(video_range).to_owned());
+                        attributes.push(video_range_to_string(video_range));
                     }
                 }
 
@@ -1103,12 +1149,8 @@ fn it(interlaced: bool, base: &str) -> String {
 }
 
 /// The `ToString()` of a [`VideoRange`], matching the C# enum member names.
-fn video_range_to_string(range: VideoRange) -> &'static str {
-    match range {
-        VideoRange::Unknown => "Unknown",
-        VideoRange::Sdr => "SDR",
-        VideoRange::Hdr => "HDR",
-    }
+fn video_range_to_string(range: VideoRange) -> String {
+    range.json_name().into_owned()
 }
 
 /// Joins `attributes` with `separator`; if a `title` is present, appends only
@@ -1285,48 +1327,6 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     provider: MetadataProvider,
 ) {
     remove_provider_id(instance, provider.as_name());
-}
-
-/// Deserializes a [`MediaStreamType`] from either its PascalCase string name or
-/// its integer discriminant.
-///
-/// Jellyfin's `System.Text.Json` enum converter accepts both forms on read; the
-/// checked-in test fixtures encode `MediaStream.Type` as an integer.
-fn deserialize_media_stream_type<'de, D>(deserializer: D) -> Result<MediaStreamType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrString {
-        Int(u8),
-        Str(String),
-    }
-
-    match IntOrString::deserialize(deserializer)? {
-        IntOrString::Int(n) => match n {
-            0 => Ok(MediaStreamType::Audio),
-            1 => Ok(MediaStreamType::Video),
-            2 => Ok(MediaStreamType::Subtitle),
-            3 => Ok(MediaStreamType::EmbeddedImage),
-            4 => Ok(MediaStreamType::Data),
-            5 => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType discriminant: {other}"
-            ))),
-        },
-        IntOrString::Str(s) => match s.as_str() {
-            "Audio" => Ok(MediaStreamType::Audio),
-            "Video" => Ok(MediaStreamType::Video),
-            "Subtitle" => Ok(MediaStreamType::Subtitle),
-            "EmbeddedImage" => Ok(MediaStreamType::EmbeddedImage),
-            "Data" => Ok(MediaStreamType::Data),
-            "Lyric" => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType: {other}"
-            ))),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -1980,8 +1980,23 @@ mod tests {
                 serde_json::from_value(serde_json::json!({ "Type": str_wire })).unwrap();
             assert_eq!(from_str.stream_type, expected);
         }
+        // A name matches ignoring case, as `JsonStringEnumConverter` reads it.
+        for (wire, expected) in [
+            ("audio", MediaStreamType::Audio),
+            ("SUBTITLE", MediaStreamType::Subtitle),
+            ("embeddedImage", MediaStreamType::EmbeddedImage),
+        ] {
+            let stream: MediaStream =
+                serde_json::from_value(serde_json::json!({ "Type": wire })).unwrap();
+            assert_eq!(stream.stream_type, expected, "{wire}");
+        }
         // Out-of-range int and unknown string both error.
-        assert!(serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 })).is_err());
+        assert_eq!(
+            serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 }))
+                .unwrap()
+                .stream_type,
+            MediaStreamType::Unrecognized(99)
+        );
         assert!(
             serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": "Nope" })).is_err()
         );

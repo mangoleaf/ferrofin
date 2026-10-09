@@ -22,8 +22,9 @@ use crate::dto::{BaseItemPerson, MediaSourceInfo};
 use crate::entities_media::{ChapterInfo, MediaStream};
 
 /// Enum `MediaProtocol` — how a media source is delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaProtocol {
     /// Local file.
     #[default]
@@ -40,11 +41,27 @@ pub enum MediaProtocol {
     Rtp = 5,
     /// FTP.
     Ftp = 6,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaProtocol, None, {
+        File => ("File", 0),
+        Http => ("Http", 1),
+        Rtmp => ("Rtmp", 2),
+        Rtsp => ("Rtsp", 3),
+        Udp => ("Udp", 4),
+        Rtp => ("Rtp", 5),
+        Ftp => ("Ftp", 6),
+    }
 }
 
 /// The type of timestamps used in a transport stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TransportStreamTimestamp {
     /// The stream contains no timestamps.
     None,
@@ -52,6 +69,17 @@ pub enum TransportStreamTimestamp {
     Zero,
     /// The stream contains valid timestamps.
     Valid,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TransportStreamTimestamp, None, {
+        None => ("None", 0),
+        Zero => ("Zero", 1),
+        Valid => ("Valid", 2),
+    }
 }
 
 /// Subtitle format string constants (C# `SubtitleFormat` static class).
@@ -124,6 +152,7 @@ pub struct BlurayDiscInfo {
     pub media_streams: Vec<MediaStream>,
     /// The run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
     /// The files.
     pub files: Vec<String>,
@@ -188,18 +217,23 @@ pub struct LiveStreamRequest {
     pub play_session_id: Option<String>,
     /// The maximum streaming bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_streaming_bitrate: Option<i32>,
     /// The start time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_time_ticks: Option<i64>,
     /// The audio stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
     /// The subtitle stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
     /// The maximum audio channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_audio_channels: Option<i32>,
     /// The item id.
     #[schema(value_type = String, format = "uuid")]
@@ -306,14 +340,17 @@ pub struct MediaInfo {
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
 
     /// Gets or sets the premiere date.

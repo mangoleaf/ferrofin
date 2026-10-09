@@ -991,38 +991,14 @@ fn is_nvenc_encoder(encoder: &str) -> bool {
 /// [`EncoderPreset`] does not derive `Ord`, so speed comparisons (`preset <
 /// ultrafast`) that the C# does on the backing `int` go through the discriminant
 /// mirrored from `MediaBrowser.Model.Entities.EncoderPreset`.
-fn preset_ordinal(preset: EncoderPreset) -> u8 {
-    match preset {
-        EncoderPreset::auto => 0,
-        EncoderPreset::placebo => 1,
-        EncoderPreset::veryslow => 2,
-        EncoderPreset::slower => 3,
-        EncoderPreset::slow => 4,
-        EncoderPreset::medium => 5,
-        EncoderPreset::fast => 6,
-        EncoderPreset::faster => 7,
-        EncoderPreset::veryfast => 8,
-        EncoderPreset::superfast => 9,
-        EncoderPreset::ultrafast => 10,
-    }
+fn preset_ordinal(preset: EncoderPreset) -> i32 {
+    preset.json_value()
 }
 
 /// The ffmpeg preset token for a preset. Port of
 /// `EncoderPreset.ToString().ToLowerInvariant()`.
-fn preset_name(preset: EncoderPreset) -> &'static str {
-    match preset {
-        EncoderPreset::auto => "auto",
-        EncoderPreset::placebo => "placebo",
-        EncoderPreset::veryslow => "veryslow",
-        EncoderPreset::slower => "slower",
-        EncoderPreset::slow => "slow",
-        EncoderPreset::medium => "medium",
-        EncoderPreset::fast => "fast",
-        EncoderPreset::faster => "faster",
-        EncoderPreset::veryfast => "veryfast",
-        EncoderPreset::superfast => "superfast",
-        EncoderPreset::ultrafast => "ultrafast",
-    }
+fn preset_name(preset: EncoderPreset) -> std::borrow::Cow<'static, str> {
+    preset.json_name()
 }
 
 /// Clamps a requested level to a codec-safe maximum. Port of
@@ -1465,7 +1441,9 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
     }
 
     let range_name = video_range_type_name(range);
-    let directly_supported = requested.iter().any(|r| r.eq_ignore_ascii_case(range_name));
+    let directly_supported = requested
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&range_name));
 
     // Copying a Dolby Vision stream to a client that only supports the fallback
     // range (e.g. a browser that lists HDR10 but not DOVI) requires stripping the
@@ -1481,22 +1459,8 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
 
 /// The PascalCase wire name of a video range type. Port of
 /// `VideoRangeType.ToString()`.
-fn video_range_type_name(range: VideoRangeType) -> &'static str {
-    match range {
-        VideoRangeType::Unknown => "Unknown",
-        VideoRangeType::Sdr => "SDR",
-        VideoRangeType::Hdr10 => "HDR10",
-        VideoRangeType::Hlg => "HLG",
-        VideoRangeType::Dovi => "DOVI",
-        VideoRangeType::DoviWithHdr10 => "DOVIWithHDR10",
-        VideoRangeType::DoviWithHlg => "DOVIWithHLG",
-        VideoRangeType::DoviWithSdr => "DOVIWithSDR",
-        VideoRangeType::DoviWithEl => "DOVIWithEL",
-        VideoRangeType::DoviWithHdr10Plus => "DOVIWithHDR10Plus",
-        VideoRangeType::DoviWithElhdr10Plus => "DOVIWithELHDR10Plus",
-        VideoRangeType::DoviInvalid => "DOVIInvalid",
-        VideoRangeType::Hdr10Plus => "HDR10Plus",
-    }
+fn video_range_type_name(range_type: VideoRangeType) -> String {
+    range_type.json_name().into_owned()
 }
 
 /// The codec/parameter incompatibilities that prevent an audio copy. Port of

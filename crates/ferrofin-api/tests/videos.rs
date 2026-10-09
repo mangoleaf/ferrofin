@@ -322,6 +322,21 @@ impl ferrofin_traits::merge_versions::MergeVersionsManager for FakeMergeVersions
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(match id {
             ITEM_ID => Some(minimal_base_item(ITEM_ID, "A Movie", "Movie")),
@@ -776,7 +791,7 @@ async fn merge_versions_merges_two_ids() {
     let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
-    let other = Uuid::from_u128(0x00A1_0002);
+    let other = STACKED_ID;
     let resp = router
         .oneshot(authed(
             "POST",

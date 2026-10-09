@@ -406,17 +406,7 @@ pub mod metadata_field {
     /// The `INTEGER` discriminant for a [`MetadataField`].
     #[must_use]
     pub fn to_i32(field: MetadataField) -> i32 {
-        match field {
-            MetadataField::Cast => 0,
-            MetadataField::Genres => 1,
-            MetadataField::ProductionLocations => 2,
-            MetadataField::Studios => 3,
-            MetadataField::Tags => 4,
-            MetadataField::Name => 5,
-            MetadataField::Overview => 6,
-            MetadataField::Runtime => 7,
-            MetadataField::OfficialRating => 8,
-        }
+        field.json_value()
     }
 }
 

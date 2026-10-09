@@ -64,10 +64,14 @@ pub struct FerrofinMediaSourceManager {
     /// `user is null` path.
     user_data: Option<Arc<dyn ferrofin_traits::library::UserDataManager>>,
     /// The user manager, when configured — resolves the requesting user, whose
-    /// parental rating and tags decide which of a video's versions are
-    /// sources for them (`GetStaticMediaSources`' per-user filter). `None`
-    /// (unit tests) lists every version.
+    /// access decides which of a video's versions are sources for them
+    /// (`GetStaticMediaSources`' per-user filter). `None` (unit tests) lists
+    /// every version.
     users: Option<Arc<dyn ferrofin_traits::library::UserManager>>,
+    /// The standalone item-visibility evaluator the per-user version filter
+    /// runs ([`Self::visible_versions`]). With a resolved user and none
+    /// configured the filter fails closed, as the library's lookups do.
+    visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     /// Localization for the `MediaStream.Localized*` labels re-stamped on
     /// every read (the C# `MediaStreamRepository.Map` does the same — they are
     /// not persisted). `None` (unit tests) leaves them unset.
@@ -114,6 +118,7 @@ impl FerrofinMediaSourceManager {
             live_tv: None,
             user_data: None,
             users: None,
+            visibility: None,
             localization: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -153,11 +158,22 @@ impl FerrofinMediaSourceManager {
         self
     }
 
+    /// Installs the standalone item-visibility evaluator the per-user version
+    /// filter runs ([`Self::visible_versions`]).
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<crate::item_visibility::ItemVisibility>,
+    ) -> Self {
+        self.visibility = Some(visibility);
+        self
+    }
+
     /// The versions among `ids` the user may open — `GetStaticMediaSources`'
     /// per-user filter (`MediaSourceManager.cs:397-403`: `GetItemById(id,
-    /// user) is not null`), as one batched read with the user's parental
-    /// rating and tag rules ([`InternalItemsQuery::user`]). `None` when there
-    /// is no user (or no user manager), which keeps every version.
+    /// user) is not null`, i.e. `IsVisibleStandalone`), as one batched
+    /// visibility pass. `None` when there is no user (or no user manager),
+    /// which keeps every version.
     async fn visible_versions(
         &self,
         ids: Vec<Uuid>,
@@ -169,17 +185,18 @@ impl FerrofinMediaSourceManager {
         let Some(user) = users.get_user_by_id(user_id).await? else {
             return Ok(None);
         };
-        let query = ferrofin_traits::options::InternalItemsQuery {
-            item_ids: ids,
-            include_owned_items: true,
-            user: Some(user),
-            // Every version is its own source: a group's versions share the
-            // primary's presentation key, which a user query groups on.
-            group_by_presentation_unique_key: false,
-            ..ferrofin_traits::options::InternalItemsQuery::default()
-        };
+        let visibility = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(&ids).await?;
+        let visible = visibility.visible(&rows, &user, true).await?;
         Ok(Some(
-            self.items.get_item_ids(&query).await?.into_iter().collect(),
+            rows.iter()
+                .zip(visible)
+                .filter(|(_, visible)| *visible)
+                .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+                .collect(),
         ))
     }
 
@@ -2736,9 +2753,10 @@ mod version_resume_tests {
     use ferrofin_db::store::guid_to_db;
     use ferrofin_model::data::BaseItemKind;
 
-    /// A 4K primary and a 1080p local version, `version` rated `rating`
-    /// (score), and `user` part-way through the version.
-    async fn group(db: &Database, version_score: Option<i64>) -> (Uuid, Uuid, Uuid) {
+    /// A 4K primary and a 1080p local version, `version` rated
+    /// `version_rating` (an official rating, which `IsParentalAllowed`
+    /// scores), and `user` part-way through the version.
+    async fn group(db: &Database, version_rating: Option<&str>) -> (Uuid, Uuid, Uuid) {
         let (primary, version, user) = (
             Uuid::from_u128(0x7E_0001),
             Uuid::from_u128(0x7E_0002),
@@ -2755,7 +2773,7 @@ mod version_resume_tests {
             if id == version {
                 row.owner_id = Some(guid_to_db(primary));
                 row.primary_version_id = Some(guid_to_db(primary));
-                row.inherited_parental_rating_value = version_score;
+                row.official_rating = version_rating.map(str::to_owned);
             } else {
                 row.data =
                     Some(r#"{"LocalAlternateVersions":["/m/Heat/Heat - 1080p.mkv"]}"#.to_owned());
@@ -2799,6 +2817,12 @@ mod version_resume_tests {
         .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
             db.clone(),
         )))
+        .with_visibility(Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            crate::test_support::item_repository_over(db.clone()),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        )))
     }
 
     async fn resume(db: &Database, user: Uuid, item: Uuid) {
@@ -2841,7 +2865,7 @@ mod version_resume_tests {
     #[tokio::test]
     async fn a_hidden_version_is_never_the_default() {
         let db = test_db().await;
-        let (primary, version, user) = group(&db, Some(17)).await;
+        let (primary, version, user) = group(&db, Some("R")).await;
         resume(&db, user, version).await;
         let mgr = manager(&db);
         let sources = mgr

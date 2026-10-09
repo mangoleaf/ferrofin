@@ -2240,7 +2240,7 @@ async fn a_file_that_becomes_or_stops_being_an_extra_moves() {
         ronin,
         (BaseItemKind::Video, BaseItemKind::Movie),
         |row| {
-            row.extra_type = Some(ferrofin_model::entities::ExtraType::Clip as i32);
+            row.extra_type = Some(ferrofin_model::entities::ExtraType::Clip.json_value());
             row.owner_id = Some(owner);
             row.parent_id = None;
             row.top_parent_id = None;

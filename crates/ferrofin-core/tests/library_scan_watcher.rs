@@ -1134,6 +1134,175 @@ async fn user_data(db: &Database) -> i64 {
         .expect("count")
 }
 
+#[rstest::rstest]
+#[case::one_scan(0)]
+#[case::destination_first(1)]
+#[case::source_first(2)]
+#[case::restore_original_path(3)]
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_survives_file_moves_and_restores(#[case] order: u8) {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = tmp.path().join("movies");
+    let original_dir = media.join("Heat (1995)");
+    let destination_dir = if order == 3 {
+        original_dir.clone()
+    } else {
+        media.join("Moved Heat (1995)")
+    };
+    let seed_movie = |dir: &Path| {
+        touch(dir, "Heat (1995).mkv");
+        std::fs::write(dir.join("movie.nfo"),
+            b"<movie><title>Heat</title><uniqueid type=\"tmdb\" default=\"true\">949</uniqueid></movie>").unwrap();
+    };
+    seed_movie(&original_dir);
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+    let original = original_dir.join("Heat (1995).mkv");
+    let destination = destination_dir.join("Heat (1995).mkv");
+    let old_id = id(BaseItemKind::Movie, &original);
+    play(&fx.db, &old_id).await;
+    // Simulate the real provider-keyed snapshot; the original-path case
+    // deliberately has only the GUID key, without a provider fallback.
+    sqlx::query(
+        r#"UPDATE "UserData" SET "CustomDataKey" = ?1, "IsFavorite" = 1,
+           "PlaybackPositionTicks" = 1234567 WHERE "ItemId" = ?2"#,
+    )
+    .bind(if order == 3 {
+        old_id.to_lowercase()
+    } else {
+        "949".to_owned()
+    })
+    .bind(&old_id)
+    .execute(fx.db.writer())
+    .await
+    .unwrap();
+    if order == 1 {
+        seed_movie(&destination_dir);
+        fx.report(&[&destination]).await;
+    }
+    std::fs::remove_file(&original).unwrap();
+    if order >= 2 {
+        fx.report(&[&original]).await;
+        assert!(!fx.rows().await.contains_key(&old_id));
+        assert_eq!(
+            user_data(&fx.db).await,
+            1,
+            "history detached before destination exists"
+        );
+    }
+    if order != 1 {
+        seed_movie(&destination_dir);
+    }
+    if order == 0 {
+        fx.scanner.scan_all().await.unwrap();
+    } else if order == 1 {
+        // Destination was indexed by an earlier scan; this event only
+        // covers the source folder, so recovery must search outside it.
+        fx.report(&[&original]).await;
+    } else {
+        fx.report(&[&destination]).await;
+    }
+    let new_id = id(BaseItemKind::Movie, &destination);
+    let rows: Vec<(bool, bool, i64, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Played", "IsFavorite", "PlaybackPositionTicks", "RetentionDate"
+           FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&new_id)
+    .fetch_all(fx.db.pool())
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "history recovered at {new_id}");
+    assert!(rows.iter().all(|row| *row == (true, true, 1_234_567, None)));
+    let before = user_data(&fx.db).await;
+    fx.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        user_data(&fx.db).await,
+        before,
+        "unchanged rescan is idempotent"
+    );
+}
+
+#[rstest::rstest]
+#[case::source_first(false)]
+#[case::destination_first(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_move_back_preserves_the_latest_state(#[case] destination_first: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let media = tmp.path().join("movies");
+    let a_dir = media.join("Heat (1995)");
+    let b_dir = media.join("Moved Heat (1995)");
+    touch(&a_dir, "Heat (1995).mkv");
+    std::fs::write(a_dir.join("movie.nfo"),
+        b"<movie><title>Heat</title><uniqueid type=\"tmdb\" default=\"true\">949</uniqueid></movie>").unwrap();
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+    let a = a_dir.join("Heat (1995).mkv");
+    let b = b_dir.join("Heat (1995).mkv");
+    let a_id = id(BaseItemKind::Movie, &a);
+    let b_id = id(BaseItemKind::Movie, &b);
+    play(&fx.db, &a_id).await;
+    sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = lower("ItemId") WHERE "ItemId" = ?1"#)
+        .bind(&a_id)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    // Real writes save both a GUID alias and the provider alias.
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey",
+        "IsFavorite", "PlayCount", "PlaybackPositionTicks", "Played")
+        SELECT "ItemId", "UserId", '949', "IsFavorite", "PlayCount",
+        "PlaybackPositionTicks", "Played" FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&a_id)
+    .execute(fx.db.writer())
+    .await
+    .unwrap();
+    std::fs::rename(&a_dir, &b_dir).unwrap();
+    fx.scanner.scan_all().await.unwrap();
+    let played: bool =
+        sqlx::query_scalar(r#"SELECT "Played" FROM "UserData" WHERE "ItemId" = ?1 LIMIT 1"#)
+            .bind(&b_id)
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+    assert!(played);
+    sqlx::query(r#"UPDATE "UserData" SET "Played" = 0, "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+        .bind(&b_id)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+    if destination_first {
+        touch(&a_dir, "Heat (1995).mkv");
+        std::fs::copy(b_dir.join("movie.nfo"), a_dir.join("movie.nfo")).unwrap();
+        fx.report(&[&a]).await;
+        std::fs::remove_file(&b).unwrap();
+        fx.report(&[&b]).await;
+    } else {
+        std::fs::rename(&b_dir, &a_dir).unwrap();
+        fx.report(&[&b]).await;
+        fx.report(&[&a]).await;
+    }
+    let rows: Vec<(bool, bool, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Played", "IsFavorite", "RetentionDate" FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&a_id)
+    .fetch_all(fx.db.pool())
+    .await
+    .unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|row| *row == (false, true, None)));
+    let retained: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained, 0);
+}
+
 /// Restores a folder's permissions when dropped, so the temp dir can go.
 struct Unlistable(PathBuf);
 

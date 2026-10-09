@@ -16,7 +16,7 @@
 //! is delegated to the [`CollectionManager`](ferrofin_traits::collections::CollectionManager)
 //! seam on [`AppState`].
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 
@@ -178,4 +179,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         "/Collections/{collectionId}/Items",
         post(add_to_collection).delete(remove_from_collection),
     )
+}
+crate::query::query_parameters! {
+    CreateCollectionQuery {
+        "ids" => ',',
+    } => [("post", "/Collections")];
+    CollectionItemsQuery {
+        "ids" => ',',
+    } => [("post", "/Collections/{collectionId}/Items"), ("delete", "/Collections/{collectionId}/Items")];
 }

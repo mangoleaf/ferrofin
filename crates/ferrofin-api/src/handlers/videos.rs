@@ -19,7 +19,7 @@
 //! the C# `LinkedAlternateVersions` array and linked-child reroute are not modeled
 //! at that seam (see the manager docs).
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -31,7 +31,8 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
 use crate::error::ApiError;
-use crate::handlers::items::resolve_user_opt;
+use crate::extract::Query;
+use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{serve_static_file, stream_path};
 use crate::state::AppState;
@@ -116,17 +117,17 @@ async fn get_additional_parts(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let empty = || Json(QueryResult::from_items(Vec::new()));
     if item_id.is_nil() {
+        // The (user) root folder: it must exist, but it is no video.
+        state
+            .library
+            .get_user_root_folder()
+            .await?
+            .ok_or_else(|| ApiError::NotFound("user root folder".into()))?;
         return Ok(empty());
     }
-    // TODO(parity, open work item): upstream resolves the item as the user
-    // (`GetItemById<BaseItem>(itemId, user)`, `null` → `404` for an item the
-    // user cannot see); there is no per-user by-id read yet. Un-defer path:
-    // `brain/plans/PLAN_PER_USER_ITEM_VISIBILITY.md`.
-    let video = state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    // `GetItemById<BaseItem>(itemId, user)`: an item the user cannot see is
+    // `null`, a `404`.
+    let video = require_visible_item(&state, item_id, user.as_ref()).await?;
     let parts = state
         .library
         .get_additional_parts(&video, user.as_ref())
@@ -177,10 +178,20 @@ struct MergeVersionsQuery {
 )]
 async fn merge_versions(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Query(query): Query<MergeVersionsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let ids = parse_csv_uuids(Some(&query.ids))?;
+    let mut ids = Vec::new();
+    for id in parse_csv_uuids(Some(&query.ids))? {
+        if state
+            .library
+            .get_item_by_id_for_user(id, auth.user.as_ref())
+            .await?
+            .is_some_and(|item| is_video(&item))
+        {
+            ids.push(id);
+        }
+    }
     if ids.len() < 2 {
         return Err(ApiError::BadRequest(
             "please supply at least two videos to merge".to_owned(),
@@ -211,9 +222,13 @@ async fn merge_versions(
 )]
 async fn delete_alternate_sources(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    let item = require_visible_item(&state, item_id, auth.user.as_ref()).await?;
+    if !is_video(&item) {
+        return Err(ApiError::NotFound(format!("video {item_id}")));
+    }
     state.library.remove_alternate_sources(item_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -237,10 +252,11 @@ async fn delete_alternate_sources(
 )]
 async fn get_download(
     State(state): State<AppState>,
-    RequireDownload(_auth, policy): RequireDownload,
+    RequireDownload(auth, policy): RequireDownload,
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    require_visible_item(&state, item_id, auth.user.as_ref()).await?;
     let source = state
         .media_sources
         .get_static_media_sources(item_id, true, None)
@@ -330,6 +346,14 @@ fn attachment_disposition(filename: &str) -> String {
     format!("attachment; filename={plain}; filename*=UTF-8''{star}")
 }
 
+/// Whether the stored type is Video or one of its concrete subclasses.
+pub(crate) fn is_video(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    matches!(
+        item.type_.rsplit('.').next().unwrap_or(&item.type_),
+        "Video" | "Movie" | "Episode" | "MusicVideo" | "Trailer"
+    )
+}
+
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -351,6 +375,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             delete(delete_alternate_sources),
         )
         .route("/Items/{itemId}/Download", get(get_download))
+}
+
+crate::query::query_parameters! {
+    AdditionalPartsQuery {} => [("get", "/Videos/{itemId}/AdditionalParts")];
+    MergeVersionsQuery {
+        "ids" => ',',
+    } => [("post", "/Videos/MergeVersions")];
 }
 
 #[cfg(test)]

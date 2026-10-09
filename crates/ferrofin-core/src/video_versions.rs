@@ -838,7 +838,8 @@ fn disc_terms(format: crate::item_data::VideoFormat) -> Vec<&'static str> {
         (VideoType::BluRay, _) | (VideoType::Iso, Some(IsoType::BluRay)) => terms.push("Bluray"),
         (VideoType::Dvd, _) | (VideoType::Iso, Some(IsoType::Dvd)) => terms.push("DVD"),
         (VideoType::Iso, None) => terms.push("ISO"),
-        (VideoType::VideoFile, _) => {}
+        // A `VideoFile` (or a value no member names) adds nothing.
+        _ => {}
     }
     terms
 }

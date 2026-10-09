@@ -3888,24 +3888,16 @@ impl FerrofinDtoService {
             }
         }
         // `GetStaticMediaSources`' per-user filter (`MediaSourceManager.cs:
-        // 397-403`): the versions the user may open, in one read over every
-        // version the page reaches — the user's parental rating and tag rules
-        // as for any item ([`InternalItemsQuery::user`]). Only for a user,
-        // only when the page holds a version group.
+        // 397-403`, `GetItemById(id, user) is not null`) and `MediaSourceCount`'s
+        // `IsVisibleStandalone(user)`: the versions the user may open, as one
+        // batched standalone-visibility pass over every version the page
+        // reaches. Only for a user, only when the page holds a version group.
         let version_visible = match user {
             Some(user) if versions.ids().next().is_some() => {
-                let query = ferrofin_traits::options::InternalItemsQuery {
-                    item_ids: versions.ids().collect(),
-                    include_owned_items: true,
-                    user: Some(user.clone()),
-                    // Every version is its own source: a group's versions share the
-                    // primary's presentation key, which a user query groups on.
-                    group_by_presentation_unique_key: false,
-                    ..ferrofin_traits::options::InternalItemsQuery::default()
-                };
+                let ids: Vec<Uuid> = versions.ids().collect();
                 Some(
                     self.library
-                        .get_item_ids(&query)
+                        .get_visible_item_ids(&ids, user)
                         .await?
                         .into_iter()
                         .collect::<std::collections::HashSet<Uuid>>(),
@@ -5325,6 +5317,77 @@ mod tests {
             .unwrap();
         assert_eq!(dto.media_source_count, Some(2));
         assert_eq!(dto.media_sources.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// The per-user `MediaSourceCount` arm (`GetAllVersions().Count(v => v.Id
+    /// == video.Id || v.IsVisibleStandalone(user))`, DtoService.cs:1430-1444)
+    /// runs the library's standalone visibility: a version rated above the
+    /// user is not counted for them, while a user-less read counts it.
+    #[tokio::test]
+    async fn media_source_count_for_a_user_skips_versions_they_cannot_see() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let (open, rated) = (Uuid::new_v4(), Uuid::new_v4());
+        for (i, alt_id) in [open, rated].iter().enumerate() {
+            seed_named_item(&db, *alt_id, BaseItemKind::Video, &format!("Cut {i}")).await;
+            link_alternate_version(&db, *alt_id, movie_id).await;
+        }
+        let mut rated_row = fetch_item(&db, rated).await;
+        rated_row.official_rating = Some("R".to_owned());
+        crate::test_support::save_item(&db, &rated_row).await;
+        let mut user =
+            crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x9001)).await;
+        user.max_parental_rating_score = Some(13);
+        let items = crate::test_support::item_repository_over(db.clone());
+        let library = crate::library_manager::FerrofinLibraryManager::new(
+            items.clone(),
+            Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                db.clone(),
+            )),
+            Arc::new(
+                crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+            ),
+            Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                db.clone(),
+            )),
+        )
+        .with_visibility(Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            items,
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        )));
+        // The group as stored: the real repository's version read.
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(library),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let count_only = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount],
+            ..DtoOptions::default()
+        };
+        let movie = fetch_item(&db, movie_id).await;
+        let for_user = svc
+            .get_base_item_dto(&movie, &count_only, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(for_user.media_source_count, Some(2), "the R cut is hidden");
+        let anyone = svc
+            .get_base_item_dto(&movie, &count_only, None, None)
+            .await
+            .unwrap();
+        assert_eq!(anyone.media_source_count, Some(3));
     }
 
     /// `PartCount` (DtoService.cs:1418-1421): a stacked video counts itself

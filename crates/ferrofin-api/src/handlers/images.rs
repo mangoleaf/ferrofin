@@ -42,7 +42,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -57,6 +57,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::image_upload::{
     decode_base64, image_extension_from_content_type, image_mime_from_content_type,
 };
@@ -598,8 +599,9 @@ enum ItemResolved {
 /// resolved item (real item id or by-name item id), `image_type`/`index` select
 /// the image, and a missing item image is a `404`.
 ///
-/// The image rows are read *first* and the item's own existence is only checked
-/// when no image matched. An image row cannot outlive its item — the
+/// User-addressed handlers authorize before calling this helper. Once authorized,
+/// image rows are read first and existence is checked only on a miss for callers
+/// that have not already resolved the item. An image row cannot outlive its item — the
 /// `BaseItemImageInfos.ItemId` foreign key cascades and the runtime pools run
 /// with `foreign_keys = ON` — so a matched row already proves the item exists,
 /// and the served path pays one query instead of two. Both `404` messages are
@@ -639,6 +641,21 @@ async fn serve_item_image(
     serve_image_file(state, item_id, image, index, query, request).await
 }
 
+/// Resolve authenticated item access even on image-cache hits. Anonymous
+/// image requests retain the existing public lookup and authentication policy.
+async fn authorize_image_item(
+    state: &AppState,
+    id: Uuid,
+    auth: Result<RequireAuth, ApiError>,
+) -> Result<ItemResolved, ApiError> {
+    if let Some(user) = auth.ok().and_then(|auth| auth.0.user) {
+        require_item(state, id, Some(&user)).await?;
+        Ok(ItemResolved::Yes)
+    } else {
+        Ok(ItemResolved::No)
+    }
+}
+
 /// `GET`/`HEAD /Items/{itemId}/Images/{imageType}` — serve an item's image.
 ///
 /// Port of `ImageController.GetItemImage`. A missing item or image is a `404`.
@@ -657,20 +674,16 @@ async fn serve_item_image(
 )]
 async fn get_item_image(
     State(state): State<AppState>,
+    auth: Result<RequireAuth, ApiError>,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     let index = query.image_index.unwrap_or(0);
+    let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
-        &state,
-        item_id,
-        image_type,
-        index,
-        &query,
-        request,
-        ItemResolved::No,
+        &state, item_id, image_type, index, &query, request, resolved,
     )
     .await
 }
@@ -695,11 +708,13 @@ async fn get_item_image(
 )]
 async fn get_item_image_by_index(
     State(state): State<AppState>,
+    auth: Result<RequireAuth, ApiError>,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
+    let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state,
         item_id,
@@ -707,7 +722,7 @@ async fn get_item_image_by_index(
         image_index,
         &query,
         request,
-        ItemResolved::No,
+        resolved,
     )
     .await
 }
@@ -735,6 +750,7 @@ async fn get_item_image_by_index(
 #[allow(clippy::type_complexity)]
 async fn get_item_image_parametrized(
     State(state): State<AppState>,
+    auth: Result<RequireAuth, ApiError>,
     Path((
         item_id,
         image_type,
@@ -776,6 +792,7 @@ async fn get_item_image_parametrized(
         tag: Some(tag).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("0")),
         ..ImageQuery::default()
     };
+    let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state,
         item_id,
@@ -783,7 +800,7 @@ async fn get_item_image_parametrized(
         image_index,
         &query,
         request,
-        ItemResolved::No,
+        resolved,
     )
     .await
 }
@@ -806,12 +823,12 @@ async fn get_item_image_parametrized(
 )]
 async fn get_item_image_infos(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<axum::Json<Vec<ImageInfo>>, ApiError> {
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let images = state.library.get_item_images(item_id).await?;
@@ -1243,13 +1260,13 @@ async fn save_item_image(
 )]
 async fn set_item_image(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, auth.user.as_ref()).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
@@ -1276,13 +1293,13 @@ async fn set_item_image(
 )]
 async fn set_item_image_by_index(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, auth.user.as_ref()).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
@@ -1318,12 +1335,12 @@ async fn set_item_image_by_index(
 )]
 async fn delete_item_image(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, auth.user.as_ref()).await?;
     let index = query.image_index.unwrap_or(0);
     state
         .providers
@@ -1351,11 +1368,11 @@ async fn delete_item_image(
 )]
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, auth.user.as_ref()).await?;
     state
         .providers
         .delete_image(item_id, image_type, Some(image_index))
@@ -1397,12 +1414,12 @@ pub(crate) struct UpdateImageIndexQuery {
 )]
 async fn update_item_image_index(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, auth.user.as_ref()).await?;
     state
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)
@@ -1413,10 +1430,14 @@ async fn update_item_image_index(
 /// Resolves an item, mapping a missing one to a `404`.
 ///
 /// The shared item-existence guard the write handlers run before mutating.
-async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+async fn require_item(
+    state: &AppState,
+    item_id: Uuid,
+    user: Option<&ferrofin_db::entities::users::UserEntity>,
+) -> Result<(), ApiError> {
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, user)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok(())
@@ -1505,6 +1526,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
             get(get_user_image_by_index_legacy).head(get_user_image_by_index_legacy),
         )
+}
+
+crate::query::query_parameters! {
+    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("get", "/UserImage"), ("post", "/UserImage"), ("delete", "/UserImage"), ("delete", "/Items/{itemId}/Images/{imageType}")];
+    UpdateImageIndexQuery {} => [("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index")];
 }
 
 #[cfg(test)]

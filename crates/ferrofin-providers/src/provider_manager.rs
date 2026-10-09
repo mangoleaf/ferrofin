@@ -2269,6 +2269,7 @@ impl LocalProviderManager {
                     .copy_metadata_to_owned_videos(&[item_id], true, true)
                     .await?;
             }
+            store.reattach_user_data(&row).await?;
             // `SaveItemAsync` writes the people when the result carries a
             // list (`MetadataService.cs:320-324`). A failed write is logged,
             // as the scan logs it: the row is saved.
@@ -5612,6 +5613,7 @@ mod tests {
         upserted: std::sync::Mutex<Vec<(Uuid, String, String)>>,
         saved: std::sync::Mutex<Vec<BaseItemEntity>>,
         item_values: std::sync::Mutex<RecordedItemValues>,
+        recovered: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         /// The `LockedFields` it answers with, per item.
         locked: HashMap<Uuid, Vec<MetadataField>>,
         /// Each `copy_metadata_to_owned_videos` call: owners, versions, parts.
@@ -5731,8 +5733,25 @@ mod tests {
                 .push((owner_ids.to_vec(), versions, parts));
             Ok(0)
         }
-        async fn reattach_user_data(&self, _item: &BaseItemEntity) -> Result<(), ServiceError> {
-            unimplemented!()
+        async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+            assert!(
+                self.saved
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .any(|row| row.id == item.id),
+                "save metadata before recovering history"
+            );
+            let id = Uuid::parse_str(&item.id).expect("id");
+            let providers = self
+                .stored_ids
+                .lock()
+                .expect("lock")
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            self.recovered.lock().expect("lock").push((id, providers));
+            Ok(())
         }
         async fn update_inherited_values(&self) -> Result<(), ServiceError> {
             unimplemented!()
@@ -5975,6 +5994,11 @@ mod tests {
         assert_eq!(
             *store.replaced.lock().expect("lock"),
             vec![(item_id, vec![("Tmdb".to_owned(), "999".to_owned())])]
+        );
+        assert_eq!(
+            *store.recovered.lock().expect("lock"),
+            vec![(item_id, vec![("Tmdb".to_owned(), "999".to_owned())])],
+            "recovery sees the newly persisted provider IDs"
         );
     }
 

@@ -31,9 +31,11 @@ impl ResolutionConfiguration {
 pub struct ResolutionOptions {
     /// The maximum width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_width: Option<i32>,
     /// The maximum height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_height: Option<i32>,
 }
 

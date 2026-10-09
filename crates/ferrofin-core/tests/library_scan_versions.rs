@@ -1332,6 +1332,18 @@ async fn a_restricted_user_gets_no_parts_of_a_movie_rated_above_them() {
         f.store.clone(),
         Arc::new(ferrofin_core::FerrofinPeopleRepository::new(f.db.clone())),
     )
+    // `IsVisible(user)`: the library's own evaluator, as the server wires it.
+    .with_visibility(Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            f.db.clone(),
+            Arc::new(FerrofinItemRepository::new(
+                f.db.clone(),
+                Arc::new(ItemTypeLookup::new()),
+            )),
+            Arc::new(ferrofin_core::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        ),
+    ))
     .with_id_derivation(IdDerivation::LegacyLowercase);
     let user = seed_user(&f.db).await;
     let user_row = |max: Option<i64>| {
