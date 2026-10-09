@@ -84,6 +84,8 @@ pub struct BaseEncodingJobOptions {
     pub transcoding_max_audio_channels: Option<i32>,
     /// Whether this is a static (direct) stream (`Static`).
     pub is_static: bool,
+    /// Seek offset reported by the running encoder (StartTimeTicks).
+    pub start_time_ticks: Option<i64>,
     /// The requested video profile (`Profile`).
     pub profile: Option<String>,
     /// The requested video range type (`VideoRangeType`).
@@ -151,6 +153,7 @@ impl Default for BaseEncodingJobOptions {
             max_audio_channels: None,
             transcoding_max_audio_channels: None,
             is_static: false,
+            start_time_ticks: None,
             profile: None,
             video_range_type: None,
             level: None,

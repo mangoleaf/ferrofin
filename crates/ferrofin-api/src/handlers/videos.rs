@@ -1,23 +1,6 @@
-//! `VideosController` — direct video stream serving + version management.
-//!
-//! Ports the portable slice of `VideosController` plus the media download route:
-//! - `GET`/`HEAD /Videos/{itemId}/stream` — direct stream the item's file
-//! - `GET`/`HEAD /Videos/{itemId}/stream.{container}` — the extension form
-//! - `GET /Videos/{itemId}/AdditionalParts` — the item's additional parts
-//! - `POST /Videos/MergeVersions` — merge videos into one version group
-//! - `DELETE /Videos/{itemId}/AlternateSources` — split a version group apart
-//! - `GET /Items/{itemId}/Download` — download the item's media file
-//!
-//! The stream verbs resolve the item's static
-//! [`MediaSourceInfo`](ferrofin_model::dto::MediaSourceInfo) and serve its on-disk
-//! file via the shared [`streaming`](crate::handlers::streaming) helpers (Range /
-//! `HEAD` / `206` / `404`). Transcoding, stream copy, HLS, and the encoding query
-//! parameters are out of scope (no ffmpeg runner) and stay on the `501` stub.
-//!
-//! `MergeVersions` / `AlternateSources` port the version-group linkage
-//! (`PrimaryVersionId`) via the [`LibraryManager`](ferrofin_traits::library::LibraryManager);
-//! the C# `LinkedAlternateVersions` array and linked-child reroute are not modeled
-//! at that seam (see the manager docs).
+//! Videos streaming routes, direct play and progressive transcoding.
+//! Ordinary stream requests honour Static (default false), requested codecs,
+//! output container and HEAD. Universal-audio negotiation remains separate.
 
 use axum::extract::{Path, Request, State};
 use axum::http::{StatusCode, header};
@@ -42,40 +25,44 @@ use crate::state::AppState;
 /// requests yield `206 Partial Content`; `HEAD` returns headers only.
 async fn get_video_stream(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     Path(item_id): Path<Uuid>,
+    Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let path = stream_path(&state, item_id).await?;
-    serve_static_file(&path, request).await
+    let raw = request.uri().query().map(ToOwned::to_owned);
+    let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    crate::handlers::hls::validate_stream_request(&req)?;
+    if req.is_static {
+        let path = stream_path(&state, item_id).await?;
+        return serve_static_file(&path, request).await;
+    }
+    crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
 }
 
-/// `GET`/`HEAD /Videos/{itemId}/stream.{container}` — serve the item's video file.
-///
-/// Port of `VideosController.GetVideoStreamByContainer`, which forwards to
-/// `GetVideoStream` with `container` from the URL. After axum path normalization
-/// the `stream.{container}` segment is captured as a single `{container}`
-/// parameter (the `stream.` literal prefix is dropped); the captured value is the
-/// requested container hint and is ignored for the direct-stream slice.
+/// The extension route has the same Static=false default as the bare route.
 async fn get_video_stream_by_container(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
-    Path((item_id, _container)): Path<(Uuid, String)>,
-    Query(hls_query): Query<crate::handlers::hls::HlsQueryPub>,
+    axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
+    Path((item_id, container)): Path<(Uuid, String)>,
+    Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    // Direct-play the static file when the item has one; otherwise fall back to
-    // the progressive-transcode branch (VideosController.GetVideoStream), now
-    // wired to the real transcode runtime via the HlsStreamManager seam.
-    match stream_path(&state, item_id).await {
-        Ok(path) => serve_static_file(&path, request).await,
-        Err(ApiError::NotFound(_)) => {
-            let raw = request.uri().query().map(ToOwned::to_owned);
-            let req = crate::handlers::hls::request_from_query(item_id, hls_query, raw, &auth);
-            crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request)
-                .await
-        }
-        Err(other) => Err(other),
+    let raw = request.uri().query().map(ToOwned::to_owned);
+    let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    req.output_container = Some(
+        container
+            .strip_prefix("stream.")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
+            .to_owned(),
+    );
+    crate::handlers::hls::validate_stream_request(&req)?;
+    if req.is_static {
+        let path = stream_path(&state, item_id).await?;
+        return serve_static_file(&path, request).await;
     }
+    crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
 }
 
 /// Query parameters for `GET /Videos/{itemId}/AdditionalParts`.

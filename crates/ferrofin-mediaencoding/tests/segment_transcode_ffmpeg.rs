@@ -571,3 +571,55 @@ async fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// Statistics and interactive stdin are observed from a real ffmpeg process;
+/// this does not assume that a stock binary implements Jellyfin's pause keys.
+#[tokio::test]
+async fn concrete_transcoder_reports_stderr_progress_and_accepts_interactive_help() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let log = directory.path().join("progress.log");
+    let req = SpawnRequest {
+        program: "ffmpeg".to_owned(),
+        arguments: vec![
+            "-hide_banner".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "testsrc=duration=6:size=64x64:rate=10".into(),
+            "-threads".into(),
+            "1".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ],
+        working_dir: None,
+        output_dir: directory.path().to_path_buf(),
+        log_path: log.clone(),
+        env: Vec::new(),
+    };
+    let child = TokioSegmentTranscoder::new()
+        .start_transcode(&req)
+        .await
+        .unwrap();
+    child.write_stdin(b"?").await.unwrap();
+    assert_eq!(child.wait().await, 0);
+    for _ in 0..100 {
+        if child
+            .progress()
+            .is_some_and(|progress| progress.elapsed_ticks.is_some_and(|ticks| ticks > 0))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let progress = child.progress().expect("actual ffmpeg stderr statistics");
+    assert!(progress.elapsed_ticks.unwrap_or(0) > 0);
+    assert!(progress.framerate.is_some());
+    let text = std::fs::read_to_string(log).unwrap();
+    assert!(text.contains("time="));
+    // Inspecting help is harmless across stock and Jellyfin-ffmpeg; support
+    // selection is measured separately by the startup capability probe.
+}

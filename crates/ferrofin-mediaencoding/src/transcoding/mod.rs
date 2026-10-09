@@ -1,17 +1,10 @@
-//! Live transcode-job management.
-//!
-//! Port of the job-registry half of
-//! `MediaBrowser.MediaEncoding.Transcoding.TranscodeManager`: the
-//! `_activeTranscodingJobs` list and its lookup / ping / kill / begin / end
-//! operations. The ffmpeg spawn + `StreamState`/session wiring (`StartFfMpeg`,
-//! the throttler and segment cleaner) are **deferred** — this unit lands the
-//! bookkeeping the [`TranscodeManager`](ferrofin_traits::media_encoding::TranscodeManager)
-//! trait exposes. Progress reporting and job teardown call out to the
-//! [`SessionReporter`] seam so unit tests inject a fake.
+//! Live transcode registry, ffmpeg startup, progress and runtime controls.
 
 pub mod fs_wait;
 pub mod manager;
+pub mod progress;
 pub mod segment_transcoder;
+pub mod throttler;
 pub mod tokio_segment_transcoder;
 
 pub use fs_wait::FsWaiter;

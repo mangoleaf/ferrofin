@@ -105,10 +105,9 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
 ///
 /// `report_started` publishes what the job is — codecs, container, size,
 /// accelerator — the moment it spawns, which is what puts a transcode on the
-/// dashboard at all. `report_progress` stays a no-op: upstream fills the
-/// framerate and completion percentage from an ffmpeg progress reader that
-/// Ferrofin does not have yet. Building that reader is its own piece of work —
-/// see the ledger — and this is the seam it will report through.
+/// dashboard at all. The runtime calls it again with framerate, completion and
+/// bitrate from changed stderr statistics; `report_progress` remains the
+/// separate diagnostics hook and is not required by this adapter.
 struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
     releaser: R,
 }
@@ -229,7 +228,7 @@ pub fn build_media_encoding(
         Arc::clone(&media_sources),
         Arc::clone(&encoder),
         EncodingHelper::new(ffmpeg.capabilities.clone()),
-        config,
+        Arc::clone(&config),
         Arc::clone(&paths),
         Arc::clone(&subtitles),
         ffmpeg.supports_filter("tonemapx"),
@@ -248,13 +247,25 @@ pub fn build_media_encoding(
         Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
         None => Arc::new(NoopSessionReporter),
     };
-    let manager = Arc::new(TranscodeManagerImpl::new(reporter));
+    let manager = Arc::new(
+        TranscodeManagerImpl::new(reporter)
+            .with_encoding_configuration(config)
+            .with_pause_keys(
+                ferrofin_mediaencoding::transcoding::throttler::PauseKeys::select(
+                    ffmpeg.capabilities.pkey_pause_supported(),
+                    ffmpeg.capabilities.ffmpeg_version(),
+                ),
+            ),
+    );
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
     // → the job dies and its partial files are cleaned up. Spawned only when a
     // runtime exists so the sync composition unit test can still call this.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
         handle.spawn(
             Arc::clone(&manager)
                 .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),

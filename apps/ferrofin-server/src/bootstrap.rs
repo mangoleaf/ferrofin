@@ -558,6 +558,7 @@ pub async fn discover_ffmpeg(
             path: ffmpeg.clone(),
         })?;
 
+    let pkey_pause_supported = probe_runtime_pause(&ffmpeg, ffmpeg_version).await;
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
         .encoders(encoders)
@@ -567,7 +568,8 @@ pub async fn discover_ffmpeg(
         // `RuntimeInformation.OSArchitecture == Arm64`; only the Apple Silicon
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
-        .low_priority_hwaccel_flag(low_priority_hwaccel_flag);
+        .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
+        .pkey_pause_supported(pkey_pause_supported);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
     }
@@ -590,6 +592,7 @@ pub async fn discover_ffmpeg(
         platform = ?capabilities.platform(),
         tonemapx = capabilities.supports_filter("tonemapx"),
         libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
+        pkey_pause_supported,
         chromaprint_muxer,
         "media encoder ready"
     );
@@ -604,6 +607,59 @@ pub async fn discover_ffmpeg(
         capabilities,
         chromaprint_muxer,
     })
+}
+
+/// Detects Jellyfin-ffmpeg's explicit pause key from its interactive help.
+///
+/// Matches EncoderValidator.CheckSupportedRuntimeKey's input/duration and
+/// exact, case-sensitive help description. An absent key or failed probe does
+/// not grant keyboard support; the manager separately checks the legacy gate.
+async fn probe_runtime_pause(ffmpeg: &Path, version: Option<FfmpegVersion>) -> bool {
+    use tokio::io::AsyncWriteExt as _;
+    let duration = if version.is_some_and(|version| version >= FfmpegVersion::new(7, 0)) {
+        "10000"
+    } else {
+        "1000"
+    };
+    let input = format!("nullsrc=s=1x1:d={duration}");
+    let probe = async {
+        let mut child = tokio::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                &input,
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"?").await?;
+            // Closing stdin matches disposing EncoderValidator's test writer.
+            stdin.shutdown().await?;
+        }
+        let output = child.wait_with_output().await?;
+        Ok::<_, std::io::Error>(
+            String::from_utf8_lossy(&output.stderr).contains("p      pause transcoding"),
+        )
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), probe).await {
+        Ok(Ok(supported)) => supported,
+        Ok(Err(error)) => {
+            tracing::warn!(%error,"ffmpeg runtime pause probe failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("ffmpeg runtime pause probe timed out");
+            false
+        }
+    }
 }
 
 /// Runs the whole startup probe round against an already-resolved pair of

@@ -43,10 +43,24 @@ use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, Encodi
 /// Shared with [`super::hw::encoder`], which validates a passthrough codec name
 /// against the same pattern before it reaches an ffmpeg command line.
 pub(crate) fn is_valid_container(value: &str) -> bool {
-    value.len() <= 40
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b',' | b'|'))
+    ferrofin_model::media_info::is_valid_stream_identifier(value)
+}
+
+/// Infers an audio codec from the actual URL suffix.
+/// Port of EncodingHelper.InferAudioCodec; a bare URL retains its odd native
+/// whole-path fallback, while an empty/whitespace suffix uses AAC.
+#[must_use]
+pub fn infer_audio_codec(container: &str) -> String {
+    if container.trim().is_empty() {
+        return "aac".to_owned();
+    }
+    let lower = container.to_ascii_lowercase();
+    match lower.as_str() {
+        "ogg" | "oga" | "ogv" | "webm" | "webma" => "opus".to_owned(),
+        "m4a" | "m4b" | "mp4" | "mov" | "mkv" | "mka" => "aac".to_owned(),
+        "ts" | "avi" | "flv" | "f4v" | "swf" => "mp3".to_owned(),
+        _ => lower,
+    }
 }
 
 /// The H264 profiles the transcoder recognises, in ascending-quality order.

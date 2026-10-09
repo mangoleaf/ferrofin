@@ -107,6 +107,8 @@ pub enum PlaylistKind {
     /// `-hls_playlist_type vod`: the segment routes' on-demand job
     /// (`GetDynamicSegment`), whose playlist Ferrofin generates itself.
     Vod,
+    /// A single growing output file for the video/audio stream controllers.
+    Progressive,
     /// `-hls_playlist_type event` + `-hls_base_url "hls/{stem}/"` (+ the
     /// `superfast` preset and `-flags -global_header` for mpegts): the
     /// `live.m3u8` job (`GetLiveHlsStream`), whose playlist ffmpeg writes and
@@ -203,7 +205,7 @@ where
     P: StreamStatePlanner,
     T: SegmentTranscoder,
     C: EncodingOptionsProvider,
-    S: SessionReporter,
+    S: SessionReporter + 'static,
 {
     planner: P,
     transcoder: T,
@@ -248,7 +250,7 @@ where
     P: StreamStatePlanner,
     T: SegmentTranscoder,
     C: EncodingOptionsProvider,
-    S: SessionReporter,
+    S: SessionReporter + 'static,
 {
     /// The server's log directory — where every ffmpeg stderr log goes.
     ///
@@ -452,6 +454,7 @@ where
         playlist_key: &str,
         segment_path: &Path,
         ext: &str,
+        ending_ticks: i64,
     ) -> Option<ServedFile> {
         if !segment_path.exists() {
             return None;
@@ -460,7 +463,9 @@ where
         let _guard = self
             .manager
             .begin_request_guard(playlist_key, TranscodingJobType::Hls);
-        Some(served(segment_path, ext))
+        let mut file = served(segment_path, ext);
+        file.progress = self.manager.segment_progress(playlist_key, ending_ticks);
+        Some(file)
     }
 
     /// Starts (or reuses) the transcode for `request` and resolves segment
@@ -488,11 +493,16 @@ where
         let playlist_key = playlist_path.to_string_lossy().into_owned();
         let ext = segment_extension(&plan.segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, ext);
+        // These are the exact durations the playlist placed in the URL, also
+        // for variable keyframe-based remux segments. Missing query values stay 0.
+        let ending_ticks = request
+            .current_runtime_ticks
+            .wrapping_add(request.actual_segment_length_ticks);
 
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext) {
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
             return Ok(file);
         }
 
@@ -507,7 +517,7 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext) {
+        if let Some(file) = self.serve_if_present(&playlist_key, &segment_path, ext, ending_ticks) {
             return Ok(file);
         }
 
@@ -541,7 +551,9 @@ where
                     && segment_path.exists()
                 {
                     self.clear_restart_failures(&playlist_key);
-                    return Ok(served(&segment_path, ext));
+                    let mut file = served(&segment_path, ext);
+                    file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+                    return Ok(file);
                 }
             }
             // A seek (or the running job died mid-wait): drop the stale job before
@@ -599,7 +611,9 @@ where
             && segment_path.exists()
         {
             self.clear_restart_failures(&playlist_key);
-            Ok(served(&segment_path, ext))
+            let mut file = served(&segment_path, ext);
+            file.progress = self.manager.segment_progress(&playlist_key, ending_ticks);
+            Ok(file)
         } else {
             // A 5xx, not a 404: HLS clients skip past a 404'd segment and walk
             // the whole playlist (each request spawning another doomed ffmpeg);
@@ -661,7 +675,14 @@ where
 
         if init_is_complete(&init_path, &start_segment) {
             // A completed/earlier job left both — complete by construction.
-            return Ok(served(&init_path, ext));
+            let mut file = served(&init_path, ext);
+            file.progress = self.manager.segment_progress(
+                &plan.playlist_path.to_string_lossy(),
+                request
+                    .current_runtime_ticks
+                    .wrapping_add(request.actual_segment_length_ticks),
+            );
+            return Ok(file);
         }
 
         let playlist_key = plan.playlist_path.to_string_lossy().into_owned();
@@ -728,7 +749,14 @@ where
         }
 
         if init_is_complete(&init_path, &start_segment) {
-            Ok(served(&init_path, ext))
+            let mut file = served(&init_path, ext);
+            file.progress = self.manager.segment_progress(
+                &plan.playlist_path.to_string_lossy(),
+                request
+                    .current_runtime_ticks
+                    .wrapping_add(request.actual_segment_length_ticks),
+            );
+            Ok(file)
         } else {
             Err(ServiceError::NotFound(
                 "fmp4 init segment did not materialise".to_owned(),
@@ -780,7 +808,7 @@ where
     P: StreamStatePlanner,
     T: SegmentTranscoder,
     C: EncodingOptionsProvider,
-    S: SessionReporter,
+    S: SessionReporter + 'static,
 {
     async fn master_playlist(
         &self,
@@ -980,33 +1008,42 @@ where
         request: &HlsStreamRequest,
         is_audio: bool,
     ) -> Result<ServedFile, ServiceError> {
-        // The progressive-transcode branch produces a single output file; reuse
-        // the plan's output path and run the transcode to completion via the
-        // segment-0 wait (a progressive job writes one growing file).
         let plan = self
             .planner
-            .plan(request, is_audio, Some(0), PlaylistKind::Vod)
+            .plan(request, is_audio, None, PlaylistKind::Progressive)
             .await?;
         let output = plan.state.output_file_path.clone();
-        let start = StartFfMpegRequest {
-            program: &self.ffmpeg_path,
-            state: &plan.state,
-            output_path: Path::new(&output),
-            arguments: plan.arguments.clone(),
-            log_dir: self.log_dir(),
-            working_dir: None,
-            env: plan.ffmpeg_env.clone(),
-            hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
-        };
-        self.manager
-            .start_ffmpeg(&self.transcoder, start)
-            .await
-            .map_err(|e| ServiceError::backend(format!("failed to start transcode: {e}")))?;
         let ext = Path::new(&output)
             .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
             .unwrap_or_default();
-        Ok(served(Path::new(&output), &ext))
+        // Source GetTranscodedFile answers HEAD before starting ffmpeg.
+        if request.is_head_request {
+            return Ok(served(Path::new(&output), &ext));
+        }
+        let lock = self.playlist_lock(&output);
+        let _guard = lock.lock().await;
+        if !Path::new(&output).exists() {
+            let start = StartFfMpegRequest {
+                program: &self.ffmpeg_path,
+                state: &plan.state,
+                output_path: Path::new(&output),
+                arguments: plan.arguments.clone(),
+                log_dir: self.log_dir(),
+                working_dir: None,
+                env: plan.ffmpeg_env.clone(),
+                hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+            };
+            self.manager
+                .start_ffmpeg(&self.transcoder, start)
+                .await
+                .map_err(|error| {
+                    ServiceError::backend(format!("failed to start transcode: {error}"))
+                })?;
+        }
+        let mut file = served(Path::new(&output), &ext);
+        file.progress = self.manager.stream_progress(&output);
+        Ok(file)
     }
 
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError> {
@@ -1034,7 +1071,7 @@ where
     P: StreamStatePlanner,
     T: SegmentTranscoder,
     C: EncodingOptionsProvider,
-    S: SessionReporter,
+    S: SessionReporter + 'static,
 {
     /// Waits until the playlist ffmpeg is writing lists at least
     /// `min_segments` `#EXTINF:` entries, or the job exits.
@@ -1286,6 +1323,7 @@ fn served(path: &Path, ext: &str) -> ServedFile {
     ServedFile {
         path: path.to_string_lossy().into_owned(),
         content_type,
+        progress: None,
     }
 }
 
@@ -1300,7 +1338,7 @@ fn mime_for_extension(ext: &str) -> &'static str {
         "mp4" | "m4s" => "video/mp4",
         "aac" => "audio/aac",
         "mp3" => "audio/mpeg",
-        _ => "application/octet-stream",
+        _ => ferrofin_model::net::mime_types::get_mime_type(&format!("file{ext}")),
     }
 }
 
@@ -1397,7 +1435,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((is_audio, segment_id, kind));
-            let playlist = self.dir.join("out.m3u8");
+            let playlist = self.dir.join(if kind == PlaylistKind::Progressive {
+                "out.ts"
+            } else {
+                "out.m3u8"
+            });
             let state = EncodingJobInfo {
                 display: TranscodeDisplayNames::default(),
                 base_request: BaseEncodingJobOptions::default(),
@@ -1417,11 +1459,15 @@ mod tests {
                 is_input_video: true,
                 subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
                 run_time_ticks: Some(60 * 10_000_000),
-                transcoding_type: TranscodingJobType::Hls,
+                transcoding_type: if kind == PlaylistKind::Progressive {
+                    TranscodingJobType::Progressive
+                } else {
+                    TranscodingJobType::Hls
+                },
                 supported_video_codecs: Vec::new(),
                 supported_audio_codecs: Vec::new(),
                 segment_length_secs: 6,
-                wait_for_path: None,
+                wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
                 play_session_id: Some("sess".to_owned()),
                 device_id: Some("dev".to_owned()),
@@ -2188,5 +2234,49 @@ mod tests {
         // Behind the front (backward seek) or far ahead (forward seek): restart.
         assert!(!should_wait_for_running_job(Some(3), 2));
         assert!(!should_wait_for_running_job(Some(3), 6));
+    }
+
+    #[tokio::test]
+    async fn progressive_head_plans_without_spawn_and_get_reuses_the_single_output() {
+        use ferrofin_traits::media_encoding::TranscodeManager as _;
+        let directory = tempfile::tempdir().unwrap();
+        let (manager, calls, spawns) = manager_full(
+            directory.path(),
+            FakeScript {
+                extra_files: vec!["out.ts".to_owned()],
+                exits_immediately: true,
+                ..FakeScript::default()
+            },
+            "ts",
+        );
+        let mut request = req();
+        request.is_head_request = true;
+        let head = manager.transcode_stream(&request, false).await.unwrap();
+        assert!(head.path.ends_with("out.ts"));
+        assert!(!Path::new(&head.path).exists());
+        assert!(spawns.requests.lock().unwrap().is_empty());
+        request.is_head_request = false;
+        let first = manager.transcode_stream(&request, false).await.unwrap();
+        let second = manager.transcode_stream(&request, false).await.unwrap();
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.content_type, second.content_type);
+        assert_eq!(spawns.requests.lock().unwrap().len(), 1);
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| *call == (false, None, PlaylistKind::Progressive))
+        );
+        assert!(
+            manager
+                .manager
+                .get_transcoding_job_by_path(&first.path, TranscodingJobType::Progressive)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let observer = first.progress.unwrap();
+        assert!(observer.is_progressive());
     }
 }

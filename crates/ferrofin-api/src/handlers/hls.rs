@@ -97,6 +97,39 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+/// Jellyfin's registered NullableEnumModelBinder uses EnumConverter, retaining
+/// undefined Int32 values and comma combinations; FormatException leaves null.
+fn optional_encoding_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ferrofin_model::dlna::EncodingContext>, D::Error> {
+    use ferrofin_model::dlna::EncodingContext;
+    use serde::Deserialize as _;
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bits = value.split(',').try_fold(0_i32, |bits, part| {
+        let named = part.trim();
+        let number = if named.eq_ignore_ascii_case("Streaming") {
+            0
+        } else if named.eq_ignore_ascii_case("Static") {
+            1
+        } else {
+            part.trim_start()
+                .trim_end_matches('\0')
+                .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
+                .parse::<i32>()
+                .ok()?
+        };
+        Some(bits | number)
+    });
+    Ok(bits.map(|number| match number {
+        0 => EncodingContext::Streaming,
+        1 => EncodingContext::Static,
+        number => EncodingContext::Unrecognized(number),
+    }))
+}
+
 /// The `?static` / segment-shaping query parameters common to every HLS route.
 ///
 /// Only the fields the software transcode path consumes are captured; the full
@@ -135,9 +168,20 @@ struct HlsQuery {
     /// The desired segment container (`ts`/`mp4`).
     #[serde(default)]
     segment_container: Option<String>,
+    /// Progressive output container (stream.{container} or Container query).
+    #[serde(default)]
+    container: Option<String>,
+    /// Explicit streaming/static muxing context.
+    #[serde(default, deserialize_with = "optional_encoding_context")]
+    context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds.
     #[serde(default)]
     segment_length: Option<i32>,
+    /// Segment position and duration supplied by the generated playlist URL.
+    #[serde(default)]
+    runtime_ticks: i64,
+    #[serde(default)]
+    actual_segment_length_ticks: i64,
     /// The resume offset in ticks; starts the fMP4 init transcode at the resume
     /// segment so the cached init matches the seek-offset segments (avoids the
     /// resume spinner). Baked into playlist init/segment URLs on a resume.
@@ -295,7 +339,11 @@ fn build_request(
         play_session_id: query.play_session_id,
         device_id: query.device_id,
         segment_container: query.segment_container,
+        output_container: query.container,
+        context: query.context,
         segment_length: query.segment_length,
+        current_runtime_ticks: query.runtime_ticks,
+        actual_segment_length_ticks: query.actual_segment_length_ticks,
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
@@ -334,6 +382,27 @@ fn build_request(
     }
 }
 
+/// The ordinary stream controllers validate these query/route identifiers
+/// before dispatch, including Static=true requests.
+pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), ApiError> {
+    for value in [
+        &request.output_container,
+        &request.segment_container,
+        &request.video_codec,
+        &request.audio_codec,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ferrofin_model::media_info::is_valid_stream_identifier(value) {
+            return Err(ApiError::BadRequest(
+                "invalid streaming container or codec".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Serves the transcode branch of a direct-play stream route.
 ///
 /// The `/Videos|Audio/{id}/{container}` (`stream.{container}`) and
@@ -356,8 +425,29 @@ pub(crate) async fn transcode_stream_fallback(
 ) -> Result<Response, ApiError> {
     let mut req = query;
     req.item_id = item_id;
+    validate_stream_request(&req)?;
+    req.requested_url = Some(request.uri().path().to_owned());
+    req.is_head_request = request.method() == axum::http::Method::HEAD;
     let file = state.hls.transcode_stream(&req, is_audio).await?;
-    served_file_response(file, request).await
+    let mut response = if req.is_head_request {
+        Response::new(Body::empty())
+    } else {
+        crate::handlers::streaming::serve_growing_transcode(&file.path, request, file.progress)
+            .await?
+    };
+    response.headers_mut().insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("none"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(&file.content_type).map_err(|error| {
+            ApiError::from(ferrofin_traits::error::ServiceError::backend(
+                error.to_string(),
+            ))
+        })?,
+    );
+    Ok(response)
 }
 
 /// Builds an [`HlsStreamRequest`] (public to `videos`/`audio` so their direct-play
@@ -385,6 +475,23 @@ pub(crate) fn request_from_query(
 #[serde(transparent)]
 pub(crate) struct HlsQueryPub(HlsQuery);
 
+/// Universal audio declares Container as a collection, unlike ordinary streams.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct UniversalHlsQueryPub(HlsQuery);
+
+/// Retains the existing universal-audio fallback while binding its collections.
+/// Container negotiation is separate from the ordinary progressive request.
+pub(crate) fn request_from_universal_query(
+    item_id: Uuid,
+    mut query: UniversalHlsQueryPub,
+    raw_query: Option<String>,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> HlsStreamRequest {
+    query.0.container = None;
+    request_from_query(item_id, HlsQueryPub(query.0), raw_query, auth)
+}
+
 /// Serves a playlist string as an HLS `.m3u8` response.
 fn playlist_response(playlist: String) -> Response {
     (
@@ -399,8 +506,30 @@ fn playlist_response(playlist: String) -> Response {
 /// Uses the shared [`serve_static_file`](crate::handlers::streaming::serve_static_file)
 /// helper (Range/`HEAD`/`404`), then overrides the `Content-Type` with the MIME
 /// type the seam resolved for the file (ffmpeg's segment/playlist extensions).
-async fn served_file_response(file: ServedFile, request: Request) -> Result<Response, ApiError> {
-    let mut response = crate::handlers::streaming::serve_static_file(&file.path, request).await?;
+async fn served_file_response(
+    mut file: ServedFile,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let observer = file.progress.take();
+    let mut response = if let Some(observer) = observer
+        .as_ref()
+        .filter(|observer| observer.is_progressive())
+    {
+        crate::handlers::streaming::serve_growing_transcode(
+            &file.path,
+            request,
+            Some(std::sync::Arc::clone(observer)),
+        )
+        .await?
+    } else {
+        let mut response =
+            crate::handlers::streaming::serve_static_file(&file.path, request).await?;
+        if let Some(observer) = observer {
+            let body = std::mem::replace(response.body_mut(), Body::empty());
+            *response.body_mut() = crate::handlers::streaming::track_transcode_body(body, observer);
+        }
+        response
+    };
     if let Ok(value) = header::HeaderValue::from_str(&file.content_type) {
         response.headers_mut().insert(header::CONTENT_TYPE, value);
     }
@@ -741,14 +870,31 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/universal")];
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream")];
     StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
-    HlsQueryPub {} => [("get", "/Audio/{itemId}/universal")];
+    HlsQueryPub {} => [("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/stream")];
+    UniversalHlsQueryPub {"container" => ','} => [("get", "/Audio/{itemId}/universal")];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_container_is_scalar_and_universal_container_is_a_collection() {
+        let uri = "/?Container=mp3&container=flac".parse().unwrap();
+        let ordinary = Query::<HlsQueryPub>::try_from_uri(&uri).unwrap();
+        assert_eq!(ordinary.0.0.container.as_deref(), Some("mp3"));
+        let universal = Query::<UniversalHlsQueryPub>::try_from_uri(&uri).unwrap();
+        assert_eq!(universal.0.0.container.as_deref(), Some("mp3,flac"));
+        let request = request_from_universal_query(
+            Uuid::nil(),
+            universal.0,
+            None,
+            &ferrofin_traits::options::AuthorizationInfo::default(),
+        );
+        assert!(request.output_container.is_none());
+    }
 
     /// Binds `query` the way the routes do, through the shared [`Query`]
     /// extractor (keys matched ignoring case).

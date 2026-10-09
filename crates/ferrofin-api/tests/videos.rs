@@ -664,7 +664,10 @@ async fn video_stream_serves_file() {
     let app = state(&path, no_subtitles()).app;
     let router = create_router(app);
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -680,7 +683,10 @@ async fn video_stream_serves_full_body() {
     let path = media.path.clone();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -698,7 +704,7 @@ async fn video_stream_range_request_is_206_with_content_range() {
     let response = router
         .oneshot(
             Request::builder()
-                .uri(format!("/Videos/{ITEM_ID}/stream"))
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
                 .header("Authorization", "Bearer token")
                 .header(header::RANGE, "bytes=2-5")
                 .body(Body::empty())
@@ -731,7 +737,10 @@ async fn video_stream_missing_file_is_404() {
     let path = path.to_string_lossy().into_owned();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

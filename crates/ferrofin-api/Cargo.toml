@@ -46,6 +46,7 @@ tower-http = { workspace = true, features = ["fs", "trace", "cors", "compression
 tokio = { workspace = true }
 # The `Stream` impl behind the progressive Live TV response bodies.
 futures-core.workspace = true
+futures-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true

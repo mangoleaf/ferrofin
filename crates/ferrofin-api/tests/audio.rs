@@ -581,7 +581,10 @@ async fn audio_stream_by_container_serves_file() {
     let router = create_router(app);
     // `/Audio/{itemId}/stream.mp3` normalizes to `/Audio/{itemId}/{container}`.
     let resp = router
-        .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/stream.mp3")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Audio/{ITEM_ID}/stream.mp3?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);

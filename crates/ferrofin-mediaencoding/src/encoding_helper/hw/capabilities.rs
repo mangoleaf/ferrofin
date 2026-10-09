@@ -210,6 +210,7 @@ pub struct FfmpegCapabilities {
     vaapi_vulkan_drm_interop: bool,
     is_videotoolbox_av1_decode: bool,
     low_priority_hwaccel_flag: bool,
+    pkey_pause_supported: bool,
 }
 
 impl FfmpegCapabilities {
@@ -259,6 +260,12 @@ impl FfmpegCapabilities {
             .get(option.index())
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Whether ffmpeg's interactive help reports its explicit pause key.
+    #[must_use]
+    pub fn pkey_pause_supported(&self) -> bool {
+        self.pkey_pause_supported
     }
 
     /// The detected ffmpeg version, or `None` when the probe could not
@@ -497,6 +504,13 @@ impl FfmpegCapabilitiesBuilder {
     #[must_use]
     pub fn all_bsf_options(mut self, supported: bool) -> Self {
         self.caps.bsf_options = [supported; BsfOption::ALL.len()];
+        self
+    }
+
+    /// Records the interactive runtime-key probe result.
+    #[must_use]
+    pub fn pkey_pause_supported(mut self, supported: bool) -> Self {
+        self.caps.pkey_pause_supported = supported;
         self
     }
 

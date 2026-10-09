@@ -974,7 +974,7 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         call(
             &f.router,
             "GET",
-            &format!("/Videos/{id}/stream"),
+            &format!("/Videos/{id}/stream?Static=true"),
             Some(&f.viewer),
             None
         )

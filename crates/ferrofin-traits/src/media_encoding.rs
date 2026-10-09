@@ -461,8 +461,20 @@ pub struct HlsStreamRequest {
     pub device_id: Option<String>,
     /// The desired segment container, e.g. `"ts"` or `"mp4"` (`segmentContainer`).
     pub segment_container: Option<String>,
+    /// Container requested by the progressive stream route or its query.
+    pub output_container: Option<String>,
+    /// Original request path used by native progressive audio-codec inference.
+    pub requested_url: Option<String>,
+    /// HEAD resolves the output format without starting a transcode.
+    pub is_head_request: bool,
+    /// Explicit context; ordinary video defaults to Streaming and audio to Static.
+    pub context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds (`segmentLength`).
     pub segment_length: Option<i32>,
+    /// This segment's starting position from the playlist's runtimeTicks query.
+    pub current_runtime_ticks: i64,
+    /// This segment's exact duration from actualSegmentLengthTicks.
+    pub actual_segment_length_ticks: i64,
     /// The desired output audio codec (`audioCodec`).
     pub audio_codec: Option<String>,
     /// The desired output video codec (`videoCodec`).
@@ -569,7 +581,13 @@ impl Default for HlsStreamRequest {
             play_session_id: None,
             device_id: None,
             segment_container: None,
+            output_container: None,
+            requested_url: None,
+            is_head_request: false,
+            context: None,
             segment_length: None,
+            current_runtime_ticks: 0,
+            actual_segment_length_ticks: 0,
             audio_codec: None,
             video_codec: None,
             transcoding_max_audio_channels: None,
@@ -614,13 +632,44 @@ impl Default for HlsStreamRequest {
 /// caller (a `ferrofin-api` handler) streams the file at [`path`](Self::path) with
 /// [`content_type`](Self::content_type); the transcode job that produced it is
 /// kept alive / torn down by the [`HlsStreamManager`] internally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ServedFile {
     /// The absolute path of the file to serve.
     pub path: String,
     /// The MIME type to serve it as (e.g. `video/mp2t`, `application/x-mpegURL`).
     pub content_type: String,
+    /// Bound to the producing job at resolution, before any seek replacement.
+    pub progress: Option<std::sync::Arc<dyn TranscodeStreamProgress>>,
 }
+
+impl std::fmt::Debug for ServedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServedFile")
+            .field("path", &self.path)
+            .field("content_type", &self.content_type)
+            .field("has_progress", &self.progress.is_some())
+            .finish()
+    }
+}
+
+/// Records the actual lifetime and reads of a transcode HTTP response.
+///
+/// Implementations bind to the producing job, so an older response cannot
+/// update the replacement job after a seek. Dropping an observer releases its
+/// active-consumer mark and completes the callback, including cancellation.
+pub trait TranscodeStreamProgress: Send + Sync {
+    /// Records bytes read from a progressive output file.
+    fn add_bytes(&self, bytes: usize);
+    /// Records response termination (the HLS segment's ending time).
+    fn complete(&self);
+    /// Whether the producing process has exited, terminating a growing body.
+    fn has_exited(&self) -> bool;
+    /// Whether this response reads a growing progressive output file.
+    fn is_progressive(&self) -> bool;
+}
+
+fn _assert_object_safe_transcode_stream_progress(_: &dyn TranscodeStreamProgress) {}
 
 /// Serves the dynamic-HLS + transcode-stream flow behind one seam.
 ///
