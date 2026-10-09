@@ -22,7 +22,7 @@ use super::IntroSkipperConfig;
 /// passes recorded is analysed again with it, rather than stranded under an
 /// unchanged hash. Ferrofin's hashes are its own (the plugin's database is
 /// not imported), so the token costs no compatibility.
-const ANALYZERS: &str = "chromaprint,silence,keyframes";
+const ANALYZERS: &str = "chromaprint,silence,keyframes,chapters";
 
 /// C#'s `bool.ToString()`.
 fn b(value: bool) -> &'static str {

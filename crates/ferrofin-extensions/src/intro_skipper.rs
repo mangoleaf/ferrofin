@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::ffmpeg::{FfmpegService, ProcessOptions};
 use crate::fingerprint::Fingerprinter;
 
+mod chapter_analyzer;
 mod config_hash;
 mod engine;
 mod queue;
@@ -751,8 +752,7 @@ impl DetectSegmentsTask {
 
     /// Deletes the detection caches (`{item}.{mode tag}.…`: prints, silences,
     /// keyframes) of `items` (all when `None`) for `mode` (all when `None`).
-    /// Like the plugin's `DeleteByMode`, a mode nothing is cached for (Preview,
-    /// Commercial) has nothing to erase.
+    /// Like the plugin's `DeleteByMode`.
     async fn erase_cache_files(
         &self,
         items: Option<&[Uuid]>,
@@ -764,7 +764,9 @@ impl DetectSegmentsTask {
             Some(WireMode::Introduction) => Some(&["intro2", "intro"]),
             Some(WireMode::Credits) => Some(&["credits3", "credits2", "credits"]),
             Some(WireMode::Recap) => Some(&["recap2", "recap"]),
-            Some(_) => return Ok(0),
+            Some(WireMode::Preview) => Some(&["preview"]),
+            Some(WireMode::Commercial) => Some(&["commercial"]),
+            Some(WireMode::Unrecognized(_)) => return Ok(0),
         };
         let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
             Ok(entries) => entries,
@@ -858,7 +860,7 @@ impl DetectSegmentsTask {
     /// detection reads misses the cache.
     async fn detection_cached<T, F>(
         &self,
-        (entry, mode, window): (&queue::QueuedEpisode, AnalysisMode, (f64, f64)),
+        (entry, mode, window): (&queue::QueuedEpisode, WireMode, (f64, f64)),
         (kind, hash, enabled): (&str, &str, bool),
         detect: F,
     ) -> Result<Vec<T>, String>
@@ -869,7 +871,7 @@ impl DetectSegmentsTask {
         let cache = self.cache_dir.join(format!(
             "{}.{}.{}-{}.{hash}.{kind}",
             entry.episode_id,
-            mode_tag(mode),
+            cache_tag(mode),
             window.0,
             window.1
         ));
@@ -891,7 +893,7 @@ impl DetectSegmentsTask {
     async fn silences(
         &self,
         entry: &queue::QueuedEpisode,
-        mode: AnalysisMode,
+        mode: WireMode,
         window: (f64, f64),
         config: &IntroSkipperConfig,
         options: ProcessOptions,
@@ -915,7 +917,7 @@ impl DetectSegmentsTask {
     async fn keyframes(
         &self,
         entry: &queue::QueuedEpisode,
-        mode: AnalysisMode,
+        mode: WireMode,
         window: (f64, f64),
         config: &IntroSkipperConfig,
         options: ProcessOptions,
@@ -934,6 +936,19 @@ impl DetectSegmentsTask {
 /// The cache-file extensions of the detections besides the prints (`.fp`).
 const SILENCE_CACHE: &str = "silence";
 const KEYFRAME_CACHE: &str = "keyframes";
+
+/// A plugin mode's cache-file tag: its print's for the fingerprinted modes,
+/// so erasing a mode reaches every cache of it.
+fn cache_tag(mode: WireMode) -> &'static str {
+    match mode {
+        WireMode::Introduction => mode_tag(AnalysisMode::Introduction),
+        WireMode::Credits => mode_tag(AnalysisMode::Credits),
+        WireMode::Recap => mode_tag(AnalysisMode::Recap),
+        WireMode::Preview => "preview",
+        WireMode::Commercial => "commercial",
+        WireMode::Unrecognized(_) => "unrecognized",
+    }
+}
 
 /// A short filename tag for an analysis mode (part of the fingerprint-cache
 /// key).
@@ -1843,7 +1858,7 @@ mod tests {
             async move {
                 task.silences(
                     entry,
-                    AnalysisMode::Introduction,
+                    WireMode::Introduction,
                     (0.0, 5.0),
                     &config,
                     ProcessOptions::default(),
@@ -1870,6 +1885,135 @@ mod tests {
         detect(uncached.clone()).await;
         detect(uncached).await;
         assert_eq!(calls(), 4, "CacheFingerprints off: always detected");
+    }
+
+    /// The same named chapters for every item.
+    struct FakeChapters(Vec<(&'static str, i64)>);
+
+    #[async_trait]
+    impl ferrofin_traits::chapters::ChapterManager for FakeChapters {
+        async fn supports(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: Uuid,
+            _chapters: &[ferrofin_model::entities_media::ChapterInfo],
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_chapter(
+            &self,
+            _item_id: Uuid,
+            _index: i32,
+        ) -> Result<Option<ferrofin_model::entities_media::ChapterInfo>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_chapters(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<ferrofin_model::entities_media::ChapterInfo>, ServiceError> {
+            Ok(self
+                .0
+                .iter()
+                .map(
+                    |(name, seconds)| ferrofin_model::entities_media::ChapterInfo {
+                        start_position_ticks: seconds * 10_000_000,
+                        name: Some((*name).to_owned()),
+                        image_path: None,
+                        image_date_modified: chrono::Utc::now(),
+                        image_tag: None,
+                    },
+                )
+                .collect())
+        }
+        async fn delete_chapter_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// The chapter analyzer runs in the chain: a "Preview" chapter becomes
+    /// each episode's Preview segment (its end at the episode's end).
+    #[tokio::test]
+    async fn a_named_chapter_becomes_a_segment() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let task = DetectSegmentsTask {
+            chapters: Arc::new(FakeChapters(vec![("Episode", 0), ("Preview", 1700)])),
+            ..h.task.clone()
+        };
+        task.execute(&TaskProgress::default()).await.expect("run");
+        for id in [EP_A, EP_B] {
+            let preview = h
+                .actions
+                .segments(id)
+                .await
+                .expect("tier")
+                .into_iter()
+                .find(|s| s.mode == WireMode::Preview)
+                .expect("preview");
+            assert_eq!((preview.start, preview.end), (1700.0, 1800.0));
+        }
+    }
+
+    /// A Chromaprint match snaps to a chapter inside its window only with
+    /// `AdjustIntroBasedOnChapters` (chapters no pattern matches).
+    #[rstest]
+    #[case::snapping("{}", 51.0)]
+    #[case::not_snapping(r#"{"AdjustIntroBasedOnChapters":false}"#, 49.5)]
+    #[tokio::test]
+    async fn a_match_snaps_to_a_chapter_when_asked(#[case] config: &str, #[case] end: f64) {
+        let h = harness(&TWO_EPISODES, true, config, true).await;
+        let task = DetectSegmentsTask {
+            chapters: Arc::new(FakeChapters(vec![("Part A", 0), ("Part B", 51)])),
+            ..h.task.clone()
+        };
+        task.execute(&TaskProgress::default()).await.expect("run");
+        let intro = h
+            .actions
+            .segments(EP_A)
+            .await
+            .expect("tier")
+            .into_iter()
+            .find(|s| s.mode == WireMode::Introduction)
+            .expect("intro");
+        assert!((intro.end - end).abs() < 0.1, "{intro:?}");
+    }
+
+    /// The chapter analyzer leaves a user's segment alone.
+    #[tokio::test]
+    async fn the_chapter_analyzer_keeps_a_user_segment() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        h.actions
+            .update_timestamp(StoredSegment {
+                item_id: EP_A,
+                mode: WireMode::Preview,
+                start: 1650.0,
+                end: 1700.0,
+                is_user_provided: true,
+                config_hash: String::new(),
+            })
+            .await
+            .expect("user edit");
+        let task = DetectSegmentsTask {
+            chapters: Arc::new(FakeChapters(vec![("Episode", 0), ("Preview", 1700)])),
+            ..h.task.clone()
+        };
+        task.execute(&TaskProgress::default()).await.expect("run");
+        let previews = |segments: Vec<StoredSegment>| {
+            segments
+                .into_iter()
+                .filter(|s| s.mode == WireMode::Preview)
+                .map(|s| (s.start, s.end, s.is_user_provided))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            previews(h.actions.segments(EP_A).await.expect("tier")),
+            [(1650.0, 1700.0, true)]
+        );
+        assert_eq!(
+            previews(h.actions.segments(EP_B).await.expect("tier")),
+            [(1700.0, 1800.0, false)]
+        );
     }
 
     /// `ProbeAudioDuration`: credits end where a shorter audio stream does.

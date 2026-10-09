@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use chrono::{DateTime, Utc};
 use ferrofin_chromaprint::{AnalysisMode as PrintMode, CompareConfig, TimeRange, compare_episodes};
 use ferrofin_core::TaskProgress;
+use ferrofin_model::entities_media::ChapterInfo;
 use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, SeasonState, StoredSegment};
@@ -23,7 +24,7 @@ use futures_util::StreamExt as _;
 use uuid::Uuid;
 
 use super::queue::{Category, QueuedEpisode};
-use super::{DetectSegmentsTask, IntroSkipperConfig, config_hash};
+use super::{DetectSegmentsTask, IntroSkipperConfig, chapter_analyzer, config_hash};
 use crate::ffmpeg::ProcessOptions;
 use crate::fingerprint::Fingerprinter;
 
@@ -84,7 +85,7 @@ impl Item {
     }
 
     /// `NeedsAnalysis`: neither analysed nor user-provided.
-    fn needs_analysis(&self, mode: Mode) -> bool {
+    pub(super) fn needs_analysis(&self, mode: Mode) -> bool {
         !matches!(
             self.get(mode),
             EpisodeState::Analyzed | EpisodeState::UserProvided
@@ -759,11 +760,11 @@ impl DetectSegmentsTask {
                         self.chromaprint(items, mode, config, fingerprinter).await?;
                     }
                 }
-                // TODO(intro-skipper steps 7–8): `ChapterAnalyzer`,
-                // `BlackFrameAnalyzer`/`CreditsBlackFrameAnalyzer` — the
-                // chain is ordered for them already. Bump
-                // `config_hash::ANALYZERS` when one lands.
-                Analyzer::Chapter | Analyzer::BlackFrame => {}
+                Analyzer::Chapter => self.chapter_analyzer(items, mode, config).await?,
+                // TODO(intro-skipper step 8): `BlackFrameAnalyzer` /
+                // `CreditsBlackFrameAnalyzer` — the chain is ordered for them
+                // already. Bump `config_hash::ANALYZERS` when it lands.
+                Analyzer::BlackFrame => {}
             }
         }
         if mode == Mode::Credits
@@ -888,26 +889,15 @@ impl DetectSegmentsTask {
                 break;
             }
             if let Some(range) = found.get(&current).copied() {
-                let item_id = items[current].entry.episode_id;
-                let (start, end) = self
-                    .adjust_intro_times(
-                        &items[current].entry,
-                        print,
-                        (range.start, range.end),
-                        config,
-                    )
-                    .await;
-                self.actions
-                    .update_timestamp(StoredSegment {
-                        item_id,
-                        mode,
-                        start,
-                        end,
-                        is_user_provided: false,
-                        config_hash: items[current].config_hash.clone(),
-                    })
-                    .await?;
-                items[current].set(mode, EpisodeState::Analyzed);
+                let snap_to_chapters = config.adjust_intro_based_on_chapters;
+                self.store_found(
+                    &mut items[current],
+                    mode,
+                    (range.start, range.end),
+                    config,
+                    snap_to_chapters,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -978,6 +968,33 @@ impl DetectSegmentsTask {
         Ok(())
     }
 
+    /// An analyzer's find for the item: adjusted (`AdjustIntroTimesAsync`),
+    /// stored under the mode's hash, and the item marked analysed.
+    pub(super) async fn store_found(
+        &self,
+        item: &mut Item,
+        mode: Mode,
+        found: (f64, f64),
+        config: &IntroSkipperConfig,
+        snap_to_chapters: bool,
+    ) -> Result<(), ServiceError> {
+        let (start, end) = self
+            .adjust_intro_times(&item.entry, mode, found, config, snap_to_chapters)
+            .await;
+        self.actions
+            .update_timestamp(StoredSegment {
+                item_id: item.entry.episode_id,
+                mode,
+                start,
+                end,
+                is_user_provided: false,
+                config_hash: item.config_hash.clone(),
+            })
+            .await?;
+        item.set(mode, EpisodeState::Analyzed);
+        Ok(())
+    }
+
     /// `AdjustIntroTimesAsync`: the pure adjustment, then an end not snapped
     /// to the episode end moved to the next silence (`AdjustIntroBasedOnSilence`)
     /// and to the nearest keyframe (`SnapToKeyframe`) within the window. A
@@ -987,11 +1004,16 @@ impl DetectSegmentsTask {
     async fn adjust_intro_times(
         &self,
         entry: &QueuedEpisode,
-        print: PrintMode,
+        mode: Mode,
         original: (f64, f64),
         config: &IntroSkipperConfig,
+        use_chapters: bool,
     ) -> (f64, f64) {
-        let chapters = self.chapter_starts(entry.episode_id, config).await;
+        let chapters = if use_chapters {
+            self.chapter_starts(entry.episode_id).await
+        } else {
+            Vec::new()
+        };
         let adjusted = adjust_times(config, entry.duration, &chapters, original);
         let Some(window) = adjusted.window else {
             return settle_times(original, adjusted.start, adjusted.end);
@@ -999,7 +1021,7 @@ impl DetectSegmentsTask {
         let options = ProcessOptions::new(&config.process_priority, config.process_threads);
         let mut end = adjusted.end;
         if config.adjust_intro_based_on_silence {
-            match self.silences(entry, print, window, config, options).await {
+            match self.silences(entry, mode, window, config, options).await {
                 Ok(silences) => {
                     end = silence_end(
                         &silences,
@@ -1014,7 +1036,7 @@ impl DetectSegmentsTask {
             }
         }
         if config.snap_to_keyframe {
-            match self.keyframes(entry, print, window, config, options).await {
+            match self.keyframes(entry, mode, window, config, options).await {
                 Ok(keyframes) => end = nearest(keyframes.into_iter(), end),
                 Err(err) => {
                     tracing::debug!(%err, item = entry.name, "intro skipper: keyframe detection failed");
@@ -1024,19 +1046,24 @@ impl DetectSegmentsTask {
         settle_times(original, adjusted.start, end)
     }
 
-    /// The item's chapter starts (seconds), when `AdjustIntroBasedOnChapters`.
-    async fn chapter_starts(&self, item_id: Uuid, config: &IntroSkipperConfig) -> Vec<f64> {
-        if !config.adjust_intro_based_on_chapters {
-            return Vec::new();
-        }
-        #[allow(clippy::cast_precision_loss)]
+    /// The item's chapter starts (seconds).
+    async fn chapter_starts(&self, item_id: Uuid) -> Vec<f64> {
+        self.item_chapters(item_id)
+            .await
+            .iter()
+            .map(|c| chapter_analyzer::seconds(c.start_position_ticks))
+            .collect()
+    }
+
+    /// The item's chapters; none when they cannot be read.
+    pub(super) async fn item_chapters(&self, item_id: Uuid) -> Vec<ChapterInfo> {
         self.chapters
             .get_chapters(item_id)
             .await
+            .inspect_err(
+                |err| tracing::debug!(%err, %item_id, "intro skipper: chapters unreadable"),
+            )
             .unwrap_or_default()
-            .iter()
-            .map(|c| c.start_position_ticks as f64 / 10_000_000.0)
-            .collect()
     }
 
     /// `HasCachedFingerprint`: the window's print is on disk.
