@@ -4,8 +4,7 @@ Deleting `/Items/{id}/Images/Backdrop/1` previously removed every backdrop and
 returned all of their paths for deletion. It now removes only the selected slot.
 The remaining rows keep their identities and insertion order, with subsequent
 slots compacting naturally. The same behavior applies to screenshots and other
-image types. An omitted index selects zero; negative and missing indexes do
-nothing. Selection, deletion and collection of the removed path use one atomic
+image types. An omitted index selects zero; negative and missing indexes remove no stored images. Selection, deletion and collection of the removed path use one atomic
 writer statement, avoiding a separate read/delete race.
 
 The source oracle is Jellyfin `4910aafa1a`,
@@ -31,5 +30,8 @@ The native reference uses backdrops. Its unindexed screenshot uploads replace
 one image, while Ferrofin appends; that independent upload gap remains **S39**.
 Stored screenshot-slot deletion is covered by persistence and HTTP regressions.
 Shared-host timings are observations, not publishable benchmark results.
-The final workspace test and fresh core coverage gates run after S20 as part
-of this two-finding batch.
+Artwork mutation repository/save notifications and missing-slot NFO saver
+suppression remain the independent source-audit finding **S40**.
+The final shared workspace and fresh core coverage gates passed for this
+two-finding batch; their measured results are recorded in
+[the S20 review](dashboard-settings-s20.md).

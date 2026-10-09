@@ -725,12 +725,26 @@ impl FerrofinVirtualFolderManager {
     /// Resolves one `.mblink` shortcut to its target path (its whole text
     /// content, with a trailing separator trimmed — `MbLinkShortcutHandler.Resolve`).
     async fn resolve_shortcut(shortcut: &Path) -> Option<String> {
-        let content = tokio::fs::read_to_string(shortcut).await.ok()?;
-        let trimmed = content.trim_end_matches(['/', '\\']).to_owned();
-        if trimmed.is_empty() {
+        let mut content = tokio::fs::read_to_string(shortcut).await.ok()?;
+        // Path.TrimEndingDirectorySeparator removes one native separator,
+        // stopping at the root (including a Windows drive/prefix when present).
+        let root_length: usize = Path::new(&content)
+            .components()
+            .take_while(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+            .map(|component| component.as_os_str().len())
+            .sum();
+        if content.len() > root_length && content.ends_with(std::path::is_separator) {
+            content.pop();
+        }
+        if content.is_empty() {
             None
         } else {
-            Some(trimmed)
+            Some(content)
         }
     }
 
@@ -781,7 +795,12 @@ impl FerrofinVirtualFolderManager {
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
-        let target = target.trim_end_matches(['/', '\\']);
+        // A filesystem root must retain its separator to match the shortcut.
+        let target = if Path::new(target).has_root() && Path::new(target).parent().is_none() {
+            target
+        } else {
+            target.trim_end_matches(['/', '\\'])
+        };
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -1586,6 +1605,80 @@ mod tests {
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shortcut_resolution_trims_one_native_separator_and_preserves_root() {
+        let (tmp, _mgr) = manager();
+        let shortcut = tmp.path().join("case.mblink");
+        for (input, expected) in [
+            ("/", Some("/")),
+            ("//", Some("/")),
+            ("///", Some("//")),
+            ("/media/", Some("/media")),
+            ("/media//", Some("/media/")),
+            ("/media\\", Some("/media\\")),
+            ("relative/", Some("relative")),
+            ("/media/\n", Some("/media/\n")),
+            (" ", Some(" ")),
+            ("", None),
+        ] {
+            tokio::fs::write(&shortcut, input).await.unwrap();
+            assert_eq!(
+                FerrofinVirtualFolderManager::resolve_shortcut(&shortcut)
+                    .await
+                    .as_deref(),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_location_round_trips_ownership_and_removal_without_scanning() {
+        let (_tmp, _db, mgr) = manager_with_store().await;
+        mgr.add_virtual_folder(
+            "Root",
+            None,
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo { path: "/".into() }],
+                enable_realtime_monitor: false,
+                save_subtitles_with_media: false,
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        assert_eq!(folders[0].locations, ["/"]);
+        assert_eq!(mgr.get_physical_paths().await.unwrap(), ["/"]);
+        let owner = ferrofin_model::entities_media::owning_library(
+            &folders,
+            None,
+            Some("/tmp/disposable/movie.mkv"),
+        )
+        .unwrap();
+        assert_eq!(owner.name.as_deref(), Some("Root"));
+        assert!(
+            !owner
+                .library_options
+                .as_ref()
+                .unwrap()
+                .save_subtitles_with_media
+        );
+        mgr.remove_media_path("Root", "/").await.unwrap();
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(folders[0].locations.is_empty());
+        assert!(
+            folders[0]
+                .library_options
+                .as_ref()
+                .unwrap()
+                .path_infos
+                .is_empty()
+        );
     }
 
     #[tokio::test]

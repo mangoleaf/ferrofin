@@ -603,11 +603,55 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_media_segment_library_options(&api, id).await;
     verify_special_episode_display(&api, tmp.path()).await;
     verify_date_added_policy(&api, tmp.path()).await;
+    verify_root_library_location(&api).await;
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
         .unwrap();
     mock.abort();
+}
+
+async fn verify_root_library_location(api: &Api) {
+    api.post(
+        "/Library/VirtualFolders?name=Root-fixture&collectionType=movies&refreshLibrary=false",
+        &json!({"LibraryOptions":{
+            "PathInfos":[{"Path":"/"}],"EnableRealtimeMonitor":false,
+            "SaveSubtitlesWithMedia":false,
+            "TypeOptions":[{"Type":"Movie","MetadataFetchers":[],"ImageFetchers":[]}]
+        }}),
+    )
+    .await;
+    let folders = api.get("/Library/VirtualFolders").await;
+    let root = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Root-fixture")
+        .unwrap();
+    assert_eq!(root["Locations"], json!(["/"]));
+    assert_eq!(root["LibraryOptions"]["PathInfos"][0]["Path"], "/");
+    assert!(!root["ItemId"].as_str().unwrap().is_empty());
+    api.client
+        .delete(format!(
+            "{}/Library/VirtualFolders/Paths?name=Root-fixture&path=%2F&refreshLibrary=false",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let folders = api.get("/Library/VirtualFolders").await;
+    let root = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Root-fixture")
+        .unwrap();
+    assert_eq!(root["Locations"], json!([]));
+    assert_eq!(root["LibraryOptions"]["PathInfos"], json!([]));
+    // No refresh follows root configuration: only the disposable fixture was scanned.
 }
 
 /// Production registry, persisted producer output, live library saves and player filtering.
