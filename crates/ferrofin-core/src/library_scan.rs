@@ -13095,7 +13095,7 @@ fn extra_matches_owner(
 /// The three stat timestamps the creation-time rule reads.
 #[derive(Debug, Clone, Copy)]
 struct FileTimes {
-    /// The statx birth time, when the filesystem reports one.
+    /// The runtime-compatible birth time, when its platform backend has one.
     birth: Option<std::time::SystemTime>,
     /// The inode change time (`st_ctime`).
     ctime: std::time::SystemTime,
@@ -13104,13 +13104,17 @@ struct FileTimes {
 }
 
 impl FileTimes {
-    /// Reads the timestamps off a stat result. `Metadata::created()` is
-    /// `ErrorKind::Unsupported` exactly when statx reports no `STATX_BTIME` —
-    /// the same condition as .NET's `HasBirthTime`.
+    /// Linux .NET uses stat without birth-time support, while Rust can expose
+    /// statx birth times. Match the source's Linux fallback even when Rust's
+    /// `Metadata::created()` succeeds; other platforms keep their native clock.
     fn of(meta: &std::fs::Metadata) -> Self {
         let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         Self {
-            birth: meta.created().ok(),
+            birth: if cfg!(target_os = "linux") {
+                None
+            } else {
+                meta.created().ok()
+            },
             ctime: ctime_of(meta).unwrap_or(mtime),
             mtime,
         }
@@ -13132,14 +13136,10 @@ fn ctime_of(_meta: &std::fs::Metadata) -> Option<std::time::SystemTime> {
     None
 }
 
-/// .NET's `FileSystemInfo.CreationTimeUtc` on Unix (`FileStatus.Unix.cs`
-/// `GetCreationTime`): the statx birth time when the filesystem has one,
-/// otherwise "the oldest time we have in between change and modify time" —
-/// the older of `ctime` and `mtime`. Ported for fidelity rather than effect:
-/// `min(ctime, mtime)` only differs from the mtime alone when the mtime lies
-/// in the future of the inode change (clock skew, a future-dated copy) — a
-/// `cp -p`/rsync-preserved file still dates by its preserved mtime, exactly
-/// as it does on Jellyfin.
+/// .NET's `FileSystemInfo.CreationTimeUtc` uses a backend birth time when
+/// available, otherwise the older of `ctime` and `mtime`. Linux uses the
+/// latter even on filesystems with statx birth times. A copied file with a
+/// preserved old mtime therefore keeps that date, as it does on Jellyfin.
 fn creation_time_from(times: &FileTimes) -> std::time::SystemTime {
     times.birth.unwrap_or_else(|| times.ctime.min(times.mtime))
 }
@@ -16049,8 +16049,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// .NET `GetCreationTime` on Unix: the birth time wins; without one the
-    /// OLDER of ctime and mtime (not the mtime alone).
+    /// A backend birth time wins; without one the older of ctime and mtime
+    /// wins. The Linux source backend has no birth-time support.
     #[rstest::rstest]
     #[case(Some(10), 20, 30, 10)]
     #[case(Some(40), 20, 30, 40)]
@@ -16072,20 +16072,101 @@ mod tests {
         assert_eq!(super::creation_time_from(&times), at(expected));
     }
 
-    /// On a real file the stat rule agrees with the filesystem: the statx
-    /// birth time when there is one, else the older of ctime/mtime.
+    /// MetadataService.BeforeSaveInternal only re-dates a stored physical file
+    /// when its mtime changes by more than one second and creation dating is on.
+    #[rstest::rstest]
+    #[case(true, Some(100), Some(102), false, true)]
+    #[case(true, Some(100), Some(101), false, false)]
+    #[case(true, Some(100), Some(100), false, false)]
+    #[case(true, None, Some(102), false, true)]
+    #[case(true, Some(100), None, false, false)]
+    #[case(true, Some(100), Some(102), true, false)]
+    #[case(false, Some(100), Some(102), false, false)]
+    #[case(false, None, Some(102), false, false)]
+    fn creation_dating_redates_only_changed_files_under_the_live_rule(
+        #[case] creation_dating: bool,
+        #[case] stored_mtime: Option<i64>,
+        #[case] mtime: Option<i64>,
+        #[case] folder: bool,
+        #[case] should_redate: bool,
+    ) {
+        let time = |seconds| chrono::DateTime::from_timestamp(seconds, 0).unwrap();
+        let original = time(10);
+        let birth = time(20);
+        let stored = BaseItemEntity {
+            date_created: Some(original),
+            date_modified: stored_mtime.map(time),
+            ..Default::default()
+        };
+        let planned = super::Planned {
+            id: uuid::Uuid::nil(),
+            ancestors: Vec::new(),
+            entity: BaseItemEntity {
+                date_created: Some(birth),
+                date_modified: mtime.map(time),
+                is_folder: folder,
+                ..Default::default()
+            },
+        };
+        let mut refresh = super::RefreshContext::of(super::ScanRun::defaults());
+        refresh.date_added =
+            super::DateAdded::of(ferrofin_model::configuration::MetadataConfiguration {
+                use_file_creation_time_for_date_added: creation_dating,
+            });
+        assert_eq!(
+            refresh.redated(&stored, &planned),
+            should_redate.then_some(birth)
+        );
+        assert_eq!(
+            stored.date_created,
+            Some(original),
+            "saving configuration alone never rewrites stored dates"
+        );
+    }
+
+    /// A real file follows the source platform backend, including Linux's
+    /// stat fallback despite Rust having access to statx birth times.
     #[test]
-    fn file_times_read_the_birth_time_when_the_filesystem_has_one() {
+    fn creation_dating_uses_the_platform_runtime_clock() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("movie.mkv");
         std::fs::write(&file, b"x").expect("write");
         let meta = std::fs::metadata(&file).expect("stat");
         let times = super::FileTimes::of(&meta);
-        let expected = meta
-            .created()
-            .ok()
-            .unwrap_or_else(|| times.ctime.min(times.mtime));
+        let expected = if cfg!(target_os = "linux") {
+            times.ctime.min(times.mtime)
+        } else {
+            meta.created()
+                .ok()
+                .unwrap_or_else(|| times.ctime.min(times.mtime))
+        };
         assert_eq!(super::creation_time_from(&times), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn creation_dating_uses_preserved_linux_mtime_instead_of_new_birth_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("copied.mkv");
+        std::fs::write(&file, b"copied file").expect("write");
+        let preserved: std::time::SystemTime = "2020-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("known preserved date")
+            .into();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(preserved)
+            .expect("preserve mtime");
+        let meta = std::fs::metadata(&file).expect("stat");
+        assert_eq!(meta.modified().expect("mtime"), preserved);
+        let times = super::FileTimes::of(&meta);
+        assert!(
+            times.birth.is_none(),
+            "the Linux source uses stat without birth time"
+        );
+        assert_eq!(super::creation_time_from(&times), preserved);
     }
 
     /// `ResolverHelper.SetDateCreated` + the `ManagedFileSystem` directory

@@ -547,6 +547,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_local_reader_order(&api, tmp.path()).await;
     verify_media_segment_library_options(&api, id).await;
     verify_special_episode_display(&api, tmp.path()).await;
+    verify_date_added_policy(&api, tmp.path()).await;
     api.post("/System/Shutdown", &Value::Null).await;
     tokio::task::spawn_blocking(move || server.join().unwrap())
         .await
@@ -2038,5 +2039,226 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
         let result = api.get(&path).await;
         assert_eq!(names(&result), ["One", "Two"], "{path}: {result}");
         assert_eq!(result["TotalRecordCount"], 2);
+    }
+}
+
+/// A fresh registered-task execution proves the resolver and item save finished.
+async fn date_policy_scan(api: &Api) {
+    let tasks = api.get("/ScheduledTasks").await;
+    let task = tasks["Items"]
+        .as_array()
+        .or_else(|| tasks.as_array())
+        .unwrap()
+        .iter()
+        .find(|task| task["Key"] == "RefreshLibrary")
+        .unwrap();
+    let id = task["Id"].as_str().unwrap();
+    let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
+    api.post(&format!("/ScheduledTasks/Running/{id}"), &Value::Null)
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let task = api.get(&format!("/ScheduledTasks/{id}")).await;
+        let end = &task["LastExecutionResult"]["EndTimeUtc"];
+        if task["State"] == "Idle" && end.is_string() && *end != previous {
+            assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fresh date policy scan did not complete: {task}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn date_policy_ticks(item: &Value) -> i128 {
+    let value =
+        ferrofin_model::json::datetime::parse(item["DateCreated"].as_str().unwrap()).unwrap();
+    i128::from(value.timestamp()) * 10_000_000 + i128::from(value.timestamp_subsec_nanos() / 100)
+}
+
+/// Re-stat after every mtime edit: Linux uses the source's min(ctime,mtime).
+fn date_policy_creation_ticks(file: &std::path::Path) -> i128 {
+    let stat = std::fs::metadata(file).unwrap();
+    let fallback = || {
+        use std::os::unix::fs::MetadataExt as _;
+        let change = std::time::UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(stat.ctime()).unwrap(),
+                u32::try_from(stat.ctime_nsec()).unwrap(),
+            );
+        change.min(stat.modified().unwrap())
+    };
+    let creation = if cfg!(target_os = "linux") {
+        fallback()
+    } else {
+        stat.created().unwrap_or_else(|_| fallback())
+    };
+    i128::try_from(
+        creation
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            / 100,
+    )
+    .unwrap()
+}
+
+/// Live named configuration covers new resolver imports and changed/unchanged existing files.
+#[allow(clippy::too_many_lines)]
+async fn verify_date_added_policy(api: &Api, root: &std::path::Path) {
+    let media = root.join("date-added");
+    std::fs::create_dir_all(&media).unwrap();
+    let mut metadata = api.get("/System/Configuration/metadata").await;
+    metadata["UseFileCreationTimeForDateAdded"] = json!(false);
+    api.post("/System/Configuration/metadata", &metadata).await;
+    let options = json!({"PathInfos":[{"Path":media}],"EnableInternetProviders":false,
+        "EnableRealtimeMonitor":false,"MetadataSavers":[],"EnableChapterImageExtraction":false,
+        "EnableTrickplayImageExtraction":false,"TypeOptions":[{"Type":"Movie","MetadataFetchers":[],"ImageFetchers":[]}]});
+    api.post(
+        "/Library/VirtualFolders?name=Dates&collectionType=movies&refreshLibrary=false",
+        &json!({"LibraryOptions":options}),
+    )
+    .await;
+    let mut first = None;
+    // Same server/library: false -> true -> false applies to newly resolved files.
+    for (phase, creation) in [
+        ("Import false", false),
+        ("Import true", true),
+        ("Import false again", false),
+    ] {
+        metadata["UseFileCreationTimeForDateAdded"] = json!(creation);
+        api.post("/System/Configuration/metadata", &metadata).await;
+        let folder = media.join(phase);
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("Dated.mkv");
+        std::fs::write(&file, b"dated fixture").unwrap();
+        let nfo = folder.join("Dated.nfo");
+        std::fs::write(&nfo, format!("<movie><title>{phase}</title></movie>")).unwrap();
+        let born = date_policy_creation_ticks(&file);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::SystemTime::now();
+        date_policy_scan(api).await;
+        let finished = std::time::SystemTime::now();
+        let result = api
+            .get("/Items?recursive=true&includeItemTypes=Movie&fields=DateCreated,Etag")
+            .await;
+        let item = result["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["Name"] == phase)
+            .unwrap_or_else(|| panic!("import phase did not persist: {result}"))
+            .clone();
+        let date = date_policy_ticks(&item);
+        if creation {
+            assert_eq!(date, born, "new creation-enabled import: {item}");
+        } else {
+            let lower = i128::try_from(
+                started
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    / 100,
+            )
+            .unwrap();
+            let upper = i128::try_from(
+                finished
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    / 100,
+            )
+            .unwrap();
+            assert!(
+                date > born && date >= lower && date <= upper,
+                "new scan-dated import: {item}, born {born}"
+            );
+        }
+        if first.is_none() {
+            first = Some((item, file, nfo));
+        }
+    }
+    let (item, file, nfo) = first.unwrap();
+    let id = item["Id"].as_str().unwrap();
+    let path = format!("/Items/{id}?fields=DateCreated,Etag");
+    // The metadata editor permits an exact .NET tick. Preserve all seven decimal
+    // digits in unchanged/disabled refreshes; millisecond/microsecond checks hide loss.
+    let exact = "2001-02-03T04:05:06.1234567Z";
+    let mut edited = api.get(&path).await;
+    let original_name = edited["Name"].clone();
+    edited["DateCreated"] = json!(exact);
+    api.post(&format!("/Items/{id}"), &edited).await;
+    let saved = api.get(&path).await;
+    assert_eq!(
+        saved["Name"], original_name,
+        "date edit must preserve the title"
+    );
+    let mut current_date = date_policy_ticks(&saved);
+    assert_eq!(
+        current_date,
+        date_policy_ticks(&json!({"DateCreated":exact}))
+    );
+    for (index, (creation, changed)) in [
+        (false, false),
+        (true, false),
+        (true, true),
+        (false, false),
+        (false, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        metadata["UseFileCreationTimeForDateAdded"] = json!(creation);
+        api.post("/System/Configuration/metadata", &metadata).await;
+        assert_eq!(
+            date_policy_ticks(&api.get(&path).await),
+            current_date,
+            "save alone must retain existing dates"
+        );
+        if changed {
+            let offset = if creation { 3600 } else { 7200 };
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(offset))
+                .unwrap();
+        }
+        let expected = if creation && changed {
+            date_policy_creation_ticks(&file)
+        } else {
+            current_date
+        };
+        let phase = format!("Existing date phase {index}");
+        std::fs::write(&nfo, format!("<movie><title>{phase}</title></movie>")).unwrap();
+        let previous = api.get(&path).await["Etag"].clone();
+        // FullRefresh without replacement only fills missing fields, so replace
+        // metadata to make the fresh NFO title prove this refresh completed.
+        api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"), &Value::Null).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let updated = api.get(&path).await;
+            // A queued request or unrelated earlier save cannot satisfy the new
+            // NFO title plus final row Etag. Name and DateCreated persist together.
+            if updated["Name"] == phase
+                && updated["Etag"].is_string()
+                && updated["Etag"] != previous
+            {
+                assert_eq!(
+                    date_policy_ticks(&updated),
+                    expected,
+                    "creation={creation}, changed={changed}: {updated}"
+                );
+                current_date = expected;
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual date refresh did not persist: {updated}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 }
