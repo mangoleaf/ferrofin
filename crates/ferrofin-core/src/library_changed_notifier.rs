@@ -708,6 +708,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_image_update_stamps_the_save_time_and_announces_itself() {
+        // `BaseItem.UpdateToRepositoryAsync(ImageUpdate)` after an artwork change:
+        // DateLastSaved (the Etag) moves and `ItemUpdated` fires — once, and only
+        // for a row that exists.
+        use ferrofin_traits::persistence::ItemPersistenceService;
+
+        let (n, events) = notifier(Duration::from_millis(50));
+        let db = crate::test_support::test_db().await;
+        let svc = crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        item.parent_id = None;
+        item.top_parent_id = None;
+        let id = Uuid::parse_str(&item.id).expect("uuid");
+        // The stored form (`guid_to_db`), as every real writer supplies.
+        item.id = ferrofin_db::store::guid_to_db(id);
+        svc.save_items(std::slice::from_ref(&item))
+            .await
+            .expect("save");
+        // Attached after the seed save so only the touch is announced.
+        svc.set_change_notifier(Arc::clone(&n));
+        let before = crate::test_support::fetch_item(&db, id)
+            .await
+            .date_last_saved;
+
+        assert!(
+            !svc.touch_item_updated(Uuid::new_v4())
+                .await
+                .expect("missing")
+        );
+        assert!(svc.touch_item_updated(id).await.expect("touch"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let after = crate::test_support::fetch_item(&db, id)
+            .await
+            .date_last_saved;
+        assert!(after.is_some() && after != before, "the Etag input moved");
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].items_updated, vec![id.simple().to_string()]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_metadata_edit_names_no_collection_folder() {
         // `GetTopParentIds` is fed foldersAddedTo + foldersRemovedFrom. An edit

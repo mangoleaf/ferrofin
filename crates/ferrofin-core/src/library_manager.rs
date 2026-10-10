@@ -1951,7 +1951,7 @@ impl LibraryManager for FerrofinLibraryManager {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // Only backdrops and chapters may hold multiple images and thus be
         // reordered; any other type is a bad request (C# `AllowsMultipleImages`
         // guard throwing `ArgumentException` → 400).

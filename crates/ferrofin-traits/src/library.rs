@@ -423,20 +423,23 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// [`ServiceError::InvalidInput`] when `image_type` does not allow multiple
     /// images, or [`ServiceError::Backend`] on a storage failure.
+    ///
+    /// Returns whether a swap happened, i.e. whether the caller owes the
+    /// `ImageUpdate` repository save.
     async fn swap_images(
         &self,
         item_id: Uuid,
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         if !image_type_allows_multiple(image_type) {
             return Err(ServiceError::invalid_input(
                 "The change index operation is only applicable to backdrops and chapters",
             ));
         }
         let _ = (item_id, index1, index2);
-        Ok(())
+        Ok(false)
     }
 
     /// Gets an item's ancestor rows, nearest parent first, walking the

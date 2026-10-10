@@ -1414,17 +1414,19 @@ async fn update_item_image_index(
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_ref()).await?;
-    state
+    let swapped = state
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)
         .await?;
-    state
-        .providers
-        .save_metadata(
-            item_id,
-            ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
-        )
-        .await?;
+    if swapped {
+        state
+            .providers
+            .update_to_repository(
+                item_id,
+                ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+            )
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

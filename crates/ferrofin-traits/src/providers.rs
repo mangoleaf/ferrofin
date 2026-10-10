@@ -317,6 +317,25 @@ pub trait ProviderManager: Send + Sync {
         update_type: ItemUpdateType,
     ) -> Result<(), ServiceError>;
 
+    /// The repository save an artwork change performs
+    /// (`BaseItem.UpdateToRepositoryAsync`): runs the metadata savers like
+    /// [`save_metadata`](Self::save_metadata), stamps the item's save time so
+    /// its Etag moves, and announces the update to library-changed listeners.
+    ///
+    /// The default only runs the savers (for managers without a repository).
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`save_metadata`](Self::save_metadata) or the repository
+    /// save surfaces.
+    async fn update_to_repository(
+        &self,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        self.save_metadata(item_id, update_type).await
+    }
+
     /// Gets the external-id descriptors applicable to an item.
     async fn get_external_id_infos(
         &self,

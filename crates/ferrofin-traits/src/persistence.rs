@@ -443,6 +443,12 @@ pub trait ItemRepository: Send + Sync {
     ///
     /// # Errors
     ///
+    /// Returns whether the two rows were swapped. Upstream reaches its repository
+    /// save only then: a missing slot, or a non-local (remote) path on either
+    /// side, is "nothing to do".
+    ///
+    /// # Errors
+    ///
     /// [`ServiceError::Backend`] on a storage failure.
     async fn swap_item_images(
         &self,
@@ -450,7 +456,7 @@ pub trait ItemRepository: Send + Sync {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<bool, ServiceError>;
 
     /// Gets genres with their item counts.
     async fn get_genres(
@@ -1058,6 +1064,21 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<HashMap<Uuid, FolderAggregate<chrono::DateTime<chrono::Utc>>>, ServiceError> {
         let _ = folder_ids;
         Ok(HashMap::new())
+    }
+
+    /// The repository save an image mutation performs after it changed an item
+    /// (`BaseItem.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate)`): stamps
+    /// the row's `DateLastSaved` (so its Etag moves) and announces `ItemUpdated`
+    /// to the library-changed notifier. Returns whether the row exists.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
     }
 
     /// Writes an existing row's `DateLastMediaAdded`, when it differs, with

@@ -4021,7 +4021,7 @@ impl ProviderManager for LocalProviderManager {
             store.set_item_image(item_id, &image).await?;
         }
         self.remove_replaced_backdrop_file(item_id, &current, index, &image);
-        self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
+        self.update_to_repository(item_id, ItemUpdateType::ImageUpdate)
             .await
     }
 
@@ -4039,6 +4039,11 @@ impl ProviderManager for LocalProviderManager {
         let paths = store
             .delete_item_image(item_id, image_type, image_index)
             .await?;
+        // `BaseItem.DeleteImageAsync`: a missing slot is "nothing to do" — no
+        // saver, no repository save, no update notification.
+        if paths.is_empty() {
+            return Ok(());
+        }
         for path in paths {
             // Shared files can belong to a previous metadata root. Their
             // persisted layout, not today's root, identifies shared ownership.
@@ -4052,7 +4057,7 @@ impl ProviderManager for LocalProviderManager {
             }
             let _ = std::fs::remove_file(&path);
         }
-        self.save_metadata(item_id, ItemUpdateType::ImageUpdate)
+        self.update_to_repository(item_id, ItemUpdateType::ImageUpdate)
             .await
     }
 
@@ -4105,6 +4110,21 @@ impl ProviderManager for LocalProviderManager {
             && let Err(error) = saver.save(item_id, update_type).await
         {
             tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
+        Ok(())
+    }
+
+    async fn update_to_repository(
+        &self,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        // `LibraryManager.UpdateItemsAsync` runs the savers, then the save
+        // re-stamps `DateLastSaved` "after write time of externally saved
+        // metadata" and `ItemUpdated` fires.
+        self.save_metadata(item_id, update_type).await?;
+        if let Some(store) = &self.image_store {
+            store.touch_item_updated(item_id).await?;
         }
         Ok(())
     }
@@ -6176,7 +6196,7 @@ mod tests {
             _image_type: ImageType,
             _index1: i32,
             _index2: i32,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<bool, ServiceError> {
             unimplemented!()
         }
         async fn get_genres(
@@ -6376,6 +6396,10 @@ mod tests {
         recovered: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         /// The `LockedFields` it answers with, per item.
         locked: HashMap<Uuid, Vec<MetadataField>>,
+        /// The file paths its next `delete_item_image` reports as removed.
+        removed_paths: std::sync::Mutex<Vec<String>>,
+        /// The items whose save time it was asked to stamp.
+        touched: std::sync::Mutex<Vec<Uuid>>,
     }
 
     #[async_trait]
@@ -6424,6 +6448,20 @@ mod tests {
         ) -> Result<(), ServiceError> {
             self.images.lock().unwrap().push((item_id, image.clone()));
             Ok(())
+        }
+        async fn delete_item_image(
+            &self,
+            _item_id: Uuid,
+            _image_type: ImageType,
+            _index: Option<i32>,
+        ) -> Result<Vec<String>, ServiceError> {
+            Ok(std::mem::take(
+                &mut *self.removed_paths.lock().expect("lock"),
+            ))
+        }
+        async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+            self.touched.lock().expect("lock").push(item_id);
+            Ok(true)
         }
         async fn delete_items(&self, _ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
             unimplemented!()
@@ -6601,6 +6639,49 @@ mod tests {
             .with_remote_images(tmdb, items)
             .with_image_store(store, std::env::temp_dir());
         (item_id, mgr)
+    }
+
+    /// `BaseItem.DeleteImageAsync`: a missing slot is "nothing to do", but a real
+    /// deletion is followed by the `ImageUpdate` repository save.
+    #[tokio::test]
+    async fn delete_image_saves_the_item_only_when_a_slot_was_removed() {
+        let store = Arc::new(RecordingStore::default());
+        let mgr =
+            LocalProviderManager::default().with_image_store(store.clone(), std::env::temp_dir());
+        let item = Uuid::new_v4();
+
+        mgr.delete_image(item, ImageType::Backdrop, Some(7))
+            .await
+            .expect("missing slot");
+        assert!(store.touched.lock().expect("lock").is_empty());
+
+        store
+            .removed_paths
+            .lock()
+            .expect("lock")
+            .push("/nonexistent/ferrofin-s40/backdrop0.jpg".to_owned());
+        mgr.delete_image(item, ImageType::Backdrop, Some(0))
+            .await
+            .expect("real delete");
+        assert_eq!(*store.touched.lock().expect("lock"), vec![item]);
+    }
+
+    /// Artwork saves run the same repository save, and a manager with no
+    /// store still runs its savers without failing.
+    #[tokio::test]
+    async fn update_to_repository_stamps_through_the_store_when_present() {
+        let store = Arc::new(RecordingStore::default());
+        let mgr =
+            LocalProviderManager::default().with_image_store(store.clone(), std::env::temp_dir());
+        let item = Uuid::new_v4();
+        mgr.update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("update");
+        assert_eq!(*store.touched.lock().expect("lock"), vec![item]);
+        LocalProviderManager::default()
+            .update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("no store");
     }
 
     /// "Replace all metadata" of the metadata only.

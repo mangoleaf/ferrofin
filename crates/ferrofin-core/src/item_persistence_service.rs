@@ -2810,6 +2810,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let written = sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(item_id))
+            .bind(datetime_to_db(chrono::Utc::now()))
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+            > 0;
+        if written && let Some(changed) = self.changed.get() {
+            // `ItemUpdated`, as every other repository save announces it.
+            let item =
+                sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(item_id))
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .map_err(db_err)?;
+            if let Some(item) = item {
+                changed.record_updated(&[item]);
+            }
+        }
+        Ok(written)
+    }
+
     async fn never_refreshed_ids(
         &self,
         kind: BaseItemKind,

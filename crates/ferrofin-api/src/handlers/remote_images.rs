@@ -20,7 +20,6 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::providers::{
     ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteImageResult,
 };
-use ferrofin_traits::providers::ItemUpdateType;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
@@ -155,7 +154,7 @@ struct DownloadQuery {
 /// an item.
 ///
 /// Port of `RemoteImageController.DownloadRemoteImage`: stores the URL via the
-/// provider manager and records an [`ItemUpdateType::ImageUpdate`]. A missing
+/// provider manager, which performs the `ImageUpdate` repository save. A missing
 /// item is a `404`; a missing `type` is a `400`. On success `204`.
 #[utoipa::path(
     post,
@@ -185,10 +184,6 @@ async fn download_remote_image(
     state
         .providers
         .save_image_from_url(item_id, &url, image_type, None)
-        .await?;
-    state
-        .providers
-        .save_metadata(item_id, ItemUpdateType::ImageUpdate)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }

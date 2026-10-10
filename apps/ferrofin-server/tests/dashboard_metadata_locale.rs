@@ -1184,10 +1184,16 @@ async fn verify_screenshot_replacement(api: &Api, id: &str) {
 
 async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {
     let kind = "Backdrop";
+    let etag = || async { api.get(&format!("/Items/{id}")).await["Etag"].clone() };
+    // An upload is `UpdateToRepositoryAsync(ImageUpdate)`: the item's save
+    // time, and so its Etag, moves.
+    let before_upload = etag().await;
     upload_artwork(api, id, kind).await;
+    assert_ne!(etag().await, before_upload, "upload keeps the Etag");
     upload_artwork(api, id, kind).await;
     let endpoint = format!("/Items/{id}/Images");
     let before = api.get(&endpoint).await;
+    let before_delete = etag().await;
     let images: Vec<_> = before
         .as_array()
         .unwrap()
@@ -1210,8 +1216,12 @@ async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-        if index != 1 {
+        if index == 1 {
+            assert_ne!(etag().await, before_delete, "delete keeps the Etag");
+        } else {
+            // A missing slot is "nothing to do": no save, no new Etag.
             assert_eq!(api.get(&endpoint).await, before);
+            assert_eq!(etag().await, before_delete, "missing slot saved the item");
         }
     }
     assert!(!std::path::Path::new(deleted).exists());

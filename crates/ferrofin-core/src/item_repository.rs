@@ -2770,6 +2770,12 @@ async fn folder_preference(
     guid_preference(user_db.pool(), &user.id, kind).await
 }
 
+/// `!ItemImageInfo.IsLocalFile`: upstream's case-insensitive `StartsWith("http")`.
+fn is_remote_image_path(path: &str) -> bool {
+    path.get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http"))
+}
+
 #[async_trait]
 impl ItemRepository for FerrofinItemRepository {
     async fn filter_folder_children(
@@ -3155,12 +3161,7 @@ impl ItemRepository for FerrofinItemRepository {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
-        // A same-index swap is a no-op (matching C#, where swapping a row with
-        // itself changes nothing) and avoids a needless write.
-        if index1 == index2 {
-            return Ok(());
-        }
+    ) -> Result<bool, ServiceError> {
         // Load this item's rows for the requested type in the same stable order
         // get_image_infos exposes, so the caller's 0-based indices address the
         // same images the read side does.
@@ -3178,11 +3179,15 @@ impl ItemRepository for FerrofinItemRepository {
         // Out-of-range indices are a no-op — the C# `GetImageInfo` returns null and
         // SwapImagesAsync bails with "nothing to do".
         let (Ok(i1), Ok(i2)) = (usize::try_from(index1), usize::try_from(index2)) else {
-            return Ok(());
+            return Ok(false);
         };
         let (Some(first), Some(second)) = (rows.get(i1), rows.get(i2)) else {
-            return Ok(());
+            return Ok(false);
         };
+        // `!info.IsLocalFile` on either side: "Not supported yet", nothing done.
+        if is_remote_image_path(&first.path) || is_remote_image_path(&second.path) {
+            return Ok(false);
+        }
 
         // C# swaps the two on-disk files and clears the cached dimensions. The
         // portable equivalent over stored rows is to exchange the two rows' paths
@@ -3213,7 +3218,7 @@ impl ItemRepository for FerrofinItemRepository {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(true)
     }
 
     async fn get_genres(
@@ -6035,10 +6040,12 @@ mod tests {
         }
 
         // Swap index 0 (/a.jpg) with index 2 (/c.jpg).
-        repository
-            .swap_item_images(item, ImageType::Backdrop, 0, 2)
-            .await
-            .expect("swap");
+        assert!(
+            repository
+                .swap_item_images(item, ImageType::Backdrop, 0, 2)
+                .await
+                .expect("swap")
+        );
 
         let images = repository.get_image_infos(item).await.expect("images");
         assert_eq!(images.len(), 3);
@@ -6071,14 +6078,60 @@ mod tests {
         .expect("insert backdrop");
 
         // Index 5 does not exist — a faithful no-op, and the row is untouched.
-        repository
-            .swap_item_images(item, ImageType::Backdrop, 0, 5)
-            .await
-            .expect("noop swap");
+        assert!(
+            !repository
+                .swap_item_images(item, ImageType::Backdrop, 0, 5)
+                .await
+                .expect("noop swap")
+        );
         let images = repository.get_image_infos(item).await.expect("images");
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].path, "/only.jpg");
         assert_eq!(images[0].width, 1920);
+        // Upstream swaps a slot with itself like any other pair: dimensions
+        // reset and the repository save follows.
+        assert!(
+            repository
+                .swap_item_images(item, ImageType::Backdrop, 0, 0)
+                .await
+                .expect("same-slot swap")
+        );
+        assert_eq!(
+            repository.get_image_infos(item).await.expect("images")[0].width,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_item_images_ignores_remote_urls() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9400);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Remote Backdrop").await;
+        for (n, path) in [(0u128, "/local.jpg"), (1, "HTTPS://example.test/b.jpg")] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+            )
+            .bind(guid_to_db(Uuid::from_u128(0x9410 + n)))
+            .bind(guid_to_db(item))
+            .bind(path)
+            .execute(db.writer())
+            .await
+            .expect("insert backdrop");
+        }
+        // `!IsLocalFile` on either side: "Not supported yet", nothing changes.
+        assert!(
+            !repository
+                .swap_item_images(item, ImageType::Backdrop, 0, 1)
+                .await
+                .expect("remote swap")
+        );
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert_eq!(images[0].path, "/local.jpg");
+        assert_eq!(images[0].width, 1920);
+        assert_eq!(images[1].path, "HTTPS://example.test/b.jpg");
     }
 
     #[tokio::test]
