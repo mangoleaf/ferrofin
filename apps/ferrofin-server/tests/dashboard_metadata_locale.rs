@@ -494,6 +494,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_nfo_image_order_culture(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_indexed_artwork_deletion(&api, id).await;
+    verify_replaced_artwork_cleanup_failure(&api, id).await;
     verify_indexed_artwork_upload(&api, id).await;
     verify_screenshot_replacement(&api, id).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
@@ -1182,6 +1183,53 @@ async fn verify_screenshot_replacement(api: &Api, id: &str) {
     assert_eq!(api.get(&endpoint).await, before);
 }
 
+/// `ImageSaver.SaveImage` stores the new image before it deletes the previous
+/// file, and only "file not found" is forgiven: an undeletable previous file
+/// fails the request while the replacement stays published.
+async fn verify_replaced_artwork_cleanup_failure(api: &Api, id: &str) {
+    let endpoint = format!("/Items/{id}/Images");
+    upload_artwork(api, id, "Primary").await;
+    let primary = |images: Value| -> String {
+        images
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|image| image["ImageType"] == "Primary")
+            .unwrap()["Path"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let before = primary(api.get(&endpoint).await);
+    // Turn the stored file into a directory with content: it can no longer be
+    // removed as a file, whatever the library's destination setting.
+    let stuck = std::path::PathBuf::from(&before);
+    std::fs::remove_file(&stuck).unwrap();
+    std::fs::create_dir(&stuck).unwrap();
+    std::fs::write(stuck.join("keep"), b"x").unwrap();
+    // A different extension makes the new file a different path from the old.
+    let response = api
+        .client
+        .post(format!("{}{endpoint}/Primary", api.base))
+        .header("Authorization", &api.auth)
+        .header("Content-Type", "image/jpeg")
+        .body("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let after = primary(api.get(&endpoint).await);
+    assert_ne!(after, before, "the replacement stays persisted");
+    assert!(std::path::Path::new(&after).is_file());
+    assert!(stuck.join("keep").is_file(), "the undeletable file remains");
+    std::fs::remove_dir_all(&stuck).unwrap();
+}
+
 async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {
     let kind = "Backdrop";
     let etag = || async { api.get(&format!("/Items/{id}")).await["Etag"].clone() };
@@ -1412,6 +1460,22 @@ async fn verify_artwork_destinations(
             .as_ref()
     );
     verify_extra_thumbs_duplication(api, library, options, id, media).await;
+    // Keep the stored Primary out of the media folder first: replacing a file
+    // that cannot be deleted fails the upload (see S36), whereas this checks
+    // that an unwritable *destination* falls back to the internal image.
+    options["SaveLocalMetadata"] = json!(false);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
+    upload_artwork(api, id, "Primary").await;
+    options["SaveLocalMetadata"] = json!(true);
+    api.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        &json!({"Id":library,"LibraryOptions":options}),
+    )
+    .await;
     std::fs::remove_file(media.join("poster.png")).unwrap();
     std::fs::create_dir(media.join("poster.png")).unwrap();
     upload_artwork(api, id, "Primary").await;

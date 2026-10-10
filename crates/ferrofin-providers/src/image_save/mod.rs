@@ -14,6 +14,30 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// A published image together with the outcome of removing the file it
+/// replaced.
+///
+/// `ImageSaver.SaveImage` stores the new path on the item *before* it deletes
+/// the previous file and lets any deletion error other than "not found"
+/// escape; callers therefore persist [`image`](Self::image) first and then
+/// surface [`cleanup`](Self::cleanup).
+#[derive(Debug)]
+pub struct SavedImage {
+    /// The image to persist, at its published destination.
+    pub image: ItemImageInfo,
+    /// The failure to remove the previous file, when removal was attempted.
+    pub cleanup: Option<ServiceError>,
+}
+
+impl SavedImage {
+    fn clean(image: ItemImageInfo) -> Self {
+        Self {
+            image,
+            cleanup: None,
+        }
+    }
+}
+
 struct Selection<'a> {
     index: usize,
     current: &'a [ItemImageInfo],
@@ -58,15 +82,17 @@ impl ImageFileSaver {
     /// # Errors
     /// Returns a repository/configuration failure or an unrecoverable duplicate
     /// output failure. A single unwritable media destination falls back internally.
+    /// A failure to remove the replaced file is reported in
+    /// [`SavedImage::cleanup`], with the new image already published.
     pub async fn save(
         &self,
         item: &BaseItemEntity,
         image: ItemImageInfo,
         index: usize,
         current: &[ItemImageInfo],
-    ) -> Result<ItemImageInfo, ServiceError> {
+    ) -> Result<SavedImage, ServiceError> {
         let Some(settings) = self.settings(item).await? else {
-            return Ok(image);
+            return Ok(SavedImage::clean(image));
         };
         self.publish(
             item,
@@ -116,7 +142,12 @@ impl ImageFileSaver {
                     )
                     .await
                 {
-                    Ok(saved) => *image = saved,
+                    Ok(saved) => {
+                        *image = saved.image;
+                        if let Some(error) = saved.cleanup {
+                            failure.get_or_insert(error);
+                        }
+                    }
                     Err(error) => {
                         failure.get_or_insert(error);
                     }
@@ -191,11 +222,11 @@ impl ImageFileSaver {
         image: ItemImageInfo,
         selection: Selection<'_>,
         settings: &Settings,
-    ) -> Result<ItemImageInfo, ServiceError> {
+    ) -> Result<SavedImage, ServiceError> {
         if !self.managed(Path::new(&image.path))
             || !policy::eligible(item, settings.series.as_ref(), image.image_type)
         {
-            return Ok(image);
+            return Ok(SavedImage::clean(image));
         }
         let extension = Path::new(&image.path)
             .extension()
@@ -210,7 +241,7 @@ impl ImageFileSaver {
         }
         .destinations(image.image_type, &extension, selection.index);
         if paths.is_empty() {
-            return Ok(image);
+            return Ok(SavedImage::clean(image));
         }
         let old = selection
             .previous
@@ -226,23 +257,39 @@ impl ImageFileSaver {
         let source = PathBuf::from(&image.path);
         let destination = paths[0].clone();
         let duplicate = paths.len() > 1;
-        let copied = tokio::task::spawn_blocking(move || {
-            let result = copy_images(&source, &paths, old.as_deref());
-            if result.is_err() && !duplicate && source.is_file() {
-                remove_previous(old.as_deref(), std::slice::from_ref(&source));
+        let old_path = old.clone();
+        let (copied, cleanup) = tokio::task::spawn_blocking(move || {
+            match copy_images(&source, &paths, old.as_deref()) {
+                Ok(cleanup) => (Ok(()), cleanup),
+                Err(error) => {
+                    // The retained internal image is the new image, so the
+                    // replaced file still goes.
+                    let cleanup = (!duplicate && source.is_file())
+                        .then(|| remove_previous(old.as_deref(), std::slice::from_ref(&source)))
+                        .and_then(Result::err);
+                    (Err(error), cleanup)
+                }
             }
-            result
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))?;
+        let cleanup = cleanup.map(|error| {
+            ServiceError::backend(format!(
+                "remove replaced artwork {}: {error}",
+                old_path.as_deref().unwrap_or(Path::new("")).display()
+            ))
+        });
         match copied {
-            Ok(()) => Ok(ItemImageInfo {
-                path: destination.to_string_lossy().into_owned(),
-                date_modified: std::fs::metadata(&destination)
-                    .ok()
-                    .and_then(|info| info.modified().ok())
-                    .map_or(image.date_modified, chrono::DateTime::from),
-                ..image
+            Ok(()) => Ok(SavedImage {
+                image: ItemImageInfo {
+                    path: destination.to_string_lossy().into_owned(),
+                    date_modified: std::fs::metadata(&destination)
+                        .ok()
+                        .and_then(|info| info.modified().ok())
+                        .map_or(image.date_modified, chrono::DateTime::from),
+                    ..image
+                },
+                cleanup,
             }),
             Err(error) if duplicate => Err(ServiceError::backend(format!(
                 "write duplicated artwork {}: {error}",
@@ -250,7 +297,7 @@ impl ImageFileSaver {
             ))),
             Err(error) => {
                 tracing::warn!(%error,path=%destination.display(),"media artwork destination failed; retaining internal image");
-                Ok(image)
+                Ok(SavedImage { image, cleanup })
             }
         }
     }
@@ -261,27 +308,46 @@ fn shared(path: &Path) -> bool {
         .any(|part| part.as_os_str() == crate::provider_manager::SHARED_ALBUM_ARTWORK_DIR)
 }
 
-fn copy_images(source: &Path, paths: &[PathBuf], old: Option<&Path>) -> std::io::Result<()> {
+/// Writes every destination, then removes the replaced file and the staged
+/// source. `Err` means a destination could not be written; `Ok(Some(_))` means
+/// the images were published but the previous file could not be removed.
+fn copy_images(
+    source: &Path,
+    paths: &[PathBuf],
+    old: Option<&Path>,
+) -> std::io::Result<Option<std::io::Error>> {
     let bytes = std::fs::read(source)?;
     for path in paths {
         if path != source && std::fs::read(path).ok().as_deref() != Some(bytes.as_slice()) {
             ferrofin_util::file_helper::atomic_write_media(path, &bytes)?;
         }
     }
-    remove_previous(old, paths);
+    let cleanup = remove_previous(old, paths).err();
     if !paths.iter().any(|path| path == source) && !shared(source) {
         let _ = std::fs::remove_file(source);
     }
-    Ok(())
+    Ok(cleanup)
 }
 
-fn remove_previous(old: Option<&Path>, paths: &[PathBuf]) {
-    if let Some(old) = old
-        && !paths.iter().any(|path| path == old)
-        && let Err(error) = std::fs::remove_file(old)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(%error, path=%old.display(), "could not remove replaced artwork");
+/// `ImageSaver`'s "Delete the current path": skipped when any saved path equals
+/// it ignoring case (`OrdinalIgnoreCase`), and only "file not found" is
+/// forgiven — every other failure is returned.
+fn remove_previous(old: Option<&Path>, paths: &[PathBuf]) -> std::io::Result<()> {
+    let Some(old) = old else {
+        return Ok(());
+    };
+    let same = |path: &PathBuf| {
+        ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+            &path.to_string_lossy(),
+            &old.to_string_lossy(),
+        )
+    };
+    if paths.iter().any(same) {
+        return Ok(());
+    }
+    match std::fs::remove_file(old) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -296,7 +362,11 @@ mod tests {
         let dest = tmp.path().join("folder.png");
         std::fs::write(&source, b"art").unwrap();
         std::fs::write(&old, b"old").unwrap();
-        copy_images(&source, std::slice::from_ref(&dest), Some(&old)).unwrap();
+        assert!(
+            copy_images(&source, std::slice::from_ref(&dest), Some(&old))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"art");
         assert!(!source.exists());
         assert!(!old.exists());
@@ -308,6 +378,44 @@ mod tests {
             modified
         );
     }
+    /// `ImageSaver.SaveImage` forgives only "file not found" when deleting the
+    /// previous image, compares saved paths ignoring case, and has already
+    /// published the new image when the deletion fails.
+    #[test]
+    fn previous_file_failures_follow_the_saver_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("internal.png");
+        let dest = tmp.path().join("folder.png");
+        std::fs::write(&source, b"new").unwrap();
+        // An undeletable previous file (a non-empty directory) is reported,
+        // after the new image was written and the staged source removed.
+        let stuck = tmp.path().join("old.jpg");
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("keep"), b"x").unwrap();
+        let cleanup = copy_images(&source, std::slice::from_ref(&dest), Some(&stuck)).unwrap();
+        assert!(cleanup.is_some());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!source.exists());
+        // An already-absent previous file is fine.
+        std::fs::write(&source, b"new").unwrap();
+        let missing = tmp.path().join("gone.jpg");
+        assert!(
+            copy_images(&source, std::slice::from_ref(&dest), Some(&missing))
+                .unwrap()
+                .is_none()
+        );
+        // A previous path equal to a saved path ignoring case is kept.
+        std::fs::write(&source, b"new").unwrap();
+        let alias = tmp.path().join("FOLDER.PNG");
+        std::fs::write(&alias, b"old").unwrap();
+        assert!(
+            copy_images(&source, std::slice::from_ref(&dest), Some(&alias))
+                .unwrap()
+                .is_none()
+        );
+        assert!(alias.exists());
+    }
+
     #[test]
     fn failed_output_preserves_source_and_old_cover_and_shared_covers_remain_owned() {
         let tmp = tempfile::tempdir().unwrap();

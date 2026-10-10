@@ -9215,7 +9215,12 @@ impl LibraryScanner {
             && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
         {
             match saver.save(&row, album_cover.clone(), 0, &existing).await {
-                Ok(saved) => album_cover = saved,
+                Ok(saved) => {
+                    album_cover = saved.image;
+                    if let Some(error) = saved.cleanup {
+                        tracing::warn!(%error, item_id=%album_uuid, "could not remove replaced album artwork");
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(%error, item_id=%album_uuid, "could not publish album artwork");
                 }

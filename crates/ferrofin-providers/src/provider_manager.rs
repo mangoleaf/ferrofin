@@ -2704,25 +2704,27 @@ impl LocalProviderManager {
         })
     }
 
-    fn remove_replaced_backdrop_file(
+    /// `ImageSaver.SaveImage`'s "Delete the current path" for a file kept in the
+    /// internal metadata tree. Narrower than upstream's `Contains` test: only a
+    /// file inside this item's own folder, referenced once, and not the shared
+    /// album artwork is removed, so a path an unrelated record points at is
+    /// never deleted. Only a missing file is forgiven; other failures return.
+    fn remove_replaced_internal_file(
         &self,
         item_id: Uuid,
         current: &[ItemImageInfo],
         slot: usize,
         image: &ItemImageInfo,
-    ) {
-        if image.image_type != ImageType::Backdrop {
-            return;
-        }
+    ) -> Result<(), ServiceError> {
         let Some(previous) = current
             .iter()
-            .filter(|old| old.image_type == ImageType::Backdrop)
+            .filter(|old| old.image_type == image.image_type)
             .nth(slot)
         else {
-            return;
+            return Ok(());
         };
         let Some(root) = &self.metadata_dir else {
-            return;
+            return Ok(());
         };
         let old = std::path::Path::new(&previous.path);
         if ferrofin_util::string_extensions::equals_ordinal_ignore_case(&previous.path, &image.path)
@@ -2741,24 +2743,25 @@ impl LocalProviderManager {
                 .count()
                 > 1
         {
-            return;
+            return Ok(());
         }
         let Some(parent) = old.parent().and_then(|parent| parent.canonicalize().ok()) else {
-            return;
+            return Ok(());
         };
         let Ok(owned_root) = root
             .join(ferrofin_db::store::guid_to_db(item_id))
             .canonicalize()
         else {
-            return;
+            return Ok(());
         };
         if !parent.starts_with(owned_root) {
-            return;
+            return Ok(());
         }
-        if let Err(error) = std::fs::remove_file(old)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, path=%old.display(), "could not remove replaced internal backdrop");
+        match std::fs::remove_file(old) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(
+                ServiceError::backend(format!("remove replaced image {}: {error}", old.display())),
+            ),
+            _ => Ok(()),
         }
     }
 
@@ -4008,10 +4011,13 @@ impl ProviderManager for LocalProviderManager {
         let write_index = image_upload_file_index(image_type, index, &current)?;
         let mut image =
             self.write_image_file(item_id, content, mime_type, image_type, write_index)?;
+        let mut cleanup = None;
         if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
             && let Some(row) = items.retrieve_item(item_id).await?
         {
-            image = saver.save(&row, image, index, &current).await?;
+            let saved = saver.save(&row, image, index, &current).await?;
+            image = saved.image;
+            cleanup = saved.cleanup;
         }
         if multiple && self.items.is_some() {
             store
@@ -4020,7 +4026,15 @@ impl ProviderManager for LocalProviderManager {
         } else {
             store.set_item_image(item_id, &image).await?;
         }
-        self.remove_replaced_backdrop_file(item_id, &current, index, &image);
+        // `ImageSaver.SaveImage` has already set the new path when it deletes
+        // the previous file, and a deletion failure escapes before the
+        // controller's repository save: the new image stays persisted, the
+        // caller sees the error, and the item is not re-saved.
+        let backdrop = self.remove_replaced_internal_file(item_id, &current, index, &image);
+        if let Some(error) = cleanup {
+            return Err(error);
+        }
+        backdrop?;
         self.update_to_repository(item_id, ItemUpdateType::ImageUpdate)
             .await
     }
@@ -8367,16 +8381,59 @@ mod tests {
             path: previous_path.to_string_lossy().into_owned(),
             ..replacement.clone()
         };
-        manager.remove_replaced_backdrop_file(
-            item_id,
-            std::slice::from_ref(&previous),
-            0,
-            &replacement,
-        );
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                0,
+                &replacement,
+            )
+            .unwrap();
         assert!(
             previous_path.is_file(),
             "source compares saved paths ignoring case"
         );
+    }
+
+    /// A failed deletion of the replaced internal backdrop is reported, while
+    /// an already-missing file is not.
+    #[test]
+    fn replaced_backdrop_deletion_failures_are_returned() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9023);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let replacement = manager
+            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .unwrap();
+        let previous_path = std::path::Path::new(&replacement.path).with_file_name("old.jpg");
+        let previous = ItemImageInfo {
+            path: previous_path.to_string_lossy().into_owned(),
+            ..replacement.clone()
+        };
+        // Missing: forgiven.
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                0,
+                &replacement,
+            )
+            .unwrap();
+        // A non-empty directory cannot be removed as a file.
+        std::fs::create_dir(&previous_path).unwrap();
+        std::fs::write(previous_path.join("keep"), b"x").unwrap();
+        let error = manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                0,
+                &replacement,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("remove replaced image"));
     }
 
     #[test]
@@ -8414,7 +8471,9 @@ mod tests {
         };
         // Another slot can carry the same file's case alias on a
         // case-insensitive filesystem. Preserve its owned backing file.
-        manager.remove_replaced_backdrop_file(item_id, &[previous.clone(), alias], 0, &replacement);
+        manager
+            .remove_replaced_internal_file(item_id, &[previous.clone(), alias], 0, &replacement)
+            .unwrap();
         assert_eq!(std::fs::read(previous.path).unwrap(), b"referenced");
         assert_eq!(std::fs::read(replacement.path).unwrap(), b"replacement");
     }
@@ -8439,12 +8498,14 @@ mod tests {
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(2))
             .unwrap();
-        manager.remove_replaced_backdrop_file(
-            item_id,
-            std::slice::from_ref(&previous),
-            0,
-            &replacement,
-        );
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                0,
+                &replacement,
+            )
+            .unwrap();
         assert!(!std::path::Path::new(&previous.path).exists());
         assert_eq!(std::fs::read(&replacement.path).unwrap(), b"later");
         let outside = tempfile::tempdir().unwrap();
@@ -8454,12 +8515,14 @@ mod tests {
             path: external_path.to_string_lossy().into_owned(),
             ..previous.clone()
         };
-        manager.remove_replaced_backdrop_file(
-            item_id,
-            std::slice::from_ref(&external),
-            0,
-            &replacement,
-        );
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&external),
+                0,
+                &replacement,
+            )
+            .unwrap();
         assert!(external_path.is_file());
         #[cfg(unix)]
         {
@@ -8475,12 +8538,14 @@ mod tests {
                     .into_owned(),
                 ..previous.clone()
             };
-            manager.remove_replaced_backdrop_file(
-                item_id,
-                std::slice::from_ref(&linked),
-                0,
-                &replacement,
-            );
+            manager
+                .remove_replaced_internal_file(
+                    item_id,
+                    std::slice::from_ref(&linked),
+                    0,
+                    &replacement,
+                )
+                .unwrap();
             assert!(external_path.is_file());
         }
         let shared_path = directory
@@ -8494,25 +8559,26 @@ mod tests {
             path: shared_path.to_string_lossy().into_owned(),
             ..previous.clone()
         };
-        manager.remove_replaced_backdrop_file(
-            item_id,
-            std::slice::from_ref(&shared),
-            0,
-            &replacement,
-        );
+        manager
+            .remove_replaced_internal_file(item_id, std::slice::from_ref(&shared), 0, &replacement)
+            .unwrap();
         assert!(shared_path.is_file());
         // A historical duplicate path still used by another slot is retained.
         std::fs::write(&previous.path, b"retained").unwrap();
         let duplicate = [previous.clone(), previous.clone()];
-        manager.remove_replaced_backdrop_file(item_id, &duplicate, 0, &replacement);
+        manager
+            .remove_replaced_internal_file(item_id, &duplicate, 0, &replacement)
+            .unwrap();
         assert_eq!(std::fs::read(&previous.path).unwrap(), b"retained");
         // Appending has no previous slot to delete.
-        manager.remove_replaced_backdrop_file(
-            item_id,
-            std::slice::from_ref(&previous),
-            1,
-            &replacement,
-        );
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                1,
+                &replacement,
+            )
+            .unwrap();
         assert_eq!(std::fs::read(previous.path).unwrap(), b"retained");
     }
 
