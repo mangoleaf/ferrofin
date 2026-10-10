@@ -1198,6 +1198,20 @@ pub async fn build_app_state(
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().dummy_chapter_duration
     })
+    // The saved `xbmcmetadata` options (ReleaseDateFormat, UserId) every NFO
+    // sidecar is parsed with, re-read when the dashboard changes the file.
+    .with_nfo_configuration({
+        use ferrofin_traits::configuration::ServerConfigurationManager as _;
+        let source = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
+            std::path::PathBuf::from(
+                config_mgr
+                    .application_paths()
+                    .user_configuration_directory_path(),
+            )
+            .join("named/xbmcmetadata.json"),
+        ));
+        move || source.current()
+    })
     .with_metadata_locale({
         let config_mgr = Arc::clone(&config_mgr);
         move || {

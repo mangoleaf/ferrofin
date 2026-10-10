@@ -53,19 +53,12 @@ pub fn try_read_date_time(reader: &mut XmlCursor) -> Option<DateTime<Utc>> {
 /// Parses a `DateTime` from the current node using an exact format
 /// (`XmlReaderExtensions.TryReadDateTimeExact`).
 ///
-/// Only the `yyyy-MM-dd` format string is used by the NFO configuration; it is
-/// matched against a bare date (midnight UTC).
+/// `DateTime.TryParseExact(content, format, InvariantCulture, AssumeUniversal |
+/// AdjustToUniversal)`: the element text is matched as written (no trimming)
+/// against any .NET date pattern, see [`super::dotnet_date`]. A malformed
+/// pattern yields no date; upstream's `FormatException` would abort the read.
 pub fn try_read_date_time_exact(reader: &mut XmlCursor, format: &str) -> Option<DateTime<Utc>> {
-    let text = reader.read_element_content_as_string();
-    let text = text.trim();
-    if format == "yyyy-MM-dd" {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|dt| Utc.from_utc_datetime(&dt))
-    } else {
-        parse_date_time_flexible(text)
-    }
+    super::dotnet_date::try_parse_exact(&reader.read_element_content_as_string(), format)
 }
 
 /// Parses a date-time in any of the NFO-supported layouts as UTC.

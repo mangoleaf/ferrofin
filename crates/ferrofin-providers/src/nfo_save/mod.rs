@@ -374,6 +374,9 @@ impl NfoSaver {
         config: &NfoConfiguration,
     ) -> Result<String, ServiceError> {
         use ferrofin_model::data::BaseItemKind;
+        if let Some(reason) = saver::release_date_format_error(&result.item, config) {
+            return Err(ServiceError::invalid_input(reason));
+        }
         Ok(match result.item.kind {
             NfoItemKind::Episode => saver::save_episode(result, config),
             NfoItemKind::Series => saver::save_series(result, config),

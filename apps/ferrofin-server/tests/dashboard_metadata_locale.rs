@@ -1048,6 +1048,38 @@ async fn verify_nfo_savers(
     .await;
     api.post(&item_url, &body).await;
     assert!(!std::fs::read_to_string(&nfo).unwrap().contains("<art>"));
+    // ReleaseDateFormat is any .NET pattern: dates are written with it, and a
+    // malformed one fails the save (as FormatException does) without losing
+    // the edit.
+    body["PremiereDate"] = json!("1999-03-31T00:00:00.0000000Z");
+    for (format, expected) in [
+        ("dd.MM.yyyy", Some("<premiered>31.03.1999</premiered>")),
+        (
+            "MMMM d, yyyy",
+            Some("<premiered>March 31, 1999</premiered>"),
+        ),
+        ("H", None),
+    ] {
+        api.post(
+            "/System/Configuration/xbmcmetadata",
+            &json!({"SaveImagePathsInNfo":false,"ReleaseDateFormat":format}),
+        )
+        .await;
+        let before = std::fs::read_to_string(&nfo).unwrap();
+        body["Name"] = json!(format!("Dated {format}"));
+        api.post(&item_url, &body).await;
+        assert_eq!(api.get(&item_url).await["Name"], body["Name"]);
+        let saved = std::fs::read_to_string(&nfo).unwrap();
+        match expected {
+            Some(tag) => assert!(saved.contains(tag), "{format}: {saved}"),
+            None => assert_eq!(saved, before, "an invalid pattern must not rewrite the NFO"),
+        }
+    }
+    api.post(
+        "/System/Configuration/xbmcmetadata",
+        &json!({"SaveImagePathsInNfo":false,"ReleaseDateFormat":"yyyy-MM-dd"}),
+    )
+    .await;
     std::fs::remove_file(&nfo).unwrap();
     std::fs::create_dir(&nfo).unwrap();
     body["Name"] = json!("Edit survives saver failure");

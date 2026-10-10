@@ -2778,6 +2778,9 @@ pub struct LibraryScanner {
     scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     dummy_chapter_duration: Option<Arc<dyn Fn() -> i32 + Send + Sync>>,
+    /// The saved NFO options (`ReleaseDateFormat`, `UserId`), read per sidecar.
+    nfo_configuration:
+        Option<Arc<dyn Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync>>,
     chapter_image_extractor:
         std::sync::OnceLock<Arc<crate::chapter_image_extractor::ChapterImageExtractor>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
@@ -3080,6 +3083,7 @@ impl LibraryScanner {
             subtitle_downloader: std::sync::OnceLock::new(),
             chapter_image_extractor: std::sync::OnceLock::new(),
             dummy_chapter_duration: None,
+            nfo_configuration: None,
         }
     }
 
@@ -3112,6 +3116,17 @@ impl LibraryScanner {
         downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
     ) {
         let _ = self.subtitle_downloader.set(downloader);
+    }
+
+    /// Reads the saved NFO options (`ReleaseDateFormat`, `UserId`) for every
+    /// sidecar parsed, so a dashboard edit applies to the next item.
+    #[must_use]
+    pub fn with_nfo_configuration(
+        mut self,
+        read: impl Fn() -> ferrofin_providers::xbmc::config::NfoConfiguration + Send + Sync + 'static,
+    ) -> Self {
+        self.nfo_configuration = Some(Arc::new(read));
+        self
     }
 
     /// Reads the saved automatic chapter interval before each successful video
@@ -7587,7 +7602,10 @@ impl LibraryScanner {
         let Some(xml) = xml else {
             return LocalNfo::default();
         };
-        let config = NfoConfiguration::default();
+        let config = self
+            .nfo_configuration
+            .as_ref()
+            .map_or_else(NfoConfiguration::default, |read| read());
         // The id tags a document may carry are per-kind: C# builds
         // `_validProviderIds` from `GetExternalIdInfos(item)`. A fixed
         // video-only list silently discards an `album.nfo`'s

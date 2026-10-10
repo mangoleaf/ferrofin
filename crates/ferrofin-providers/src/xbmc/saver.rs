@@ -148,17 +148,34 @@ fn strip_html(text: &str) -> String {
     out.trim().replace("&quot;", "'")
 }
 
-/// Formats a `DateTime` with a chrono `strftime` string (invariant culture).
+/// `DateTime.ToString(format, CultureInfo.InvariantCulture)` with the NFO
+/// `ReleaseDateFormat`.
+///
+/// A malformed pattern throws `FormatException` upstream, aborting the save;
+/// the Ferrofin save path rejects it first ([`release_date_format_error`]), so
+/// the ISO fallback only serves direct callers that skipped that check.
 fn format_date(date: DateTime<Utc>, fmt: &str) -> String {
-    date.format(fmt).to_string()
+    super::dotnet_date::format_date_time(date, fmt)
+        .unwrap_or_else(|| date.format("%Y-%m-%d").to_string())
 }
 
-/// Converts the .NET release-date format to a chrono `strftime` string.
-///
-/// TODO(parity): port custom .NET release-date patterns for both reader and
-/// writer. The existing round-trip implementation supports the default only.
-fn release_date_strftime(_format: &str) -> &'static str {
-    "%Y-%m-%d"
+/// Why `config`'s release-date format cannot be used to write `item`'s dates,
+/// when it cannot: upstream's `FormatException`, raised only when a date is
+/// actually written (`premiered`/`releasedate`/`formed`/`enddate`/`aired`/
+/// `disbanded`).
+#[must_use]
+pub fn release_date_format_error(item: &NfoBaseItem, config: &NfoConfiguration) -> Option<String> {
+    let writes_date = if item.kind == NfoItemKind::Episode {
+        item.premiere_date.is_some()
+    } else {
+        item.premiere_date.is_some() || item.end_date.is_some()
+    };
+    (writes_date && !super::dotnet_date::is_valid_format(&config.release_date_format)).then(|| {
+        format!(
+            "ReleaseDateFormat {:?} is not a valid date format",
+            config.release_date_format
+        )
+    })
 }
 
 /// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`).
@@ -231,9 +248,9 @@ fn add_common_nodes(
         writer.element("lockedfields", &joined);
     }
 
-    let date_added = item
-        .date_created
-        .map_or_else(default_date_added, |d| format_date(d, DATE_ADDED_FORMAT));
+    let date_added = item.date_created.map_or_else(default_date_added, |d| {
+        d.format(DATE_ADDED_FORMAT).to_string()
+    });
     writer.element("dateadded", &date_added);
 
     writer.element("title", item.name.as_deref().unwrap_or_default());
@@ -347,7 +364,7 @@ fn add_common_nodes(
         writer.element("countrycode", cc);
     }
 
-    let date_fmt = release_date_strftime(&config.release_date_format);
+    let date_fmt = config.release_date_format.as_str();
     if let Some(premiere) = item
         .premiere_date
         .filter(|_| item.kind != NfoItemKind::Episode)
@@ -675,7 +692,7 @@ pub fn save_episode(result: &MetadataResult<NfoBaseItem>, config: &NfoConfigurat
         writer.element("season", &season.to_string());
     }
     if let Some(premiere) = item.premiere_date {
-        let fmt = release_date_strftime(&config.release_date_format);
+        let fmt = config.release_date_format.as_str();
         writer.element("aired", &format_date(premiere, fmt));
     }
 
@@ -859,7 +876,7 @@ pub fn save_artist(
     add_common_nodes(&mut writer, item, people_slice(result), config);
 
     if let Some(end) = item.end_date {
-        let fmt = release_date_strftime(&config.release_date_format);
+        let fmt = config.release_date_format.as_str();
         writer.element("disbanded", &format_date(end, fmt));
     }
 

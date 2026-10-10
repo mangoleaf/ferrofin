@@ -87,6 +87,17 @@ impl Fixture {
         }
     }
 
+    /// Reads NFO sidecars with the given release-date pattern.
+    fn with_release_date_format(mut self, format: &'static str) -> Self {
+        self.scanner = self.scanner.with_nfo_configuration(move || {
+            ferrofin_providers::xbmc::config::NfoConfiguration {
+                release_date_format: format.to_owned(),
+                ..Default::default()
+            }
+        });
+        self
+    }
+
     async fn row(&self, relative: &str) -> BaseItemEntity {
         sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Path" = ?"#)
             .bind(self.media.join(relative).to_string_lossy().as_ref())
@@ -325,6 +336,32 @@ async fn nested_release_and_mixed_folders_do_not_lend_the_wrong_owner() {
             .await
             .is_in_mixed_folder
     );
+}
+
+/// The saved `ReleaseDateFormat` is the pattern a sidecar's dates are read
+/// with: a date written in another pattern is not a date at all.
+#[tokio::test]
+async fn nfo_release_dates_are_read_with_the_saved_pattern() {
+    for (format, written, expected_date) in [
+        ("dd.MM.yyyy", "05.12.2010", Some("2010-12-05")),
+        ("MMMM d, yyyy", "December 5, 2010", Some("2010-12-05")),
+        ("yyyy-MM-dd", "05.12.2010", None),
+        ("dd.MM.yyyy", "2010-12-05", None),
+    ] {
+        let f = Fixture::new(&[MOVIE])
+            .await
+            .with_release_date_format(format);
+        std::fs::write(
+            f.media.join("Heat (1995)/movie.nfo"),
+            format!("<movie><title>Dated</title><premiered>{written}</premiered></movie>"),
+        )
+        .unwrap();
+        f.scanner.scan_all().await.unwrap();
+        let row = f.row(MOVIE).await;
+        assert_eq!(row.name.as_deref(), Some("Dated"), "{format}");
+        let date = row.premiere_date.map(|d| d.format("%Y-%m-%d").to_string());
+        assert_eq!(date.as_deref(), expected_date, "{format} / {written}");
+    }
 }
 
 #[tokio::test]
