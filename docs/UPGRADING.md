@@ -90,10 +90,11 @@ Still open in this release:
   series, the season number and the season's name). On a database an earlier Ferrofin
   scanned, the first start after upgrading moves each such season to its new id, with
   its watch state, images and episodes, after copying the database to
-  `jellyfin.db.pre-season-ids`. Ferrofin names a new season "Season N", "Specials" or
-  "Season Unknown" whatever the server's language or the library's season-zero
-  display name (`SeasonZeroDisplayName`), so a season Jellyfin created under another
-  name keeps its id, but a new one gets the English name and the id that name gives.
+  `jellyfin.db.pre-season-ids`. As in Jellyfin, a new season is named in the server's
+  display language ("Season 1", "Staffel 1", …, and "Season Unknown" for episodes with
+  no season number), and season 0 takes the library's season 0 display name
+  (`SeasonZeroDisplayName`). A season with no folder keeps the name and id it was
+  created with when either setting changes later.
 
 ## Unreleased — the first scan after upgrading stores items as Jellyfin does
 

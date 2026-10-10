@@ -12168,6 +12168,22 @@ impl LibraryScanner {
         }
     }
 
+    /// The names the seasons of the series at `series_dir` (in library `cf`)
+    /// are created with: its library's season-zero name
+    /// (`LibraryManager.GetLibraryOptions(series)`) and the server's
+    /// localized season strings ([`SeasonNames`]).
+    fn season_names(&self, ctx: &PlanCtx<'_>, cf: Uuid, series_dir: &str) -> SeasonNames {
+        let library = ferrofin_model::entities_media::owning_library(
+            ctx.key_folders,
+            Some(&cf.to_string()),
+            Some(series_dir),
+        );
+        SeasonNames::of(
+            library.and_then(|f| f.library_options.as_ref()),
+            self.localization.as_deref(),
+        )
+    }
+
     /// Plans one series folder: `Season NN` subfolders → a `Season` plus its
     /// episodes; a video directly in the series folder → an `Episode` with no
     /// season parent.
@@ -12196,6 +12212,7 @@ impl LibraryScanner {
         let entries = self.list(series_dir, ctx);
         note_episode_folder(series_dir, &entries, ctx);
         let extras = self.plan_folder_extras(&entries, series_dir, series_id, cf, ctx, out);
+        let names = self.season_names(ctx, cf, series_dir);
         for entry in entries {
             if extras.contains(&entry.path) {
                 continue;
@@ -12207,7 +12224,7 @@ impl LibraryScanner {
                 let season = season_path_parser::parse(&entry.path, Some(series_dir), true, true);
                 if season.season_number.is_some() || season.is_season_folder {
                     let num = season.season_number;
-                    let name = num.map_or_else(|| entry.name.clone(), season_display_name);
+                    let name = num.map_or_else(|| entry.name.clone(), |n| names.numbered(n));
                     let Some((season_id, mut e)) = self.base_item(
                         ctx,
                         BaseItemKind::Season,
@@ -12328,13 +12345,14 @@ impl LibraryScanner {
             })
             .collect();
 
+        let names = self.season_names(ctx, cf, series_dir);
         // One virtual season per distinct number (BTreeMap → deterministic order).
         let mut season_ids: BTreeMap<Option<i32>, Uuid> = BTreeMap::new();
         for &(_, num) in &resolved {
             if season_ids.contains_key(&num) {
                 continue;
             }
-            let name = virtual_season_name(num);
+            let name = names.virtual_season(num);
             // A season with no folder is keyed by its series, number and name
             // (`SeriesMetadataService.CreateSeasonAsync`), and has no path.
             // A stored one of the series with its number keeps its own id
@@ -12380,7 +12398,7 @@ impl LibraryScanner {
 
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
-            let season_name = virtual_season_name(num);
+            let season_name = names.virtual_season(num);
             let home = EpisodeHome {
                 cf,
                 series_id,
@@ -15970,10 +15988,11 @@ fn saved_row(
         // `Folder.AddChild` stamps a new child's unset `DateModified` with
         // the `UtcNow` of its `DateCreated`. A path-less one (a season with
         // no folder) keeps it — no save restats it, where a file's or a
-        // folder's is its stat's — unless its first refresh's provider
-        // result replaces it ([`MergeMode::clears_date_modified`]).
-        if is_path_less(&row) && row.date_modified.is_none() && !facts.merge.clears_date_modified()
-        {
+        // folder's is its stat's — unless a provider answers its creation
+        // refresh: that is a Default refresh whatever the pass
+        // (`CreateSeasonAsync`: `new MetadataRefreshOptions(directoryService)`),
+        // which replaces ([`MergeMode::clears_date_modified`]).
+        if is_path_less(&row) && row.date_modified.is_none() && !facts.merge.merges {
             row.date_modified = row.date_created;
         }
         row
@@ -17359,22 +17378,69 @@ fn repoint_planned(planned: &mut [Planned], ids: &HashMap<Uuid, (Uuid, Option<&s
     }
 }
 
-/// The display name for a season number — `0` is "Specials" (Jellyfin's
-/// convention for extras/specials), every other number is "Season N".
-fn season_display_name(number: i32) -> String {
-    if number == 0 {
-        "Specials".to_owned()
-    } else {
-        format!("Season {number}")
+/// The names a series' seasons are created with: season `0` takes the
+/// library's `SeasonZeroDisplayName`, any other number the server's
+/// localized `NameSeasonNumber` ("Season {0}"), and a season with no number
+/// `NameSeasonUnknown` — `SeasonResolver.Resolve` (`SeasonResolver.cs:
+/// 95-104`) for a season folder, `SeriesMetadataService.
+/// GetValidSeasonNameForSeries` (`SeriesMetadataService.cs:466-478`) for a
+/// season with no folder of its own, whose id the name is part of
+/// ([`item_type_lookup::virtual_season_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeasonNames {
+    /// The library's `SeasonZeroDisplayName`.
+    zero: String,
+    /// `NameSeasonNumber`, a `{0}` format.
+    numbered: String,
+    /// `NameSeasonUnknown`.
+    unknown: String,
+}
+
+impl Default for SeasonNames {
+    /// The `en-US` strings and the default `SeasonZeroDisplayName` — the
+    /// names every older Ferrofin scan created seasons with.
+    fn default() -> Self {
+        Self {
+            zero: "Specials".to_owned(),
+            numbered: "Season {0}".to_owned(),
+            unknown: "Season Unknown".to_owned(),
+        }
     }
 }
 
-/// The name a season with no folder of its own is created with, and keyed by
-/// ([`item_type_lookup::virtual_season_id`]) — `SeriesMetadataService.
-/// GetValidSeasonNameForSeries(series, null, number)`: "Season Unknown" for
-/// no number, else [`season_display_name`].
-pub(crate) fn virtual_season_name(number: Option<i32>) -> String {
-    number.map_or_else(|| "Season Unknown".to_owned(), season_display_name)
+impl SeasonNames {
+    /// The names under `options` (none: the defaults), localized by
+    /// `localization` in the server's UI culture (none: `en-US`).
+    pub(crate) fn of(
+        options: Option<&LibraryOptionsModel>,
+        localization: Option<&crate::localization_manager::LocalizationManager>,
+    ) -> Self {
+        let mut names = Self::default();
+        if let Some(options) = options {
+            names.zero.clone_from(&options.season_zero_display_name);
+        }
+        if let Some(localization) = localization {
+            names.numbered = localization.get_localized_string("NameSeasonNumber");
+            names.unknown = localization.get_localized_string("NameSeasonUnknown");
+        }
+        names
+    }
+
+    /// A numbered season's name: `0`'s is the season-zero name, any other
+    /// `string.Format(InvariantCulture, NameSeasonNumber, number)`.
+    pub(crate) fn numbered(&self, number: i32) -> String {
+        if number == 0 {
+            self.zero.clone()
+        } else {
+            self.numbered.replace("{0}", &number.to_string())
+        }
+    }
+
+    /// The name of a season with no folder of its own
+    /// (`GetValidSeasonNameForSeries(series, null, number)`).
+    pub(crate) fn virtual_season(&self, number: Option<i32>) -> String {
+        number.map_or_else(|| self.unknown.clone(), |n| self.numbered(n))
+    }
 }
 
 fn image_item_kind(type_: &str) -> ImageItemKind {
@@ -22873,8 +22939,9 @@ mod tests {
     /// merged over it with `replaceData` — then it has none, as upstream's
     /// `MergeBaseItemData` takes the result's `MinValue`: a Default scan a
     /// remote provider answered, or "Replace all metadata". A pass nothing
-    /// answered, or "Search for missing metadata", keeps it; so does a new
-    /// season nothing answered.
+    /// answered, or "Search for missing metadata", keeps it. A new season's
+    /// creation refresh is a Default one whatever the pass
+    /// (`CreateSeasonAsync`), so its stamp goes whenever a provider answered.
     #[rstest::rstest]
     #[case::scan_unanswered("scan", false, true)]
     #[case::scan_answered("scan", true, false)]
@@ -22918,8 +22985,7 @@ mod tests {
             answered,
         );
         assert_eq!(saved.date_modified, kept.then_some(stamp));
-        // A new season: the creation's stamp, unless its first pass's
-        // result replaced it.
+        // A new season: the creation's stamp, unless a provider answered.
         let saved = save_in_mode(
             None,
             &planned,
@@ -22932,7 +22998,7 @@ mod tests {
         );
         assert_eq!(
             saved.date_modified,
-            kept.then_some(planned.date_created).flatten()
+            if answered { None } else { planned.date_created }
         );
     }
 

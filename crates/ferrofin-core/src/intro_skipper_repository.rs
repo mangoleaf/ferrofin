@@ -554,6 +554,7 @@ pub(crate) async fn move_item_rows(
     conn: &mut sqlx::SqliteConnection,
     from: Uuid,
     to: Uuid,
+    listed: bool,
 ) -> Result<(), sqlx::Error> {
     let (to_lower, to_upper) = spellings(to);
     for sql in [
@@ -568,7 +569,19 @@ pub(crate) async fn move_item_rows(
             .execute(&mut *conn)
             .await?;
     }
-    carry_rows(conn, from, to).await
+    carry_rows(conn, from, to, listed).await
+}
+
+/// Whether an item stored as `type_name` can be named in a season's
+/// analysed lists: the plugin queues Episodes and Movies (a `Video` a scan
+/// moves to either kind was one of them). A season — the boot repair's
+/// moves, [`crate::adoption_repairs::rekey_virtual_seasons`] — never is, so
+/// its move reads no list.
+pub(crate) fn listable_type(type_name: &str) -> bool {
+    matches!(
+        type_name.rsplit('.').next(),
+        Some("Episode" | "Movie" | "Video")
+    )
 }
 
 /// The Intro Skipper's half of a fold
@@ -591,6 +604,7 @@ pub(crate) async fn fold_item_rows(
     conn: &mut sqlx::SqliteConnection,
     loser: Uuid,
     kept: Uuid,
+    listed: bool,
 ) -> Result<(), sqlx::Error> {
     let (loser_lower, loser_upper) = spellings(loser);
     let (kept_lower, kept_upper) = spellings(kept);
@@ -632,20 +646,48 @@ pub(crate) async fn fold_item_rows(
             .execute(&mut *conn)
             .await?;
     }
-    carry_rows(conn, loser, kept).await
+    carry_rows(conn, loser, kept, listed).await
 }
 
-/// Renames `from` to `to` (lowercase) in every Intro Skipper id column and
-/// id list. A rename that would meet a primary key (an exclusion or a mode's
-/// state the target already holds) leaves the target's row, and the source's
-/// is dropped.
+/// Renames `from` to `to` (lowercase) in every Intro Skipper id column and,
+/// when `from` can be listed ([`listable_type`]), in every id list. `to`'s
+/// own rows are first put in the lowercase form too, the lowercase row
+/// winning where both spellings hold one (a mode's segments, an exclusion,
+/// a mode's state). A rename that would meet a primary key (an exclusion or
+/// a mode's state the target already holds) leaves the target's row, and
+/// the source's is dropped.
 async fn carry_rows(
     conn: &mut sqlx::SqliteConnection,
     from: Uuid,
     to: Uuid,
+    listed: bool,
 ) -> Result<(), sqlx::Error> {
+    let (to_lower, to_upper) = spellings(to);
+    for sql in [
+        // `to`'s segments of a mode its lowercase rows hold go in the
+        // upper-case spelling; the rest take the lowercase one.
+        r#"DELETE FROM "FerrofinIntroSkipperSegments" AS u
+           WHERE u."ItemId" = ?2
+             AND EXISTS (SELECT 1 FROM "FerrofinIntroSkipperSegments" AS l
+                         WHERE l."ItemId" = ?1 AND l."Type" = u."Type")"#,
+        r#"UPDATE "FerrofinIntroSkipperSegments" SET "ItemId" = ?1 WHERE "ItemId" = ?2"#,
+        r#"UPDATE OR IGNORE "FerrofinIntroSkipperDisabledEpisodes" SET "EpisodeId" = ?1
+           WHERE "EpisodeId" = ?2"#,
+        r#"DELETE FROM "FerrofinIntroSkipperDisabledEpisodes" WHERE "EpisodeId" = ?2"#,
+        r#"UPDATE OR IGNORE "FerrofinIntroSkipperDisabledEpisodes" SET "SeasonId" = ?1
+           WHERE "SeasonId" = ?2"#,
+        r#"DELETE FROM "FerrofinIntroSkipperDisabledEpisodes" WHERE "SeasonId" = ?2"#,
+        r#"UPDATE OR IGNORE "FerrofinIntroSkipperSeasonStates" SET "SeasonId" = ?1
+           WHERE "SeasonId" = ?2"#,
+        r#"DELETE FROM "FerrofinIntroSkipperSeasonStates" WHERE "SeasonId" = ?2"#,
+    ] {
+        sqlx::query(sql)
+            .bind(&to_lower)
+            .bind(&to_upper)
+            .execute(&mut *conn)
+            .await?;
+    }
     let (from_lower, from_upper) = spellings(from);
-    let to_lower = to.to_string();
     for sql in [
         r#"UPDATE "FerrofinIntroSkipperSegments" SET "ItemId" = ?3 WHERE "ItemId" IN (?1, ?2)"#,
         r#"UPDATE OR IGNORE "FerrofinIntroSkipperDisabledEpisodes" SET "EpisodeId" = ?3
@@ -664,6 +706,9 @@ async fn carry_rows(
             .bind(&to_lower)
             .execute(&mut *conn)
             .await?;
+    }
+    if !listed {
+        return Ok(());
     }
     // The id lists, element-wise (either spelling), in their order, without
     // a duplicate where the list already named `to`. `instr` finds the rows
@@ -1291,6 +1336,171 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(listed, format!(r#"["{kept}"]"#), "named once");
+    }
+
+    /// Inserts a segment row as written, `item_id` in the spelling given.
+    async fn raw_segment(db: &Database, item_id: &str, mode: AnalysisMode, start: f64) {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinIntroSkipperSegments" ("ItemId", "Type", "Start", "End")
+               VALUES (?1, ?2, ?3, ?3 + 30)"#,
+        )
+        .bind(item_id)
+        .bind(mode.value())
+        .bind(start)
+        .execute(db.writer())
+        .await
+        .expect("segment");
+    }
+
+    /// The kept row's own rows stored in both spellings end in the store's
+    /// lowercase one, the lowercase row winning a mode both hold; what the
+    /// loser carries joins them; no id stays upper-case.
+    #[tokio::test]
+    async fn a_fold_lowercases_the_kept_rows() {
+        use AnalysisMode::{Credits, Introduction, Recap};
+        let db = test_db().await;
+        let store = FerrofinIntroSkipperStore::new(db.clone());
+        let (kept, loser, season) = (
+            Uuid::from_u128(0xD1),
+            Uuid::from_u128(0xD2),
+            Uuid::from_u128(0x5D1),
+        );
+        for (id, kind) in [
+            (kept, BaseItemKind::Episode),
+            (loser, BaseItemKind::Episode),
+            (season, BaseItemKind::Season),
+        ] {
+            seed_item(&db, id, kind).await;
+        }
+        let upper = kept.to_string().to_uppercase();
+        raw_segment(&db, &kept.to_string(), Introduction, 10.0).await;
+        raw_segment(&db, &upper, Introduction, 99.0).await;
+        raw_segment(&db, &upper, Credits, 1200.0).await;
+        raw_segment(&db, &loser.to_string(), Recap, 0.0).await;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinIntroSkipperDisabledEpisodes" ("SeasonId", "EpisodeId")
+               VALUES (?1, ?2)"#,
+        )
+        .bind(season.to_string())
+        .bind(&upper)
+        .execute(db.writer())
+        .await
+        .expect("exclusion");
+
+        let done = rekey_rows(
+            &db,
+            &[rekey(kept, kept, BaseItemKind::Episode, &[loser])],
+            RekeyKind::Changed,
+        )
+        .await
+        .expect("fold");
+        assert_eq!(done.len(), 1);
+        let mut segments = store.segments(kept).await.unwrap();
+        segments.sort_by_key(|s| s.mode.value());
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| (s.mode, s.start))
+                .collect::<Vec<_>>(),
+            vec![(Introduction, 10.0), (Credits, 1200.0), (Recap, 0.0)]
+        );
+        assert_eq!(
+            store.excluded_episodes(season).await.unwrap(),
+            HashSet::from([kept])
+        );
+        let spellings = stored_spellings(&db).await;
+        assert!(!spellings.contains(&upper), "{spellings:?}");
+    }
+
+    /// Commercial segments are several per item (no key on `(ItemId,
+    /// Type)`): a fold keeps all of the kept row's, and takes all of the
+    /// loser's where the kept row has none.
+    #[tokio::test]
+    async fn a_fold_carries_every_commercial_segment() {
+        use AnalysisMode::Commercial;
+        let db = test_db().await;
+        let store = FerrofinIntroSkipperStore::new(db.clone());
+        let ids: Vec<Uuid> = (0xF1..=0xF4).map(Uuid::from_u128).collect();
+        for id in &ids {
+            seed_item(&db, *id, BaseItemKind::Episode).await;
+        }
+        // F1 keeps its two over F2's two; F3, with none, takes F4's two.
+        for (item, starts) in [
+            (ids[0], [600.0, 900.0]),
+            (ids[1], [100.0, 200.0]),
+            (ids[3], [300.0, 400.0]),
+        ] {
+            for start in starts {
+                raw_segment(&db, &item.to_string(), Commercial, start).await;
+            }
+        }
+        let done = rekey_rows(
+            &db,
+            &[
+                rekey(ids[0], ids[0], BaseItemKind::Episode, &[ids[1]]),
+                rekey(ids[2], ids[2], BaseItemKind::Episode, &[ids[3]]),
+            ],
+            RekeyKind::Changed,
+        )
+        .await
+        .expect("fold");
+        assert_eq!(done.len(), 2);
+        for (item, expected) in [(ids[0], [600.0, 900.0]), (ids[2], [300.0, 400.0])] {
+            let mut starts: Vec<f64> = store
+                .segments(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|s| s.start)
+                .collect();
+            starts.sort_by(f64::total_cmp);
+            assert_eq!(starts, expected);
+        }
+        for gone in [ids[1], ids[3]] {
+            assert!(store.segments(gone).await.unwrap().is_empty());
+        }
+    }
+
+    /// Only an episode or a movie (or a video that becomes one) is named in
+    /// the analysed lists: a season's move rewrites none of them.
+    #[rstest::rstest]
+    #[case("MediaBrowser.Controller.Entities.TV.Episode", true)]
+    #[case("MediaBrowser.Controller.Entities.Movies.Movie", true)]
+    #[case("MediaBrowser.Controller.Entities.Video", true)]
+    #[case("MediaBrowser.Controller.Entities.TV.Season", false)]
+    #[case("MediaBrowser.Controller.Entities.TV.Series", false)]
+    fn only_episodes_and_movies_are_listed(#[case] type_name: &str, #[case] listed: bool) {
+        assert_eq!(listable_type(type_name), listed);
+    }
+
+    #[tokio::test]
+    async fn a_season_move_leaves_the_lists_alone() {
+        use AnalysisMode::Introduction;
+        let db = test_db().await;
+        let store = FerrofinIntroSkipperStore::new(db.clone());
+        let (season, to, holder) = (
+            Uuid::from_u128(0x5E1),
+            Uuid::from_u128(0x5E2),
+            Uuid::from_u128(0x5E3),
+        );
+        seed_item(&db, season, BaseItemKind::Season).await;
+        // A list naming the season's id (no list does): not rewritten.
+        store
+            .set_episode_ids(holder, Introduction, &[season], "H")
+            .await
+            .unwrap();
+        let done = rekey_rows(
+            &db,
+            &[rekey(season, to, BaseItemKind::Season, &[])],
+            RekeyKind::Represented,
+        )
+        .await
+        .expect("move");
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            store.season_states(holder).await.unwrap()[&Introduction].episode_ids,
+            HashSet::from([season])
+        );
     }
 
     /// A list that is not JSON does not fail the move (it reads as empty);

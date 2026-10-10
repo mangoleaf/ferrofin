@@ -3800,16 +3800,22 @@ async fn merge_one(
 ) -> Result<(), sqlx::Error> {
     let (from, into) = (guid_to_db(loser), guid_to_db(to));
     let stored: Option<String> =
-        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" = ?1"#)
+        sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
             .bind(&from)
             .fetch_optional(&mut *conn)
             .await?;
-    if stored.is_none() {
+    let Some(loser_type) = stored else {
         return Ok(());
-    }
+    };
     merge_user_data(conn, loser, to).await?;
     carry_version_link(conn, (loser, to), extra, references).await?;
-    crate::intro_skipper_repository::fold_item_rows(conn, loser, to).await?;
+    crate::intro_skipper_repository::fold_item_rows(
+        conn,
+        loser,
+        to,
+        crate::intro_skipper_repository::listable_type(&loser_type),
+    )
+    .await?;
     for (table, column, cascades) in references
         .iter()
         .filter(|(table, ..)| !table.eq_ignore_ascii_case("UserData"))
@@ -4068,18 +4074,24 @@ async fn move_one(
     kind: RekeyKind,
 ) -> Result<bool, sqlx::Error> {
     let (from, to) = (guid_to_db(m.from), guid_to_db(m.to));
-    let stored: Vec<(String, bool)> =
-        sqlx::query_as(r#"SELECT "Id", "IsLocked" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
-            .bind(&from)
-            .bind(&to)
-            .fetch_all(&mut *conn)
-            .await?;
-    let Some(&(_, locked)) = stored.iter().find(|(id, _)| *id == from) else {
+    let stored: Vec<(String, bool, String)> = sqlx::query_as(
+        r#"SELECT "Id", "IsLocked", "Type" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#,
+    )
+    .bind(&from)
+    .bind(&to)
+    .fetch_all(&mut *conn)
+    .await?;
+    let Some((_, locked, old_type)) = stored.iter().find(|(id, ..)| *id == from) else {
         return Ok(false);
     };
-    if stored.iter().any(|(id, _)| *id == to) {
+    let locked = *locked;
+    if stored.iter().any(|(id, ..)| *id == to) {
         return Ok(false);
     }
+    // Only an episode or a movie (or what becomes one) is named in a
+    // season's analysed lists.
+    let listed = crate::intro_skipper_repository::listable_type(old_type)
+        || crate::intro_skipper_repository::listable_type(&m.type_name);
     // Rows without a foreign key can outlive an item an older scan pruned:
     // whatever is still keyed by the unstored new id is stale.
     for sql in [
@@ -4090,7 +4102,7 @@ async fn move_one(
     }
     // The Intro Skipper's rows (lowercase ids, some inside JSON lists; no
     // foreign key reaches them): segments, exclusions, season state.
-    crate::intro_skipper_repository::move_item_rows(conn, m.from, m.to).await?;
+    crate::intro_skipper_repository::move_item_rows(conn, m.from, m.to, listed).await?;
     for (table, column, _) in references {
         let sql = format!(r#"UPDATE "{table}" SET "{column}" = ?1 WHERE "{column}" = ?2"#);
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -5266,23 +5278,27 @@ pub(crate) fn path_prefix_range(root: &str) -> (String, String, String) {
     (root.to_owned(), format!("{root}/"), format!("{root}0"))
 }
 
-/// [`ItemPersistenceService::items_at_paths`] over `n` paths: a batched
-/// `FindByPath`, each path an equality seek on `IX_BaseItems_Path`;
-/// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
 /// [`ItemPersistenceService::pathless_seasons`] over `n` series ids (binds
-/// `?1..?n` the ids, `?{n+1}` the season type): by `ParentId`, which
-/// `IX_BaseItems_ParentId` serves; in id order, so the season a scan keeps
-/// of two with one number is the same every time.
+/// `?1..?n` the ids, `?{n+1}` the season type): each series' children
+/// sought on `IX_BaseItems_ParentId`, in id order, so the season a scan
+/// keeps of two with one number is the same every time. The unary `+` on
+/// `Type` and `Path` keeps the planner off `IX_BaseItems_Path` (every
+/// path-less row — Live TV programs among them — on a Jellyfin schema) and
+/// the type index (every season); `EXPLAIN QUERY PLAN` pinned by
+/// `pathless_seasons_seek_by_parent`.
 pub(crate) fn pathless_seasons_sql(n: usize) -> String {
     format!(
         r#"SELECT "Id", "ParentId", "IndexNumber", "Name" FROM "BaseItems"
-           WHERE "ParentId" IN ({}) AND "Type" = ?{} AND "Path" IS NULL
+           WHERE "ParentId" IN ({}) AND +"Type" = ?{} AND +"Path" IS NULL
            ORDER BY "Id""#,
         numbered_placeholders(n),
         n + 1
     )
 }
 
+/// [`ItemPersistenceService::items_at_paths`] over `n` paths: a batched
+/// `FindByPath`, each path an equality seek on `IX_BaseItems_Path`;
+/// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
 pub(crate) fn items_at_paths_sql(n: usize) -> String {
     format!(
         r#"SELECT "Id", "Type", "Path", "ParentId", "ExtraType" FROM "BaseItems" WHERE "Path" IN ({})"#,
@@ -10295,6 +10311,28 @@ mod tests {
             .into_iter()
             .map(|(_, _, _, detail)| detail)
             .collect()
+    }
+
+    /// A series' path-less seasons are read from its children, sought on
+    /// `IX_BaseItems_ParentId` — never from the path index (every path-less
+    /// row) or the type index (every season).
+    #[tokio::test]
+    async fn pathless_seasons_seek_by_parent() {
+        let db = test_db().await;
+        for n in [1, 3] {
+            let plan = query_plan(&db, &super::pathless_seasons_sql(n), n + 1).await;
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH") && s.contains("IX_BaseItems_ParentId")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")
+                    || s.contains("IX_BaseItems_Path")
+                    || s.contains("Type")),
+                "{plan:?}"
+            );
+        }
     }
 
     #[tokio::test]

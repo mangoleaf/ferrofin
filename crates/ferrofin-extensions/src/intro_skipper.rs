@@ -3562,6 +3562,76 @@ mod tests {
         );
     }
 
+    /// The items the Media Segment Scan offers the plugin, as
+    /// `MediaSegmentExtractionTask` and `RunSegmentPluginProviders` pick
+    /// them: an alternate version too (`IncludeOwnedItems`), never a missing
+    /// file or a directory (a disc rip: `File.Exists` is false), never one in
+    /// a library whose `DisabledMediaSegmentProviders` names the plugin in
+    /// any case, and one under no library by the default options (enabled).
+    #[tokio::test]
+    async fn the_segment_scan_offers_what_upstreams_task_does() {
+        use ferrofin_model::entities_media::VirtualFolderInfo;
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let media = h.cache.path().join("media");
+        let movie = ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+            .expect("stored type name");
+        let file = |rel: &str| {
+            let path = media.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, b"").expect("file");
+            path.to_string_lossy().into_owned()
+        };
+        let rip = media.join("on/Rip (2001)");
+        std::fs::create_dir_all(rip.join("VIDEO_TS")).expect("rip");
+        let (primary, alternate, missing, ripped, off, loose) = (
+            Uuid::from_u128(0xB1),
+            Uuid::from_u128(0xB2),
+            Uuid::from_u128(0xB3),
+            Uuid::from_u128(0xB4),
+            Uuid::from_u128(0xB5),
+            Uuid::from_u128(0xB6),
+        );
+        let row = |id: Uuid, path: String| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: movie.to_owned(),
+            path: Some(path),
+            ..BaseItemEntity::default()
+        };
+        let gone = file("on/Gone (2002).mkv");
+        let rows = vec![
+            row(primary, file("on/Film (2000)/Film - 2160p.mkv")),
+            BaseItemEntity {
+                owner_id: Some(guid_to_db(primary)),
+                primary_version_id: Some(guid_to_db(primary)),
+                ..row(alternate, file("on/Film (2000)/Film - 1080p.mkv"))
+            },
+            row(missing, gone.clone()),
+            row(ripped, rip.to_string_lossy().into_owned()),
+            row(off, file("off/Other (2003).mkv")),
+            row(loose, file("elsewhere/Loose (2004).mkv")),
+        ];
+        h.persistence.save_items(&rows).await.expect("seed");
+        std::fs::remove_file(&gone).expect("missing file");
+        let library = |location: &str, disabled: &[&str]| VirtualFolderInfo {
+            locations: vec![media.join(location).to_string_lossy().into_owned()],
+            library_options: Some(LibraryOptions {
+                disabled_media_segment_providers: disabled.iter().map(|&p| p.to_owned()).collect(),
+                ..LibraryOptions::default()
+            }),
+            ..VirtualFolderInfo::default()
+        };
+        let folders = [
+            library("on", &["Other"]),
+            library("off", &["intro SKIPPER"]),
+        ];
+        let ids = [primary, alternate, missing, ripped, off, loose];
+        let offered = queue::publishable(h.task.library.as_ref(), &folders, &ids)
+            .await
+            .expect("offered");
+        let expected: std::collections::HashSet<Uuid> = [primary, alternate, loose].into();
+        assert_eq!(offered, expected);
+    }
+
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and
     /// description, daily at midnight.
     #[tokio::test]

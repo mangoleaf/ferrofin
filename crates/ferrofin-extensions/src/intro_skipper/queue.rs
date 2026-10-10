@@ -163,10 +163,14 @@ pub(super) async fn build(
 
 /// Of `ids`, the items Jellyfin's Media Segment Scan would run the plugin's
 /// `SegmentProvider` for (`MediaSegmentExtractionTask.ExecuteAsync`: the
-/// library's non-virtual items whose file exists, in a library whose
-/// `DisabledMediaSegmentProviders` does not name the plugin
-/// (`MediaSegmentManager.RunSegmentPluginProviders`), that the provider
-/// `Supports` — an Episode or a Movie). An item deleted from the library is
+/// non-virtual items, owned ones included — `IncludeOwnedItems = true`, so
+/// an alternate version too — that the provider `Supports`, an Episode or a
+/// Movie; `MediaSegmentManager.RunSegmentPluginProviders`: "only local files
+/// supported", `IsFileProtocol && File.Exists`, which a directory — a disc
+/// rip's — is not, and the plugin not named, case-insensitively, in the
+/// `DisabledMediaSegmentProviders` of the item's library options:
+/// `LibraryManager.GetLibraryOptions(item)`, its first collection folder's,
+/// the defaults when it is in none). An item deleted from the library is
 /// never among them, whatever the plugin still stores for it (upstream keeps
 /// those rows until its clean task; its `OnItemRemoved` drops only the
 /// detection cache).
@@ -178,16 +182,18 @@ pub(super) async fn publishable(
     folders: &[VirtualFolderInfo],
     ids: &[Uuid],
 ) -> Result<HashSet<Uuid>, ServiceError> {
-    let enabled: Vec<&VirtualFolderInfo> = folders
-        .iter()
-        .filter(|folder| {
-            !folder.library_options.as_ref().is_some_and(|o| {
-                o.disabled_media_segment_providers
+    let disabled = |item: &BaseItemEntity| {
+        folders
+            .iter()
+            .find(|folder| in_folder(item, folder))
+            .and_then(|folder| folder.library_options.as_ref())
+            .is_some_and(|options| {
+                options
+                    .disabled_media_segment_providers
                     .iter()
-                    .any(|p| p == PLUGIN_NAME)
+                    .any(|p| ordinal_ignore_case_eq(p, PLUGIN_NAME))
             })
-        })
-        .collect();
+    };
     let mut out = HashSet::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         let items = library
@@ -195,6 +201,7 @@ pub(super) async fn publishable(
                 item_ids: chunk.to_vec(),
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
                 is_virtual_item: Some(false),
+                include_owned_items: true,
                 ..InternalItemsQuery::default()
             })
             .await?;
@@ -205,13 +212,16 @@ pub(super) async fn publishable(
             if !matches!(
                 kind(&item),
                 Some(BaseItemKind::Episode | BaseItemKind::Movie)
-            ) || !enabled.iter().any(|folder| in_folder(&item, folder))
+            ) || disabled(&item)
             {
                 continue;
             }
-            // "Only local files supported": `IsFileProtocol && File.Exists`.
+            // "Only local files supported": `IsFileProtocol && File.Exists`,
+            // false for a directory.
             let exists = match item.path.as_deref() {
-                Some(path) => tokio::fs::try_exists(path).await.unwrap_or(false),
+                Some(path) => tokio::fs::metadata(path)
+                    .await
+                    .is_ok_and(|meta| meta.is_file()),
                 None => false,
             };
             if exists {
@@ -220,6 +230,14 @@ pub(super) async fn publishable(
         }
     }
     Ok(out)
+}
+
+/// .NET's `StringComparison.OrdinalIgnoreCase`: equal once every char is
+/// upper-cased by its simple (invariant) mapping.
+fn ordinal_ignore_case_eq(a: &str, b: &str) -> bool {
+    a.chars()
+        .flat_map(char::to_uppercase)
+        .eq(b.chars().flat_map(char::to_uppercase))
 }
 
 /// Whether `item`'s file lives under one of the folder's locations

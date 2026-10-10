@@ -1065,9 +1065,14 @@ pub async fn build_app_state(
     .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
-    .with_localization(Arc::new(LocalizationManager::new(
-        &server_config.metadata_country_code,
-    )))
+    // …and names the seasons it creates in the server's UI culture
+    // (`NameSeasonNumber`, `NameSeasonUnknown`), read at each use.
+    .with_localization(Arc::new(
+        LocalizationManager::new(&server_config.metadata_country_code).with_ui_culture_source({
+            let config_mgr = Arc::clone(&config_mgr);
+            move || config_mgr.snapshot_shared().ui_culture.clone()
+        }),
+    ))
     // `ServerConfiguration.PreferredMetadataLanguage`, the last fallback a
     // series' presentation key embeds (`Series.AddLibrariesToPresentationUniqueKey`).
     .with_default_metadata_language(server_config.preferred_metadata_language.clone())

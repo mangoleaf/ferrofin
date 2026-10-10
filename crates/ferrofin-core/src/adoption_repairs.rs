@@ -34,7 +34,7 @@ use crate::item_type_lookup::{
     IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
     stored_type_name, virtual_season_id,
 };
-use crate::library_scan::{rekey_source, virtual_season_name};
+use crate::library_scan::{SeasonNames, rekey_source};
 use ferrofin_traits::persistence::ItemPersistenceService;
 
 /// `LinkedChildType::LocalAlternateVersion`.
@@ -1073,7 +1073,9 @@ pub async fn rekey_virtual_seasons(
         let Ok(number) = number.map(i32::try_from).transpose() else {
             continue;
         };
-        let name = virtual_season_name(number);
+        // The name the older scan created it with: `en-US`'s, whatever the
+        // library's season-zero name or the server's culture.
+        let name = SeasonNames::default().virtual_season(number);
         let Some(to) = virtual_season_id(derivation, series_id, number, &name) else {
             continue;
         };
