@@ -307,6 +307,12 @@ pub struct FerrofinTaskManager {
     // a std mutex — critical sections are trivial map edits, never held across an
     // `.await`; task execution happens on a clone taken *outside* the lock.
     tasks: Arc<Mutex<HashMap<String, Registration>>>,
+    /// Runs requested while their task was busy, oldest first, as
+    /// `(task key, trigger tag)` — upstream's `_taskQueue`. Producers check the
+    /// task's state and push under this lock, and the completion path drains
+    /// under it after the task is `Idle`, so a request is either started
+    /// directly or seen by the drain, never lost between the two.
+    busy_queue: Arc<Mutex<std::collections::VecDeque<(String, &'static str)>>>,
     /// Trigger overrides loaded from / persisted to `store_path`, applied to a
     /// task when it registers.
     stored_overrides: Arc<Mutex<HashMap<String, Vec<TaskTriggerInfo>>>>,
@@ -746,6 +752,50 @@ impl FerrofinTaskManager {
             reg.started_at = None;
         }
         self.publish_snapshot(&guard);
+        drop(guard);
+        self.drain_busy_queue();
+    }
+
+    /// `TaskManager.QueueScheduledTask`: starts the task when it is idle,
+    /// otherwise remembers the request and starts it once the current run ends
+    /// (`ExecuteQueuedTasks`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no task has that key.
+    fn queue_scheduled(&self, key: &str, trigger: &'static str) -> Result<(), ServiceError> {
+        let mut queue = lock(&self.busy_queue);
+        let state = lock(&self.tasks)
+            .get(key)
+            .map(|reg| reg.state)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+        if state == TaskState::Idle {
+            return self.queue_with_trigger(key, trigger);
+        }
+        queue.push_back((key.to_owned(), trigger));
+        Ok(())
+    }
+
+    /// `TaskManager.ExecuteQueuedTasks`, run where a run completes: takes every
+    /// remembered request, keeps the first for each task, and starts those
+    /// tasks that are idle. It runs in the completing worker's context, so a
+    /// started run inherits that worker's culture scope like upstream's.
+    fn drain_busy_queue(&self) {
+        let mut queue = lock(&self.busy_queue);
+        let mut requests: Vec<(String, &'static str)> = Vec::new();
+        while let Some(request) = queue.pop_front() {
+            if requests.iter().all(|(key, _)| *key != request.0) {
+                requests.push(request);
+            }
+        }
+        for (key, trigger) in requests {
+            let idle = lock(&self.tasks)
+                .get(&key)
+                .is_some_and(|reg| reg.state == TaskState::Idle);
+            if idle && let Err(error) = self.queue_with_trigger(&key, trigger) {
+                tracing::warn!(task = key, %error, "queued task failed to start");
+            }
+        }
     }
 
     /// Runs the named task now, to completion, recording the outcome.
@@ -939,6 +989,7 @@ impl FerrofinTaskManager {
         drop(guard);
         self.publish_task_completed(&result);
         self.persist_result(key, &result);
+        self.drain_busy_queue();
         Ok(())
     }
 
@@ -1016,7 +1067,7 @@ impl FerrofinTaskManager {
             // Startup triggers fire once, after upstream's grace period.
             tokio::time::sleep(STARTUP_TRIGGER_DELAY).await;
             for key in startup_keys {
-                if let Err(e) = this.queue_with_trigger(&key, "startup") {
+                if let Err(e) = this.queue_scheduled(&key, "startup") {
                     tracing::warn!(task = key, error = %e, "startup trigger failed to queue");
                 }
             }
@@ -1038,15 +1089,14 @@ impl FerrofinTaskManager {
             let mut guard = lock(&self.tasks);
             for (key, reg) in guard.iter_mut() {
                 let triggers = reg.effective_triggers();
-                if reg.state == TaskState::Running {
-                    if let (Some(started), Some(max_ticks)) = (
+                if reg.state == TaskState::Running
+                    && let (Some(started), Some(max_ticks)) = (
                         reg.started_at,
                         triggers.iter().filter_map(|t| t.max_runtime_ticks).min(),
-                    ) && now - started >= ticks_to_chrono(max_ticks)
-                    {
-                        overrun.push(key.clone());
-                    }
-                    continue;
+                    )
+                    && now - started >= ticks_to_chrono(max_ticks)
+                {
+                    overrun.push(key.clone());
                 }
                 let last_run_end = reg.last_result.as_ref().map(|r| r.end_time_utc);
                 let triggers_since = reg.triggers_since;
@@ -1074,7 +1124,7 @@ impl FerrofinTaskManager {
         }
         for key in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
-            if let Err(e) = self.queue_with_trigger(&key, "schedule") {
+            if let Err(e) = self.queue_scheduled(&key, "schedule") {
                 tracing::warn!(task = key, error = %e, "trigger failed to queue task");
             }
         }
@@ -1755,6 +1805,134 @@ mod tests {
             self.gate.notified().await;
             Ok(())
         }
+    }
+
+    /// A task that counts its runs and stays running until its gate is released.
+    struct CountedGatedTask {
+        runs: Arc<AtomicU32>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for CountedGatedTask {
+        fn key(&self) -> &str {
+            "counted-gated"
+        }
+        fn name(&self) -> &str {
+            "Counted Gated Task"
+        }
+        fn description(&self) -> &str {
+            "counts runs, waits for its gate"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.gate.notified().await;
+            Ok(())
+        }
+    }
+
+    async fn wait_for_runs(runs: &Arc<AtomicU32>, expected: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runs.load(Ordering::SeqCst) < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {expected} never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn counted_gated() -> (
+        FerrofinTaskManager,
+        Arc<AtomicU32>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let mgr = FerrofinTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        mgr.register(Arc::new(CountedGatedTask {
+            runs: runs.clone(),
+            gate: gate.clone(),
+        }));
+        (mgr, runs, gate)
+    }
+
+    /// `TaskManager.QueueScheduledTask`: a request for a busy task is
+    /// remembered, coalesced per task, and started when the run completes.
+    #[tokio::test]
+    async fn busy_requests_coalesce_and_start_after_the_run_completes() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.queue("counted-gated").expect("started");
+        wait_for_runs(&runs, 1).await;
+        // The explicit (StartTask) path still refuses a running task.
+        assert!(matches!(
+            mgr.queue("counted-gated"),
+            Err(ServiceError::InvalidInput(_))
+        ));
+        for trigger in ["schedule", "startup", "schedule"] {
+            mgr.queue_scheduled("counted-gated", trigger)
+                .expect("queued");
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing starts while busy");
+
+        gate.notify_one();
+        wait_for_runs(&runs, 2).await;
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Running);
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "three requests coalesce into one follow-up run"
+        );
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Idle);
+        assert!(matches!(
+            mgr.queue_scheduled("nope", "schedule"),
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    /// Cancelling the running task drains the queue too (`OnTaskCompleted`
+    /// follows every outcome), and an idle task starts directly.
+    #[tokio::test]
+    async fn cancelling_a_busy_task_starts_its_queued_request() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.queue_scheduled("counted-gated", "schedule")
+            .expect("idle: starts");
+        wait_for_runs(&runs, 1).await;
+        mgr.queue_scheduled("counted-gated", "schedule")
+            .expect("queued");
+        mgr.cancel("counted-gated").expect("cancel");
+        wait_for_runs(&runs, 2).await;
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Running);
+        gate.notify_one();
+    }
+
+    /// A trigger that fires while its task runs is queued rather than dropped.
+    #[tokio::test]
+    async fn a_due_trigger_on_a_running_task_queues_a_follow_up_run() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.set_triggers(
+            "counted-gated",
+            &[TaskTriggerInfo {
+                type_: TaskTriggerInfoType::IntervalTrigger,
+                interval_ticks: Some(3600 * TICKS_PER_SECOND),
+                ..TaskTriggerInfo::default()
+            }],
+        )
+        .expect("triggers");
+        mgr.queue("counted-gated").expect("started");
+        wait_for_runs(&runs, 1).await;
+        let now = Utc::now();
+        mgr.scheduler_sweep(now - chrono::Duration::hours(2), now);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        gate.notify_one();
+        wait_for_runs(&runs, 2).await;
+        gate.notify_one();
     }
 
     #[tokio::test]
@@ -2768,5 +2946,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*task.captured.lock().unwrap(), ["sv", "sv"]);
+    }
+
+    /// `ExecuteQueuedTasks` runs in the completing worker's context: a request
+    /// queued under another culture starts with the finishing run's, not the
+    /// producer's.
+    #[tokio::test]
+    async fn a_drained_run_inherits_the_completing_workers_culture() {
+        let manager = FerrofinTaskManager::new();
+        let task = Arc::new(CultureTask {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        manager.register(task.clone());
+        let wait = std::time::Duration::from_secs(2);
+        ferrofin_util::current_culture::scope("sv".into(), async {
+            manager.queue("culture").unwrap();
+        })
+        .await;
+        tokio::time::timeout(wait, task.started.notified())
+            .await
+            .unwrap();
+        ferrofin_util::current_culture::scope("de".into(), async {
+            manager.queue_scheduled("culture", "schedule").unwrap();
+        })
+        .await;
+        task.release.notify_one();
+        tokio::time::timeout(wait, task.finished.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(wait, task.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(task.captured.lock().unwrap()[2], "sv");
+        task.release.notify_one();
     }
 }
