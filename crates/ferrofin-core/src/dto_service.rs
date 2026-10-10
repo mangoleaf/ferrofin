@@ -277,15 +277,12 @@ impl Prefetched {
 use crate::kinds;
 
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
-/// multiple" (backdrops/chapters/screenshots) — the single-image loop skips
+/// multiple" (backdrops/chapters) — the single-image loop skips
 /// these so they are handled by their own limited fetch.
 ///
 /// Mirrors `BaseItem.AllowsMultipleImages`.
 fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(
-        image_type,
-        ImageType::Backdrop | ImageType::Screenshot | ImageType::Chapter
-    )
+    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
 }
 
 /// Reads an [`ImageType`] from its stored `BaseItemImageInfos.ImageType`
@@ -7984,6 +7981,7 @@ mod tests {
             id,
             &[
                 image_info(ImageType::Primary, "/primary.jpg", Some("LKO2")),
+                image_info(ImageType::Screenshot, "/screenshot.png", Some("SHOT")),
                 image_info(ImageType::Backdrop, "/backdrop.jpg", None),
             ],
         )
@@ -7997,6 +7995,7 @@ mod tests {
 
         let image_tags = dto.image_tags.as_ref().expect("image tags");
         assert_eq!(image_tags[&ImageType::Primary], "tag:/primary.jpg");
+        assert_eq!(image_tags[&ImageType::Screenshot], "tag:/screenshot.png");
         assert_eq!(
             dto.backdrop_image_tags.as_deref(),
             Some(&["tag:/backdrop.jpg".to_owned()][..])
@@ -8004,6 +8003,10 @@ mod tests {
         // Blurhash recorded under the primary image's tag.
         let hashes = dto.image_blur_hashes.as_ref().expect("blur hashes");
         assert_eq!(hashes[&ImageType::Primary]["tag:/primary.jpg"], "LKO2");
+        assert_eq!(
+            hashes[&ImageType::Screenshot]["tag:/screenshot.png"],
+            "SHOT"
+        );
         // Aspect ratio comes from the fake processor's 400x200 → 2.0.
         assert_eq!(dto.primary_image_aspect_ratio, Some(2.0));
     }

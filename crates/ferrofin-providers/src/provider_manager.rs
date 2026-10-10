@@ -3871,8 +3871,9 @@ fn image_upload_file_index(
     current: &[ItemImageInfo],
 ) -> Result<Option<i32>, ServiceError> {
     if kind != ImageType::Backdrop || slot == 0 {
-        return Ok(matches!(kind, ImageType::Backdrop | ImageType::Screenshot)
-            .then(|| i32::try_from(slot).unwrap_or(i32::MAX)));
+        return Ok(
+            matches!(kind, ImageType::Backdrop).then(|| i32::try_from(slot).unwrap_or(i32::MAX))
+        );
     }
     (1..=i32::MAX)
         .find(|index| {
@@ -3991,7 +3992,7 @@ impl ProviderManager for LocalProviderManager {
         } else {
             Vec::new()
         };
-        let multiple = matches!(image_type, ImageType::Backdrop | ImageType::Screenshot);
+        let multiple = image_type == ImageType::Backdrop;
         let index = if multiple {
             image_index
                 .and_then(|index| usize::try_from(index).ok())
@@ -8202,7 +8203,7 @@ mod tests {
     #[case::other_stems(ImageType::Backdrop, 2, &["fanart.png", "not-backdrop1.png"], Some(1))]
     #[case::replacement_slot(ImageType::Backdrop, 1, &["backdrop.png", "backdrop1.png", "backdrop2.png"], Some(3))]
     #[case::explicit_zero(ImageType::Backdrop, 0, &["backdrop.png", "backdrop1.png"], Some(0))]
-    #[case::screenshot_unchanged(ImageType::Screenshot, 2, &["backdrop2.png"], Some(2))]
+    #[case::screenshot_single(ImageType::Screenshot, 2, &["backdrop2.png"], None)]
     #[case::single_image_unchanged(ImageType::Primary, 2, &["backdrop1.png"], None)]
     fn image_upload_backdrop_filenames_match_pinned_source(
         #[case] kind: ImageType,

@@ -3003,10 +3003,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         index: usize,
     ) -> Result<(), ServiceError> {
         use ferrofin_model::entities::ImageType;
-        if !matches!(
-            image.image_type,
-            ImageType::Backdrop | ImageType::Screenshot
-        ) {
+        if image.image_type != ImageType::Backdrop {
             return self.set_item_image(item_id, image).await;
         }
         let item = guid_to_db(item_id);
@@ -4275,6 +4272,39 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(paths, ["primary.png", "other.png", "screenshot-last.png"]);
+    }
+
+    #[tokio::test]
+    async fn indexed_screenshot_writes_replace_the_single_image() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::test_support::item_repository_over(db);
+        for (index, path) in [
+            (0, "first.png"),
+            (1, "second.png"),
+            (usize::MAX, "last.png"),
+        ] {
+            let image = ItemImageInfo {
+                image_type: ImageType::Screenshot,
+                path: path.to_owned(),
+                date_modified: chrono::Utc::now(),
+                width: 2,
+                height: 3,
+                blur_hash: None,
+            };
+            store
+                .set_item_image_at_index(item, &image, index)
+                .await
+                .unwrap();
+            let images = repo.get_image_infos(item).await.unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].path, path);
+            assert_eq!((images[0].width, images[0].height), (2, 3));
+        }
     }
 
     #[tokio::test]
