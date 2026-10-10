@@ -149,6 +149,55 @@ pub fn read_book_metadata_with_readers(path: &str, readers: &[&str]) -> Option<B
     })
 }
 
+/// The newest modification time among the files the enabled local readers
+/// watch for `path` — `IHasItemChangeMonitor.HasChanged` of the Comic and
+/// Open Packaging Format providers, whose test is `file.Exists && mtime >
+/// item.DateLastSaved`, so any watched file being newer is the newest being
+/// newer. `None` when no watched file exists.
+///
+/// - **Open Packaging Format** (`OpfProvider.GetXmlFile`): `<stem>.opf`, else
+///   `content.opf`, else `metadata.opf` beside the book.
+/// - **Comic Provider**: the external ComicInfo file (`ExternalComicInfoProvider`:
+///   `<stem>.xml`, else `ComicInfo.xml`), and for a `.cbz` the book file itself
+///   (`InternalComicInfoProvider` and `ComicBookInfoProvider`).
+/// - The EPUB reader has no change monitor.
+#[must_use]
+pub fn book_change_mtime(path: &str, readers: &[&str]) -> Option<std::time::SystemTime> {
+    use crate::library_options::fetcher_names;
+    let file = Path::new(path);
+    let dir = file.parent()?;
+    let first_existing = |candidates: Vec<std::path::PathBuf>| {
+        candidates.into_iter().find_map(|candidate| {
+            let metadata = std::fs::metadata(candidate).ok()?;
+            metadata.is_file().then_some(metadata.modified().ok()?)
+        })
+    };
+    let mut newest: Option<std::time::SystemTime> = None;
+    let mut consider = |mtime: Option<std::time::SystemTime>| {
+        newest = newest.max(mtime);
+    };
+    for reader in readers {
+        match *reader {
+            fetcher_names::OPF => consider(first_existing(vec![
+                file.with_extension("opf"),
+                dir.join("content.opf"),
+                dir.join("metadata.opf"),
+            ])),
+            fetcher_names::COMIC => {
+                consider(first_existing(vec![
+                    file.with_extension("xml"),
+                    dir.join("ComicInfo.xml"),
+                ]));
+                if extension_of(path) == "cbz" {
+                    consider(first_existing(vec![file.to_path_buf()]));
+                }
+            }
+            _ => {}
+        }
+    }
+    newest
+}
+
 /// ComicProvider's internal readers have a fixed registration order. The
 /// external ComicInfo reader is applicable to any Book, including EPUB/PDF.
 fn read_comic_metadata(path: &str) -> Option<BookMetadata> {
@@ -978,6 +1027,66 @@ struct ComicBookInfoCredit {
     person: Option<String>,
     #[serde(default)]
     role: Option<String>,
+}
+
+#[cfg(test)]
+mod change_monitor_tests {
+    use super::*;
+    use crate::library_options::fetcher_names::{COMIC, EPUB, OPF};
+    use std::time::{Duration, SystemTime};
+
+    fn touch(path: &Path, age_secs: u64) -> SystemTime {
+        std::fs::write(path, "x").unwrap();
+        let mtime = SystemTime::now() - Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// `OpfProvider`/`ComicProvider.HasChanged`: each enabled reader watches
+    /// its own file, the first of its candidates that exists, and the newest
+    /// watched file decides.
+    #[test]
+    fn readers_watch_their_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = dir.path().join("Story.epub");
+        let book = book.to_str().unwrap();
+        assert_eq!(book_change_mtime(book, &[COMIC, EPUB, OPF]), None);
+
+        let opf_specific = touch(&dir.path().join("Story.opf"), 300);
+        touch(&dir.path().join("content.opf"), 10);
+        // The specific name wins over content.opf, and it is the only OPF watched.
+        assert_eq!(book_change_mtime(book, &[OPF]), Some(opf_specific));
+        // The EPUB reader has no monitor; the Comic reader does not watch OPFs.
+        assert_eq!(book_change_mtime(book, &[EPUB]), None);
+        assert_eq!(book_change_mtime(book, &[COMIC]), None);
+
+        let comic_xml = touch(&dir.path().join("ComicInfo.xml"), 100);
+        assert_eq!(book_change_mtime(book, &[COMIC]), Some(comic_xml));
+        // Both enabled: the newer of the two files.
+        assert_eq!(book_change_mtime(book, &[COMIC, OPF]), Some(comic_xml));
+        let stem_xml = touch(&dir.path().join("Story.xml"), 5);
+        assert_eq!(book_change_mtime(book, &[COMIC]), Some(stem_xml));
+    }
+
+    #[test]
+    fn a_cbz_is_watched_itself_but_other_comic_formats_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let cbz = dir.path().join("Issue.cbz");
+        let cbr = dir.path().join("Issue.cbr");
+        let cbz_time = touch(&cbz, 20);
+        touch(&cbr, 20);
+        assert_eq!(
+            book_change_mtime(cbz.to_str().unwrap(), &[COMIC]),
+            Some(cbz_time)
+        );
+        assert_eq!(book_change_mtime(cbr.to_str().unwrap(), &[COMIC]), None);
+        assert_eq!(book_change_mtime(cbz.to_str().unwrap(), &[OPF]), None);
+    }
 }
 
 #[cfg(test)]

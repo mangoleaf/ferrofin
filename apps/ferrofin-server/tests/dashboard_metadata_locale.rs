@@ -918,6 +918,15 @@ async fn verify_local_reader_order(api: &Api, root: &std::path::Path) {
         api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true"), &Value::Null).await;
         assert_eq!(await_book(api, expected).await["Id"], id);
     }
+    // A sidecar edit alone (no replace-all request) is picked up by the next
+    // library refresh: the Comic and OPF providers monitor their files.
+    std::fs::write(
+        books.join("Ordered.xml"),
+        "<ComicInfo><Title>Comic edited</Title></ComicInfo>",
+    )
+    .unwrap();
+    api.post("/Library/Refresh", &Value::Null).await;
+    assert_eq!(await_book(api, "Comic edited").await["Id"], id);
 }
 
 async fn await_book(api: &Api, name: &str) -> Value {

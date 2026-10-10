@@ -2259,6 +2259,20 @@ fn sidecars_changed(
 /// NFO, or the library disabled the reader).
 fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
     use ferrofin_providers::xbmc::item::NfoItemKind;
+    if entity.type_.ends_with(".Book") {
+        // A book has no NFO reader; its Comic and OPF providers monitor
+        // their own files.
+        let readers = ferrofin_providers::books::book_metadata_readers(
+            policy.options,
+            policy.global_for("Book"),
+        );
+        let mtime =
+            ferrofin_providers::books::book_change_mtime(entity.path.as_deref()?, &readers)?;
+        return Some(LocalMetadataFile {
+            mtime: DateTime::<Utc>::from(mtime),
+            format: LocalMetadataFormat::Book,
+        });
+    }
     if !policy.local_reader_enabled(fetcher_names::NFO) {
         return None;
     }

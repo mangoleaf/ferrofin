@@ -109,6 +109,9 @@ pub enum LocalMetadataFormat {
     /// the scan never passes one; the arm is ported for their refresh.
     #[cfg_attr(not(test), allow(dead_code))]
     Xml,
+    /// A book's Comic/OPF sidecar or `.cbz` file (`ComicProvider.HasChanged`,
+    /// `OpfProvider.HasChanged`): newer than the last save, with no tolerance.
+    Book,
 }
 
 /// What the filesystem says about the item now.
@@ -369,7 +372,7 @@ fn local_metadata_changed(stored: &StoredState, fs: &FileFacts) -> bool {
     };
     let tolerance = match file.format {
         LocalMetadataFormat::Nfo => NFO_SAVE_TOLERANCE_MS,
-        LocalMetadataFormat::Xml => XML_SAVE_TOLERANCE_MS,
+        LocalMetadataFormat::Xml | LocalMetadataFormat::Book => XML_SAVE_TOLERANCE_MS,
     };
     stored
         .date_last_saved
