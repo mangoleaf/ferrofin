@@ -46,6 +46,7 @@ use rstest::rstest;
     "Crouching.Tiger.Hidden.Dragon.4K.UltraHD.HDR.BDrip-HDC.mkv",
     "Crouching.Tiger.Hidden.Dragon"
 )]
+#[case("Last.Call.for.Nowhere.WEB-DL.1080p", "Last.Call.for.Nowhere")]
 #[case("[HorribleSubs] Made in Abyss - 13 [720p].mkv", "Made in Abyss")]
 #[case(
     "[Tsundere] Kore wa Zombie Desu ka of the Dead [BDRip h264 1920x1080 FLAC]",

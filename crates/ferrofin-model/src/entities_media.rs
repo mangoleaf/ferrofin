@@ -367,6 +367,93 @@ pub struct VirtualFolderInfo {
     pub refresh_status: Option<String>,
 }
 
+impl VirtualFolderInfo {
+    /// Whether one of this library's locations holds `path` — the location
+    /// itself or anything under it, compared as upstream compares physical
+    /// locations (`OrdinalIgnoreCase`).
+    #[must_use]
+    pub fn holds_path(&self, path: &str) -> bool {
+        self.location_holding(path).is_some()
+    }
+
+    /// The longest of this library's locations that holds `path`.
+    fn location_holding(&self, path: &str) -> Option<&str> {
+        let path = trim_separators(path);
+        self.locations
+            .iter()
+            .map(|location| trim_separators(location))
+            .filter(|location| {
+                path.len() >= location.len()
+                    && path.is_char_boundary(location.len())
+                    && path[..location.len()].eq_ignore_ascii_case(location)
+                    && (path.len() == location.len()
+                        || location.ends_with(['/', '\\'])
+                        || path[location.len()..].starts_with(['/', '\\']))
+            })
+            .max_by_key(|location| location.len())
+    }
+
+    /// Whether `top_parent_id` (a stored `TopParentId`, any GUID form) is
+    /// this library's collection folder.
+    fn is_collection_folder(&self, top_parent_id: &str) -> bool {
+        match (
+            self.item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+            uuid::Uuid::parse_str(top_parent_id).ok(),
+        ) {
+            (Some(own), Some(top)) => own == top,
+            _ => false,
+        }
+    }
+}
+
+/// A location without its trailing separators (the root stays itself).
+fn trim_separators(path: &str) -> &str {
+    match path.trim_end_matches(['/', '\\']) {
+        "" if !path.is_empty() => &path[..1],
+        trimmed => trimmed,
+    }
+}
+
+/// Every configured library one of whose locations holds `path` —
+/// `LibraryManager.GetCollectionFolders(item)`, which walks to the item's
+/// top-level physical folder and returns each collection folder whose
+/// physical locations contain it, so a folder two libraries share is in both.
+#[must_use]
+pub fn libraries_holding<'a>(
+    folders: &'a [VirtualFolderInfo],
+    path: &str,
+) -> Vec<&'a VirtualFolderInfo> {
+    folders.iter().filter(|f| f.holds_path(path)).collect()
+}
+
+/// The configured library that owns an item stored with `top_parent_id` at
+/// `path` (its own path, or for a path-less item its nearest ancestor's):
+/// the library whose collection folder is the `TopParentId` (a row an older
+/// Ferrofin scan wrote), else the one a location of which holds the path —
+/// the innermost, where locations nest. Upstream reads library options and
+/// collection folders through the item's location the same way
+/// (`LibraryManager.GetLibraryOptions` → `GetCollectionFolders`).
+#[must_use]
+pub fn owning_library<'a>(
+    folders: &'a [VirtualFolderInfo],
+    top_parent_id: Option<&str>,
+    path: Option<&str>,
+) -> Option<&'a VirtualFolderInfo> {
+    if let Some(top) = top_parent_id
+        && let Some(folder) = folders.iter().find(|f| f.is_collection_folder(top))
+    {
+        return Some(folder);
+    }
+    let path = path?;
+    folders
+        .iter()
+        .filter_map(|f| f.location_holding(path).map(|location| (location.len(), f)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, f)| f)
+}
+
 /// Since `BaseItem` and `DTOBaseItem` both have provider ids, this trait helps
 /// avoid code repetition by using extension methods (the free functions on
 /// this module).
@@ -1244,6 +1331,62 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
+        let library = |id: &str, locations: &[&str]| super::VirtualFolderInfo {
+            item_id: Some(id.to_owned()),
+            locations: locations.iter().map(|l| (*l).to_owned()).collect(),
+            ..super::VirtualFolderInfo::default()
+        };
+        let movies = library("11111111-1111-1111-1111-111111111111", &["/media/Movies/"]);
+        let kids = library(
+            "22222222-2222-2222-2222-222222222222",
+            &["/media/movies/Kids"],
+        );
+        let all = [movies, kids];
+        let name = |f: Option<&super::VirtualFolderInfo>| f.and_then(|f| f.item_id.clone());
+        // An older row's collection folder, in the database's GUID form.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some(
+                    "11111111-1111-1111-1111-111111111111"
+                        .to_uppercase()
+                        .as_str()
+                ),
+                None
+            )),
+            all[0].item_id
+        );
+        // By path: case-insensitive, the innermost location wins.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some("not-a-library"),
+                Some("/media/MOVIES/Heat/Heat.mkv")
+            )),
+            all[0].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                None,
+                Some("/media/movies/Kids/Up/Up.mkv")
+            )),
+            all[1].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(&all, None, Some("/media/movies"))),
+            all[0].item_id
+        );
+        // A sibling that only shares a prefix is no location's.
+        assert!(super::owning_library(&all, None, Some("/media/Movies2/x.mkv")).is_none());
+        assert_eq!(
+            super::libraries_holding(&all, "/media/movies/Kids/Up").len(),
+            2
+        );
+    }
     use super::*;
 
     #[test]

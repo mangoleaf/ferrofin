@@ -96,6 +96,61 @@ fn library(
     }
 }
 
+/// The movies library's files: movies alone, in their own folders and in a
+/// plain collection folder, extras by suffix, folder and theme song, version
+/// groups (one an alternate with its own stack), stacks in a folder and at
+/// the root, disc rips and a soundtrack.
+const MOVIES: &[&str] = &[
+    "Alien (1979).mkv",
+    "Alien (1979)-trailer.mkv",
+    "Heat (1995)/Heat (1995).mkv",
+    "Heat (1995)/Heat (1995)-trailer.mkv",
+    "Ronin (1998)/Ronin (1998) - 1080p.mkv",
+    "Ronin (1998)/Ronin (1998) - 2160p.mkv",
+    "Ronin (1998)/Ronin (1998) - 1080p-trailer.mkv",
+    "Twins (1988)/Twins (1988).mkv",
+    "Twins (1988)/Twins (1988) - 1080p part1.mkv",
+    "Twins (1988)/Twins (1988) - 1080p part2.mkv",
+    "Heist cd1.mkv",
+    "Heist cd2.mkv",
+    "Heat (1995)/trailers/Teaser.mkv",
+    "Heat (1995)/extras/Behind the Scenes.mkv",
+    "Heat (1995)/theme.mp3",
+    "Blade Runner (1982)/VIDEO_TS/VTS_01_1.VOB",
+    "Blade Runner (1982)/VIDEO_TS/VIDEO_TS.IFO",
+    "Dune (2021)/BDMV/index.bdmv",
+    "Dune (2021)/BDMV/STREAM/00001.m2ts",
+    "Dune (2021)/trailers/Dune Trailer.mkv",
+    "Jaws (1975)/VIDEO_TS.IFO",
+    "Jaws (1975)/VTS_01_1.VOB",
+    "Jaws (1975)/Jaws (1975)-trailer.mkv",
+    "Sound of Music/Sound of Music (1965) (Disc 01)/VIDEO_TS/VTS_01_1.VOB",
+    "Sound of Music/Sound of Music (1965) (Disc 02)/VIDEO_TS/VTS_01_1.VOB",
+    // No extra of the set's: its owner folder is the first disc, and the
+    // name is not the set's (`ExtraResolver.cs:71,85-91`).
+    "Sound of Music/trailers/Sound of Music Trailer.mkv",
+    // Named after the set's title and year: its trailer.
+    "Sound of Music/Sound of Music (1965)-trailer.mkv",
+    "Collections/Alien/Aliens (1986).mkv",
+    "Collections/Alien/Alien 3 (1992).mkv",
+    "Soundtrack/score.mp3",
+];
+
+/// The untyped library's files: movies, a series by its `tvshow.nfo`, one by
+/// its season folder, a folder of plain videos (`season.nfo`), and audio.
+const MIXED: &[&str] = &[
+    "Film.mkv",
+    "Folder/Other Film (2001).mkv",
+    "Folder/pic.jpg",
+    "Show/tvshow.nfo",
+    "Show/Show S01E01.mkv",
+    "Anthology/Season 1/Anthology S01E01.mkv",
+    "Anthology/Season 1/Anthology S01E02.mkv",
+    "Notes/season.nfo",
+    "Notes/A.mkv",
+    "song.mp3",
+];
+
 /// One fixture tree per library type — each shape a resolver treats
 /// specially: movies with versions, extras (by suffix, folder and theme
 /// song) and disc rips; series with season folders, specials, multi-episode
@@ -107,26 +162,7 @@ fn library(
 /// mixed library.
 fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
     let movies = root.join("movies");
-    for rel in [
-        "Alien (1979).mkv",
-        "Alien (1979)-trailer.mkv",
-        "Heat (1995)/Heat (1995).mkv",
-        "Heat (1995)/Heat (1995)-trailer.mkv",
-        "Ronin (1998)/Ronin (1998) - 1080p.mkv",
-        "Ronin (1998)/Ronin (1998) - 2160p.mkv",
-        "Ronin (1998)/Ronin (1998) - 1080p-trailer.mkv",
-        "Heat (1995)/trailers/Teaser.mkv",
-        "Heat (1995)/extras/Behind the Scenes.mkv",
-        "Heat (1995)/theme.mp3",
-        "Blade Runner (1982)/VIDEO_TS/VTS_01_1.VOB",
-        "Blade Runner (1982)/VIDEO_TS/VIDEO_TS.IFO",
-        "Dune (2021)/BDMV/index.bdmv",
-        "Dune (2021)/BDMV/STREAM/00001.m2ts",
-        "Dune (2021)/trailers/Dune Trailer.mkv",
-        "Collections/Alien/Aliens (1986).mkv",
-        "Collections/Alien/Alien 3 (1992).mkv",
-        "Soundtrack/score.mp3",
-    ] {
+    for rel in MOVIES {
         touch(&movies, rel);
     }
     let tv = root.join("tv");
@@ -180,6 +216,8 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         "root.jpg",
         "clip.mp4",
         "clip.jpg",
+        "Lesson pt1.mp4",
+        "Lesson pt2.mp4",
         "Trip 2024/img1.jpg",
         "Trip 2024/day2/img2.jpg",
         "Trip 2024/day2/movie.mkv",
@@ -188,7 +226,7 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
         touch(&home, rel);
     }
     let mixed = root.join("mixed");
-    for rel in ["Film.mkv", "Folder/Other Film (2001).mkv", "Folder/pic.jpg"] {
+    for rel in MIXED {
         touch(&mixed, rel);
     }
     // A directory that differs from `tv` only in case: a library of its own
@@ -214,14 +252,17 @@ fn fixture(root: &std::path::Path) -> Vec<VirtualFolderInfo> {
 }
 
 /// What the invariant compares for one planned item: its id, its ancestor
-/// closure, and its row (presentation keys included) — with a folder's
-/// `DateCreated` cleared, which the planner stamps with the clock.
+/// closure, and its row (presentation keys included) — with a directory's
+/// (a folder's, a disc rip's) `DateCreated` cleared, which the planner
+/// stamps with the clock.
 fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
     items
         .into_iter()
         .map(|p| {
             let mut entity = p.entity;
-            if entity.is_folder {
+            // A directory — a folder's, a disc rip's — is stamped with the
+            // resolve time.
+            if crate::item_data::path_is_directory(&entity) {
                 entity.date_created = None;
             }
             (p.id, p.ancestors, entity)
@@ -230,24 +271,55 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
 }
 
 /// The full plan filtered to `paths` (and `exact`), as a scoped scan used to
-/// build it: the items at, under or above a path, and the path-less virtual
-/// seasons those items sit in.
+/// build it: the items at, under or above a path, the path-less virtual
+/// seasons those items sit in, and the rest of a kept video's local group —
+/// its primary, stacked parts and alternate versions, linked by `OwnerId`
+/// (no extra), which a scoped plan plans whole — and a multi-disc movie
+/// one of whose `AdditionalParts` disc folders (which have no rows) is.
 fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Planned> {
+    let kept = |path: &str| {
+        exact == Some(path)
+            || paths
+                .iter()
+                .any(|c| path_is_under(path, c) || path_is_under(c, path))
+    };
     let by_path = |p: &Planned| {
-        p.entity.path.as_deref().is_some_and(|path| {
-            exact == Some(path)
-                || paths
-                    .iter()
-                    .any(|c| path_is_under(path, c) || path_is_under(c, path))
-        })
+        p.entity.path.as_deref().is_some_and(kept)
+            || crate::item_data::parse_data(p.entity.data.as_deref())
+                .get("AdditionalParts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|part| crate::item_data::path_is_directory(&p.entity) && kept(part))
+                })
     };
     let parents: std::collections::HashSet<String> = full
         .iter()
         .filter(|p| by_path(p))
         .filter_map(|p| p.entity.parent_id.clone())
         .collect();
+    let owners: std::collections::HashMap<&str, &str> = full
+        .iter()
+        .filter(|p| p.entity.extra_type.is_none())
+        .filter_map(|p| Some((p.entity.id.as_str(), p.entity.owner_id.as_deref()?)))
+        .collect();
+    let head = |p: &Planned| {
+        let mut id = p.entity.id.as_str();
+        while let Some(owner) = owners.get(id) {
+            id = owner;
+        }
+        id.to_owned()
+    };
+    let groups: std::collections::HashSet<String> =
+        full.iter().filter(|p| by_path(p)).map(head).collect();
     full.iter()
-        .filter(|p| by_path(p) || (p.entity.path.is_none() && parents.contains(&p.entity.id)))
+        .filter(|p| {
+            by_path(p)
+                || (p.entity.path.is_none() && parents.contains(&p.entity.id))
+                || groups.contains(&head(p))
+        })
         .map(|p| Planned {
             id: p.id,
             entity: p.entity.clone(),
@@ -256,11 +328,50 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
         .collect()
 }
 
+/// The owner of `p` when it is a local group's member — a stacked part or
+/// a local alternate version (owned, no extra).
+fn owned_by(p: &Planned) -> Option<&str> {
+    p.entity
+        .owner_id
+        .as_deref()
+        .filter(|_| p.entity.extra_type.is_none())
+}
+
+/// Every local group shape is present in `full`: a stacked part (owned, no
+/// extra, pointing at nothing), a local alternate version (owned and
+/// pointing at its primary), and an alternate's own part.
+fn assert_group_shapes(full: &[Planned]) {
+    let alternates: Vec<&str> = full
+        .iter()
+        .filter(|p| owned_by(p).is_some() && p.entity.primary_version_id.is_some())
+        .map(|p| p.entity.id.as_str())
+        .collect();
+    assert!(!alternates.is_empty(), "the fixture plans no alternate");
+    let parts: Vec<&Planned> = full
+        .iter()
+        .filter(|p| owned_by(p).is_some() && p.entity.primary_version_id.is_none())
+        .collect();
+    assert!(
+        parts
+            .iter()
+            .any(|p| !alternates.contains(&owned_by(p).unwrap())),
+        "the fixture plans no primary's part"
+    );
+    assert!(
+        parts
+            .iter()
+            .any(|p| alternates.contains(&owned_by(p).unwrap())),
+        "the fixture plans no alternate's part"
+    );
+}
+
 /// For every planned item of every fixture library — and for folders that
 /// are no item, the library roots (with and without a trailing slash), the
 /// inside of a disc rip, and paths that do not exist — planning that one
 /// path, through the libraries a path-scoped scan walks for it
 /// (`affected_libraries`), yields exactly the full plan filtered to it.
+// The fixture's path list is one table.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn plan_paths_matches_the_filtered_full_plan() {
     let tmp = tempfile::tempdir().unwrap();
@@ -289,6 +400,7 @@ async fn plan_paths_matches_the_filtered_full_plan() {
             "the fixture plans no {kind}"
         );
     }
+    assert_group_shapes(&full);
     // A dotted directory name is a name, not a file name with an extension.
     let named = |kind: &str, name: &str| {
         full.iter()
@@ -314,6 +426,10 @@ async fn plan_paths_matches_the_filtered_full_plan() {
         "movies/Dune (2021)/BDMV/STREAM/00001.m2ts",
         "movies/Dune (2021)/BDMV",
         "movies/Dune (2021)/trailers",
+        "movies/Jaws (1975)/VTS_01_1.VOB",
+        "movies/Sound of Music",
+        "movies/Sound of Music/Sound of Music (1965) (Disc 02)/VIDEO_TS/VTS_01_1.VOB",
+        "movies/Sound of Music/trailers",
         "movies/Gone (2000).mkv",
         "tv",
         "tv/",

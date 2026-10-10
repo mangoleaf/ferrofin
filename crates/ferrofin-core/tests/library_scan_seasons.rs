@@ -280,14 +280,13 @@ impl Library {
             .collect()
     }
 
-    /// Moves the season folder's mtime an hour ahead: the season's
-    /// `requiresRefresh` (D3) on the next scan.
-    fn touch_season(&self) {
-        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
-        std::fs::File::open(&self.season_dir)
-            .expect("open season dir")
-            .set_modified(later)
-            .expect("season mtime");
+    /// Clears the season's `DateLastRefreshed`: its `isFirstRefresh` on the
+    /// next scan, which runs every provider in `Default` mode
+    /// (`MetadataService.RefreshMetadata`). A changed season folder does not:
+    /// a directory has no `DateModified` (D2), and `BaseItem.RequiresRefresh`
+    /// is false for a `MinValue` one (`BaseItem.cs:1721-1731`).
+    async fn forget_season_refresh(&self) {
+        self.set_season(r#""DateLastRefreshed" = NULL"#).await;
     }
 
     /// Sets one column of the season's row.
@@ -353,8 +352,8 @@ fn dashboard(choice: &str) -> MetadataRefreshOptions {
 /// request is the one its episode shares, and its TVDB id comes from the
 /// series record the series provider read: a first scan asks TheMovieDb for
 /// the season once and TheTVDB for the season's record once. An unchanged
-/// rescan asks nothing; a changed season folder (D3) asks both season
-/// providers again, and nothing else.
+/// rescan asks nothing — a changed season folder neither (D2); a season to
+/// refresh again asks both season providers again, and nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -409,8 +408,20 @@ async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request()
         "an unchanged season asks nothing"
     );
 
-    library.touch_season();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+    std::fs::File::open(&library.season_dir)
+        .expect("open season dir")
+        .set_modified(later)
+        .expect("season mtime");
     scanner.scan_all().await.expect("folder-change rescan");
+    assert_eq!(
+        drain(&log),
+        Vec::<String>::new(),
+        "a changed season folder asks nothing"
+    );
+
+    library.forget_season_refresh().await;
+    scanner.scan_all().await.expect("refreshing rescan");
     let mut asked_now: Vec<String> = drain(&log)
         .into_iter()
         .filter_map(|l| l.split_whitespace().nth(1).map(str::to_owned))
@@ -512,9 +523,9 @@ async fn a_season_under_a_series_tmdb_never_matched_asks_tmdb_nothing() {
     );
 }
 
-/// A locked season runs no season provider, even when its folder changed
-/// (`CanRefreshMetadata`: a locked item runs no remote provider), so nothing
-/// is asked and nothing is written over.
+/// A locked season runs no season provider, even on what would be its first
+/// refresh (`CanRefreshMetadata`: a locked item runs no remote provider), so
+/// nothing is asked and nothing is written over.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_season_asks_its_providers_nothing() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -525,9 +536,9 @@ async fn a_locked_season_asks_its_providers_nothing() {
     library
         .set_season(r#""IsLocked" = 1, "Overview" = 'Mine.'"#)
         .await;
+    library.forget_season_refresh().await;
     drain(&log);
 
-    library.touch_season();
     scanner.scan_all().await.expect("rescan");
     assert_eq!(drain(&log), Vec::<String>::new());
     let season = library.season().await;
@@ -568,7 +579,7 @@ async fn a_seasons_locked_overview_stands_under_replace_all() {
 
 /// The adoption gates' provider outage: every season provider request
 /// fails (nothing listens), in each refresh that runs the season's
-/// providers — a changed folder under "Scan for new and updated files",
+/// providers — a first refresh under "Scan for new and updated files",
 /// "Search for missing metadata" and "Replace all metadata" (which skips
 /// re-adding the stored values, `RemoveOldMetadata`). A season provider
 /// that fails never clears what the season stores: its overview, dates,
@@ -585,14 +596,14 @@ async fn a_failing_season_provider_never_clears_the_stored_season(#[case] choice
     let library = Library::new(tmp.path(), LibraryOptions::default()).await;
     let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
     library.scanner(&base).scan_all().await.expect("first scan");
+    if choice == "scan" {
+        library.forget_season_refresh().await;
+    }
     let before = library.season().await;
     let ids = library.season_ids().await;
     let cast = library.cast().await;
     assert!(before.overview.is_some() && !ids.is_empty() && !cast.is_empty());
 
-    if choice == "scan" {
-        library.touch_season();
-    }
     library
         .scanner(&unreachable_base())
         .scan_with(None, &dashboard(choice))

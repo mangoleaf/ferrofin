@@ -631,6 +631,26 @@ pub trait LibraryManager: Send + Sync {
         ))
     }
 
+    /// The other parts of a stacked video, ordered by `SortName`.
+    ///
+    /// Port of `Video.GetAdditionalParts(user)` (`Video.cs:492-498`): one
+    /// `Video` item per path in the video's `AdditionalParts` (its id derived
+    /// from the path as a `Video`'s), those that exist and — with a user —
+    /// that the user may see (parental rating and tags). Empty for a video
+    /// that is not stacked, and for any other item.
+    ///
+    /// The default implementation reports the operation as unsupported (see
+    /// [`merge_versions`](Self::merge_versions)); `FerrofinLibraryManager`
+    /// overrides it.
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (video, user);
+        Err(ServiceError::backend("get_additional_parts not supported"))
+    }
+
     /// Gets the people rows attached to an item.
     async fn get_people(
         &self,
@@ -1740,6 +1760,28 @@ pub trait MediaSourceManager: Send + Sync {
     > {
         let _ = primary_ids;
         Ok(std::collections::HashMap::new())
+    }
+
+    /// [`Self::get_alternate_versions_batch`] with, beside each row, whether
+    /// it has versions of its own (some other row names it as its
+    /// `PrimaryVersionId`), read in the same query. The default flags every
+    /// row the unflagged form returns.
+    async fn get_alternate_versions_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<
+            Uuid,
+            Vec<(ferrofin_db::entities::base_items::BaseItemEntity, bool)>,
+        >,
+        ServiceError,
+    > {
+        Ok(self
+            .get_alternate_versions_batch(primary_ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
     }
 
     /// Gets the media attachments of an item as presentation DTOs.

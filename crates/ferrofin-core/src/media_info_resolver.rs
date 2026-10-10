@@ -271,9 +271,24 @@ impl MediaInfoResolver {
             self.localization.as_ref(),
             self.profile_type,
         );
+        // VobSub .sub payloads only carry per-track language metadata when read via
+        // their paired .idx file, so probe the .idx instead and skip the .sub. Pairing
+        // requires the same directory (ffprobe can't resolve a split pair) and an
+        // ordinal comparison (ffprobe matches the .sub by exact case on case-sensitive
+        // filesystems, so a looser match could suppress a .sub with no working .idx).
+        // An .idx file with no paired .sub cannot be probed at all, so it is left out
+        // entirely rather than surfaced (which would otherwise fail every probe and,
+        // since the .idx would keep "existing", prevent stale subtitle stream
+        // metadata from ever being cleared once the .sub is gone).
+        let paired_vob_sub_keys =
+            (self.profile_type == DlnaProfileType::Subtitle).then(|| paired_vob_sub_keys(&files));
+
         let prefix = video.file_name_without_extension();
         let mut external_path_infos = Vec::new();
         for file in &files {
+            if is_suppressed_vob_sub_file(file, paired_vob_sub_keys.as_ref()) {
+                continue;
+            }
             let file_name_without_extension = naming_path::file_name_without_extension(file);
             let Some(rest) = strip_prefix_ignore_case(file_name_without_extension, prefix) else {
                 continue;
@@ -319,6 +334,56 @@ impl MediaInfoResolver {
             media_is_audio: self.profile_type == DlnaProfileType::Audio,
         };
         self.media_encoder.get_media_info(&request).await
+    }
+}
+
+/// Whether `file` is the `.sub` half of a VobSub pair (its `.idx` is probed
+/// instead), or an `.idx` with no paired `.sub`, which cannot be probed at all.
+/// Port of `IsSuppressedVobSubFile`.
+fn is_suppressed_vob_sub_file(
+    file: &str,
+    paired_vob_sub_keys: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    let Some(paired) = paired_vob_sub_keys else {
+        return false;
+    };
+    let extension = naming_path::extension(file);
+    if extension.eq_ignore_ascii_case(".sub") {
+        // A paired .idx exists; probe it instead of the .sub payload.
+        return paired.contains(&vob_sub_pairing_key(file));
+    }
+    if extension.eq_ignore_ascii_case(".idx") {
+        // Without its .sub payload, the .idx cannot be probed for any data.
+        return !paired.contains(&vob_sub_pairing_key(file));
+    }
+    false
+}
+
+/// The directory+basename keys that have both an `.idx` and a `.sub` among
+/// `files`. Port of `GetPairedVobSubKeys`.
+fn paired_vob_sub_keys(files: &[String]) -> std::collections::HashSet<String> {
+    let mut idx_keys = std::collections::HashSet::new();
+    let mut sub_keys = std::collections::HashSet::new();
+    for file in files {
+        let extension = naming_path::extension(file);
+        if extension.eq_ignore_ascii_case(".idx") {
+            idx_keys.insert(vob_sub_pairing_key(file));
+        } else if extension.eq_ignore_ascii_case(".sub") {
+            sub_keys.insert(vob_sub_pairing_key(file));
+        }
+    }
+    idx_keys.retain(|key| sub_keys.contains(key));
+    idx_keys
+}
+
+/// The directory+basename key pairing a VobSub `.idx` with its `.sub` only
+/// when both live in the same directory (ordinal). Port of
+/// `GetVobSubPairingKey` (`Path.Combine(directory, baseName)`).
+fn vob_sub_pairing_key(file: &str) -> String {
+    let base_name = naming_path::file_name_without_extension(file);
+    match naming_path::directory_name(file).filter(|dir| !dir.is_empty()) {
+        Some(dir) => format!("{dir}/{base_name}"),
+        None => base_name.to_owned(),
     }
 }
 
@@ -786,6 +851,63 @@ mod tests {
         let streams = resolver.get_external_files(&video("My.Video.mkv"));
 
         assert!(streams.is_empty(), "{streams:?}");
+    }
+
+    /// The external files `resolver` finds beside `My.Video.mkv` when the
+    /// video folder lists `video_files` and the metadata folder `metadata_files`.
+    fn external_paths(video_files: &[&str], metadata_files: &[&str]) -> Vec<String> {
+        let listing = |dir: &str, files: &[&str]| {
+            files
+                .iter()
+                .map(|f| format!("{dir}/{f}"))
+                .collect::<Vec<_>>()
+        };
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH, METADATA_DIRECTORY_PATH],
+            vec![
+                (
+                    VIDEO_DIRECTORY_PATH,
+                    listing(VIDEO_DIRECTORY_PATH, video_files),
+                ),
+                (
+                    METADATA_DIRECTORY_PATH,
+                    listing(METADATA_DIRECTORY_PATH, metadata_files),
+                ),
+            ],
+        );
+        let resolver = resolver(DlnaProfileType::Subtitle, vec![MediaStream::default()], fs);
+        resolver
+            .get_external_files(&video("My.Video.mkv"))
+            .into_iter()
+            .map(|info| info.path)
+            .collect()
+    }
+
+    /// Upstream `GetExternalFiles_VobSub*` (commit 39c2885fd6): an `.idx`/`.sub`
+    /// pair in one directory, same basename (flags included), resolves to the
+    /// `.idx` alone; a lone `.sub` stays; an `.idx` without its `.sub` is
+    /// dropped, including across the video/metadata split or a name mismatch.
+    #[rstest]
+    // GetExternalFiles_VobSubIdxAndSubPair_OnlyReturnsIdxFile
+    #[case(&["My.Video.idx", "My.Video.sub"], &[], &[".idx"])]
+    // GetExternalFiles_VobSubIdxWithoutMatchingSub_DoesNotReturnIdxFile
+    #[case(&["My.Video.idx"], &[], &[])]
+    // GetExternalFiles_StandaloneSubWithoutIdx_StillReturnsSubFile
+    #[case(&["My.Video.sub"], &[], &[".sub"])]
+    // GetExternalFiles_VobSubIdxAndSubInDifferentDirectories_DoesNotPair
+    #[case(&["My.Video.sub"], &["My.Video.idx"], &[".sub"])]
+    // GetExternalFiles_VobSubIdxAndSubWithMatchingLanguageFlag_SuppressesSub
+    #[case(&["My.Video.en.idx", "My.Video.en.sub"], &[], &[".idx"])]
+    // GetExternalFiles_VobSubIdxAndSubWithMismatchedNames_DoesNotPair
+    #[case(&["My.Video.idx", "My.Video.en.sub"], &[], &[".sub"])]
+    fn get_external_files_pairs_vob_sub_index_and_payload(
+        #[case] video_files: &[&str],
+        #[case] metadata_files: &[&str],
+        #[case] expected_extensions: &[&str],
+    ) {
+        let paths = external_paths(video_files, metadata_files);
+        let extensions: Vec<&str> = paths.iter().map(|p| naming_path::extension(p)).collect();
+        assert_eq!(extensions, expected_extensions, "{paths:?}");
     }
 
     // GetExternalStreams_BadPaths_ReturnsNoSubtitles

@@ -54,11 +54,15 @@ release changes what a refresh does once it runs:
   `album.nfo` or `artist.nfo` now wins over every remote provider:
   [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
 
-Apart from scans, who may delete an item now follows Jellyfin's rules:
-[who may delete an item](#unreleased--who-may-delete-an-item-follows-jellyfin-more-closely).
+Apart from scans, deleting an item now deletes its files, and who may delete one follows
+Jellyfin's rules:
+[deleting an item now deletes its files](#unreleased--deleting-an-item-now-deletes-its-files-as-in-jellyfin).
 
 **Upgrading from 1.3.x** causes no full pass: an unchanged item is still not reprocessed,
-and each change above reaches an item at its next refresh that asks its providers.
+and each change above reaches an item at its next refresh that asks its providers. The
+first scan does save every item once, because items are now stored as Jellyfin stores
+them:
+[the first scan after upgrading stores items as Jellyfin does](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does).
 
 **Upgrading from 1.2.x or earlier:** also read the 1.3.0 entries below, starting with
 [library scans process only what changed](#130--library-scans-process-only-what-changed):
@@ -69,22 +73,182 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- Deleting an item leaves its media files on disk.
 - Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
   (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
   shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
   updated by the disk watcher (where it can see the change) and by scheduled scans.
-- The first scan of an adopted Jellyfin database saves every item once, as described in
-  the 1.3.0 entry.
+- The first scan of an adopted Jellyfin database still rewrites three kinds of item: music
+  albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
+  album's `folder.jpg`; music artists, whose running time Ferrofin sums from their tracks
+  where Jellyfin stored 0; and the seasons Jellyfin made for episodes that are not in a
+  season folder. Ferrofin derives those seasons' ids differently, so the scan replaces
+  each such season with a new one and saves and refreshes its episodes once (on a
+  Jellyfin 10.11.8 test library, 591 seasons and about 8,700 episodes). See the next
+  entry.
 
-## Unreleased — who may delete an item follows Jellyfin more closely
+## Unreleased — the first scan after upgrading stores items as Jellyfin does
 
-This applies to accounts that delete items: the **Delete media**, **Delete Series**,
-**Delete Episode** or **Delete** entry in an item's menu, and `DELETE /Items/{itemId}` /
-`DELETE /Items?ids=`.
+Ferrofin now stores library items the way Jellyfin stores them. What the first library scan
+after upgrading does about it depends on where your database came from. Nothing on disk
+has to change, and no watch history is lost.
 
-Ferrofin 1.3.0–1.3.2 already refused a delete from an account without deletion rights. Three
-things are refined, to match Jellyfin:
+**A database Ferrofin created itself** (no `jellyfin.db.pre-ferrofin` next to it) is
+rewritten once by its next scan: every item is saved, and each item's `Etag` changes once.
+That scan probes no file and asks no metadata provider, except for an item whose kind
+changes (below), which is refreshed once as its new kind. It:
+
+- files every item under a folder item for its library location, as Jellyfin does (each
+  item's `TopParentId` and ancestors, and the parent of the items at the top of a
+  location). Until that scan has run, a library is read through both, so nothing
+  disappears in the meantime;
+- clears the movie flag (`IsMovie`) on every movie: Jellyfin sets it only on Live TV
+  programs and channels;
+- stores no modification time (`DateModified`) and the media type `Unknown` for every
+  folder-like item: series, seasons, albums, artists and folders;
+- stores the shared-folder flag (`IsInMixedFolder`) of episodes, tracks and books as
+  Jellyfin does;
+- stores a DVD or Blu-ray rip as a video, not a folder (`IsFolder` 1 → 0);
+- groups each movie's versions (`Movie - 1080p.mkv` beside `Movie - 2160p.mkv`) and
+  stacked parts (`Movie - cd1.mkv`, `Movie - cd2.mkv`) under one item, as Jellyfin lists
+  them, and likewise the versions and parts of an episode in one folder, so the movie and
+  episode counts drop by one per version and part. The rows older scans made for them
+  become that item's versions and parts;
+- moves an item whose kind changed to the id of its new kind: a clip in a home-videos
+  library, stored as a movie before, is now a video; files in a library with no content
+  type become the episodes or videos Jellyfin resolves; a stacked part becomes a video.
+  The item keeps its title, overview and artwork, but drops its provider ids unless it is
+  locked.
+
+Watch history, resume positions, favourites, playlist and collection entries and edits move
+with every item that is regrouped or changes kind. Jellyfin itself would delete such an
+item and create a new one.
+
+**DVD and Blu-ray rips and multi-disc sets** now resolve as one video each, as in Jellyfin:
+a folder holding `VIDEO_TS`, `BDMV` or `VIDEO_TS.IFO` is one video, and a folder of disc
+folders that stack (`Heat (1995) - Disc 1`, `Heat (1995) - Disc 2`) is one video whose
+other discs are parts. The rows older scans made per file or per disc fold into that video
+with their user data. As in Jellyfin, **a rip hides any other media in its folder**: apart
+from extras named for it, nothing else there or in its subfolders is resolved, and the scan
+removes those items, logging a warning that names the folder and the first of the files.
+Move such files out of a rip's folder to keep them in the library.
+
+**Items Jellyfin never lists are removed from the library** by that scan; their files stay
+on disk. Besides what a rip hides, that is a title inside a folder named like an extras
+folder below the top of a library (`Collection/Other/Film (2001)/`), an album in such a
+folder (one named `Other` inside an artist's folder), an album an older scan made of
+each disc folder of a multi-disc album (now one album), and the album an older scan made of
+a music library's loose top-level tracks (they are now tracks of their own). The watch
+history of a removed item is set aside, as for any item whose file disappears, and returns
+if the item is listed again.
+
+**A folder no longer refreshes because its modification time changed**, as in Jellyfin:
+adding an episode refreshes the new episode, not its season.
+
+**A database adopted from Jellyfin 10.11** has its local versions and stacked parts
+reshaped once at boot, before any scan, into the shape Jellyfin 12 gives them (Jellyfin's
+own 12.0 upgrade deletes those rows and lets the next scan create them again; Ferrofin
+keeps them with their user data). When there is work to do, the database file is first
+copied to `jellyfin.db.pre-rehome`, next to the database, and the copy is never touched
+again. Then the first scan rewrites only what Ferrofin still stores differently: on the
+benchmark library (a database Jellyfin 10.11.8 scanned, 20,497 items, remote metadata
+downloaders off), it updated 800 music albums (their cover) and 296 artists (their running
+time), two of the differences listed as still open above, probed no file, and the second
+scan wrote nothing. (The benchmark library keeps every episode in a season folder.)
+
+**A database whose episodes were grouped with Group versions**, such as one adopted from
+Jellyfin 12.1, has the copies of an episode that sit in one folder regrouped as that
+episode's local versions on its first scan, as Jellyfin's own current scanner groups them.
+On the Jellyfin 12.1 test database that rewrote about 828 episode rows.
+
+Adoption stays one-way: going back to Jellyfin means restoring the
+`jellyfin.db.pre-ferrofin` copy taken at adoption, which predates every change Ferrofin
+made. `jellyfin.db.pre-rehome` is not a way back either; it is the database as it was just
+before the reshaping above.
+
+## Unreleased — deleting an item now deletes its files, as in Jellyfin
+
+This applies to everyone who deletes media from Ferrofin: the **Delete media**,
+**Delete Series**, **Delete Episode** or **Delete** entry in an item's menu, and
+`DELETE /Items/{itemId}` / `DELETE /Items?ids=`.
+
+**Deleting an item now deletes its files**, exactly as Jellyfin does. Before, Ferrofin
+removed only the item from its database: the files stayed on disk and the next scan
+brought the item back. Now:
+
+- A movie (or other video) in its own folder takes **the whole folder** and everything in
+  it: its extras, its other versions, its artwork and subtitles.
+- A movie that shares a folder with others takes its file and every `.nfo`, image,
+  subtitle or lyric file in that folder whose name **starts with** the movie's file name.
+  Deleting `Alien.mkv` therefore also deletes `Aliens.nfo` and `Aliens-poster.jpg`, as
+  Jellyfin does.
+- A trailer or other extra kept beside its film, in the film's own folder, is deleted the
+  way Jellyfin deletes it: **with the film's whole folder.** Remove such an extra from disk
+  yourself if you want to keep the film.
+- The same rule reaches further than you might expect, exactly as in Jellyfin:
+  - a trailer or other extra kept **directly in a series folder** takes **the whole
+    series folder** with it, every season and episode included;
+  - one kept **directly in a season folder** takes **that season's folder**;
+  - a home video that is the only clip in a subfolder of a home-videos library takes
+    **that subfolder**, photos and anything else in it included.
+
+  Delete such items from disk yourself if you want to keep what is around them.
+- Three more cases are kept as Jellyfin has them:
+  - deleting **one version** of a film kept in the film's own folder deletes that whole
+    folder, **the other versions included**;
+  - a single video in a folder that also holds subfolders is not counted as sharing its
+    folder, so deleting it takes **the folder with its subfolders**;
+  - deleting a DVD or Blu-ray rip, or a multi-disc set, deletes its folder, **with any
+    other media inside it** that the rip or set hid from the library.
+- An item with other versions (another cut or resolution of the same film, kept beside
+  it or merged into it with **Group versions**) is replaced by its first remaining
+  version, as in Jellyfin: that version keeps its own watch history, the item's playlist
+  and collection entries move to it, and the other versions now belong to it. A film in
+  its own folder still takes the whole folder, the versions beside it included; the next
+  scan then removes those versions from the library. Deleting one version moves its
+  playlist and collection entries to the item it is a version of.
+- A series, season or album takes its folder; an episode takes only its own file.
+- A trickplay folder saved next to the media goes with the item.
+
+Check what a folder holds before deleting from it, and keep a backup of anything you are
+not sure about.
+
+Two safeguards differ from Jellyfin:
+
+- **Scan each library once after upgrading before deleting from it.** Until a full scan of
+  a library by this version has finished, a delete of an item in it is refused (`409
+  Conflict`, and jellyfin-web shows an error) and nothing is deleted: rows an earlier
+  Ferrofin stored can name more than the item — 1.3.x, for example, stored a music
+  library's own folder as an album, and deleting that album would have deleted the whole
+  library. Run **Scan All Libraries** (Dashboard → Libraries) or scan the library, then
+  delete again. The same applies to a database adopted from Jellyfin. Collections and
+  playlists are not affected.
+- **A library's own folder is never deleted**, nor any folder above one, nor the server's
+  collections and playlists folders. An item whose path is one of them shows no delete
+  entry, and deleting it by id answers `401`; Jellyfin would delete the folder. No delete
+  removes such a folder either: a video at a library's root that Ferrofin does not count
+  as sharing the folder is refused rather than taking the library with it.
+
+**If your media is mounted read-only** (a read-only NFS or SMB mount, a container volume
+mounted `:ro`), a delete now fails: the server answers with an error and nothing of your
+media is deleted, the item stays in the library. Some things have already happened by
+then, as in Jellyfin, and are not undone:
+
+- the artwork and metadata Ferrofin keeps for the item in its own data folder are
+  cleared. Art a metadata refresh downloads comes back on the item's next refresh; **an
+  image you uploaded, or art for a library whose image fetchers are turned off, does not
+  come back**;
+- if the item had other versions, the first remaining one has already taken its place:
+  it is its own item now, the item's playlist and collection entries have moved to it,
+  and versions whose files were already gone have been removed from the library;
+- if the item was itself a version, its playlist and collection entries have moved to
+  the item it is a version of, which no longer lists it.
+
+To let Ferrofin delete media, mount it read-write for the server's user; otherwise
+untick **Allow media deletion from** for your accounts so the delete entry is not
+offered.
+
+**Who may delete** follows Jellyfin more closely. Ferrofin 1.3.0–1.3.2 already refused
+accounts without deletion rights; three things are refined:
 
 - An account allowed to delete in some libraries only is matched to an item's library
   through the library tree, as Jellyfin does, instead of by comparing folder paths.
@@ -103,20 +267,22 @@ from**: **All libraries** lets the account delete in every library, or tick indi
 libraries. New accounts have neither; an administrator needs one of them too (the
 administrator Ferrofin creates on first start has **All libraries**). Deleting a collection
 needs **Allow this user to manage collections** or an administrator. An account that may
-not delete an item gets `401 Unauthorized`, and nothing is deleted.
+not delete an item gets `401 Unauthorized`, and nothing is deleted; an item in a library
+the account cannot see answers `404 Not Found`, as in Jellyfin, whatever its deletion
+rights.
 
-**Deleting an item still removes it from the library database only: its media files stay
-on disk**, and the next scan finds them again. Jellyfin also deletes the files; a later
-release will too, the way Jellyfin does.
-
-One more difference from Jellyfin remains: an account with **All libraries** deletion that can
-see only some libraries can still delete, by id, an item in a library it cannot see, where
-Jellyfin answers `404`. A later release closes this.
-
+A delete now finishes even if the app that asked for it is closed half way, and
 `DELETE /Items?ids=` handles the ids one at a time, in order, as Jellyfin does: if it
 reaches an id the account may not delete, it stops with `401`, and the items before that
-one are already deleted. A delete finishes even if the app that asked for it is closed
-half way.
+one are already deleted.
+
+**Trickplay saved next to media** is now looked for where Jellyfin puts it. For a video
+whose file name has more than one dot (`Alien.Resurrection.mkv`), that is
+`Alien.Resurrection.trickplay`; Ferrofin looked for `Alien.trickplay`, which belongs to
+`Alien.mkv`. For a folder item it is inside the folder. Ferrofin itself only writes
+trickplay to its data folder, so nothing it made is left behind; trickplay a Jellyfin
+install saved next to such files is now found, moved by the trickplay move task, and
+deleted with its item.
 
 ## Unreleased — plugin metadata sources run at their rank
 
@@ -327,8 +493,10 @@ item's `Etag` changes once. It is a one-time cost: on the 20,497-item benchmark 
 database Jellyfin 10.11.8 scanned, remote metadata downloaders off), it took about 80 s and
 wrote about 9 GB, and every later scan of the unchanged library took about 2 s. With
 downloaders checked, both scans also pay for the re-asking described next. A Jellyfin
-database adopted and scanned by 1.2.x or earlier gets the full pass above instead. Storing
-these values as Jellyfin does, so that adoption needs no such pass, is open work.
+database adopted and scanned by 1.2.x or earlier gets the full pass above instead. From
+this release these values are stored as Jellyfin stores them, and that first scan rewrites
+far fewer items:
+[the first scan after upgrading stores items as Jellyfin does](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does).
 
 **Titles still missing metadata are asked about on every scan.** This is a Ferrofin rule
 that Jellyfin does not have, and the one kind of provider request a scan of an unchanged
@@ -413,8 +581,10 @@ Ferrofin's scan groups files (they are open work, not intended behaviour):
 
 - **Alternate versions show as separate movies.** Jellyfin lists a movie with several
   versions (`Movie (2010) - 1080p.mkv` beside `Movie (2010) - 2160p.mkv`) once, with a
-  version picker. Ferrofin does not group versions yet, so after its scan each file is a
-  movie of its own, and the movie count rises by one per extra version.
+  version picker. Ferrofin 1.3.x does not group versions, so after its scan each file is a
+  movie of its own, and the movie count rises by one per extra version. From this release
+  versions are grouped as in Jellyfin
+  ([the first scan after upgrading](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does)).
 - **A plain subfolder in a movie library shows as an empty folder.** Jellyfin lists a
   folder that is not a movie's own (`Movies/Collection/Movie (2010)/…`) as a folder
   holding its movies. Ferrofin's scan lists those movies at the top of the library

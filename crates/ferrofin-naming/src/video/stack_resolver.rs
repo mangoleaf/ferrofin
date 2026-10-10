@@ -2,6 +2,7 @@
 
 use crate::audiobook::AudioBookFileInfo;
 use crate::common::NamingOptions;
+use crate::culture::culture_cmp;
 use crate::io::FileSystemMetadata;
 use crate::path;
 use crate::video::{FileStack, is_stub_file, is_video_file};
@@ -72,11 +73,14 @@ pub fn resolve(files: &[FileSystemMetadata], naming_options: &NamingOptions) -> 
                 || is_stub_file(&i.full_name, naming_options)
         })
         .collect();
-    potential_files.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    // `OrderBy(i => i.FullName)`: the current culture's order, not ordinal.
+    potential_files.sort_by(|a, b| culture_cmp(&a.full_name, &b.full_name));
 
-    // Insertion-ordered map of stack name → metadata.
+    // Insertion-ordered map of stack name → metadata (`index` finds a name's
+    // slot, so a folder of thousands of parts stays linear).
     let mut order: Vec<String> = Vec::new();
     let mut stacks: Vec<StackMetadata> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for file in potential_files {
         let mut name = file.name();
@@ -93,9 +97,10 @@ pub fn resolve(files: &[FileSystemMetadata], naming_options: &NamingOptions) -> 
             let part_number = parsed.part_number;
             let part_type = parsed.part_type;
 
-            let idx = if let Some(pos) = order.iter().position(|n| n == &stack_name) {
+            let idx = if let Some(&pos) = index.get(&stack_name) {
                 pos
             } else {
+                index.insert(stack_name.clone(), order.len());
                 order.push(stack_name);
                 stacks.push(StackMetadata::new(
                     file.is_directory,

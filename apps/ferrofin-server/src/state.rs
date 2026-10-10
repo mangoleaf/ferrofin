@@ -637,8 +637,23 @@ pub async fn build_app_state(
             move || config_mgr.snapshot_shared().ui_culture.clone()
         }),
     );
+    // An owned video's parental score follows the ratings its owner gives it.
+    item_persistence_impl.set_localization(Arc::clone(&localization));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
+    // The one boot repair that re-keys items: a Jellyfin 10.11 local version
+    // or stacked part takes the shape 12.x's scanner stores, so the first
+    // scan writes nothing for it. It needs the id derivation and the folders
+    // named after an item, so it runs here rather than with the others in
+    // `open_database`; nothing has scanned yet.
+    ferrofin_core::adoption_repairs::run_rehome_local_versions(
+        db,
+        &id_derivation,
+        Some(metadata_library.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await
+    .context("failed to re-home local alternate versions")?;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>
@@ -689,9 +704,13 @@ pub async fn build_app_state(
             .with_configuration(Arc::clone(&config_trait)),
     );
     let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
-    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = Arc::new(
-        FerrofinUserDataManager::new(db.clone(), Arc::clone(&config_trait)),
-    );
+    // Kept concrete until the session manager exists: the versions a
+    // played-state change propagates to are announced through it (below).
+    let user_data_impl = Arc::new(FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::clone(&config_trait),
+    ));
+    let user_data: Arc<dyn ferrofin_traits::library::UserDataManager> = user_data_impl.clone();
     // Live TV. Built after `users` (EnabledUsers needs the user manager) and
     // kept concrete: the DTO service the channel/programme projections need is
     // built later — it consumes the media-source manager, which consumes this
@@ -793,7 +812,8 @@ pub async fn build_app_state(
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
             .with_user_root(user_root_store.clone())
-            .with_scan_progress(scan_progress.clone()),
+            .with_scan_progress(scan_progress.clone())
+            .with_virtual_paths(virtual_paths.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -1020,10 +1040,15 @@ pub async fn build_app_state(
         Arc::clone(&file_system),
         Arc::clone(&item_persistence_service),
     )
-    .with_id_derivation(id_derivation)
+    .with_id_derivation(id_derivation.clone())
     // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
     // validation (the same expansion every image reader applies).
     .with_virtual_paths(virtual_paths.clone())
+    // An item moved to a new id (its kind changed) takes its folders along.
+    .with_path_manager(Arc::clone(&path_manager))
+    // Each library location is the `Folder` row Jellyfin keeps for it, under
+    // the aggregate root, and what it holds hangs off it (owner decision D1).
+    .with_root_folder(root_folder_ids.aggregate)
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())
@@ -1134,6 +1159,17 @@ pub async fn build_app_state(
             std::time::Duration::from_secs(library_update_duration),
         ),
     );
+    // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
+    // user-scoped lookups and the media sources' per-user version filter.
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
     let library_impl = Arc::new(
         FerrofinLibraryManager::new(
             Arc::clone(&item_repository),
@@ -1141,15 +1177,7 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
-        .with_visibility(Arc::new(
-            ferrofin_core::item_visibility::ItemVisibility::new(
-                db.clone(),
-                Arc::clone(&item_repository),
-                Arc::clone(&localization),
-                ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-            )
-            .with_virtual_paths(virtual_paths.clone()),
-        ))
+        .with_visibility(Arc::clone(&item_visibility))
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)
@@ -1161,11 +1189,21 @@ pub async fn build_app_state(
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
         .with_chapters(Arc::clone(&chapter_repository))
+        // A merge re-points playlist and collection entries to the primary.
+        .with_linked_children(Arc::clone(&linked_children_service))
         // `Items/Root` creates the root on first use; `/Years/{year}` creates
         // the year on first use — both as Jellyfin does.
         .with_user_root(user_root_store)
         .with_years(year_store)
-        .with_by_name_store(by_name_store),
+        .with_by_name_store(by_name_store)
+        // A stacked video's parts are found by the ids their paths derive to.
+        .with_id_derivation(id_derivation)
+        // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
+        // the internal metadata root whose per-item folders it cleans, and
+        // the `%AppDataPath%` expansion of a stored path (an adopted
+        // collection's or playlist's folder). Nothing confines the delete to
+        // the library locations, as upstream.
+        .with_app_paths(Arc::clone(&paths)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // The library monitor drives refreshes from two change sources: the
@@ -1270,6 +1308,10 @@ pub async fn build_app_state(
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.
         .with_user_data(Arc::clone(&user_data))
+        // A user is offered only the versions they may see standalone
+        // (`GetStaticMediaSources`' per-user filter).
+        .with_users(Arc::clone(&users))
+        .with_visibility(Arc::clone(&item_visibility))
         .with_localization(Arc::clone(&localization)),
     );
 
@@ -1633,7 +1675,10 @@ pub async fn build_app_state(
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
-    let _external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
+    // Every item delete removes the deleted rows' extracted data
+    // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
+    // manager is built before the chapter and segment managers this needs.
+    let external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
             Arc::clone(&keyframe_repository),
@@ -1641,6 +1686,7 @@ pub async fn build_app_state(
             Arc::clone(&trickplay),
             Arc::clone(&chapters),
         ));
+    library_impl.set_external_data(external_data);
 
     // ---- dto (consumes many of the above) ---------------------------------
     let dto_impl = Arc::new(
@@ -1701,6 +1747,11 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
+    // The versions a played-state change propagates to are announced to the
+    // user's sessions (`UserDataChanged`), as each save is upstream.
+    user_data_impl.set_user_data_changed_sink(Arc::new(
+        ferrofin_core::user_data_manager::SessionUserDataSink(Arc::downgrade(&sessions)),
+    ));
 
     // Every repository save announces itself (`ItemUpdated`), which is where
     // Jellyfin's notifier hooks in. Attached here rather than at construction
@@ -1715,6 +1766,7 @@ pub async fn build_app_state(
         sessions: Arc::clone(&sessions),
         users: Arc::clone(&users),
         items: Arc::clone(&item_repository),
+        persistence: Arc::clone(&item_persistence_service),
     }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -2109,6 +2161,7 @@ pub async fn build_app_state(
         crate::media_encoding::MediaEncodingExtras {
             // Transcode logs resolve item/series/library names through the library.
             library: Some(me_library),
+            virtual_folders: Some(Arc::clone(&virtual_folders)),
             trickplay: Some(me_trickplay),
             sessions: Some(me_sessions),
         },
@@ -2279,6 +2332,7 @@ struct SessionLibraryAudience {
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
     items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+    persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
 }
 
 #[async_trait::async_trait]
@@ -2308,6 +2362,20 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
             return Ok(Vec::new());
         };
         self.items.visible_library_ids(&user).await
+    }
+
+    async fn library_top_parents(
+        &self,
+        libraries: &[Uuid],
+    ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        let mut tops = Vec::with_capacity(libraries.len() * 2);
+        for &library in libraries {
+            match self.persistence.library_top_parents(library).await? {
+                Some(ids) => tops.extend(ids),
+                None => tops.push(library),
+            }
+        }
+        Ok(tops)
     }
 
     async fn deliver(

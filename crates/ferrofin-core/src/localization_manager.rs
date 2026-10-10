@@ -847,6 +847,36 @@ fn build_parental_ratings_from(table: Option<&RatingTable>) -> Vec<ParentalRatin
     ratings
 }
 
+/// An item's parental rating score — `BaseItem.GetParentalRatingScore`
+/// (`BaseItem.cs:1916-1931`) over the item's OWN ratings: its custom rating
+/// when it has one, else its official rating, scored by the localization
+/// tables against the server's metadata country; `None` when it has neither
+/// or the rating is unknown.
+///
+/// TODO(parity, open work item): upstream reads `CustomRatingForComparison`
+/// and `OfficialRatingForComparison`, which fall back to the item's
+/// `DisplayParent` (an episode or season with no rating of its own takes its
+/// series'), and scores against `GetPreferredMetadataCountryCode()` (the
+/// item's, else its library's, else the server's country). Here only the
+/// item's own ratings count and the server's country is used. Un-defer path:
+/// pass the display parent's ratings (one batched read of the series per
+/// scan pass, as the series-key read) and the library's preferred country
+/// into this function, and apply it in the scan, the owned-video copy and
+/// the boot repair (`repair_rating_levels`) together, so no writer disagrees
+/// with another.
+#[must_use]
+pub fn parental_rating_score(
+    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) -> Option<ParentalRatingScore> {
+    let rating = item
+        .custom_rating
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .or_else(|| item.official_rating.as_deref().filter(|r| !r.is_empty()))?;
+    localization.get_rating_score(rating, None)
+}
+
 impl ferrofin_traits::localization::LocalizationManager for LocalizationManager {
     fn get_cultures(&self) -> Vec<CultureDto> {
         CULTURE_DATA.cultures.clone()

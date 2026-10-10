@@ -646,6 +646,41 @@ impl FerrofinSessionManager {
         })
     }
 
+    /// The item a playback report's user data is kept against — port of
+    /// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): a
+    /// client playing another version of the item it shows reports the shown
+    /// item as `ItemId` and the version played as `MediaSourceId`, and the
+    /// version's own progress is what is kept. A media source id that is the
+    /// item's own, or no version of it, keeps the item. Costs nothing unless
+    /// the two ids differ; then the item and its version group are read
+    /// ([`crate::video_versions::VersionRows`]).
+    async fn progress_item(
+        &self,
+        item_id: Uuid,
+        media_source_id: Option<&str>,
+    ) -> Result<Uuid, ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRowReader as _, VersionRows};
+        let Some(source) = media_source_id
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .filter(|id| *id != item_id)
+        else {
+            return Ok(item_id);
+        };
+        let reader = DbVersionReader(&self.db);
+        let rows = reader.rows_by_id(&[item_id]).await?;
+        let Some(item) = rows.first().filter(|row| {
+            crate::item_type_lookup::kind_from_type_name(&row.type_)
+                .is_some_and(crate::kinds::is_video)
+        }) else {
+            return Ok(item_id);
+        };
+        let versions = VersionRows::load(&reader, &[item]).await?;
+        Ok(versions
+            .alternate_version(item, source)
+            .and_then(|version| Uuid::parse_str(&version.id).ok())
+            .unwrap_or(item_id))
+    }
+
     /// Pushes the user's refreshed play-state for `item_id` to every session
     /// belonging to that user (`UserDataChanged`), so their other signed-in
     /// devices update resume position / played flags live instead of showing
@@ -1107,12 +1142,15 @@ impl SessionManager for FerrofinSessionManager {
         // PlayCount++ and the LastPlayedDate stamp Next Up filters on), then
         // push the change to the user's other devices.
         if !info.item_id.is_nil() {
+            let progress_item = self
+                .progress_item(info.item_id, info.media_source_id.as_deref())
+                .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
-                    .record_playback_start(user_id, info.item_id)
+                    .record_playback_start(user_id, progress_item)
                     .await?;
-                self.push_user_data_changed(user_id, info.item_id).await;
+                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1162,12 +1200,15 @@ impl SessionManager for FerrofinSessionManager {
         // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`), then
         // push the change to the user's other devices.
         if !info.item_id.is_nil() {
+            let progress_item = self
+                .progress_item(info.item_id, info.media_source_id.as_deref())
+                .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
-                    .update_play_state(user_id, info.item_id, info.position_ticks)
+                    .update_play_state(user_id, progress_item, info.position_ticks)
                     .await?;
-                self.push_user_data_changed(user_id, info.item_id).await;
+                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1201,12 +1242,15 @@ impl SessionManager for FerrofinSessionManager {
         // `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`),
         // then push the change to the user's other devices.
         if !info.item_id.is_nil() && !info.failed {
+            let progress_item = self
+                .progress_item(info.item_id, info.media_source_id.as_deref())
+                .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
                 self.user_data_manager
-                    .update_play_state(user_id, info.item_id, info.position_ticks)
+                    .update_play_state(user_id, progress_item, info.position_ticks)
                     .await?;
-                self.push_user_data_changed(user_id, info.item_id).await;
+                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 

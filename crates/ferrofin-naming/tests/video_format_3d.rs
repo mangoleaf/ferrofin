@@ -71,20 +71,44 @@ fn test_expanded_format_3d() {
     test("Super movie [sbs3d].mp4", true, Some("sbs3d"));
 }
 
-/// Upstream's `IndexOfAny` fallback is `index = path.Length - 1`, so the final
-/// token of a delimiter-free tail is parsed **one character short**. Nothing in
-/// the ported xUnit cases covers it, but the tokenizer has to keep it: pinning
-/// it here stops a "tidy-up" of the split loop from silently changing which
-/// files are flagged 3D.
 #[test]
-fn trailing_token_loses_its_last_character() {
-    // With no extension the tail is the last token, so `hsbs` is seen as `hsb`.
-    test("Super movie.3d.hsbs", false, None);
-    // ...and one junk character on the end is exactly what makes it match.
-    test("Super movie.3d.hsbsx", true, Some("hsbs"));
+fn test_format_3d_at_end_of_path() {
+    // Directory based media (eg. DVD or BluRay folder rips) have no file extension,
+    // so the 3D tag can be the last token of the path.
+    test("Super movie (2009) 3d hsbs", true, Some("hsbs"));
+    test("Super movie (2009).3d.sbs", true, Some("sbs"));
+    test("Super movie (2009) 3d htab", true, Some("htab"));
+    test("Super movie (2009).hsbs", true, Some("hsbs"));
+    test("Super movie (2009) 3d", false, None);
+}
+
+#[test]
+fn test_resolve_directory_3d() {
+    let options = NamingOptions::new();
+    let result = video_resolver::resolve_directory(
+        Some("/movies/Oblivion (2013) 3d hsbs"),
+        &options,
+        true,
+        None,
+    );
+
+    assert!(result.as_ref().is_some_and(|r| r.is_3d));
+    assert!(
+        result
+            .as_ref()
+            .and_then(|r| r.format_3d.as_deref())
+            .is_some_and(|f| f.eq_ignore_ascii_case("hsbs"))
+    );
+}
+
+/// The final token of a delimiter-free tail is the whole remainder (upstream
+/// 5be844e1b7), so a trailing junk character no longer makes a token match.
+#[test]
+fn trailing_token_is_read_whole() {
+    test("Super movie.3d.hsbs", true, Some("hsbs"));
+    test("Super movie.3d.hsbsx", false, None);
     test("Super movie.3d.hsbs.", true, Some("hsbs"));
-    // The same rule applies to the preceding token.
-    test("Super movie 3d hsbs", false, None);
+    test("Super movie 3d hsbs", true, Some("hsbs"));
 }
 
 /// The token split is shared across every 3D rule, so a rule late in the table

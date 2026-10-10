@@ -233,14 +233,12 @@ impl FerrofinItemRepository {
     /// (`PhysicalFolderIds`); the physical folders themselves hang off the
     /// AggregateFolder, so there is no relational path to follow instead.
     ///
-    /// Ferrofin's scan hangs what it saves off the collection folder itself
-    /// (`ParentId` and `TopParentId`), so on an adopted database a library's
-    /// rows carry either: a view is translated to itself AND its physical
-    /// folders ([`library_top_parents_by_view`]), never to the folders alone.
-    ///
-    /// A Ferrofin-written database keeps no `PhysicalFolderIds` and hangs items
-    /// off the collection folder directly, so every lookup here comes back
-    /// empty and the query is left exactly as it was.
+    /// Ferrofin's scan stores the same shape (a `Folder` row per location,
+    /// named by `PhysicalFolderIds`), but rows an older Ferrofin scan saved
+    /// hang off the collection folder itself (`ParentId` and `TopParentId`)
+    /// until a scan saves them again, so a library's rows carry either: a view
+    /// is translated to itself AND its physical folders
+    /// ([`library_top_parents_by_view`]), never to the folders alone.
     async fn resolve_views(
         &self,
         filter: &InternalItemsQuery,
@@ -2201,6 +2199,31 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(rows)
     }
 
+    async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        // `IX_LinkedChildren_ParentId_ChildType` for the rows, a
+        // `PrimaryVersionId` scan for the pointers (as
+        // `get_items_by_primary_version`).
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1 AND "ChildType" = 3
+               UNION
+               SELECT b."Id" FROM "BaseItems" b
+               WHERE b."PrimaryVersionId" = ?1 AND b."Id" <> ?2
+                 AND NOT (b."OwnerId" IS NOT NULL AND b."OwnerId" = ?1 AND b."ExtraType" IS NULL)
+                 AND NOT EXISTS (SELECT 1 FROM "LinkedChildren" l
+                                 WHERE l."ParentId" = ?1 AND l."ChildId" = b."Id"
+                                   AND l."ChildType" = 2)"#,
+        )
+        .bind(guid_to_db(primary_id))
+        .bind(PLACEHOLDER_ID)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
     async fn get_items_by_primary_version_batch(
         &self,
         primary_ids: &[Uuid],
@@ -2229,6 +2252,13 @@ impl ItemRepository for FerrofinItemRepository {
             }
         }
         Ok(map)
+    }
+
+    async fn get_items_by_primary_version_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        rows_by_primary_flagged(&self.db, primary_ids).await
     }
 
     async fn get_items_with_provider_id(
@@ -2487,8 +2517,11 @@ impl ItemRepository for FerrofinItemRepository {
         // `AddUserToQuery` first, and once: every facet below runs the same
         // filter, so scoping here scopes all four. A filter dialog that offers a
         // genre, tag, rating or year from a library the account cannot see is
-        // offering a choice that returns nothing.
-        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        // offering a choice that returns nothing. The views are resolved as a
+        // browse resolves them (which scopes an unparented query to the
+        // user's libraries): a library's children hang off its locations'
+        // folders, so `parentId={library}` alone matches none of them.
+        let scoped = self.resolve_views(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         // Each facet runs the filter once as its own WHERE (via `append_predicates`)
         // instead of materializing the whole matching id set and binding it back as a
@@ -2519,9 +2552,9 @@ impl ItemRepository for FerrofinItemRepository {
         // `/Years` wants the years and nothing else. Going through
         // `get_query_filters_legacy` for them also ran the official-ratings
         // scan and both `ItemValues` MIN aggregates and dropped all three — but
-        // it does share that method's user scoping, which has to be applied
-        // here too.
-        let scoped = scope_to_user_libraries(&self.db, filter).await?;
+        // it does share that method's view resolution and user scoping, which
+        // have to be applied here too.
+        let scoped = self.resolve_views(filter).await?;
         self.distinct_years(scoped.as_ref().unwrap_or(filter)).await
     }
 
@@ -2687,6 +2720,97 @@ fn placeholders(n: usize) -> String {
         s.push('?');
     }
     s
+}
+
+/// `SELECT *` of the `BaseItems` rows whose `column` is one of `ids`,
+/// chunked under the bind ceiling — the version-group reads
+/// ([`crate::video_versions::DbVersionReader`]).
+pub(crate) async fn select_item_rows(
+    db: &Database,
+    column: &str,
+    ids: &[Uuid],
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let mut conn = db.pool().acquire().await.map_err(db_err)?;
+    select_item_rows_on(&mut conn, column, ids).await
+}
+
+/// [`select_item_rows`] on a given connection — inside a transaction, the
+/// owned-video copy reads what it is about to write.
+pub(crate) async fn select_item_rows_on(
+    conn: &mut sqlx::SqliteConnection,
+    column: &str,
+    ids: &[Uuid],
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let mut rows = Vec::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let marks = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(r#"SELECT * FROM "BaseItems" WHERE {column} IN ({marks})"#);
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        rows.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
+    }
+    Ok(rows)
+}
+
+/// A row and whether some other row names it as its `PrimaryVersionId`.
+#[derive(sqlx::FromRow)]
+struct FlaggedRow {
+    #[sqlx(flatten)]
+    row: BaseItemEntity,
+    #[sqlx(rename = "HasVersions")]
+    has_versions: bool,
+}
+
+/// The statement [`rows_by_primary_flagged`] runs over `n` primary ids: the
+/// rows pointing at them (never the placeholder row, never one pointing at
+/// itself), each with whether a row points at IT — an `EXISTS` the partial
+/// `FerrofinIX_BaseItems_PrimaryVersionId` answers by one seek per row.
+pub(crate) fn rows_by_primary_flagged_sql(n: usize) -> String {
+    format!(
+        r#"SELECT b.*, EXISTS (SELECT 1 FROM "BaseItems" x
+                               WHERE x."PrimaryVersionId" = b."Id" AND x."Id" <> b."Id")
+                   AS "HasVersions"
+           FROM "BaseItems" b
+           WHERE b."PrimaryVersionId" IN ({}) AND b."Id" <> ?{} AND b."Id" <> b."PrimaryVersionId""#,
+        placeholders(n),
+        n + 1
+    )
+}
+
+/// The rows naming each of `primary_ids` as their `PrimaryVersionId`, by
+/// that id, each with whether it has versions of its own — one query per
+/// chunk ([`rows_by_primary_flagged_sql`]).
+pub(crate) async fn rows_by_primary_flagged(
+    db: &Database,
+    primary_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+    let mut map: HashMap<Uuid, Vec<(BaseItemEntity, bool)>> = HashMap::new();
+    for chunk in primary_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let sql = rows_by_primary_flagged_sql(chunk.len());
+        let mut query = sqlx::query_as::<_, FlaggedRow>(sqlx::AssertSqlSafe(sql));
+        for id in chunk {
+            query = query.bind(guid_to_db(*id));
+        }
+        query = query.bind(PLACEHOLDER_ID);
+        for flagged in query.fetch_all(db.pool()).await.map_err(db_err)? {
+            if let Some(primary) = flagged
+                .row
+                .primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                map.entry(primary)
+                    .or_default()
+                    .push((flagged.row, flagged.has_versions));
+            }
+        }
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -3492,6 +3616,64 @@ mod tests {
             !plan.iter().any(|d| d.trim() == "SCAN BaseItems"),
             "the locked-item read must not scan BaseItems, got: {plan:?}"
         );
+    }
+
+    /// The flagged version read seeks a `PrimaryVersionId` index twice —
+    /// for the rows pointing at the page's ids, and for each row's "does
+    /// anything point at it" flag — and scans nothing: the flag costs one
+    /// index seek per version row, never a pass over `BaseItems`. (The
+    /// planner takes Jellyfin's `IX_BaseItems_PrimaryVersionId` where the
+    /// schema has it, Ferrofin's partial one otherwise; either seeks.) It
+    /// answers the flag too: a version with a version of its own, and one
+    /// without.
+    #[tokio::test]
+    async fn the_flagged_version_read_seeks_the_partial_index() {
+        let db = test_db().await;
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            rows_by_primary_flagged_sql(2)
+        )));
+        for _ in 0..3 {
+            query = query.bind("00000000-0000-0000-0000-000000000001");
+        }
+        let plan: Vec<String> = query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect();
+        let seeks = |alias: &str| {
+            plan.iter().any(|d| {
+                d.starts_with(&format!("SEARCH {alias} USING"))
+                    && d.contains("_PrimaryVersionId (PrimaryVersionId=?)")
+            })
+        };
+        assert!(seeks("b"), "the rows by their pointer, got: {plan:?}");
+        assert!(seeks("x"), "the flag by the same index, got: {plan:?}");
+        assert!(
+            !plan.iter().any(|d| d.starts_with("SCAN")),
+            "no scan, got: {plan:?}"
+        );
+
+        let (primary, merged, local) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [primary, merged, local] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        for (id, to) in [(merged, primary), (local, merged)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(guid_to_db(to))
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        let flagged = rows_by_primary_flagged(&db, &[primary, merged])
+            .await
+            .unwrap();
+        let flag = |under: Uuid| -> Vec<bool> { flagged[&under].iter().map(|(_, f)| *f).collect() };
+        assert_eq!(flag(primary), vec![true], "the merged version has one");
+        assert_eq!(flag(merged), vec![false], "the local version has none");
     }
 
     /// Two rows sharing a `CleanName` must resolve to the SAME id under both

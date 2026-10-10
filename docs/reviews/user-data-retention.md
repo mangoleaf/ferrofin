@@ -77,6 +77,9 @@ eligible for recovery on the next scan or destination refresh.
 | Duplicate paths during adoption | Move the duplicate's history to its known survivor; detach history on descendants that will cascade-delete. |
 | Container ID migration and localized view consolidation | Move history directly to the known survivor and translate its GUID key; preserve existing destination state. |
 | Orphaned person cleanup | Use the same retention-aware persistence deletion. |
+| Scanner prune of rows a disc rip or multi-disc set swallows, and of a removed location's `Folder` row and its items | Pruned through `delete_items`, so history is detached once and recovered when the file resolves at its path again. |
+| Scanner and boot-repair folds (`rekey_items`/`merge_one`: an older per-file row folding into a rip, a duplicate of a re-keyed video, an adopted 10.11 local version) | The loser's history moves onto the kept row (the later-played, then more-played row wins per user and key, as upstream keeps duplicates); nothing is detached or snapshotted, so recovery cannot revive a second copy. |
+| Parts and versions released from a pruned owner (`release_owned_versions`) | The row survives, so its history stays attached; only the pruned owner's history is detached. |
 | Existing person and artist merges | Already transfer user data before deleting duplicate items; their existing conflict handling is retained. |
 | Schema table rebuilds | Already disable foreign-key cascades during migration and validate integrity afterward. Historical migrations are unchanged. |
 

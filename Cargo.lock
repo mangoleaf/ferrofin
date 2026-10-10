@@ -1510,6 +1510,7 @@ dependencies = [
  "fancy-regex",
  "ferrofin-model",
  "ferrofin-util",
+ "icu_collator",
  "regex",
  "rstest",
  "serde",

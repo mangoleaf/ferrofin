@@ -1,23 +1,28 @@
 //! `DELETE /Items/{itemId}` and `DELETE /Items` end to end: who may delete,
-//! as upstream's `LibraryController.DeleteItem`/`DeleteItems` decide it with
-//! `item.CanDelete(user)`.
+//! and that a delete removes the item's files exactly as upstream's
+//! `LibraryController.DeleteItem`/`DeleteItems` with
+//! `DeleteOptions { DeleteFileLocation = true }` does.
 //!
 //! Boots the real composition root ([`ferrofin_server::state::build_app_state`])
-//! over a temp data dir and two movie libraries of small files, scans them,
-//! and drives every step over the real router as three accounts:
+//! over a temp data dir and three libraries of small files, scans them, and
+//! drives every step over the real router as three accounts:
 //!
-//! - `viewer`, a default account (nothing under "Allow media deletion
-//!   from"): `401`, and the item stays; its DTO says `CanDelete: false`;
+//! - `viewer`, a default account (no "Allow media deletion from"): `401`, and
+//!   the row and the file stay; its DTO says `CanDelete: false`;
 //! - `curator`, allowed to delete from one library only ("Allow media
-//!   deletion from" with that library ticked): `204` there, `401` in the
-//!   other, and a mixed `DELETE /Items?ids=` stops at the first refused id,
+//!   deletion from" with that library ticked): `204` there, `401` in another
+//!   library, and a mixed `DELETE /Items?ids=` stops at the first refused id,
 //!   the ones before it already deleted (upstream's per-item loop);
-//! - the administrator ("All libraries"): `204`.
+//! - the administrator ("All libraries"): a movie in its own folder takes
+//!   the whole folder; a movie among others takes its file and every sidecar
+//!   whose name starts with its own (`Alien` takes `Aliens.nfo`); a series
+//!   takes its directory; the trickplay folder saved beside a movie goes with
+//!   it and a sibling's stays (`ChangeExtension(GetFileName(Path))`); a folder
+//!   whose entries cannot be removed fails the delete with nothing deleted.
 //!
-//! A delete removes the item from the library database only: the media file
-//! stays on disk. Upstream also deletes the files (`DeleteFileLocation =
-//! true`) — an open work item, `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+//! A rescan afterwards brings none of the deleted items back.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
@@ -64,11 +69,31 @@ async fn boot() -> Harness {
         admin_password: ADMIN_PASSWORD.to_owned(),
         ..Config::test_stub(temp.path())
     };
+    let nfo = |title: &str| format!("<movie><title>{title}</title></movie>");
     for (path, contents) in [
         ("movies/Alpha (1999)/Alpha (1999).mkv", String::new()),
+        (
+            "movies/Alpha (1999)/Alpha (1999)-trailer.mkv",
+            String::new(),
+        ),
+        ("movies/Alpha (1999)/poster.jpg", String::new()),
         ("movies/Epsilon (2003)/Epsilon (2003).mkv", String::new()),
+        ("movies/Alien.mkv", String::new()),
+        ("movies/Alien.nfo", nfo("Alien")),
+        (
+            "movies/Alien.en.srt",
+            "1\n00:00:01,000 --> 00:00:02,000\nhi\n".to_owned(),
+        ),
+        ("movies/Aliens.mkv", String::new()),
+        ("movies/Aliens.nfo", nfo("Aliens")),
+        ("movies/Kilo.mkv", String::new()),
+        ("movies/Kilo.trickplay/320 - 10x10/0.jpg", String::new()),
+        ("movies/Kilo.Two.mkv", String::new()),
+        ("movies/Kilo.Two.trickplay/320 - 10x10/0.jpg", String::new()),
         ("more/Gamma (2001)/Gamma (2001).mkv", String::new()),
         ("more/Delta (2002)/Delta (2002).mkv", String::new()),
+        ("shows/Show/Season 1/Show S01E01.mkv", String::new()),
+        ("shows/Show/Season 1/Show S01E02.mkv", String::new()),
     ] {
         touch(&temp.path().join(path), &contents);
     }
@@ -184,7 +209,7 @@ async fn items_by_path(
     let (status, items) = call(
         router,
         "GET",
-        "/Items?recursive=true&includeItemTypes=Movie&fields=Path",
+        "/Items?recursive=true&includeItemTypes=Movie,Series,Season,Episode&fields=Path",
         Some(token),
         None,
     )
@@ -252,18 +277,22 @@ async fn scan(harness: &Harness) {
 // nothing.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
+async fn deleting_items_over_http_checks_can_delete_and_removes_their_files() {
     let h = boot().await;
     let router = ferrofin_api::create_router(h.wired.state.clone());
     let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
 
-    for (name, dir) in [("Movies", "movies"), ("More", "more")] {
+    for (name, kind, dir) in [
+        ("Movies", "movies", "movies"),
+        ("More", "movies", "more"),
+        ("Shows", "tvshows", "shows"),
+    ] {
         let path = encode(&h.path(dir).to_string_lossy());
         let (status, body) = call(
             &router,
             "POST",
             &format!(
-                "/Library/VirtualFolders?name={name}&collectionType=movies&paths={path}&refreshLibrary=false"
+                "/Library/VirtualFolders?name={name}&collectionType={kind}&paths={path}&refreshLibrary=false"
             ),
             Some(&admin),
             None,
@@ -296,8 +325,12 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
     };
     let alpha = id("movies/Alpha (1999)/Alpha (1999).mkv");
     let epsilon = id("movies/Epsilon (2003)/Epsilon (2003).mkv");
+    let alien = id("movies/Alien.mkv");
+    let kilo_two = id("movies/Kilo.Two.mkv");
     let gamma = id("more/Gamma (2001)/Gamma (2001).mkv");
     let delta = id("more/Delta (2002)/Delta (2002).mkv");
+    let show = id("shows/Show");
+    let episode = id("shows/Show/Season 1/Show S01E01.mkv");
 
     // ---- viewer: no deletion right ------------------------------------------
     let viewer_id = create_user(&router, &admin, "viewer", "viewer-pw").await;
@@ -308,7 +341,10 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
     }
     assert!(exists(&router, &admin, &alpha).await, "the row stays");
-    assert!(h.path("movies/Alpha (1999)/Alpha (1999).mkv").is_file());
+    assert!(
+        h.path("movies/Alpha (1999)/Alpha (1999).mkv").is_file(),
+        "the file stays"
+    );
 
     // ---- curator: "Allow media deletion from" the More library only ----------
     let curator_id = create_user(&router, &admin, "curator", "curator-pw").await;
@@ -347,8 +383,8 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
     assert_eq!(status, StatusCode::NO_CONTENT, "allowed in its library");
     assert!(!exists(&router, &admin, &gamma).await, "the row is gone");
     assert!(
-        h.path("more/Gamma (2001)/Gamma (2001).mkv").is_file(),
-        "the file stays on disk"
+        !h.path("more/Gamma (2001)").exists(),
+        "the movie's folder is deleted"
     );
     let (status, _) = call(
         &router,
@@ -360,6 +396,7 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "not in another library");
     assert!(exists(&router, &admin, &alpha).await);
+    assert!(h.path("movies/Alpha (1999)/Alpha (1999).mkv").is_file());
     // Per item, in order: Delta goes, Alpha is refused, Epsilon is never reached.
     let (status, _) = call(
         &router,
@@ -374,12 +411,14 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
         !exists(&router, &admin, &delta).await,
         "deleted before the refusal"
     );
+    assert!(!h.path("more/Delta (2002)").exists());
     for kept in [&alpha, &epsilon] {
         assert!(exists(&router, &admin, kept).await);
     }
 
     // ---- administrator: "All libraries" --------------------------------------
     assert!(dto_can_delete(&router, &admin, &admin_id(&router, &admin).await, &alpha).await);
+    // A movie in its own folder takes the whole folder (`Video.GetDeletePaths`).
     let (status, _) = call(
         &router,
         "DELETE",
@@ -391,9 +430,117 @@ async fn deleting_items_over_http_asks_can_delete_and_keeps_the_files() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(!exists(&router, &admin, &alpha).await, "the row is gone");
     assert!(
-        h.path("movies/Alpha (1999)/Alpha (1999).mkv").is_file(),
-        "the file stays on disk"
+        !h.path("movies/Alpha (1999)").exists(),
+        "the whole folder, trailer and poster included"
     );
+    // A movie among others takes its file and every prefix sidecar
+    // (`GetLocalMetadataFilesToDelete`): Alien takes Aliens.nfo, as upstream.
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/Items/{alien}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for gone in [
+        "movies/Alien.mkv",
+        "movies/Alien.nfo",
+        "movies/Alien.en.srt",
+        "movies/Aliens.nfo",
+    ] {
+        assert!(!h.path(gone).exists(), "{gone} is deleted");
+    }
+    assert!(
+        h.path("movies/Aliens.mkv").is_file(),
+        "not a sidecar extension"
+    );
+    // The trickplay folder saved beside a file is named
+    // `ChangeExtension(GetFileName(Path))`: Kilo.Two's is Kilo.Two.trickplay,
+    // and Kilo's own folder stays.
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/Items/{kilo_two}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!h.path("movies/Kilo.Two.mkv").exists());
+    assert!(!h.path("movies/Kilo.Two.trickplay").exists());
+    assert!(h.path("movies/Kilo.trickplay/320 - 10x10/0.jpg").is_file());
+    assert!(h.path("movies/Kilo.mkv").is_file());
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/Items/{show}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        !h.path("shows/Show").exists(),
+        "the series' directory is deleted"
+    );
+    assert!(
+        !exists(&router, &admin, &episode).await,
+        "with its episodes"
+    );
+
+    // A folder whose entries cannot be removed: the first path's failure fails
+    // the delete (`500`) with nothing deleted and the row in place.
+    let folder = h.path("movies/Epsilon (2003)");
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    // Root ignores the mode bits; then there is nothing to simulate.
+    let probe = folder.join(".probe");
+    let bypassed = std::fs::write(&probe, b"").is_ok();
+    let (status, _) = call(
+        &router,
+        "DELETE",
+        &format!("/Items/{epsilon}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    if bypassed {
+        std::fs::remove_file(&probe).expect("probe");
+    } else {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(exists(&router, &admin, &epsilon).await, "the row stays");
+        assert!(h.path("movies/Epsilon (2003)/Epsilon (2003).mkv").is_file());
+    }
+
+    // ---- a rescan brings none of the deleted items back ----------------------
+    scan(&h).await;
+    let after = items_by_path(&router, &admin).await;
+    for gone in [
+        "more/Gamma (2001)/Gamma (2001).mkv",
+        "more/Delta (2002)/Delta (2002).mkv",
+        "movies/Alpha (1999)/Alpha (1999).mkv",
+        "movies/Alien.mkv",
+        "movies/Kilo.Two.mkv",
+        "shows/Show",
+        "shows/Show/Season 1/Show S01E01.mkv",
+    ] {
+        assert!(
+            !after.contains_key(&h.path(gone).to_string_lossy().into_owned()),
+            "{gone} came back: {after:?}"
+        );
+    }
+    for kept in [
+        "movies/Epsilon (2003)/Epsilon (2003).mkv",
+        "movies/Aliens.mkv",
+        "movies/Kilo.mkv",
+    ] {
+        assert!(
+            after.contains_key(&h.path(kept).to_string_lossy().into_owned()),
+            "{kept} is still there: {after:?}"
+        );
+    }
 }
 
 /// The administrator's own id.

@@ -30,7 +30,7 @@ use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::persistence::KeyframeRepository;
-use ferrofin_traits::system::{ExternalDataManager, PathManager};
+use ferrofin_traits::system::{ExternalDataManager, MediaLocation, PathManager};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
@@ -127,8 +127,17 @@ impl FerrofinExternalDataManager {
 
     /// Removes every extracted-data folder for an item, logging and skipping
     /// failures (C# `DeleteExternalItemFiles`).
-    fn delete_files(&self, item_id: Uuid, media_path: &str) {
-        for path in self.path_manager.extracted_data_paths(item_id, media_path) {
+    fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
+        for path in self.path_manager.extracted_data_paths(item_id, media) {
+            // Never the root, an empty path or a relative one — a trickplay
+            // folder computed for a path with no folder would otherwise be
+            // `X.trickplay` against the server's working directory.
+            if !crate::item_deletion::is_deletable_path(std::path::Path::new(&path)) {
+                if !path.is_empty() {
+                    tracing::warn!(item_id = %item_id, path, "refusing to delete extracted data at a root or relative path");
+                }
+                continue;
+            }
             if !self.directory_remover.exists(&path) {
                 continue;
             }
@@ -144,10 +153,10 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_data(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
         // Filesystem first, then the four DB-side deletions (C# ordering).
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media);
         self.keyframe_repository
             .delete_keyframe_data(item_id)
             .await?;
@@ -162,9 +171,9 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_files(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media);
         Ok(())
     }
 }
@@ -203,7 +212,7 @@ mod tests {
         paths: Vec<String>,
     }
     impl PathManager for StubPathManager {
-        fn trickplay_directory(&self, _: Uuid, _: &str, _: bool) -> String {
+        fn trickplay_directory(&self, _: Uuid, _: MediaLocation<'_>, _: bool) -> String {
             String::new()
         }
         fn subtitle_path(&self, _: &str, _: i32, _: &str) -> Option<String> {
@@ -224,7 +233,7 @@ mod tests {
         fn chapter_image_path(&self, _: Uuid, _: &str, _: i64) -> String {
             String::new()
         }
-        fn extracted_data_paths(&self, _: Uuid, _: &str) -> Vec<String> {
+        fn extracted_data_paths(&self, _: Uuid, _: MediaLocation<'_>) -> Vec<String> {
             self.paths.clone()
         }
     }
@@ -413,7 +422,7 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_data(item, "/media/x.mkv")
+        mgr.delete_external_item_data(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete");
 
@@ -447,11 +456,40 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_files(item, "/media/x.mkv")
+        mgr.delete_external_item_files(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete files");
 
         assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
         assert!(deletes.keyframe.lock().unwrap().is_empty());
+    }
+
+    /// The root guard: a root, empty or relative extracted-data path is
+    /// never removed, even when the remover says it exists — a trickplay
+    /// folder computed for a path with no folder would otherwise resolve
+    /// against the working directory.
+    #[tokio::test]
+    async fn root_empty_and_relative_paths_are_never_removed() {
+        let candidates = ["/", "", "Film.trickplay", "/x/kept"];
+        let remover = Arc::new(RecordingRemover {
+            existing: candidates.iter().map(|p| (*p).to_owned()).collect(),
+            ..Default::default()
+        });
+        let path_manager = Arc::new(StubPathManager {
+            paths: candidates.iter().map(|p| (*p).to_owned()).collect(),
+        });
+        let deletes = Arc::new(RecordingDeletes::default());
+        let mgr = FerrofinExternalDataManager::with_remover(
+            path_manager,
+            Arc::clone(&deletes) as Arc<dyn KeyframeRepository>,
+            Arc::clone(&deletes) as Arc<dyn MediaSegmentManager>,
+            Arc::clone(&deletes) as Arc<dyn TrickplayManager>,
+            Arc::clone(&deletes) as Arc<dyn ChapterManager>,
+            Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
+        );
+        mgr.delete_external_item_files(Uuid::new_v4(), MediaLocation::default())
+            .await
+            .expect("delete files");
+        assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/kept"]);
     }
 }

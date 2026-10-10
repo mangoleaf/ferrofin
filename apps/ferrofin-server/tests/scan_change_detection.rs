@@ -44,14 +44,14 @@
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
 //! | 5 | webhook and watcher: add one file | 1 created; parent via decision; nothing else |
-//! | 6 | webhook and watcher: delete one file | 1 removed; the watched season asks its season providers once |
+//! | 6 | webhook and watcher: delete one file | 1 removed; the watched season validated, asking nothing |
 //! | 7 | edit Overview (no LockData), rescan | edit survives; `LockData` false |
 //! | 8 | "Search for missing metadata" | empty fields filled, edited Overview kept |
 //! | 9 | "Replace all metadata", Overview unlocked | Overview replaced |
 //! | 10 | lock Overview, "Replace all metadata" | Overview kept, other fields replaced |
 //! | 11 | `LockData=true`, add `poster.png`, rescan | poster discovered; 0 provider requests |
 //! | 12 | locked item saved by a rescan | `Data` (trailers) intact |
-//! | 13 | episode with TMDB date/rating, rescans | fields intact; the season whose folder changed asks its season providers once |
+//! | 13 | episode with TMDB date/rating, rescans | fields intact; the season whose folder changed asks nothing |
 //! | 14 | pending library refresh + webhook path | no full scan queued |
 //! | 15 | movie refresh: TMDB 429 and missing ffprobe | text retained; images follow replacement flags |
 //!
@@ -69,24 +69,14 @@
 //! through the real inotify watcher on a library with real-time monitoring
 //! on, with `LibraryMonitorDelay` at 1 s.
 //!
-//! Rows 6 (watcher) and 13 refresh a season because its folder changed (a
-//! file left or joined it): upstream's `requiresRefresh`
-//! (`BaseItem.RequiresRefresh`, `Folder.RequiresRefresh`) makes
-//! `GetProviders` run every remote provider of the season
-//! (`MetadataService.cs:655-658`), and the Shows and Live libraries tick
-//! TheMovieDb alone for seasons. `TmdbSeasonProvider` then asks for the
-//! season by its series' recorded `Tmdb` id: exactly one
-//! `/tmdb/tv/{series}/season/1` request, which an episode refreshed in the
-//! same scan shares (row 5). Every other row's 0 holds: an unchanged season
-//! runs no provider.
-//!
-//! The pinned count is the request the refresh decision makes, not
-//! upstream's network count. Upstream's `TmdbClientManager` keeps each season
-//! response in memory for an hour (`season-{id}-s{n}-{lang}`,
-//! `TmdbClientManager.cs:238-262`), so it would serve rows 6 and 13 from
-//! memory a few seconds after row 1 fetched the same seasons, with 0 network
-//! requests. Ferrofin's TMDB season cache lasts one scan, so each of those
-//! rows asks once.
+//! Rows 5, 6 (watcher) and 13 change a season's folder (a file left or
+//! joined it), and the season still refreshes nothing: a directory has no
+//! `DateModified` (owner decision D2: `GetFileSystemMetadata` fills no times
+//! for a directory, stored as NULL), and `BaseItem.RequiresRefresh` is false
+//! for a `MinValue` one (`BaseItem.cs:1721-1731`), so `GetProviders` runs no
+//! remote provider of the season. The one `/tmdb/tv/{series}/season/1`
+//! request of row 5 is the new episode's: its name and still come from the
+//! season's response.
 //!
 //! One test function, one process: the metrics pipeline is process-global.
 
@@ -1691,25 +1681,6 @@ fn assert_no_provider_request(seen: &Seen, row: &str) {
     );
 }
 
-/// Asserts the row's only provider request was TheMovieDb's season lookup
-/// `season` (`/tmdb/tv/{series}/season/{n}`) — what a season refreshed for
-/// its changed folder asks for in a library that ticks only TheMovieDb for
-/// seasons (see the module docs, rows 6 and 13).
-fn assert_only_the_season_request(seen: &Seen, season: &str, row: &str) {
-    assert_eq!(
-        seen.provider_metric,
-        BTreeMap::from([("tmdb".to_owned(), 1.0)]),
-        "row {row}: provider metric {seen:?}"
-    );
-    let paths: Vec<&str> = seen
-        .requests
-        .iter()
-        .filter_map(|r| r.split_whitespace().nth(1))
-        .map(|target| target.split('?').next().unwrap_or(target))
-        .collect();
-    assert_eq!(paths, [season], "row {row}: provider requests {seen:?}");
-}
-
 /// Asserts the row wrote exactly the item tables in `tables` (every one,
 /// and none else), so a rewrite of `Peoples`, `ItemValues`,
 /// `LinkedChildren`… can't hide behind the right set of items.
@@ -1810,8 +1781,9 @@ async fn rows(h: &Harness) {
     // ---- 1: the first scan creates everything and asks the providers ----
     let first = h.rescan("1").await;
     // Movies: 3. Harbor: series, season, 2 episodes. Lantern: series,
-    // season, 1 episode. Music: artist, album, 2 tracks.
-    let all_items = 14.0;
+    // season, 1 episode. Music: artist, album, 2 tracks. And each of the
+    // four library locations' `Folder` rows (owner decision D1).
+    let all_items = 18.0;
     assert_eq!(first.outcome("created"), all_items, "row 1: {first:?}");
     for outcome in ["updated", "unchanged", "removed"] {
         assert_eq!(first.outcome(outcome), 0.0, "row 1: {outcome} {first:?}");
@@ -2064,10 +2036,12 @@ async fn rows(h: &Harness) {
         BTreeMap::from([("webhook".to_owned(), 1.0)]),
         "row 5: {added:?}"
     );
-    // A movie's nearest existing item is its library: the scan validates
-    // the reported path alone, so nothing else is even counted unchanged.
+    // A movie's nearest existing item is its library location: the scan
+    // validates the reported path, with the location's folder above it as
+    // context (owner decision D1) — counted unchanged, nothing else.
     assert_eq!(added.item("webhook", "created"), 1.0, "row 5: {added:?}");
-    for outcome in ["updated", "unchanged", "removed"] {
+    assert_eq!(added.outcome("unchanged"), 1.0, "row 5: {added:?}");
+    for outcome in ["updated", "removed"] {
         assert_eq!(added.outcome(outcome), 0.0, "row 5: {outcome} {added:?}");
     }
     assert_eq!(
@@ -2118,7 +2092,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    for outcome in ["created", "updated", "unchanged"] {
+    // The location's folder above the path is context (owner decision D1).
+    assert_eq!(removed.outcome("unchanged"), 1.0, "row 6: {removed:?}");
+    for outcome in ["created", "updated"] {
         assert_eq!(
             removed.outcome(outcome),
             0.0,
@@ -2139,7 +2115,6 @@ async fn rows(h: &Harness) {
     assert_tables(&removed, NEW_FILE_TABLES, "6");
 
     // ---- 5 (watcher): a new episode lands in a watched season ----
-    let lantern_season = m.key(m.lantern_e2.parent().expect("season"));
     let lantern_series = m.key(
         m.lantern_e2
             .parent()
@@ -2157,11 +2132,14 @@ async fn rows(h: &Harness) {
         "row 5: {added:?}"
     );
     // The episode is created; its season is the nearest existing item and
-    // goes through the decision (its folder's mtime moved: D3); the series
-    // and the sibling episode are context and validation only.
+    // goes through the decision, which finds nothing to do though its
+    // folder's mtime moved (a directory has no `DateModified`, D2); the
+    // sibling episode is saved, now in a mixed folder (a second episode
+    // beside it, `ResolveVideos`' count); the series and the location's
+    // folder are context only.
     assert_eq!(added.item("watcher", "created"), 1.0, "row 5: {added:?}");
     assert_eq!(added.item("watcher", "updated"), 1.0, "row 5: {added:?}");
-    assert_eq!(added.item("watcher", "unchanged"), 2.0, "row 5: {added:?}");
+    assert_eq!(added.item("watcher", "unchanged"), 3.0, "row 5: {added:?}");
     assert_eq!(added.outcome("removed"), 0.0, "row 5: {added:?}");
     assert_eq!(
         added.probes.get("ok").copied(),
@@ -2184,7 +2162,7 @@ async fn rows(h: &Harness) {
     );
     let mut expected = vec![
         lantern_series.clone(),
-        lantern_season.clone(),
+        m.key(&m.lantern_e2.with_file_name("Lantern - S01E01.mkv")),
         m.key(&m.lantern_e2),
     ];
     expected.sort_unstable();
@@ -2209,9 +2187,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    // The season goes through the decision again (its folder changed):
-    // `requiresRefresh` runs its one ticked season provider, TheMovieDb's,
-    // which asks for the season once — nothing else is asked for.
+    // The season goes through the decision again, and again finds nothing
+    // to do though its folder changed (D2): nothing is asked for. The
+    // sibling, alone again, leaves its mixed folder and is saved.
     assert_eq!(
         removed.item("watcher", "updated"),
         1.0,
@@ -2219,7 +2197,7 @@ async fn rows(h: &Harness) {
     );
     assert_eq!(removed.outcome("created"), 0.0, "row 6: {removed:?}");
     assert_no_probe(&removed, "6");
-    assert_only_the_season_request(&removed, "/tmdb/tv/202/season/1", "6");
+    assert_no_provider_request(&removed, "6");
     assert_no_artwork_or_people(&removed, "6");
     assert_eq!(removed.written_items(), expected, "row 6: {removed:?}");
     assert_tables(&removed, NEW_FILE_TABLES, "6");
@@ -2239,6 +2217,9 @@ async fn rows(h: &Harness) {
     })
     .await;
     let edited = h.rescan("7").await;
+    // The movies location's own directory changed in row 6 (Delta's folder
+    // went), and its folder is still unchanged: a directory has no
+    // `DateModified` (D2).
     assert_eq!(edited.outcome("unchanged"), all_items, "row 7: {edited:?}");
     assert_no_probe(&edited, "7");
     assert_no_provider_request(&edited, "7");
@@ -2426,17 +2407,15 @@ async fn rows(h: &Harness) {
     );
     // A new sidecar re-probes the episode and saves it without asking its
     // providers (only the probe's change monitor fired): the stored date and
-    // rating must survive that save. Its season goes through the decision
-    // for its changed folder: `requiresRefresh` runs every season provider
-    // the library ticks — TheMovieDb's — which asks for the season by the
-    // series' recorded Tmdb id, once. The series and the other episode are
-    // unchanged and ask nothing.
+    // rating must survive that save. Its season, whose folder changed, is
+    // unchanged (a directory has no `DateModified`, D2), as are the series
+    // and the other episode: nothing is asked.
     put(
         &m.harbor_e1.with_file_name("Harbor - S01E01.en.srt"),
         b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
     );
     let resaved = h.rescan("13s").await;
-    assert_eq!(resaved.outcome("updated"), 2.0, "row 13: {resaved:?}");
+    assert_eq!(resaved.outcome("updated"), 1.0, "row 13: {resaved:?}");
     assert_eq!(
         resaved.probes.get("ok").copied(),
         Some(1.0),
@@ -2446,14 +2425,11 @@ async fn rows(h: &Harness) {
         resaved.probed("Harbor - S01E01.mkv"),
         "row 13: re-probed {resaved:?}"
     );
-    assert_only_the_season_request(&resaved, "/tmdb/tv/201/season/1", "13");
+    assert_no_provider_request(&resaved, "13");
     assert_no_artwork_or_people(&resaved, "13");
     assert_eq!(
         resaved.written_items(),
-        [
-            m.key(m.harbor_e1.parent().expect("season")),
-            m.key(&m.harbor_e1)
-        ],
+        [m.key(&m.harbor_e1)],
         "row 13: {resaved:?}"
     );
     assert_tables(&resaved, &["BaseItems", "MediaStreamInfos"], "13");
@@ -2508,15 +2484,19 @@ async fn rows(h: &Harness) {
     // never joined into a wider scan, then had nothing left to create.
     assert_eq!(queued.item("api", "created"), 1.0, "row 14: {queued:?}");
     assert_eq!(queued.item("webhook", "created"), 0.0, "row 14: {queued:?}");
+    // The movie, with its location's folder as context (owner decision D1).
     assert_eq!(
         queued.item("webhook", "unchanged"),
-        1.0,
+        2.0,
         "row 14: {queued:?}"
     );
-    // Shows (series, season, 2 episodes; the touched one updated) and
-    // Movies (4 with the new one): 8 items, not the 15 of every library.
+    // Shows (series, season, 2 episodes; the touched one updated; the
+    // location's folder) and Movies (4 with the new one; the location's
+    // folder, unchanged though its directory gained the new movie's: a
+    // directory has no `DateModified`, D2): 10 items, not the 19 of every
+    // library.
     assert_eq!(queued.item("api", "updated"), 1.0, "row 14: {queued:?}");
-    assert_eq!(queued.item("api", "unchanged"), 6.0, "row 14: {queued:?}");
+    assert_eq!(queued.item("api", "unchanged"), 8.0, "row 14: {queued:?}");
     assert_eq!(queued.outcome("removed"), 0.0, "row 14: {queued:?}");
     assert!(
         queued.probed("Harbor - S01E02.mkv") && queued.probed("Epsilon (1999).mkv"),
@@ -3019,14 +2999,15 @@ fn assert_no_artwork_or_people(seen: &Seen, row: &str) {
 }
 
 /// A full pass over the Movies library: every movie re-probed, fetched by
-/// its stored TMDB id (no search) and saved; no other library touched.
+/// its stored TMDB id (no search) and saved, with the location's folder;
+/// no other library touched.
 fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
     assert_eq!(
         seen.scans,
         BTreeMap::from([("api".to_owned(), 1.0)]),
         "row {row}: {seen:?}"
     );
-    assert_eq!(seen.outcome("updated"), movies, "row {row}: {seen:?}");
+    assert_eq!(seen.outcome("updated"), movies + 1.0, "row {row}: {seen:?}");
     for outcome in ["created", "unchanged", "removed"] {
         assert_eq!(seen.outcome(outcome), 0.0, "row {row}: {outcome} {seen:?}");
     }
@@ -3062,8 +3043,8 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
         keys.iter().all(|k| written.contains(k))
             && written
                 .iter()
-                .all(|w| w.starts_with("movies/") || w.contains(':')),
-        "row {row}: the three movies (and their people, genres, years) {written:?}"
+                .all(|w| w == "movies" || w.starts_with("movies/") || w.contains(':')),
+        "row {row}: the three movies, the location (and their people, genres, years) {written:?}"
     );
 }
 

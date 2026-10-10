@@ -52,14 +52,25 @@ impl<'a> VideoListResolver<'a> {
             .collect();
 
         let stack_result = stack_resolver::resolve(&non_extras, self.naming_options);
+        // Every stacked file, as `FileStack.ContainsFile` compares it (ASCII
+        // case-blind, directory or not) — one lookup per file instead of a
+        // pass over every stack.
+        let stacked: std::collections::HashSet<(bool, String)> = stack_result
+            .iter()
+            .flat_map(|stack| {
+                stack
+                    .files
+                    .iter()
+                    .map(|file| (stack.is_directory_stack, file.to_ascii_lowercase()))
+            })
+            .collect();
 
         let mut remaining_files: Vec<VideoFileInfo> = Vec::new();
         let mut standalone_media: Vec<VideoFileInfo> = Vec::new();
 
         for current in video_infos {
-            if stack_result
-                .iter()
-                .any(|s| s.contains_file(&current.path, current.is_directory))
+            if !current.path.is_empty()
+                && stacked.contains(&(current.is_directory, current.path.to_ascii_lowercase()))
             {
                 continue;
             }
@@ -199,25 +210,7 @@ impl<'a> VideoListResolver<'a> {
         let mut groups: Vec<Vec<VideoInfo>> = Vec::new();
 
         for video in videos {
-            let episode_result = parser.parse(&video.files[0].path, false, None, None, None, false);
-            let mut key: Option<String> = None;
-            if episode_result.success {
-                if let (true, Some(y), Some(m), Some(d)) = (
-                    episode_result.is_by_date,
-                    episode_result.year,
-                    episode_result.month,
-                    episode_result.day,
-                ) {
-                    key = Some(format!("D{y}{m:02}{d:02}"));
-                } else if let Some(ep) = episode_result.episode_number {
-                    key = Some(format!(
-                        "S{}E{ep}",
-                        episode_result.season_number.unwrap_or(0)
-                    ));
-                }
-            }
-
-            let Some(key) = key else {
+            let Some(key) = episode_version_key(&parser, &video.files[0].path) else {
                 result.push(video);
                 continue;
             };
@@ -239,6 +232,34 @@ impl<'a> VideoListResolver<'a> {
         }
 
         result
+    }
+}
+
+/// Port of `VideoListResolver.GetEpisodeVersionKey` (upstream PR #17890).
+///
+/// Optimistic expressions are guesses, so they are not consulted here: merging is destructive,
+/// a file collapsed into the alternate versions of another one is no longer an episode of its
+/// own. A non-dated key therefore needs both a season and an episode number.
+fn episode_version_key(parser: &EpisodePathParser<'_>, path: &str) -> Option<String> {
+    let episode_result = parser.parse(path, false, None, Some(false), None, false);
+    if !episode_result.success {
+        return None;
+    }
+
+    if episode_result.is_by_date {
+        return match (
+            episode_result.year,
+            episode_result.month,
+            episode_result.day,
+        ) {
+            (Some(y), Some(m), Some(d)) => Some(format!("D{y}{m:02}{d:02}")),
+            _ => None,
+        };
+    }
+
+    match (episode_result.season_number, episode_result.episode_number) {
+        (Some(season), Some(episode)) => Some(format!("S{season}E{episode}")),
+        _ => None,
     }
 }
 

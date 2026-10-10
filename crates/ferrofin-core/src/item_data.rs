@@ -182,23 +182,50 @@ pub fn set_data_field(data: Option<&str>, key: &str, value: &str) -> Option<Stri
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
-/// `stored` with the resolver's `VideoType` (read from `resolved`) in place
-/// of its own — `Video.UpdateFromResolvedItem` (`Video.cs:518-522`), which
+/// The path lists `Video.UpdateFromResolvedItem` takes from the resolver
+/// (`Video.cs:506-516`): a stacked movie's other parts and a primary's local
+/// alternate versions, each a `string[]` of paths.
+pub const RESOLVED_VIDEO_PATH_LISTS: [&str; 2] = ["AdditionalParts", "LocalAlternateVersions"];
+
+/// `stored` with the resolver's video fields (read from `resolved`) in place
+/// of its own — `Video.UpdateFromResolvedItem` (`Video.cs:500-526`), which
 /// runs on every existing item a scan resolves, locked or not, before any
-/// refresh. `None` when that changes nothing: `resolved` names no
-/// `VideoType`, `stored` already holds that one, or `stored` is not a JSON
-/// object (a blob that cannot be read is never rewritten). An empty or
-/// absent `stored` is an empty object.
+/// refresh: `AdditionalParts` and `LocalAlternateVersions` when they differ
+/// as ordinal sequences ([`RESOLVED_VIDEO_PATH_LISTS`]), and `VideoType`.
+///
+/// The resolver's blob speaks for a `Video` (`if (newItem is Video
+/// newVideo)`) only when it names a `VideoType`, which every video the
+/// planner resolves carries; otherwise nothing changes. A path list the
+/// resolver's blob does not carry is left as stored: the planner speaks for
+/// a list only by writing its key. One it carries replaces the stored list
+/// whole when they differ, a stored list that is absent or JSON `null`
+/// being the empty one C# initialises it to (a resolved `null` or non-list
+/// is `[]` too) — so this rule alone never rewrites a row that lacks the
+/// key to hold `[]`, which keeps a locked row's blob as stored. An unlocked
+/// row's save still gains a resolved `[]` from the refresh merge
+/// (`merge_data_blob` takes every other source key), so once the planner
+/// writes both keys every saved unlocked video holds both — as upstream,
+/// which serializes both arrays on every `Video`.
+///
+/// Upstream replaces both lists on every resolve, so a stack or version
+/// group that dissolves clears them; the movie and TV walks write both keys
+/// (`[]` when empty) for every video they plan, so it does here too.
+///
+/// `None` when that changes nothing, or `stored` is not a JSON object (a
+/// blob that cannot be read is never rewritten). An empty or absent `stored`
+/// is an empty object.
 ///
 /// The returned text is `serde_json`'s rendering (keys sorted): an unlocked
 /// row is saved with it. A locked row's save applies the same rule in SQL
-/// instead (`json_set`, `LOCKED_DATA_SQL`), which keeps every other key and
-/// its value in their order but returns the document re-rendered minified;
-/// when nothing changes, the SQL leaves the stored text as it is.
+/// instead (`json_patch`, the persistence service's `locked_data_sql`),
+/// which keeps every other key and its value in their order but returns the
+/// document re-rendered minified; when nothing changes, the SQL leaves the
+/// stored text as it is.
 #[must_use]
-pub fn with_resolved_video_type(stored: Option<&str>, resolved: Option<&str>) -> Option<String> {
-    const KEY: &str = "VideoType";
-    let video_type = read_data_string(&parse_data(resolved), KEY)?;
+pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) -> Option<String> {
+    const VIDEO_TYPE: &str = "VideoType";
+    let resolved = parse_data(resolved);
+    let video_type = read_data_string(&resolved, VIDEO_TYPE)?;
     let mut object = match stored.filter(|d| !d.is_empty()) {
         None => Map::new(),
         Some(text) => match serde_json::from_str::<Value>(text).ok()? {
@@ -206,10 +233,29 @@ pub fn with_resolved_video_type(stored: Option<&str>, resolved: Option<&str>) ->
             _ => return None,
         },
     };
-    if read_data_string(&object, KEY).as_deref() == Some(video_type.as_str()) {
+    let mut changed = false;
+    if read_data_string(&object, VIDEO_TYPE).as_deref() != Some(video_type.as_str()) {
+        object.insert(VIDEO_TYPE.to_owned(), Value::String(video_type));
+        changed = true;
+    }
+    for key in RESOLVED_VIDEO_PATH_LISTS {
+        let new = match resolved.get(key) {
+            None => continue,
+            Some(list @ Value::Array(_)) => list.clone(),
+            Some(_) => Value::Array(Vec::new()),
+        };
+        let same = match object.get(key) {
+            None | Some(Value::Null) => new.as_array().is_some_and(Vec::is_empty),
+            Some(old) => *old == new,
+        };
+        if !same {
+            object.insert(key.to_owned(), new);
+            changed = true;
+        }
+    }
+    if !changed {
         return None;
     }
-    object.insert(KEY.to_owned(), Value::String(video_type));
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
@@ -355,6 +401,78 @@ pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -
         return None;
     }
     serde_json::to_string(&Value::Object(object)).ok()
+}
+
+/// A video's format as its `Data` stores it: `Video.VideoType` (the
+/// `VideoFile` default when the blob names none), `IsoType` and
+/// `Video3DFormat`, each serialized by name (`BaseItemMapper` keeps them in
+/// the blob, not in a column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoFormat {
+    /// `Video.VideoType`.
+    pub video_type: ferrofin_model::entities::VideoType,
+    /// `Video.IsoType`, for a disc image.
+    pub iso_type: Option<ferrofin_model::entities::IsoType>,
+    /// `Video.Video3DFormat`, for a 3D video.
+    pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
+}
+
+/// The [`VideoFormat`] `data` stores. The text is read first: a blob naming
+/// no disc, image or 3D format — nearly every video's — is not parsed.
+#[must_use]
+pub fn video_format(data: Option<&str>) -> VideoFormat {
+    let plain = VideoFormat {
+        video_type: ferrofin_model::entities::VideoType::VideoFile,
+        iso_type: None,
+        video3d_format: None,
+    };
+    let Some(text) = data.filter(|t| {
+        ["Video3DFormat", "\"BluRay\"", "\"Dvd\"", "\"Iso\""]
+            .iter()
+            .any(|needle| t.contains(needle))
+    }) else {
+        return plain;
+    };
+    let data = parse_data(Some(text));
+    let field = |key: &str| data.get(key).cloned().filter(|v| !v.is_null());
+    VideoFormat {
+        video_type: field("VideoType")
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or(plain.video_type),
+        iso_type: field("IsoType").and_then(|v| serde_json::from_value(v).ok()),
+        video3d_format: field("Video3DFormat").and_then(|v| serde_json::from_value(v).ok()),
+    }
+}
+
+/// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
+/// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
+/// the case `Video.ContainingFolderPath` (`Video.cs:201-219`) and
+/// `MovieNfoSaver.GetMovieSavePaths` treat the path itself as the folder.
+/// The text is read first, so a blob naming neither type is not parsed.
+#[must_use]
+pub fn is_disc_folder(data: Option<&str>) -> bool {
+    let Some(text) = data.filter(|t| t.contains("\"Dvd\"") || t.contains("\"BluRay\"")) else {
+        return false;
+    };
+    let data = parse_data(Some(text));
+    matches!(
+        read_data_string(&data, "VideoType").as_deref(),
+        Some("Dvd" | "BluRay")
+    ) && !data
+        .get("IsPlaceHolder")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether `item`'s path names a directory: a folder's, or a disc rip's
+/// ([`is_disc_folder`]) — a `Video`, which upstream never stores as a folder
+/// (`BaseItem.IsFolder`, `BaseItem.cs:803`), whose path is the rip's
+/// directory all the same. A directory has no `DateModified` (owner
+/// decision D2: `GetFileSystemMetadata` fills no times for one, and its
+/// `MinValue` is stored as `NULL`).
+#[must_use]
+pub fn path_is_directory(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
+    item.is_folder || is_disc_folder(item.data.as_deref())
 }
 
 /// Reads one `Data` field as a string.
@@ -701,6 +819,100 @@ pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uu
 mod tests {
     use super::*;
     use crate::test_support::{seed_item, seed_named_item, test_db};
+
+    /// `Video.UpdateFromResolvedItem` (`Video.cs:500-526`) over the `Data`
+    /// blob: the `AdditionalParts`/`LocalAlternateVersions` the resolver's
+    /// blob carries replace the stored ones when they differ as ordinal
+    /// sequences (a stored list absent or `null` is `[]`), one it does not
+    /// carry is left as stored, and its `VideoType` replaces the stored one;
+    /// a blob naming no `VideoType` is no `Video` and moves nothing. The rule as the locked save's SQL runs it is checked against
+    /// this one in the persistence service's tests.
+    #[rstest::rstest]
+    #[case::absent_is_empty(
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#),
+        None
+    )]
+    #[case::empty_is_absent(
+        Some(r#"{"AdditionalParts":[],"LocalAlternateVersions":[],"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        None
+    )]
+    #[case::null_is_empty(
+        Some(r#"{"AdditionalParts":null,"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#),
+        None
+    )]
+    #[case::same_lists(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#),
+        None
+    )]
+    #[case::parts_added(
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv","/m/c.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv","/m/c.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::reordered(
+        Some(r#"{"AdditionalParts":["/m/c.mkv","/m/b.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv","/m/c.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv","/m/c.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::ordinal_case(
+        Some(r#"{"LocalAlternateVersions":["/m/Heat - 4K.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"LocalAlternateVersions":["/m/heat - 4k.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"LocalAlternateVersions":["/m/heat - 4k.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::versions_gone(
+        Some(
+            r#"{"LocalAlternateVersions":["/m/x.mkv"],"Status":"Ended","VideoType":"VideoFile"}"#
+        ),
+        Some(r#"{"LocalAlternateVersions":[],"VideoType":"VideoFile"}"#),
+        Some(r#"{"LocalAlternateVersions":[],"Status":"Ended","VideoType":"VideoFile"}"#)
+    )]
+    #[case::versions_not_resolved(
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        None
+    )]
+    #[case::parts_not_resolved_video_type_moves(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"Dvd"}"#),
+        Some(r#"{"LocalAlternateVersions":[],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::resolved_null_is_empty(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":null,"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::video_type(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"Dvd"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"AdditionalParts":["/m/b.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::no_stored_blob(
+        None,
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#),
+        Some(r#"{"LocalAlternateVersions":["/m/x.mkv"],"VideoType":"VideoFile"}"#)
+    )]
+    #[case::not_a_video(
+        Some(r#"{"AdditionalParts":["/m/b.mkv"]}"#),
+        Some(r#"{"AdditionalParts":[]}"#),
+        None
+    )]
+    #[case::no_resolved_blob(Some(r#"{"AdditionalParts":["/m/b.mkv"]}"#), None, None)]
+    #[case::stored_not_an_object(Some("[1]"), Some(r#"{"VideoType":"VideoFile"}"#), None)]
+    #[case::stored_malformed(Some("{"), Some(r#"{"VideoType":"VideoFile"}"#), None)]
+    fn resolved_video_fields_replace_the_stored_ones(
+        #[case] stored: Option<&str>,
+        #[case] resolved: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            with_resolved_video_fields(stored, resolved).as_deref(),
+            expected
+        );
+    }
 
     /// `Status` is read out of the blob as Jellyfin writes it
     /// (`"Status":"Ended"`), and only written when absent.
@@ -1137,5 +1349,29 @@ mod tests {
             json,
             r#"{"Path":"/m/x.mkv","Type":"Manual","ItemId":"d37ecb9d75b0c0a8e9ecb0a864ec670e"}"#
         );
+    }
+
+    /// A disc rip's path is a directory though the row is no folder; a
+    /// `.disc` placeholder's, an image's and a file's are not.
+    #[rstest::rstest]
+    #[case::folder(true, None, true)]
+    #[case::dvd_rip(false, Some(r#"{"VideoType":"Dvd"}"#), true)]
+    #[case::bluray_rip(false, Some(r#"{"VideoType": "BluRay"}"#), true)]
+    #[case::placeholder(false, Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#), false)]
+    #[case::iso(false, Some(r#"{"VideoType":"Iso","IsoType":"Dvd"}"#), false)]
+    #[case::file(false, Some(r#"{"VideoType":"VideoFile"}"#), false)]
+    #[case::unreadable(false, Some(r#"{"VideoType":"Dvd""#), false)]
+    #[case::no_data(false, None, false)]
+    fn a_disc_rips_path_is_a_directory(
+        #[case] is_folder: bool,
+        #[case] data: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            is_folder,
+            data: data.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(super::path_is_directory(&item), expected);
     }
 }

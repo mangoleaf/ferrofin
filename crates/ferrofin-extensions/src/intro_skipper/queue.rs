@@ -161,6 +161,67 @@ pub(super) async fn build(
     Ok(queue.queue)
 }
 
+/// Of `ids`, the items Jellyfin's Media Segment Scan would run the plugin's
+/// `SegmentProvider` for (`MediaSegmentExtractionTask.ExecuteAsync`: the
+/// library's non-virtual items whose file exists, in a library whose
+/// `DisabledMediaSegmentProviders` does not name the plugin
+/// (`MediaSegmentManager.RunSegmentPluginProviders`), that the provider
+/// `Supports` — an Episode or a Movie). An item deleted from the library is
+/// never among them, whatever the plugin still stores for it (upstream keeps
+/// those rows until its clean task; its `OnItemRemoved` drops only the
+/// detection cache).
+///
+/// # Errors
+/// A library read failed.
+pub(super) async fn publishable(
+    library: &dyn LibraryManager,
+    folders: &[VirtualFolderInfo],
+    ids: &[Uuid],
+) -> Result<HashSet<Uuid>, ServiceError> {
+    let enabled: Vec<&VirtualFolderInfo> = folders
+        .iter()
+        .filter(|folder| {
+            !folder.library_options.as_ref().is_some_and(|o| {
+                o.disabled_media_segment_providers
+                    .iter()
+                    .any(|p| p == PLUGIN_NAME)
+            })
+        })
+        .collect();
+    let mut out = HashSet::new();
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let items = library
+            .get_item_list(&InternalItemsQuery {
+                item_ids: chunk.to_vec(),
+                include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+                is_virtual_item: Some(false),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        for item in items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            if !matches!(
+                kind(&item),
+                Some(BaseItemKind::Episode | BaseItemKind::Movie)
+            ) || !enabled.iter().any(|folder| in_folder(&item, folder))
+            {
+                continue;
+            }
+            // "Only local files supported": `IsFileProtocol && File.Exists`.
+            let exists = match item.path.as_deref() {
+                Some(path) => tokio::fs::try_exists(path).await.unwrap_or(false),
+                None => false,
+            };
+            if exists {
+                out.insert(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `item`'s file lives under one of the folder's locations
 /// (`GetLibraryOptions(item)`'s resolution, as the library tasks use).
 fn in_folder(item: &BaseItemEntity, folder: &VirtualFolderInfo) -> bool {
