@@ -143,13 +143,16 @@ impl FerrofinSubtitleManager {
         Ok(true)
     }
 
-    /// Selects the provider that owns a namespaced id (`"{name}_{local}"`),
-    /// returning it plus the provider-local id (prefix stripped).
+    /// Selects the provider that owns a namespaced id (`"{provider_id}_{local}"`),
+    /// returning it plus the provider-local id. Like `String.Split('_', 2)` with
+    /// `parts[0]`/`parts[^1]`, an id without `_` is both the provider id and the
+    /// local id.
     fn route(&self, id: &str) -> Option<(&Arc<dyn SubtitleProvider>, String)> {
-        self.providers.iter().find_map(|p| {
-            let prefix = format!("{}_", p.name());
-            id.strip_prefix(&prefix).map(|local| (p, local.to_owned()))
-        })
+        let (head, local) = id.split_once('_').unwrap_or((id, id));
+        self.providers
+            .iter()
+            .find(|p| provider_id(p.name()) == head)
+            .map(|p| (p, local.to_owned()))
     }
 
     /// A failed provider contributes no candidates, letting ordered fallback
@@ -163,6 +166,16 @@ impl FerrofinSubtitleManager {
             Ok(mut found) => {
                 if request.is_perfect_match == Some(true) {
                     found.retain(|result| result.is_hash_match == Some(true));
+                }
+                // SubtitleManager.Normalize: namespace every candidate id with
+                // the MD5 id of the candidate's own provider name.
+                for result in &mut found {
+                    let namespace =
+                        provider_id(result.provider_name.as_deref().unwrap_or(provider.name()));
+                    result.id = Some(format!(
+                        "{namespace}_{}",
+                        result.id.as_deref().unwrap_or("")
+                    ));
                 }
                 found
             }
@@ -248,6 +261,15 @@ impl FerrofinSubtitleManager {
             .save_media_streams(item_id, &streams)
             .await
     }
+}
+
+/// `SubtitleManager.GetProviderId`: the .NET `GetMD5().ToString("N")` of the
+/// lowercased provider name. It namespaces candidate ids and identifies the
+/// provider in `GetSupportedProviders`.
+fn provider_id(name: &str) -> String {
+    ferrofin_common::extensions::get_md5(&ferrofin_util::string_extensions::lower_invariant(name))
+        .simple()
+        .to_string()
 }
 
 /// Only Movies and Episodes are supported by the subtitle manager's item
@@ -511,7 +533,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .filter(|provider| provider.supported_media_types().contains(&content_type))
             .map(|p| SubtitleProviderInfo {
                 name: Some(p.name().to_owned()),
-                id: Some(p.name().to_owned()),
+                id: Some(provider_id(p.name())),
             })
             .collect())
     }
@@ -559,7 +581,7 @@ mod tests {
             request: &SubtitleSearchRequest,
         ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
             Ok(vec![RemoteSubtitleInfo {
-                id: Some("fake_42".to_owned()),
+                id: Some("42".to_owned()),
                 provider_name: Some("fake".to_owned()),
                 name: request.name.clone(),
                 ..Default::default()
@@ -626,7 +648,7 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id.as_deref(), Some("fake_42"));
+        assert_eq!(results[0].id, Some(format!("{}_42", provider_id("fake"))));
     }
 
     struct CapturingProvider(Arc<std::sync::Mutex<Vec<SubtitleSearchRequest>>>);
@@ -749,7 +771,7 @@ mod tests {
         set_item_path(&db, item, &media).await;
 
         let mgr = manager(db.clone(), vec![Arc::new(FakeProvider)]);
-        mgr.download_subtitles(item, "fake_42")
+        mgr.download_subtitles(item, &format!("{}_42", provider_id("fake")))
             .await
             .expect("download");
 
@@ -1000,7 +1022,9 @@ mod tests {
         let original = tmp.path().join("Movie.eng.srt");
         std::fs::write(&original, b"original").unwrap();
         mgr.upload_subtitle(item, &response).await.unwrap();
-        mgr.download_subtitles(item, "fake_42").await.unwrap();
+        mgr.download_subtitles(item, &format!("{}_42", provider_id("fake")))
+            .await
+            .unwrap();
         for name in ["Movie.eng.0.srt", "Movie.eng.1.srt"] {
             assert_eq!(
                 std::fs::read(tmp.path().join(name)).unwrap(),
@@ -1016,7 +1040,9 @@ mod tests {
             .await
             .unwrap();
         mgr.upload_subtitle(item, &response).await.unwrap();
-        mgr.download_subtitles(item, "fake_42").await.unwrap();
+        mgr.download_subtitles(item, &format!("{}_42", provider_id("fake")))
+            .await
+            .unwrap();
         let internal = mgr.item_metadata_dir(item);
         for name in ["Movie.eng.srt", "Movie.eng.0.srt"] {
             assert_eq!(
@@ -1165,7 +1191,10 @@ mod tests {
     async fn get_remote_routes_by_prefix() {
         let db = test_db().await;
         let mgr = manager(db, vec![Arc::new(FakeProvider)]);
-        let resp = mgr.get_remote_subtitles("fake_42").await.expect("remote");
+        let resp = mgr
+            .get_remote_subtitles(&format!("{}_42", provider_id("fake")))
+            .await
+            .expect("remote");
         assert_eq!(resp.format, "srt");
         assert!(matches!(
             mgr.get_remote_subtitles("unknown_1").await,
@@ -1182,6 +1211,33 @@ mod tests {
         let providers = mgr.get_supported_providers(item).await.expect("providers");
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name.as_deref(), Some("fake"));
+        assert_eq!(
+            providers[0].id.as_deref(),
+            Some("fb54b3c3796fa82a7cd4be5f371d176c")
+        );
+    }
+
+    #[test]
+    fn provider_id_is_dotnet_md5_of_lowercase_name() {
+        // .NET: "opensubtitles".ToLowerInvariant().GetMD5().ToString("N")
+        assert_eq!(
+            provider_id("OpenSubtitles"),
+            "29c0c3633fefe8ab4d5b9af1b0275f3d"
+        );
+        assert_eq!(provider_id("opensubtitles"), provider_id("OPENSUBTITLES"));
+    }
+
+    #[tokio::test]
+    async fn routing_uses_provider_id_and_keeps_later_underscores() {
+        let db = test_db().await;
+        let mgr = manager(db, vec![Arc::new(FakeProvider)]);
+        // The readable-name prefix is not a namespace.
+        assert!(mgr.get_remote_subtitles("fake_42").await.is_err());
+        // Only the first underscore splits; the rest belongs to the local id.
+        let routed = mgr.route(&format!("{}_a_b", provider_id("fake")));
+        assert_eq!(routed.map(|(_, local)| local).as_deref(), Some("a_b"));
+        // No underscore: the whole id is both provider id and local id.
+        assert!(mgr.route(&provider_id("fake")).is_some());
     }
 
     struct RankedProvider(&'static str, bool);
@@ -1196,7 +1252,7 @@ mod tests {
             _: &SubtitleSearchRequest,
         ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
             Ok(vec![RemoteSubtitleInfo {
-                id: Some(format!("{}_1", self.0)),
+                id: Some("1".to_owned()),
                 is_hash_match: Some(self.1),
                 ..Default::default()
             }])
@@ -1227,13 +1283,13 @@ mod tests {
             1,
             "stop after the preferred provider answers"
         );
-        assert_eq!(results[0].id.as_deref(), Some("second_1"));
+        assert_eq!(results[0].id, Some(format!("{}_1", provider_id("second"))));
         request.subtitle_fetcher_order.clear();
         request.is_perfect_match = Some(true);
         let results = mgr.search_subtitles(&request).await.unwrap();
         assert_eq!(
-            results[0].id.as_deref(),
-            Some("second_1"),
+            results[0].id,
+            Some(format!("{}_1", provider_id("second"))),
             "skip a nonmatching provider result"
         );
         request.disabled_subtitle_fetchers = vec!["SECOND".to_owned()];
@@ -1284,7 +1340,7 @@ mod tests {
                 SearchOutcome::Failed => Err(ServiceError::backend("fixture provider failed")),
                 SearchOutcome::Empty => Ok(Vec::new()),
                 SearchOutcome::Found => Ok(vec![RemoteSubtitleInfo {
-                    id: Some(format!("{}_1", self.name)),
+                    id: Some("1".to_owned()),
                     ..Default::default()
                 }]),
             }
@@ -1322,15 +1378,15 @@ mod tests {
         };
         let results = mgr.search_subtitles(&request).await.unwrap();
         assert_eq!(
-            results[0].id.as_deref(),
-            Some("Fallback_1"),
+            results[0].id,
+            Some(format!("{}_1", provider_id("Fallback"))),
             "saved provider names use exact casing"
         );
         assert_eq!(*calls.lock().unwrap(), ["Fallback"]);
         calls.lock().unwrap().clear();
         request.disabled_subtitle_fetchers = vec!["FALLBACK".to_owned()];
         let results = mgr.search_subtitles(&request).await.unwrap();
-        assert_eq!(results[0].id.as_deref(), Some("Movies_1"));
+        assert_eq!(results[0].id, Some(format!("{}_1", provider_id("Movies"))));
         assert_eq!(
             *calls.lock().unwrap(),
             ["Failed", "Empty", "Movies"],
@@ -1340,10 +1396,8 @@ mod tests {
         request.disabled_subtitle_fetchers.clear();
         request.subtitle_fetcher_order = vec!["Movies".to_owned(), "Failed".to_owned()];
         assert_eq!(
-            mgr.search_subtitles(&request).await.unwrap()[0]
-                .id
-                .as_deref(),
-            Some("Movies_1")
+            mgr.search_subtitles(&request).await.unwrap()[0].id,
+            Some(format!("{}_1", provider_id("Movies")))
         );
         assert_eq!(*calls.lock().unwrap(), ["Movies"]);
         calls.lock().unwrap().clear();
@@ -1394,10 +1448,7 @@ mod tests {
             };
             let results = mgr.search_subtitles(&request).await.unwrap();
             assert_eq!(results.len(), 1);
-            assert_eq!(
-                results[0].id.as_deref(),
-                Some(format!("{expected}_1").as_str())
-            );
+            assert_eq!(results[0].id, Some(format!("{}_1", provider_id(expected))));
             let descriptors = mgr.get_supported_providers(id).await.unwrap();
             assert_eq!(descriptors.len(), 1);
             assert_eq!(descriptors[0].name.as_deref(), Some(expected));
@@ -1437,7 +1488,7 @@ mod tests {
         ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
             self.barrier.wait().await;
             Ok(vec![RemoteSubtitleInfo {
-                id: Some(format!("{}_1", self.name)),
+                id: Some("1".to_owned()),
                 ..Default::default()
             }])
         }
@@ -1476,7 +1527,10 @@ mod tests {
                 .iter()
                 .map(|result| result.id.as_deref().unwrap())
                 .collect::<Vec<_>>(),
-            ["Beta_1", "Alpha_1"]
+            [
+                format!("{}_1", provider_id("Beta")),
+                format!("{}_1", provider_id("Alpha"))
+            ]
         );
         let mgr = manager(
             test_db().await,

@@ -190,9 +190,9 @@ fn parse_subtitle_id(id: &str) -> Option<ParsedId> {
 
 /// Maps a search response into namespaced [`RemoteSubtitleInfo`] candidates.
 ///
-/// Each candidate's `id` is `"{PLUGIN_NAME}_{local}"` so the manager can route
-/// a later download back to this provider (it strips the `"{name}_"` prefix and
-/// hands us the local id, see [`build_subtitle_id`]). As in the plugin, the
+/// Each candidate's `id` is the provider-local id ([`build_subtitle_id`]); the
+/// subtitle manager namespaces it with the provider's MD5 id, as upstream
+/// `SubtitleManager.Normalize` does. As in the plugin, the
 /// language stamped on the candidate and into its id is the CALLER's 3-letter
 /// code (`request.Language`), never the API's own tag: the search was already
 /// filtered by it, and the API's tags (`pt-BR`, `zh-CN`) carry a `-` that would
@@ -205,10 +205,7 @@ fn map_search(response: &SearchResponse, language: &str) -> Vec<RemoteSubtitleIn
         // A result can carry several files; each downloadable file is a candidate.
         for file in &attrs.files {
             out.push(RemoteSubtitleInfo {
-                id: Some(format!(
-                    "{PLUGIN_NAME}_{}",
-                    build_subtitle_id(language, attrs, file.file_id)
-                )),
+                id: Some(build_subtitle_id(language, attrs, file.file_id)),
                 provider_name: Some(PLUGIN_NAME.to_owned()),
                 three_letter_iso_language_name: Some(language.to_owned()),
                 name: file.file_name.clone().or_else(|| attrs.release.clone()),
@@ -685,7 +682,7 @@ mod tests {
         let mapped = map_search(&parsed, "eng");
         assert_eq!(mapped.len(), 1);
         let c = &mapped[0];
-        assert_eq!(c.id.as_deref(), Some("opensubtitles_srt-eng-998877"));
+        assert_eq!(c.id.as_deref(), Some("srt-eng-998877"));
         assert_eq!(c.hearing_impaired, Some(false));
         assert_eq!(c.forced, None);
         assert_eq!(c.provider_name.as_deref(), Some("opensubtitles"));
@@ -701,7 +698,7 @@ mod tests {
             "files": [{"file_id": 5}]}}]}"#;
         let parsed: SearchResponse = serde_json::from_str(json).unwrap();
         let c = &map_search(&parsed, "por")[0];
-        assert_eq!(c.id.as_deref(), Some("opensubtitles_srt-por-5"));
+        assert_eq!(c.id.as_deref(), Some("srt-por-5"));
         assert_eq!(c.three_letter_iso_language_name.as_deref(), Some("por"));
         let p = parse_subtitle_id("srt-por-5").unwrap();
         assert_eq!((p.language.as_str(), p.file_id), ("por", 5));

@@ -458,7 +458,7 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             Ok(vec![RemoteSubtitleInfo {
-                id: Some(format!("fake_{}", request.language)),
+                id: Some(request.language.clone()),
                 is_hash_match: Some(!self.non_matching.load(Ordering::SeqCst)),
                 ..Default::default()
             }])

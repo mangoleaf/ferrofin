@@ -1810,6 +1810,33 @@ async fn verify_automatic_subtitle_constraints(
                 && uri.contains("imdb_id=0133093"))
     );
 
+    // Manual search candidates carry the upstream MD5 provider namespace, which
+    // routes both the raw-content and download endpoints; the readable provider
+    // name is not an alias.
+    let found = api
+        .get(&format!("/Items/{id}/RemoteSearch/Subtitles/eng"))
+        .await;
+    let candidate = found[0]["Id"].as_str().unwrap().to_owned();
+    let (namespace, local) = candidate.split_once('_').unwrap();
+    assert_eq!(namespace, "29c0c3633fefe8ab4d5b9af1b0275f3d", "{found}");
+    assert!(local.ends_with("-eng-42"), "{found}");
+    for (path, expected) in [
+        (format!("/Providers/Subtitles/Subtitles/{candidate}"), 200),
+        (
+            format!("/Providers/Subtitles/Subtitles/OpenSubtitles_{local}"),
+            400,
+        ),
+    ] {
+        let response = api
+            .client
+            .get(format!("{}{path}", api.base))
+            .header("Authorization", &api.auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+    }
+
     for (language, flag) in [
         ("fra", "SkipSubtitlesIfAudioTrackMatches"),
         ("spa", "SkipSubtitlesIfEmbeddedSubtitlesPresent"),
