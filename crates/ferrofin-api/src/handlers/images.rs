@@ -1275,14 +1275,16 @@ async fn set_item_image(
 
 /// `POST /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed upload.
 ///
-/// Port of `ImageController.SetItemImageByIndex`.
+/// Port of `ImageController.SetItemImageByIndex`. Jellyfin accepts the route
+/// index but saves without it: multi-image types append and single-image types
+/// replace their sole image, just as on the unindexed upload route.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}/{imageIndex}",
     params(
         ("itemId" = String, Path, description = "The item id"),
         ("imageType" = String, Path, description = "The image type"),
-        ("imageIndex" = i32, Path, description = "The image index"),
+        ("imageIndex" = i32, Path, description = "Unused image index"),
     ),
     responses(
         (status = 204, description = "Image saved"),
@@ -1294,7 +1296,7 @@ async fn set_item_image(
 async fn set_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((item_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1303,15 +1305,7 @@ async fn set_item_image_by_index(
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    save_item_image(
-        &state,
-        item_id,
-        image_type,
-        Some(image_index),
-        content_type,
-        &body,
-    )
-    .await
+    save_item_image(&state, item_id, image_type, None, content_type, &body).await
 }
 
 /// `DELETE /Items/{itemId}/Images/{imageType}` — delete an item's image.

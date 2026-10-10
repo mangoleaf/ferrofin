@@ -494,6 +494,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_nfo_image_order_culture(&api, library, &mut options, id, &media).await;
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_indexed_artwork_deletion(&api, id).await;
+    verify_indexed_artwork_upload(&api, id).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
     verify_embedded_subtitle_options(&api, library, &mut options, id, &media, tmp.path()).await;
     verify_automatic_subtitle_constraints(
@@ -1080,6 +1081,59 @@ async fn upload_artwork(api: &Api, id: &str, kind: &str) {
     );
 }
 
+// Keep N04's next append slot stable across its independent configuration phases.
+async fn prepare_backdrop_append(api: &Api, id: &str, index: usize) {
+    let endpoint = format!("/Items/{id}/Images");
+    let images = api.get(&endpoint).await;
+    let count = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|image| image["ImageType"] == "Backdrop")
+        .count();
+    for remove in (index..count).rev() {
+        let response = api
+            .client
+            .delete(format!("{}{endpoint}/Backdrop/{remove}", api.base))
+            .header("Authorization", &api.auth)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    for _ in count..index {
+        upload_artwork(api, id, "Backdrop").await;
+    }
+}
+
+async fn verify_indexed_artwork_upload(api: &Api, id: &str) {
+    let endpoint = format!("/Items/{id}/Images");
+    for index in [0, 1, -1, i32::MAX] {
+        let before = api.get(&endpoint).await;
+        let previous: Vec<_> = before
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .map(|image| image["Path"].clone())
+            .collect();
+        upload_artwork(api, id, &format!("Backdrop/{index}")).await;
+        let after = api.get(&endpoint).await;
+        let actual: Vec<_> = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .map(|image| image["Path"].clone())
+            .collect();
+        assert_eq!(actual.len(), previous.len() + 1);
+        assert_eq!(&actual[..previous.len()], previous);
+        for path in actual {
+            assert!(std::path::Path::new(path.as_str().unwrap()).is_file());
+        }
+    }
+}
+
 async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {
     for kind in ["Backdrop", "Screenshot"] {
         upload_artwork(api, id, kind).await;
@@ -1241,6 +1295,7 @@ async fn verify_artwork_destinations(
         &json!({"EnableExtraThumbsDuplication":true}),
     )
     .await;
+    prepare_backdrop_append(api, id, 0).await;
     upload_artwork(api, id, "Backdrop/0").await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert_eq!(std::fs::read(media.join("fanart.png")).unwrap(), POSTER);
@@ -1348,6 +1403,7 @@ async fn verify_extra_thumbs_duplication(
     configuration["EnableExtraThumbsDuplication"] = json!(false);
     api.post("/System/Configuration/xbmcmetadata", &configuration)
         .await;
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert_eq!(
         std::fs::read(&duplicate).unwrap(),
@@ -1357,17 +1413,20 @@ async fn verify_extra_thumbs_duplication(
     configuration["EnableExtraThumbsDuplication"] = json!(true);
     api.post("/System/Configuration/xbmcmetadata", &configuration)
         .await;
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert_eq!(std::fs::read(&duplicate).unwrap(), POSTER);
     configuration["EnableExtraThumbsDuplication"] = json!(false);
     api.post("/System/Configuration/xbmcmetadata", &configuration)
         .await;
     std::fs::remove_file(&duplicate).unwrap();
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert!(!duplicate.exists(), "disabling applies on the next upload");
     configuration["EnableExtraThumbsDuplication"] = json!(true);
     api.post("/System/Configuration/xbmcmetadata", &configuration)
         .await;
+    prepare_backdrop_append(api, id, 0).await;
     upload_artwork(api, id, "Backdrop/0").await;
     assert!(
         !media.join("extrathumbs/thumb0.png").exists(),
@@ -1376,6 +1435,7 @@ async fn verify_extra_thumbs_duplication(
     let mut config = server.clone();
     config["ImageSavingConvention"] = json!("Legacy");
     api.post("/System/Configuration", &config).await;
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert!(!duplicate.exists(), "Legacy uses one local output");
     config["ImageSavingConvention"] = json!("Compatible");
@@ -1386,6 +1446,7 @@ async fn verify_extra_thumbs_duplication(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert!(
         !duplicate.exists(),
@@ -1397,6 +1458,7 @@ async fn verify_extra_thumbs_duplication(
         &json!({"Id":library,"LibraryOptions":options}),
     )
     .await;
+    prepare_backdrop_append(api, id, 1).await;
     let images = api.get(&format!("/Items/{id}/Images")).await;
     std::fs::create_dir(&duplicate).unwrap();
     let response = api.client.post(format!("{}/Items/{id}/Images/Backdrop/1",api.base))
@@ -1414,6 +1476,7 @@ async fn verify_extra_thumbs_duplication(
         "failed duplication must not publish a new image path"
     );
     std::fs::remove_dir(&duplicate).unwrap();
+    prepare_backdrop_append(api, id, 1).await;
     upload_artwork(api, id, "Backdrop/1").await;
     assert_eq!(
         std::fs::read(&duplicate).unwrap(),

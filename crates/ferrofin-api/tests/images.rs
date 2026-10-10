@@ -619,10 +619,12 @@ impl UserManager for StubUsers {
     }
 }
 
+type SavedImage = (Uuid, String, ImageType, Option<i32>);
+
 /// A [`ProviderManager`] recording `save_image`/`delete_image` and returning a
 /// canned remote image + provider.
 struct StubProviders {
-    saved: Arc<Mutex<Vec<(Uuid, String)>>>,
+    saved: Arc<Mutex<Vec<SavedImage>>>,
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
 }
 
@@ -664,13 +666,15 @@ impl ProviderManager for StubProviders {
         item_id: Uuid,
         _content: &[u8],
         mime_type: &str,
-        _image_type: ImageType,
-        _image_index: Option<i32>,
+        image_type: ImageType,
+        image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        self.saved
-            .lock()
-            .expect("lock")
-            .push((item_id, mime_type.to_owned()));
+        self.saved.lock().expect("lock").push((
+            item_id,
+            mime_type.to_owned(),
+            image_type,
+            image_index,
+        ));
         Ok(())
     }
     async fn delete_image(
@@ -1210,21 +1214,49 @@ async fn set_item_image_saves_and_returns_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let saved = s.providers.saved.lock().expect("lock");
-    assert_eq!(saved.as_slice(), [(ITEM_ID, "image/png".to_owned())]);
+    assert_eq!(
+        saved.as_slice(),
+        [(ITEM_ID, "image/png".to_owned(), ImageType::Primary, None)]
+    );
 }
 
 #[tokio::test]
-async fn set_item_image_by_index_saves() {
+async fn indexed_upload_ignores_every_bound_index_for_single_and_multiple_images() {
     let s = elevated_stubs(String::new(), String::new());
-    let (status, _) = send(
-        &s,
-        "POST",
-        &format!("/Items/{ITEM_ID}/Images/Backdrop/2"),
-        Some(("image/jpeg", "aGk=")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(s.providers.saved.lock().expect("lock").len(), 1);
+    let mut expected = Vec::new();
+    for (kind, image_type) in [
+        ("Backdrop", ImageType::Backdrop),
+        ("Primary", ImageType::Primary),
+    ] {
+        for index in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
+            let (status, _) = send(
+                &s,
+                "POST",
+                &format!("/Items/{ITEM_ID}/Images/{kind}/{index}"),
+                Some(("image/png", "aGk=")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{kind}/{index}");
+            expected.push((ITEM_ID, "image/png".to_owned(), image_type, None));
+        }
+    }
+    assert_eq!(*s.providers.saved.lock().expect("lock"), expected);
+}
+
+#[tokio::test]
+async fn indexed_upload_rejects_unbound_indices_without_saving() {
+    let s = elevated_stubs(String::new(), String::new());
+    for index in ["2147483648", "-2147483649", "invalid"] {
+        let (status, _) = send(
+            &s,
+            "POST",
+            &format!("/Items/{ITEM_ID}/Images/Backdrop/{index}"),
+            Some(("image/png", "aGk=")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(s.providers.saved.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]
