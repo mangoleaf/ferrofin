@@ -495,6 +495,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_artwork_destinations(&api, library, &mut options, id, &media).await;
     verify_indexed_artwork_deletion(&api, id).await;
     verify_replaced_artwork_cleanup_failure(&api, id).await;
+    verify_backdrop_reorder_swaps_the_files(&api, id).await;
     verify_indexed_artwork_upload(&api, id).await;
     verify_screenshot_replacement(&api, id).await;
     verify_similarity_selection(&api, library, &mut options, id, &media, &requests).await;
@@ -1269,6 +1270,74 @@ async fn verify_replaced_artwork_cleanup_failure(api: &Api, id: &str) {
     assert!(std::path::Path::new(&after).is_file());
     assert!(stuck.join("keep").is_file(), "the undeletable file remains");
     std::fs::remove_dir_all(&stuck).unwrap();
+}
+
+/// `BaseItem.SwapImagesAsync` exchanges the two backdrop FILES; each slot keeps
+/// its path, and what is served at an index follows the new order.
+async fn verify_backdrop_reorder_swaps_the_files(api: &Api, id: &str) {
+    const RED: &str = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGP4z8AARwzEcQCukw/x0F8jngAAAABJRU5ErkJggg==";
+    const BLUE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGNgYPiPhIjiAACOsw/xs6MvMwAAAABJRU5ErkJggg==";
+    let endpoint = format!("/Items/{id}/Images");
+    let paths = |images: Value| -> Vec<String> {
+        images
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|image| image["ImageType"] == "Backdrop")
+            .map(|image| image["Path"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let before = paths(api.get(&endpoint).await);
+    for body in [RED, BLUE] {
+        let response = api
+            .client
+            .post(format!("{}{endpoint}/Backdrop", api.base))
+            .header("Authorization", &api.auth)
+            .header("Content-Type", "image/png")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
+    let after = paths(api.get(&endpoint).await);
+    let (first, second) = (after.len() - 2, after.len() - 1);
+    assert_eq!(after.len(), before.len() + 2);
+    let bytes = |index: usize| std::fs::read(&after[index]).unwrap();
+    let (red_bytes, blue_bytes) = (bytes(first), bytes(second));
+    assert_ne!(red_bytes, blue_bytes);
+    let response = api
+        .client
+        .post(format!(
+            "{}{endpoint}/Backdrop/{first}/Index?newIndex={second}",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        paths(api.get(&endpoint).await),
+        after,
+        "slots keep their paths"
+    );
+    assert_eq!(bytes(first), blue_bytes);
+    assert_eq!(bytes(second), red_bytes);
+    let served = api
+        .client
+        .get(format!(
+            "{}{endpoint}/Backdrop/{first}?format=Original",
+            api.base
+        ))
+        .header("Authorization", &api.auth)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(served.as_ref(), blue_bytes.as_slice());
 }
 
 async fn verify_indexed_artwork_deletion(api: &Api, id: &str) {

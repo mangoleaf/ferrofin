@@ -430,26 +430,27 @@ pub trait ItemRepository: Send + Sync {
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
-    /// Port of the persistence side of `BaseItem.SwapImagesAsync`: C# swaps the
-    /// on-disk files backing the two rows and clears their cached dimensions;
-    /// against the stored image rows the equivalent is to exchange the two rows'
-    /// `Path` (and reset `Width`/`Height` to `0` and stamp `DateModified`), so the
-    /// image that was at `index1` now resolves at `index2` and vice versa.
+    /// Port of `BaseItem.SwapImagesAsync`: exchanges the **contents** of the two
+    /// image files (each row keeps its path), then clears the rows' cached
+    /// dimensions and blur hash and re-reads their modified times from the
+    /// files, so the image that was at `index1` is now served at `index2` and
+    /// vice versa.
     ///
     /// Indices are `0`-based positions **within** the `image_type` group, in the
     /// same order [`get_image_infos`](Self::get_image_infos) returns. When either
     /// index is out of range the swap is a no-op (mirroring C#'s "nothing to do"
-    /// when `GetImageInfo` returns `null`).
+    /// when `GetImageInfo` returns `null`); so is a slot against itself, whose
+    /// file copy onto itself would throw upstream.
+    ///
+    /// Returns whether the two files were swapped — the only case in which
+    /// upstream reaches its repository save. A missing slot, or a non-local
+    /// (remote) path on either side, is "nothing to do".
     ///
     /// # Errors
     ///
-    /// Returns whether the two rows were swapped. Upstream reaches its repository
-    /// save only then: a missing slot, or a non-local (remote) path on either
-    /// side, is "nothing to do".
-    ///
-    /// # Errors
-    ///
-    /// [`ServiceError::Backend`] on a storage failure.
+    /// [`ServiceError::Backend`] when a file cannot be exchanged (missing, not
+    /// writable) — the rows and the other file are left as they were — or on a
+    /// storage failure.
     async fn swap_item_images(
         &self,
         item_id: Uuid,

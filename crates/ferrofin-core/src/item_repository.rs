@@ -2770,6 +2770,22 @@ async fn folder_preference(
     guid_preference(user_db.pool(), &user.id, kind).await
 }
 
+/// `ManagedFileSystem.SwapFiles`: exchanges the contents of two files through a
+/// temporary copy of the first. A failure part-way restores the first file.
+fn swap_image_files(first: &std::path::Path, second: &std::path::Path) -> std::io::Result<()> {
+    let temp = first.with_file_name(format!(".ferrofin-swap-{}", Uuid::new_v4().simple()));
+    std::fs::copy(first, &temp)?;
+    let result = std::fs::copy(second, first)
+        .and_then(|_| std::fs::rename(&temp, second))
+        .inspect_err(|_| {
+            // Put the first file back; the temporary copy is its only other
+            // holder of the original content.
+            let _ = std::fs::copy(&temp, first);
+        });
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
 /// `!ItemImageInfo.IsLocalFile`: upstream's case-insensitive `StartsWith("http")`.
 fn is_remote_image_path(path: &str) -> bool {
     path.get(..4)
@@ -3189,34 +3205,41 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(false);
         }
 
-        // C# swaps the two on-disk files and clears the cached dimensions. The
-        // portable equivalent over stored rows is to exchange the two rows' paths
-        // (so the image previously at index1 now resolves at index2) and reset
-        // Width/Height to the "unknown" sentinel, stamping DateModified.
-        let now = datetime_to_db(Utc::now());
+        // The same file under two rows (or one slot against itself) has nothing
+        // to exchange; upstream's copy onto itself would throw.
+        if first.path == second.path {
+            return Ok(false);
+        }
+        // `SwapImagesAsync` swaps the CONTENTS of the two files — the rows keep
+        // their paths — and then clears the cached dimensions and re-reads each
+        // modified time from its file.
+        let (path1, path2) = (first.path.clone(), second.path.clone());
+        let modified = tokio::task::spawn_blocking(move || {
+            swap_image_files(std::path::Path::new(&path1), std::path::Path::new(&path2))?;
+            let stamp = |path: &str| {
+                std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .map_or_else(|_| Utc::now(), chrono::DateTime::<Utc>::from)
+            };
+            Ok::<_, std::io::Error>((stamp(&path1), stamp(&path2)))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(error.to_string()))?
+        .map_err(|error| ServiceError::backend(format!("swap image files: {error}")))?;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(
-            r#"UPDATE "BaseItemImageInfos"
-                SET "Path" = ?2, "Width" = 0, "Height" = 0, "DateModified" = ?3
-                WHERE "Id" = ?1"#,
-        )
-        .bind(&first.id)
-        .bind(&second.path)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        sqlx::query(
-            r#"UPDATE "BaseItemImageInfos"
-                SET "Path" = ?2, "Width" = 0, "Height" = 0, "DateModified" = ?3
-                WHERE "Id" = ?1"#,
-        )
-        .bind(&second.id)
-        .bind(&first.path)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+        for (row, modified) in [(first, modified.0), (second, modified.1)] {
+            // The blur hash described the old content, so it goes too.
+            sqlx::query(
+                r#"UPDATE "BaseItemImageInfos"
+                    SET "Width" = 0, "Height" = 0, "Blurhash" = NULL, "DateModified" = ?2
+                    WHERE "Id" = ?1"#,
+            )
+            .bind(&row.id)
+            .bind(datetime_to_db(modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(true)
     }
@@ -6018,20 +6041,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_item_images_reorders_two_backdrops() {
+    async fn swap_item_images_exchanges_the_files_and_keeps_the_rows() {
         let db = test_db().await;
         let repository = repo(&db);
         let item = Uuid::from_u128(0x9200);
         seed_named_item(&db, item, BaseItemKind::Movie, "Reorder Me").await;
+        let dir = tempfile::tempdir().unwrap();
 
-        // Three backdrops (type 2), addressed by index 0/1/2 in Id order.
-        for (n, path) in [(0u128, "/a.jpg"), (1, "/b.jpg"), (2, "/c.jpg")] {
+        // Three backdrops (type 2), addressed by index 0/1/2 in insertion order.
+        let paths: Vec<String> = ["a.jpg", "b.jpg", "c.jpg"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, name.to_uppercase()).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        for (n, path) in paths.iter().enumerate() {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                     ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
-                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+                    VALUES (?1, X'6162', NULL, 1080, 2, ?2, ?3, 1920)"#,
             )
-            .bind(guid_to_db(Uuid::from_u128(0x9210 + n)))
+            .bind(guid_to_db(Uuid::from_u128(0x9210 + n as u128)))
             .bind(guid_to_db(item))
             .bind(path)
             .execute(db.writer())
@@ -6039,7 +6071,7 @@ mod tests {
             .expect("insert backdrop");
         }
 
-        // Swap index 0 (/a.jpg) with index 2 (/c.jpg).
+        // Swap index 0 with index 2.
         assert!(
             repository
                 .swap_item_images(item, ImageType::Backdrop, 0, 2)
@@ -6047,17 +6079,29 @@ mod tests {
                 .expect("swap")
         );
 
+        // `SwapImagesAsync` swaps the FILES: each row keeps its path, the
+        // contents trade places, and no temporary copy is left behind.
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "C.JPG");
+        assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), "B.JPG");
+        assert_eq!(std::fs::read_to_string(&paths[2]).unwrap(), "A.JPG");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
         let images = repository.get_image_infos(item).await.expect("images");
-        assert_eq!(images.len(), 3);
-        // Paths are exchanged; the middle one is untouched. Dimensions of the two
-        // swapped rows are reset to the unknown sentinel (0), matching C#.
-        assert_eq!(images[0].path, "/c.jpg");
-        assert_eq!(images[0].width, 0);
-        assert_eq!(images[0].height, 0);
-        assert_eq!(images[1].path, "/b.jpg");
-        assert_eq!(images[1].width, 1920);
-        assert_eq!(images[2].path, "/a.jpg");
-        assert_eq!(images[2].width, 0);
+        assert_eq!(
+            images.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+            paths
+        );
+        // The two swapped rows lose their cached size and blur hash and take
+        // the file's modified time; the other is untouched.
+        for (index, swapped) in [(0, true), (1, false), (2, true)] {
+            assert_eq!(images[index].width, if swapped { 0 } else { 1920 });
+            assert_eq!(images[index].height, if swapped { 0 } else { 1080 });
+            assert_eq!(images[index].blur_hash.is_none(), swapped, "{index}");
+            let recent = (Utc::now() - images[index].date_modified)
+                .num_seconds()
+                .abs()
+                < 60;
+            assert_eq!(recent, swapped, "{index}");
+        }
     }
 
     #[tokio::test]
@@ -6066,40 +6110,73 @@ mod tests {
         let repository = repo(&db);
         let item = Uuid::from_u128(0x9300);
         seed_named_item(&db, item, BaseItemKind::Movie, "One Backdrop").await;
+        let dir = tempfile::tempdir().unwrap();
+        let only = dir.path().join("only.jpg");
+        std::fs::write(&only, "ONLY").unwrap();
         sqlx::query(
             r#"INSERT INTO "BaseItemImageInfos"
                 ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
-                VALUES (?1, NULL, NULL, 1080, 2, ?2, '/only.jpg', 1920)"#,
+                VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
         )
         .bind(guid_to_db(Uuid::from_u128(0x9310)))
         .bind(guid_to_db(item))
+        .bind(only.to_string_lossy().as_ref())
         .execute(db.writer())
         .await
         .expect("insert backdrop");
 
         // Index 5 does not exist — a faithful no-op, and the row is untouched.
-        assert!(
-            !repository
-                .swap_item_images(item, ImageType::Backdrop, 0, 5)
-                .await
-                .expect("noop swap")
-        );
+        // Neither does a slot swap with itself: upstream's copy onto the same
+        // file would throw, so nothing is exchanged or stamped.
+        for pair in [(0, 5), (5, 0), (-1, 0), (0, 0)] {
+            assert!(
+                !repository
+                    .swap_item_images(item, ImageType::Backdrop, pair.0, pair.1)
+                    .await
+                    .expect("noop swap"),
+                "{pair:?}"
+            );
+        }
         let images = repository.get_image_infos(item).await.expect("images");
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].path, "/only.jpg");
         assert_eq!(images[0].width, 1920);
-        // Upstream swaps a slot with itself like any other pair: dimensions
-        // reset and the repository save follows.
+        assert_eq!(std::fs::read_to_string(&only).unwrap(), "ONLY");
+    }
+
+    /// A row whose file is gone fails the swap, as `File.Copy` throws, and the
+    /// rows and the other file stay as they were.
+    #[tokio::test]
+    async fn swap_item_images_fails_cleanly_when_a_file_is_missing() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9350);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Broken").await;
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.jpg");
+        std::fs::write(&present, "PRESENT").unwrap();
+        for (n, path) in [(0_u128, &present), (1, &dir.path().join("gone.jpg"))] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+            )
+            .bind(guid_to_db(Uuid::from_u128(0x9360 + n)))
+            .bind(guid_to_db(item))
+            .bind(path.to_string_lossy().as_ref())
+            .execute(db.writer())
+            .await
+            .expect("insert backdrop");
+        }
         assert!(
             repository
-                .swap_item_images(item, ImageType::Backdrop, 0, 0)
+                .swap_item_images(item, ImageType::Backdrop, 0, 1)
                 .await
-                .expect("same-slot swap")
+                .is_err()
         );
-        assert_eq!(
-            repository.get_image_infos(item).await.expect("images")[0].width,
-            0
-        );
+        assert_eq!(std::fs::read_to_string(&present).unwrap(), "PRESENT");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let images = repository.get_image_infos(item).await.expect("images");
+        assert!(images.iter().all(|image| image.width == 1920));
     }
 
     #[tokio::test]

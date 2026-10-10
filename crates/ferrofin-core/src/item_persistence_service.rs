@@ -4397,18 +4397,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first_id, guid_to_db(Uuid::from_u128(2)));
-        repo.swap_item_images(item, ImageType::Backdrop, 0, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            repo.get_image_infos(item)
-                .await
-                .unwrap()
-                .iter()
-                .map(|image| image.path.as_str())
-                .collect::<Vec<_>>(),
-            ["third.png", "second.png", "new-first.png"]
-        );
     }
 
     #[tokio::test]

@@ -4596,7 +4596,11 @@ mod tests {
         let db = test_db().await;
         let item = Uuid::from_u128(0xA100);
         seed_named_item(&db, item, BaseItemKind::Movie, "Swappable").await;
-        for (n, path) in [(0u128, "/one.jpg"), (1, "/two.jpg")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (one, two) = (dir.path().join("one.jpg"), dir.path().join("two.jpg"));
+        std::fs::write(&one, "ONE").unwrap();
+        std::fs::write(&two, "TWO").unwrap();
+        for (n, path) in [(0u128, &one), (1, &two)] {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                     ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
@@ -4604,7 +4608,7 @@ mod tests {
             )
             .bind(ferrofin_db::store::guid_to_db(Uuid::from_u128(0xA110 + n)))
             .bind(ferrofin_db::store::guid_to_db(item))
-            .bind(path)
+            .bind(path.to_string_lossy().as_ref())
             .execute(db.writer())
             .await
             .expect("insert backdrop");
@@ -4619,12 +4623,17 @@ mod tests {
         assert!(matches!(err, ServiceError::InvalidInput(_)));
 
         // Backdrop is reorderable and the swap goes through to the repository.
-        mgr.swap_images(item, ImageType::Backdrop, 0, 1)
-            .await
-            .expect("swap");
+        assert!(
+            mgr.swap_images(item, ImageType::Backdrop, 0, 1)
+                .await
+                .expect("swap")
+        );
+        // The files trade contents; each slot keeps its path.
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "TWO");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "ONE");
         let images = mgr.get_item_images(item).await.expect("images");
-        assert_eq!(images[0].path, "/two.jpg");
-        assert_eq!(images[1].path, "/one.jpg");
+        assert_eq!(images[0].path, one.to_string_lossy());
+        assert_eq!(images[1].path, two.to_string_lossy());
     }
 
     #[tokio::test]
