@@ -26,7 +26,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
     FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, ItemRekey, ItemUserWeight,
-    LibraryLocations, LocalVersionGroup, StoredImageMetadata, StoredItemLinks, VersionPromotion,
+    LibraryLocations, LocalVersionGroup, PathlessSeasonRow, StoredImageMetadata, StoredItemLinks,
+    VersionPromotion,
 };
 use std::collections::HashMap;
 
@@ -1183,9 +1184,11 @@ impl FerrofinItemPersistenceService {
     /// the library scan's ownership-respecting variant. Both bind the same
     /// columns in the same order: [`written_columns`]'s, then the save time.
     ///
-    /// The scan's variants also bind `?74`, whether the row's path is a
-    /// directory ([`crate::item_data::path_is_directory`]), which clears a
-    /// stored `DateModified` (D2); `scan` says which statement `sql` is.
+    /// The scan's variants also bind `?74`, whether the row's
+    /// `DateModified` follows the save
+    /// ([`crate::item_data::date_modified_follows_save`]: a directory's,
+    /// which clears a stored one (D2), or a path-less item's); `scan` says
+    /// which statement `sql` is.
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
@@ -1203,7 +1206,7 @@ impl FerrofinItemPersistenceService {
         }
         query = query.bind(datetime_to_db(chrono::Utc::now()));
         if scan {
-            query = query.bind(crate::item_data::path_is_directory(item));
+            query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
         query.execute(self.db.writer()).await.map_err(db_err)?;
         Ok(())
@@ -1427,12 +1430,10 @@ pub(crate) fn scan_save_changes_row(
                 }
                 // A directory has none (D2): an older scan's stamp goes —
                 // a folder's, or a disc rip's (a `Video`, not a folder,
-                // whose path is the rip's directory). TODO(parity, open work
-                // item): a path-less virtual season is a folder upstream
-                // stamps with `UtcNow` once (`Folder.AddChild`) and keeps;
-                // Ferrofin stores none for it (and keys it differently,
-                // `SeriesMetadataService.cs:449-451`) — port both together.
-                "DateModified" if crate::item_data::path_is_directory(saved) => new,
+                // whose path is the rip's directory). A path-less item's
+                // (a season with no folder) is the one it was created with
+                // (`Folder.AddChild`), which the saved row carries over.
+                "DateModified" if crate::item_data::date_modified_follows_save(saved) => new,
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
                 // `locked_data_sql`: only the resolver's video fields move.
                 "Data" if stored.is_locked => {
@@ -2665,6 +2666,36 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             out.extend(path_rows(
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?,
             ));
+        }
+        Ok(Some(out))
+    }
+
+    async fn pathless_seasons(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<Option<Vec<PathlessSeasonRow>>, ServiceError> {
+        let mut out = Vec::new();
+        for chunk in series_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = pathless_seasons_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, (String, String, Option<i64>, Option<String>)>(
+                sqlx::AssertSqlSafe(sql.as_str()),
+            );
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            query = query.bind(stored_type_name(BaseItemKind::Season).unwrap_or_default());
+            for (id, series, index_number, name) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                if let (Ok(id), Ok(series_id)) = (Uuid::parse_str(&id), Uuid::parse_str(&series)) {
+                    out.push(PathlessSeasonRow {
+                        id,
+                        series_id,
+                        index_number,
+                        name,
+                    });
+                }
+            }
         }
         Ok(Some(out))
     }
@@ -4787,9 +4818,11 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 ///   never cleared (`coalesce(excluded, stored)`): the scan saves them from
 ///   the stored row or its stat, and a row it could not read, or a path it
 ///   could not stat, must not lose them — except the `DateModified` of a
-///   row whose path is a directory (a folder's, a disc rip's; bound as
-///   `?74`, [`crate::item_data::path_is_directory`]), which a directory never
-///   has (owner decision D2), so the stamp an older scan stored is cleared,
+///   row whose path is a directory (a folder's, a disc rip's), which a
+///   directory never has (owner decision D2), so the stamp an older scan
+///   stored is cleared, and of a path-less row, which no stat sets and the
+///   saved row carries as it is (bound as `?74`,
+///   [`crate::item_data::date_modified_follows_save`]),
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
@@ -5236,6 +5269,20 @@ pub(crate) fn path_prefix_range(root: &str) -> (String, String, String) {
 /// [`ItemPersistenceService::items_at_paths`] over `n` paths: a batched
 /// `FindByPath`, each path an equality seek on `IX_BaseItems_Path`;
 /// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
+/// [`ItemPersistenceService::pathless_seasons`] over `n` series ids (binds
+/// `?1..?n` the ids, `?{n+1}` the season type): by `ParentId`, which
+/// `IX_BaseItems_ParentId` serves; in id order, so the season a scan keeps
+/// of two with one number is the same every time.
+pub(crate) fn pathless_seasons_sql(n: usize) -> String {
+    format!(
+        r#"SELECT "Id", "ParentId", "IndexNumber", "Name" FROM "BaseItems"
+           WHERE "ParentId" IN ({}) AND "Type" = ?{} AND "Path" IS NULL
+           ORDER BY "Id""#,
+        numbered_placeholders(n),
+        n + 1
+    )
+}
+
 pub(crate) fn items_at_paths_sql(n: usize) -> String {
     format!(
         r#"SELECT "Id", "Type", "Path", "ParentId", "ExtraType" FROM "BaseItems" WHERE "Path" IN ({})"#,
@@ -8143,6 +8190,7 @@ mod tests {
             id: guid_to_db(id),
             type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
             name: Some("The Matrix".into()),
+            path: Some("/media/movies/The Matrix (1999).mkv".into()),
             overview: Some("A hacker learns the truth.".into()),
             community_rating: Some(8.2),
             // Nanosecond precision, as a stat reports it; the table keeps
@@ -8188,6 +8236,18 @@ mod tests {
             ..item.clone()
         };
         assert!(!super::scan_save_changes_row(&guarded, &stored, false));
+        // A path-less row's `DateModified` (a season with no folder) follows
+        // the save, `NULL` too: no stat sets it, the merge does.
+        let path_less = ferrofin_db::entities::base_items::BaseItemEntity {
+            path: None,
+            ..stored.clone()
+        };
+        let cleared = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_modified: None,
+            ..path_less.clone()
+        };
+        assert!(super::scan_save_changes_row(&cleared, &path_less, false));
+        assert!(!super::scan_save_changes_row(&path_less, &path_less, false));
         // The re-dating save writes the new DateCreated, and still never
         // clears it.
         assert!(super::scan_save_changes_row(&guarded, &stored, true));
@@ -8631,7 +8691,8 @@ mod tests {
                 "never-cleared guard missing for column {col}"
             );
         }
-        // …but a directory's `DateModified` follows the save (D2).
+        // …but a directory's `DateModified` follows the save (D2), and a
+        // path-less item's.
         assert!(sql.contains(
             r#""DateModified" = CASE WHEN ?74 THEN excluded."DateModified" ELSE coalesce(excluded."DateModified", "DateModified") END"#
         ));
@@ -8789,6 +8850,7 @@ mod tests {
         let fresh = Uuid::new_v4();
         let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(fresh),
+            path: Some("/media/fresh.mkv".to_owned()),
             ..item.clone()
         };
         svc.save_scanned_items(std::slice::from_ref(&row))

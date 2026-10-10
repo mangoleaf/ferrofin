@@ -28,7 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ferrofin_core::file_system::FerrofinFileSystem;
-use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
+use ferrofin_core::item_type_lookup::{
+    IdDerivation, ItemTypeLookup, derive_item_id, virtual_season_id,
+};
 use ferrofin_core::{
     FerrofinChapterRepository, FerrofinItemPersistenceService, FerrofinItemRepository,
     FerrofinMediaStreamRepository, FerrofinVirtualFolderManager, LibraryScanner, ScanOutcome,
@@ -366,6 +368,21 @@ fn id(kind: BaseItemKind, path: &Path) -> String {
     guid_to_db(derive_item_id(kind, &path.to_string_lossy()).expect("id"))
 }
 
+/// The id the scan gives season `n` of the series at `series` when the
+/// season has no folder of its own: keyed by the series, number and name
+/// (`SeriesMetadataService.CreateSeasonAsync`), under the derivation
+/// [`id`] uses.
+fn virtual_season(series: &Path, n: i32) -> String {
+    let series = derive_item_id(BaseItemKind::Series, &series.to_string_lossy()).expect("id");
+    let id = virtual_season_id(
+        &IdDerivation::LegacyLowercase,
+        series,
+        Some(n),
+        &format!("Season {n}"),
+    );
+    guid_to_db(id.expect("id"))
+}
+
 fn touch(path: &Path, file: &str) {
     std::fs::create_dir_all(path).expect("mkdir");
     std::fs::write(path.join(file), b"0123").expect("write");
@@ -652,7 +669,7 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     );
     assert_eq!(
         new_season[0],
-        id(BaseItemKind::Season, &series.join("#virtual-season-2")),
+        virtual_season(&series, 2),
         "the id the library scan derives"
     );
 
@@ -693,12 +710,7 @@ async fn removing_a_virtual_seasons_last_episode_prunes_the_season_too() {
         .scanned()
         .await;
     let series = media.join("Flat");
-    let season = |n: u32| {
-        id(
-            BaseItemKind::Season,
-            &series.join(format!("#virtual-season-{n}")),
-        )
-    };
+    let season = |n: i32| virtual_season(&series, n);
     let before = fx.rows().await;
     assert!(before.contains_key(&season(1)) && before.contains_key(&season(2)));
 
@@ -1389,7 +1401,7 @@ async fn a_kept_episode_keeps_its_virtual_season_and_series() {
         .await
         .scanned()
         .await;
-    let season = id(BaseItemKind::Season, &series.join("#virtual-season-1"));
+    let season = virtual_season(&series, 1);
     let elsewhere = id(
         BaseItemKind::Episode,
         &media.join("Elsewhere").join("Flat S01E02.mkv"),

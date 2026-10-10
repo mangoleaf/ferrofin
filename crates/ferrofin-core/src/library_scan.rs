@@ -60,7 +60,8 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
     ItemPathRow, ItemPersistenceService, ItemRekey, ItemRepository, ItemUserWeight,
-    LocalVersionGroup, MediaStreamRepository, StoredImageMetadata, StoredItemLinks,
+    LocalVersionGroup, MediaStreamRepository, PathlessSeasonRow, StoredImageMetadata,
+    StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
@@ -4429,6 +4430,62 @@ impl LibraryScanner {
         Ok((done, moves))
     }
 
+    /// Gives each planned season with no folder of its own the id of the
+    /// stored one its series already holds with its number, its episodes
+    /// following: upstream's `CreateSeasonsAsync` takes the series' existing
+    /// season of the number (`seasons.FirstOrDefault(i => i.IndexNumber ==
+    /// seasonNumber)`) and creates one — under
+    /// [`item_type_lookup::virtual_season_id`], the id the planner derives —
+    /// only where there is none (`SeriesMetadataService.cs:394-402`). So a
+    /// season keeps its id whatever name it was created with (another UI
+    /// language, another `SeasonZeroDisplayName`).
+    ///
+    /// Only a stored path-less season is taken, and only one no planned
+    /// item already is, the first by id where two share a number: a season
+    /// folder is planned as its own season, so — unlike upstream, which
+    /// files a loose episode under a season folder of its number — its
+    /// number's loose episodes keep a season of their own.
+    async fn reuse_stored_season_ids(&self, planned: &mut [Planned]) -> Result<(), ServiceError> {
+        let season_type = item_type_lookup::stored_type_name(BaseItemKind::Season);
+        let virtual_seasons: Vec<(Uuid, Uuid, Option<i64>)> = planned
+            .iter()
+            .filter(|p| p.entity.path.is_none() && Some(p.entity.type_.as_str()) == season_type)
+            .filter_map(|p| {
+                let series = p.entity.parent_id.as_deref().and_then(parse_id)?;
+                Some((p.id, series, p.entity.index_number))
+            })
+            .collect();
+        if virtual_seasons.is_empty() {
+            return Ok(());
+        }
+        let mut series: Vec<Uuid> = virtual_seasons.iter().map(|&(_, s, _)| s).collect();
+        series.sort_unstable();
+        series.dedup();
+        let Some(stored) = self.persistence.pathless_seasons(&series).await? else {
+            return Ok(());
+        };
+        let planned_ids: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
+        let stored_ids: std::collections::HashSet<Uuid> = stored.iter().map(|row| row.id).collect();
+        let mut by_number: HashMap<(Uuid, Option<i64>), &PathlessSeasonRow> = HashMap::new();
+        for row in stored.iter().filter(|row| !planned_ids.contains(&row.id)) {
+            by_number
+                .entry((row.series_id, row.index_number))
+                .or_insert(row);
+        }
+        let ids: HashMap<Uuid, (Uuid, Option<&str>)> = virtual_seasons
+            .into_iter()
+            .filter(|(id, ..)| !stored_ids.contains(id))
+            .filter_map(|(id, series, number)| {
+                let row = by_number.get(&(series, number))?;
+                Some((id, (row.id, row.name.as_deref())))
+            })
+            .collect();
+        if !ids.is_empty() {
+            repoint_planned(planned, &ids);
+        }
+        Ok(())
+    }
+
     /// [`item_folders::move_item_folders`] under this scanner's art root and
     /// path manager.
     fn move_item_folders(
@@ -4786,6 +4843,9 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
+        // Before anything reads the planned ids: a season with no folder
+        // keeps the id its series already holds it under.
+        self.reuse_stored_season_ids(&mut planned).await?;
         // First, so the extra and owner reuse below sees the moved rows.
         let (mut moved, unmade) = self
             .rekey_changed_kinds(&planned, folders, key_folders)
@@ -12274,22 +12334,30 @@ impl LibraryScanner {
             if season_ids.contains_key(&num) {
                 continue;
             }
-            let name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
-            // A flat series has no season folder, so derive a stable id from a
-            // synthetic path (unique per series+season) and leave the season's own
-            // path unset (it is a virtual grouping, not an on-disk folder).
-            let synthetic = format!("{series_dir}/#virtual-season-{}", num.unwrap_or(-1));
-            let Some((season_id, mut e)) = self.base_item(
+            let name = virtual_season_name(num);
+            // A season with no folder is keyed by its series, number and name
+            // (`SeriesMetadataService.CreateSeasonAsync`), and has no path.
+            // A stored one of the series with its number keeps its own id
+            // ([`LibraryScanner::reuse_stored_season_ids`]).
+            let Some(season_id) =
+                item_type_lookup::virtual_season_id(&self.id_derivation, series_id, num, &name)
+            else {
+                continue;
+            };
+            // Resolved over the series folder, a directory: no file times,
+            // created now under either "Date added" rule (`Folder.AddChild`).
+            let Some((_, mut e)) = self.base_item(
                 ctx,
                 BaseItemKind::Season,
                 cf,
                 series_id,
                 name,
-                &synthetic,
+                series_dir,
                 true,
             ) else {
                 continue;
             };
+            e.id = guid_to_db(season_id);
             e.path = None;
             e.index_number = num.map(i64::from);
             e.sort_name = Some(season_sort_name(
@@ -12312,7 +12380,7 @@ impl LibraryScanner {
 
         for (path, num) in resolved {
             let season = season_ids.get(&num).map(|&sid| (sid, num));
-            let season_name = num.map_or_else(|| "Season Unknown".to_owned(), season_display_name);
+            let season_name = virtual_season_name(num);
             let home = EpisodeHome {
                 cf,
                 series_id,
@@ -15583,6 +15651,19 @@ impl MergeMode {
         merges: true,
     };
 
+    /// Whether the pass clears a path-less item's `DateModified`, which no
+    /// stat restores: `MergeBaseItemData` takes the provider result's
+    /// (`MinValue`, which no provider sets, and which the "add existing
+    /// metadata" merge does not fill: it merges no settings) when the result
+    /// is merged at all (`refreshResult.UpdateType > None`) with
+    /// `replaceData` (`MetadataService.cs:895-917`, `:1386-1389`). So a
+    /// season whose remote providers answered a Default refresh has none,
+    /// and one nothing answered keeps `Folder.AddChild`'s stamp — as a real
+    /// Jellyfin 12.1 database's path-less seasons do.
+    fn clears_date_modified(self) -> bool {
+        self.merges && self.replace
+    }
+
     /// The merge of a pass that runs its remote providers only because a
     /// D2 backfill heuristic asked ([`LibraryScanner::wants_backfill`]):
     /// "Search for missing metadata"'s — `FullRefresh` without
@@ -15886,6 +15967,15 @@ fn saved_row(
     } else {
         let mut row = scanned.clone();
         guesses.fill(&mut row);
+        // `Folder.AddChild` stamps a new child's unset `DateModified` with
+        // the `UtcNow` of its `DateCreated`. A path-less one (a season with
+        // no folder) keeps it — no save restats it, where a file's or a
+        // folder's is its stat's — unless its first refresh's provider
+        // result replaces it ([`MergeMode::clears_date_modified`]).
+        if is_path_less(&row) && row.date_modified.is_none() && !facts.merge.clears_date_modified()
+        {
+            row.date_modified = row.date_created;
+        }
         row
     };
     settle_sort_name(&mut row);
@@ -16092,9 +16182,24 @@ fn merge_onto_stored(
             },
         )
         .item;
+        if is_path_less(scanned) {
+            row.date_modified = if merge.clears_date_modified() {
+                None
+            } else {
+                stored.date_modified
+            };
+        }
     }
     overlay_file_facts(&mut row, scanned, probe_ran);
     row
+}
+
+/// Whether `item` has no path (a season with no folder of its own): no
+/// save restats it (`SaveInternal` reads only a file-protocol path), so
+/// its `DateModified` is the one it was created with
+/// ([`MergeMode::clears_date_modified`]).
+fn is_path_less(item: &BaseItemEntity) -> bool {
+    item.path.as_deref().is_none_or(str::is_empty)
 }
 
 /// Lays what this scan read off the filesystem over the saved row: the
@@ -16156,6 +16261,9 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
         // A directory — a folder's, a disc rip's — has no `DateModified`
         // (D2): one an older scan stored goes on the next save.
         row.date_modified = None;
+    } else if is_path_less(scanned) {
+        // A path-less item (a season with no folder) is never restatted:
+        // its `DateModified` is the merge's ([`merge_onto_stored`]).
     } else if scanned.date_modified.is_some() {
         row.date_modified = scanned.date_modified;
     }
@@ -17218,6 +17326,39 @@ fn folder_name(dir: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Gives the planned seasons of `ids`' keys the stored season each maps to
+/// — its id and name — and every planned item naming one (as its parent,
+/// its season or an ancestor) the stored id; an episode of it takes the
+/// stored season's name as its `SeasonName` (`episode.SeasonName =
+/// season.Name`, `SeriesMetadataService.cs:425-426`)
+/// ([`LibraryScanner::reuse_stored_season_ids`]).
+fn repoint_planned(planned: &mut [Planned], ids: &HashMap<Uuid, (Uuid, Option<&str>)>) {
+    let stored = |field: Option<&str>| field.and_then(parse_id).and_then(|id| ids.get(&id));
+    for item in planned {
+        if let Some(&(new, name)) = ids.get(&item.id) {
+            item.id = new;
+            item.entity.id = guid_to_db(new);
+            if let Some(name) = name {
+                item.entity.name = Some(name.to_owned());
+            }
+        }
+        if let Some(&(new, _)) = stored(item.entity.parent_id.as_deref()) {
+            item.entity.parent_id = Some(guid_to_db(new));
+        }
+        if let Some(&(new, name)) = stored(item.entity.season_id.as_deref()) {
+            item.entity.season_id = Some(guid_to_db(new));
+            if let Some(name) = name {
+                item.entity.season_name = Some(name.to_owned());
+            }
+        }
+        for ancestor in &mut item.ancestors {
+            if let Some(&(new, _)) = ids.get(ancestor) {
+                *ancestor = new;
+            }
+        }
+    }
+}
+
 /// The display name for a season number — `0` is "Specials" (Jellyfin's
 /// convention for extras/specials), every other number is "Season N".
 fn season_display_name(number: i32) -> String {
@@ -17226,6 +17367,14 @@ fn season_display_name(number: i32) -> String {
     } else {
         format!("Season {number}")
     }
+}
+
+/// The name a season with no folder of its own is created with, and keyed by
+/// ([`item_type_lookup::virtual_season_id`]) — `SeriesMetadataService.
+/// GetValidSeasonNameForSeries(series, null, number)`: "Season Unknown" for
+/// no number, else [`season_display_name`].
+pub(crate) fn virtual_season_name(number: Option<i32>) -> String {
+    number.map_or_else(|| "Season Unknown".to_owned(), season_display_name)
 }
 
 fn image_item_kind(type_: &str) -> ImageItemKind {
@@ -22717,6 +22866,74 @@ mod tests {
                 redated: None,
             },
         )
+    }
+
+    /// A season with no folder keeps the `DateModified` `Folder.AddChild`
+    /// stamped (no save restats it) until a pass's provider result is
+    /// merged over it with `replaceData` — then it has none, as upstream's
+    /// `MergeBaseItemData` takes the result's `MinValue`: a Default scan a
+    /// remote provider answered, or "Replace all metadata". A pass nothing
+    /// answered, or "Search for missing metadata", keeps it; so does a new
+    /// season nothing answered.
+    #[rstest::rstest]
+    #[case::scan_unanswered("scan", false, true)]
+    #[case::scan_answered("scan", true, false)]
+    #[case::missing_answered("missing", true, true)]
+    #[case::replace_answered("replace", true, false)]
+    #[case::replace_unanswered("replace", false, true)]
+    fn a_path_less_seasons_date_modified_goes_only_with_a_replacing_merge(
+        #[case] choice: &str,
+        #[case] answered: bool,
+        #[case] kept: bool,
+    ) {
+        use chrono::TimeZone as _;
+        let stamp = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 29, 10, 1, 56)
+            .unwrap();
+        let planned = BaseItemEntity {
+            id: "5D4284B7-8FBC-069E-80C2-644AED45F8B1".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some("Season 1".into()),
+            index_number: Some(1),
+            is_folder: true,
+            path: None,
+            date_created: Some(stamp + chrono::TimeDelta::days(30)),
+            ..BaseItemEntity::default()
+        };
+        let stored = BaseItemEntity {
+            date_created: Some(stamp),
+            date_modified: Some(stamp),
+            date_last_refreshed: Some(stamp),
+            ..planned.clone()
+        };
+        let options = dashboard(choice);
+        let saved = save_in_mode(
+            Some(&stored),
+            &planned,
+            |_, _| {},
+            &[],
+            false,
+            &options,
+            false,
+            answered,
+        );
+        assert_eq!(saved.date_modified, kept.then_some(stamp));
+        // A new season: the creation's stamp, unless its first pass's
+        // result replaced it.
+        let saved = save_in_mode(
+            None,
+            &planned,
+            |_, _| {},
+            &[],
+            false,
+            &options,
+            false,
+            answered,
+        );
+        assert_eq!(
+            saved.date_modified,
+            kept.then_some(planned.date_created).flatten()
+        );
     }
 
     /// The three dashboard choices as the item-refresh route builds them.

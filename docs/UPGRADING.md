@@ -80,11 +80,20 @@ Still open in this release:
 - The first scan of an adopted Jellyfin database still rewrites three kinds of item: music
   albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
   album's `folder.jpg`; music artists, whose running time Ferrofin sums from their tracks
-  where Jellyfin stored 0; and the seasons Jellyfin made for episodes that are not in a
-  season folder. Ferrofin derives those seasons' ids differently, so the scan replaces
-  each such season with a new one and saves and refreshes its episodes once (on a
-  Jellyfin 10.11.8 test library, 591 seasons and about 8,700 episodes). See the next
-  entry.
+  where Jellyfin stored 0; and the episodes that are not in a season folder. The
+  seasons Jellyfin made for those episodes keep their ids (and their watch state,
+  images and dates), but Ferrofin files such an episode under its season where
+  Jellyfin files it under the series, so the scan saves each of those episodes once
+  (on a Jellyfin 12.1 test library, about 8,700 episodes under 591 seasons). See the
+  next entry.
+- Seasons with no folder of their own now take the ids Jellyfin gives them (from the
+  series, the season number and the season's name). On a database an earlier Ferrofin
+  scanned, the first start after upgrading moves each such season to its new id, with
+  its watch state, images and episodes, after copying the database to
+  `jellyfin.db.pre-season-ids`. Ferrofin names a new season "Season N", "Specials" or
+  "Season Unknown" whatever the server's language or the library's season-zero
+  display name (`SeasonZeroDisplayName`), so a season Jellyfin created under another
+  name keeps its id, but a new one gets the English name and the id that name gives.
 
 ## Unreleased — the first scan after upgrading stores items as Jellyfin does
 

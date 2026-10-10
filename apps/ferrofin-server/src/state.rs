@@ -654,6 +654,16 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to re-home local alternate versions")?;
+    // Likewise: a season with no folder an older Ferrofin scan keyed by a
+    // synthetic path takes the id Jellyfin keys it by.
+    ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
+        db,
+        &id_derivation,
+        Some(metadata_library.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await
+    .context("failed to re-key seasons with no folder")?;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>

@@ -31,9 +31,10 @@ use crate::item_persistence_service::{
     move_user_data, rekey_rows, user_weights,
 };
 use crate::item_type_lookup::{
-    IdDerivation, derive_item_id_with, kind_from_type_name, stored_type_name,
+    IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
+    stored_type_name, virtual_season_id,
 };
-use crate::library_scan::rekey_source;
+use crate::library_scan::{rekey_source, virtual_season_name};
 use ferrofin_traits::persistence::ItemPersistenceService;
 
 /// `LinkedChildType::LocalAlternateVersion`.
@@ -1012,6 +1013,145 @@ pub async fn run_rehome_local_versions(
             versions = rehomed.versions,
             parts = rehomed.parts,
             "gave local alternate versions and stacked parts their owner's shape"
+        );
+    }
+    Ok(())
+}
+
+/// The extension of the database snapshot [`rekey_virtual_seasons`] takes
+/// (`jellyfin.db.pre-season-ids`).
+const SEASON_SNAPSHOT_EXTENSION: &str = "db.pre-season-ids";
+
+/// Moves every season with no folder of its own that an older Ferrofin scan
+/// keyed by the synthetic path `{series folder}/#virtual-season-{n}`
+/// ([`legacy_virtual_season_id`]) to the id Jellyfin keys it by — its
+/// series, number and name ([`virtual_season_id`],
+/// `SeriesMetadataService.CreateSeasonAsync`, `SeriesMetadataService.cs:
+/// 449-453`), which the scan now plans for it. The scan's re-key moves it
+/// ([`rekey_rows`]): its user data, images, provider ids and locked fields,
+/// its episodes' `ParentId` and `SeasonId`, the ancestors naming it and the
+/// Intro Skipper's season state follow, and so do its folders named after
+/// the id ([`move_item_folders`]). Only its id changes, not what it is
+/// ([`RekeyKind::Represented`]: its refresh stamp stays).
+///
+/// A season stored under any other id — Jellyfin's own, whatever name it
+/// was created with — is left alone, as is one whose new id is already
+/// stored; the scan keeps a series' stored season of a number either way
+/// (`LibraryScanner::reuse_stored_season_ids`). Runs once; a move that
+/// fails is undone and the repair runs again on the next boot.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub async fn rekey_virtual_seasons(
+    db: &Database,
+    derivation: &IdDerivation,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    const KEY: &str = "virtual_season_ids_v12";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let season_type = stored_type_name(BaseItemKind::Season).unwrap_or_default();
+    let rows: Vec<(String, String, Option<i64>, String)> = sqlx::query_as(
+        r#"SELECT s."Id", s."ParentId", s."IndexNumber", p."Path"
+           FROM "BaseItems" s JOIN "BaseItems" p ON p."Id" = s."ParentId"
+           WHERE s."Type" = ?1 AND s."Path" IS NULL AND p."Path" IS NOT NULL"#,
+    )
+    .bind(season_type)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut targets: Vec<(Uuid, Uuid)> = Vec::new();
+    for (id, series, number, series_path) in rows {
+        let (Ok(from), Ok(series_id)) = (Uuid::parse_str(&id), Uuid::parse_str(&series)) else {
+            continue;
+        };
+        if legacy_virtual_season_id(derivation, &series_path, number) != Some(from) {
+            continue;
+        }
+        let Ok(number) = number.map(i32::try_from).transpose() else {
+            continue;
+        };
+        let name = virtual_season_name(number);
+        let Some(to) = virtual_season_id(derivation, series_id, number, &name) else {
+            continue;
+        };
+        if to != from && !stored(db, to).await? {
+            targets.push((from, to));
+        }
+    }
+    if targets.is_empty() {
+        done(db, KEY).await?;
+        return Ok(0);
+    }
+    // It rewrites rows users made something of: the file as it was goes
+    // aside first, as before a table-rebuilding migration.
+    if let Some(backup) = db
+        .snapshot_once(SEASON_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before re-keying seasons with no folder"
+        );
+    }
+    let mut moves: Vec<ItemRekey> = Vec::with_capacity(targets.len());
+    let mut renamed: Vec<(Uuid, MovedFolders)> = Vec::with_capacity(targets.len());
+    for (from, to) in targets {
+        // A season with no folder has no media path (its trickplay folder,
+        // which one never has, is the internal one).
+        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        renamed.push((to, folders));
+        moves.push(ItemRekey {
+            from,
+            to,
+            type_name: season_type.to_owned(),
+            dirs,
+            merged: Vec::new(),
+            extra: false,
+        });
+    }
+    let made: BTreeSet<Uuid> = match rekey_rows(db, &moves, RekeyKind::Represented).await {
+        Ok(done) => done.iter().map(|m| m.to).collect(),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "could not re-key seasons with no folder; they keep their ids, \
+                 and the repair runs again on the next boot"
+            );
+            BTreeSet::new()
+        }
+    };
+    for (to, folders) in renamed {
+        if made.contains(&to) {
+            folders.commit();
+        } else {
+            folders.undo();
+        }
+    }
+    if made.len() == moves.len() {
+        done(db, KEY).await?;
+    }
+    Ok(made.len())
+}
+
+/// [`rekey_virtual_seasons`] and its log line, for the composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the repair's queries fail.
+pub async fn run_rekey_virtual_seasons(
+    db: &Database,
+    derivation: &IdDerivation,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<(), ServiceError> {
+    let moved = rekey_virtual_seasons(db, derivation, art_root, path_manager).await?;
+    if moved > 0 {
+        tracing::info!(
+            items = moved,
+            "re-keyed seasons with no folder to their series, number and name"
         );
     }
     Ok(())

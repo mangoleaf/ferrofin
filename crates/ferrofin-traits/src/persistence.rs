@@ -975,6 +975,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
+    /// The stored seasons with no path (no folder of their own) whose
+    /// `ParentId` is one of `series_ids` — the seasons a series' episodes
+    /// with no season folder are grouped into, which the library scan keeps
+    /// by series and number (`SeriesMetadataService.CreateSeasonsAsync`).
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then plans each season's derived id.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn pathless_seasons(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<Option<Vec<PathlessSeasonRow>>, ServiceError> {
+        let _ = series_ids;
+        Ok(None)
+    }
+
     /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
     /// carry: the folders of its locations its `PhysicalFolderIds` names,
     /// which is what Jellyfin and Ferrofin write (`BaseItem.GetTopParent`:
@@ -1927,6 +1946,20 @@ pub struct ItemPathRow {
     /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
     /// for nothing else — an owned part or alternate version has none.
     pub extra_type: Option<i32>,
+}
+
+/// One stored season with no folder of its own
+/// ([`ItemPersistenceService::pathless_seasons`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathlessSeasonRow {
+    /// The season's id.
+    pub id: Uuid,
+    /// Its `ParentId`: the series it belongs to.
+    pub series_id: Uuid,
+    /// Its `IndexNumber`, the season number (`None`: "Season Unknown").
+    pub index_number: Option<i64>,
+    /// Its `Name`, which its episodes carry as their `SeasonName`.
+    pub name: Option<String>,
 }
 
 /// One library's media locations and the scanner generation that last

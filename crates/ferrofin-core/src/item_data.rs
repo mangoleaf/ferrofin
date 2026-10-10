@@ -469,10 +469,27 @@ pub fn is_disc_folder(data: Option<&str>) -> bool {
 /// (`BaseItem.IsFolder`, `BaseItem.cs:803`), whose path is the rip's
 /// directory all the same. A directory has no `DateModified` (owner
 /// decision D2: `GetFileSystemMetadata` fills no times for one, and its
-/// `MinValue` is stored as `NULL`).
+/// `MinValue` is stored as `NULL`). An item with no path names none: a
+/// path-less folder (a season with no folder of its own) keeps the
+/// `DateModified` it was created with, which no save restats
+/// (`SaveInternal` reads only a file-protocol path).
 #[must_use]
 pub fn path_is_directory(item: &ferrofin_db::entities::base_items::BaseItemEntity) -> bool {
-    item.is_folder || is_disc_folder(item.data.as_deref())
+    item.path.as_deref().is_some_and(|p| !p.is_empty())
+        && (item.is_folder || is_disc_folder(item.data.as_deref()))
+}
+
+/// Whether the library scan's save writes `item`'s `DateModified` as the
+/// saved row carries it, `NULL` too, rather than keeping a stored one over a
+/// `NULL`: a directory's (it has none, [`path_is_directory`]), and a
+/// path-less item's — no stat ever sets it, so the saved row's is the
+/// stored one, `Folder.AddChild`'s stamp on a new row, or none after a
+/// replace (`MergeBaseItemData` takes the provider result's `MinValue`).
+#[must_use]
+pub fn date_modified_follows_save(
+    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+) -> bool {
+    path_is_directory(item) || item.path.as_deref().is_none_or(str::is_empty)
 }
 
 /// Reads one `Data` field as a string.
@@ -1370,8 +1387,23 @@ mod tests {
         let item = ferrofin_db::entities::base_items::BaseItemEntity {
             is_folder,
             data: data.map(str::to_owned),
+            path: Some("/media/item".to_owned()),
             ..Default::default()
         };
         assert_eq!(super::path_is_directory(&item), expected);
+    }
+
+    /// A folder with no path (a season with no folder of its own) names no
+    /// directory: it keeps the `DateModified` it was created with.
+    #[rstest::rstest]
+    #[case::no_path(None)]
+    #[case::empty_path(Some(""))]
+    fn a_path_less_folder_names_no_directory(#[case] path: Option<&str>) {
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            is_folder: true,
+            path: path.map(str::to_owned),
+            ..Default::default()
+        };
+        assert!(!super::path_is_directory(&item));
     }
 }

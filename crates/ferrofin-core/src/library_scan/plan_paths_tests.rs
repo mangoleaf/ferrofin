@@ -260,9 +260,12 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
         .into_iter()
         .map(|p| {
             let mut entity = p.entity;
-            // A directory — a folder's, a disc rip's — is stamped with the
-            // resolve time.
-            if crate::item_data::path_is_directory(&entity) {
+            // A directory — a folder's, a disc rip's — and a path-less
+            // folder (a season with no folder) are stamped with the resolve
+            // time.
+            if crate::item_data::path_is_directory(&entity)
+                || (entity.is_folder && entity.path.is_none())
+            {
                 entity.date_created = None;
             }
             (p.id, p.ancestors, entity)
