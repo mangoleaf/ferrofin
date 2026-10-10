@@ -28,7 +28,8 @@ The first targeted run caught an incorrect test fingerprint (`af` first);
 the captured full catalog correctly starts with `ab`. Its corrected rerun
 and the original failure remain in the evidence directory.
 
-Final shared validation is recorded with S16 after this two-finding batch.
+Final shared workspace and fresh core coverage gates passed for both findings;
+measured results are recorded in [the S16 review](dashboard-settings-s16.md).
 
 The corrected targeted run passed 75 tests, and the production build and
 three native phases passed. Median request elapsed time across ten local

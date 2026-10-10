@@ -68,6 +68,10 @@ pub struct SubtitleSearchRequest {
     pub parent_index_number: Option<i32>,
     /// The episode number, for episodes.
     pub index_number: Option<i32>,
+    /// The last episode number when a video contains an episode range.
+    pub index_number_end: Option<i32>,
+    /// All external provider IDs recorded for the item, retaining their keys.
+    pub provider_ids: std::collections::HashMap<String, String>,
     /// The item's runtime, in ticks (helps rank matches).
     pub runtime_ticks: Option<i64>,
     /// The on-disk media path (enables hash-based matching).

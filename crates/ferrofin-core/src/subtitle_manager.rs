@@ -112,6 +112,32 @@ impl FerrofinSubtitleManager {
             request.parent_index_number =
                 item.parent_index_number.and_then(|n| i32::try_from(n).ok());
             request.index_number = item.index_number.and_then(|n| i32::try_from(n).ok());
+            request.runtime_ticks = item.run_time_ticks;
+            request.index_number_end = if content_type == SubtitleMediaType::Episode {
+                crate::item_data::parse_data(item.data.as_deref())
+                    .get("IndexNumberEnd")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|number| i32::try_from(number).ok())
+            } else {
+                None
+            };
+            request.provider_ids = self
+                .db
+                .provider_ids_for_items(&[guid_to_db(request.item_id)])
+                .await
+                .map_err(ServiceError::from)?
+                .into_iter()
+                .map(|(_, key, value)| (key, value))
+                .collect();
+            // The built-in OpenSubtitles REST adapter consumes this convenience
+            // field; plugins receive the complete upstream ProviderIds map.
+            request.imdb_id = request
+                .provider_ids
+                .iter()
+                .find(|(key, _)| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(key, "Imdb")
+                })
+                .map(|(_, value)| value.clone());
             request.media_path = item.path;
         }
         Ok(true)
@@ -601,6 +627,114 @@ mod tests {
             .expect("search");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id.as_deref(), Some("fake_42"));
+    }
+
+    struct CapturingProvider(Arc<std::sync::Mutex<Vec<SubtitleSearchRequest>>>);
+
+    #[async_trait]
+    impl SubtitleProvider for CapturingProvider {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+        async fn search(
+            &self,
+            request: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            self.0.lock().unwrap().push(request.clone());
+            Ok(vec![RemoteSubtitleInfo {
+                is_hash_match: Some(false),
+                ..Default::default()
+            }])
+        }
+        async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
+            unreachable!("search only")
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn search_enriches_ids_episode_range_and_runtime_from_saved_item() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        use crate::test_support::{save_item, seed_provider_id};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let library = library_manager_over(db.clone());
+        let mut row = library.get_item_by_id(item).await.unwrap().unwrap();
+        row.name = Some("Two episodes".to_owned());
+        row.series_name = Some("Saved series".to_owned());
+        row.index_number = Some(2);
+        row.parent_index_number = Some(1);
+        row.run_time_ticks = Some(42_000_000);
+        row.data = Some(r#"{"IndexNumberEnd":3}"#.to_owned());
+        save_item(&db, &row).await;
+        for (key, value) in [
+            ("IMDB", "tt1234567"),
+            ("Tvdb", "321"),
+            ("Custom", "unchanged"),
+        ] {
+            seed_provider_id(&db, item, key, value).await;
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = manager(
+            db.clone(),
+            vec![Arc::new(CapturingProvider(captured.clone()))],
+        );
+        let request = SubtitleSearchRequest {
+            item_id: item,
+            language: "eng".to_owned(),
+            is_perfect_match: Some(true),
+            imdb_id: Some("stale".to_owned()),
+            index_number_end: Some(99),
+            provider_ids: std::collections::HashMap::from([("Stale".to_owned(), "old".to_owned())]),
+            ..Default::default()
+        };
+        assert!(
+            mgr.search_subtitles(&request).await.unwrap().is_empty(),
+            "perfect matching still rejects this candidate"
+        );
+        let seen = captured.lock().unwrap()[0].clone();
+        assert_eq!(seen.imdb_id.as_deref(), Some("tt1234567"));
+        assert_eq!(seen.provider_ids.len(), 3);
+        assert_eq!(seen.provider_ids["Tvdb"], "321");
+        assert_eq!(seen.provider_ids["Custom"], "unchanged");
+        assert_eq!(seen.index_number, Some(2));
+        assert_eq!(seen.index_number_end, Some(3));
+        assert_eq!(seen.parent_index_number, Some(1));
+        assert_eq!(seen.runtime_ticks, Some(42_000_000));
+        assert_eq!(seen.is_perfect_match, Some(true));
+        assert_eq!(seen.language, "eng");
+        // Missing/invalid range data clears a stale caller value; movies never
+        // acquire an episode range, even with an adopted stray Data property.
+        for (kind, data) in [
+            (BaseItemKind::Episode, "{}"),
+            (BaseItemKind::Episode, r#"{"IndexNumberEnd":2147483648}"#),
+            (BaseItemKind::Episode, "invalid JSON"),
+            (BaseItemKind::Movie, r#"{"IndexNumberEnd":3}"#),
+        ] {
+            row.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            row.data = Some(data.to_owned());
+            row.run_time_ticks = None;
+            save_item(&db, &row).await;
+            mgr.search_subtitles(&request).await.unwrap();
+            let seen = captured.lock().unwrap().last().unwrap().clone();
+            assert_eq!(seen.index_number_end, None);
+            assert_eq!(seen.runtime_ticks, None);
+        }
+        crate::item_persistence_service::FerrofinItemPersistenceService::new(db)
+            .replace_provider_ids(item, &[])
+            .await
+            .unwrap();
+        mgr.search_subtitles(&request).await.unwrap();
+        let seen = captured.lock().unwrap().last().unwrap().clone();
+        assert!(seen.provider_ids.is_empty());
+        assert_eq!(
+            seen.imdb_id, None,
+            "absent saved IDs clear stale caller metadata"
+        );
     }
 
     #[tokio::test]

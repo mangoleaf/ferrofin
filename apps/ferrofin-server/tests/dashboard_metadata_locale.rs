@@ -373,6 +373,11 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         "{CLIENT}, Token=\"{}\"",
         login["AccessToken"].as_str().unwrap()
     );
+    let expected: Value = serde_json::from_str(include_str!(
+        "../../../crates/ferrofin-core/src/data/localization_options.json"
+    ))
+    .unwrap();
+    assert_eq!(api.get("/Localization/Options").await, expected);
     let mut config = api.get("/System/Configuration").await;
     config["PreferredMetadataLanguage"] = json!("fr");
     config["MetadataCountryCode"] = json!("FR");
@@ -1635,6 +1640,9 @@ async fn verify_automatic_subtitle_constraints(
         ],
         "format":{"format_name":"matroska,webm","duration":"60.0","size":"131072","bit_rate":"1000"}
     }).to_string()).unwrap();
+    let mut saved = api.get(&format!("/Items/{id}")).await;
+    saved["ProviderIds"] = json!({"Tmdb":"603", "IMDB":"tt0133093", "Custom":"subtitle-fixture"});
+    api.post(&format!("/Items/{id}"), &saved).await;
     options["AllowEmbeddedSubtitles"] = json!("AllowNone");
     options["DisabledSubtitleFetchers"] = json!([]);
     options["SubtitleDownloadLanguages"] = json!(["eng"]);
@@ -1658,7 +1666,9 @@ async fn verify_automatic_subtitle_constraints(
             .lock()
             .unwrap()
             .iter()
-            .any(|uri| uri.starts_with("/subtitles?") && uri.contains("moviehash_match=only"))
+            .any(|uri| uri.starts_with("/subtitles?")
+                && uri.contains("moviehash_match=only")
+                && uri.contains("imdb_id=0133093"))
     );
     assert!(
         !requests
@@ -1685,7 +1695,9 @@ async fn verify_automatic_subtitle_constraints(
             .lock()
             .unwrap()
             .iter()
-            .any(|uri| uri.starts_with("/subtitles?") && !uri.contains("moviehash_match=only"))
+            .any(|uri| uri.starts_with("/subtitles?")
+                && !uri.contains("moviehash_match=only")
+                && uri.contains("imdb_id=0133093"))
     );
 
     for (language, flag) in [
