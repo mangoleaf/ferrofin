@@ -1094,6 +1094,8 @@ pub trait RemoteSearchProvider: Send + Sync {
 /// manager would.
 #[derive(Default, Clone)]
 pub struct LocalProviderManager {
+    /// Refreshes waiting for the serial worker (`ProviderManager._refreshQueue`).
+    refresh_queue: Arc<std::sync::Mutex<RefreshQueue>>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
     image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
     external_id_infos: Vec<ExternalIdInfo>,
@@ -1176,6 +1178,13 @@ pub struct LocalProviderManager {
 impl std::fmt::Debug for LocalProviderManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalProviderManager")
+            .field(
+                "queued_refreshes",
+                &self
+                    .refresh_queue
+                    .lock()
+                    .map_or(0, |queue| queue.items.len()),
+            )
             .field("external_id_infos", &self.external_id_infos)
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field(
@@ -1250,6 +1259,7 @@ impl LocalProviderManager {
     #[must_use]
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
+            refresh_queue: Arc::default(),
             nfo_saver: None,
             image_saver: None,
             external_id_infos,
@@ -3897,30 +3907,116 @@ fn image_upload_file_index(
         .ok_or_else(|| ServiceError::backend("no unused backdrop filename suffix"))
 }
 
+/// The pending refreshes, ordered by priority (`High` first) and, within a
+/// priority, by arrival, plus whether a worker is draining them.
+///
+/// `ProviderManager._refreshQueue` is a .NET `PriorityQueue`, whose order among
+/// equal priorities is unspecified; arrival order is one valid choice.
+#[derive(Default)]
+struct RefreshQueue {
+    /// `(priority rank, arrival)` keys, smallest first.
+    pending: std::collections::BinaryHeap<std::cmp::Reverse<(u8, u64)>>,
+    items: HashMap<u64, (Uuid, MetadataRefreshOptions)>,
+    arrivals: u64,
+    /// A worker is running (`_isProcessingRefreshQueue`).
+    processing: bool,
+}
+
+impl RefreshQueue {
+    fn push(&mut self, item_id: Uuid, options: MetadataRefreshOptions, priority: RefreshPriority) {
+        let rank = match priority {
+            RefreshPriority::High => 0,
+            RefreshPriority::Normal => 1,
+            RefreshPriority::Low => 2,
+        };
+        let arrival = self.arrivals;
+        self.arrivals += 1;
+        self.pending.push(std::cmp::Reverse((rank, arrival)));
+        self.items.insert(arrival, (item_id, options));
+    }
+
+    /// The next refresh, or `None` once the queue ran dry — which also stands
+    /// the worker down under the same lock, so a request queued right after
+    /// cannot meet a worker that has already stopped.
+    fn pop_or_stand_down(&mut self) -> Option<(Uuid, MetadataRefreshOptions)> {
+        let next = self
+            .pending
+            .pop()
+            .and_then(|std::cmp::Reverse((_, arrival))| self.items.remove(&arrival));
+        if next.is_none() {
+            self.processing = false;
+        }
+        next
+    }
+}
+
+/// Stands the worker down if it unwinds, so a panicking refresh cannot leave
+/// the queue claimed forever.
+struct WorkerGuard(Arc<std::sync::Mutex<RefreshQueue>>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .processing = false;
+    }
+}
+
+impl LocalProviderManager {
+    /// `StartProcessingRefreshQueue`: refreshes one item at a time, highest
+    /// priority first, until the queue is empty. A failed refresh is logged and
+    /// the queue keeps draining.
+    async fn drain_refresh_queue(&self) {
+        let guard = WorkerGuard(Arc::clone(&self.refresh_queue));
+        loop {
+            let next = self
+                .refresh_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_or_stand_down();
+            let Some((item_id, options)) = next else {
+                break;
+            };
+            if let Err(err) = self.refresh_full_item(item_id, &options).await {
+                tracing::warn!(%item_id, %err, "queued metadata refresh failed");
+            }
+        }
+        drop(guard);
+    }
+}
+
 #[async_trait]
 impl ProviderManager for LocalProviderManager {
     async fn queue_refresh(
         &self,
         item_id: Uuid,
         options: &MetadataRefreshOptions,
-        _priority: RefreshPriority,
+        priority: RefreshPriority,
     ) -> Result<(), ServiceError> {
-        // Run the refresh in the background and return immediately — the C#
-        // queued-refresh shape (the refresh button 204s while the fetch runs).
-        // ponytail: _priority ignored — a single-item spawn needs no ordering.
-        // Add an ordered, priority-aware worker queue when bulk/library-wide
-        // refreshes land.
-        let mgr = self.clone();
-        let options = options.clone();
-        let handle = tokio::spawn(ferrofin_util::current_culture::scope(
-            ferrofin_util::current_culture::capture(),
-            async move {
-                if let Err(err) = mgr.refresh_full_item(item_id, &options).await {
-                    tracing::warn!(%item_id, %err, "queued metadata refresh failed");
-                }
-            },
-        ));
-        drop(handle);
+        // `ProviderManager.QueueRefresh`: an empty id is rejected; otherwise the
+        // request joins a priority queue drained by one worker, started by
+        // whichever request finds none running. That first requester's culture
+        // is the one the worker (and so every queued refresh) runs under.
+        if item_id.is_nil() {
+            return Err(ServiceError::invalid_input("Guid can't be empty"));
+        }
+        let start_worker = {
+            let mut queue = self
+                .refresh_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.push(item_id, options.clone(), priority);
+            !std::mem::replace(&mut queue.processing, true)
+        };
+        if start_worker {
+            let mgr = self.clone();
+            let handle = tokio::spawn(ferrofin_util::current_culture::scope(
+                ferrofin_util::current_culture::capture(),
+                async move { mgr.drain_refresh_queue().await },
+            ));
+            drop(handle);
+        }
         Ok(())
     }
 
@@ -4351,7 +4447,18 @@ impl ProviderManager for LocalProviderManager {
     }
 
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
-        Ok(Vec::new())
+        // `GetRefreshQueue`: the ids waiting, not the one being refreshed.
+        let queue = self
+            .refresh_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(queue
+            .items
+            .values()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect())
     }
 }
 
@@ -5984,9 +6091,10 @@ mod tests {
         let id = Uuid::nil();
         let opts = MetadataRefreshOptions::default();
 
-        // `queue_refresh` spawns the refresh in the background and returns Ok
-        // immediately; with no TMDB client wired the spawned refresh no-ops.
-        mgr.queue_refresh(id, &opts, RefreshPriority::Normal)
+        // `queue_refresh` joins the refresh queue and returns Ok immediately
+        // (an empty id is refused, as upstream's `ArgumentException`); with no
+        // TMDB client wired the queued refresh no-ops.
+        mgr.queue_refresh(Uuid::from_u128(1), &opts, RefreshPriority::Normal)
             .await
             .expect("queue_refresh accepts the enqueue");
 
@@ -6112,6 +6220,9 @@ mod tests {
         assert_eq!(unknown, MetadataOptions::default());
     }
 
+    /// The culture each `retrieve_item` ran under, in call order.
+    static SEEN_CULTURES: std::sync::Mutex<Vec<(Uuid, String)>> = std::sync::Mutex::new(Vec::new());
+
     /// An [`ItemRepository`] over a fixed map, reporting each `retrieve_item`
     /// call on a channel so a test can observe a background refresh running.
     /// Every method the refresh path never touches is `unimplemented!`.
@@ -6132,6 +6243,10 @@ mod tests {
         }
 
         async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+            SEEN_CULTURES
+                .lock()
+                .unwrap()
+                .push((id, ferrofin_util::current_culture::capture()));
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
         }
@@ -7597,6 +7712,119 @@ mod tests {
             .expect("background refresh ran")
             .expect("channel open");
         assert_eq!(seen, item_id);
+    }
+
+    /// A manager over albums (which refresh offline) with the given ids.
+    fn queue_fixture(
+        ids: &[Uuid],
+    ) -> (
+        LocalProviderManager,
+        tokio::sync::mpsc::UnboundedReceiver<Uuid>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rows = ids
+            .iter()
+            .map(|id| {
+                let mut album = row("Audio.MusicAlbum", "Album");
+                album.id = id.to_string();
+                (*id, album)
+            })
+            .collect();
+        let items = Arc::new(FakeItems { rows, seen: tx });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items);
+        (mgr, rx)
+    }
+
+    async fn next_seen(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Uuid>) -> Uuid {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("refresh ran")
+            .expect("channel open")
+    }
+
+    /// `ProviderManager._refreshQueue`: one worker, highest priority first,
+    /// arrival order within a priority.
+    #[tokio::test]
+    async fn queued_refreshes_run_serially_by_priority_then_arrival() {
+        let [low_a, low_b, high, normal] = [1_u128, 2, 3, 4].map(Uuid::from_u128);
+        let (mgr, mut rx) = queue_fixture(&[low_a, low_b, high, normal]);
+        let options = MetadataRefreshOptions::default();
+        for (id, priority) in [
+            (low_a, RefreshPriority::Low),
+            (low_b, RefreshPriority::Low),
+            (high, RefreshPriority::High),
+            (normal, RefreshPriority::Normal),
+        ] {
+            mgr.queue_refresh(id, &options, priority).await.unwrap();
+        }
+        // The worker has not had a turn yet: all four wait.
+        let mut waiting = mgr.get_refresh_queue().await.unwrap();
+        waiting.sort();
+        assert_eq!(waiting, [low_a, low_b, high, normal]);
+        let mut order = Vec::new();
+        while order.len() < 4 {
+            let id = next_seen(&mut rx).await;
+            if order.last() != Some(&id) {
+                order.push(id);
+            }
+        }
+        assert_eq!(order, [high, normal, low_a, low_b]);
+        assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_refresh_rejects_an_empty_id_and_restarts_after_draining() {
+        let ids = [Uuid::from_u128(11), Uuid::from_u128(12)];
+        let (mgr, mut rx) = queue_fixture(&ids);
+        let options = MetadataRefreshOptions::default();
+        assert!(matches!(
+            mgr.queue_refresh(Uuid::nil(), &options, RefreshPriority::High)
+                .await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        mgr.queue_refresh(ids[0], &options, RefreshPriority::Low)
+            .await
+            .unwrap();
+        assert_eq!(next_seen(&mut rx).await, ids[0]);
+        // Once the worker stood down, the next request starts a new one.
+        while mgr.refresh_queue.lock().unwrap().processing {
+            tokio::task::yield_now().await;
+        }
+        mgr.queue_refresh(ids[1], &options, RefreshPriority::Low)
+            .await
+            .unwrap();
+        assert_eq!(next_seen(&mut rx).await, ids[1]);
+    }
+
+    /// The worker, and so every refresh it runs, carries the culture of the
+    /// request that started it — and a failing refresh does not stop it.
+    #[tokio::test]
+    async fn the_first_requesters_culture_governs_the_worker() {
+        let [missing, first, second] = [21_u128, 22, 23].map(Uuid::from_u128);
+        let (mgr, mut rx) = queue_fixture(&[first, second]);
+        let options = MetadataRefreshOptions::default();
+        for (culture, id) in [("sv", missing), ("de", first), ("fr", second)] {
+            ferrofin_util::current_culture::scope(culture.to_owned(), async {
+                mgr.queue_refresh(id, &options, RefreshPriority::Low)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        }
+        let mut seen = Vec::new();
+        while !seen.contains(&second) {
+            seen.push(next_seen(&mut rx).await);
+        }
+        assert!(seen.contains(&missing), "the failing refresh ran first");
+        let cultures: Vec<_> = SEEN_CULTURES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| [missing, first, second].contains(id))
+            .map(|(_, culture)| culture.clone())
+            .collect();
+        assert!(!cultures.is_empty() && cultures.iter().all(|culture| culture == "sv"));
     }
 
     #[tokio::test]
