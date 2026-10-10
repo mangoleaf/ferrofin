@@ -6013,14 +6013,14 @@ impl LibraryScanner {
                         run_time_ticks: video.run_time_ticks,
                         ..Default::default()
                     })?;
-            let template = self.localization.as_ref().map_or_else(
-                || "Chapter {0}".to_owned(),
-                |localization| localization.get_localized_string("ChapterNameValue"),
-            );
-            for (index, chapter) in chapters.iter_mut().enumerate() {
-                chapter.name = Some(template.replace("{0}", &(index + 1).to_string()));
-            }
         }
+        // `NormalizeChapterNames`, over probed and dummy chapters alike: blank
+        // names and names `TimeSpan.TryParse` accepts become "Chapter N".
+        let template = self.localization.as_ref().map_or_else(
+            || "Chapter {0}".to_owned(),
+            |localization| localization.get_localized_string("ChapterNameValue"),
+        );
+        ferrofin_providers::chapter_names::normalize_chapter_names(&mut chapters, &template);
         Ok(chapters)
     }
 
@@ -31400,6 +31400,61 @@ mod chapter_image_refresh_tests {
                 }
             }
         }
+    }
+
+    /// `FFProbeVideoInfo.NormalizeChapterNames`: probed markers whose name is
+    /// blank or parses as a `TimeSpan` are renamed with the localized template,
+    /// numbered by position; real names survive.
+    #[tokio::test]
+    async fn blank_and_time_chapter_names_become_localized_numbers() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let (mut scanner, repo) = scanner(&fixture);
+        scanner.localization = Some(Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source(|| "fr".to_owned()),
+        ));
+        let mut probe = video_probe(&[
+            0, 10_000_000, 20_000_000, 30_000_000, 40_000_000, 50_000_000,
+        ]);
+        for (chapter, name) in probe.chapters.iter_mut().zip([
+            None,
+            Some(""),
+            Some("  \t"),
+            Some("00:05:00"),
+            Some("Opening"),
+            Some("12"),
+        ]) {
+            chapter.name = name.map(str::to_owned);
+        }
+        let id = Uuid::parse_str(&fixture.video.id).unwrap();
+        scanner
+            .persist_video_chapters(
+                &fixture.video,
+                &probe,
+                MetadataRefreshMode::FullRefresh,
+                Some(&fixture.options),
+                &ScanCancel::default(),
+            )
+            .await
+            .unwrap();
+        let names: Vec<_> = repo
+            .get_chapters(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|chapter| chapter.name.unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Chapitre 1",
+                "Chapitre 2",
+                "Chapitre 3",
+                "Chapitre 4",
+                "Opening",
+                // A bare number is a day count to TimeSpan.TryParse.
+                "Chapitre 6",
+            ]
+        );
     }
 
     #[allow(clippy::too_many_lines)]
