@@ -46,6 +46,46 @@ pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
     kind.stored_type_name()
 }
 
+/// `ServerConfiguration.EnableCaseSensitiveItemIds` (default **true**): when
+/// false every item id key is lowercased (`GetNewItemIdInternal`).
+static CASE_SENSITIVE_ITEM_IDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// `ServerConfiguration.EnableNormalizedItemByNameIds` (default **true**): when
+/// true a by-name item's id key is lowercased even if item ids are otherwise
+/// case-sensitive (`GetItemByNameId`).
+static NORMALIZED_BY_NAME_IDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Publishes the two server settings that shape item ids. The configuration
+/// manager calls it when the configuration loads and whenever it changes, so
+/// the next derivation sees the saved values as upstream's live reads do.
+/// Changing them changes the ids derived from then on; nothing rewrites ids
+/// already stored.
+pub fn set_item_id_policy(case_sensitive_item_ids: bool, normalized_by_name_ids: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CASE_SENSITIVE_ITEM_IDS.store(case_sensitive_item_ids, Relaxed);
+    NORMALIZED_BY_NAME_IDS.store(normalized_by_name_ids, Relaxed);
+}
+
+/// Whether an item-id key is lowercased: always for a by-name id when
+/// `normalized_by_name_ids`, and for any id when ids are not case-sensitive.
+fn lowercases_key(by_name: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    key_is_lowercased(
+        CASE_SENSITIVE_ITEM_IDS.load(Relaxed),
+        NORMALIZED_BY_NAME_IDS.load(Relaxed),
+        by_name,
+    )
+}
+
+/// `GetNewItemIdInternal`'s `forceCaseInsensitive || !EnableCaseSensitiveItemIds`,
+/// where only a by-name id forces case-insensitivity (with
+/// `EnableNormalizedItemByNameIds`).
+const fn key_is_lowercased(case_sensitive: bool, normalized_by_name: bool, by_name: bool) -> bool {
+    !case_sensitive || (by_name && normalized_by_name)
+}
+
 /// How stable item ids are derived from kind + path — a **per-database** mode.
 ///
 /// Jellyfin 10.11.8 derives `MD5(TypeFullName + key)` over UTF-16LE where
@@ -108,7 +148,12 @@ pub fn derive_item_id_with(
                 .as_deref()
                 .and_then(|data| path.strip_prefix(data))
                 .map(|rel| rel.trim_start_matches(['/', '\\']).replace('/', "\\"));
-            rewritten.unwrap_or_else(|| path.to_owned())
+            let key = rewritten.unwrap_or_else(|| path.to_owned());
+            if lowercases_key(false) {
+                ferrofin_util::string_extensions::lower_invariant(&key)
+            } else {
+                key
+            }
         }
         IdDerivation::LegacyLowercase => path.to_lowercase(),
     };
@@ -129,7 +174,7 @@ pub fn derive_item_id_with(
 /// resolved a different one).
 #[must_use]
 pub fn person_path(people_path: &str, name: &str) -> String {
-    let valid = valid_filename(name);
+    let valid = item_by_name_folder_name(name);
     match valid.chars().find(|c| c.is_alphanumeric()) {
         Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
         None => format!("{people_path}/{valid}"),
@@ -185,8 +230,10 @@ fn by_name_item_id_with_casing(
             let key = rewritten.unwrap_or_else(|| path.to_owned());
             if previous {
                 key.to_lowercase()
-            } else {
+            } else if lowercases_key(true) {
                 ferrofin_util::string_extensions::lower_invariant(&key)
+            } else {
+                key
             }
         }
         IdDerivation::LegacyLowercase => path.to_lowercase(),
@@ -204,7 +251,7 @@ fn by_name_item_id_with_casing(
 /// first-letter subfolder (unlike people).
 #[must_use]
 pub fn by_name_path(root: &str, name: &str) -> String {
-    let valid = valid_filename(name);
+    let valid = item_by_name_folder_name(name);
     format!("{root}/{valid}")
 }
 
@@ -245,6 +292,45 @@ pub fn user_root_folder_id(
 #[must_use]
 pub fn aggregate_folder_id(mode: &IdDerivation, root_folder_path: &str) -> Option<uuid::Uuid> {
     derive_item_id_with(mode, BaseItemKind::AggregateFolder, root_folder_path)
+}
+
+/// The most UTF-8 bytes a by-name entity's folder name may take
+/// (`BaseItem.MaxItemByNameFolderNameBytes`): well under the 255 bytes of
+/// common Linux filesystems, so the files inside still fit `MAX_PATH`.
+const MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES: usize = 128;
+
+/// `BaseItem.GetItemByNameFolderName`: [`valid_filename`], and — for a name
+/// that would not fit a path component — a readable prefix, `-`, and the MD5
+/// of the whole sanitized name, in at most 128 UTF-8 bytes. The cut is made on
+/// UTF-16 units like the original and never splits a surrogate pair.
+pub(crate) fn item_by_name_folder_name(name: &str) -> String {
+    bound_folder_name(valid_filename(name))
+}
+
+/// The length-bounding half of [`item_by_name_folder_name`], over an already
+/// sanitized name.
+fn bound_folder_name(valid: String) -> String {
+    if valid.len() <= MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES {
+        return valid;
+    }
+    let suffix = format!("-{}", ferrofin_common::extensions::get_md5(&valid).simple());
+    let budget = MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES - suffix.len();
+    let units: Vec<u16> = valid.encode_utf16().collect();
+    // UTF-8 length of a UTF-16 prefix; a lone surrogate counts as U+FFFD.
+    let utf8_len = |end: usize| {
+        char::decode_utf16(units[..end].iter().copied())
+            .map(|unit| unit.map_or(3, char::len_utf8))
+            .sum::<usize>()
+    };
+    let mut length = units.len().min(budget);
+    while length > 0 && utf8_len(length) > budget {
+        length -= 1;
+    }
+    if length > 0 && (0xD800..0xDC00).contains(&units[length - 1]) {
+        length -= 1;
+    }
+    let prefix = String::from_utf16_lossy(&units[..length]);
+    format!("{}{suffix}", prefix.trim_end().trim_end_matches('.'))
 }
 
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
@@ -311,6 +397,78 @@ impl ItemTypeLookupTrait for ItemTypeLookup {
 
 #[cfg(test)]
 mod tests {
+    use super::{bound_folder_name, by_name_path, item_by_name_folder_name, key_is_lowercased};
+
+    /// The four settings combinations: a scanned id is lowercased only when
+    /// ids are not case-sensitive; a by-name id also when normalized.
+    #[test]
+    fn id_key_casing_follows_both_settings() {
+        for (case_sensitive, normalized, scanned, by_name) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, true, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                key_is_lowercased(case_sensitive, normalized, false),
+                scanned,
+                "scanned: case_sensitive={case_sensitive} normalized={normalized}"
+            );
+            assert_eq!(
+                key_is_lowercased(case_sensitive, normalized, true),
+                by_name,
+                "by-name: case_sensitive={case_sensitive} normalized={normalized}"
+            );
+        }
+    }
+
+    /// `BaseItem.GetItemByNameFolderName` against the upstream method run on
+    /// .NET 10 (a verbatim copy; the names hold no invalid file-name characters).
+    #[test]
+    fn by_name_folder_names_match_dotnet() {
+        let cases: Vec<(String, String)> = serde_json::from_str(include_str!(
+            "../tests/fixtures/item_by_name_folder_names.json"
+        ))
+        .unwrap();
+        assert!(cases.len() > 30);
+        for (name, expected) in cases {
+            // The oracle's file system passes names through, as upstream's
+            // test fixture does; the bound applies to the trimmed name.
+            let actual = bound_folder_name(name.trim().trim_end_matches('.').to_owned());
+            assert_eq!(actual, expected, "{name:?}");
+            assert!(actual.len() <= 128, "{name:?}");
+        }
+    }
+
+    /// The upstream xUnit cases (`BaseItemTests.GetItemByNameFolderName_*`).
+    #[test]
+    fn overlong_by_name_folder_names_stay_unique_and_stable() {
+        assert_eq!(
+            item_by_name_folder_name("Mairghread Scott."),
+            "Mairghread Scott"
+        );
+        let credits = vec!["Jerry Siegel (created by Superman)"; 20].join(", ");
+        let folder = item_by_name_folder_name(&credits);
+        assert!(folder.len() <= 128);
+        assert!(folder.starts_with("Jerry Siegel (created by Superman)"));
+        let prefix = "a".repeat(200);
+        assert_ne!(
+            item_by_name_folder_name(&format!("{prefix}Joe Shuster")),
+            item_by_name_folder_name(&format!("{prefix}Bob Kane"))
+        );
+        let long = "a".repeat(300);
+        assert_eq!(
+            item_by_name_folder_name(&long),
+            item_by_name_folder_name(&long)
+        );
+        // Paths built from a long name use the bounded folder.
+        let path = by_name_path("/meta/Genre", &long);
+        assert_eq!(
+            path.rsplit('/').next().unwrap(),
+            item_by_name_folder_name(&long)
+        );
+    }
+
     #[rstest::rstest]
     #[case("İpek", "İpek")]
     #[case("ΟΣ", "οσ")]

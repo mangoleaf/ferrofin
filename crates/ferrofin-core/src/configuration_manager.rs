@@ -227,6 +227,14 @@ pub struct FerrofinServerConfigurationManager {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WarnedFile(Option<std::time::SystemTime>);
 
+/// Hands the two settings that shape item ids to id derivation.
+fn publish_item_id_policy(configuration: &ServerConfiguration) {
+    crate::item_type_lookup::set_item_id_policy(
+        configuration.enable_case_sensitive_item_ids,
+        configuration.enable_normalized_item_by_name_ids,
+    );
+}
+
 impl std::fmt::Debug for FerrofinServerConfigurationManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FerrofinServerConfigurationManager")
@@ -416,6 +424,7 @@ impl FerrofinServerConfigurationManager {
 
         prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
+        publish_item_id_policy(&configuration);
 
         Ok(Self {
             paths,
@@ -692,6 +701,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             ferrofin_util::file_helper::atomic_write(&path, &json)
                 .map_err(|e| io_err("write configuration", &path, &e))?;
             *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            publish_item_id_policy(&replacement);
             paths.set_cache_path(replacement.cache_path.as_deref());
             paths.set_internal_metadata_path(Some(&replacement.metadata_path));
             notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
