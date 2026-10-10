@@ -1696,6 +1696,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
+                // No foreign key reaches these two, so nothing cascades:
+                // upstream deletes them with the rows (`:151`, `:155`), and a
+                // segment provider's scan must not find them published.
+                format!(r#"DELETE FROM "MediaSegments" WHERE "ItemId" IN ({ids})"#),
+                format!(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" IN ({ids})"#),
             ] {
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
@@ -3752,9 +3757,10 @@ async fn is_stored(conn: &mut sqlx::SqliteConnection, id: Uuid) -> Result<bool, 
 /// containers' version entries for it go. A reference the two rows held to
 /// each other leaves none to itself. What is keyed by its id without a
 /// cascading foreign key (media segments, trickplay) moves to `to` where
-/// `to` has none in that table, else goes. Then the row is deleted, its own
-/// data (streams, images, people, …) with it. A `loser` not stored is
-/// skipped.
+/// `to` has none in that table, else goes; its Intro Skipper rows follow by
+/// that extension's rule ([`crate::intro_skipper_repository::fold_item_rows`]).
+/// Then the row is deleted, its own data (streams, images, people, …) with
+/// it. A `loser` not stored is skipped.
 async fn merge_one(
     conn: &mut sqlx::SqliteConnection,
     (loser, to): (Uuid, Uuid),
@@ -3772,6 +3778,7 @@ async fn merge_one(
     }
     merge_user_data(conn, loser, to).await?;
     carry_version_link(conn, (loser, to), extra, references).await?;
+    crate::intro_skipper_repository::fold_item_rows(conn, loser, to).await?;
     for (table, column, cascades) in references
         .iter()
         .filter(|(table, ..)| !table.eq_ignore_ascii_case("UserData"))
@@ -4050,6 +4057,9 @@ async fn move_one(
     ] {
         sqlx::query(sql).bind(&to).execute(&mut *conn).await?;
     }
+    // The Intro Skipper's rows (lowercase ids, some inside JSON lists; no
+    // foreign key reaches them): segments, exclusions, season state.
+    crate::intro_skipper_repository::move_item_rows(conn, m.from, m.to).await?;
     for (table, column, _) in references {
         let sql = format!(r#"UPDATE "{table}" SET "{column}" = ?1 WHERE "{column}" = ?2"#);
         sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -11321,6 +11331,47 @@ mod tests {
                 .await
                 .expect("user data");
         assert_eq!(rows, vec![(guid_to_db(kept), kept.to_string(), 1)]);
+    }
+
+    /// `delete_items` takes the rows no foreign key reaches with the item —
+    /// its published media segments and trickplay
+    /// (`ItemPersistenceService.cs:151,155`) — and leaves another item's.
+    #[tokio::test]
+    async fn delete_items_takes_the_segments_and_trickplay_with_the_item() {
+        let (gone, kept) = (Uuid::from_u128(0xD401), Uuid::from_u128(0xD402));
+        let db = test_db().await;
+        for item in [gone, kept] {
+            seed_item(&db, item, BaseItemKind::Episode).await;
+            sqlx::query(
+                r#"INSERT INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId",
+                   "StartTicks", "Type") VALUES (?1, 10, ?2, 'p', 0, 5)"#,
+            )
+            .bind(item.simple().to_string())
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .expect("segment");
+            sqlx::query(
+                r#"INSERT INTO "TrickplayInfos" ("ItemId", "Width", "Height", "TileWidth",
+                   "TileHeight", "ThumbnailCount", "Interval", "Bandwidth")
+                   VALUES (?1, 320, 180, 10, 10, 1, 10000, 1)"#,
+            )
+            .bind(guid_to_db(item))
+            .execute(db.writer())
+            .await
+            .expect("trickplay");
+        }
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(svc.delete_items(&[gone]).await.expect("delete"), vec![gone]);
+        for table in ["MediaSegments", "TrickplayInfos"] {
+            let owners: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                r#"SELECT "ItemId" FROM "{table}""#
+            )))
+            .fetch_all(db.pool())
+            .await
+            .expect("rows");
+            assert_eq!(owners, vec![guid_to_db(kept)], "{table}");
+        }
     }
 
     /// What a merged row has keyed by its id without a cascading foreign key

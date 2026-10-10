@@ -940,17 +940,35 @@ impl DetectSegmentsTask {
         removed
     }
 
-    /// Publishes every stored item's segments (the plugin's `SegmentProvider`
-    /// as the Media Segment Scan runs it), logging a failed item and going on.
+    /// Publishes the stored segments of every item the Media Segment Scan
+    /// covers (the plugin's `SegmentProvider` as `MediaSegmentExtractionTask`
+    /// runs it over the library's items, [`queue::publishable`]), logging a
+    /// failed item and going on. A stored item no longer in the library —
+    /// deleted, or in a library that disables the plugin — is not published:
+    /// upstream's scan only walks the library.
     async fn publish_stored(&self) {
-        let items = match self.actions.stored_item_ids().await {
+        let stored = match self.actions.stored_item_ids().await {
             Ok(items) => items,
             Err(err) => {
                 tracing::error!(%err, "intro skipper: could not list stored segments to publish");
                 return;
             }
         };
-        for item_id in items {
+        let folders = match self.virtual_folders.get_virtual_folders().await {
+            Ok(folders) => folders,
+            Err(err) => {
+                tracing::error!(%err, "intro skipper: could not read the libraries to publish");
+                return;
+            }
+        };
+        let live = match queue::publishable(self.library.as_ref(), &folders, &stored).await {
+            Ok(live) => live,
+            Err(err) => {
+                tracing::error!(%err, "intro skipper: could not read the items to publish");
+                return;
+            }
+        };
+        for item_id in stored.into_iter().filter(|id| live.contains(id)) {
             if let Err(err) =
                 intro_store::refresh(self.actions.as_ref(), self.media_segments.as_ref(), item_id)
                     .await
@@ -3506,6 +3524,42 @@ mod tests {
 
         scan.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// With `UpdateMediaSegments` off the scan publishes the stored segments
+    /// itself, for the items Jellyfin's `MediaSegmentExtractionTask` walks —
+    /// the library's: a deleted episode's segments, which the plugin keeps
+    /// (its `OnItemRemoved` drops only the detection cache), are not
+    /// published again; a live episode's missing ones are.
+    #[tokio::test]
+    async fn the_scan_does_not_republish_a_deleted_item() {
+        let h = harness(&THREE_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let (live, gone) = (THREE_EPISODES[0].0, THREE_EPISODES[2].0);
+        assert_eq!(intros_of(&h.segments, gone).await.len(), 1);
+        intro_store::remove_published(h.segments.as_ref(), live)
+            .await
+            .expect("unpublish");
+        assert!(intros_of(&h.segments, live).await.is_empty());
+        h.persistence.delete_items(&[gone]).await.expect("delete");
+        assert!(
+            intros_of(&h.segments, gone).await.is_empty(),
+            "the delete takes the published segments"
+        );
+
+        let scan = MediaSegmentScanTask {
+            detect: Arc::new(configured(&h, r#"{"UpdateMediaSegments":false}"#)),
+        };
+        scan.execute(&TaskProgress::default()).await.expect("scan");
+        assert!(intros_of(&h.segments, gone).await.is_empty());
+        assert_eq!(intros_of(&h.segments, live).await.len(), 1);
+        assert!(
+            !h.actions.segments(gone).await.expect("tier").is_empty(),
+            "the plugin's own rows stay, as upstream's, for its clean task"
+        );
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and
