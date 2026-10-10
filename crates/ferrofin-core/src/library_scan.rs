@@ -2254,11 +2254,11 @@ fn sidecars_changed(
         || differs(seam.resolvers.audio(), &links.external_audio)
 }
 
-/// The NFO sidecar the local reader would read for `entity`, with its mtime
-/// — `BaseNfoProvider.GetXmlFile` — or `None` (no such file, a kind with no
-/// NFO, or the library disabled the reader).
+/// The newest NFO sidecar the local readers would read for `entity`, with its
+/// mtime — each provider's `BaseNfoProvider.GetXmlFile`, whose `HasChanged`
+/// any of them can raise — or `None` (no such file, a kind with no NFO, or
+/// the library disabled the reader).
 fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalMetadataFile> {
-    use ferrofin_providers::xbmc::item::NfoItemKind;
     if entity.type_.ends_with(".Book") {
         // A book has no NFO reader; its Comic and OPF providers monitor
         // their own files.
@@ -2276,22 +2276,16 @@ fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalM
     if !policy.local_reader_enabled(fetcher_names::NFO) {
         return None;
     }
-    let kind = match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
-        "Movie" => NfoItemKind::Movie,
-        "Series" => NfoItemKind::Series,
-        "Season" => NfoItemKind::Season,
-        "Episode" => NfoItemKind::Episode,
-        "MusicAlbum" => NfoItemKind::MusicAlbum,
-        "MusicArtist" => NfoItemKind::MusicArtist,
-        _ => return None,
-    };
-    let path = entity.path.as_deref()?;
-    nfo_candidates(path, entity.is_folder, kind)
+    let kind = nfo_kind_of(&entity.type_)?;
+    nfo_groups(entity, kind)
         .into_iter()
-        .find_map(|candidate| {
-            let meta = std::fs::metadata(candidate).ok()?;
-            meta.is_file().then_some(meta.modified().ok()?)
+        .filter_map(|(_, candidates)| {
+            candidates.into_iter().find_map(|candidate| {
+                let meta = std::fs::metadata(candidate).ok()?;
+                meta.is_file().then_some(meta.modified().ok()?)
+            })
         })
+        .max()
         .map(|mtime| LocalMetadataFile {
             mtime: DateTime::<Utc>::from(mtime),
             format: LocalMetadataFormat::Nfo,
@@ -7591,29 +7585,20 @@ impl LibraryScanner {
         if !policy.local_reader_enabled(fetcher_names::NFO) {
             return LocalNfo::default();
         }
-        let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
-        let kind = match short {
-            "Movie" => NfoItemKind::Movie,
-            "Series" => NfoItemKind::Series,
-            "Season" => NfoItemKind::Season,
-            "Episode" => NfoItemKind::Episode,
-            "MusicAlbum" => NfoItemKind::MusicAlbum,
-            "MusicArtist" => NfoItemKind::MusicArtist,
-            _ => return LocalNfo::default(),
-        };
-        let Some(path) = entity.path.as_deref() else {
+        let Some(kind) = nfo_kind_of(&entity.type_) else {
             return LocalNfo::default();
         };
-        let mut xml = None;
-        let mut nfo_path = String::new();
-        for cand in nfo_candidates(path, entity.is_folder, kind) {
-            if let Ok(contents) = tokio::fs::read_to_string(&cand).await {
-                nfo_path = cand.to_string_lossy().into_owned();
-                xml = Some(contents);
-                break;
+        // Providers run in order and the first sidecar that reads wins.
+        let mut found = None;
+        'groups: for (source, candidates) in nfo_groups(entity, kind) {
+            for cand in candidates {
+                if let Ok(contents) = tokio::fs::read_to_string(&cand).await {
+                    found = Some((source, cand.to_string_lossy().into_owned(), contents));
+                    break 'groups;
+                }
             }
         }
-        let Some(xml) = xml else {
+        let Some((source, nfo_path, xml)) = found else {
             return LocalNfo::default();
         };
         let config = self
@@ -7634,8 +7619,28 @@ impl LibraryScanner {
         );
         let ds = NoDirectoryService;
         let mut result = xbmc::new_result(kind);
+        // `BaseNfoProvider.GetMetadata` seeds the item with the library item's
+        // index number; the series-season reader matches `namedseason` on it.
+        result.item.index_number = entity
+            .index_number
+            .and_then(|n| i32::try_from(n).ok())
+            .or_else(|| {
+                // `Season.BeforeMetadataRefresh`: a season without a number
+                // takes the one its folder name carries.
+                (kind == NfoItemKind::Season)
+                    .then(|| {
+                        let path = entity.path.as_deref()?;
+                        let series = Path::new(path).parent().and_then(Path::to_str);
+                        season_path_parser::parse(path, series, true, true).season_number
+                    })
+                    .flatten()
+            });
         let parsed = match kind {
-            NfoItemKind::Movie => {
+            NfoItemKind::Season if source == NfoSource::SeriesSeason => {
+                xbmc::fetch_series_season(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
+            }
+            // The Movie parser serves Movie, Video and MusicVideo alike.
+            NfoItemKind::Movie | NfoItemKind::Video | NfoItemKind::MusicVideo => {
                 xbmc::fetch_movie(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
             NfoItemKind::Series => {
@@ -7650,7 +7655,6 @@ impl LibraryScanner {
             NfoItemKind::MusicAlbum | NfoItemKind::MusicArtist => {
                 xbmc::fetch_music(&mut result, &nfo_path, &xml, &config, &ext_ids, &ds)
             }
-            _ => return LocalNfo::default(),
         };
         if parsed.is_err() {
             return LocalNfo::default();
@@ -13369,34 +13373,109 @@ fn image_type_file_stem(image_type: ImageType) -> &'static str {
 /// hasn't already set (so a probed runtime, a local NFO, or a prior scan wins).
 /// Genres/studios are stored pipe-delimited, matching the `BaseItems` columns the
 /// DTO service reads.
-/// Resolves the candidate `.nfo` sidecar paths for an item, in Jellyfin's search
-/// order. Movies/episodes (files) look next to the media (`<stem>.nfo`, then
-/// `movie.nfo` in the folder); series/seasons (folders) look for `tvshow.nfo` /
-/// `season.nfo` inside. `is_folder` disambiguates a single-folder movie.
-fn nfo_candidates(
-    path: &str,
-    is_folder: bool,
+/// Which NFO provider a sidecar group belongs to: the item's own reader, or
+/// `SeriesNfoSeasonProvider`, which reads a season's name out of `tvshow.nfo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NfoSource {
+    Own,
+    SeriesSeason,
+}
+
+/// The NFO kind the local reader handles for an item type name, if any.
+fn nfo_kind_of(type_name: &str) -> Option<ferrofin_providers::xbmc::item::NfoItemKind> {
+    use ferrofin_providers::xbmc::item::NfoItemKind;
+    Some(match type_name.rsplit('.').next().unwrap_or(type_name) {
+        "Movie" => NfoItemKind::Movie,
+        "Video" => NfoItemKind::Video,
+        "MusicVideo" => NfoItemKind::MusicVideo,
+        "Series" => NfoItemKind::Series,
+        "Season" => NfoItemKind::Season,
+        "Episode" => NfoItemKind::Episode,
+        "MusicAlbum" => NfoItemKind::MusicAlbum,
+        "MusicArtist" => NfoItemKind::MusicArtist,
+        _ => return None,
+    })
+}
+
+/// `MovieNfoSaver.GetMovieSavePaths`, the search order of the Movie, Video and
+/// MusicVideo readers: a DVD's `VIDEO_TS/VIDEO_TS.nfo`; `movie.nfo` in the
+/// containing folder, for a movie that is not in a mixed folder; then the
+/// folder-named `.nfo` of a disc structure, otherwise the media file's own
+/// `.nfo`.
+fn movie_nfo_paths(
+    entity: &BaseItemEntity,
     kind: ferrofin_providers::xbmc::item::NfoItemKind,
 ) -> Vec<PathBuf> {
     use ferrofin_providers::xbmc::item::NfoItemKind;
+    let path = Path::new(entity.path.as_deref().unwrap_or_default());
+    // `ContainingFolderPath`: a folder item is its own container.
+    let containing = if entity.is_folder {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let data = crate::item_data::parse_data(entity.data.as_deref());
+    let video_type = crate::item_data::read_data_string(&data, "VideoType");
+    let placeholder = data
+        .get("IsPlaceHolder")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let disc = matches!(video_type.as_deref(), Some("Dvd" | "BluRay"));
+    let mut candidates = Vec::new();
+    if video_type.as_deref() == Some("Dvd") && !placeholder {
+        candidates.push(containing.join("VIDEO_TS").join("VIDEO_TS.nfo"));
+    }
+    if !entity.is_in_mixed_folder && kind == NfoItemKind::Movie {
+        candidates.push(containing.join("movie.nfo"));
+    }
+    if !placeholder && disc {
+        let folder = containing.file_name().unwrap_or_default().to_string_lossy();
+        candidates.push(containing.join(format!("{folder}.nfo")));
+    } else {
+        candidates.push(path.with_extension("nfo"));
+    }
+    candidates
+}
+
+/// The `.nfo` sidecar groups the local readers consult for an item, in
+/// provider order; within a group the first existing file is the one read.
+///
+/// Series, seasons, albums and artists read a fixed name inside their folder;
+/// episodes read `<stem>.nfo`; movies, videos and music videos follow
+/// [`movie_nfo_paths`]. A season has a second reader after its own
+/// `season.nfo`: `SeriesNfoSeasonProvider` takes the name from `tvshow.nfo`
+/// in the season folder, else in the series folder (here the season folder's
+/// parent).
+fn nfo_groups(
+    entity: &BaseItemEntity,
+    kind: ferrofin_providers::xbmc::item::NfoItemKind,
+) -> Vec<(NfoSource, Vec<PathBuf>)> {
+    use ferrofin_providers::xbmc::item::NfoItemKind;
+    let Some(path) = entity.path.as_deref() else {
+        return Vec::new();
+    };
     let p = Path::new(path);
-    match kind {
+    let own = match kind {
         NfoItemKind::Series => vec![p.join("tvshow.nfo")],
         NfoItemKind::Season => vec![p.join("season.nfo")],
         // C# `AlbumNfoProvider`/`ArtistNfoProvider.GetXmlFile`: a fixed
         // filename inside the album/artist folder.
         NfoItemKind::MusicAlbum => vec![p.join("album.nfo")],
         NfoItemKind::MusicArtist => vec![p.join("artist.nfo")],
-        NfoItemKind::Movie if is_folder => vec![p.join("movie.nfo")],
-        NfoItemKind::Movie => {
-            let mut c = vec![p.with_extension("nfo")];
-            if let Some(dir) = p.parent() {
-                c.push(dir.join("movie.nfo"));
-            }
-            c
+        NfoItemKind::Movie | NfoItemKind::Video | NfoItemKind::MusicVideo => {
+            movie_nfo_paths(entity, kind)
         }
-        _ => vec![p.with_extension("nfo")], // Episode + any leaf kind
+        NfoItemKind::Episode => vec![p.with_extension("nfo")],
+    };
+    let mut groups = vec![(NfoSource::Own, own)];
+    if kind == NfoItemKind::Season {
+        let mut named = vec![p.join("tvshow.nfo")];
+        if let Some(series) = p.parent() {
+            named.push(series.join("tvshow.nfo"));
+        }
+        groups.push((NfoSource::SeriesSeason, named));
     }
+    groups
 }
 
 /// Merges parsed NFO fields onto `entity`, filling only what the row still lacks
@@ -16669,31 +16748,124 @@ mod tests {
 
     // NFO sidecar search order: files look next to the media then for movie.nfo;
     // folders look inside for tvshow.nfo/season.nfo; a single-folder movie for movie.nfo.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn nfo_candidates_match_jellyfin_search_order() {
         use ferrofin_providers::xbmc::item::NfoItemKind;
+        let at = |path: &str, is_folder: bool, data: Option<&str>, mixed: bool| {
+            ferrofin_db::entities::base_items::BaseItemEntity {
+                path: Some(path.to_owned()),
+                is_folder,
+                is_in_mixed_folder: mixed,
+                data: data.map(str::to_owned),
+                ..Default::default()
+            }
+        };
+        let own = |entity: &ferrofin_db::entities::base_items::BaseItemEntity,
+                   kind: NfoItemKind| {
+            super::nfo_groups(entity, kind)
+                .into_iter()
+                .next()
+                .map(|(_, candidates)| candidates)
+                .unwrap()
+        };
+        let paths = |list: &[&str]| -> Vec<std::path::PathBuf> {
+            list.iter().map(std::path::PathBuf::from).collect()
+        };
+        // `MovieNfoSaver.GetMovieSavePaths`: movie.nfo first for a movie that
+        // is not in a mixed folder, then the file's own .nfo.
         assert_eq!(
-            super::nfo_candidates("/m/Movie (2020)/Movie.mkv", false, NfoItemKind::Movie),
-            vec![
-                std::path::PathBuf::from("/m/Movie (2020)/Movie.nfo"),
-                std::path::PathBuf::from("/m/Movie (2020)/movie.nfo"),
-            ]
+            own(
+                &at("/m/Movie (2020)/Movie.mkv", false, None, false),
+                NfoItemKind::Movie
+            ),
+            paths(&["/m/Movie (2020)/movie.nfo", "/m/Movie (2020)/Movie.nfo"])
+        );
+        // Mixed folders and owned videos never read movie.nfo.
+        assert_eq!(
+            own(
+                &at("/m/Mixed/Movie.mkv", false, None, true),
+                NfoItemKind::Movie
+            ),
+            paths(&["/m/Mixed/Movie.nfo"])
         );
         assert_eq!(
-            super::nfo_candidates("/m/Movie (2020)", true, NfoItemKind::Movie),
-            vec![std::path::PathBuf::from("/m/Movie (2020)/movie.nfo")]
+            own(&at("/v/Clip.mkv", false, None, false), NfoItemKind::Video),
+            paths(&["/v/Clip.nfo"])
         );
         assert_eq!(
-            super::nfo_candidates("/tv/Series", true, NfoItemKind::Series),
-            vec![std::path::PathBuf::from("/tv/Series/tvshow.nfo")]
+            own(
+                &at("/v/Song.mkv", false, None, false),
+                NfoItemKind::MusicVideo
+            ),
+            paths(&["/v/Song.nfo"])
+        );
+        // A folder item is its own container.
+        assert_eq!(
+            own(
+                &at("/m/Movie (2020)", true, None, false),
+                NfoItemKind::Movie
+            ),
+            paths(&["/m/Movie (2020)/movie.nfo", "/m/Movie (2020).nfo"])
+        );
+        // Disc structures: DVD adds VIDEO_TS.nfo; discs read <folder>.nfo.
+        assert_eq!(
+            own(
+                &at("/m/Disc", true, Some(r#"{"VideoType":"Dvd"}"#), false),
+                NfoItemKind::Movie
+            ),
+            paths(&[
+                "/m/Disc/VIDEO_TS/VIDEO_TS.nfo",
+                "/m/Disc/movie.nfo",
+                "/m/Disc/Disc.nfo"
+            ])
         );
         assert_eq!(
-            super::nfo_candidates("/tv/Series/Season 01", true, NfoItemKind::Season),
-            vec![std::path::PathBuf::from("/tv/Series/Season 01/season.nfo")]
+            own(
+                &at("/m/Disc", true, Some(r#"{"VideoType":"BluRay"}"#), false),
+                NfoItemKind::Movie
+            ),
+            paths(&["/m/Disc/movie.nfo", "/m/Disc/Disc.nfo"])
         );
         assert_eq!(
-            super::nfo_candidates("/tv/Series/S01E01.mkv", false, NfoItemKind::Episode),
-            vec![std::path::PathBuf::from("/tv/Series/S01E01.nfo")]
+            own(
+                &at(
+                    "/m/Disc",
+                    true,
+                    Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#),
+                    false
+                ),
+                NfoItemKind::Movie
+            ),
+            paths(&["/m/Disc/movie.nfo", "/m/Disc.nfo"])
+        );
+        assert_eq!(
+            own(&at("/tv/Series", true, None, false), NfoItemKind::Series),
+            paths(&["/tv/Series/tvshow.nfo"])
+        );
+        assert_eq!(
+            own(
+                &at("/tv/Series/S01E01.mkv", false, None, false),
+                NfoItemKind::Episode
+            ),
+            paths(&["/tv/Series/S01E01.nfo"])
+        );
+        // A season reads season.nfo, then the series' tvshow.nfo for its name.
+        let season = at("/tv/Series/Season 01", true, None, false);
+        let groups = super::nfo_groups(&season, NfoItemKind::Season);
+        assert_eq!(
+            groups[0],
+            (
+                super::NfoSource::Own,
+                paths(&["/tv/Series/Season 01/season.nfo"])
+            )
+        );
+        assert_eq!(
+            groups[1],
+            (
+                super::NfoSource::SeriesSeason,
+                paths(&["/tv/Series/Season 01/tvshow.nfo", "/tv/Series/tvshow.nfo"])
+            )
         );
     }
 

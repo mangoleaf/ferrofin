@@ -364,6 +364,112 @@ async fn nfo_release_dates_are_read_with_the_saved_pattern() {
     }
 }
 
+/// `MovieNfoSaver.GetMovieSavePaths`: `movie.nfo` is searched before the
+/// file's own `.nfo`, so it wins when both exist.
+#[tokio::test]
+async fn movie_nfo_is_searched_before_the_files_own_sidecar() {
+    let f = Fixture::new(&[MOVIE]).await;
+    let dir = f.media.join("Heat (1995)");
+    std::fs::write(
+        dir.join("movie.nfo"),
+        "<movie><title>From movie.nfo</title></movie>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Heat.nfo"),
+        "<movie><title>From Heat.nfo</title></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(MOVIE).await.name.as_deref(), Some("From movie.nfo"));
+}
+
+/// The Video/MusicVideo readers share the movie parser and search order.
+#[tokio::test]
+async fn music_video_sidecars_are_read() {
+    let f = Fixture::with_type(
+        &["Artist - Song (2001).mkv"],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    std::fs::write(
+        f.media.join("Artist - Song (2001).nfo"),
+        "<musicvideo><title>Local video title</title><plot>Sidecar plot</plot></musicvideo>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let row = f.row("Artist - Song (2001).mkv").await;
+    assert!(row.type_.ends_with(".MusicVideo"), "{}", row.type_);
+    assert_eq!(row.name.as_deref(), Some("Local video title"));
+    assert_eq!(row.overview.as_deref(), Some("Sidecar plot"));
+}
+
+/// `SeasonNfoProvider` reads `season.nfo`; failing that,
+/// `SeriesNfoSeasonProvider` names the season from the series' `tvshow.nfo`.
+#[tokio::test]
+async fn a_season_is_named_from_the_series_nfo_unless_it_has_its_own() {
+    const EPISODE: &str = "Show/Season 01/Show S01E01.mkv";
+    const TVSHOW: &str = "<tvshow><title>Show</title>\
+        <namedseason number=\"1\">First Arc</namedseason>\
+        <namedseason number=\"2\">Second Arc</namedseason></tvshow>";
+    let f = Fixture::with_type(&[EPISODE], CollectionTypeOptions::tvshows).await;
+    std::fs::write(f.media.join("Show/tvshow.nfo"), TVSHOW).unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("First Arc")
+    );
+
+    // A season.nfo that reads takes precedence; tvshow.nfo is not consulted.
+    let season_nfo = f.media.join("Show/Season 01/season.nfo");
+    std::fs::write(&season_nfo, "<season><title>Own Name</title></season>").unwrap();
+    // Newer than the NFO provider's one-minute save tolerance.
+    std::fs::File::options()
+        .write(true)
+        .open(&season_nfo)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(300))
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("Own Name")
+    );
+}
+
+/// Editing the series NFO alone is enough for the next scan to re-read it.
+#[tokio::test]
+async fn a_series_nfo_edit_renames_the_season_on_the_next_scan() {
+    const EPISODE: &str = "Show/Season 01/Show S01E01.mkv";
+    let f = Fixture::with_type(&[EPISODE], CollectionTypeOptions::tvshows).await;
+    let tvshow = f.media.join("Show/tvshow.nfo");
+    std::fs::write(
+        &tvshow,
+        "<tvshow><namedseason number=\"1\">Before</namedseason></tvshow>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("Before")
+    );
+    // The sidecar must be newer than the NFO save tolerance (one minute).
+    std::fs::write(
+        &tvshow,
+        "<tvshow><namedseason number=\"1\">After</namedseason></tvshow>",
+    )
+    .unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(300);
+    std::fs::File::options()
+        .write(true)
+        .open(&tvshow)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row("Show/Season 01").await.name.as_deref(), Some("After"));
+}
+
 #[tokio::test]
 async fn scoped_discovery_ignores_files_and_preserves_metadata_sidecars() {
     let f = Fixture::new(&[MOVIE]).await;
