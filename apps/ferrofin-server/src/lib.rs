@@ -21,6 +21,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+pub mod listen;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
@@ -38,7 +39,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::serve::{Listener as _, ListenerExt as _};
+use axum::serve::Listener as _;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
@@ -534,19 +535,17 @@ async fn serve_once(
     // `Router::layer`, which runs per-matched-route, too late to re-route).
 
     boot_stage(started, "router mounted");
-    let addr = SocketAddr::new(config.bind_addr, config.port);
-    let listener = bind_listener(addr).await?;
-    let bound_addr = listener.local_addr()?;
-    wired.app_host.set_bound_http_port(bound_addr.port());
+    let (listeners, addresses, bound_port) = bind_http_listeners(config, &wired.state)?;
+    wired.app_host.set_bound_http_port(bound_port);
     let discovery = start_discovery(&wired, config.discovery_bind_addr).await;
     let discovery_abort = discovery
         .as_ref()
         .map(tokio::task::JoinHandle::abort_handle);
     boot_stage(started, "listener bound");
-    tracing::info!(%addr, "ferrofin-server listening");
+    tracing::info!(addresses = ?addresses, "ferrofin-server listening");
 
     let serve_result = serve_until_drained(
-        listener,
+        listeners,
         router,
         announce_shutdown(
             shutdown_rx,
@@ -633,7 +632,7 @@ async fn stop_background_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
 /// reading, so a restart during playback never came back. Dropping the serve
 /// future past the deadline aborts the remaining connections.
 async fn serve_until_drained(
-    listener: axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>,
+    listeners: Vec<listen::Listener>,
     router: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     timeout_secs: u32,
@@ -643,25 +642,46 @@ async fn serve_until_drained(
     let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
         .layer(app);
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
-    let serve =
-        axum::serve(
-            listener,
-            // `with_connect_info` so handlers can read the client's socket address
-            // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
-            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                SocketAddr,
-            >(app),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            let _ = drain_started_tx.send(());
+    // One serve loop per listening address, all stopped by the same trigger.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let mut stop = stop_rx.clone();
+        let app = app.clone();
+        servers.spawn(async move {
+            axum::serve(
+                listener,
+                // `with_connect_info` so handlers can read the client's socket address
+                // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
+                axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                    SocketAddr,
+                >(app),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stop.wait_for(|stopped| *stopped).await;
+            })
+            .await
         });
+    }
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stop_tx.send(true);
+        let _ = drain_started_tx.send(());
+    });
     let deadline = async move {
         let _ = drain_started_rx.await;
         tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_secs))).await;
     };
+    let serve = async {
+        while let Some(finished) = servers.join_next().await {
+            finished
+                .context("a listener task failed")?
+                .context("server error")?;
+        }
+        Ok(())
+    };
     tokio::select! {
-        result = serve => result.context("server error"),
+        result = serve => result,
         () = deadline => {
             tracing::warn!(
                 timeout_s = timeout_secs,
@@ -670,6 +690,53 @@ async fn serve_until_drained(
             Ok(())
         }
     }
+}
+
+/// Plans and binds this lifetime's HTTP listeners, returning them with the
+/// addresses they were planned on and the port clients are told about (the
+/// first listener's; every address shares it).
+fn bind_http_listeners(
+    config: &Config,
+    state: &ferrofin_api::state::AppState,
+) -> anyhow::Result<(Vec<listen::Listener>, Vec<SocketAddr>, u16)> {
+    let addresses = listen_addresses(config, state);
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "the network settings leave no address to listen on (IPv4 and IPv6 are both disabled)"
+    );
+    let listeners = listen::bind_all(&addresses)?;
+    let port = listeners
+        .first()
+        .context("no listener was bound")?
+        .local_addr()?
+        .port();
+    Ok((listeners, addresses, port))
+}
+
+/// The addresses this lifetime listens on: the operator's startup bind when
+/// they pinned one, otherwise Jellyfin's `GetAllBindInterfaces` over the saved
+/// network settings (`LocalNetworkAddresses`, `EnableIPv4`/`EnableIPv6`).
+fn listen_addresses(config: &Config, state: &ferrofin_api::state::AppState) -> Vec<SocketAddr> {
+    let interfaces: Vec<listen::BindInterface> = state
+        .network
+        .as_ref()
+        .and_then(|network| network.read().ok())
+        .map(|network| {
+            network
+                .get_all_bind_interfaces(false)
+                .into_iter()
+                .map(|interface| listen::BindInterface {
+                    address: interface.address,
+                    index: u32::try_from(interface.index).unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    listen::plan_addresses(
+        config.bind_addr_explicit.then_some(config.bind_addr),
+        config.port,
+        &interfaces,
+    )
 }
 
 /// Cancels every scheduled task currently running (best-effort: a task that
@@ -752,17 +819,6 @@ impl Signals {
     }
 }
 
-/// Binds the HTTP listener, with Nagle's algorithm off on every connection it
-/// accepts (see [`disable_nagle`]).
-async fn bind_listener(
-    addr: SocketAddr,
-) -> anyhow::Result<axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>> {
-    Ok(tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind {addr}"))?
-        .tap_io(disable_nagle as fn(&mut tokio::net::TcpStream)))
-}
-
 /// Turns Nagle's algorithm off on every accepted connection (`TCP_NODELAY`).
 ///
 /// Kestrel — the server Jellyfin runs on — sets `NoDelay` on accepted sockets by
@@ -782,7 +838,7 @@ async fn bind_listener(
 /// A failure to set the option is logged and ignored: it is an optimisation, not
 /// a correctness requirement, and a connection that cannot take the sockopt must
 /// still be served.
-fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "failed to set TCP_NODELAY on an accepted connection");
     }
@@ -1357,7 +1413,7 @@ mod tests {
     /// (asserted first, so the test fails loudly if the platform ever changes
     /// that premise and makes the assertion below vacuous), and `axum::serve`
     /// adds nothing of its own. Drop the `.tap_io(disable_nagle)` from
-    /// [`bind_listener`] — or stub `disable_nagle` out — and the second
+    /// [`listen::bind`] — or stub `disable_nagle` out — and the second
     /// assertion fails.
     #[tokio::test]
     async fn accepted_connections_have_nagle_disabled() {
@@ -1380,9 +1436,7 @@ mod tests {
         drop((raw, client, plain));
 
         // The real thing: whatever `run` binds must hand out no-delay sockets.
-        let mut listener = super::bind_listener("127.0.0.1:0".parse().expect("addr"))
-            .await
-            .expect("bind");
+        let mut listener = super::listen::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
         let addr = listener.local_addr().expect("addr");
         let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (served, _) = listener.accept().await;

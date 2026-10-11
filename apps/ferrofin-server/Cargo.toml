@@ -45,6 +45,7 @@ tower.workspace = true
 # wasm_plugins integration test: compile the inline-WAT fixture component.
 wat.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
+socket2 = { workspace = true }
 tokio = { workspace = true }
 async-trait.workspace = true
 reqwest.workspace = true

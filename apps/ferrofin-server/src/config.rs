@@ -226,6 +226,12 @@ pub struct Config {
     /// Address the HTTP listener binds to. Parsed from `bind_addr`.
     pub bind_addr: IpAddr,
 
+    /// Whether the operator chose `bind_addr` (flag, `FERROFIN_BIND_ADDR` or
+    /// `config.toml`). When they did, that one address is the listener; when
+    /// they did not, the dashboard's network settings (`LocalNetworkAddresses`,
+    /// `EnableIPv4`/`EnableIPv6`) decide, as Jellyfin's `GetAllBindInterfaces`.
+    pub bind_addr_explicit: bool,
+
     /// Internal discovery transport seam: production uses UDP 7359; test fixtures
     /// disable it or select an isolated loopback endpoint. Not a file/env setting.
     #[doc(hidden)]
@@ -527,11 +533,12 @@ impl Config {
             .or(file.web_dir)
             .unwrap_or_else(|| data_dir.join("web"));
 
-        let bind_addr_str = cli
+        let chosen_bind = cli
             .bind_addr
             .or_else(|| env.var("FERROFIN_BIND_ADDR"))
-            .or(file.bind_addr)
-            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
+            .or(file.bind_addr);
+        let bind_addr_explicit = chosen_bind.is_some();
+        let bind_addr_str = chosen_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
         let bind_addr: IpAddr = bind_addr_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
@@ -637,6 +644,7 @@ impl Config {
             cache_dir,
             web_dir,
             bind_addr,
+            bind_addr_explicit,
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             provider_endpoints: ProviderEndpoints::default(),
             port,
@@ -778,6 +786,7 @@ impl Config {
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
+            bind_addr_explicit: true,
             discovery_bind_addr: None,
             provider_endpoints: ProviderEndpoints::default(),
             port: 0,
