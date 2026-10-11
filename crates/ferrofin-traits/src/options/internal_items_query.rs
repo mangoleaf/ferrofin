@@ -338,6 +338,11 @@ pub struct InternalItemsQuery {
     /// Internal scope used for recursive BoxSet/Playlist reads; filters and
     /// paging apply to the resulting rows, never to traversal intermediates.
     pub descendant_of_id: Option<Uuid>,
+    /// Order the rows by their position in this container's linked children
+    /// (`LinkedChildren.SortOrder`) before any other ordering: a box set whose
+    /// `DisplayOrder` is `Default` lists its members as they were added.
+    /// Internal, set by the library manager, never a client option.
+    pub linked_order_of: Option<Uuid>,
     /// Cached internal root resolution for the row and count statements.
     /// Repositories recompute it when its parent differs from DescendantOfId.
     pub descendant_roots: Option<DescendantQueryRoots>,
@@ -576,6 +581,7 @@ impl Default for InternalItemsQuery {
             folder_query_recursive: false,
             parent_type: None,
             descendant_of_id: None,
+            linked_order_of: None,
             descendant_roots: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),

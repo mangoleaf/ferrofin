@@ -2224,6 +2224,14 @@ pub(crate) fn append_order_by(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
 
     qb.push(" ORDER BY ");
 
+    // A box set listing in its own `Default` order: the members' positions in
+    // the container's linked children lead, whatever else is asked.
+    if let Some(container) = filter.linked_order_of {
+        qb.push(r#"(SELECT lc."SortOrder" FROM "LinkedChildren" lc WHERE lc."ParentId" = "#)
+            .push_bind(guid_to_db(container))
+            .push(r#" AND lc."ChildId" = bi."Id" LIMIT 1) ASC, "#);
+    }
+
     // `UserRootFolder.GetEligibleChildrenForRecursiveChildren` (UserRootFolder.cs:96-102)
     // does `list.AddRange(LibraryManager.RootFolder.VirtualChildren)` — it
     // APPENDS the aggregate's plug-in folders after its own children rather

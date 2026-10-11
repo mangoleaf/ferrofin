@@ -3015,9 +3015,20 @@ impl FerrofinDtoService {
         // series' episode ordering and a collection's child ordering, both
         // kept in the `Data` blob. The web editor's "Display order" select
         // reads it.
-        if matches!(kind, BaseItemKind::Series | BaseItemKind::BoxSet) {
+        if kind == BaseItemKind::Series {
             let order = ferrofin_providers::tvdb::display_order_of(item.data.as_deref());
             dto.display_order = Some(order).filter(|order| !order.is_empty());
+        } else if kind == BaseItemKind::BoxSet {
+            // `BoxSet`'s constructor sets `DisplayOrder = "PremiereDate"`, which
+            // stands until the set stores one of its own (a stored blank one
+            // is written back as it is).
+            let data = crate::item_data::parse_data(item.data.as_deref());
+            dto.display_order = Some(
+                data.get("DisplayOrder")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("PremiereDate")
+                    .to_owned(),
+            );
         }
 
         // Production locations.

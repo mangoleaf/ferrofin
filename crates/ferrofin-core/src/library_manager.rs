@@ -1230,9 +1230,14 @@ impl FerrofinLibraryManager {
             return Ok(None);
         }
         let should_collapse = folder_should_collapse(&resolved, movies, shows);
+        // `BoxSet.GetChildren` orders the set's direct members by its
+        // `DisplayOrder` (`BoxSet.cs:116-132`) unless the request names an order
+        // of its own. A recursive listing is the repository query, which does
+        // not (measured against Jellyfin 12.2: name order whatever the set says).
+        self.apply_box_set_order(&mut resolved).await?;
         // These domain overrides never substitute in plain Folder views.
-        // Preserve their existing browse consumers; full BoxSet DisplayOrder
-        // and music child-selection semantics are separate source gaps.
+        // Preserve their existing browse consumers; music child-selection
+        // semantics are a separate source gap.
         if !resolved.recursive
             && matches!(
                 resolved.parent_type,
@@ -1475,6 +1480,36 @@ impl FerrofinLibraryManager {
             }
         };
         Ok(children)
+    }
+
+    /// Orders a box set's listing by its `DisplayOrder`: `Enum.TryParse<
+    /// ItemSortBy>` of the stored text (a name, or a number — a value that is
+    /// not an `ItemSortBy` falls back to `PremiereDate`, the constructor's
+    /// default for a set that stored none), ascending; `Default` keeps the order
+    /// the members were added in.
+    async fn apply_box_set_order(
+        &self,
+        query: &mut InternalItemsQuery,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        if query.parent_type != Some(BaseItemKind::BoxSet)
+            || query.recursive
+            || !query.order_by.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(set) = self.items.retrieve_item(query.parent_id).await? else {
+            return Ok(());
+        };
+        let data = crate::item_data::parse_data(set.data.as_deref());
+        let stored = data.get("DisplayOrder").and_then(serde_json::Value::as_str);
+        let sort_by = box_set_sort_by(stored);
+        if sort_by == ItemSortBy::Default {
+            query.linked_order_of = Some(query.parent_id);
+        } else {
+            query.order_by = vec![(sort_by, SortOrder::Ascending)];
+        }
+        Ok(())
     }
 
     /// Substitute eligible movie or series children through CollectionManager.
@@ -2755,6 +2790,29 @@ impl FerrofinLibraryManager {
             && queue.lane.is_empty()
             && queue.serving.is_empty()
     }
+}
+
+/// `BoxSet.Sort`'s `Enum.TryParse<ItemSortBy>(DisplayOrder)`: the name or the
+/// number of an `ItemSortBy`, case-sensitively; a set that stored nothing
+/// carries the constructor's `PremiereDate`, and anything unparseable sorts by it.
+fn box_set_sort_by(stored: Option<&str>) -> ferrofin_model::live_tv::ItemSortBy {
+    use ferrofin_model::json::enums::JsonEnum as _;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let Some(text) = stored else {
+        return ItemSortBy::PremiereDate;
+    };
+    let by_name = ItemSortBy::members()
+        .iter()
+        .find(|(name, _)| *name == text)
+        .map(|(_, value)| *value);
+    let by_number = text
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|value| ItemSortBy::members().iter().any(|(_, v)| v == value));
+    by_name
+        .or(by_number)
+        .map_or(ItemSortBy::PremiereDate, ItemSortBy::from_json_value)
 }
 
 #[cfg(test)]
@@ -5814,6 +5872,147 @@ mod tests {
                 ..Default::default()
             }
         ));
+    }
+
+    /// `BoxSet.GetChildren` sorts the set's direct members by its
+    /// `DisplayOrder` (default `PremiereDate`; `Default` keeps the order the
+    /// members were added in; an unparseable one is `PremiereDate`) unless the
+    /// request orders them itself — read off a Jellyfin 12.2 oracle on a set
+    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one set, every display order
+    async fn a_box_set_lists_its_members_by_its_display_order() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
+        let db = test_db().await;
+        let temporary_paths = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            temporary_paths.path().to_string_lossy().into_owned(),
+        ));
+        let library = Arc::new(
+            base.with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+                .with_visibility(visibility),
+        );
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::CollectionFolder, "Library").await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> = {
+            let temp = temporary_paths.path();
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                temp.to_str().unwrap(),
+                temp.join("log").to_str().unwrap(),
+                temp.join("config").to_str().unwrap(),
+                temp.join("cache").to_str().unwrap(),
+                temp.join("web").to_str().unwrap(),
+            ))
+        };
+        let collections: Arc<dyn CollectionManager> =
+            Arc::new(crate::collection_manager::FerrofinCollectionManager::new(
+                db.clone(),
+                library.clone(),
+                Arc::new(
+                    crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
+                ),
+                paths,
+            ));
+        library.attach_collections(&collections);
+        let mut members = Vec::new();
+        for (name, year) in [
+            ("Zeta", 2001),
+            ("Alpha", 2003),
+            ("Mid", 1999),
+            ("Beta", 2002),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.parent_id = Some(guid_to_db(folder));
+            row.top_parent_id = Some(guid_to_db(folder));
+            row.sort_name = Some(name.to_lowercase());
+            row.clean_name = Some(crate::text_util::get_clean_value(name));
+            row.premiere_date = chrono::NaiveDate::from_ymd_opt(year, 6, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| date.and_utc());
+            row.production_year = Some(i64::from(year));
+            library.persistence.save_items(&[row]).await.unwrap();
+            members.push(id);
+        }
+        let set = collections
+            .create_collection(&CollectionCreationOptions {
+                name: "Box".into(),
+                item_id_list: members,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let set_id = Uuid::parse_str(&set.id).unwrap();
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|item| item.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let list = |recursive: bool, order: Vec<(ItemSortBy, SortOrder)>| {
+            let query = InternalItemsQuery {
+                user: Some(user.clone()),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                recursive,
+                apply_folder_display_options: true,
+                order_by: order,
+                ..Default::default()
+            };
+            let library = Arc::clone(&library);
+            async move { names(library.query_items(&query).await.unwrap()) }
+        };
+        let set_display_order = |value: Option<&'static str>| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, set_id).await;
+                let mut data = crate::item_data::parse_data(row.data.as_deref());
+                match value {
+                    Some(value) => data.insert("DisplayOrder".to_owned(), value.into()),
+                    None => data.remove("DisplayOrder"),
+                };
+                row.data = Some(serde_json::Value::Object(data).to_string());
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+
+        // Nothing stored: the constructor's `PremiereDate`.
+        set_display_order(None).await;
+        let by_date = ["Mid", "Zeta", "Beta", "Alpha"];
+        assert_eq!(list(false, vec![]).await, by_date);
+        let by_name = ["Alpha", "Beta", "Mid", "Zeta"];
+        assert_eq!(
+            list(true, vec![]).await,
+            by_name,
+            "a recursive listing is the repository query, which ignores the set's order"
+        );
+        // An order the request names wins.
+        assert_eq!(
+            list(false, vec![(ItemSortBy::SortName, SortOrder::Ascending)]).await,
+            ["Alpha", "Beta", "Mid", "Zeta"]
+        );
+        // The set's own: a name, a number, an unparseable text.
+        set_display_order(Some("SortName")).await;
+        assert_eq!(list(false, vec![]).await, ["Alpha", "Beta", "Mid", "Zeta"]);
+        set_display_order(Some("10")).await;
+        assert_eq!(list(false, vec![]).await, ["Alpha", "Beta", "Mid", "Zeta"]);
+        for unparseable in ["premieredate", "", "Nonsense"] {
+            set_display_order(Some(unparseable)).await;
+            assert_eq!(list(false, vec![]).await, by_date, "{unparseable:?}");
+        }
+        // `Default`: the order the members were added in.
+        set_display_order(Some("Default")).await;
+        let added = ["Zeta", "Alpha", "Mid", "Beta"];
+        assert_eq!(list(false, vec![]).await, added);
+        assert_eq!(list(true, vec![]).await, by_name);
     }
 
     #[tokio::test]

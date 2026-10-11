@@ -1096,6 +1096,101 @@ async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() 
     assert_eq!(open.tags.as_deref(), Some("Keep|New"));
 }
 
+/// `IHasDisplayOrder.DisplayOrder = request.DisplayOrder` (`:412-415`): a box
+/// set's and a series' display order is written to the row as sent, a null
+/// clears it, and no other kind keeps one; a series whose order changed
+/// (compared case-insensitively, null as empty) queues a `FullRefresh` that
+/// replaces its metadata (`:83-86,120-132`) — a box set's change does not.
+#[tokio::test]
+async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
+    let id = Uuid::from_u128(0xD0);
+    for (kind, stored, sent, expected_data, refreshes) in [
+        (
+            "Movies.BoxSet",
+            None,
+            r#","DisplayOrder":"SortName""#,
+            Some(r#"{"DisplayOrder":"SortName"}"#),
+            false,
+        ),
+        (
+            "Movies.BoxSet",
+            Some(r#"{"DisplayOrder":"Default"}"#),
+            "",
+            None,
+            false,
+        ),
+        (
+            "TV.Series",
+            Some(r#"{"DisplayOrder":"dvd"}"#),
+            r#","DisplayOrder":"absolute""#,
+            Some(r#"{"DisplayOrder":"absolute"}"#),
+            true,
+        ),
+        // Case alone is no change; a null one against nothing is none either.
+        (
+            "TV.Series",
+            Some(r#"{"DisplayOrder":"DVD"}"#),
+            r#","DisplayOrder":"dvd""#,
+            Some(r#"{"DisplayOrder":"dvd"}"#),
+            false,
+        ),
+        ("TV.Series", None, "", None, false),
+        // Clearing an order the series had is a change.
+        (
+            "TV.Series",
+            Some(r#"{"DisplayOrder":"dvd"}"#),
+            "",
+            None,
+            true,
+        ),
+        // A movie keeps no display order, whatever is posted.
+        (
+            "Movies.Movie",
+            None,
+            r#","DisplayOrder":"dvd""#,
+            None,
+            false,
+        ),
+    ] {
+        let tree = Tree {
+            root: Some(BaseItemEntity {
+                type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+                is_folder: true,
+                path: Some("/media/library/Item".to_owned()),
+                data: stored.map(str::to_owned),
+                ..base_item_entity(id)
+            }),
+            ..Tree::default()
+        };
+        let library = post_update(
+            tree_library(id, tree),
+            format!(r#"{{"Id":"{id}","Name":"X"{sent}}}"#),
+        )
+        .await;
+        let written = library.updated.lock().unwrap().clone();
+        let row = written.last().expect("the item is written");
+        assert_eq!(
+            row.data.as_deref(),
+            expected_data,
+            "{kind} {stored:?} + {sent:?}"
+        );
+        let scans = library.refresh_scans.lock().unwrap().clone();
+        assert_eq!(
+            scans.len(),
+            usize::from(refreshes),
+            "{kind} {stored:?} + {sent:?}: {scans:?}"
+        );
+        if let Some((_, options)) = scans.first() {
+            assert_eq!(
+                options.metadata_refresh_mode,
+                MetadataRefreshMode::FullRefresh
+            );
+            assert_eq!(options.image_refresh_mode, MetadataRefreshMode::FullRefresh);
+            assert!(options.replace_all_metadata && !options.replace_all_images);
+        }
+    }
+}
+
 /// The season and album walks (`:357-381`): episodes / tracks take the
 /// rating and tag edit, not the series name.
 #[tokio::test]
