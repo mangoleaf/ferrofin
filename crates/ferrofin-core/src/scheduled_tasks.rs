@@ -380,12 +380,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///
 /// Callers must hold the lock guarding `value` across this call, so concurrent
 /// writers cannot lose each other's updates.
-fn write_store<T: serde::Serialize>(path: &std::path::Path, value: &T, store: &str) {
+///
+/// A failure is logged and returned, so a caller whose success depends on the
+/// file (a trigger save) can refuse to report it.
+fn write_store<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+    store: &str,
+) -> Result<(), String> {
     let bytes = match serde_json::to_vec_pretty(value) {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(store, error = %e, "failed to serialize task store");
-            return;
+            return Err(e.to_string());
         }
     };
     if let Some(parent) = path.parent() {
@@ -398,12 +405,14 @@ fn write_store<T: serde::Serialize>(path: &std::path::Path, value: &T, store: &s
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = write_synced(&tmp, &bytes) {
         tracing::warn!(store, path = %tmp.display(), error = %e, "failed to persist task store");
-        return;
+        return Err(e.to_string());
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         tracing::warn!(store, path = %path.display(), error = %e, "failed to persist task store");
         let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
     }
+    Ok(())
 }
 
 /// Writes `bytes` to `path` and flushes them to the device, so the rename that
@@ -476,12 +485,20 @@ impl FerrofinTaskManager {
     /// The map's lock is held across the write so two concurrent savers cannot
     /// lose each other's update (or interleave two truncating writes into
     /// invalid JSON).
-    fn persist_overrides(&self) {
-        let Some(path) = lock(&self.store_path).clone() else {
-            return;
-        };
-        let overrides = lock(&self.stored_overrides);
-        write_store(&path, &*overrides, "task triggers");
+    ///
+    /// The key's triggers join the stored map only once the write succeeds, so
+    /// a failed save leaves both the file and the in-memory overrides as they
+    /// were (`ScheduledTaskWorker.Triggers` saves before it assigns).
+    fn persist_overrides(&self, key: &str, triggers: &[TaskTriggerInfo]) -> Result<(), String> {
+        let path = lock(&self.store_path).clone();
+        let mut overrides = lock(&self.stored_overrides);
+        let mut next = overrides.clone();
+        next.insert(key.to_owned(), triggers.to_vec());
+        if let Some(path) = path {
+            write_store(&path, &next, "task triggers")?;
+        }
+        *overrides = next;
+        Ok(())
     }
 
     /// Points the registry at its run-history store, loading any previously
@@ -516,7 +533,8 @@ impl FerrofinTaskManager {
         };
         let mut results = lock(&self.stored_results);
         results.insert(key.to_owned(), result.clone());
-        write_store(&path, &*results, "task history");
+        // Already logged; a history write never fails the run it describes.
+        let _ = write_store(&path, &*results, "task history");
     }
 
     /// Registers a task, replacing any existing task with the same key.
@@ -1016,11 +1034,20 @@ impl FerrofinTaskManager {
                 "unrecognized task trigger type or weekday",
             ));
         }
+        if !lock(&self.tasks).contains_key(key) {
+            return Err(ServiceError::not_found(format!("scheduled task {key}")));
+        }
+        // Save first: a failed write leaves the task's triggers as they were
+        // and the caller sees the failure, as upstream's `SaveTriggers` throws
+        // before it assigns.
+        self.persist_overrides(key, triggers).map_err(|error| {
+            ServiceError::backend(format!("could not save the triggers of {key}: {error}"))
+        })?;
         {
             let mut guard = lock(&self.tasks);
-            let reg = guard
-                .get_mut(key)
-                .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+            let Some(reg) = guard.get_mut(key) else {
+                return Err(ServiceError::not_found(format!("scheduled task {key}")));
+            };
             reg.triggers_override = Some(triggers.to_vec());
             reg.trigger_fires.clear();
             // The new trigger set only ever arms *future* occurrences; without
@@ -1028,8 +1055,6 @@ impl FerrofinTaskManager {
             // occurrence look due again on the next sweep.
             reg.triggers_since = Some(Utc::now());
         }
-        lock(&self.stored_overrides).insert(key.to_owned(), triggers.to_vec());
-        self.persist_overrides();
         Ok(())
     }
 
@@ -2101,6 +2126,37 @@ mod tests {
         mgr.run_now("counting").await.expect("run");
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    /// `ScheduledTaskWorker.Triggers` saves the file before it assigns: a
+    /// failed write is reported to the caller and leaves the task's triggers,
+    /// and the stored overrides, as they were.
+    #[tokio::test]
+    async fn a_failed_trigger_save_is_reported_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the store's directory should be: the write cannot land.
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_trigger_store(blocker.join("triggers.json"));
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let triggers = vec![TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(42),
+            ..TaskTriggerInfo::default()
+        }];
+
+        let error = mgr.set_triggers("counting", &triggers).unwrap_err();
+        assert!(
+            error.to_string().contains("could not save the triggers"),
+            "{error}"
+        );
+        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        assert!(super::lock(&mgr.stored_overrides).is_empty());
     }
 
     #[tokio::test]
