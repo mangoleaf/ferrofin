@@ -16,7 +16,7 @@ use ferrofin_traits::media_encoding::TranscodingJobType;
 use crate::encoder::FfmpegVersion;
 use crate::encoding_helper::EncodingJobInfo;
 use crate::encoding_helper::hw::versions::{
-    MIN_FFMPEG_READRATE_CATCHUP_OPTION, MIN_FFMPEG_READRATE_OPTION,
+    MIN_FFMPEG_FPS_MODE_OPTION, MIN_FFMPEG_READRATE_CATCHUP_OPTION, MIN_FFMPEG_READRATE_OPTION,
 };
 
 use super::segment_transcoder::TranscodeChild;
@@ -26,6 +26,60 @@ const CLEAN_INTERVAL: Duration = Duration::from_secs(20);
 const DELETE_DELAY: Duration = Duration::from_millis(1500);
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 const MIN_RUNTIME_TICKS: i64 = 300 * 10_000_000;
+
+/// The input timestamp-sync options `EncodingHelper.AttachMediaSourceInfo`
+/// selects and `GetInputModifier` emits ahead of the pacing: a native-rate
+/// source that is not a segmented live stream (and a local `wtv` file) syncs
+/// audio with `-async 1` and, below ffmpeg 5.1 (where `-fps_mode` cannot be an
+/// input option), video with `-vsync -1`.
+#[must_use]
+pub fn input_sync_arguments(
+    state: &EncodingJobInfo,
+    version: Option<FfmpegVersion>,
+) -> Vec<String> {
+    let source = &state.media_source;
+    let wtv_file = source.protocol == MediaProtocol::File
+        && source
+            .container
+            .as_deref()
+            .is_some_and(|container| container.eq_ignore_ascii_case("wtv"));
+    if !((source.read_at_native_framerate && !state.is_segmented_live_stream()) || wtv_file) {
+        return Vec::new();
+    }
+    let mut arguments = vec!["-async".to_owned(), "1".to_owned()];
+    if version.is_some_and(|version| version < MIN_FFMPEG_FPS_MODE_OPTION) {
+        arguments.extend(["-vsync".to_owned(), "-1".to_owned()]);
+    }
+    arguments
+}
+
+/// The input options `GetInputModifier` emits after the pacing and that the
+/// live-TV tuner settings drive: `-fflags +igndts` for a source that ignores
+/// input DTS (`IgnoreInputDts`), then the looping reconnect options for a
+/// source that `RequiresLooping` (an M3U tuner with stream looping).
+#[must_use]
+pub fn input_source_arguments(state: &EncodingJobInfo) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if state.media_source.ignore_dts {
+        arguments.extend(["-fflags".to_owned(), "+igndts".to_owned()]);
+    }
+    if state.media_source.requires_looping {
+        arguments.extend(
+            [
+                "-stream_loop",
+                "-1",
+                "-reconnect_at_eof",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    arguments
+}
 
 /// Input pacing required by `EncodingHelper.GetInputModifier`.
 ///
@@ -531,6 +585,68 @@ mod tests {
         .unwrap();
         assert_eq!(removed.lock().unwrap().len(), 1);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// `AttachMediaSourceInfo` + `GetInputModifier`: a native-rate source that
+    /// is not a segmented live stream (or a local `wtv` file) syncs audio with
+    /// `-async 1`, and video with `-vsync -1` only below ffmpeg 5.1.
+    #[test]
+    fn native_rate_sources_sync_their_input_timestamps() {
+        let mut state = state();
+        // Nothing to sync for an ordinary file.
+        assert!(input_sync_arguments(&state, None).is_empty());
+
+        state.media_source.read_at_native_framerate = true;
+        state.run_time_ticks = Some(600 * 10_000_000);
+        assert_eq!(input_sync_arguments(&state, None), ["-async", "1"]);
+        assert_eq!(
+            input_sync_arguments(&state, Some(FfmpegVersion::new(5, 0))),
+            ["-async", "1", "-vsync", "-1"]
+        );
+        assert_eq!(
+            input_sync_arguments(&state, Some(FfmpegVersion::new(5, 1))),
+            ["-async", "1"]
+        );
+        // A segmented live stream (HLS, no runtime) is excluded.
+        state.transcoding_type = TranscodingJobType::Hls;
+        state.run_time_ticks = None;
+        assert!(input_sync_arguments(&state, None).is_empty());
+
+        // A local wtv recording syncs whatever its rate flag.
+        state.media_source.read_at_native_framerate = false;
+        state.media_source.protocol = MediaProtocol::File;
+        state.media_source.container = Some("WTV".to_owned());
+        assert_eq!(input_sync_arguments(&state, None), ["-async", "1"]);
+        state.media_source.protocol = MediaProtocol::Http;
+        assert!(input_sync_arguments(&state, None).is_empty());
+    }
+
+    /// `IgnoreInputDts` → `-fflags +igndts`; `RequiresLooping` → the loop and
+    /// reconnect options, in that order.
+    #[test]
+    fn ignore_dts_and_stream_looping_reach_the_input_options() {
+        let mut state = state();
+        assert!(input_source_arguments(&state).is_empty());
+        state.media_source.ignore_dts = true;
+        assert_eq!(input_source_arguments(&state), ["-fflags", "+igndts"]);
+        state.media_source.requires_looping = true;
+        assert_eq!(
+            input_source_arguments(&state),
+            [
+                "-fflags",
+                "+igndts",
+                "-stream_loop",
+                "-1",
+                "-reconnect_at_eof",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "2",
+            ]
+        );
+        state.media_source.ignore_dts = false;
+        assert_eq!(input_source_arguments(&state)[0], "-stream_loop");
     }
 
     #[test]

@@ -1379,12 +1379,23 @@ impl FerrofinStreamStatePlanner {
         args.push("200M".to_owned());
         push_split(&mut args, "-probesize");
         args.push("1G".to_owned());
+        // `GetInputModifier`: timestamp sync, then pacing, then the options
+        // the live-TV source settings drive (ignore DTS, stream looping).
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
+                state,
+                caps.ffmpeg_version(),
+            ),
+        );
         args.extend(
             ferrofin_mediaencoding::transcoding::segment_cleaner::input_rate_arguments(
                 state,
                 options,
                 caps.ffmpeg_version(),
             ),
+        );
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(state),
         );
         push_split(&mut args, "-i");
         let mut input_source = state.media_source.clone();
@@ -3477,6 +3488,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.segment_length_ms, 3000);
+    }
+
+    /// The live-TV tuner settings reach the transcode's input options in
+    /// `GetInputModifier`'s order: timestamp sync, pacing, `-fflags +igndts`,
+    /// then the looping reconnect options — all ahead of `-i`, none after.
+    #[tokio::test]
+    async fn tuner_input_settings_become_ordered_input_options() {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        src.read_at_native_framerate = true;
+        src.ignore_dts = true;
+        src.requires_looping = true;
+        let capabilities = FfmpegCapabilities::builder()
+            .ffmpeg_version(FfmpegVersion::new(5, 0))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![src],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities,
+            EncodingOptions::default(),
+        );
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let input = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "-i")
+            .unwrap();
+        let before = plan.arguments[..input].join(" ");
+        // Version 5.0 has neither `-fps_mode` nor the read-rate catch-up.
+        let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
+            -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
+        assert!(before.contains(expected), "{before}");
+        let after = plan.arguments[input + 1..].join(" ");
+        assert!(
+            !after.contains("igndts") && !after.contains("stream_loop"),
+            "{after}"
+        );
     }
 
     #[tokio::test]
