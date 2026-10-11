@@ -145,6 +145,10 @@ async fn a_location_is_a_folder_its_items_hang_off() {
     );
     assert_eq!(folder.parent_id, Some(guid_to_db(lib.aggregate)));
     assert_eq!(folder.top_parent_id, Some(guid_to_db(location)));
+    // Stored as Jellyfin stores a folder: `MediaType` `Unknown`, no
+    // `DateModified` (D2).
+    assert_eq!(folder.media_type.as_deref(), Some("Unknown"));
+    assert_eq!(folder.date_modified, None);
 
     let cf = lib.row(lib.cf).await.expect("collection folder");
     let data: serde_json::Value =
@@ -163,6 +167,10 @@ async fn a_location_is_a_folder_its_items_hang_off() {
     let row = lib.row(movie).await.expect("movie");
     assert_eq!(row.top_parent_id, Some(guid_to_db(location)));
     assert_eq!(row.parent_id, Some(guid_to_db(location)));
+    // `IsMovie` is a Live TV program's flag (`IHasProgramAttributes`): a
+    // movie stores false, as Jellyfin's do.
+    assert!(!row.is_movie);
+    assert_eq!(row.media_type.as_deref(), Some("Video"));
     let mut expected = vec![
         guid_to_db(lib.cf),
         guid_to_db(location),
@@ -270,11 +278,16 @@ async fn a_removed_location_takes_its_folder_and_items() {
         .add_virtual_folder("Empty", None, &LibraryOptions::default())
         .await
         .expect("add an empty library");
-    let rescan = lib
-        .scanner
-        .scan_all()
+    lib.scanner.scan_all().await.expect("held");
+    assert!(
+        lib.row(ronin).await.is_some(),
+        "held while a library lists no location"
+    );
+    lib.vf
+        .remove_virtual_folder("Empty")
         .await
-        .expect("rescan with an empty library");
+        .expect("remove the empty library");
+    let rescan = lib.scanner.scan_all().await.expect("rescan");
     assert_eq!(
         rescan.removed, 2,
         "the location's folder and its movie: {rescan:?}"
@@ -491,7 +504,10 @@ async fn the_first_path_refresh_provisions_its_physical_parent() {
 }
 
 #[tokio::test]
-async fn removing_the_last_library_prunes_its_media_on_the_next_scan() {
+/// With no library configured nothing is pruned (an unreadable configuration
+/// must not read as every location removed); the first scan once a library
+/// is configured again prunes what the removed one held.
+async fn removing_the_last_library_prunes_its_media_once_a_library_is_configured() {
     let lib = Library::new(&["Heat/Heat.mkv"]).await;
     lib.scanner.scan_all().await.unwrap();
     let movie = derive_item_id(
@@ -504,6 +520,26 @@ async fn removing_the_last_library_prunes_its_media_on_the_next_scan() {
         lib.row(movie).await.is_some(),
         "refresh false preserves the physical row"
     );
+    lib.scanner.scan_all().await.unwrap();
+    assert!(
+        lib.row(movie).await.is_some(),
+        "held while no library is configured"
+    );
+    let other = lib.media.parent().expect("media parent").join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    lib.vf
+        .add_virtual_folder(
+            "Other",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: other.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
     lib.scanner.scan_all().await.unwrap();
     assert!(lib.row(movie).await.is_none());
     assert!(lib.row(lib.location()).await.is_none());
@@ -610,8 +646,9 @@ async fn disabling_photos_does_not_prune_an_unreachable_location() {
 }
 
 /// `MovieResolver` in a home-video library (`ResolveVideo<Video>`,
-/// `parseName: false`): every video file is a plain `Video` in a mixed folder,
-/// named by its file stem with no year read from it — a lone file in its own
+/// `parseName: false`): every video file is a plain `Video`, named by its file
+/// stem with no year read from it, in a mixed folder at the library root and
+/// not when alone in a folder (`ResolveVideos`) — a lone file in its own
 /// folder is no title's "own-folder movie" there (`FindMovie` only makes one
 /// outside photo collections). The movie and music-video libraries keep their
 /// own kinds and naming.
@@ -627,10 +664,10 @@ async fn a_home_video_library_resolves_plain_videos_named_by_their_file_stem() {
     )
     .await;
     lib.scanner.scan_all().await.unwrap();
-    for (file, name) in [
-        ("Charlie Video.mkv", "Charlie Video"),
-        ("Trips/Beach Day (2021).mkv", "Beach Day (2021)"),
-        ("Trips/Solo/Only.mkv", "Only"),
+    for (file, name, mixed) in [
+        ("Charlie Video.mkv", "Charlie Video", true),
+        ("Trips/Beach Day (2021).mkv", "Beach Day (2021)", false),
+        ("Trips/Solo/Only.mkv", "Only", false),
     ] {
         let path = lib.media.join(file).to_string_lossy().into_owned();
         let video = lib
@@ -644,7 +681,7 @@ async fn a_home_video_library_resolves_plain_videos_named_by_their_file_stem() {
         assert_eq!(video.name.as_deref(), Some(name), "{file}");
         assert_eq!(video.production_year, None, "{file}: no year from the name");
         assert!(!video.is_movie, "{file}");
-        assert!(video.is_in_mixed_folder, "{file}");
+        assert_eq!(video.is_in_mixed_folder, mixed, "{file}");
         assert_eq!(video.media_type.as_deref(), Some("Video"), "{file}");
         assert!(
             lib.row(derive_item_id(BaseItemKind::Movie, &path).unwrap())
@@ -675,7 +712,11 @@ async fn a_home_video_library_resolves_plain_videos_named_by_their_file_stem() {
         .await
         .expect("a movie");
     assert_eq!(heat.name.as_deref(), Some("Heat (1995)"));
-    assert!(heat.is_movie);
+    assert!(
+        heat.type_.ends_with(".Movies.Movie"),
+        "{}: a movie stays a Movie",
+        heat.type_
+    );
     let clips = Library::of_type(
         &["Artist - Song (2001).mkv"],
         CollectionTypeOptions::musicvideos,
@@ -699,12 +740,11 @@ async fn a_home_video_library_resolves_plain_videos_named_by_their_file_stem() {
     assert!(!clip.is_movie);
 }
 
-/// A home video an earlier scan stored as a `Movie` keeps its row — id, and so
-/// its user data and links — when the scan resolves it as a `Video`: the type
-/// moves, no second row appears, and the old `Movie` identity is not left
-/// behind.
+/// A home video an earlier scan stored as a `Movie` moves to the id Jellyfin
+/// keys a `Video` at its path by (the kind is part of the id), its row with
+/// it: no second row appears, and the old `Movie` identity is not left behind.
 #[tokio::test]
-async fn a_home_video_stored_as_a_movie_keeps_its_row_when_it_becomes_a_video() {
+async fn a_home_video_stored_as_a_movie_moves_to_the_videos_id() {
     let lib = Library::of_type(&["Charlie Video.mkv"], CollectionTypeOptions::homevideos).await;
     let path = lib
         .media
@@ -730,9 +770,14 @@ async fn a_home_video_stored_as_a_movie_keeps_its_row_when_it_becomes_a_video() 
     lib.scanner.scan_all().await.unwrap();
     lib.scanner.scan_all().await.unwrap();
 
-    let kept = lib.row(movie_id).await.expect("the row survives");
-    assert_eq!(kept.type_, "MediaBrowser.Controller.Entities.Video");
-    assert!(!kept.is_movie);
+    assert!(
+        lib.row(movie_id).await.is_none(),
+        "the Movie identity is gone"
+    );
+    let video_id = derive_item_id(BaseItemKind::Video, &path).unwrap();
+    let moved = lib.row(video_id).await.expect("the row moved");
+    assert_eq!(moved.type_, "MediaBrowser.Controller.Entities.Video");
+    assert!(!moved.is_movie);
     let at_path: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Path" = ?1"#)
         .bind(&path)
         .fetch_one(lib.db.pool())
@@ -877,4 +922,114 @@ async fn plain_subfolders_of_a_movie_library_are_folders_that_parent_their_title
     assert!(lib.row(heat).await.is_none());
     assert!(lib.row(action).await.is_some() && lib.row(ronin).await.is_some());
     let _ = location;
+}
+
+/// A removed location's movie goes with its folder (the stale-row prune and
+/// `prune_orphan_locations` both reach it): its history is detached once —
+/// one placeholder copy, one snapshot — and the location coming back
+/// recovers it onto the movie's same id, consuming both.
+#[tokio::test]
+async fn a_removed_locations_history_is_detached_once_and_recovered() {
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let more = lib.media.with_file_name("more");
+    std::fs::create_dir_all(more.join("Ronin (1998)")).expect("mkdir");
+    std::fs::write(more.join("Ronin (1998)/Ronin (1998).mkv"), b"").expect("write");
+    let more_path = more.to_string_lossy().into_owned();
+    let location = MediaPathInfo {
+        path: more_path.clone(),
+    };
+    lib.vf
+        .add_media_path("Movies", &location)
+        .await
+        .expect("add location");
+    lib.scanner.scan_all().await.expect("scan");
+    let ronin = derive_item_id(
+        BaseItemKind::Movie,
+        &more.join("Ronin (1998)/Ronin (1998).mkv").to_string_lossy(),
+    )
+    .expect("id");
+    assert!(lib.row(ronin).await.is_some());
+    let user = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, ?2, upper(?2))"#,
+    )
+    .bind(guid_to_db(user))
+    .bind(user.simple().to_string())
+    .execute(lib.db.writer())
+    .await
+    .expect("user");
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+           "PlayCount", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, 1, 2, 77, 1)"#,
+    )
+    .bind(guid_to_db(ronin))
+    .bind(guid_to_db(user))
+    .bind(ronin.to_string())
+    .execute(lib.db.writer())
+    .await
+    .expect("user data");
+    let history = || async {
+        sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+            r#"SELECT "ItemId", "CustomDataKey", "PlaybackPositionTicks", "RetentionDate"
+               FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_all(lib.db.pool())
+        .await
+        .expect("history")
+    };
+    let snapshots = || async {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(ronin))
+        .fetch_one(lib.db.pool())
+        .await
+        .expect("snapshots")
+    };
+
+    lib.vf
+        .remove_media_path("Movies", &more_path)
+        .await
+        .expect("remove location");
+    lib.scanner.scan_all().await.expect("prune");
+    assert!(lib.row(ronin).await.is_none(), "the movie went with it");
+    let detached = history().await;
+    assert_eq!(detached.len(), 1, "detached once: {detached:?}");
+    assert_eq!(
+        (
+            detached[0].0.as_str(),
+            detached[0].1.as_str(),
+            detached[0].2
+        ),
+        (
+            ferrofin_db::PLACEHOLDER_ITEM_ID,
+            ronin.to_string().as_str(),
+            77
+        )
+    );
+    assert!(detached[0].3.is_some(), "with a retention date");
+    assert_eq!(snapshots().await, 1);
+
+    lib.vf
+        .add_media_path("Movies", &location)
+        .await
+        .expect("re-add location");
+    lib.scanner.scan_all().await.expect("rescan");
+    assert!(lib.row(ronin).await.is_some(), "the movie is back");
+    assert_eq!(
+        history().await,
+        vec![(guid_to_db(ronin), ronin.to_string(), 77, None)],
+        "recovered once onto its id"
+    );
+    assert_eq!(snapshots().await, 0, "the snapshot is consumed");
 }

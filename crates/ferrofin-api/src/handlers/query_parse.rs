@@ -16,8 +16,7 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::value::{Error as ValueError, StrDeserializer};
-use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
+use serde::de::{self, DeserializeOwned, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
 
@@ -42,39 +41,19 @@ where
     raw.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter_map(deserialize_enum_token_ci)
+        .filter_map(deserialize_token)
         .collect()
 }
 
-/// Deserializes one enum token, retrying case-insensitively on a miss.
-///
-/// The retry recovers the type's accepted spellings from serde's own
-/// "unknown variant `X`, expected one of `A`, `B`" error message — the only
-/// way to enumerate a derived enum's variants without adding a reflection
-/// dependency or hand-maintained variant lists. The message shape is pinned by
-/// the tests below, so a serde format change fails loudly here, not in an API
-/// handler.
-fn deserialize_enum_token_ci<T>(token: &str) -> Option<T>
+/// Converts one collection token as the element type's `TypeConverter` does
+/// ([`crate::query::value`]): an enum name in any case or its C# value, an
+/// integer with `BaseNumberConverter`'s hex forms, a GUID, a string. `None` is
+/// a token the converter refuses.
+fn deserialize_token<T>(token: &str) -> Option<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let de: StrDeserializer<'_, ValueError> = token.into_deserializer();
-    match T::deserialize(de) {
-        Ok(v) => Some(v),
-        Err(err) => {
-            // "unknown variant `x`, expected one of `A`, `B`" — every
-            // backtick-quoted word after "expected" is an accepted spelling.
-            let msg = err.to_string();
-            let expected = msg.split("expected").nth(1)?;
-            let canonical = expected
-                .split('`')
-                .skip(1)
-                .step_by(2)
-                .find(|variant| variant.eq_ignore_ascii_case(token))?;
-            let de: StrDeserializer<'_, ValueError> = canonical.into_deserializer();
-            T::deserialize(de).ok()
-        }
-    }
+    T::deserialize(crate::query::value::Value::nullable(token)).ok()
 }
 
 /// Splits a comma-delimited value into [`Uuid`]s, skipping empty tokens.
@@ -122,6 +101,36 @@ where
             .map(Some)
             .map_err(serde::de::Error::custom),
     }
+}
+
+/// Binds a NULLABLE enum query member (`[FromQuery] LogLevel? severity`) the way
+/// Jellyfin's `NullableEnumModelBinder` does: a name in any case, or a numeric
+/// value, binds; a value that does not convert binds `null` instead of failing
+/// the request (measured on Jellyfin 12.2: `?severity=Nope` is 200,
+/// unfiltered). A numeric value reaches a wire enum
+/// (`ferrofin_model::json::enums::wire_enum!`) as its C# value — an undefined
+/// one is kept (`Unrecognized`), as upstream keeps it (`?severity=99` filters on
+/// 99) — and a derived enum by its C# value too ([`crate::query::value`]); a
+/// derived enum cannot hold an undefined value, so that one binds `null`
+/// (every nullable enum member today is a wire enum).
+pub(crate) fn nullable_enum<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let Some(raw) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(T::deserialize(crate::query::value::Value::nullable(raw)).ok())
+}
+
+/// Keeps a present query value verbatim, empty included, for a `[FromQuery] T[]`
+/// member: `ArrayModelBinder` binds `?sortBy=` as one empty element (then
+/// refused), where a scalar's `ConvertEmptyStringToNull` would make it `null`.
+pub(crate) fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 /// Splits a pipe-delimited value into owned strings, trimming and dropping empty
@@ -256,16 +265,14 @@ where
 
     fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
         // `Split(Delimiter, RemoveEmptyEntries)` + `Trim()` + convert, dropping
-        // whatever the `TypeConverter` refuses. `deserialize_enum_token_ci` is
-        // the same token parser the query-string path uses, so a spelling that
-        // binds on `GET /LiveTv/Programs` binds identically on the `POST` form;
-        // for `Guid` and `string` elements it degrades to a plain parse, which
-        // is what `GuidConverter`/`StringConverter` do upstream.
+        // whatever the `TypeConverter` refuses. `deserialize_token` is the
+        // same token converter the query-string path uses, so a spelling that
+        // binds on `GET /LiveTv/Programs` binds identically on the `POST` form.
         Ok(value
             .split(self.delimiter)
             .map(str::trim)
             .filter(|token| !token.is_empty())
-            .filter_map(deserialize_enum_token_ci)
+            .filter_map(deserialize_token)
             .collect())
     }
 
@@ -319,8 +326,62 @@ pub(crate) fn apply_location_types(
 #[cfg(test)]
 mod tests {
     use super::{empty_as_none_uuid, parse_csv_uuids, parse_pipe_strings};
+
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
+
+    #[test]
+    fn nullable_enums_bind_like_the_nullable_enum_model_binder() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum Order {
+            Ascending,
+            Descending,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        struct Q {
+            #[serde(default, deserialize_with = "super::nullable_enum")]
+            order: Option<Order>,
+        }
+        impl crate::query::QueryParameters for Q {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[];
+        }
+        let bind = |q: &str| {
+            crate::query::Query::<Q>::try_from_uri(&format!("/?{q}").parse().unwrap())
+                .map(|crate::query::Query(q)| q.order)
+                .expect(q)
+        };
+        assert_eq!(bind("order=descending"), Some(Order::Descending));
+        assert_eq!(bind("order=%20ASCENDING%20"), Some(Order::Ascending));
+        assert_eq!(bind("order=1"), Some(Order::Descending));
+        // Unconvertible values bind null rather than failing the request.
+        assert_eq!(bind("order=Nope"), None);
+        assert_eq!(bind("order=9"), None);
+        assert_eq!(bind("order="), None);
+        assert_eq!(bind(""), None);
+    }
+
+    #[test]
+    fn nullable_wire_enums_keep_csharp_values() {
+        use ferrofin_model::dto::SortOrder;
+        // A wire enum maps numbers by C# value and keeps an undefined one.
+        #[derive(Debug, serde::Deserialize)]
+        struct W {
+            #[serde(default, deserialize_with = "super::nullable_enum")]
+            order: Option<SortOrder>,
+        }
+        impl crate::query::QueryParameters for W {
+            const COLLECTIONS: &'static [(&'static str, char)] = &[];
+        }
+        let wire = |q: &str| {
+            crate::query::Query::<W>::try_from_uri(&format!("/?{q}").parse().unwrap())
+                .map(|crate::query::Query(q)| q.order)
+                .expect(q)
+        };
+        assert_eq!(wire("order=DESCENDING"), Some(SortOrder::Descending));
+        assert_eq!(wire("order=1"), Some(SortOrder::Descending));
+        assert_eq!(wire("order=7"), Some(SortOrder::from_json_value(7)));
+        assert_eq!(wire("order=Nope"), None);
+    }
 
     #[derive(Debug, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -376,11 +437,12 @@ mod tests {
         );
         let types: Vec<VideoType> = parse_csv_enums_lenient(Some("Bluray,dvd"));
         assert_eq!(types, vec![VideoType::BluRay, VideoType::Dvd]);
-        // This retry parses serde's "unknown variant …, expected one of …"
-        // message to enumerate the accepted spellings; if serde ever changes
-        // that shape, this test is the loud failure.
         let kinds: Vec<BaseItemKind> = parse_csv_enums_lenient(Some("movie"));
         assert_eq!(kinds, vec![BaseItemKind::Movie]);
+        // A number is the C# value (`IsFolder` = 1, `IsResumable` = 7), as
+        // `EnumConverter` reads it; one no member has is dropped.
+        let filters: Vec<ItemFilter> = parse_csv_enums_lenient(Some("1, 7,6"));
+        assert_eq!(filters, vec![ItemFilter::IsFolder, ItemFilter::IsResumable]);
     }
 
     #[test]

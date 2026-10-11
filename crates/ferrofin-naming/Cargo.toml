@@ -16,6 +16,7 @@ serde.workspace = true
 regex.workspace = true
 fancy-regex.workspace = true
 chrono.workspace = true
+icu_collator.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

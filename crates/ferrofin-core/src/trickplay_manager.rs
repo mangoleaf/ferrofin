@@ -50,7 +50,7 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
 use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
-use ferrofin_traits::system::PathManager;
+use ferrofin_traits::system::{MediaLocation, PathManager};
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
@@ -573,16 +573,20 @@ impl FerrofinTrickplayManager {
         media_path: &str,
     ) -> Result<(), ServiceError> {
         let existing = self.resolutions_for(item_id).await?;
-        let local_root = self
-            .path_manager
-            .trickplay_directory(item_id, media_path, false);
-        let media_root = self
-            .path_manager
-            .trickplay_directory(item_id, media_path, true);
+        let local_root = self.path_manager.trickplay_directory(
+            item_id,
+            MediaLocation::of_file(media_path),
+            false,
+        );
+        let media_root = self.path_manager.trickplay_directory(
+            item_id,
+            MediaLocation::of_file(media_path),
+            true,
+        );
         for info in existing.values() {
             let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
             if !has_tiles(&Path::new(&local_root).join(&sub))
-                && !has_tiles(&Path::new(&media_root).join(&sub))
+                && (media_root.is_empty() || !has_tiles(&Path::new(&media_root).join(&sub)))
             {
                 tracing::info!(
                     width = info.width,
@@ -607,9 +611,11 @@ impl FerrofinTrickplayManager {
     ) -> Result<(), ServiceError> {
         self.prune_orphaned_rows(item_id, media_path).await?;
         let mut existing = self.resolutions_for(item_id).await?;
-        let root = self
-            .path_manager
-            .trickplay_directory(item_id, media_path, save_with_media);
+        let root = self.path_manager.trickplay_directory(
+            item_id,
+            MediaLocation::of_file(media_path),
+            save_with_media,
+        );
         if !Path::new(&root).is_dir() {
             return Ok(());
         }
@@ -779,12 +785,25 @@ impl FerrofinTrickplayManager {
         ) else {
             return Ok(());
         };
-        let local_root = self
-            .path_manager
-            .trickplay_directory(item_id, &media_path, false);
-        let media_root = self
-            .path_manager
-            .trickplay_directory(item_id, &media_path, true);
+        let local_root = self.path_manager.trickplay_directory(
+            item_id,
+            MediaLocation::of_file(&media_path),
+            false,
+        );
+        // `MediaLocation::of_file` is the location a delete uses
+        // (`containing_folder_path_at`) for every path that reaches here:
+        // `can_generate_trickplay` admits only a file, never a disc rip's
+        // folder. When rips gain trickplay, read their location as the delete
+        // does.
+        let media_root = self.path_manager.trickplay_directory(
+            item_id,
+            MediaLocation::of_file(&media_path),
+            true,
+        );
+        // No folder beside the media (a path at the root): nothing to move.
+        if media_root.is_empty() {
+            return Ok(());
+        }
         let (source_root, destination_root) = if library.save_trickplay_with_media {
             (&local_root, &media_root)
         } else {
@@ -841,7 +860,7 @@ impl FerrofinTrickplayManager {
 
         let trickplay_dir = self.path_manager.trickplay_directory(
             item_id,
-            &media_path,
+            MediaLocation::of_file(&media_path),
             library_options.save_trickplay_with_media,
         );
 
@@ -1159,6 +1178,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
             entity
                 .as_ref()
                 .and_then(|row| row.path.as_deref())
+                .map(MediaLocation::of_file)
                 .unwrap_or_default(),
             library.is_some_and(|options| options.save_trickplay_with_media),
         );
@@ -1441,6 +1461,7 @@ mod tests {
     use ferrofin_db::store::guid_to_db;
     use ferrofin_model::configuration::{LibraryOptions, ServerConfiguration, TrickplayOptions};
     use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::system::MediaLocation;
     use uuid::Uuid;
 
     use std::path::{Path, PathBuf};
@@ -1820,7 +1841,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
         let grid = root.join("320 - 10x10");
         std::fs::create_dir_all(&grid).unwrap();
         image::RgbImage::new(3200, 1800)
@@ -1870,7 +1892,12 @@ mod tests {
         assert_eq!(r.extractor.calls(), 1);
         assert_eq!(r.extractor.last_request(), Some((10_000, 320)));
 
-        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let tile_dir = Path::new(&r.pm.trickplay_directory(
+            item,
+            MediaLocation::of_file(&media),
+            false,
+        ))
+        .join("320 - 2x2");
         assert!(tile_dir.join("0.jpg").is_file(), "first tile written");
         assert!(tile_dir.join("1.jpg").is_file(), "second tile written");
         assert!(!tile_dir.join("2.jpg").exists(), "only two tiles");
@@ -1916,7 +1943,8 @@ mod tests {
         assert_eq!(r.extractor.calls(), 1, "existing data is skipped");
 
         // Replace wipes the directory (a stale marker vanishes) and re-extracts.
-        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
         std::fs::write(root.join("stale.txt"), b"x").expect("marker");
         r.mgr
             .refresh_trickplay_data(item, true, &extraction_on())
@@ -1939,7 +1967,12 @@ mod tests {
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
 
         // A user-placed 640×360 tile grid (2×2 of 320×180) with no DB row.
-        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let tile_dir = Path::new(&r.pm.trickplay_directory(
+            item,
+            MediaLocation::of_file(&media),
+            false,
+        ))
+        .join("320 - 2x2");
         std::fs::create_dir_all(&tile_dir).expect("tile dir");
         image::RgbImage::new(640, 360)
             .save(tile_dir.join("0.jpg"))
@@ -1989,7 +2022,12 @@ mod tests {
             .refresh_trickplay_data(item, false, &extraction_on())
             .await
             .expect("generate");
-        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+        let tile_dir = Path::new(&r.pm.trickplay_directory(
+            item,
+            MediaLocation::of_file(&media),
+            false,
+        ))
+        .join("320 - 2x2");
         assert!(tile_dir.join("0.jpg").is_file());
 
         // The library turns extraction off: tiles and rows go (C# prune branch).
@@ -2030,7 +2068,12 @@ mod tests {
         assert!(!tile_dir.exists());
 
         // Save-with-media + disabled: user-managed, catalogued and left alone.
-        let tile_dir = Path::new(&r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+        let tile_dir = Path::new(&r.pm.trickplay_directory(
+            item,
+            MediaLocation::of_file(&media),
+            true,
+        ))
+        .join("320 - 2x2");
         std::fs::create_dir_all(&tile_dir).expect("tile dir");
         image::RgbImage::new(640, 360)
             .save(tile_dir.join("0.jpg"))
@@ -2068,7 +2111,11 @@ mod tests {
             } else {
                 std::fs::remove_file(&media).unwrap();
             }
-            let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+            let root = PathBuf::from(r.pm.trickplay_directory(
+                item,
+                MediaLocation::of_file(&media),
+                false,
+            ));
             let grid = root.join("320 - 2x2");
             std::fs::create_dir_all(&grid).unwrap();
             image::RgbImage::new(640, 360)
@@ -2208,7 +2255,8 @@ mod tests {
             .await
             .expect("save");
         // A folder no row accounts for → unexpected.
-        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
         let stray = root.join("unexpected-folder");
         std::fs::create_dir_all(&stray).expect("stray dir");
         std::fs::write(stray.join("0.jpg"), b"x").expect("stray tile");
@@ -2244,7 +2292,8 @@ mod tests {
         row.tile_width = 2;
         row.tile_height = 2;
         r.mgr.save_trickplay_info(&row).await.expect("save");
-        let media_root = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let media_root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
         let media_tiles = media_root.join("320 - 2x2");
         std::fs::create_dir_all(&media_tiles).expect("media tiles dir");
         std::fs::write(media_tiles.join("0.jpg"), b"tile").expect("tile");
@@ -2255,7 +2304,8 @@ mod tests {
             .expect("move");
 
         let local_tiles =
-            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false))
+                .join("320 - 2x2");
         assert!(local_tiles.join("0.jpg").is_file(), "tiles moved inward");
         assert!(!media_tiles.exists(), "media-adjacent tiles gone");
         assert!(!media_root.exists(), "emptied .trickplay folder removed");
@@ -2276,7 +2326,8 @@ mod tests {
         row.tile_height = 2;
         r.mgr.save_trickplay_info(&row).await.expect("save");
         let local_tiles =
-            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false))
+                .join("320 - 2x2");
         std::fs::create_dir_all(&local_tiles).expect("local tiles dir");
         std::fs::write(local_tiles.join("0.jpg"), b"tile").expect("tile");
 
@@ -2400,7 +2451,8 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(60_000 * 10_000), None).await;
-        let root = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
         let tiles = root.join("640 - 3x2");
         std::fs::create_dir_all(&tiles).unwrap();
         for index in 0..2 {
@@ -2502,7 +2554,9 @@ mod tests {
         seed_sized_video_stream(&db, item, "h264", None, Some(200)).await;
         let mut entity = r.mgr.items.retrieve_item(item).await.unwrap().unwrap();
         entity.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
-        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("640 - 3x2");
+        let grid =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("640 - 3x2");
         std::fs::create_dir_all(&grid).unwrap();
         image::RgbImage::new(1920, 360)
             .save(grid.join("0.jpg"))
@@ -2617,8 +2671,10 @@ mod tests {
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
         let (folders, mut options) = configured_library(&r, true).await;
         r.mgr.attach_virtual_folders(folders);
-        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
-        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
         r.mgr
             .refresh_trickplay_data(item, false, &options)
             .await
@@ -2691,8 +2747,10 @@ mod tests {
             .refresh_trickplay_data(item, false, &options)
             .await
             .unwrap();
-        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
-        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
         let original = std::fs::read(internal.join("320 - 2x2/0.jpg")).unwrap();
         for save in [true, false] {
             options.save_trickplay_with_media = save;
@@ -2752,8 +2810,11 @@ mod tests {
         row.tile_height = 2;
         r.mgr.save_trickplay_info(&row).await.unwrap();
         let internal =
-            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
-        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false))
+                .join("320 - 2x2");
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("320 - 2x2");
         std::fs::create_dir_all(&internal).unwrap();
         std::fs::write(internal.join("0.jpg"), b"source").unwrap();
         std::fs::create_dir_all(&sidecar).unwrap();
@@ -2787,8 +2848,11 @@ mod tests {
         row.tile_height = 2;
         r.mgr.save_trickplay_info(&row).await.unwrap();
         let internal =
-            PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
-        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false))
+                .join("320 - 2x2");
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("320 - 2x2");
         std::fs::create_dir_all(&internal).unwrap();
         std::fs::write(internal.join("0.jpg"), b"source tiles").unwrap();
         std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
@@ -2818,8 +2882,10 @@ mod tests {
         row.tile_width = 2;
         row.tile_height = 2;
         r.mgr.save_trickplay_info(&row).await.unwrap();
-        let internal = PathBuf::from(r.pm.trickplay_directory(item, &media, false));
-        let sidecar = PathBuf::from(r.pm.trickplay_directory(item, &media, true));
+        let internal =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
+        let sidecar =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
         std::fs::create_dir_all(internal.join("320 - 2x2")).unwrap();
         std::fs::write(internal.join("320 - 2x2/0.jpg"), b"source tiles").unwrap();
         std::fs::write(internal.join("retained.txt"), b"ordinary source file").unwrap();
@@ -2871,10 +2937,15 @@ mod tests {
             row.tile_width = 2;
             row.tile_height = 2;
             r.mgr.save_trickplay_info(&row).await.unwrap();
-            let internal =
-                PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            let internal = PathBuf::from(r.pm.trickplay_directory(
+                item,
+                MediaLocation::of_file(&media),
+                false,
+            ))
+            .join("320 - 2x2");
             let sidecar =
-                PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 2x2");
+                PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                    .join("320 - 2x2");
             std::fs::create_dir_all(&internal).unwrap();
             std::fs::write(internal.join("0.jpg"), label.as_bytes()).unwrap();
             cases.push((label, internal, sidecar, eligible));
@@ -2960,7 +3031,9 @@ mod tests {
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[]), FakeExtractor::new(0, 180));
         let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
-        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("640 - 3x2");
+        let grid =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("640 - 3x2");
         std::fs::create_dir_all(&grid).unwrap();
         std::fs::write(grid.join("0.jpg"), b"invalid JPEG bytes").unwrap();
         r.mgr
@@ -3009,8 +3082,12 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let grid =
-                PathBuf::from(r.pm.trickplay_directory(item, &media, false)).join("320 - 2x2");
+            let grid = PathBuf::from(r.pm.trickplay_directory(
+                item,
+                MediaLocation::of_file(&media),
+                false,
+            ))
+            .join("320 - 2x2");
             std::fs::create_dir_all(&grid).unwrap();
             std::fs::write(grid.join("0.jpg"), b"existing data must remain untouched").unwrap();
             r.mgr.save_trickplay_info(&info(item, 320)).await.unwrap();
@@ -3084,7 +3161,9 @@ mod tests {
         options.interval = 100;
         let r = rig(&db, options, FakeExtractor::new(4, 180));
         let media = seed_video(&db, &r, item, Some(5_000 * 10_000), None).await;
-        let grid = PathBuf::from(r.pm.trickplay_directory(item, &media, true)).join("320 - 5x1");
+        let grid =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("320 - 5x1");
         std::fs::create_dir_all(&grid).unwrap();
         image::RgbImage::new(1600, 180)
             .save(grid.join("0.jpg"))

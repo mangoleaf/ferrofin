@@ -462,7 +462,10 @@ struct LegacyStartQuery {
     audio_stream_index: Option<i32>,
     #[serde(default)]
     subtitle_stream_index: Option<i32>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     play_method: Option<PlayMethod>,
     #[serde(default)]
     live_stream_id: Option<String>,
@@ -521,13 +524,19 @@ struct LegacyProgressQuery {
     subtitle_stream_index: Option<i32>,
     #[serde(default)]
     volume_level: Option<i32>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     play_method: Option<PlayMethod>,
     #[serde(default)]
     live_stream_id: Option<String>,
     #[serde(default)]
     play_session_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     repeat_mode: Option<RepeatMode>,
     #[serde(default)]
     is_paused: Option<bool>,

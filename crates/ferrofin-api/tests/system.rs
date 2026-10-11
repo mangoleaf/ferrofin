@@ -772,6 +772,65 @@ async fn activity_log_binds_query_and_returns_entries() {
     assert_eq!(q.has_user_id, Some(true));
 }
 
+/// `[FromQuery] ActivityLogSortBy[]? sortBy, SortOrder[]? sortOrder` and
+/// `LogLevel? severity`, as Jellyfin 12.2 binds them (measured on the oracle).
+#[tokio::test]
+async fn activity_log_binds_sorts_and_severity_like_the_model_binder() {
+    use ferrofin_traits::activity::{ActivityLogSortBy as By, SortOrder as Dir};
+    let bind = |query: &'static str| async move {
+        let activity = Arc::new(StubActivity::default());
+        let app = state_with_activity(activity.clone());
+        let (status, _) = get(app, &format!("/System/ActivityLog/Entries?{query}")).await;
+        let last = activity.last_query.lock().unwrap().clone();
+        (status, last)
+    };
+    for (query, expected) in [
+        (
+            "sortBy=Type&sortBy=name",
+            vec![(By::Type, Dir::Ascending), (By::Name, Dir::Ascending)],
+        ),
+        // Numbers are the C# values (DateCreated = 5, Overiew = 1).
+        (
+            "sortBy=5&sortBy=1&sortOrder=1",
+            vec![
+                (By::DateCreated, Dir::Descending),
+                (By::Overview, Dir::Descending),
+            ],
+        ),
+        ("sortBy=OVERIEW", vec![(By::Overview, Dir::Ascending)]),
+        // `GetOrderBy` pads with the FIRST order.
+        (
+            "sortBy=Username&sortBy=LogSeverity&sortBy=Name&sortOrder=Descending&sortOrder=Ascending",
+            vec![
+                (By::Username, Dir::Descending),
+                (By::LogSeverity, Dir::Ascending),
+                (By::Name, Dir::Descending),
+            ],
+        ),
+    ] {
+        let (status, last) = bind(query).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(last.unwrap().order_by, expected, "{query}");
+    }
+    for query in [
+        "sortBy=4",
+        "sortBy=Bogus",
+        "sortBy=",
+        "sortBy=Name&sortOrder=bogus",
+        "sortBy=Name&sortOrder=2",
+    ] {
+        let (status, _) = bind(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+    }
+    // `NullableEnumModelBinder`: an undefined number is kept, a bad name is null.
+    let (_, last) = bind("severity=99").await;
+    assert_eq!(last.unwrap().severity, Some(LogLevel::Unrecognized(99)));
+    let (_, last) = bind("severity=bogus").await;
+    assert_eq!(last.unwrap().severity, None);
+    let (_, last) = bind("severity=WARNING").await;
+    assert_eq!(last.unwrap().severity, Some(LogLevel::Warning));
+}
+
 #[tokio::test]
 async fn dashboard_pages_empty_and_page_not_found() {
     let (pages, pb) = get(elevated_full_state(), "/web/ConfigurationPages").await;

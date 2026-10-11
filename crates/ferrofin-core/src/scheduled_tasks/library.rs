@@ -1329,6 +1329,8 @@ impl ScheduledTask for MediaSegmentExtractionTask {
             is_virtual_item: Some(false),
             source_types: vec![SourceType::Library],
             recursive: true,
+            // `IncludeOwnedItems = true`: an alternate version too.
+            include_owned_items: true,
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
@@ -1343,12 +1345,15 @@ impl ScheduledTask for MediaSegmentExtractionTask {
             for item in &items {
                 done += 1;
                 // Only local files are supported (upstream's `IsFileProtocol
-                // && File.Exists`); a missing file is skipped, not an error.
-                // `tokio::fs` because this stats every movie/episode/track in
-                // the library — on a network mount a blocking stat per item
-                // would stall a runtime worker for the whole pass.
+                // && File.Exists`); a missing file — or a directory, a disc
+                // rip's, which `File.Exists` is false for — is skipped, not an
+                // error. `tokio::fs` because this stats every movie/episode/
+                // track in the library — on a network mount a blocking stat
+                // per item would stall a runtime worker for the whole pass.
                 if let Some(path) = item.path.as_deref()
-                    && tokio::fs::try_exists(path).await.unwrap_or(false)
+                    && tokio::fs::metadata(path)
+                        .await
+                        .is_ok_and(|meta| meta.is_file())
                 {
                     match Uuid::parse_str(&item.id) {
                         Ok(item_id) => match self
@@ -2599,6 +2604,24 @@ mod tests {
         set_path(&db, missing, &dir.path().join("gone.mkv").to_string_lossy()).await;
         let series = Uuid::from_u128(0xA4);
         seed_item(&db, series, BaseItemKind::Series).await;
+        // An alternate version is handed over (`IncludeOwnedItems = true`);
+        // a directory — a disc rip — is not (`File.Exists` is false for it).
+        let alternate = Uuid::from_u128(0xA5);
+        seed_item(&db, alternate, BaseItemKind::Movie).await;
+        set_media_type(&db, alternate, "Video").await;
+        let alternate_path = dir.path().join("a - 1080p.mkv");
+        std::fs::write(&alternate_path, b"x").expect("write");
+        let mut row = crate::test_support::fetch_item(&db, alternate).await;
+        row.path = Some(alternate_path.to_string_lossy().into_owned());
+        row.owner_id = Some(guid_to_db(present_a));
+        row.primary_version_id = Some(guid_to_db(present_a));
+        crate::test_support::save_item(&db, &row).await;
+        let rip = Uuid::from_u128(0xA6);
+        seed_item(&db, rip, BaseItemKind::Movie).await;
+        set_media_type(&db, rip, "Video").await;
+        let rip_path = dir.path().join("Rip (2001)");
+        std::fs::create_dir_all(rip_path.join("VIDEO_TS")).expect("rip");
+        set_path(&db, rip, &rip_path.to_string_lossy()).await;
 
         let segments = Arc::new(FakeSegments::default());
         let task = MediaSegmentExtractionTask::new(library, segments.clone());
@@ -2621,7 +2644,7 @@ mod tests {
 
         let mut ran = segments.ran.lock().expect("lock").clone();
         ran.sort();
-        let mut expected = vec![present_a, present_b];
+        let mut expected = vec![present_a, present_b, alternate];
         expected.sort();
         assert_eq!(
             ran, expected,

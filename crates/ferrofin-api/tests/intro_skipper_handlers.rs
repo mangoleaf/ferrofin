@@ -19,6 +19,7 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction as Action};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::tasks::{TaskInfo, TaskState};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
@@ -259,7 +260,13 @@ impl PluginManager for MemPlugins {
 
 /// Builds an authenticated `AppState` with the four working fakes wired in.
 fn build_app(segments: Arc<MemSegments>, tasks: Arc<MemTasks>, config: Arc<MemConfig>) -> AppState {
-    build_app_as(segments, tasks, config, Arc::new(AuthedAuthService))
+    // Every route but the two episode reads is `RequiresElevation` upstream.
+    build_app_as(
+        segments,
+        tasks,
+        config,
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    )
 }
 
 /// [`build_app`] with the authentication seam chosen by the caller, so the
@@ -336,73 +343,140 @@ fn state() -> (Arc<MemSegments>, AppState) {
     (seg, app)
 }
 
+/// One recorded cache erase: the items (all when `None`) and the mode.
+type CacheErase = (Option<Vec<Uuid>>, Option<Mode>);
+
+/// An analysis runtime that records what the routes ask of it.
+#[derive(Default)]
+struct FakeAnalysis {
+    running: std::sync::atomic::AtomicBool,
+    rescans: Mutex<Vec<Uuid>>,
+    erased: Mutex<Vec<CacheErase>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
+    fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError> {
+        if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.rescans.lock().unwrap().push(season_id);
+        Ok(true)
+    }
+    async fn erase_cache(
+        &self,
+        items: Option<&[Uuid]>,
+        mode: Option<Mode>,
+    ) -> Result<u64, ServiceError> {
+        self.erased
+            .lock()
+            .unwrap()
+            .push((items.map(<[Uuid]>::to_vec), mode));
+        Ok(0)
+    }
+    async fn clear_excluded(
+        &self,
+    ) -> Result<ferrofin_traits::intro_skipper::ExcludedClear, ServiceError> {
+        Ok(ferrofin_traits::intro_skipper::ExcludedClear {
+            affected_items: 2,
+            removed_segments: 3,
+            removed_cache_entries: 4,
+        })
+    }
+    // The routes never drive automatic analysis.
+    async fn items_changed(&self, _added: &[Uuid], _updated: &[Uuid], _removed: &[Uuid]) {}
+    async fn task_completed(&self, _key: &str, _completed: bool) {}
+    async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
+    async fn support_bundle(&self) -> String {
+        String::new()
+    }
+    /// The extension's typed settings, as its parse of the plugin config
+    /// above (`SkipbuttonHideDelay` 11) gives them.
+    async fn settings(&self) -> ferrofin_traits::intro_skipper::IntroSkipperSettings {
+        ferrofin_traits::intro_skipper::IntroSkipperSettings {
+            skip_button_hide_delay: 11,
+            ..Default::default()
+        }
+    }
+    async fn hides_intros(&self, _item_id: Uuid) -> bool {
+        false
+    }
+}
+
+/// `ExcludedTimestamps/Clear` answers the dashboard's PascalCase counts.
 #[tokio::test]
-async fn scan_status_reports_idle_and_running() {
-    let (_seg, idle) = state();
-    let (status, body) = send(idle, "GET", "/Intros/ScanStatus", "").await;
+async fn clear_excluded_reports_its_counts() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    let (status, body) = send(
+        with_analysis(&analysis),
+        "POST",
+        "/Intros/ExcludedTimestamps/Clear",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        r#"{"AffectedItems":2,"RemovedSegments":3,"RemovedCacheEntries":4}"#
+    );
+    // Detached (no extension): a 500.
+    let (status, _) = send(state().1, "POST", "/Intros/ExcludedTimestamps/Clear", "").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+fn with_analysis(analysis: &Arc<FakeAnalysis>) -> AppState {
+    let (_seg, app) = state();
+    app.with_intro_skipper_analysis(Arc::clone(analysis) as _)
+}
+
+/// `ScanStatus` is the plugin's `ScheduledTaskSemaphore.IsBusy`, and
+/// `ScanSeason` takes it: 202 and a rescan of that season, or 409 while a pass
+/// runs.
+#[tokio::test]
+async fn scan_season_takes_the_scan_lock_and_status_reports_it() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    let (status, body) = send(with_analysis(&analysis), "GET", "/Intros/ScanStatus", "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, r#"{"isRunning":false}"#);
 
-    let busy = build_app(
-        Arc::new(MemSegments::default()),
-        Arc::new(MemTasks {
-            running: true,
-            started: Mutex::new(Vec::new()),
-        }),
-        Arc::new(MemConfig::default()),
-    );
-    let (_status, body) = send(busy, "GET", "/Intros/ScanStatus", "").await;
+    let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
+    let uri = format!("/Intros/ScanSeason/{series}/{season}");
+    let (status, _) = send(with_analysis(&analysis), "POST", &uri, "").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(analysis.rescans.lock().unwrap().as_slice(), [season]);
+
+    let (_, body) = send(with_analysis(&analysis), "GET", "/Intros/ScanStatus", "").await;
     assert_eq!(body, r#"{"isRunning":true}"#);
+    let (status, _) = send(with_analysis(&analysis), "POST", &uri, "").await;
+    assert_eq!(status, StatusCode::CONFLICT);
 }
 
+/// `eraseCache` erases the mode's cached fingerprints — only for
+/// Introduction and Credits, as upstream.
 #[tokio::test]
-async fn scan_season_starts_task_or_conflicts() {
-    // Idle → 202 and the detection task is started.
-    let started = Arc::new(MemTasks {
-        running: false,
-        started: Mutex::new(Vec::new()),
-    });
-    let app = build_app(
-        Arc::new(MemSegments::default()),
-        started.clone(),
-        Arc::new(MemConfig::default()),
-    );
-    let series = Uuid::new_v4();
-    let season = Uuid::new_v4();
-    let (status, _) = send(
-        app,
-        "POST",
-        &format!("/Intros/ScanSeason/{series}/{season}"),
-        "",
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    // The handler addresses the task by its WIRE id (`ScheduledTaskWorker.Id`),
-    // not by its key — that is what `ITaskManager`'s lookup takes.
+async fn erase_timestamps_erases_the_cache_when_asked() {
+    let analysis = Arc::new(FakeAnalysis::default());
+    for query in [
+        "mode=Credits&eraseCache=true",
+        "mode=Recap&eraseCache=true",
+        "mode=Introduction",
+    ] {
+        let (status, _) = send(
+            with_analysis(&analysis),
+            "POST",
+            &format!("/Intros/EraseTimestamps?{query}"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{query}");
+    }
     assert_eq!(
-        started.started.lock().unwrap().as_slice(),
-        [ferrofin_traits::tasks::task_id_for_key(
-            "IntroSkipper.Detect"
-        )]
+        analysis.erased.lock().unwrap().as_slice(),
+        [(None, Some(Mode::Credits))]
     );
-
-    // Already running → 409.
-    let busy = build_app(
-        Arc::new(MemSegments::default()),
-        Arc::new(MemTasks {
-            running: true,
-            started: Mutex::new(Vec::new()),
-        }),
-        Arc::new(MemConfig::default()),
-    );
-    let (status, _) = send(
-        busy,
-        "POST",
-        &format!("/Intros/ScanSeason/{series}/{season}"),
-        "",
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -411,7 +485,7 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
     let item = Uuid::new_v4();
     // Two IntroSkipper rows (Intro + Outro) and one other-provider row.
     seg.rows.lock().unwrap().push((
-        "IntroSkipper".to_owned(),
+        ferrofin_traits::intro_skipper::provider_id(),
         MediaSegmentDto {
             id: Uuid::new_v4(),
             item_id: item,
@@ -421,7 +495,7 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
         },
     ));
     seg.rows.lock().unwrap().push((
-        "IntroSkipper".to_owned(),
+        ferrofin_traits::intro_skipper::provider_id(),
         MediaSegmentDto {
             id: Uuid::new_v4(),
             item_id: item,
@@ -441,15 +515,32 @@ async fn erase_timestamps_deletes_matching_provider_rows() {
         },
     ));
 
+    let other = Uuid::from_u128(0x54);
+    app.intro_skipper
+        .update_timestamp(stored(other, Mode::Introduction, 0.0, 30.0))
+        .await
+        .unwrap();
+    app.intro_skipper
+        .update_timestamp(stored(other, Mode::Credits, 900.0, 960.0))
+        .await
+        .unwrap();
+    // `[FromQuery] AnalysisMode mode` is non-nullable: absent is Introduction.
+    let (status, _) = send(app.clone(), "POST", "/Intros/EraseTimestamps", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left = app.intro_skipper.segments(other).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].mode, Mode::Credits);
+    let (status, _) = send(app.clone(), "POST", "/Intros/EraseTimestamps?mode=99", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = send(app, "POST", "/Intros/EraseTimestamps?mode=Introduction", "").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let rows = seg.rows.lock().unwrap();
     // The IntroSkipper Intro row is gone; the Outro and the other provider stay.
     assert_eq!(rows.len(), 2);
-    assert!(
-        rows.iter()
-            .all(|(p, s)| !(p == "IntroSkipper" && s.type_ == MediaSegmentType::Intro))
-    );
+    assert!(rows.iter().all(
+        |(p, s)| !(*p == ferrofin_traits::intro_skipper::provider_id()
+            && s.type_ == MediaSegmentType::Intro)
+    ));
 }
 
 #[tokio::test]
@@ -474,45 +565,198 @@ async fn plugin_metadata_and_support_bundle() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Plugin version: 1.2.3"));
     assert!(body.contains("Runs on:"));
-    // The fingerprinter probes still report, and report a bool — the ffmpeg one
-    // runs as a child process the handler awaits rather than blocks on.
-    for line in [
-        "Chromaprint (ffmpeg muxer) available: ",
-        "Chromaprint (fpcalc) available: ",
-    ] {
-        let at = body
-            .find(line)
-            .unwrap_or_else(|| panic!("{line:?} missing from bundle: {body:?}"));
-        let value = body[at + line.len()..].lines().next().unwrap_or_default();
-        assert!(
-            value == "true" || value == "false",
-            "{line:?} carries a bool, got {value:?}"
-        );
-    }
+    // The analysis reports the rest (the detached seam says it is absent).
+    assert!(body.contains("Jellyfin version: "), "{body}");
+    assert!(
+        body.ends_with("* The intro skipper extension is not attached\n"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
 async fn no_op_success_routes() {
     let (_seg, app) = state();
-    for (method, uri, body) in [
-        ("POST", "/Intros/RebuildDatabase", ""),
-        (
-            "POST",
-            "/Intros/AnalyzerActions/UpdateSeason",
-            r#"{"Id":"00000000-0000-0000-0000-000000000000","AnalyzerActions":{}}"#,
-        ),
-    ] {
+    for (method, uri, body) in [("POST", "/Intros/RebuildDatabase", "")] {
         let (status, _) = send(app.clone(), method, uri, body).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{method} {uri}");
     }
+}
+
+fn stored(
+    item: Uuid,
+    mode: Mode,
+    start: f64,
+    end: f64,
+) -> ferrofin_traits::intro_skipper::StoredSegment {
+    ferrofin_traits::intro_skipper::StoredSegment {
+        item_id: item,
+        mode,
+        start,
+        end,
+        is_user_provided: false,
+        config_hash: String::new(),
+    }
+}
+
+/// `GET Episode/{id}/IntroSkipperSegments` reads the plugin's tier
+/// (`GetTimestampsAsync`: the earliest per mode) and keys the dictionary by the
+/// `AnalysisMode` names, as STJ writes enum dictionary keys.
+#[tokio::test]
+async fn skippable_segments_come_from_the_tier_keyed_by_mode_name() {
+    let (_seg, app) = state();
+    let item = Uuid::from_u128(0x51);
+    for segment in [
+        stored(item, Mode::Introduction, 40.0, 70.0),
+        stored(item, Mode::Commercial, 600.0, 630.0),
+        stored(item, Mode::Commercial, 300.0, 330.0),
+    ] {
+        app.intro_skipper.update_timestamp(segment).await.unwrap();
+    }
+    let (status, body) = send(
+        app,
+        "GET",
+        &format!("/Episode/{item}/IntroSkipperSegments"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["Introduction"]["Start"], 40.0);
+    assert_eq!(json["Commercial"]["Start"], 300.0, "the earliest of a mode");
+    assert_eq!(json.as_object().unwrap().len(), 2);
+}
+
+/// `GET Intros/DisabledEpisodes/{SeasonId}` lists the season's excluded
+/// episodes as `"N"`-form GUIDs (an unknown season has none).
+#[tokio::test]
+async fn disabled_episodes_list_the_seasons_exclusions() {
+    let (_seg, app) = state();
+    let (season, a, b) = (
+        Uuid::from_u128(0x60),
+        Uuid::from_u128(0x61),
+        Uuid::from_u128(0x62),
+    );
+    app.intro_skipper
+        .set_excluded(season, b, true)
+        .await
+        .unwrap();
+    app.intro_skipper
+        .set_excluded(season, a, true)
+        .await
+        .unwrap();
+    app.intro_skipper
+        .set_excluded(Uuid::from_u128(0x63), a, true)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        app.clone(),
+        "GET",
+        &format!("/Intros/DisabledEpisodes/{season}"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, format!(r#"["{}","{}"]"#, a.simple(), b.simple()));
+    let (_, body) = send(
+        app,
+        "GET",
+        &format!("/Intros/DisabledEpisodes/{}", Uuid::from_u128(0x64)),
+        "",
+    )
+    .await;
+    assert_eq!(body, "[]");
+}
+
+/// `RebuildDatabaseAsync` keeps only valid segments; the editor's create needs
+/// `providerId`, its delete `itemId` + `type`; a Commercial delete without a
+/// published match is a 404.
+#[tokio::test]
+async fn editor_and_rebuild_routes_validate_like_upstream() {
+    let (_seg, app) = state();
+    let item = Uuid::from_u128(0x52);
+    app.intro_skipper
+        .update_timestamp(stored(item, Mode::Recap, 0.0, 0.0))
+        .await
+        .unwrap();
+    let (status, _) = send(app.clone(), "POST", "/Intros/RebuildDatabase", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(app.intro_skipper.segments(item).await.unwrap().is_empty());
+
+    let body = r#"{"Type":"Intro","StartTicks":0,"EndTicks":10}"#;
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        &format!("/MediaSegmentsApi/{item}"),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "providerId is [Required]");
+    let segment = Uuid::from_u128(0x53);
+    let (status, _) = send(
+        app.clone(),
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}"),
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "itemId and type are [Required]"
+    );
+    let (status, _) = send(
+        app.clone(),
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}?itemId={item}&type=commercial"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        app,
+        "DELETE",
+        &format!("/MediaSegmentsApi/{segment}?itemId={item}&type=bogus"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// Upstream binds `UpdateAnalyzerActionsRequest` through the MVC binder: an
 /// object only, names and enum values (keys too) ignoring case.
 #[tokio::test]
 async fn analyzer_actions_bind_like_the_mvc_binder() {
-    let (_seg, app) = state();
+    let tasks = || {
+        Arc::new(MemTasks {
+            running: false,
+            started: Mutex::new(Vec::new()),
+        })
+    };
     let uri = "/Intros/AnalyzerActions/UpdateSeason";
+    // `VisualizationController` is `RequiresElevation`: a plain user is
+    // refused on both routes.
+    let user_app = build_app_as(
+        Arc::new(MemSegments::default()),
+        tasks(),
+        Arc::new(MemConfig::default()),
+        Arc::new(AuthedAuthService),
+    );
+    let (status, _) = send(user_app.clone(), "POST", uri, r#"{"AnalyzerActions":{}}"#).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        user_app,
+        "GET",
+        &format!("/Intros/AnalyzerActions/{}", Uuid::nil()),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let app = build_app_as(
+        Arc::new(MemSegments::default()),
+        tasks(),
+        Arc::new(MemConfig::default()),
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+    );
     for body in [
         r#"{"id":"00000000-0000-0000-0000-000000000000","analyzerActions":{"introduction":"chromaprint","Credits":"None"}}"#,
         r#"{"Id":"00000000-0000-0000-0000-000000000000","AnalyzerActions":{"Recap":"BlackFrame"}}"#,
@@ -528,6 +772,20 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
         let (status, _) = send(app.clone(), "POST", uri, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
+    // `SetAnalyzerActionAsync`: each named mode is replaced, the rest kept.
+    let nil = app
+        .intro_skipper
+        .analyzer_actions(Uuid::nil())
+        .await
+        .unwrap();
+    assert_eq!(nil.len(), 3);
+    assert_eq!(nil[&Mode::Introduction], Action::Chromaprint);
+    assert_eq!(nil[&Mode::Credits], Action::None);
+    assert_eq!(nil[&Mode::Recap], Action::BlackFrame);
+    let ui = Uuid::parse_str("28c3ad34d0306759137254e7c81d74e0").unwrap();
+    let ui = app.intro_skipper.analyzer_actions(ui).await.unwrap();
+    assert_eq!(ui[&Mode::Preview], Action::Chapter);
+    assert_eq!(ui[&Mode::Commercial], Action::None);
 }
 
 /// `POST /FileTransformation/RegisterTransformation` registers a callback that
@@ -537,6 +795,54 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
 /// bare `RequireAuth`, which let any authenticated account grow that registry —
 /// measured at +157 MB of RssAnon over 150 requests carrying 1 MB of strings
 /// each, linearly and with no plateau.
+/// Upstream's plugin controllers are `RequiresElevation` (class-level on
+/// `VisualizationController`, `SegmentEditorController` and
+/// `TroubleshootingController`; per action on `SkipButtonCssController` and the
+/// writes of `SkipIntroController`). Only the two episode reads are plain
+/// `[Authorize]`.
+#[tokio::test]
+async fn plugin_routes_are_elevated_as_upstream() {
+    let user_app = build_app_as(
+        Arc::new(MemSegments::default()),
+        Arc::new(MemTasks {
+            running: false,
+            started: Mutex::new(Vec::new()),
+        }),
+        Arc::new(MemConfig::default()),
+        Arc::new(AuthedAuthService),
+    );
+    let id = Uuid::from_u128(1);
+    for (method, uri) in [
+        ("POST", format!("/Episode/{id}/Timestamps")),
+        ("POST", "/Intros/EraseTimestamps".to_owned()),
+        ("POST", "/Intros/RebuildDatabase".to_owned()),
+        ("GET", "/MediaSegmentsApi".to_owned()),
+        ("POST", format!("/MediaSegmentsApi/{id}")),
+        ("DELETE", format!("/MediaSegmentsApi/{id}")),
+        ("POST", "/SkipButtonCss/InjectCss".to_owned()),
+        ("POST", "/SkipButtonCss/UpdateSkipDuration".to_owned()),
+        ("GET", "/IntroSkipper".to_owned()),
+        ("GET", "/IntroSkipper/SupportBundle".to_owned()),
+        ("GET", format!("/Intros/AnalyzerActions/{id}")),
+        ("POST", "/Intros/AnalyzerActions/UpdateSeason".to_owned()),
+        ("GET", format!("/Intros/Show/{id}/{id}")),
+        ("DELETE", format!("/Intros/Show/{id}/{id}")),
+        ("POST", format!("/Intros/ScanSeason/{id}/{id}")),
+        ("GET", "/Intros/ScanStatus".to_owned()),
+        (
+            "POST",
+            "/FileTransformation/RegisterTransformation".to_owned(),
+        ),
+        ("GET", format!("/Intros/DisabledEpisodes/{id}")),
+        ("POST", "/Intros/DisabledEpisodes/Update".to_owned()),
+        ("DELETE", format!("/Intros/Show/{id}")),
+        ("POST", "/Intros/ExcludedTimestamps/Clear".to_owned()),
+    ] {
+        let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
 #[tokio::test]
 async fn register_transformation_requires_an_administrator() {
     let seg = Arc::new(MemSegments::default());
@@ -590,14 +896,15 @@ async fn inject_css_writes_import_and_duration_then_updates() {
             started: Mutex::new(Vec::new()),
         }),
         config.clone(),
-    );
+    )
+    .with_intro_skipper_analysis(Arc::new(FakeAnalysis::default()));
 
     // Update-only with no prior injection is a no-op success (nothing to update).
     let (status, _) = send(app.clone(), "POST", "/SkipButtonCss/UpdateSkipDuration", "").await;
     assert_eq!(status, StatusCode::OK);
     assert!(config.branding.lock().unwrap().custom_css.is_none());
 
-    // Inject writes the import + the duration variable (from config's delay=11).
+    // Inject writes the import + the duration variable (the settings' delay, 11).
     let (status, _) = send(app.clone(), "POST", "/SkipButtonCss/InjectCss", "").await;
     assert_eq!(status, StatusCode::OK);
     let css = config.branding.lock().unwrap().custom_css.clone().unwrap();

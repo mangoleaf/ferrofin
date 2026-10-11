@@ -268,6 +268,42 @@ pub fn year_item_id(mode: &IdDerivation, year_root: &str, name: &str) -> Option<
     by_name_item_id(mode, BaseItemKind::Year, &year_path(year_root, name))
 }
 
+/// The id of a season with no folder of its own (a series' episodes sit in
+/// its folder, or in a folder that names no season) — the port of
+/// `SeriesMetadataService.CreateSeasonAsync`, which keys it by its series,
+/// number and name rather than a path: `GetNewItemId(series.Id +
+/// (seasonNumber ?? -1).ToString(InvariantCulture) + seasonName,
+/// typeof(Season))`. `series.Id` concatenates in `Guid`'s
+/// default format (lowercase, hyphenated) and the name is the one the season
+/// was created with. Under [`IdDerivation::Jellyfin`] the key keeps its case
+/// (`EnableCaseSensitiveItemIds`), as every other scanned id; verified
+/// against every path-less season of a real 12.1 database.
+#[must_use]
+pub fn virtual_season_id(
+    mode: &IdDerivation,
+    series_id: uuid::Uuid,
+    number: Option<i32>,
+    name: &str,
+) -> Option<uuid::Uuid> {
+    let key = format!("{series_id}{}{name}", number.unwrap_or(-1));
+    derive_item_id_with(mode, BaseItemKind::Season, &key)
+}
+
+/// The id older Ferrofin scans gave a season with no folder of its own: the
+/// one derived from the synthetic path `{series_dir}/#virtual-season-{n}`
+/// (`-1` for no number). The boot repair
+/// ([`crate::adoption_repairs::rekey_virtual_seasons`]) recognises such a
+/// season by it and moves it to its [`virtual_season_id`].
+#[must_use]
+pub fn legacy_virtual_season_id(
+    mode: &IdDerivation,
+    series_dir: &str,
+    number: Option<i64>,
+) -> Option<uuid::Uuid> {
+    let path = format!("{series_dir}/#virtual-season-{}", number.unwrap_or(-1));
+    derive_item_id_with(mode, BaseItemKind::Season, &path)
+}
+
 /// The `UserRootFolder` item id for the default user-views directory —
 /// `GetNewItemId(DefaultUserViewsPath, typeof(UserRootFolder))`, the one row
 /// `Items/Root` resolves to (case-sensitive, like every scanned folder; an
@@ -603,6 +639,78 @@ mod tests {
             ),
             Some(uuid::Uuid::parse_str("F137A2DD-21BB-C1B9-9AA5-C0F6BF02A805").expect("uuid")),
         );
+    }
+
+    /// Path-less seasons of a real Jellyfin 12.1 database (the adoption
+    /// fixture upgraded from 12.0; created by 10.11.x and 12.x alike), as
+    /// stored: `(Id, SeriesId, IndexNumber, Name)`. All 591 of its
+    /// path-less seasons derive this way.
+    #[rstest::rstest]
+    #[case(
+        "CC86EE2C-C78D-0F79-0BCE-1F8F8ADBB846",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(0),
+        "Specials"
+    )]
+    #[case(
+        "5D4284B7-8FBC-069E-80C2-644AED45F8B1",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(1),
+        "Season 1"
+    )]
+    #[case(
+        "59586EC5-7224-BFF1-5BA9-7E133D666050",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(12),
+        "Season 12"
+    )]
+    #[case(
+        "B8FFA3AC-6431-B12D-9ACE-B10DA99149BE",
+        "C3B1F536-2827-4088-EB52-C3518C9BFB9F",
+        Some(0),
+        "Specials"
+    )]
+    #[case(
+        "09293A86-BD86-819E-77DB-44AFA1F265EF",
+        "27A96C9A-7E57-DD56-A051-40190E9CF47F",
+        None,
+        "Season Unknown"
+    )]
+    fn virtual_season_id_matches_a_real_database(
+        #[case] id: &str,
+        #[case] series: &str,
+        #[case] number: Option<i32>,
+        #[case] name: &str,
+    ) {
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let series = uuid::Uuid::parse_str(series).expect("uuid");
+        assert_eq!(
+            super::virtual_season_id(&mode, series, number, name),
+            Some(uuid::Uuid::parse_str(id).expect("uuid"))
+        );
+    }
+
+    /// The id older Ferrofin scans gave a path-less season is the synthetic
+    /// path's, under either derivation.
+    #[test]
+    fn legacy_virtual_season_id_is_the_synthetic_paths() {
+        for mode in [
+            IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            IdDerivation::LegacyLowercase,
+        ] {
+            assert_eq!(
+                super::legacy_virtual_season_id(&mode, "/tv/Show", Some(2)),
+                derive_item_id_with(&mode, BaseItemKind::Season, "/tv/Show/#virtual-season-2")
+            );
+            assert_eq!(
+                super::legacy_virtual_season_id(&mode, "/tv/Show", None),
+                derive_item_id_with(&mode, BaseItemKind::Season, "/tv/Show/#virtual-season--1")
+            );
+        }
     }
 
     /// Oracle values from the same real 10.11.8 database: the `UserRootFolder`

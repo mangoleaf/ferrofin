@@ -62,6 +62,11 @@ impl Pending {
     }
 }
 
+/// The in-process event every debounced change set is published as, its
+/// payload the unfiltered `LibraryUpdateInfo`; never forwarded to clients
+/// (`LibraryChanged` is, filtered per user).
+pub const ITEMS_CHANGED: &str = "ItemsChanged";
+
 /// Accumulates library changes and pushes a folded `LibraryChanged` once the
 /// changes stop arriving.
 pub struct LibraryChangedNotifier {
@@ -204,11 +209,18 @@ impl LibraryChangedNotifier {
         if folded.info.is_empty {
             return;
         }
+        // The whole change set for in-process consumers (the server's own
+        // `ILibraryManager.ItemAdded`/`ItemUpdated`/`ItemRemoved` subscribers,
+        // such as the intro skipper), before any per-user filtering.
+        let payload = serde_json::to_string(&folded.info).ok();
+        if let Some(payload) = &payload {
+            let _ = self.events.publish(ITEMS_CHANGED, payload).await;
+        }
         let Some(audience) = self.audience.get() else {
             // No fan-out wired: one payload to everyone, the pre-existing
             // scan-end behaviour.
-            if let Ok(payload) = serde_json::to_string(&folded.info) {
-                let _ = self.events.publish("LibraryChanged", &payload).await;
+            if let Some(payload) = &payload {
+                let _ = self.events.publish("LibraryChanged", payload).await;
             }
             return;
         };
@@ -668,6 +680,37 @@ mod tests {
         );
     }
 
+    /// In-process consumers get the whole change set, audience or not, as
+    /// [`ITEMS_CHANGED`] — never as a client push.
+    #[tokio::test(start_paused = true)]
+    async fn in_process_consumers_get_every_change_unfiltered() {
+        let (n, events) = notifier(Duration::from_secs(30));
+        n.set_audience(Arc::new(SplitAudience {
+            visible: Vec::new(),
+            locations: Vec::new(),
+            delivered: Mutex::new(Vec::new()),
+        }) as Arc<dyn LibraryChangeAudience>);
+        let item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        n.record_added(std::slice::from_ref(&item));
+        n.record_removed(&[movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())]);
+        tokio::time::sleep(Duration::from_secs(31)).await;
+
+        let published = events.published.lock().expect("lock");
+        let changes: Vec<LibraryUpdateInfo> = published
+            .iter()
+            .filter(|(t, _)| t == ITEMS_CHANGED)
+            .map(|(_, p)| serde_json::from_str(p).expect("payload parses"))
+            .collect();
+        assert_eq!(changes.len(), 1);
+        let id = Uuid::parse_str(&item.id)
+            .expect("uuid")
+            .simple()
+            .to_string();
+        assert_eq!(changes[0].items_added, [id]);
+        assert_eq!(changes[0].items_removed.len(), 1);
+        assert!(published.iter().all(|(t, _)| t != "LibraryChanged"));
+    }
+
     // Real clock, not `start_paused`: sqlx's pool acquire times out instantly
     // against a frozen clock. Hence the millisecond debounce.
     #[tokio::test]
@@ -747,6 +790,42 @@ mod tests {
         assert!(after.is_some() && after != before, "the Etag input moved");
         let pushed = events.library_updates();
         assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].items_updated, vec![id.simple().to_string()]);
+    }
+
+    // Real clock, as above.
+    #[tokio::test]
+    async fn a_released_version_announces_itself() {
+        // `release_owned_versions` writes outside the save path (the prune
+        // frees a part or version whose owner goes); the row it frees is an
+        // item of its own from then on, and a client must hear so now.
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_traits::persistence::ItemPersistenceService;
+
+        let (n, events) = notifier(Duration::from_millis(50));
+        let db = crate::test_support::test_db().await;
+        let svc = crate::item_persistence_service::FerrofinItemPersistenceService::new(db);
+        // Stored as the scan stores ids (`guid_to_db`), which the release
+        // looks rows up by.
+        let (primary, id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut owner = movie(primary, Uuid::new_v4(), Uuid::new_v4());
+        owner.id = guid_to_db(primary);
+        owner.parent_id = None;
+        owner.top_parent_id = None;
+        let mut part = movie(id, Uuid::new_v4(), Uuid::new_v4());
+        part.id = guid_to_db(id);
+        part.path = Some("/media/a cd2.mkv".to_owned());
+        part.parent_id = None;
+        part.top_parent_id = None;
+        part.owner_id = Some(guid_to_db(primary));
+        svc.save_items(&[owner, part]).await.expect("save");
+        svc.set_change_notifier(Arc::clone(&n));
+
+        assert!(svc.release_owned_versions(&[id]).await.expect("release"));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 1, "a release must announce itself");
         assert_eq!(pushed[0].items_updated, vec![id.simple().to_string()]);
     }
 

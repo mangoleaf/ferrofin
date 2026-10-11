@@ -2527,6 +2527,14 @@ impl LocalProviderManager {
                     .replace_provider_ids(item_id, &merged.provider_ids)
                     .await?;
             }
+            // The refresh of a video copies its title metadata to its parts
+            // (`BaseItem.RefreshMetadataForOwnedItem`) and its save gives its
+            // local versions its metadata (`Video.UpdateToRepositoryAsync`).
+            if owns_videos(row.data.as_deref()) {
+                store
+                    .copy_metadata_to_owned_videos(&[item_id], true, true)
+                    .await?;
+            }
             store.reattach_user_data(&row).await?;
             // `SaveItemAsync` writes the people when the result carries a
             // list (`MetadataService.cs:320-324`). A failed write is logged,
@@ -4078,6 +4086,24 @@ pub(crate) fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     ))
 }
 
+/// Whether a video's `Data` lists other parts (`AdditionalParts`) or local
+/// alternate versions (`LocalAlternateVersions`) — the owned videos a save
+/// of it copies metadata to. Anything else owns none, and costs no query.
+fn owns_videos(data: Option<&str>) -> bool {
+    let Some(serde_json::Value::Object(map)) =
+        data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+    else {
+        return false;
+    };
+    ["AdditionalParts", "LocalAlternateVersions"]
+        .iter()
+        .any(|key| {
+            map.get(*key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|list| !list.is_empty())
+        })
+}
+
 /// The on-disk filename stem for an uploaded image of `image_type`/`index`,
 /// e.g. `Primary` → `primary`, `Backdrop` index 2 → `backdrop2`.
 fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
@@ -4447,6 +4473,11 @@ impl ProviderManager for LocalProviderManager {
         self.save_metadata(item_id, update_type).await?;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
+            // A video's save gives its local versions its images and
+            // metadata (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`).
+            store
+                .copy_metadata_to_owned_videos(&[item_id], true, false)
+                .await?;
         }
         Ok(())
     }
@@ -6741,6 +6772,8 @@ mod tests {
         removed_paths: std::sync::Mutex<Vec<String>>,
         /// The items whose save time it was asked to stamp.
         touched: std::sync::Mutex<Vec<Uuid>>,
+        /// Each `copy_metadata_to_owned_videos` call: owners, versions, parts.
+        copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
     }
 
     #[async_trait]
@@ -6805,6 +6838,12 @@ mod tests {
             Ok(true)
         }
         async fn delete_items(&self, _ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            unimplemented!()
+        }
+        async fn deletion_closure(
+            &self,
+            _ids: &[Uuid],
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             unimplemented!()
         }
         async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
@@ -6914,6 +6953,18 @@ mod tests {
                 .insert(item_id, ids.to_vec());
             Ok(())
         }
+        async fn copy_metadata_to_owned_videos(
+            &self,
+            owner_ids: &[Uuid],
+            versions: bool,
+            parts: bool,
+        ) -> Result<usize, ServiceError> {
+            self.copied
+                .lock()
+                .expect("lock")
+                .push((owner_ids.to_vec(), versions, parts));
+            Ok(0)
+        }
         async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
             assert!(
                 self.saved
@@ -6936,6 +6987,72 @@ mod tests {
         }
         async fn update_inherited_values(&self) -> Result<(), ServiceError> {
             unimplemented!()
+        }
+    }
+
+    /// Every image write is a save of the item, so a primary's versions take
+    /// its images (`Video.UpdateToRepositoryAsync`): an upload and a delete
+    /// each ask the store to copy to the item's local versions.
+    #[tokio::test]
+    async fn an_image_save_or_delete_copies_to_the_items_versions() {
+        let store = Arc::new(RecordingStore::default());
+        let dir = tempfile::tempdir().expect("tmp");
+        let mgr = LocalProviderManager::default()
+            .with_image_store(Arc::clone(&store) as Arc<_>, dir.path().to_path_buf());
+        let id = Uuid::new_v4();
+        mgr.save_image(id, b"data", "image/jpeg", ImageType::Backdrop, None)
+            .await
+            .expect("save");
+        // A delete that removed a slot (one that found none saves nothing).
+        store
+            .removed_paths
+            .lock()
+            .expect("lock")
+            .push(dir.path().join("gone.jpg").to_string_lossy().into_owned());
+        mgr.delete_image(id, ImageType::Backdrop, None)
+            .await
+            .expect("delete");
+        assert_eq!(
+            *store.copied.lock().expect("lock"),
+            [(vec![id], true, false), (vec![id], true, false)]
+        );
+    }
+
+    /// A refresh that saves a video owning parts or versions copies its
+    /// metadata to both (`RefreshedOwnedItems` + `UpdateToRepositoryAsync`);
+    /// one owning none asks nothing.
+    #[tokio::test]
+    async fn a_refresh_save_of_an_owner_copies_to_its_owned_videos() {
+        for (data, expected) in [
+            (Some(r#"{"AdditionalParts":["/m/b.mkv"]}"#), true),
+            (
+                Some(r#"{"AdditionalParts":[],"LocalAlternateVersions":[]}"#),
+                false,
+            ),
+        ] {
+            let (_server, tmdb) = tmdb_with_decoy_search().await;
+            let store = Arc::new(RecordingStore::default());
+            let mut stored = row("Movies.BoxSet", "Matrix");
+            stored.data = data.map(ToOwned::to_owned);
+            let (item_id, mgr) = box_set_manager(stored, tmdb, Arc::clone(&store));
+            store
+                .stored_ids
+                .lock()
+                .expect("lock")
+                .insert(item_id, vec![("Tmdb".to_owned(), "2344".to_owned())]);
+            mgr.refresh_full_item(item_id, &full_metadata_refresh())
+                .await
+                .expect("refresh");
+            assert!(
+                !store.saved.lock().expect("lock").is_empty(),
+                "the refresh saved"
+            );
+            let copied = store.copied.lock().expect("lock").clone();
+            if expected {
+                assert_eq!(copied, [(vec![item_id], true, true)]);
+            } else {
+                assert!(copied.is_empty(), "{copied:?}");
+            }
         }
     }
 

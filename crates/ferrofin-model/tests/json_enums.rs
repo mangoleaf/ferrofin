@@ -5,8 +5,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 fn check<T: JsonEnum + Serialize + DeserializeOwned>(name: &str) {
-    let fixture =
-        include_str!("../../ferrofin-api/tests/data/json-binding/jellyfin-12.2-enums.jsonl");
+    let fixture = include_str!("../../ferrofin-api/src/query/csharp_enums.jsonl");
     let upstream: Value = fixture
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())

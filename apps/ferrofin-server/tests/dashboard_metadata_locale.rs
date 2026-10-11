@@ -685,14 +685,12 @@ async fn verify_media_segment_library_options(api: &Api, item: &str) {
         .unwrap();
     let library = &folder["ItemId"];
     let mut options = folder["LibraryOptions"].clone();
+    // The plugin's editor stores the segment in its own tier and publishes
+    // it under the plugin's provider id (`providerId` is `[Required]` but
+    // not used for the write).
     api.post(
-        &format!("/MediaSegmentsApi/{item}"),
+        &format!("/MediaSegmentsApi/{item}?providerId=IntroSkipper"),
         &json!({"Type":"Intro", "StartTicks":0, "EndTicks":10_000_000}),
-    )
-    .await;
-    api.post(
-        &format!("/MediaSegmentsApi/{item}?providerId=wasm:unloaded"),
-        &json!({"Type":"Outro", "StartTicks":20_000_000, "EndTicks":30_000_000}),
     )
     .await;
     for disabled in [true, false, true, false] {

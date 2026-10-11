@@ -857,6 +857,28 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Snapshots a file-backed database once, before a boot repair rewrites
+    /// what users made (as a table-rebuild migration snapshots the file to
+    /// `<db>.pre-00NN`): to `<db>` with its extension set to `extension`
+    /// (`"db.pre-rehome"` → `jellyfin.db.pre-rehome`), through
+    /// [`Database::snapshot_to`]. Returns the path written — `None` for an
+    /// in-memory database or when that snapshot already exists (an earlier
+    /// boot's, the file as it was before the first attempt).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the snapshot fails.
+    pub async fn snapshot_once(&self, extension: &str) -> Result<Option<std::path::PathBuf>> {
+        let Some(path) = &self.file_path else {
+            return Ok(None);
+        };
+        let backup = path.with_extension(extension);
+        if backup.exists() {
+            return Ok(None);
+        }
+        self.snapshot_to(&backup).await?;
+        Ok(Some(backup))
+    }
 }
 
 /// The exact `__EFMigrationsHistory` migration-id set a Jellyfin 10.11.8
@@ -1600,6 +1622,30 @@ mod tests {
     /// table itself is absent — this must not error), the full chain length
     /// after, and unchanged across a re-open. If it ever reported a constant,
     /// the check would silently stop running on the boots that need it.
+    /// A boot repair's snapshot is written once, beside the file, and never
+    /// over an earlier one; an in-memory database has none.
+    #[tokio::test]
+    async fn a_repair_snapshot_is_taken_once_beside_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let written = db.snapshot_once("db.pre-rehome").await.expect("snapshot");
+        assert_eq!(written, Some(dir.path().join("jellyfin.db.pre-rehome")));
+        assert!(dir.path().join("jellyfin.db.pre-rehome").is_file());
+        assert_eq!(
+            db.snapshot_once("db.pre-rehome").await.expect("again"),
+            None
+        );
+        let memory = Database::connect_in_memory().await.expect("memory");
+        assert_eq!(
+            memory.snapshot_once("db.pre-rehome").await.expect("memory"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn applied_migration_count_tracks_the_chain_and_is_stable_on_reopen() {
         use sqlx::ConnectOptions as _;

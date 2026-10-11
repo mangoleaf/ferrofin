@@ -106,7 +106,11 @@ async fn get_guide_info(
 #[allow(clippy::struct_excessive_bools)] // one field per contract parameter
 struct ChannelsQuery {
     /// Filter by channel type (`TV`/`Radio`).
-    #[serde(rename = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     type_: Option<ferrofin_model::live_tv::ChannelType>,
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
@@ -144,6 +148,10 @@ struct ChannelsQuery {
     /// Comma-delimited sort columns.
     sort_by: Option<String>,
     /// The sort order applied to every sort column.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     sort_order: Option<SortOrder>,
     /// Whether favourited/liked channels sort first (contract default `false`).
     enable_favorite_sorting: Option<bool>,
@@ -988,6 +996,10 @@ struct RecordingsQuery {
     /// The maximum number of records to return.
     limit: Option<i32>,
     /// Restrict to one recording status.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     status: Option<ferrofin_model::live_tv::RecordingStatus>,
     /// Restrict to recordings that are (not) being captured right now.
     is_in_progress: Option<bool>,
@@ -1620,6 +1632,10 @@ struct SeriesTimersQuery {
     /// The field to sort on — only `Priority` is recognised upstream.
     sort_by: Option<String>,
     /// The sort direction.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     sort_order: Option<ferrofin_model::dto::SortOrder>,
 }
 

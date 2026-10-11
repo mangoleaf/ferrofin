@@ -1357,21 +1357,27 @@ name = "ferrofin-extensions"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "chrono",
+ "fancy-regex",
  "ferrofin-chromaprint",
  "ferrofin-core",
  "ferrofin-db",
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
+ "libc",
  "regex",
  "reqwest",
  "rstest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1511,6 +1517,7 @@ dependencies = [
  "fancy-regex",
  "ferrofin-model",
  "ferrofin-util",
+ "icu_collator",
  "regex",
  "rstest",
  "serde",

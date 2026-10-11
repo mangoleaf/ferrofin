@@ -54,10 +54,16 @@ impl Drop for Permit {
 #[derive(Clone)]
 struct Seed<'a> {
     scope: super::PlanScope<'a>,
+    key_folders: &'a [super::VirtualFolderInfo],
+    tv_library: bool,
     locations: std::collections::HashSet<String>,
     date_added: super::DateAdded,
     direct_file_counts: std::collections::HashMap<String, usize>,
     owner_paths: std::collections::HashMap<uuid::Uuid, String>,
+    prelisted: std::collections::HashMap<String, Vec<super::FileSystemEntryInfo>>,
+    album_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
+    folder_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
+    episode_folders: std::collections::HashMap<String, super::EpisodeFolder>,
     budget: Option<Arc<Budget>>,
     cancel: Option<super::ScanCancel>,
 }
@@ -66,10 +72,16 @@ impl<'a> Seed<'a> {
     fn of(ctx: &super::PlanCtx<'a>) -> Self {
         Self {
             scope: ctx.scope,
+            key_folders: ctx.key_folders,
+            tv_library: ctx.tv_library.get(),
             locations: ctx.locations.clone(),
             date_added: ctx.date_added,
             direct_file_counts: ctx.direct_file_counts.borrow().clone(),
             owner_paths: ctx.owner_paths.borrow().clone(),
+            prelisted: ctx.prelisted.borrow().clone(),
+            album_ancestors: ctx.album_ancestors.borrow().clone(),
+            folder_ancestors: ctx.folder_ancestors.borrow().clone(),
+            episode_folders: ctx.episode_folders.borrow().clone(),
             budget: ctx.fanout.clone(),
             cancel: ctx.cancel.clone(),
         }
@@ -79,10 +91,17 @@ impl<'a> Seed<'a> {
     where
         'a: 'b,
     {
-        let mut ctx = super::PlanCtx::new(naming, self.scope).with_date_added(self.date_added);
+        let mut ctx = super::PlanCtx::new(naming, self.scope)
+            .with_date_added(self.date_added)
+            .with_key_folders(self.key_folders);
+        ctx.tv_library.set(self.tv_library);
         ctx.locations = self.locations;
         *ctx.direct_file_counts.borrow_mut() = self.direct_file_counts;
         *ctx.owner_paths.borrow_mut() = self.owner_paths;
+        *ctx.prelisted.borrow_mut() = self.prelisted;
+        *ctx.album_ancestors.borrow_mut() = self.album_ancestors;
+        *ctx.folder_ancestors.borrow_mut() = self.folder_ancestors;
+        *ctx.episode_folders.borrow_mut() = self.episode_folders;
         ctx.fanout = self.budget;
         ctx.cancel = self.cancel;
         ctx
@@ -91,29 +110,53 @@ impl<'a> Seed<'a> {
 
 struct Effects {
     excluded: Vec<String>,
+    superseded: Vec<String>,
     unlisted: Vec<String>,
     inaccessible: Vec<String>,
     owners: std::collections::HashMap<uuid::Uuid, String>,
     counts: std::collections::HashMap<String, usize>,
+    rip_folds: Vec<super::RipFold>,
+    local_versions: Vec<(uuid::Uuid, Vec<String>)>,
+    album_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
+    folder_ancestors: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>>,
+    episode_folders: std::collections::HashMap<String, super::EpisodeFolder>,
 }
 
 impl Effects {
     fn of(ctx: super::PlanCtx<'_>) -> Self {
         Self {
             excluded: ctx.excluded.into_inner(),
+            superseded: ctx.superseded.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
             owners: ctx.owner_paths.into_inner(),
             counts: ctx.direct_file_counts.into_inner(),
+            rip_folds: ctx.rip_folds.into_inner(),
+            local_versions: ctx.local_versions.into_inner(),
+            album_ancestors: ctx.album_ancestors.into_inner(),
+            folder_ancestors: ctx.folder_ancestors.into_inner(),
+            episode_folders: ctx.episode_folders.into_inner(),
         }
     }
 
     fn merge(self, ctx: &super::PlanCtx<'_>) {
         ctx.excluded.borrow_mut().extend(self.excluded);
+        ctx.superseded.borrow_mut().extend(self.superseded);
         ctx.unlisted.borrow_mut().extend(self.unlisted);
         ctx.inaccessible.borrow_mut().extend(self.inaccessible);
         ctx.owner_paths.borrow_mut().extend(self.owners);
         ctx.direct_file_counts.borrow_mut().extend(self.counts);
+        ctx.rip_folds.borrow_mut().extend(self.rip_folds);
+        ctx.local_versions.borrow_mut().extend(self.local_versions);
+        ctx.album_ancestors
+            .borrow_mut()
+            .extend(self.album_ancestors);
+        ctx.folder_ancestors
+            .borrow_mut()
+            .extend(self.folder_ancestors);
+        ctx.episode_folders
+            .borrow_mut()
+            .extend(self.episode_folders);
     }
 }
 
