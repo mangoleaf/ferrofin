@@ -250,20 +250,36 @@ impl FromRequestParts<AppState> for RequireAdmin {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let info = authenticated_info(parts, state).await?;
-        if info.is_api_key {
-            return Ok(Self(info));
-        }
-        if let Some(user) = &info.user
-            && match &info.user_policy {
-                Some(policy) => policy.is_administrator,
-                None => crate::handlers::users::is_administrator(state, user).await?,
-            }
-        {
+        if is_administrator_identity(state, &info).await? {
             return Ok(Self(info));
         }
         Err(ApiError::Forbidden(
             "administrator access required".to_owned(),
         ))
+    }
+}
+
+/// Whether an authenticated caller carries the `Administrator` role: an API
+/// key (the `ApiKey` scheme's principal), or a user whose policy says so.
+/// Public routes that only *prefer* administrators (`User.IsInRole`) use this
+/// on their optional [`AuthenticatedIdentity`].
+///
+/// # Errors
+///
+/// A failed policy lookup.
+pub async fn is_administrator_identity(
+    state: &AppState,
+    info: &AuthorizationInfo,
+) -> Result<bool, ApiError> {
+    if info.is_api_key {
+        return Ok(true);
+    }
+    let Some(user) = &info.user else {
+        return Ok(false);
+    };
+    match &info.user_policy {
+        Some(policy) => Ok(policy.is_administrator),
+        None => crate::handlers::users::is_administrator(state, user).await,
     }
 }
 

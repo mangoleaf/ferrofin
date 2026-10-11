@@ -138,6 +138,16 @@ pub(crate) struct ImageQuery {
 }
 
 impl ImageQuery {
+    /// A query naming only a cache `tag` and an output `format`, as the
+    /// splashscreen route accepts.
+    pub(crate) fn tagged(tag: Option<String>, format: Option<String>) -> Self {
+        Self {
+            format,
+            tag,
+            ..Self::default()
+        }
+    }
+
     /// Whether the request asks for any transform (resize/format/blur); a plain
     /// request serves the stored original untouched.
     fn wants_transform(&self) -> bool {
@@ -400,7 +410,7 @@ fn select_image(
 /// This is the shared tail of every image route once an image row is resolved.
 /// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
 /// image processor, so it is a `404` (the contract's not-found outcome).
-async fn serve_image_file(
+pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
     image: &ItemImageInfo,
