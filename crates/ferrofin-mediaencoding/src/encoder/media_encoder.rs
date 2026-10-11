@@ -19,7 +19,7 @@ use std::sync::RwLock;
 
 use crate::error::MediaEncodingError;
 use async_trait::async_trait;
-use ferrofin_model::drawing::ImageResolution;
+use ferrofin_model::drawing::{ImageFormat, ImageResolution};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{IsoType, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
@@ -572,6 +572,91 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         Ok(output_path)
     }
 
+    async fn extract_image_stream(
+        &self,
+        input_file: &str,
+        container: &str,
+        media_source: &MediaSourceInfo,
+        stream_index: i32,
+        format: ImageFormat,
+    ) -> Result<String, ServiceError> {
+        // Same temp-directory rules as the frame extraction above.
+        let configured_temp = self.config.temp_dir.resolve();
+        let temp_dir = if configured_temp.as_os_str().is_empty() {
+            std::env::temp_dir()
+        } else {
+            configured_temp
+        };
+        ferrofin_util::file_helper::ensure_writable_dir(&temp_dir).map_err(|e| {
+            MediaEncodingError::process(format!(
+                "image extraction temp directory `{}` is not writable: {e}",
+                temp_dir.display()
+            ))
+        })?;
+        let input_path = self.get_input_argument(input_file, media_source);
+        let ffmpeg = self.encoder_path();
+        let _permit = self
+            .image_encoding_pool
+            .acquire()
+            .await
+            .map_err(ServiceError::backend_source)?;
+        // `ExtractImage` tries the I-frame path first and, when that leaves
+        // nothing, the standard one.
+        let mut last_error = String::new();
+        for use_iframe in [true, false] {
+            let output_path = temp_dir
+                .join(format!(
+                    "ferrofin-image-{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    format.extension()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            let args = Self::extract_image_arguments(
+                &input_path,
+                container,
+                None,
+                Some(stream_index),
+                None,
+                None,
+                use_iframe,
+                &output_path,
+                self.config.ffmpeg_version,
+                self.config.threads,
+                self.chapter_image_resolution
+                    .as_ref()
+                    .map_or(ImageResolution::MatchSource, |read| read()),
+            );
+            let output = self
+                .transcoder
+                .get_process_output(&ffmpeg, &args, true, None, &[])
+                .await
+                .map(ProcessOutput::into_output)
+                .map_err(MediaEncodingError::process)?;
+            if std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                return Ok(output_path);
+            }
+            let _ = std::fs::remove_file(&output_path);
+            last_error = output
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+        }
+        Err(MediaEncodingError::process(format!(
+            "ffmpeg image extraction failed for `{input_file}` stream {stream_index}: {}",
+            if last_error.trim().is_empty() {
+                "(no stderr)"
+            } else {
+                last_error.trim()
+            }
+        ))
+        .into())
+    }
+
     fn get_input_argument(&self, input_file: &str, media_source: &MediaSourceInfo) -> String {
         let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
             "bluray"
@@ -604,7 +689,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use ferrofin_model::drawing::ImageResolution;
+    use ferrofin_model::drawing::{ImageFormat, ImageResolution};
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
@@ -778,6 +863,125 @@ mod tests {
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
             true
         }
+    }
+
+    /// A transcoder that records its arguments and writes nothing until its
+    /// `succeed_on`th call (zero-based), as ffmpeg does when a picture cannot
+    /// be extracted the quick way.
+    struct FlakyTranscoder {
+        calls: std::sync::Mutex<Vec<String>>,
+        succeed_on: usize,
+    }
+
+    #[async_trait]
+    impl Transcoder for FlakyTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            let attempt = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(arguments.to_owned());
+                calls.len() - 1
+            };
+            if attempt >= self.succeed_on {
+                let out = arguments.rsplit('"').nth(1).expect("output path");
+                std::fs::write(out, b"png").expect("write picture");
+            }
+            Ok(ProcessOutput {
+                output: "ffmpeg log tail".to_owned(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// `ExtractVideoImage(…, imageStream, imageStreamIndex, targetFormat, …)`:
+    /// the picture stream is mapped by index, written under the requested
+    /// extension in the temp dir, and the standard path is tried when the
+    /// I-frame one leaves nothing.
+    #[tokio::test]
+    async fn extract_image_stream_maps_the_stream_and_retries_without_the_iframe_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(FlakyTranscoder {
+            calls: std::sync::Mutex::new(Vec::new()),
+            succeed_on: 1,
+        });
+        let enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let out = enc
+            .extract_image_stream(
+                "/media/movie.mkv",
+                "matroska",
+                &MediaSourceInfo::default(),
+                3,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("second attempt succeeds");
+        assert_eq!(
+            std::path::Path::new(&out)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("png"),
+            "{out}"
+        );
+        assert!(std::path::Path::new(&out).starts_with(tmp.path()));
+        let calls = transcoder.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls.iter().all(|call| call.contains(" -map 0:3")),
+            "{calls:?}"
+        );
+        // Nothing but the extracted picture is left in the temp dir.
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn extract_image_stream_reports_ffmpeg_output_when_nothing_is_produced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(FlakyTranscoder {
+                calls: std::sync::Mutex::new(Vec::new()),
+                succeed_on: usize::MAX,
+            }),
+            "/usr/bin/ffmpeg".to_owned(),
+            "/usr/bin/ffprobe".to_owned(),
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let error = enc
+            .extract_image_stream(
+                "/media/movie.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                9,
+                ImageFormat::Jpg,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("stream 9") && error.contains("ffmpeg log tail"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

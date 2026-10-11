@@ -81,6 +81,10 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// The attachments of the probe that ran for an item in this pass, kept for
+    /// the artwork step: they are not persisted until after it.
+    probe_attachments:
+        HashMap<Uuid, Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>>,
     /// Final season names for episode `BeforeSaveInternal`, read once per pass.
     season_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
@@ -847,6 +851,142 @@ fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
 
 /// Finds an existing art file `stem.<ext>` in `dir` for any recognized image
 /// extension, preferring the canonical `.jpg` first.
+/// The image types `EmbeddedImageProvider.GetSupportedImages` offers for a
+/// video: an episode's Primary only; any other video's Primary, Backdrop and
+/// Logo. Empty for anything that is not a video.
+fn embedded_image_types(type_name: &str) -> &'static [ImageType] {
+    match crate::item_type_lookup::kind_from_type_name(type_name) {
+        Some(BaseItemKind::Episode) => &[ImageType::Primary],
+        Some(
+            BaseItemKind::Movie
+            | BaseItemKind::Video
+            | BaseItemKind::MusicVideo
+            | BaseItemKind::Trailer,
+        ) => &[ImageType::Primary, ImageType::Backdrop, ImageType::Logo],
+        _ => &[],
+    }
+}
+
+/// The file-name fragments an attachment's name or a stream's comment must
+/// contain to serve as an image type.
+fn embedded_image_names(image_type: ImageType) -> &'static [&'static str] {
+    match image_type {
+        ImageType::Primary => &["poster", "folder", "cover", "default", "movie", "show"],
+        ImageType::Backdrop => &["backdrop", "background", "art"],
+        ImageType::Logo => &["logo"],
+        _ => &[],
+    }
+}
+
+/// The media-source facts a stored video row carries, as ffmpeg's input
+/// argument needs them.
+fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> MediaSourceInfo {
+    let parsed = |key: &str| data.get(key).cloned();
+    MediaSourceInfo {
+        video_type: parsed("VideoType")
+            .and_then(|value| serde_json::from_value(value).ok())
+            .or(Some(VideoType::VideoFile)),
+        iso_type: parsed("IsoType").and_then(|value| serde_json::from_value(value).ok()),
+        protocol: parsed("PathProtocol")
+            .and_then(|value| {
+                serde_json::from_value::<ferrofin_model::media_info::MediaProtocol>(value).ok()
+            })
+            .unwrap_or_default(),
+        ..MediaSourceInfo::default()
+    }
+}
+
+/// `EmbeddedImageProvider.Supports` + `GetImage`: no shortcuts, remote
+/// sources, placeholders or DVD structures.
+fn embedded_image_eligible(path: &str, data: &serde_json::Map<String, serde_json::Value>) -> bool {
+    !(Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("strm"))
+        || !crate::media_info_resolver::is_file_protocol(path)
+        || data
+            .get("IsPlaceHolder")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || crate::item_data::read_data_string(data, "VideoType").as_deref() == Some("Dvd"))
+}
+
+/// An embedded picture to extract: the ffmpeg stream index and output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmbeddedPicture {
+    index: i32,
+    format: ferrofin_model::drawing::ImageFormat,
+}
+
+/// `EmbeddedImageProvider.GetEmbeddedImage`'s source choice. An attachment whose
+/// file name contains one of the type's fragments wins (its format from the
+/// MIME type, else the file extension); otherwise the first embedded-image
+/// stream whose comment contains one does (its format from the codec); a
+/// Primary with no labelled match takes the first embedded-image stream.
+fn pick_embedded_picture(
+    image_type: ImageType,
+    attachments: &[(i32, Option<&str>, Option<&str>)],
+    streams: &[(i32, Option<&str>, Option<&str>)],
+) -> Option<EmbeddedPicture> {
+    use ferrofin_model::drawing::ImageFormat;
+    let names = embedded_image_names(image_type);
+    let contains = |haystack: &str| {
+        let lower = haystack.to_lowercase();
+        names.iter().any(|name| lower.contains(name))
+    };
+    if let Some((index, file_name, mime)) = attachments
+        .iter()
+        .find(|(_, file_name, _)| file_name.is_some_and(|name| !name.is_empty() && contains(name)))
+    {
+        // `MimeTypes.ToExtension(mime)`, or the file name's own extension.
+        let extension = match mime.filter(|mime| !mime.is_empty()) {
+            Some(mime) => match mime.to_ascii_lowercase().as_str() {
+                "image/bmp" => ".bmp",
+                "image/gif" => ".gif",
+                "image/png" => ".png",
+                "image/webp" => ".webp",
+                _ => ".jpg",
+            }
+            .to_owned(),
+            None => Path::new(file_name.unwrap_or_default())
+                .extension()
+                .map(|extension| format!(".{}", extension.to_string_lossy().to_lowercase()))
+                .unwrap_or_default(),
+        };
+        let format = match extension.as_str() {
+            ".bmp" => ImageFormat::Bmp,
+            ".gif" => ImageFormat::Gif,
+            ".png" => ImageFormat::Png,
+            ".webp" => ImageFormat::Webp,
+            _ => ImageFormat::Jpg,
+        };
+        return Some(EmbeddedPicture {
+            index: *index,
+            format,
+        });
+    }
+    let (index, _, codec) = streams
+        .iter()
+        .find(|(_, comment, _)| {
+            comment.is_some_and(|comment| !comment.is_empty() && contains(comment))
+        })
+        .or_else(|| {
+            (image_type == ImageType::Primary)
+                .then(|| streams.first())
+                .flatten()
+        })?;
+    let format = match codec.unwrap_or_default() {
+        "bmp" => ImageFormat::Bmp,
+        "gif" => ImageFormat::Gif,
+        "png" => ImageFormat::Png,
+        "webp" => ImageFormat::Webp,
+        _ => ImageFormat::Jpg,
+    };
+    Some(EmbeddedPicture {
+        index: *index,
+        format,
+    })
+}
+
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
     ART_FILE_EXTENSIONS
         .iter()
@@ -5465,10 +5605,17 @@ impl LibraryScanner {
         } else {
             None
         };
+        if rows.save_attachments {
+            state
+                .art_cache
+                .probe_attachments
+                .insert(item.id, rows.attachments.clone());
+        }
         let ((artwork, cut_short), failed) = count_request_failures(Box::pin(
             self.collect_artwork(item.id, art, state.art_cache),
         ))
         .await;
+        state.art_cache.probe_attachments.remove(&item.id);
         // A cancel inside the artwork pass stops its fetches where they
         // stand. Its file changes (the replaced images removed, the
         // downloads that landed) are already on disk, so the item is saved
@@ -9206,6 +9353,151 @@ impl LibraryScanner {
         }]
     }
 
+    /// A video's embedded pictures, for each supported type the item still
+    /// lacks and the library's image limit allows.
+    #[allow(clippy::too_many_arguments)]
+    async fn extract_video_embedded_images(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+        policy: FetcherPolicy<'_>,
+        kind: &str,
+        fetch: ImageFetch,
+        cache: &ArtworkCache,
+        images: &mut Vec<ItemImageInfo>,
+    ) {
+        let preferences =
+            ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, kind);
+        for image_type in embedded_image_types(&entity.type_) {
+            if images.iter().any(|i| i.image_type == *image_type)
+                || preferences.limit(*image_type) == 0
+            {
+                continue;
+            }
+            if let Some(image) = self
+                .extract_video_embedded_image(
+                    item_id,
+                    entity,
+                    streams,
+                    *image_type,
+                    fetch == ImageFetch::All,
+                    cache.probe_attachments.get(&item_id).map(Vec::as_slice),
+                )
+                .await
+            {
+                images.push(image);
+            }
+        }
+    }
+
+    /// `EmbeddedImageProvider` for a video: a Primary, Backdrop or Logo taken
+    /// from a labelled attachment or embedded-image stream and stored beside
+    /// the item's other artwork. Best-effort like every extractor: no encoder,
+    /// an ineligible item, no matching picture or a failed extraction yield
+    /// nothing. A stored extraction is reused unless images are being replaced.
+    async fn extract_video_embedded_image(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+        image_type: ImageType,
+        replace: bool,
+        probe_attachments: Option<&[ferrofin_db::entities::base_items::AttachmentStreamInfoEntity]>,
+    ) -> Option<ItemImageInfo> {
+        let (encoder, meta_root, path) = (
+            self.media_encoder.as_ref()?,
+            self.metadata_dir.as_ref()?,
+            entity.path.as_deref()?,
+        );
+        let data = crate::item_data::parse_data(entity.data.as_deref());
+        if !embedded_image_eligible(path, &data) {
+            return None;
+        }
+        let dir = meta_root.join(&entity.id);
+        let stem = image_type_file_stem(image_type);
+        if !replace && let Some(existing) = existing_art_file(&dir, stem) {
+            return Some(ItemImageInfo {
+                path: existing.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: file_date_modified(&existing),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            });
+        }
+        // The probe that just ran is authoritative; without one the stored rows are.
+        let attachments = match (probe_attachments, &self.media_attachments) {
+            (Some(rows), _) => rows.to_vec(),
+            (None, Some(repo)) => repo
+                .get_media_attachments(&ferrofin_traits::persistence::MediaAttachmentQuery {
+                    item_id,
+                    index: None,
+                })
+                .await
+                .unwrap_or_default(),
+            (None, None) => Vec::new(),
+        };
+        let attachment_rows: Vec<_> = attachments
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    i32::try_from(row.index).ok()?,
+                    row.filename.as_deref(),
+                    row.mime_type.as_deref(),
+                ))
+            })
+            .collect();
+        let stream_rows: Vec<_> = streams
+            .iter()
+            .filter(|stream| stream.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
+            .filter_map(|stream| {
+                Some((
+                    i32::try_from(stream.stream_index).ok()?,
+                    stream.comment.as_deref(),
+                    stream.codec.as_deref(),
+                ))
+            })
+            .collect();
+        let picture = pick_embedded_picture(image_type, &attachment_rows, &stream_rows)?;
+        let source = stored_media_source(&data);
+        let container = crate::item_data::read_data_string(&data, "Container").unwrap_or_default();
+        let extracted = match encoder
+            .extract_image_stream(path, &container, &source, picture.index, picture.format)
+            .await
+        {
+            Ok(extracted) => extracted,
+            Err(err) => {
+                tracing::warn!(%err, item = %item_id, ?image_type, "failed to extract embedded image");
+                return None;
+            }
+        };
+        let dest = dir.join(format!("{stem}{}", picture.format.extension()));
+        let stored = std::fs::create_dir_all(&dir).and_then(|()| {
+            // A replaced extraction may have another extension; keep one file.
+            for old in ART_FILE_EXTENSIONS {
+                let old = dir.join(format!("{stem}.{old}"));
+                if old != dest {
+                    let _ = std::fs::remove_file(&old);
+                }
+            }
+            std::fs::copy(&extracted, &dest).map(|_| ())
+        });
+        let _ = std::fs::remove_file(&extracted);
+        if let Err(err) = stored {
+            tracing::warn!(%err, item = %item_id, "failed to store embedded image");
+            return None;
+        }
+        Some(ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: file_date_modified(&dest),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        })
+    }
+
     /// Publish the album cover and backfill tracks that had no picture before
     /// the first successful extraction. Existing track-specific art wins.
     async fn inherit_album_cover(&self, album_uuid: Uuid, items: &dyn ItemRepository) {
@@ -9551,6 +9843,12 @@ impl LibraryScanner {
                     }
                     self.run_remote_image_providers(fetch, entity, cache, selected, images)
                         .await;
+                }
+                Step::Embedded if extractor == fetcher_names::EMBEDDED_IMAGES => {
+                    self.extract_video_embedded_images(
+                        item_id, entity, streams, policy, short, fetch, cache, images,
+                    )
+                    .await;
                 }
                 Step::Embedded if !images.iter().any(|i| i.image_type == ImageType::Primary) => {
                     images.extend(
@@ -16748,6 +17046,116 @@ mod tests {
 
     // NFO sidecar search order: files look next to the media then for movie.nfo;
     // folders look inside for tvshow.nfo/season.nfo; a single-folder movie for movie.nfo.
+    #[test]
+    fn embedded_picture_sources_follow_embedded_image_provider() {
+        use super::{EmbeddedPicture, pick_embedded_picture};
+        use ferrofin_model::drawing::ImageFormat::{Bmp, Gif, Jpg, Png, Webp};
+        use ferrofin_model::entities::ImageType;
+        let pick = |kind,
+                    attachments: &[(i32, Option<&str>, Option<&str>)],
+                    streams: &[(i32, Option<&str>, Option<&str>)]| {
+            pick_embedded_picture(kind, attachments, streams)
+        };
+        let at = |index, format| Some(EmbeddedPicture { index, format });
+        // An attachment whose name contains a fragment (any case) beats a stream.
+        assert_eq!(
+            pick(
+                ImageType::Primary,
+                &[(4, Some("My_POSTER.jpeg"), None)],
+                &[(2, Some("cover"), Some("png"))]
+            ),
+            at(4, Jpg)
+        );
+        // Its format comes from the MIME type, else the file extension.
+        for (mime, name, expected) in [
+            (Some("image/png"), "logo.bmp", Png),
+            (Some("image/BMP"), "logo.png", Bmp),
+            (Some("image/gif"), "logo", Gif),
+            (Some("image/webp"), "logo", Webp),
+            (Some("image/tiff"), "logo.png", Jpg),
+            (None, "logo.GIF", Gif),
+            (Some(""), "logo.png", Png),
+            (None, "logo", Jpg),
+        ] {
+            assert_eq!(
+                pick(ImageType::Logo, &[(1, Some(name), mime)], &[]),
+                at(1, expected),
+                "{mime:?} {name}"
+            );
+        }
+        // Streams: the first whose comment contains a fragment; the codec names
+        // the format.
+        let streams = [
+            (1, None, Some("mjpeg")),
+            (2, Some("Screenshot"), Some("png")),
+            (3, Some("Fan ART"), Some("webp")),
+            (5, Some("cover.bmp"), Some("bmp")),
+        ];
+        assert_eq!(pick(ImageType::Backdrop, &[], &streams), at(3, Webp));
+        assert_eq!(pick(ImageType::Primary, &[], &streams), at(5, Bmp));
+        // Primary alone falls back to the first stream; the others do not.
+        assert_eq!(pick(ImageType::Primary, &[], &streams[..2]), at(1, Jpg));
+        assert_eq!(pick(ImageType::Logo, &[], &streams), None);
+        assert_eq!(pick(ImageType::Backdrop, &[], &streams[..2]), None);
+        // Empty names and comments match nothing.
+        assert_eq!(
+            pick(
+                ImageType::Logo,
+                &[(1, Some(""), None), (2, None, None)],
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            pick(ImageType::Thumb, &[(1, Some("thumb.png"), None)], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_image_eligibility_excludes_shortcuts_remote_placeholders_and_dvds() {
+        use super::embedded_image_eligible;
+        let data = |json: &str| match serde_json::from_str(json).unwrap() {
+            serde_json::Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+        assert!(embedded_image_eligible("/m/a.mkv", &data("{}")));
+        assert!(!embedded_image_eligible("/m/a.STRM", &data("{}")));
+        assert!(!embedded_image_eligible("http://host/a.mkv", &data("{}")));
+        assert!(!embedded_image_eligible(
+            "/m/a.mkv",
+            &data(r#"{"IsPlaceHolder":true}"#)
+        ));
+        assert!(!embedded_image_eligible(
+            "/m/a.mkv",
+            &data(r#"{"VideoType":"Dvd"}"#)
+        ));
+        assert!(embedded_image_eligible(
+            "/m/a.mkv",
+            &data(r#"{"VideoType":"BluRay"}"#)
+        ));
+    }
+
+    #[test]
+    fn embedded_image_types_follow_the_item_kind() {
+        use super::embedded_image_types;
+        use ferrofin_model::entities::ImageType;
+        let stored = |name: &str| format!("MediaBrowser.Controller.Entities.{name}");
+        assert_eq!(
+            embedded_image_types(&stored("TV.Episode")),
+            [ImageType::Primary]
+        );
+        for movie in ["Movies.Movie", "Video", "MusicVideo"] {
+            assert_eq!(
+                embedded_image_types(&stored(movie)),
+                [ImageType::Primary, ImageType::Backdrop, ImageType::Logo],
+                "{movie}"
+            );
+        }
+        assert!(embedded_image_types(&stored("Audio.Audio")).is_empty());
+        assert!(embedded_image_types(&stored("TV.Series")).is_empty());
+    }
+
     #[allow(clippy::too_many_lines)]
     #[test]
     fn nfo_candidates_match_jellyfin_search_order() {

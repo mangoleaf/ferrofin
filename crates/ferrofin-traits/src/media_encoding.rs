@@ -31,6 +31,7 @@
 //! metadata the library scan reads from audio tags.
 
 use async_trait::async_trait;
+use ferrofin_model::drawing::ImageFormat;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::Video3DFormat;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
@@ -175,6 +176,33 @@ pub trait MediaEncoder: Send + Sync {
         threed_format: Option<Video3DFormat>,
         offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError>;
+
+    /// Extracts one embedded image stream (a still picture or an attachment
+    /// ffmpeg exposes as a stream) of a video file to a temporary file in
+    /// `format`, returning its path. Port of the `ExtractVideoImage(inputFile,
+    /// container, mediaSource, imageStream, imageStreamIndex, targetFormat, …)`
+    /// overload `EmbeddedImageProvider` calls.
+    ///
+    /// The default reports the operation as unsupported, for encoders (and
+    /// test doubles) that only extract frames.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the encoder cannot extract images or
+    /// ffmpeg produces no picture.
+    async fn extract_image_stream(
+        &self,
+        input_file: &str,
+        container: &str,
+        media_source: &MediaSourceInfo,
+        stream_index: i32,
+        format: ImageFormat,
+    ) -> Result<String, ServiceError> {
+        let _ = (input_file, container, media_source, stream_index, format);
+        Err(ServiceError::backend(
+            "this media encoder cannot extract embedded image streams",
+        ))
+    }
 
     /// Builds the ffmpeg input argument for a single file. Port of
     /// `GetInputArgument(string inputFile, MediaSourceInfo)`.
