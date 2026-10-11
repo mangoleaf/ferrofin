@@ -15573,25 +15573,7 @@ fn apply_omdb(
 /// Maps OMDb's credited people to persistable rows: the director, the writer,
 /// then each actor. OMDb carries no per-person id or image.
 fn omdb_people(item: &ferrofin_providers::OmdbItem) -> Vec<PeopleEntity> {
-    item.people()
-        .into_iter()
-        .map(|(name, kind)| PeopleEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            name,
-            person_type: Some(
-                match kind {
-                    ferrofin_providers::OmdbPersonKind::Director => "Director",
-                    ferrofin_providers::OmdbPersonKind::Writer => "Writer",
-                    ferrofin_providers::OmdbPersonKind::Actor => "Actor",
-                }
-                .to_owned(),
-            ),
-            role: None,
-            primary_image_url: None,
-            provider_id: None,
-            sort_order: None,
-        })
-        .collect()
+    ferrofin_providers::episode::omdb_people(item)
 }
 
 /// Fills a provider-owned serialized property without reserializing a no-op.
@@ -15975,19 +15957,7 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
 fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
-    people
-        .iter()
-        .map(|p| PeopleEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            name: p.name.clone(),
-            person_type: Some(p.person_type.clone()),
-            role: p.role.clone(),
-            primary_image_url: p.image_url.clone(),
-            provider_id: None,
-            // The TVDB plugin sets no `SortOrder` on its credits.
-            sort_order: None,
-        })
-        .collect()
+    ferrofin_providers::episode::tvdb_people(people)
 }
 
 /// Applies C# `AlbumMetadataService`'s child-metadata aggregation to one album,

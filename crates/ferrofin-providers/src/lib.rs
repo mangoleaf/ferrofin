@@ -12,6 +12,7 @@ pub mod books;
 pub mod builtin_plugins;
 pub mod chapter_names;
 pub mod container_types;
+pub mod episode;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;

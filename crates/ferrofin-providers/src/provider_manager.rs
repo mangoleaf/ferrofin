@@ -1616,9 +1616,10 @@ impl LocalProviderManager {
 
     /// The remote metadata providers this manager's refresh runs for `kind`,
     /// in registration order ([`BUILT_IN_METADATA_FETCHERS`]): TheMovieDb's,
-    /// and for a season the TVDB plugin's `TvdbSeasonProvider` too when its
-    /// client is wired — first, as a plugin registers before the server's
-    /// providers in Jellyfin.
+    /// and for a season or an episode the TVDB plugin's providers too when
+    /// its client is wired — first, as a plugin registers before the server's
+    /// providers in Jellyfin — and for an episode OMDb's `OmdbEpisodeProvider`
+    /// when it has a key.
     ///
     /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
     fn metadata_fetchers(&self, kind: &str) -> Vec<&'static str> {
@@ -1627,7 +1628,12 @@ impl LocalProviderManager {
             .copied()
             .filter(|&name| {
                 name == fetcher_names::TMDB
-                    || (name == fetcher_names::TVDB && kind == "Season" && self.tvdb.is_some())
+                    || (name == fetcher_names::TVDB
+                        && matches!(kind, "Season" | "Episode")
+                        && self.tvdb.is_some())
+                    || (name == fetcher_names::OMDB
+                        && kind == "Episode"
+                        && self.omdb.as_ref().is_some_and(|omdb| omdb.is_enabled()))
             })
             .collect()
     }
@@ -1680,29 +1686,6 @@ impl LocalProviderManager {
                 .and_then(|series| series.data)
                 .as_deref(),
         )
-    }
-
-    /// Resolves the parent series' TMDB id (its stored provider ids first,
-    /// then a title search) and fetches one season's details — the shared
-    /// first half of the season/episode refresh arms. `None` when the series
-    /// has no TMDB match or the season fetch fails.
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_season(
-        &self,
-        tmdb: &Arc<TmdbClient>,
-        series_id: Option<Uuid>,
-        series_name: &str,
-        series_year: Option<i32>,
-        season_number: i32,
-        language: Option<&str>,
-    ) -> Option<crate::tmdb::SeasonDetails> {
-        let stored = match series_id {
-            Some(id) => self.stored_provider_ids(id).await,
-            None => Vec::new(),
-        };
-        let tmdb_id = Self::series_tmdb_id(tmdb, &stored, series_name, series_year).await?;
-        tmdb.season_details_for_language(tmdb_id, season_number, language)
-            .await
     }
 
     /// The parent series' TMDB id: its stored ids first (`Tmdb`, else `Imdb`
@@ -1979,68 +1962,204 @@ impl LocalProviderManager {
         })
     }
 
-    /// The episode arm — `TmdbEpisodeProvider`: the parent series' season
-    /// from TMDB, then the one episode within it, with the numbers it was
-    /// looked up by. Its artwork is its still — Primary, like the scanner.
+    /// Every episode provider for a path-less episode — `TmdbEpisodeProvider`,
+    /// `OmdbEpisodeProvider` and the TVDB plugin's `TvdbEpisodeProvider`, those
+    /// the library has enabled, in its provider order — as
+    /// `ExecuteRemoteProviders` folds them (`MetadataService.cs:955-1025`).
     ///
-    /// TODO(parity, open work item — NOT an accepted divergence): upstream
-    /// runs every episode provider here too (OMDb's and the TVDB plugin's,
-    /// in the library's order), resolves the series by its `Tmdb` id only
-    /// (`TmdbEpisodeProvider.cs:92-97`: no search), and saves the episode's
-    /// credits. Port it as [`fetch_season_providers`] runs the season's.
-    ///
-    /// [`fetch_season_providers`]: Self::fetch_season_providers
-    async fn fetch_tv(
-        &self,
-        tmdb: &Arc<TmdbClient>,
-        target: RefreshTarget,
-        fetch: Fetch,
-        language: Option<&str>,
-    ) -> Option<Fetched> {
-        let RefreshTarget::Episode {
-            series_id,
-            series_name,
-            series_year,
+    /// Each provider resolves by the parent series' ids alone, never by its
+    /// name: TheMovieDb by the series' `Tmdb` id (`TmdbEpisodeProvider.cs:
+    /// 92-97`, no search), OMDb by its `Imdb` id and the episode's own, TheTVDB
+    /// by its `Tvdb` id in the series' display order. An answer folds into
+    /// `temp` as the scan folds it: an answer in the preferred language with an
+    /// overview drops one an earlier answer in another language supplied (and
+    /// one in another language marks the overview it is first to supply as a
+    /// fallback), the fields fill only where `temp` is empty, and the ids it
+    /// gathered join the lookup the providers after it resolve by (OMDb finds
+    /// the episode's own `Imdb` id there). Each answer's credits are kept to be
+    /// folded as the scan folds them.
+    async fn fetch_episode_providers(&self, episode: EpisodeRefresh<'_>) -> Fetched {
+        use crate::library_options::metadata_fetcher_rank;
+        use crate::metadata_merge::{MetadataResult, merge_data, merge_provider_ids};
+        let EpisodeRefresh {
+            row,
+            series_ids,
+            own_ids,
             season_number,
             episode_number,
-        } = target
-        else {
-            return None;
+            library,
+            prefer,
+            fetch,
+        } = episode;
+        let global = self.global_metadata_options_for("Episode");
+        let enabled =
+            |name: &str| metadata_fetcher_enabled(library, global.as_ref(), "Episode", name);
+        let series_id_of = |key: &str| {
+            provider_id_of_pairs(series_ids, key)
+                .and_then(parse_numeric_provider_id)
+                .filter(|id| *id > 0)
         };
-        let season = self
-            .fetch_season(
-                tmdb,
-                series_id,
-                &series_name,
-                series_year,
-                season_number,
-                language,
-            )
-            .await?;
-        let episode = season
-            .episodes
+        let mut sources: Vec<&'static str> = self
+            .metadata_fetchers("Episode")
             .into_iter()
-            .find(|ep| ep.episode_number == episode_number)?;
-        let (item, image_url) = (
-            BaseItemEntity {
-                name: episode.name,
-                overview: episode.overview,
-                index_number: Some(i64::from(episode_number)),
-                parent_index_number: Some(i64::from(season_number)),
-                ..BaseItemEntity::default()
-            },
-            episode.still_url,
-        );
+            .filter(|name| fetch.metadata && enabled(name))
+            .collect();
+        sources
+            .sort_by_key(|name| metadata_fetcher_rank(library, global.as_ref(), "Episode", name));
+        if let Some(prefer) = prefer {
+            sources.sort_by_key(|name| !name.eq_ignore_ascii_case(prefer));
+        }
+        let language = self.preferred_metadata_language(row).await;
+        let country = self.preferred_metadata_country_code(row).await;
+        let tmdb_language = crate::tmdb::normalize_language(Some(&language), Some(&country));
+        let mut lookup: Vec<(String, String)> = own_ids.to_vec();
         let mut fetched = Fetched::default();
-        if fetch.metadata {
-            fetched.item = Some(item);
+        let mut temp = MetadataResult::of(BaseItemEntity::default());
+        let mut overview_is_fallback = false;
+        let mut answered = false;
+        for name in sources {
+            let answer = if name == fetcher_names::TMDB {
+                self.tmdb_episode(
+                    series_id_of("Tmdb"),
+                    season_number,
+                    episode_number,
+                    tmdb_language.as_deref(),
+                )
+                .await
+            } else if name == fetcher_names::OMDB {
+                self.omdb_episode(
+                    provider_id_of_pairs(series_ids, "Imdb"),
+                    provider_id_of_pairs(&lookup, "Imdb"),
+                    (season_number, episode_number),
+                    (&language, &country),
+                )
+                .await
+            } else {
+                match series_id_of("Tvdb") {
+                    Some(series) => {
+                        self.tvdb_episode(row, series, (season_number, episode_number), &language)
+                            .await
+                    }
+                    None => None,
+                }
+            };
+            let Some(answer) = answer else { continue };
+            let has_overview = answer
+                .result
+                .item
+                .overview
+                .as_deref()
+                .is_some_and(|text| !text.is_empty());
+            if crate::metadata_merge::matches_preferred_language(answer.language, &language) {
+                if overview_is_fallback && has_overview {
+                    temp.item.overview = None;
+                    overview_is_fallback = false;
+                }
+            } else {
+                overview_is_fallback |=
+                    temp.item.overview.as_deref().is_none_or(str::is_empty) && has_overview;
+            }
+            merge_data(
+                &MetadataResult::of(answer.result.item),
+                &mut temp,
+                &[],
+                false,
+                false,
+            );
+            temp.provider_ids =
+                merge_provider_ids(&answer.result.provider_ids, &temp.provider_ids, false);
+            lookup = merge_provider_ids(&temp.provider_ids, &lookup, false);
+            fetched.credits.push(answer.result.people);
+            answered = true;
         }
-        if fetch.images
-            && let Some(url) = image_url
-        {
-            fetched.images.push((ImageType::Primary, url));
+        if answered {
+            fetched.item = Some(temp.item);
+            fetched.provider_ids = temp.provider_ids;
         }
-        Some(fetched)
+        fetched
+    }
+
+    /// `OmdbEpisodeProvider`'s answer: the episode's entry in its series' season
+    /// listing, by the series' `Imdb` id and the episode's own (found first).
+    async fn omdb_episode(
+        &self,
+        series_imdb: Option<&str>,
+        own_imdb: Option<&str>,
+        (season_number, episode_number): (i32, i32),
+        (language, country): (&str, &str),
+    ) -> Option<crate::episode::EpisodeAnswer> {
+        let (omdb, series) = self.omdb.as_ref().zip(series_imdb)?;
+        let record = omdb
+            .episode(series, season_number, episode_number, own_imdb)
+            .await?;
+        let subtag = language
+            .split_once('-')
+            .map_or(language, |(subtag, _)| subtag);
+        Some(crate::episode::omdb_answer(
+            &record,
+            crate::episode::OmdbGates {
+                english: subtag.eq_ignore_ascii_case("en"),
+                us: country.eq_ignore_ascii_case("US"),
+                cast_and_crew: omdb.cast_and_crew().await,
+            },
+            season_number,
+            episode_number,
+        ))
+    }
+
+    /// `TvdbEpisodeProvider`'s answer: TheTVDB's record for the episode of the
+    /// series known as `series_tvdb_id`, numbered in the series' display order
+    /// and localized into `language`.
+    async fn tvdb_episode(
+        &self,
+        row: &BaseItemEntity,
+        series_tvdb_id: i64,
+        (season_number, episode_number): (i32, i32),
+        language: &str,
+    ) -> Option<crate::episode::EpisodeAnswer> {
+        let client = self.tvdb.as_ref()?;
+        let three_letter = self.three_letter_language_names(language);
+        let display_order = self.series_display_order_of(row).await;
+        let (season_type, season, number) =
+            crate::tvdb::episode_lookup(&display_order, Some(season_number), episode_number);
+        let mut record = client
+            .episode_by_number(series_tvdb_id, season_type, season, number)
+            .await?;
+        record.localize(language, &three_letter);
+        Some(crate::episode::tvdb_answer(
+            &record,
+            display_order.is_empty(),
+            season_number,
+            episode_number,
+        ))
+    }
+
+    /// `TmdbEpisodeProvider`'s answer: the episode's entry in the series'
+    /// season response and its own request, by the series' `Tmdb` id only.
+    async fn tmdb_episode(
+        &self,
+        series_tmdb_id: Option<i64>,
+        season_number: i32,
+        episode_number: i32,
+        language: Option<&str>,
+    ) -> Option<crate::episode::EpisodeAnswer> {
+        let (client, series) = self.tmdb.as_ref().zip(series_tmdb_id)?;
+        let season = client
+            .season_details_for_language(series, season_number, language)
+            .await?;
+        let entry = season
+            .episodes
+            .iter()
+            .find(|entry| entry.episode_number == episode_number)?;
+        let extras = client
+            .episode_extras_for_language(series, season_number, episode_number, language)
+            .await;
+        Some(crate::episode::tmdb_answer(
+            entry,
+            extras.as_ref(),
+            season_number,
+            episode_number,
+        ))
     }
 
     /// Runs the provider arm `target` names, the way the chosen Identify
@@ -2065,12 +2184,10 @@ impl LocalProviderManager {
                 Self::fetch_person(tmdb, chosen_name.unwrap_or(&name), tmdb_id, fetch, language)
                     .await
             }
-            // The season arm runs every season provider; `refresh_item`
-            // routes it to `fetch_season_providers`.
-            RefreshTarget::Season { .. } => None,
-            episode @ RefreshTarget::Episode { .. } => {
-                self.fetch_tv(tmdb, episode, fetch, language).await
-            }
+            // The season and episode arms run every provider of their kind;
+            // `refresh_item` routes them to `fetch_season_providers` and
+            // `fetch_episode_providers`.
+            RefreshTarget::Season { .. } | RefreshTarget::Episode { .. } => None,
         }
     }
 
@@ -2249,6 +2366,42 @@ impl LocalProviderManager {
                 // (`clippy::large_futures`).
                 let (fetched, failures) = crate::rate_limit::count_request_failures(Box::pin(
                     self.fetch_season_providers(season),
+                ))
+                .await;
+                (Some(fetched), failures)
+            }
+            Some(RefreshTarget::Episode {
+                series_id,
+                season_number,
+                episode_number,
+            }) => {
+                // `ApplySearchResult`: an identified episode looks up by the
+                // chosen result's ids as its SERIES' ids and has none of its own.
+                let (series_ids, own_ids) = match (&options.search_result, series_id) {
+                    (Some(_), _) => (stored_ids.clone(), Vec::new()),
+                    (None, Some(series)) => {
+                        (self.stored_provider_ids(series).await, stored_ids.clone())
+                    }
+                    (None, None) => (Vec::new(), stored_ids.clone()),
+                };
+                let episode = EpisodeRefresh {
+                    row: &stored,
+                    series_ids: &series_ids,
+                    own_ids: &own_ids,
+                    season_number,
+                    episode_number,
+                    library: library.as_ref(),
+                    prefer: options
+                        .search_result
+                        .as_ref()
+                        .and_then(|r| r.search_provider_name.as_deref()),
+                    fetch: Fetch {
+                        images: false,
+                        ..fetch
+                    },
+                };
+                let (fetched, failures) = crate::rate_limit::count_request_failures(Box::pin(
+                    self.fetch_episode_providers(episode),
                 ))
                 .await;
                 (Some(fetched), failures)
@@ -2897,6 +3050,27 @@ struct SeasonRefresh<'a> {
     fetch: Fetch,
 }
 
+/// What [`LocalProviderManager::fetch_episode_providers`] looks an episode up
+/// by.
+struct EpisodeRefresh<'a> {
+    /// The episode's stored row (its preferred metadata language, its series).
+    row: &'a BaseItemEntity,
+    /// The series' ids the providers resolve by (`SeriesProviderIds`).
+    series_ids: &'a [(String, String)],
+    /// The episode's own ids (the lookup info's `ProviderIds`).
+    own_ids: &'a [(String, String)],
+    /// The season's number.
+    season_number: i32,
+    /// The episode's number.
+    episode_number: i32,
+    /// The owning library's options (its fetcher checkboxes and order).
+    library: Option<&'a ferrofin_model::configuration::LibraryOptions>,
+    /// Identify's chosen provider, which runs first.
+    prefer: Option<&'a str>,
+    /// Which halves run.
+    fetch: Fetch,
+}
+
 /// What a metadata refresh should fetch for one item with no file of its own
 /// — resolved from the item's kind and (for seasons/episodes) its
 /// parent-series linkage. Movies and series always have a path, so they
@@ -2923,14 +3097,13 @@ enum RefreshTarget {
         /// The person's name to search for.
         name: String,
     },
-    /// An episode: like a season, then select the episode within it.
+    /// An episode: every episode provider, by the parent series' stored ids
+    /// and the season and episode numbers
+    /// ([`LocalProviderManager::fetch_episode_providers`]).
     Episode {
-        /// The parent series row id (its stored provider ids pin the series).
+        /// The parent series row id (its stored provider ids are what the
+        /// episode providers resolve by).
         series_id: Option<Uuid>,
-        /// The parent series title driving the TMDB search.
-        series_name: String,
-        /// The parent series year, when known.
-        series_year: Option<i32>,
         /// The season number within the series.
         season_number: i32,
         /// The episode number within the season.
@@ -3877,14 +4050,11 @@ fn refresh_target_of(
             season_number: number(entity.index_number)?,
         });
     }
-    let series_name = series.name.clone().filter(|n| !n.is_empty())?;
-    let series_year = series.production_year.and_then(|y| i32::try_from(y).ok());
     // Episode: `parent_index_number` is the season, `index_number` the
-    // episode within it.
+    // episode within it. The episode providers resolve by the series' ids
+    // alone, never by its name.
     Some(RefreshTarget::Episode {
         series_id,
-        series_name,
-        series_year,
         season_number: number(entity.parent_index_number)?,
         episode_number: number(entity.index_number)?,
     })
@@ -8032,12 +8202,11 @@ mod tests {
         episode.index_number = Some(3);
         match refresh_target_of(&episode, Some(&series)) {
             Some(RefreshTarget::Episode {
-                series_name,
+                series_id,
                 season_number,
                 episode_number,
-                ..
             }) => {
-                assert_eq!(series_name, "Severance");
+                assert_eq!(series_id, Uuid::parse_str(&series.id).ok());
                 assert_eq!(season_number, 1);
                 assert_eq!(episode_number, 3);
             }
@@ -9656,6 +9825,401 @@ mod tests {
         let asked = log.lock().expect("log").clone();
         assert!(!asked.iter().any(|l| l.contains("/tmdb/")), "{asked:?}");
         assert!(season.people.written.lock().expect("lock").is_empty());
+    }
+
+    // ── a path-less episode: every episode provider ─────────────────────────
+
+    /// TheMovieDb's season listing with episode 2, and the episode's own
+    /// request (its external ids and one guest star).
+    const TMDB_EPISODE_SEASON: &str = r#"{"id": 3624, "episodes": [
+        {"id": 9002, "episode_number": 2, "name": "TMDB Episode",
+         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5}]}"#;
+    const TMDB_EPISODE: &str = r#"{"external_ids": {"imdb_id": "tt0002002", "tvdb_id": 5002},
+        "credits": {"cast": [], "guest_stars": [{"id": 31, "name": "Guest Star",
+        "character": "Visitor", "order": 0}], "crew": []}, "videos": {"results": []}}"#;
+
+    /// A stand-in serving TheMovieDb under `/tmdb`, TheTVDB under `/tvdb`
+    /// (series `121361`, `official` season 1 episode 2 = 5002, translated) and
+    /// OMDb under `/omdb` (series `tt0000001`, season 1), logging every
+    /// request line. With `fail` every request but TheTVDB login is refused.
+    fn spawn_episode_providers(fail: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::clone(&log);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_owned();
+                let routes = [
+                    ("/tvdb/login", r#"{"data": {"token": "tok"}}"#),
+                    (
+                        "/tvdb/series/121361/episodes/official",
+                        r#"{"data": {"episodes": [{"id": 5002, "seasonNumber": 1, "number": 2}]}}"#,
+                    ),
+                    (
+                        "/tvdb/episodes/5002/extended",
+                        r#"{"data": {"id": 5002, "name": "Le nom", "overview": "Le résumé.",
+                            "aired": "2011-04-23",
+                            "remoteIds": [{"sourceName": "IMDB", "id": "tt0005002"}],
+                            "characters": [{"personName": "TVDB Guest", "name": "Visitor",
+                                "type": 3, "peopleType": "Guest Star"}],
+                            "translations": {
+                              "nameTranslations": [{"language": "eng", "name": "TVDB Episode"},
+                                                   {"language": "fra", "name": "Épisode TVDB"}],
+                              "overviewTranslations": [{"language": "eng", "overview": "TVDB synopsis."},
+                                                       {"language": "fra", "overview": "Résumé TVDB."}]}}}"#,
+                    ),
+                    ("/tmdb/tv/1399/season/1/episode/2", TMDB_EPISODE),
+                    ("/tmdb/tv/1399/season/1", TMDB_EPISODE_SEASON),
+                    (
+                        "/omdb/",
+                        r#"{"Episodes": [{"Title": "OMDb Episode", "Episode": "2",
+                            "imdbID": "tt0002002", "Plot": "OMDb plot.", "imdbRating": "7.7"}]}"#,
+                    ),
+                ];
+                let found = routes.iter().find(|(route, _)| line.contains(route));
+                let (status, body) = match found {
+                    Some((route, _)) if fail && *route != "/tvdb/login" => ("403 Forbidden", "{}"),
+                    Some((_, body)) => ("200 OK", *body),
+                    None => ("404 Not Found", "{}"),
+                };
+                requests.lock().expect("log").push(line);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    /// What a path-less episode's refresh needs: episode 2 of season 1 under a
+    /// series whose stored ids are `series_ids`, in a library saved with
+    /// `options`, the stores it writes to, and a manager over `base` with all
+    /// three episode providers wired.
+    struct VirtualEpisode {
+        episode_id: Uuid,
+        store: Arc<RecordingStore>,
+        people: Arc<RecordingPeople>,
+        mgr: LocalProviderManager,
+    }
+
+    impl VirtualEpisode {
+        fn new(
+            base: &str,
+            series_ids: &[(&str, &str)],
+            options: ferrofin_model::configuration::LibraryOptions,
+            stored: impl FnOnce(&mut BaseItemEntity),
+        ) -> Self {
+            let library_id = Uuid::new_v4();
+            let series_id = Uuid::new_v4();
+            let mut series = row("TV.Series", "Show");
+            series.id = series_id.to_string();
+            let episode_id = Uuid::new_v4();
+            let mut episode = row("TV.Episode", "Stored");
+            // A fill-only refresh keeps a stored title; a new episode has none.
+            episode.name = None;
+            episode.id = episode_id.to_string();
+            episode.series_id = Some(series_id.to_string());
+            episode.top_parent_id = Some(library_id.to_string());
+            episode.parent_index_number = Some(1);
+            episode.index_number = Some(2);
+            stored(&mut episode);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(series_id, series), (episode_id, episode)]),
+                seen: tx,
+            });
+            let store = Arc::new(RecordingStore::default());
+            store.stored_ids.lock().expect("lock").insert(
+                series_id,
+                series_ids
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            );
+            let people = Arc::new(RecordingPeople::default());
+            let mgr = LocalProviderManager::default()
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&format!("{base}/tmdb"))),
+                    items,
+                )
+                .with_tvdb(Arc::new(
+                    crate::tvdb::TvdbClient::new().with_base_url(&format!("{base}/tvdb")),
+                ))
+                .with_omdb(Arc::new(
+                    crate::omdb::OmdbClient::new("key").with_base_url(&format!("{base}/omdb/")),
+                ))
+                .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir())
+                .with_people(Arc::clone(&people) as Arc<_>)
+                .with_localization(Arc::new(EnglishAndFrench))
+                .with_virtual_folders(Arc::new(FakeLibraries {
+                    item_id: library_id,
+                    options,
+                }));
+            Self {
+                episode_id,
+                store,
+                people,
+                mgr,
+            }
+        }
+
+        /// The refresh's last saved row.
+        fn saved(&self) -> Option<BaseItemEntity> {
+            self.store.saved.lock().expect("lock").last().cloned()
+        }
+    }
+
+    /// A library that saved `order` as its Episode fetchers and their order.
+    fn episode_fetchers(order: &[&str]) -> ferrofin_model::configuration::LibraryOptions {
+        let names: Vec<String> = order.iter().map(|n| (*n).to_owned()).collect();
+        ferrofin_model::configuration::LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Episode".to_owned()),
+                metadata_fetchers: names.clone(),
+                metadata_fetcher_order: names,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A path-less episode refreshes through every episode provider the
+    /// library ticks, in its fetcher order, as the scan's episode does: the
+    /// first answer wins a field (title, synopsis, air date), a later one fills
+    /// what is still empty (OMDb's rating), the ids all gather on the row, and
+    /// each credited provider's credits are folded. Every provider resolves by
+    /// the series' ids — never a search.
+    #[rstest::rstest]
+    #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::OMDB], "TMDB Episode", "TMDB synopsis.", "2011-04-24", "tt0002002")]
+    #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::OMDB], "TVDB Episode", "TVDB synopsis.", "2011-04-23", "tt0005002")]
+    #[tokio::test]
+    async fn a_virtual_episode_runs_every_episode_provider_in_the_librarys_order(
+        #[case] order: &[&str],
+        #[case] name: &str,
+        #[case] overview: &str,
+        #[case] premiere: &str,
+        #[case] imdb: &str,
+    ) {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
+            episode_fetchers(order),
+            |_| {},
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some(name));
+        assert_eq!(row.overview.as_deref(), Some(overview));
+        assert_eq!(
+            row.premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            Some(premiere)
+        );
+        // TMDB's rating stands in both orders; OMDb's would only fill it.
+        assert_eq!(
+            row.community_rating
+                .map(|rating| (rating * 10.0).round() / 10.0),
+            Some(8.5)
+        );
+        assert_eq!(
+            (row.parent_index_number, row.index_number),
+            (Some(1), Some(2))
+        );
+        let replaced = episode.store.replaced.lock().expect("lock").clone();
+        let (_, ids) = replaced.last().expect("the ids are written");
+        // The first provider's `Imdb` id wins the field; every other id gathers.
+        for expected in [("Tmdb", "9002"), ("Tvdb", "5002"), ("Imdb", imdb)] {
+            assert!(
+                ids.iter()
+                    .any(|(k, v)| (k.as_str(), v.as_str()) == expected),
+                "{expected:?} in {ids:?}"
+            );
+        }
+        let asked = log.lock().expect("log").clone();
+        for expected in [
+            "/tmdb/tv/1399/season/1/episode/2",
+            "/tvdb/series/121361/episodes/official",
+            "/omdb/",
+        ] {
+            assert!(
+                asked.iter().any(|l| l.contains(expected)),
+                "{expected}: {asked:?}"
+            );
+        }
+        assert!(
+            !asked.iter().any(|l| l.contains("/search")),
+            "the series' ids, never a search: {asked:?}"
+        );
+        assert!(row.date_last_refreshed.is_some());
+    }
+
+    /// A library that ticks one provider asks only that one; a series with no
+    /// ids for a provider spares it the request. OMDb reads the episode's own
+    /// `Imdb` id from TheMovieDb's answer (it ran first).
+    #[tokio::test]
+    async fn a_virtual_episode_asks_only_the_providers_it_has_ids_for() {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Imdb", "tt0000001")],
+            episode_fetchers(&[crate::library_options::fetcher_names::OMDB]),
+            |_| {},
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some("OMDb Episode"));
+        assert_eq!(row.overview.as_deref(), Some("OMDb plot."));
+        assert_eq!(
+            row.community_rating
+                .map(|rating| (rating * 10.0).round() / 10.0),
+            Some(7.7)
+        );
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked.iter().all(|l| l.contains("/omdb/")),
+            "only OMDb is asked: {asked:?}"
+        );
+
+        let (base, log) = spawn_episode_providers(false);
+        let none = VirtualEpisode::new(
+            &base,
+            &[],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |row| row.overview = Some("Stored.".to_owned()),
+        );
+        none.mgr
+            .refresh_full_item(none.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        assert_eq!(log.lock().expect("log").clone(), Vec::<String>::new());
+        assert_eq!(
+            none.saved().and_then(|r| r.overview).as_deref(),
+            Some("Stored.")
+        );
+    }
+
+    /// The episode's own credits: TheMovieDb's guest star and TheTVDB's guest are
+    /// both written (each provider answers with its own list), and a `Cast`
+    /// lock keeps the stored ones.
+    #[tokio::test]
+    async fn a_virtual_episodes_credits_are_written_and_a_cast_lock_keeps_them() {
+        let (base, _log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399"), ("Tvdb", "121361")],
+            episode_fetchers(&[
+                crate::library_options::fetcher_names::TMDB,
+                crate::library_options::fetcher_names::TVDB,
+            ]),
+            |_| {},
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let written = episode.people.written.lock().expect("lock").clone();
+        let (id, names) = written.last().expect("credits are written");
+        assert_eq!(*id, episode.episode_id);
+        assert!(names.contains(&"Guest Star".to_owned()), "{names:?}");
+
+        let mut locked = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |_| {},
+        );
+        let store = Arc::new(RecordingStore {
+            locked: HashMap::from([(locked.episode_id, vec![MetadataField::Cast])]),
+            ..RecordingStore::default()
+        });
+        store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .clone_from(&locked.store.stored_ids.lock().expect("lock"));
+        locked.mgr = locked
+            .mgr
+            .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir());
+        locked.store = store;
+        locked
+            .mgr
+            .refresh_full_item(locked.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        assert!(locked.people.written.lock().expect("lock").is_empty());
+    }
+
+    /// An answer in another language than the library's does not displace one in
+    /// its language: with French preferred, TheTVDB's French synopsis is the
+    /// episode's although OMDb's English plot ran (and was taken) first.
+    #[tokio::test]
+    async fn a_virtual_episodes_preferred_language_beats_an_english_fallback() {
+        let (base, _log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tvdb", "121361"), ("Imdb", "tt0000001")],
+            ferrofin_model::configuration::LibraryOptions {
+                preferred_metadata_language: Some("fr".to_owned()),
+                ..episode_fetchers(&[
+                    crate::library_options::fetcher_names::OMDB,
+                    crate::library_options::fetcher_names::TVDB,
+                ])
+            },
+            |_| {},
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.overview.as_deref(), Some("Résumé TVDB."));
+    }
+
+    /// Every provider failing under "Replace all metadata" erases nothing and
+    /// leaves the refresh unstamped, as for a season.
+    #[tokio::test]
+    async fn failing_virtual_episode_providers_never_clear_the_episode() {
+        let (base, _log) = spawn_episode_providers(true);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |row| row.overview = Some("Stored.".to_owned()),
+        );
+        let replace_all = Opts {
+            replace_all_metadata: true,
+            remove_old_metadata: true,
+            ..search_missing()
+        };
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &replace_all)
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a replace saves");
+        assert_eq!(row.overview.as_deref(), Some("Stored."));
+        assert_eq!(row.date_last_refreshed, None);
+        assert!(episode.people.written.lock().expect("lock").is_empty());
     }
 
     /// A path-less season has no library location, so its preferred

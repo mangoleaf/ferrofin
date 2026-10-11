@@ -49,6 +49,24 @@ fn parse_data(data: Option<&str>) -> Map<String, Value> {
     }
 }
 
+/// `MetadataLanguageUtils.MatchesPreferredLanguage`: whether an answer in
+/// `result` counts as being in the `preferred` language — either one is
+/// unknown ("a provider that doesn't report a language cannot be judged,
+/// assume it honored the request"), or both share a language subtag.
+#[must_use]
+pub fn matches_preferred_language(result: Option<&str>, preferred: &str) -> bool {
+    let subtag = |language: &str| {
+        language
+            .split_once('-')
+            .map_or(language, |(subtag, _)| subtag)
+            .to_lowercase()
+    };
+    match result.filter(|result| !result.is_empty()) {
+        Some(result) if !preferred.is_empty() => subtag(result) == subtag(preferred),
+        _ => true,
+    }
+}
+
 /// Upstream's `MetadataResult<T>`: an item plus the parts of a provider
 /// result that are not columns of its row.
 #[derive(Debug, Clone, Default, PartialEq)]
