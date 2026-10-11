@@ -12,7 +12,8 @@ use super::condition_processor::{ConditionProcessor, range_type_name, video_rang
 use super::device_profile::DeviceProfile;
 use super::direct_play_profile::DirectPlayProfile;
 use super::enums::{
-    CodecType, DlnaProfileType, ProfileConditionType, ProfileConditionValue, SubtitleDeliveryMethod,
+    CodecType, DlnaProfileType, EncodingContext, ProfileConditionType, ProfileConditionValue,
+    SubtitleDeliveryMethod,
 };
 use super::media_options::MediaOptions;
 use super::profile_condition::ProfileCondition;
@@ -111,6 +112,302 @@ impl<'a> StreamBuilder<'a> {
             streams,
             i64::from(options.get_max_bitrate(false).unwrap_or(0)),
         )
+    }
+
+    /// Gets the optimal audio stream.
+    #[must_use]
+    pub fn get_optimal_audio_stream(&self, options: &MediaOptions) -> Option<StreamInfo> {
+        validate_media_options(options, false);
+
+        let mut streams: Vec<StreamInfo> = Vec::new();
+        for media_source in &options.media_sources {
+            if let Some(id) = options.media_source_id.as_deref()
+                && !id.is_empty()
+                && !media_source
+                    .id
+                    .as_deref()
+                    .is_some_and(|mid| mid.eq_ignore_ascii_case(id))
+            {
+                continue;
+            }
+
+            if let Some(mut stream_info) = self.build_audio_item(media_source, options) {
+                stream_info.device_id.clone_from(&options.device_id);
+                stream_info.device_profile_id =
+                    options.profile.id.map(|id| id.as_simple().to_string());
+                streams.push(stream_info);
+            }
+        }
+
+        get_optimal_stream(
+            streams,
+            i64::from(options.get_max_bitrate(true).unwrap_or(0)),
+        )
+    }
+
+    /// `GetOptimalAudioStream(MediaSourceInfo, MediaOptions)`. Upstream throws
+    /// when the source has no audio stream; there is nothing to decide for one
+    /// here, so no stream is offered.
+    #[allow(clippy::too_many_lines)]
+    fn build_audio_item(
+        &self,
+        item: &MediaSourceInfo,
+        options: &MediaOptions,
+    ) -> Option<StreamInfo> {
+        // Working copy of the media source; the C# engine mutates `item`.
+        let mut item = item.clone();
+
+        let mut playlist_item = StreamInfo::new(options.profile.clone());
+        playlist_item.item_id = options.item_id;
+        playlist_item.media_type = DlnaProfileType::Audio;
+        playlist_item.run_time_ticks = item.run_time_ticks;
+        playlist_item.context = options.context;
+
+        if options.force_direct_play || options.force_direct_stream {
+            playlist_item.play_method = if options.force_direct_play {
+                PlayMethod::DirectPlay
+            } else {
+                PlayMethod::DirectStream
+            };
+            playlist_item.container = normalize_media_source_format_into_single_container(
+                item.container.as_deref(),
+                Some(&options.profile),
+                DlnaProfileType::Audio,
+                None,
+            );
+            playlist_item.media_source = Some(item);
+            return Some(playlist_item);
+        }
+
+        let audio_stream = item.get_default_audio_stream(None)?.clone();
+        let direct_play = self.get_audio_direct_play_profile(&item, &audio_stream, options);
+        let mut transcode_reasons = direct_play.transcode_reasons;
+
+        if direct_play.play_method == Some(PlayMethod::DirectPlay) {
+            let audio_failure_reasons = self.get_compatibility_audio_codec(
+                options,
+                &item,
+                item.container.as_deref().unwrap_or(""),
+                &audio_stream,
+                None,
+                false,
+                false,
+            );
+            transcode_reasons |= audio_failure_reasons;
+
+            if audio_failure_reasons.is_empty() {
+                playlist_item.play_method = PlayMethod::DirectPlay;
+                playlist_item.container = normalize_media_source_format_into_single_container(
+                    item.container.as_deref(),
+                    Some(&options.profile),
+                    DlnaProfileType::Audio,
+                    direct_play.profile.as_ref(),
+                );
+                playlist_item.media_source = Some(item);
+                return Some(playlist_item);
+            }
+        }
+
+        if direct_play.play_method == Some(PlayMethod::DirectStream) {
+            let profile_container = direct_play.profile.as_ref().map(|p| p.container.as_str());
+            let mut remux_container = item
+                .transcoding_container
+                .clone()
+                .unwrap_or_else(|| "ts".to_owned());
+            // A profile container that HLS supports overrides the preference;
+            // the client is responsible for its compatibility.
+            if let Some(container) = profile_container
+                .filter(|c| ["ts", "mp4"].iter().any(|h| h.eq_ignore_ascii_case(c)))
+            {
+                container.clone_into(&mut remux_container);
+            }
+            let codec_is_supported = if item.transcoding_sub_protocol == MediaStreamProtocol::hls {
+                // Enforce the HLS audio codec restrictions.
+                let key = direct_play
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.audio_codec.as_deref())
+                    .or(profile_container);
+                let supported: &[&str] = if remux_container.eq_ignore_ascii_case("mp4") {
+                    &SUPPORTED_HLS_AUDIO_CODECS_MP4
+                } else {
+                    &SUPPORTED_HLS_AUDIO_CODECS_TS
+                };
+                key.is_some_and(|key| supported.contains(&key))
+            } else {
+                // Assume the client gave a correct container for http.
+                true
+            };
+
+            if codec_is_supported {
+                playlist_item.play_method = PlayMethod::DirectStream;
+                playlist_item.container = Some(remux_container.clone());
+                playlist_item.transcode_reasons = transcode_reasons;
+                playlist_item.sub_protocol = item.transcoding_sub_protocol;
+                item.transcoding_container = Some(remux_container);
+                playlist_item.media_source = Some(item);
+                return Some(playlist_item);
+            }
+
+            transcode_reasons |= TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED;
+            playlist_item.transcode_reasons = transcode_reasons;
+        }
+
+        let transcoding_profile = options.profile.transcoding_profiles.iter().find(|tc| {
+            tc.profile_type == playlist_item.media_type
+                && tc.context == options.context
+                && self
+                    .transcoder_support
+                    .can_encode_to_audio_codec(&tc.audio_codec)
+        });
+
+        if let Some(transcoding_profile) = transcoding_profile {
+            if !item.supports_transcoding {
+                return None;
+            }
+
+            set_stream_info_options_from_transcoding_profile(
+                &mut item,
+                &mut playlist_item,
+                transcoding_profile,
+            );
+
+            let audio_transcoding_conditions = get_profile_conditions_for_audio(
+                &options.profile.codec_profiles,
+                &transcoding_profile.container,
+                Some(transcoding_profile.audio_codec.as_str()),
+                audio_stream.channels,
+                audio_stream.bit_rate,
+                audio_stream.sample_rate,
+                audio_stream.bit_depth,
+                false,
+            );
+            apply_transcoding_conditions(
+                &mut playlist_item,
+                &audio_transcoding_conditions,
+                None,
+                true,
+                true,
+            );
+
+            // Honor the requested max channels.
+            playlist_item.global_max_audio_channels = options.max_audio_channels;
+
+            let configured_bitrate = options.get_max_bitrate(true);
+            let mut transcoding_bitrate = i64::from(
+                options
+                    .audio_transcoding_bitrate
+                    .or(if options.context == EncodingContext::Streaming {
+                        options.profile.music_streaming_transcoding_bitrate
+                    } else {
+                        None
+                    })
+                    .or(configured_bitrate)
+                    .unwrap_or(128_000),
+            );
+            if let Some(configured) = configured_bitrate {
+                transcoding_bitrate = transcoding_bitrate.min(i64::from(configured));
+            }
+            let long_bitrate = transcoding_bitrate.min(
+                playlist_item
+                    .audio_bitrate
+                    .map_or(transcoding_bitrate, i64::from),
+            );
+            playlist_item.audio_bitrate = Some(i32::try_from(long_bitrate).unwrap_or(i32::MAX));
+
+            // Pure audio transcoding takes one codec, not a list: the profile's
+            // own, which `can_encode_to_audio_codec` already vouched for.
+            if playlist_item.audio_codecs.is_empty()
+                && !transcoding_profile.audio_codec.trim().is_empty()
+            {
+                playlist_item.audio_codecs = vec![transcoding_profile.audio_codec.clone()];
+            }
+        }
+
+        playlist_item.transcode_reasons = transcode_reasons;
+        playlist_item.media_source = Some(item);
+        Some(playlist_item)
+    }
+
+    /// `GetAudioDirectPlayProfile`: the audio profile the source plays under,
+    /// and whether that is a direct play, a direct stream (container remux) or
+    /// neither, with the reasons it is not a direct play.
+    fn get_audio_direct_play_profile(
+        &self,
+        item: &MediaSourceInfo,
+        audio_stream: &MediaStream,
+        options: &MediaOptions,
+    ) -> DirectPlayInfo {
+        let profiles = &options.profile.direct_play_profiles;
+        let mut profile = profiles
+            .iter()
+            .find(|p| {
+                p.profile_type == DlnaProfileType::Audio
+                    && is_audio_direct_play_supported(p, item, audio_stream)
+            })
+            .cloned();
+
+        let mut transcode_reasons = TranscodeReasons::empty();
+        if profile.is_none() {
+            let direct_stream_profile = profiles.iter().find(|p| {
+                p.profile_type == DlnaProfileType::Audio
+                    && is_audio_direct_stream_supported(p, item, audio_stream)
+            });
+            if let Some(direct_stream_profile) = direct_stream_profile {
+                profile = Some(direct_stream_profile.clone());
+                transcode_reasons |= TranscodeReasons::CONTAINER_NOT_SUPPORTED;
+            } else {
+                return DirectPlayInfo {
+                    profile: None,
+                    play_method: None,
+                    audio_stream_index: None,
+                    transcode_reasons: audio_reasons_from_direct_play_profiles(
+                        item,
+                        audio_stream,
+                        profiles,
+                    ),
+                };
+            }
+        }
+
+        let max_bitrate = i64::from(options.get_max_bitrate(true).unwrap_or(0));
+        // The profile describes what the device supports; if its requirements
+        // are met both a direct play and a direct stream are allowed.
+        if item.supports_direct_play && transcode_reasons.is_empty() {
+            if self.is_bitrate_limit_exceeded(item, max_bitrate) {
+                transcode_reasons |= TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT;
+            } else if options.enable_direct_play {
+                return DirectPlayInfo {
+                    profile,
+                    play_method: Some(PlayMethod::DirectPlay),
+                    audio_stream_index: None,
+                    transcode_reasons: TranscodeReasons::empty(),
+                };
+            }
+        }
+
+        // Network and other factors only apply to a direct stream; options'
+        // `enable_direct_stream` is not consulted for audio, which is always
+        // assumed to be supported.
+        if item.supports_direct_stream {
+            if self.is_bitrate_limit_exceeded(item, max_bitrate) {
+                transcode_reasons |= TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT;
+            } else if transcode_reasons == TranscodeReasons::CONTAINER_NOT_SUPPORTED {
+                return DirectPlayInfo {
+                    profile,
+                    play_method: Some(PlayMethod::DirectStream),
+                    audio_stream_index: None,
+                    transcode_reasons,
+                };
+            }
+        }
+
+        DirectPlayInfo {
+            profile,
+            play_method: None,
+            audio_stream_index: None,
+            transcode_reasons,
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1397,6 +1694,76 @@ pub fn normalize_media_source_format_into_single_container(
     }
 
     non_empty(input_container)
+}
+
+/// `IsAudioContainerSupported`: the profile names the item's container, and
+/// never plays Matroska audio when the device only declared WebM (`mkv` is
+/// assumed to be possibly `webm`).
+fn is_audio_container_supported(profile: &DirectPlayProfile, item: &MediaSourceInfo) -> bool {
+    if !profile.supports_container(item.container.as_deref()) {
+        return false;
+    }
+    !contains_container(Some("mkv"), item.container.as_deref())
+        || profile.supports_container(Some("mkv"))
+}
+
+/// `IsAudioDirectPlaySupported`.
+fn is_audio_direct_play_supported(
+    profile: &DirectPlayProfile,
+    item: &MediaSourceInfo,
+    audio_stream: &MediaStream,
+) -> bool {
+    is_audio_container_supported(profile, item)
+        && profile.supports_audio_codec(audio_stream.codec.as_deref())
+}
+
+/// `IsAudioDirectStreamSupported`: a profile whose container is *not* the
+/// item's (else it would be a direct play) but whose audio codec — or, with no
+/// codec, whose container name — is the item's audio codec.
+fn is_audio_direct_stream_supported(
+    profile: &DirectPlayProfile,
+    item: &MediaSourceInfo,
+    audio_stream: &MediaStream,
+) -> bool {
+    if is_audio_container_supported(profile, item) {
+        return false;
+    }
+    let codec = audio_stream.codec.as_deref();
+    let same = |value: Option<&str>| match (value, codec) {
+        (Some(value), Some(codec)) => value.eq_ignore_ascii_case(codec),
+        (None, None) => true,
+        _ => false,
+    };
+    same(profile.audio_codec.as_deref()) || same(Some(profile.container.as_str()))
+}
+
+/// `GetTranscodeReasonsFromDirectPlayProfile` for an audio-only item.
+fn audio_reasons_from_direct_play_profiles(
+    item: &MediaSourceInfo,
+    audio_stream: &MediaStream,
+    profiles: &[DirectPlayProfile],
+) -> TranscodeReasons {
+    let mut container_supported = false;
+    let mut audio_supported = false;
+    for profile in profiles {
+        if profile.profile_type == DlnaProfileType::Audio
+            && profile.supports_container(item.container.as_deref())
+        {
+            container_supported = true;
+            audio_supported = profile.supports_audio_codec(audio_stream.codec.as_deref());
+            if audio_supported {
+                break;
+            }
+        }
+    }
+    let mut reasons = TranscodeReasons::empty();
+    if !container_supported {
+        reasons |= TranscodeReasons::CONTAINER_NOT_SUPPORTED;
+    }
+    if !audio_supported {
+        reasons |= TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED;
+    }
+    reasons
 }
 
 fn get_default_subtitle_stream_index(

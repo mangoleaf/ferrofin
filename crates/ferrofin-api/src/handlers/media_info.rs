@@ -437,6 +437,22 @@ impl StreamDecision {
     }
 }
 
+/// `MediaInfoHelper.SetDeviceSpecificData`'s choice of negotiation: an audio
+/// item takes the audio one (its own direct play/remux/transcode rules and
+/// `/audio/…` URLs), everything else the video one.
+fn optimal_stream(
+    support: &FerrofinTranscoderSupport,
+    options: &MediaOptions,
+    is_audio: bool,
+) -> Option<ferrofin_model::dlna::StreamInfo> {
+    let builder = StreamBuilder::new(support);
+    if is_audio {
+        builder.get_optimal_audio_stream(options)
+    } else {
+        builder.get_optimal_video_stream(options)
+    }
+}
+
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
@@ -486,7 +502,7 @@ fn apply_stream_decision(
     options.media_sources = vec![source.clone()];
 
     let support = FerrofinTranscoderSupport;
-    let stream = StreamBuilder::new(&support).get_optimal_video_stream(&options)?;
+    let stream = optimal_stream(&support, &options, is_audio)?;
 
     let profile_type = if is_audio {
         DlnaProfileType::Audio
@@ -525,6 +541,17 @@ fn apply_stream_decision(
             target_video_codec: None,
             target_audio_codec: None,
         });
+    }
+    if is_audio {
+        return Some(audio_transcode_decision(
+            source,
+            stream,
+            token,
+            play_session_id,
+            flags,
+            force_remote,
+            &support,
+        ));
     }
     // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
     // copy the compatible video, re-encode only the incompatible audio) are carried
@@ -596,6 +623,41 @@ fn apply_stream_decision(
     source.transcoding_container = Some(container.clone());
     apply_subtitle_delivery(source, &stream, &support, token);
     Some(StreamDecision::transcode(&stream))
+}
+
+/// `MediaInfoHelper.SetDeviceSpecificData` for an audio item that is not
+/// direct played. A `DirectStream` (container remux over HTTP, which the
+/// server does not offer — `EnableDirectStream` is off) and a transcode both
+/// become a transcode at the stream's own `/audio/{id}/stream.{container}` (or
+/// `master.m3u8`) URL, with the profile's container and sub-protocol. There is
+/// no HLS pin: the builder's audio decision is what the client asked for.
+fn audio_transcode_decision(
+    source: &mut MediaSourceInfo,
+    mut stream: ferrofin_model::dlna::StreamInfo,
+    token: Option<&str>,
+    play_session_id: &str,
+    flags: PlaybackFlags,
+    force_remote: bool,
+    support: &FerrofinTranscoderSupport,
+) -> StreamDecision {
+    source.supports_direct_play = false;
+    source.supports_direct_stream = false;
+    if source.supports_transcoding {
+        stream.play_method = PlayMethod::Transcode;
+        stream.play_session_id = Some(play_session_id.to_owned());
+        let mut url = stream.to_url(None, token, None);
+        if force_remote || !flags.allow_video_stream_copy {
+            url.push_str("&AllowVideoStreamCopy=false");
+        }
+        if force_remote || !flags.allow_audio_stream_copy {
+            url.push_str("&AllowAudioStreamCopy=false");
+        }
+        source.transcoding_url = Some(url);
+        source.transcoding_container.clone_from(&stream.container);
+        source.transcoding_sub_protocol = stream.sub_protocol;
+    }
+    apply_subtitle_delivery(source, &stream, support, token);
+    StreamDecision::transcode(&stream)
 }
 
 /// MediaInfoHelper's remote-source branch preserves the negotiated protocol
@@ -1464,7 +1526,15 @@ mod tests {
                         "video={is_video} bits={bits}"
                     );
                     assert_eq!(source.transcoding_url.is_some(), expected);
-                    assert!(!source.supports_direct_play);
+                    // An audio source that cannot transcode gets no decision at
+                    // all (`GetOptimalAudioStream` returns null) and keeps the
+                    // static source's flags, as upstream; every other case
+                    // decides, and none of these direct plays.
+                    assert_eq!(
+                        source.supports_direct_play,
+                        !is_video && !expected,
+                        "video={is_video} bits={bits}"
+                    );
                 }
             }
         }
@@ -1600,6 +1670,136 @@ mod tests {
             !url.contains("SubtitleMethod"),
             "no stale SubtitleMethod on the URL: {url}"
         );
+    }
+
+    /// `MediaInfoHelper.SetDeviceSpecificData` for a music item: a direct play
+    /// stays one, an unplayable file becomes an audio transcode at
+    /// `/audio/{id}/stream.{container}` (never an HLS video master), a veto of
+    /// transcoding leaves it with no URL, and a disallowed audio transcode
+    /// does too.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one profile fixture and its scenarios
+    fn music_is_negotiated_by_the_audio_builder_not_the_video_one() {
+        use ferrofin_model::dlna::{DirectPlayProfile, TranscodingProfile};
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mp3".to_owned(),
+                audio_codec: Some("mp3".to_owned()),
+                video_codec: None,
+                profile_type: DlnaProfileType::Audio,
+            }],
+            transcoding_profiles: vec![TranscodingProfile {
+                container: "mp3".to_owned(),
+                audio_codec: "mp3".to_owned(),
+                profile_type: DlnaProfileType::Audio,
+                protocol: MediaStreamProtocol::http,
+                context: ferrofin_model::dlna::EncodingContext::Streaming,
+                ..TranscodingProfile::default()
+            }],
+            ..DeviceProfile::default()
+        };
+        let track = |container: &str, codec: &str, cover_art: bool| {
+            let mut streams = vec![MediaStream {
+                stream_type: MediaStreamType::Audio,
+                codec: Some(codec.to_owned()),
+                channels: Some(2),
+                index: 0,
+                ..MediaStream::default()
+            }];
+            if cover_art {
+                // An embedded cover is a video stream of an audio file.
+                streams.push(MediaStream {
+                    stream_type: MediaStreamType::Video,
+                    codec: Some("mjpeg".to_owned()),
+                    index: 1,
+                    ..MediaStream::default()
+                });
+            }
+            MediaSourceInfo {
+                id: Some("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a".to_owned()),
+                container: Some(container.to_owned()),
+                bitrate: Some(256_000),
+                media_streams: streams,
+                ..MediaSourceInfo::default()
+            }
+        };
+        let policy = |audio_transcoding: bool| ferrofin_model::users::UserPolicy {
+            enable_audio_playback_transcoding: audio_transcoding,
+            ..ferrofin_model::users::UserPolicy::default()
+        };
+        let decide = |source: &mut MediaSourceInfo, policy, flags| {
+            super::apply_stream_decision(
+                source,
+                &profile,
+                uuid::Uuid::from_u128(0xA0D10),
+                None,
+                None,
+                Some("device"),
+                super::StreamSelection::default(),
+                "ps-audio",
+                flags,
+                &policy,
+                true,
+            )
+        };
+
+        // Direct play, cover art and all.
+        let mut mp3 = track("mp3", "mp3", true);
+        let decision = decide(&mut mp3, policy(true), super::PlaybackFlags::default()).unwrap();
+        assert_eq!(decision.play_method, "DirectPlay");
+        assert!(mp3.supports_direct_play && mp3.transcoding_url.is_none());
+
+        // A FLAC file this device cannot play is an audio transcode.
+        let mut flac = track("flac", "flac", true);
+        let decision = decide(&mut flac, policy(true), super::PlaybackFlags::default()).unwrap();
+        assert_eq!(decision.play_method, "Transcode");
+        assert!(!flac.supports_direct_play && !flac.supports_direct_stream);
+        let url = flac.transcoding_url.as_deref().expect("a transcode URL");
+        assert!(
+            url.starts_with("/audio/00000000-0000-0000-0000-0000000a0d10/stream.mp3?"),
+            "{url}"
+        );
+        assert!(
+            !url.contains("master.m3u8") && url.contains("AudioCodec=mp3"),
+            "{url}"
+        );
+        assert_eq!(flac.transcoding_container.as_deref(), Some("mp3"));
+        assert_eq!(flac.transcoding_sub_protocol, MediaStreamProtocol::http);
+        assert!(flac.supports_transcoding);
+
+        // Copy vetoes ride the URL like the video ones.
+        let mut vetoed = track("flac", "flac", false);
+        let flags = super::PlaybackFlags {
+            allow_audio_stream_copy: false,
+            ..super::PlaybackFlags::default()
+        };
+        decide(&mut vetoed, policy(true), flags).unwrap();
+        assert!(
+            vetoed
+                .transcoding_url
+                .as_deref()
+                .unwrap()
+                .ends_with("&AllowAudioStreamCopy=false")
+        );
+
+        // No audio-transcoding permission, or a client veto: the source cannot
+        // transcode, so the builder offers nothing (`GetOptimalAudioStream`
+        // returns null) and no decision is made — no URL, as upstream.
+        for (policy, flags) in [
+            (policy(false), super::PlaybackFlags::default()),
+            (
+                policy(true),
+                super::PlaybackFlags {
+                    enable_transcoding: false,
+                    ..super::PlaybackFlags::default()
+                },
+            ),
+        ] {
+            let mut denied = track("flac", "flac", false);
+            assert!(decide(&mut denied, policy, flags).is_none());
+            assert!(!denied.supports_transcoding);
+            assert!(denied.transcoding_url.is_none());
+        }
     }
 
     #[test]
