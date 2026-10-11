@@ -947,11 +947,12 @@ impl UserViewManager for FerrofinUserViewManager {
                 )
             });
         }
-        if include_hidden {
-            Ok(views)
+        let views = if include_hidden {
+            views
         } else {
-            self.without_hidden_views(user_id, views).await
-        }
+            self.without_hidden_views(user_id, views).await?
+        };
+        self.in_preferred_order(user_id, views).await
     }
 
     async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
@@ -1248,6 +1249,45 @@ impl FerrofinUserViewManager {
             .into_iter()
             .filter(|view| Uuid::parse_str(&view.id).is_ok_and(|id| !excluded.contains(&id)))
             .collect())
+    }
+
+    /// `GetUserViews`' last step (`UserViewManager.cs:141-158`): the views in
+    /// the order the user saved (`OrderedViews`) — a view by its own id, else
+    /// by the `DisplayParentId` it stands for — with every view the list does
+    /// not name after them, and ties (all of them, with no saved order) in the
+    /// name order the list already has.
+    async fn in_preferred_order(
+        &self,
+        user_id: Uuid,
+        mut views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(db) = &self.db else {
+            return Ok(views);
+        };
+        let orders = user_entity_ext::guid_preference(
+            db.pool(),
+            &ferrofin_db::store::guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::OrderedViews,
+        )
+        .await?;
+        if orders.is_empty() {
+            return Ok(views);
+        }
+        let position = |id: Option<Uuid>| id.and_then(|id| orders.iter().position(|o| *o == id));
+        let rank = |view: &BaseItemEntity| {
+            position(Uuid::parse_str(&view.id).ok())
+                .or_else(|| {
+                    let data = crate::item_data::parse_data(view.data.as_deref());
+                    let parent = crate::item_data::read_data_string(&data, "DisplayParentId")
+                        .and_then(|id| Uuid::parse_str(&id).ok())
+                        .filter(|id| !id.is_nil());
+                    position(parent)
+                })
+                .unwrap_or(usize::MAX)
+        };
+        // A stable sort: views with equal rank keep their name order.
+        views.sort_by_key(rank);
+        Ok(views)
     }
 
     /// The collection type of every configured library keyed by its folder
@@ -2035,6 +2075,86 @@ mod tests {
             views
                 .iter()
                 .all(|v| v.type_ != *"Movie" && v.name.is_some())
+        );
+    }
+
+    /// `GetUserViews`' last step: the user's saved `OrderedViews` put the views
+    /// they name first, in their order — a view by its own id, a user view by the
+    /// `DisplayParentId` it stands for — and every view they do not name after
+    /// them, in name order. With nothing saved the name order stands, and
+    /// `IncludeHidden` lists are ordered the same way.
+    #[tokio::test]
+    async fn ordered_views_put_the_users_choice_first_and_the_rest_by_name() {
+        use ferrofin_db::enums::PreferenceKind;
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x7001);
+        seed_user(&db, user_id).await;
+        let (a, b, c, d) = (
+            Uuid::from_u128(0x7101),
+            Uuid::from_u128(0x7102),
+            Uuid::from_u128(0x7103),
+            Uuid::from_u128(0x7104),
+        );
+        for (id, name) in [
+            (a, "A Movies"),
+            (b, "B Shows"),
+            (c, "C Music"),
+            (d, "D Books"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::CollectionFolder, name).await;
+        }
+        let mgr = manager(&db).with_database(db.clone());
+        let names = |views: Vec<BaseItemEntity>| {
+            views
+                .into_iter()
+                .filter_map(|view| view.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(mgr.get_user_views(user_id).await.expect("views")),
+            ["A Movies", "B Shows", "C Music", "D Books"],
+            "no saved order: by name"
+        );
+
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            PreferenceKind::OrderedViews,
+            &[
+                guid_to_db(c),
+                guid_to_db(Uuid::from_u128(0xDEAD)),
+                guid_to_db(a),
+            ],
+        )
+        .await
+        .expect("save the order");
+        let expected = ["C Music", "A Movies", "B Shows", "D Books"];
+        assert_eq!(
+            names(mgr.get_user_views(user_id).await.expect("views")),
+            expected,
+            "named views first in the saved order; an id that is no view is ignored"
+        );
+        assert_eq!(
+            names(
+                mgr.get_user_views_with_hidden(user_id, true)
+                    .await
+                    .expect("views")
+            ),
+            expected
+        );
+
+        // Hidden views are not listed, and the saved order still holds for the rest.
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(c)],
+        )
+        .await
+        .expect("hide Music");
+        assert_eq!(
+            names(mgr.get_user_views(user_id).await.expect("views")),
+            ["A Movies", "B Shows", "D Books"]
         );
     }
 
