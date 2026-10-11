@@ -1765,10 +1765,16 @@ async fn an_item_refresh_removes_nothing() {
     std::fs::remove_file(&fx.heat).expect("rm");
     let options = item_refresh(MetadataRefreshMode::Default, false);
     let outcome = refresh_item(&fx, &fx.heat, &options).await;
+    // The title's directory is no longer a title's own folder, so it is a
+    // plain folder — the one row a refresh of the item carries along from
+    // above it; nothing else is planned and nothing is removed.
     assert_eq!(
         outcome,
-        ScanOutcome::default(),
-        "nothing planned, nothing removed"
+        ScanOutcome {
+            created: 1,
+            ..ScanOutcome::default()
+        },
+        "the emptied folder carried along, nothing removed"
     );
     assert!(
         fx.stamps(&fx.heat).await.1.is_some(),

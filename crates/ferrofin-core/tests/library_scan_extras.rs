@@ -107,7 +107,14 @@ impl Fixture {
     }
 
     async fn assert_browse(&self, expected: usize) {
+        self.assert_browse_split(expected, expected).await;
+    }
+
+    /// The library's children: `direct` of them in a flat listing, `all` in a
+    /// recursive one (a plain subfolder lists its own children one level down).
+    async fn assert_browse_split(&self, direct: usize, all: usize) {
         for recursive in [false, true] {
+            let expected = if recursive { all } else { direct };
             let rows = self
                 .repo
                 .get_item_list(&InternalItemsQuery {
@@ -711,7 +718,11 @@ async fn extras_in_ineligible_folders_are_cleaned_without_deleting_movies() {
     assert_eq!(f.scanner.scan_all().await.unwrap().removed, 1);
     assert!(!f.has(&id).await);
     assert!(f.media.join(EXTRA).exists());
-    f.assert_browse(2).await;
+    // `Heat (1995)` holds a video in a subfolder, so it is no title's own
+    // folder but a plain `Folder`: the library lists only it in a flat listing,
+    // and below it the `Extras` folder, `Heat.mkv` and `Release` (the title in
+    // its own folder).
+    f.assert_browse_split(1, 4).await;
 }
 
 #[tokio::test]
@@ -839,7 +850,10 @@ async fn plain_space_samples_follow_multi_item_resolution() {
             .await
             .unwrap();
         assert_eq!(mixed_sample, 0);
-        f.assert_browse(5).await;
+        // The movie in its own folder and the loose one are direct children;
+        // `Mixed` and `Sample Title` (a folder whose only video is a sample)
+        // are plain folders listing theirs one level down.
+        f.assert_browse_split(4, 7).await;
         assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
     }
 }

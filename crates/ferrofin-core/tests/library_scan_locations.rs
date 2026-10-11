@@ -291,7 +291,9 @@ async fn a_removed_location_takes_its_folder_and_items() {
 }
 
 /// A location inside another location is no child of the root
-/// (`NormalizeRootPathList`): it gets no folder of its own.
+/// (`NormalizeRootPathList`): it gets no folder of its own. Its directory is
+/// still a plain subfolder of the outer library — one `Folder` row, at that
+/// path — which hangs off the outer location, not the root.
 #[tokio::test]
 async fn a_nested_location_has_no_folder_of_its_own() {
     let lib = Library::new(&[
@@ -314,8 +316,13 @@ async fn a_nested_location_has_no_folder_of_its_own() {
     lib.scanner.scan_all().await.expect("scan");
     let folder = lib
         .row(derive_item_id(BaseItemKind::Folder, &kids).expect("id"))
-        .await;
-    assert!(folder.is_none(), "{folder:?}");
+        .await
+        .expect("the outer library's plain subfolder");
+    assert_eq!(
+        folder.parent_id.as_deref(),
+        Some(guid_to_db(lib.location()).as_str()),
+        "a child of the outer location, not of the root"
+    );
     assert!(lib.row(lib.location()).await.is_some());
 }
 
@@ -732,4 +739,142 @@ async fn a_home_video_stored_as_a_movie_keeps_its_row_when_it_becomes_a_video() 
         .await
         .unwrap();
     assert_eq!(at_path, 1, "one row for the file, not a second beside it");
+}
+
+/// `FolderResolver` claims any directory no other resolver does, and
+/// `Folder.GetNonCachedChildren` makes it the parent of what is in it: a movie
+/// library's plain subfolders (`Action/`, `Action/90s/`) are `Folder` rows —
+/// children of the folder above, never flattened into the library — holding
+/// their titles, while a title's own folder is the movie and the folders inside
+/// it (extras) are no folders of the library.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one tree, every property of it
+async fn plain_subfolders_of_a_movie_library_are_folders_that_parent_their_titles() {
+    let lib = Library::new(&[
+        "Action/Heat (1995)/Heat (1995).mkv",
+        "Action/90s/Ronin (1998)/Ronin (1998).mkv",
+        "Action/90s/Ronin (1998)/extras/Making Of.mkv",
+        "Top (2001)/Top (2001).mkv",
+        "Loose Movie (2002).mkv",
+    ])
+    .await;
+    std::fs::create_dir(lib.media.join("Empty")).unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    let id =
+        |kind, path: &str| derive_item_id(kind, &lib.media.join(path).to_string_lossy()).unwrap();
+    let action = id(BaseItemKind::Folder, "Action");
+    let nineties = id(BaseItemKind::Folder, "Action/90s");
+    let location = lib.location();
+    let heat = id(BaseItemKind::Movie, "Action/Heat (1995)/Heat (1995).mkv");
+    let ronin = id(
+        BaseItemKind::Movie,
+        "Action/90s/Ronin (1998)/Ronin (1998).mkv",
+    );
+    let top = id(BaseItemKind::Movie, "Top (2001)/Top (2001).mkv");
+    let loose = id(BaseItemKind::Movie, "Loose Movie (2002).mkv");
+
+    let parent_of = |row: BaseItemEntity| {
+        let parent = row
+            .parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok());
+        let top = row
+            .top_parent_id
+            .as_deref()
+            .and_then(|p| Uuid::parse_str(p).ok());
+        (parent, top)
+    };
+    // The collection and location the top-level rows hang off, whatever they are.
+    let (root_parent, root_top) = parent_of(lib.row(top).await.expect("top"));
+    assert_eq!(
+        parent_of(lib.row(loose).await.unwrap()),
+        (root_parent, root_top)
+    );
+    for folder in [action, id(BaseItemKind::Folder, "Empty")] {
+        let row = lib.row(folder).await.expect("a plain folder");
+        assert!(
+            row.is_folder && row.type_.ends_with("Entities.Folder"),
+            "{row:?}"
+        );
+        assert_eq!(parent_of(row), (root_parent, root_top));
+    }
+    assert_eq!(
+        parent_of(lib.row(nineties).await.unwrap()),
+        (Some(action), root_top),
+        "a folder in a folder is its child, the library stays its top parent"
+    );
+    assert_eq!(
+        parent_of(lib.row(heat).await.unwrap()),
+        (Some(action), root_top)
+    );
+    assert_eq!(
+        parent_of(lib.row(ronin).await.unwrap()),
+        (Some(nineties), root_top)
+    );
+    // A title's own folder is the movie, and `extras/` below it no folder.
+    assert!(
+        lib.row(id(BaseItemKind::Folder, "Top (2001)"))
+            .await
+            .is_none()
+    );
+    assert!(
+        lib.row(id(BaseItemKind::Folder, "Action/Heat (1995)"))
+            .await
+            .is_none()
+    );
+    assert!(
+        lib.row(id(BaseItemKind::Folder, "Action/90s/Ronin (1998)/extras"))
+            .await
+            .is_none()
+    );
+
+    // The ancestor closure runs through the folders up to the library.
+    let ancestors: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(ronin))
+            .fetch_all(lib.db.pool())
+            .await
+            .unwrap();
+    for expected in [nineties, action] {
+        assert!(
+            ancestors.contains(&guid_to_db(expected)),
+            "{expected} in {ancestors:?}"
+        );
+    }
+
+    // A listing of the library names its direct children: the folders and the
+    // titles that are not under one; a listing of a folder, what it holds.
+    let children = |parent: Uuid| {
+        let items = Arc::clone(&lib.items);
+        async move {
+            let mut names: Vec<String> = items
+                .get_item_list(&InternalItemsQuery {
+                    parent_id: parent,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|row| row.name)
+                .collect();
+            names.sort();
+            names
+        }
+    };
+    assert_eq!(children(action).await, ["90s", "Heat (1995)"]);
+    assert_eq!(children(nineties).await, ["Ronin (1998)"]);
+
+    // A rescan changes nothing, and a title removed from a folder takes only itself.
+    let again = lib.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        (again.created, again.updated, again.removed),
+        (0, 0, 0),
+        "{again:?}"
+    );
+    std::fs::remove_dir_all(lib.media.join("Action/Heat (1995)")).unwrap();
+    let pruned = lib.scanner.scan_all().await.unwrap();
+    assert_eq!(pruned.removed, 1, "{pruned:?}");
+    assert!(lib.row(heat).await.is_none());
+    assert!(lib.row(action).await.is_some() && lib.row(ronin).await.is_some());
+    let _ = location;
 }

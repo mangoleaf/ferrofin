@@ -2499,6 +2499,31 @@ struct Planned {
     ancestors: Vec<Uuid>,
 }
 
+/// Where the items planned in one directory hang: the `Folder` they are the
+/// children of (the location itself when no intermediate folder is above
+/// them) and the ancestor closure up to it.
+#[derive(Debug, Clone)]
+struct Placement {
+    /// The parent every item planned here has.
+    parent: Uuid,
+    /// The parents above it (nearest first), ending with the location.
+    ancestors: Vec<Uuid>,
+    /// Inside a title's own folder, whose subfolders (extras, trailers) belong
+    /// to the title rather than being folders of the library.
+    under_title: bool,
+}
+
+impl Placement {
+    /// The library location's own children.
+    fn at(location: Uuid) -> Self {
+        Self {
+            parent: location,
+            ancestors: vec![location],
+            under_title: false,
+        }
+    }
+}
+
 /// Which paths a plan pass resolves: every one (a library scan), or the items
 /// at or under some paths plus the items above them (a path-scoped scan).
 ///
@@ -11377,7 +11402,7 @@ impl LibraryScanner {
         self.collect_movie_plan(
             dir,
             root,
-            cf,
+            (cf, &Placement::at(cf)),
             kind,
             ctx,
             out,
@@ -11575,7 +11600,7 @@ impl LibraryScanner {
         &self,
         dir: &str,
         root: &str,
-        cf: Uuid,
+        (cf, place): (Uuid, &Placement),
         kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
@@ -11589,7 +11614,7 @@ impl LibraryScanner {
         if dir != root
             && let Some(video_type) = self.disc_video_type(dir, ctx)
         {
-            self.plan_disc_movie(dir, cf, video_type, kind, ctx, out);
+            self.plan_disc_movie(dir, (cf, place), video_type, kind, ctx, out);
             return;
         }
         let entries = self.list(dir, ctx);
@@ -11603,6 +11628,29 @@ impl LibraryScanner {
             .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
             .flatten();
         let own_folder = movie.is_some();
+        // A directory no resolver claims is a `Folder` (`FolderResolver.cs:
+        // 24-27`, the last-priority resolver for any directory) and the parent
+        // of what is in it (`Folder.GetNonCachedChildren`: `ResolvePaths(
+        // children, …, this, …)`), so a folder view browses into it while the
+        // `TopParentId` stays the library. A title's own folder is the movie
+        // itself, and the folders inside it hold its extras.
+        let folder_place;
+        let place = if dir != root
+            && !own_folder
+            && !place.under_title
+            && ctx.scope.keeps(dir)
+            && let Some((row, inside)) = self.plan_folder(dir, cf, place, ctx)
+        {
+            ctx.emit(out, row);
+            folder_place = inside;
+            &folder_place
+        } else {
+            place
+        };
+        let child_place = Placement {
+            under_title: place.under_title || own_folder,
+            ..place.clone()
+        };
         // ResolveMultiple consumes the directory's file list when it finds
         // any regular movie, and drops sample filenames from that list. If it
         // finds none, individual-file resolution can still accept a title
@@ -11640,7 +11688,7 @@ impl LibraryScanner {
             self.collect_movie_plan(
                 &entry.path,
                 root,
-                cf,
+                (cf, &child_place),
                 kind,
                 ctx,
                 &mut rows,
@@ -11652,24 +11700,6 @@ impl LibraryScanner {
         .into_iter();
         for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
-                // TODO(parity): a plain subfolder (`Movies/Collection/…`,
-                // not a title's own folder) is flattened: its movies are
-                // planned under the collection folder, and the folder itself
-                // is no item. Upstream it is a `Folder` (`FolderResolver.cs:
-                // 24-27`, the last-priority resolver for any directory no
-                // other resolver claims) and the parent of what is in it
-                // (`Folder.GetNonCachedChildren`, `Folder.cs:920-925`:
-                // `LibraryManager.ResolvePaths(children, …, this, …)`),
-                // so a folder view browses into it. On a database adopted
-                // from Jellyfin that `Folder` row survives the scan (the
-                // pruning keeps a row whose directory is still on disk) as
-                // an empty shell: the scan re-parents its movies to the
-                // collection folder. Un-defer path: resolve an unclaimed
-                // directory as a `Folder` planned under its parent folder
-                // (every library type's planner, not only this one), pass it
-                // down as the `ParentId` of what is planned in it while the
-                // `TopParentId` stays the library, and prove it with a
-                // `plan_paths` invariant case plus an adopted-library browse.
                 if ctx.scope.visits(&entry.path)
                     && let Some((rows, found_extras, owners)) = children.next()
                 {
@@ -11731,7 +11761,7 @@ impl LibraryScanner {
                 clean_name
             };
             let Some((id, mut entity)) =
-                self.base_item(ctx, kind, cf, cf, name, &entry.path, false)
+                self.base_item(ctx, kind, cf, place.parent, name, &entry.path, false)
             else {
                 continue;
             };
@@ -11745,7 +11775,7 @@ impl LibraryScanner {
                 Planned {
                     id,
                     entity,
-                    ancestors: vec![cf],
+                    ancestors: place.ancestors.clone(),
                 },
             );
         }
@@ -11782,14 +11812,15 @@ impl LibraryScanner {
     fn plan_disc_movie(
         &self,
         dir: &str,
-        cf: Uuid,
+        (cf, place): (Uuid, &Placement),
         video_type: VideoType,
         kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, cf, name, dir, true) else {
+        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, place.parent, name, dir, true)
+        else {
             return;
         };
         entity.is_movie = kind == BaseItemKind::Movie;
@@ -11800,9 +11831,36 @@ impl LibraryScanner {
             Planned {
                 id,
                 entity,
-                ancestors: vec![cf],
+                ancestors: place.ancestors.clone(),
             },
         );
+    }
+
+    /// The plain `Folder` a directory no other resolver claims, planned under
+    /// `place`, and where what is inside it hangs.
+    fn plan_folder(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        place: &Placement,
+        ctx: &PlanCtx<'_>,
+    ) -> Option<(Planned, Placement)> {
+        let name = folder_name(dir)?;
+        let (id, entity) =
+            self.base_item(ctx, BaseItemKind::Folder, cf, place.parent, name, dir, true)?;
+        let folder = Planned {
+            id,
+            entity,
+            ancestors: place.ancestors.clone(),
+        };
+        let inside = Placement {
+            parent: id,
+            ancestors: std::iter::once(id)
+                .chain(place.ancestors.iter().copied())
+                .collect(),
+            under_title: false,
+        };
+        Some((folder, inside))
     }
 
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
@@ -28883,7 +28941,7 @@ mod tests {
         let media = tmp.path().join("movies");
         std::fs::create_dir_all(&media).unwrap();
         std::fs::write(media.join("The Matrix (1999).mkv"), b"").unwrap();
-        // A nested per-title folder — still flattens under the library.
+        // A per-title folder is the movie itself, not a folder of the library.
         std::fs::create_dir_all(media.join("Dune (2021)")).unwrap();
         std::fs::write(media.join("Dune (2021)/Dune (2021).mkv"), b"").unwrap();
         std::fs::write(media.join("poster.jpg"), b"").unwrap(); // non-video: ignored
@@ -28971,11 +29029,14 @@ mod tests {
             "re-scan did not duplicate"
         );
 
-        // A deleted file is pruned and counted as removed, not as updated.
+        // A deleted file is pruned and counted as removed, not as updated; the
+        // directory it was the title of is no title's folder any more, so it is
+        // a plain `Folder` (`FolderResolver`) — one new row.
         std::fs::remove_file(media.join("Dune (2021)/Dune (2021).mkv")).unwrap();
         assert_eq!(
             scanner.scan_all().await.unwrap(),
             super::ScanOutcome {
+                created: 1,
                 unchanged: 1,
                 removed: 1,
                 ..Default::default()
