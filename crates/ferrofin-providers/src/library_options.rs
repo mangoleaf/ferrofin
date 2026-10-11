@@ -619,7 +619,7 @@ fn metadata_providers() -> Vec<Provider> {
         Provider {
             name: fetcher_names::FANART,
             caps: &[Cap::ImageFetcher],
-            types: &["Movie", "Series"],
+            types: &["Movie", "Series", "Season"],
             default_enabled: true,
             compiled: true,
             images: Some(fanart_images),
@@ -822,23 +822,19 @@ fn tvdb_images(type_name: &str) -> &'static [ImageType] {
     }
 }
 
-/// fanart.tv's movie/series/artist/album image providers.
-///
-/// TODO(parity, open work item): the plugin's `SeasonProvider` (Backdrop,
-/// Thumb, Banner, Primary — `SeasonProvider.cs:51-60`) is not advertised for
-/// a Season because nothing fetches it yet: port its `GetImages` (the
-/// series' fanart JSON filtered to the season's number) into the season
-/// image pass, then add `"Season"` to fanart's registry types and its list
-/// here.
+/// fanart.tv's movie/series/season/artist/album image providers (the season
+/// list is `SeasonProvider.GetSupportedImages`, `SeasonProvider.cs:51-60`).
 fn fanart_images(type_name: &str) -> &'static [ImageType] {
     use ImageType::{Art, Backdrop, Banner, Disc, Logo, Primary, Thumb};
     const MOVIE: &[ImageType] = &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop];
     const SERIES: &[ImageType] = &[Primary, Thumb, Art, Logo, Backdrop, Banner];
     const ARTIST: &[ImageType] = &[Primary, Logo, Art, Banner, Backdrop];
+    const SEASON: &[ImageType] = &[Backdrop, Thumb, Banner, Primary];
     const ALBUM: &[ImageType] = &[Primary, Disc];
     match type_name {
         "Movie" => MOVIE,
         "Series" => SERIES,
+        "Season" => SEASON,
         "MusicArtist" => ARTIST,
         "MusicAlbum" => ALBUM,
         _ => &[],
@@ -1507,10 +1503,16 @@ mod tests {
             ]
         );
         // TmdbSeasonImageProvider yields Primary; TheTVDB's season provider
-        // adds Banner and Backdrop (`TvdbSeasonImageProvider.cs:59-64`).
+        // adds Banner and Backdrop (`TvdbSeasonImageProvider.cs:59-64`), and
+        // fanart.tv's `SeasonProvider` adds Thumb.
         assert_eq!(
             block("Season").supported_image_types,
-            vec![ImageType::Primary, ImageType::Banner, ImageType::Backdrop]
+            vec![
+                ImageType::Primary,
+                ImageType::Banner,
+                ImageType::Backdrop,
+                ImageType::Thumb
+            ]
         );
         // Episode also has the embedded extractor, which yields Primary there.
         assert_eq!(
@@ -1909,9 +1911,9 @@ mod tests {
         assert_eq!(super::tvdb_images("Season"), [Primary, Banner, Backdrop]);
         assert_eq!(super::tvdb_images("Episode"), [Primary]);
         assert!(super::tvdb_images("Movie").is_empty());
-        assert!(
-            super::fanart_images("Season").is_empty(),
-            "not advertised until its season fetch is ported"
+        assert_eq!(
+            super::fanart_images("Season"),
+            [Backdrop, Thumb, Banner, Primary]
         );
     }
     #[test]

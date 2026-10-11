@@ -27,7 +27,7 @@ use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo, TypeOptions};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{CollectionTypeOptions, MetadataField};
 use ferrofin_providers::library_options::fetcher_names::{TMDB, TVDB};
-use ferrofin_providers::{TmdbClient, TvdbClient};
+use ferrofin_providers::{FanartClient, TmdbClient, TvdbClient};
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::{ItemRepository, PeopleRepository as _};
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
@@ -153,8 +153,20 @@ fn spawn_providers(answers: Answers) -> (String, Arc<Mutex<Vec<String>>>) {
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).into_owned();
             let line = req.lines().next().unwrap_or_default().to_owned();
-            let (status, payload) =
-                answer(&line, answers).map_or(("404 Not Found", "{}"), |b| ("200 OK", b));
+            // fanart.tv's document for the series (TVDB 121361): season 1's poster
+            // and banner, season 2's poster, an all-seasons background — their
+            // urls point back here so the scan's downloads are observable.
+            let fanart_document = format!(
+                r#"{{"seasonposter":[{{"url":"http://{addr}/img/poster-1.jpg","lang":"en","season":"1","likes":"4"}},
+                    {{"url":"http://{addr}/img/poster-2.jpg","lang":"en","season":"2","likes":"9"}}],
+                  "seasonbanner":[{{"url":"http://{addr}/img/banner-1.jpg","season":"1"}}],
+                  "showbackground":[{{"url":"http://{addr}/img/bg-all.jpg","season":"all"}}]}}"#
+            );
+            let (status, payload) = if line.contains("/fanart/tv/121361") {
+                ("200 OK", fanart_document.as_str())
+            } else {
+                answer(&line, answers).map_or(("404 Not Found", "{}"), |b| ("200 OK", b))
+            };
             log.lock().expect("log").push(line);
             let _ = write!(
                 s,
@@ -252,6 +264,9 @@ impl Library {
         )
         .with_tvdb(Arc::new(
             TvdbClient::new().with_base_url(&format!("{the_tvdb}/tvdb")),
+        ))
+        .with_fanart(Arc::new(
+            FanartClient::new(None).with_base_url(&format!("{the_moviedb}/fanart")),
         ))
         .with_people(
             Arc::clone(&self.people) as Arc<dyn ferrofin_traits::persistence::PeopleRepository>
@@ -510,6 +525,34 @@ async fn a_dvd_ordered_series_is_looked_up_in_dvd_order() {
     assert_eq!(asked(&log, "/tvdb/seasons/77/extended"), 0);
     assert_eq!(asked(&log, "/tvdb/series/121361/episodes/dvd"), 1);
     assert_eq!(asked(&log, "/tvdb/series/121361/episodes/official"), 0);
+}
+
+/// fanart.tv's `SeasonProvider` in a scan: with FanArt enabled for seasons the
+/// series' fanart document is read once more, for the season, by the series'
+/// TVDB id; with it unticked for the Season type that request is not made (the
+/// series' own request is unaffected). Which images the season keeps, and the
+/// `https` upgrade of their urls, are covered by the provider's unit tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_season_asks_fanart_for_its_artwork_only_when_fanart_is_enabled() {
+    let documents = |options: LibraryOptions| async move {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let library = Library::new(tmp.path(), options).await;
+        let (base, log) = spawn_providers(DEFAULT_ANSWERS);
+        library.scanner(&base).scan_all().await.expect("scan");
+        asked(&log, "/fanart/tv/121361")
+    };
+    let with_fanart = documents(LibraryOptions::default()).await;
+    let without = documents(LibraryOptions {
+        type_options: vec![TypeOptions {
+            type_: Some("Season".to_owned()),
+            image_fetchers: vec![TMDB.to_owned(), TVDB.to_owned()],
+            ..TypeOptions::default()
+        }],
+        ..LibraryOptions::default()
+    })
+    .await;
+    assert!(without >= 1, "the series still asks for its own artwork");
+    assert_eq!(with_fanart, without + 1, "one more request, for the season");
 }
 
 /// TheMovieDb first, with no overview for the season: TheTVDB's translated

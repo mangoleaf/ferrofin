@@ -10605,47 +10605,19 @@ impl LibraryScanner {
         let preferences =
             ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, short);
         if short == "Season" {
-            let images = if policy.image_enabled(short, fetcher_names::TMDB) {
-                match (
-                    entity.series_id.as_deref(),
-                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
-                ) {
-                    (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
-                        Some(id) => tmdb
-                            .season_images(id, number)
-                            .await
-                            .into_iter()
-                            .map(RemoteImage::from)
-                            .collect(),
-                        None => Vec::new(),
-                    },
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-            let season_art = if policy.image_enabled(short, fetcher_names::TVDB) {
-                self.tvdb_child_images(entity, cache).await
-            } else {
-                Vec::new()
-            };
-            let images = ordered_remote_images(
-                vec![
-                    (fetcher_names::TMDB, images),
-                    (fetcher_names::TVDB, season_art),
-                ],
-                policy,
-                short,
-            );
-            return artwork::acquire_images(
-                tmdb,
-                item_dir,
-                images,
-                preferences,
-                current,
-                fetch == ImageFetch::All,
-            )
-            .await;
+            return self
+                .fetch_season_images(
+                    entity,
+                    short,
+                    cache,
+                    tmdb,
+                    item_dir,
+                    policy,
+                    fetch,
+                    current,
+                    preferences,
+                )
+                .await;
         }
         let television_images = if policy.image_enabled(short, fetcher_names::TVDB) {
             self.tvdb_child_images(entity, cache).await
@@ -10695,6 +10667,110 @@ impl LibraryScanner {
             fetch == ImageFetch::All,
         )
         .await
+    }
+
+    /// A season's remote artwork: TheMovieDb's season posters, fanart.tv's
+    /// season images and TheTVDB's season art, ordered by the library's image
+    /// fetcher order.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_season_images(
+        &self,
+        entity: &BaseItemEntity,
+        short: &str,
+        cache: &mut ArtworkCache,
+        tmdb: &TmdbClient,
+        item_dir: &Path,
+        policy: FetcherPolicy<'_>,
+        fetch: ImageFetch,
+        current: &[ItemImageInfo],
+        preferences: ferrofin_providers::image_policy::ImageAcquisitionPolicy<'_>,
+    ) -> Vec<ItemImageInfo> {
+        let images = if policy.image_enabled(short, fetcher_names::TMDB) {
+            match (
+                entity.series_id.as_deref(),
+                entity.index_number.and_then(|n| i32::try_from(n).ok()),
+            ) {
+                (Some(series_id), Some(number)) => match series_tmdb_id_of(cache, series_id) {
+                    Some(id) => tmdb
+                        .season_images(id, number)
+                        .await
+                        .into_iter()
+                        .map(RemoteImage::from)
+                        .collect(),
+                    None => Vec::new(),
+                },
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let season_art = if policy.image_enabled(short, fetcher_names::TVDB) {
+            self.tvdb_child_images(entity, cache).await
+        } else {
+            Vec::new()
+        };
+        let images = ordered_remote_images(
+            vec![
+                (fetcher_names::TMDB, images),
+                (
+                    fetcher_names::FANART,
+                    self.fanart_season_images(entity, cache, policy).await,
+                ),
+                (fetcher_names::TVDB, season_art),
+            ],
+            policy,
+            short,
+        );
+        artwork::acquire_images(
+            tmdb,
+            item_dir,
+            images,
+            preferences,
+            current,
+            fetch == ImageFetch::All,
+        )
+        .await
+    }
+
+    /// fanart.tv's `SeasonProvider`: the series' fanart document filtered to
+    /// this season's number, keyed by the series' TVDB id (this pass's match, or
+    /// the id a previous scan recorded). Empty when the library does not use
+    /// fanart.tv for seasons, or the series has no TVDB id.
+    async fn fanart_season_images(
+        &self,
+        entity: &BaseItemEntity,
+        cache: &ArtworkCache,
+        policy: FetcherPolicy<'_>,
+    ) -> Vec<RemoteImage> {
+        let (Some(fanart), Some(series_id), Some(number)) = (
+            self.fanart.as_ref(),
+            entity.series_id.as_deref(),
+            entity.index_number.and_then(|n| i32::try_from(n).ok()),
+        ) else {
+            return Vec::new();
+        };
+        if !policy.image_enabled("Season", fetcher_names::FANART) {
+            return Vec::new();
+        }
+        let Some(tvdb_id) = cache
+            .series_tvdb
+            .get(series_id)
+            .map(|details| details.tvdb_id)
+            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
+            .filter(|id| *id > 0)
+        else {
+            return Vec::new();
+        };
+        let fanart = fanart
+            .as_ref()
+            .clone()
+            .with_language(&policy.metadata_language());
+        let mut images = Vec::new();
+        append_fanart(
+            &mut images,
+            fanart.season_images(&tvdb_id.to_string(), number).await,
+        );
+        images
     }
 
     /// Image providers run independently of the library's metadata selection.

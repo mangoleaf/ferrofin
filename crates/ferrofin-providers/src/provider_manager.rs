@@ -2963,6 +2963,8 @@ enum RemoteImageSource {
     FanartMovie,
     /// The fanart.tv plugin's `SeriesProvider`.
     FanartSeries,
+    /// The fanart.tv plugin's `SeasonProvider`.
+    FanartSeason,
     /// The fanart.tv plugin's `ArtistProvider`.
     FanartArtist,
     /// The fanart.tv plugin's `AlbumProvider`.
@@ -2986,9 +2988,11 @@ impl RemoteImageSource {
             | Self::TmdbPerson
             | Self::TmdbSeason
             | Self::TmdbEpisode => TMDB_PROVIDER_NAME,
-            Self::FanartMovie | Self::FanartSeries | Self::FanartArtist | Self::FanartAlbum => {
-                FANART_PROVIDER_NAME
-            }
+            Self::FanartMovie
+            | Self::FanartSeries
+            | Self::FanartSeason
+            | Self::FanartArtist
+            | Self::FanartAlbum => FANART_PROVIDER_NAME,
             Self::TvdbSeries | Self::TvdbSeason | Self::TvdbEpisode => fetcher_names::TVDB,
             Self::AudioDbArtist | Self::AudioDbAlbum => AUDIODB_PROVIDER_NAME,
             Self::Omdb => OMDB_PROVIDER_NAME,
@@ -3012,6 +3016,7 @@ impl RemoteImageSource {
             | Self::Omdb => &[Primary],
             Self::FanartMovie => &[Primary, Thumb, Art, Logo, Disc, Banner, Backdrop],
             Self::FanartSeries => &[Primary, Thumb, Art, Logo, Backdrop, Banner],
+            Self::FanartSeason => &[Backdrop, Thumb, Banner, Primary],
             Self::FanartArtist => &[Primary, Logo, Art, Banner, Backdrop],
             Self::FanartAlbum | Self::AudioDbAlbum => &[Primary, Disc],
             Self::AudioDbArtist => &[Primary, Logo, Banner, Backdrop],
@@ -3149,6 +3154,7 @@ impl LocalProviderManager {
             "Season" => {
                 sources.extend(has(self.tvdb.is_some(), RemoteImageSource::TvdbSeason));
                 sources.extend(has(self.tmdb.is_some(), RemoteImageSource::TmdbSeason));
+                sources.extend(has(self.fanart.is_some(), RemoteImageSource::FanartSeason));
             }
             "Episode" => {
                 sources.extend(has(self.tvdb.is_some(), RemoteImageSource::TvdbEpisode));
@@ -3319,6 +3325,7 @@ impl LocalProviderManager {
             | RemoteImageSource::TmdbPerson
             | RemoteImageSource::TmdbSeason
             | RemoteImageSource::TmdbEpisode => self.tmdb_images(source, entity, ids).await,
+            RemoteImageSource::FanartSeason => self.fanart_season_images(entity).await,
             RemoteImageSource::FanartMovie
             | RemoteImageSource::FanartSeries
             | RemoteImageSource::FanartArtist
@@ -3557,6 +3564,32 @@ impl LocalProviderManager {
                     None => Vec::new(),
                 }
             }
+        }
+    }
+
+    /// The fanart.tv `SeasonProvider`: the parent series' fanart document
+    /// filtered to the season's number. The series is keyed by its stored
+    /// `Tvdb` id (upstream reads the season's own id, which is not a fanart.tv
+    /// show — see [`FanartClient::season_images`]).
+    async fn fanart_season_images(&self, season: &BaseItemEntity) -> Vec<TmdbImage> {
+        let (Some(fanart), Some(number)) = (
+            &self.fanart,
+            season
+                .index_number
+                .and_then(|number| i32::try_from(number).ok()),
+        ) else {
+            return Vec::new();
+        };
+        let Some(series) = self.parent_series_of(season).await else {
+            return Vec::new();
+        };
+        let Ok(series_id) = Uuid::parse_str(&series.id) else {
+            return Vec::new();
+        };
+        let ids = self.stored_provider_ids(series_id).await;
+        match provider_id_of_pairs(&ids, "Tvdb") {
+            Some(tvdb) => fanart.season_images(tvdb, number).await,
+            None => Vec::new(),
         }
     }
 
@@ -7316,6 +7349,81 @@ mod tests {
                 ImageType::Primary
             )],
             "stills map to Primary, like ConvertStillsToRemoteImageInfo"
+        );
+    }
+
+    const FANART_SEASONS: &str = r#"{
+        "seasonposter":[{"url":"https://f/poster-1.jpg","lang":"en","season":"1","likes":"4"},
+                        {"url":"https://f/poster-2.jpg","lang":"en","season":"2","likes":"9"}],
+        "seasonbanner":[{"url":"https://f/banner-1.jpg","season":"1"}],
+        "showbackground":[{"url":"https://f/bg-all.jpg","season":"all"}]}"#;
+
+    /// `SeasonProvider` is listed for a season (`Backdrop, Thumb, Banner,
+    /// Primary`) and returns the series' fanart document filtered to the
+    /// season's number, keyed by the SERIES' Tvdb id.
+    #[tokio::test]
+    async fn a_season_offers_fanart_artwork_filtered_to_its_number() {
+        let fanart =
+            crate::mock_http::MockServer::start(vec![("/tv/121361", FANART_SEASONS.to_owned())])
+                .await;
+        let series_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Parity Show");
+        series.id = series_id.to_string();
+        let season_id = Uuid::new_v4();
+        let mut season = row("TV.Season", "Season 1");
+        season.id = season_id.to_string();
+        season.series_id = Some(series_id.to_string());
+        season.index_number = Some(1);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(series_id, series), (season_id, season)]),
+            seen: tx,
+        });
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .insert(series_id, vec![("Tvdb".to_owned(), "121361".to_owned())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_image_store(store, std::env::temp_dir())
+            .with_fanart(Arc::new(
+                crate::fanart::FanartClient::new(None).with_base_url(&fanart.base_url),
+            ));
+
+        let info = mgr.get_remote_image_provider_info(season_id).await.unwrap();
+        let fanart_info = info
+            .iter()
+            .find(|i| i.name.as_deref() == Some("FanArt"))
+            .expect("FanArt is offered for a season");
+        assert_eq!(
+            fanart_info.supported_images,
+            [
+                ImageType::Backdrop,
+                ImageType::Thumb,
+                ImageType::Banner,
+                ImageType::Primary
+            ]
+        );
+
+        let images = mgr
+            .get_available_remote_images(season_id, &RemoteImageQuery::default())
+            .await
+            .expect("season images");
+        let mut found: Vec<_> = images
+            .iter()
+            .filter(|i| i.provider_name.as_deref() == Some("FanArt"))
+            .map(|i| (i.url.as_deref().unwrap_or_default(), i.type_))
+            .collect();
+        found.sort_unstable_by_key(|(url, _)| *url);
+        assert_eq!(
+            found,
+            [
+                ("https://f/banner-1.jpg", ImageType::Banner),
+                ("https://f/poster-1.jpg", ImageType::Primary),
+            ],
+            "season 1 only; the 'all' background and season 2's poster are not its own"
         );
     }
 
