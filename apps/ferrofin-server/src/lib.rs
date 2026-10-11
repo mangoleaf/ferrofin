@@ -29,7 +29,7 @@ pub mod state;
 pub mod vaapi_probe;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -645,13 +645,10 @@ fn boot_tree_roots(config: &Config) -> ferrofin_api::handlers::backup::TreeRoots
         &config.config_dir,
         &config.database_path(),
     );
-    if let Some(metadata) = std::fs::read_to_string(config.config_dir.join("system.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|cfg| cfg.get("MetadataPath")?.as_str().map(str::to_owned))
-        .filter(|p| !p.trim().is_empty())
+    if let Some(metadata) =
+        ferrofin_api::handlers::backup::restored_metadata_root(&config.config_dir)
     {
-        roots.metadata = PathBuf::from(metadata);
+        roots.metadata = metadata;
     }
     roots
 }
