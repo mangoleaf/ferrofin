@@ -1670,6 +1670,17 @@ impl LocalProviderManager {
         items.retrieve_item(series_uuid).await.ok().flatten()
     }
 
+    /// `SeasonInfo.SeriesDisplayOrder`: the parent series' raw stored
+    /// `DisplayOrder`, empty when it has none.
+    async fn series_display_order_of(&self, entity: &BaseItemEntity) -> String {
+        crate::tvdb::display_order_of(
+            self.parent_series_of(entity)
+                .await
+                .and_then(|series| series.data)
+                .as_deref(),
+        )
+    }
+
     /// Resolves the parent series' TMDB id (its stored provider ids first,
     /// then a title search) and fetches one season's details — the shared
     /// first half of the season/episode refresh arms. `None` when the series
@@ -1921,10 +1932,11 @@ impl LocalProviderManager {
                     (Some(client), Some(series)) => {
                         let language = self.preferred_metadata_language(row).await;
                         let three_letter = self.three_letter_language_names(&language);
+                        let display_order = self.series_display_order_of(row).await;
                         crate::season::tvdb_season(
                             client,
                             series,
-                            crate::tvdb::DEFAULT_SEASON_TYPE,
+                            crate::tvdb::season_lookup_order(&display_order),
                             season_number,
                             &language,
                             &three_letter,
@@ -3352,16 +3364,12 @@ impl LocalProviderManager {
             let Some(series_id) = id_of(&self.stored_provider_ids(id).await) else {
                 return Vec::new();
             };
-            let data: serde_json::Value = series
-                .data
-                .as_deref()
-                .and_then(|data| serde_json::from_str(data).ok())
-                .unwrap_or_default();
-            let order = data
-                .get("DisplayOrder")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(crate::tvdb::DEFAULT_SEASON_TYPE);
+            let order = crate::tvdb::display_order_of(series.data.as_deref());
+            let order = if order.is_empty() {
+                crate::tvdb::DEFAULT_SEASON_TYPE
+            } else {
+                order.as_str()
+            };
             if source == RemoteImageSource::TvdbSeason {
                 match entity
                     .index_number

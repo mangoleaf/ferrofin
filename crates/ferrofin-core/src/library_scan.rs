@@ -81,6 +81,9 @@ use music::{MusicKind, MusicRefresh};
 /// its seasons/episodes reuse that match (and its per-season episode stills).
 #[derive(Default)]
 struct ArtworkCache {
+    /// Series item id → its stored `DisplayOrder` (raw; empty when it has
+    /// none), read once per pass for its seasons and episodes.
+    display_orders: HashMap<String, String>,
     /// The attachments of the probe that ran for an item in this pass, kept for
     /// the artwork step: they are not persisted until after it.
     probe_attachments:
@@ -5154,6 +5157,9 @@ impl LibraryScanner {
             });
         }
         let stored_row = stored.row();
+        let absolute_naming = self
+            .remember_display_order(state.art_cache, stored_row.unwrap_or(&item.entity))
+            .await;
         // The options this item refreshes with (the scan's, or the defaults
         // for an ancestor a path-scoped scan carries along).
         let request = *state
@@ -5180,7 +5186,15 @@ impl LibraryScanner {
         let mut video_base = stored_row.filter(|_| video_info.is_some()).cloned();
         let embedded_title = if let Some(info) = video_info {
             let base = video_base.as_mut().unwrap_or(&mut entity);
-            apply_video_metadata(base, info, policy, locked, locked_fields, options);
+            apply_video_metadata(
+                base,
+                info,
+                policy,
+                locked,
+                locked_fields,
+                options,
+                absolute_naming,
+            );
             embedded_video_title(info, base, policy, locked, locked_fields).map(str::to_owned)
         } else {
             None
@@ -5464,6 +5478,7 @@ impl LibraryScanner {
                     || plan.is_first_refresh
                     || plan.requires_refresh),
             replace_all: options.replace_all_metadata,
+            absolute_naming,
             remote_answered: has_remote_metadata,
         };
         entity = match &local_row {
@@ -8684,15 +8699,9 @@ impl LibraryScanner {
     /// their defaults; their separate plugin configuration page is an open
     /// settings work item, as recorded in `ferrofin_providers::tvdb`.
     ///
-    /// TODO(parity, open work item — NOT an accepted divergence): the plugin
-    /// orders by the series' `DisplayOrder` (`info.SeriesDisplayOrder`,
-    /// `official` when blank, `:65-74`); the scan always asks for the
-    /// `official` ordering, as its episode arm does
-    /// ([`DEFAULT_SEASON_TYPE`]). To port: read the series row's
-    /// `DisplayOrder` from its `Data` blob when the series is planned and
-    /// pass it to both arms.
-    ///
-    /// [`DEFAULT_SEASON_TYPE`]: ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
+    /// The season is looked up in the series' own ordering
+    /// (`info.SeriesDisplayOrder`, `official` when blank, `:65-74`), with no
+    /// fallback to another ordering when the series lists no such season.
     async fn fetch_tvdb_season(
         &self,
         row: &BaseItemEntity,
@@ -8710,10 +8719,11 @@ impl LibraryScanner {
             .map(|d| d.tvdb_id)
             .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
             .filter(|id| *id > 0)?;
+        let display_order = self.series_display_order(cache, series_id).await?;
         let result = ferrofin_providers::season::tvdb_season(
             tvdb,
             series_tvdb,
-            ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
+            ferrofin_providers::tvdb::season_lookup_order(&display_order),
             number,
             language,
             &self.three_letter_language_names(language),
@@ -8880,11 +8890,8 @@ impl LibraryScanner {
                 Some(answer)
             }
             "Episode" => {
-                let (Some(series_id), Some(season), Some(number)) = (
-                    row.series_id.clone(),
-                    lookup.parent_index(row),
-                    lookup.index(row),
-                ) else {
+                let (Some(series_id), Some(number)) = (row.series_id.clone(), lookup.index(row))
+                else {
                     return None;
                 };
                 // The parent series matched TVDB earlier this scan, or a
@@ -8895,13 +8902,17 @@ impl LibraryScanner {
                     .get(&series_id)
                     .map(|d| d.tvdb_id)
                     .or_else(|| recorded_provider_id(cache, &series_id, "Tvdb"))?;
+                // `GetEpisodeTvdbId`: the series' ordering decides the season
+                // type and numbers asked for; a season-less episode is in
+                // season 1.
+                let display_order = self.series_display_order(cache, &series_id).await?;
+                let (season_type, season, number) = ferrofin_providers::tvdb::episode_lookup(
+                    &display_order,
+                    lookup.parent_index(row),
+                    number,
+                );
                 let mut ep = tvdb
-                    .episode_by_number(
-                        tvdb_id,
-                        ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE,
-                        season,
-                        number,
-                    )
+                    .episode_by_number(tvdb_id, season_type, season, number)
                     .await?;
                 let language = lookup.metadata_language(FetcherPolicy::default());
                 ep.localize(&language, &self.three_letter_language_names(&language));
@@ -8910,7 +8921,7 @@ impl LibraryScanner {
                 }
                 // `TvdbEpisodeProvider` names no `ResultLanguage`.
                 let mut answer = RemoteAnswer::for_row(row, None);
-                apply_tvdb_episode(&mut answer.item, &ep);
+                apply_tvdb_episode(&mut answer.item, &ep, display_order.is_empty());
                 // Cast & Crew on an episode page is the EPISODE's credits, not
                 // the series': TVDB's episode record, a list even when it
                 // credits nobody (`TvdbEpisodeProvider.cs:225`).
@@ -10709,6 +10720,50 @@ impl LibraryScanner {
         }
     }
 
+    /// The series' stored `DisplayOrder`, as the plugin's `SeriesDisplayOrder`
+    /// carries it: raw, and empty when the row has none or no repository is
+    /// attached. A failed read is counted as a failed request and answers
+    /// `None`, so the caller skips its lookup instead of guessing an order.
+    async fn series_display_order(&self, cache: &ArtworkCache, series_id: &str) -> Option<String> {
+        if let Some(order) = cache.display_orders.get(series_id) {
+            return Some(order.clone());
+        }
+        let (Some(items), Ok(id)) = (&self.item_repository, Uuid::parse_str(series_id)) else {
+            return Some(String::new());
+        };
+        match items.retrieve_item(id).await {
+            Ok(row) => Some(ferrofin_providers::tvdb::display_order_of(
+                row.and_then(|row| row.data).as_deref(),
+            )),
+            Err(err) => {
+                tracing::warn!(%err, item_id = %series_id, "could not read series display order");
+                ferrofin_providers::rate_limit::note_request_failure();
+                None
+            }
+        }
+    }
+
+    /// Reads the display order of the series `row` hangs off into the pass's
+    /// cache, so the item's providers and path resolver share one read.
+    /// Returns whether the series uses absolute naming
+    /// (`FillMissingEpisodeNumbersFromPath`'s `isAbsoluteNaming`, ordinal
+    /// ignore-case).
+    async fn remember_display_order(&self, cache: &mut ArtworkCache, row: &BaseItemEntity) -> bool {
+        let Some(series_id) = row
+            .series_id
+            .as_deref()
+            .filter(|_| row.type_.ends_with("Episode") || row.type_.ends_with("Season"))
+        else {
+            return false;
+        };
+        let Some(order) = self.series_display_order(cache, series_id).await else {
+            return false;
+        };
+        let absolute = order.eq_ignore_ascii_case("absolute");
+        cache.display_orders.insert(series_id.to_owned(), order);
+        absolute
+    }
+
     /// TVDB artwork resolves through the series and its display order, even
     /// when metadata refresh was disabled. Episode-local ids do not select art.
     async fn tvdb_child_images(
@@ -10728,33 +10783,18 @@ impl LibraryScanner {
         else {
             return Vec::new();
         };
-        let data = if let (Some(items), Ok(id)) =
-            (&self.item_repository, Uuid::parse_str(series_id))
-        {
-            match items.retrieve_item(id).await {
-                Ok(row) => row.and_then(|row| row.data),
-                Err(err) => {
-                    tracing::warn!(%err, item_id = %series_id, "could not read image display order");
-                    ferrofin_providers::rate_limit::note_request_failure();
-                    return Vec::new();
-                }
-            }
-        } else {
-            None
+        let Some(order) = self.series_display_order(cache, series_id).await else {
+            return Vec::new();
         };
-        let data: serde_json::Value = data
-            .as_deref()
-            .and_then(|data| serde_json::from_str(data).ok())
-            .unwrap_or_default();
-        let order = data
-            .get("DisplayOrder")
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE);
-        // The metadata episode provider currently uses official order. Its
-        // cached still is reusable only for that same order.
+        let order = if order.is_empty() {
+            ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
+        } else {
+            order.as_str()
+        };
+        // The metadata episode provider looked the episode up in the same
+        // series order ([`ferrofin_providers::tvdb::episode_lookup`]), so the
+        // still it found is the one this provider would resolve.
         if entity.type_.ends_with("Episode")
-            && order == ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
             && let Some(url) = cache.episode_tvdb_still.get(&entity.id)
         {
             return vec![RemoteImage {
@@ -13875,6 +13915,16 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     if let Some(status) = n.status {
         apply_series_status(entity, series_status_name(status));
     }
+    // `<displayorder>` (`BaseNfoParser`, series only): the series' episode
+    // ordering, which lives in the `Data` blob and selects the TVDB ordering
+    // its seasons and episodes are looked up in.
+    fill_provider_data(
+        entity,
+        "DisplayOrder",
+        n.display_order
+            .as_ref()
+            .map(|order| serde_json::json!(order)),
+    );
     // `<airs_dayofweek>` / `<airs_time>` (SeriesNfoParser.cs:63-74) —
     // `Series.AirDays`/`AirTime`, the other two blob-only series properties.
     if let Some(data) = crate::item_data::fill_series_air(
@@ -14153,6 +14203,9 @@ struct SaveFacts<'a> {
     before_refresh: bool,
     /// The pass replaces all metadata (`ReplaceAllMetadata`).
     replace_all: bool,
+    /// The episode's series uses `absolute` display order, so its bare
+    /// file numbers are absolute episode numbers.
+    absolute_naming: bool,
     /// A remote provider answered with metadata. A season's or an
     /// episode's put the number it was looked up by on its result (TMDB's
     /// `IndexNumber = info.IndexNumber`); Ferrofin's fetchers leave that to
@@ -14346,7 +14399,12 @@ impl MergeMode {
 /// No other kind takes anything (a book's year or series never comes back
 /// from its path). Two episode fields upstream may also set here are not
 /// ported yet — see the `TODO(parity)` notes below.
-fn before_metadata_refresh(row: &mut BaseItemEntity, replace_all: bool, season_index: Option<i64>) {
+fn before_metadata_refresh(
+    row: &mut BaseItemEntity,
+    replace_all: bool,
+    season_index: Option<i64>,
+    absolute_naming: bool,
+) {
     let path = row.path.clone().filter(|p| !p.is_empty());
     // ACCEPTED DIVERGENCE (Ferrofin is the more-correct side: upstream
     // BaseItem.cs:2728 bypasses its own Folder/Video FileNameWithoutExtension).
@@ -14410,7 +14468,13 @@ fn before_metadata_refresh(row: &mut BaseItemEntity, replace_all: bool, season_i
             // Embedded episode info is applied by `apply_video_metadata`
             // before this path fallback; the probe and lookup share that row.
             if let Some(path) = path.as_deref() {
-                fill_episode_numbers_from_path(row, path, replace_all, season_index);
+                fill_episode_numbers_from_path(
+                    row,
+                    path,
+                    replace_all,
+                    season_index,
+                    absolute_naming,
+                );
             }
         }
         _ => {}
@@ -14441,21 +14505,27 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 /// plain-folder parent (the planner creates none). `IndexNumberEnd` is not
 /// in the schema, so it is neither filled nor cleared.
 ///
-/// TODO(parity): upstream resolves with `isAbsoluteNaming` when the series'
-/// `DisplayOrder` is `absolute` (`LibraryManager.cs:3292-3298`), which reads
-/// a bare number as an absolute episode number. The planner does not pass
-/// it either. To port: read the series row's `DisplayOrder` (its `Data`
-/// blob; the scan holds the series row when it plans the episode), pass it
-/// to both the planner's and this `EpisodeResolver::resolve` call, and test
-/// an absolute-order series with bare-numbered files.
+/// A series whose `DisplayOrder` is `absolute` resolves with
+/// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
+/// that read absolute episode numbers run, so a name they do not match leaves
+/// the numbers as they were. Any other order applies no filter.
 fn fill_episode_numbers_from_path(
     row: &mut BaseItemEntity,
     path: &str,
     replace_all: bool,
     season_index: Option<i64>,
+    absolute_naming: bool,
 ) {
     use chrono::TimeZone as _;
-    let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve_simple(path, false) else {
+    // `isAbsoluteNaming`: `null` (no filter) unless the series is absolute.
+    let Some(info) = EpisodeResolver::new(&PATH_NAMING).resolve(
+        path,
+        false,
+        None,
+        None,
+        absolute_naming.then_some(true),
+        true,
+    ) else {
         return;
     };
     if info.is_by_date {
@@ -14529,6 +14599,7 @@ fn apply_video_metadata(
     locked: bool,
     fields: &[MetadataField],
     options: &MetadataRefreshOptions,
+    absolute_naming: bool,
 ) {
     if options.metadata_refresh_mode != MetadataRefreshMode::None {
         if !locked && embedded_episode_info_enabled(row, policy) {
@@ -14542,7 +14613,12 @@ fn apply_video_metadata(
                 row.series_name = Some(name.clone());
             }
         }
-        before_metadata_refresh(row, options.replace_all_metadata, row.parent_index_number);
+        before_metadata_refresh(
+            row,
+            options.replace_all_metadata,
+            row.parent_index_number,
+            absolute_naming,
+        );
     }
     if let Some(title) = embedded_video_title(info, row, policy, locked, fields) {
         row.name = Some(title.to_owned());
@@ -14582,7 +14658,12 @@ fn saved_row(
             base.date_created = facts.redated;
         }
         if facts.before_refresh {
-            before_metadata_refresh(&mut base, facts.replace_all, guesses.parent_index_number);
+            before_metadata_refresh(
+                &mut base,
+                facts.replace_all,
+                guesses.parent_index_number,
+                facts.absolute_naming,
+            );
         }
         let mut row = merge_onto_stored(&base, scanned, facts, base.parent_index_number);
         if !facts.locked {
@@ -15363,16 +15444,24 @@ fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
 /// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
 /// everything except the title, where the provider outranks the resolver's
 /// filename placeholder).
-fn apply_tvdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbEpisodeDetails) {
+fn apply_tvdb_episode(
+    entity: &mut BaseItemEntity,
+    d: &ferrofin_providers::TvdbEpisodeDetails,
+    aired_order: bool,
+) {
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&d.name);
     }
-    for (key, value) in [
-        ("AirsBeforeEpisodeNumber", d.airs_before_episode),
-        ("AirsAfterSeasonNumber", d.airs_after_season),
-        ("AirsBeforeSeasonNumber", d.airs_before_season),
-    ] {
-        fill_provider_data(entity, key, value.map(|v| serde_json::json!(v)));
+    // "Below metadata info only applicable for Aired Order": the plugin sets
+    // them only when the series has no display order of its own.
+    if aired_order {
+        for (key, value) in [
+            ("AirsBeforeEpisodeNumber", d.airs_before_episode),
+            ("AirsAfterSeasonNumber", d.airs_after_season),
+            ("AirsBeforeSeasonNumber", d.airs_before_season),
+        ] {
+            fill_provider_data(entity, key, value.map(|v| serde_json::json!(v)));
+        }
     }
     if entity.overview.is_none() {
         entity.overview.clone_from(&d.overview);
@@ -16128,6 +16217,7 @@ mod tests {
             locked,
             &[],
             &refresh,
+            false,
         );
         assert_eq!(
             (row.index_number, row.parent_index_number),
@@ -16244,14 +16334,14 @@ mod tests {
             airs_before_season: Some(1),
             ..Default::default()
         };
-        super::apply_tvdb_episode(&mut ep, &tvdb);
+        super::apply_tvdb_episode(&mut ep, &tvdb, true);
         assert_eq!(ep.original_title.as_deref(), Some("Special"));
         let data = crate::item_data::parse_data(ep.data.as_deref());
         assert_eq!(data["AirsBeforeEpisodeNumber"], 2);
         assert_eq!(data["AirsAfterSeasonNumber"], 0);
         assert_eq!(data["AirsBeforeSeasonNumber"], 1);
         let before = ep.clone();
-        super::apply_tvdb_episode(&mut ep, &tvdb);
+        super::apply_tvdb_episode(&mut ep, &tvdb, true);
         assert_eq!(ep, before);
     }
 
@@ -20646,7 +20736,7 @@ mod tests {
         };
         // Blank name → filled.
         let mut blank = BaseItemEntity::default();
-        super::apply_tvdb_episode(&mut blank, &ep);
+        super::apply_tvdb_episode(&mut blank, &ep, true);
         assert_eq!(blank.name.as_deref(), Some("Winter Is Coming"));
         assert_eq!(blank.overview.as_deref(), Some("Ned is summoned."));
         assert!(blank.premiere_date.is_some());
@@ -20668,7 +20758,7 @@ mod tests {
             index_number: Some(1),
             ..Default::default()
         };
-        super::apply_tvdb_episode(&mut placeholder, &ep);
+        super::apply_tvdb_episode(&mut placeholder, &ep, true);
         assert_eq!(placeholder.name.as_deref(), Some("Winter Is Coming"));
         // The new title must NOT become an alphabetical sort name: an episode
         // sorts by its position, or the client's play queue scrambles.
@@ -20682,7 +20772,7 @@ mod tests {
             path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
             ..Default::default()
         };
-        super::apply_tvdb_episode(&mut named, &ep);
+        super::apply_tvdb_episode(&mut named, &ep, true);
         assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
@@ -21368,6 +21458,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
+                absolute_naming: false,
                 remote_answered: false,
                 redated: None,
             },
@@ -21534,6 +21625,7 @@ mod tests {
                 merge,
                 before_refresh: true,
                 replace_all: options.replace_all_metadata,
+                absolute_naming: false,
                 remote_answered: answered,
                 redated: None,
             },
@@ -22454,12 +22546,12 @@ mod tests {
     ) {
         let mut row = stored_row(kind, path, name, None);
         row.is_in_mixed_folder = mixed;
-        super::before_metadata_refresh(&mut row, false, None);
+        super::before_metadata_refresh(&mut row, false, None, false);
         assert_eq!(row.name.as_deref(), expected_name, "{kind}");
         assert_eq!(row.production_year, expected_year, "{kind}");
         // A value the row holds is never replaced.
         let mut kept = stored_row(kind, path, name.or(Some("Kept")), Some(1900));
-        super::before_metadata_refresh(&mut kept, true, None);
+        super::before_metadata_refresh(&mut kept, true, None, false);
         assert_eq!(kept.production_year, Some(1900), "{kind}");
     }
 
@@ -22470,12 +22562,12 @@ mod tests {
     fn the_refill_reads_a_disc_rips_own_folder() {
         let mut rip = stored_row("Movies.Movie", "/m/Dune (2021)", None, None);
         rip.data = Some(r#"{"VideoType":"BluRay"}"#.to_owned());
-        super::before_metadata_refresh(&mut rip, false, None);
+        super::before_metadata_refresh(&mut rip, false, None, false);
         assert_eq!(rip.name.as_deref(), Some("Dune (2021)"));
         assert_eq!(rip.production_year, Some(2021));
         let mut named = stored_row("Movies.Movie", "/m (1999)/Dune (2021)", Some("Dune"), None);
         named.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
-        super::before_metadata_refresh(&mut named, false, None);
+        super::before_metadata_refresh(&mut named, false, None, false);
         assert_eq!(
             named.production_year,
             Some(2021),
@@ -22488,10 +22580,10 @@ mod tests {
     #[test]
     fn the_refill_numbers_a_season_from_its_folder() {
         let mut season = stored_row("TV.Season", "/tv/Show/Season 03", Some("Season 3"), None);
-        super::before_metadata_refresh(&mut season, false, None);
+        super::before_metadata_refresh(&mut season, false, None, false);
         assert_eq!(season.index_number, Some(3));
         season.index_number = Some(9);
-        super::before_metadata_refresh(&mut season, true, None);
+        super::before_metadata_refresh(&mut season, true, None, false);
         assert_eq!(season.index_number, Some(9));
     }
 
@@ -22500,11 +22592,41 @@ mod tests {
     /// `ReplaceAllMetadata` forces the path's; a by-date name clears the
     /// number and fills the air date and year; a locked episode is left
     /// alone; a season number still missing takes the season's.
+    /// `FillMissingEpisodeNumbersFromPath` resolves with `isAbsoluteNaming`
+    /// for an `absolute` series: a bare "101" is episode 101, not S1E01.
+    #[test]
+    fn absolute_series_read_bare_numbers_as_absolute_episode_numbers() {
+        let episode = |name: &str| BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+            path: Some(format!("/tv/Show/{name}")),
+            ..BaseItemEntity::default()
+        };
+        // "Show.102" is season 1 episode 2 by default; an absolute series only
+        // tries the absolute-number expressions, which do not match it, so
+        // nothing is taken from the path.
+        let mut aired = episode("Show.102.mkv");
+        super::before_metadata_refresh(&mut aired, false, None, false);
+        assert_eq!(
+            (aired.parent_index_number, aired.index_number),
+            (Some(1), Some(2))
+        );
+        let mut absolute = episode("Show.102.mkv");
+        super::before_metadata_refresh(&mut absolute, false, None, true);
+        assert_eq!(
+            (absolute.parent_index_number, absolute.index_number),
+            (None, None)
+        );
+        // A bare number both read the same way is an absolute number.
+        let mut bare = episode("Show 101.mkv");
+        super::before_metadata_refresh(&mut bare, false, None, true);
+        assert_eq!(bare.index_number, Some(101));
+    }
+
     #[test]
     fn the_refill_numbers_an_episode_from_its_path() {
         let path = "/tv/Show/Season 01/Show S01E03.mkv";
         let mut missing = stored_row("TV.Episode", path, Some("Title"), None);
-        super::before_metadata_refresh(&mut missing, false, None);
+        super::before_metadata_refresh(&mut missing, false, None, false);
         assert_eq!(
             (missing.parent_index_number, missing.index_number),
             (Some(1), Some(3))
@@ -22513,12 +22635,12 @@ mod tests {
         let mut edited = stored_row("TV.Episode", path, Some("Title"), None);
         edited.parent_index_number = Some(2);
         edited.index_number = Some(1);
-        super::before_metadata_refresh(&mut edited, false, None);
+        super::before_metadata_refresh(&mut edited, false, None, false);
         assert_eq!(
             (edited.parent_index_number, edited.index_number),
             (Some(2), Some(1))
         );
-        super::before_metadata_refresh(&mut edited, true, None);
+        super::before_metadata_refresh(&mut edited, true, None, false);
         assert_eq!(
             (edited.parent_index_number, edited.index_number),
             (Some(1), Some(3)),
@@ -22527,7 +22649,7 @@ mod tests {
 
         let mut locked = stored_row("TV.Episode", path, Some("Title"), None);
         locked.is_locked = true;
-        super::before_metadata_refresh(&mut locked, true, None);
+        super::before_metadata_refresh(&mut locked, true, None, false);
         assert_eq!(
             (locked.parent_index_number, locked.index_number),
             (None, None)
@@ -22540,7 +22662,7 @@ mod tests {
             None,
         );
         by_date.index_number = Some(7);
-        super::before_metadata_refresh(&mut by_date, false, Some(4));
+        super::before_metadata_refresh(&mut by_date, false, Some(4), false);
         assert_eq!(by_date.index_number, None, "a by-date name has no number");
         assert_eq!(by_date.production_year, Some(2024));
         assert_eq!(
@@ -22577,6 +22699,7 @@ mod tests {
                     merge: super::MergeMode::DEFAULT,
                     before_refresh,
                     replace_all: false,
+                    absolute_naming: false,
                     remote_answered: false,
                     redated: None,
                 },
@@ -22888,6 +23011,7 @@ mod tests {
                     },
                     before_refresh: true,
                     replace_all: false,
+                    absolute_naming: false,
                     remote_answered: false,
                     redated: None,
                 },
@@ -23286,6 +23410,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
+                absolute_naming: false,
                 remote_answered: true,
                 redated: None,
             },
@@ -23664,6 +23789,7 @@ mod tests {
                 merge: super::MergeMode::DEFAULT,
                 before_refresh: true,
                 replace_all: false,
+                absolute_naming: false,
                 remote_answered: true,
                 redated: None,
             },
@@ -29436,6 +29562,7 @@ mod tests {
                 airs_before_episode: Some(7),
                 ..Default::default()
             },
+            true,
         );
         assert_eq!(
             row, before,
@@ -32001,6 +32128,7 @@ mod chapter_image_refresh_tests {
                             },
                             before_refresh: false,
                             replace_all: replace,
+                            absolute_naming: false,
                             remote_answered: false,
                             redated: None,
                         },

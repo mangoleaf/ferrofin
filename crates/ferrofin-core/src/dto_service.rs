@@ -2997,6 +2997,16 @@ impl FerrofinDtoService {
             dto.status = fields.status;
         }
 
+        // `if (item is IHasDisplayOrder hasDisplayOrder) dto.DisplayOrder =
+        // hasDisplayOrder.DisplayOrder;` (`DtoService.cs:1207-1210`): a
+        // series' episode ordering and a collection's child ordering, both
+        // kept in the `Data` blob. The web editor's "Display order" select
+        // reads it.
+        if matches!(kind, BaseItemKind::Series | BaseItemKind::BoxSet) {
+            let order = ferrofin_providers::tvdb::display_order_of(item.data.as_deref());
+            dto.display_order = Some(order).filter(|order| !order.is_empty());
+        }
+
         // Production locations.
         if options.contains_field(ItemFields::ProductionLocations) {
             let locations = split_multi(item.production_locations.as_deref());
@@ -6499,6 +6509,65 @@ mod tests {
         assert_eq!(dtos[1].air_time, None);
         assert_eq!(dtos[2].status, None);
         assert_eq!(dtos[2].air_days, None, "only a Series carries them");
+    }
+
+    /// `if (item is IHasDisplayOrder hasDisplayOrder) dto.DisplayOrder = …`
+    /// (`DtoService.cs:1207-1210`): a series and a collection carry it from
+    /// their `Data` blob; a blank or missing value, and every other kind, do
+    /// not.
+    #[tokio::test]
+    async fn series_and_collection_dtos_carry_their_display_order() {
+        let db = test_db().await;
+        let dvd = Uuid::new_v4();
+        let blank = Uuid::new_v4();
+        let collection = Uuid::new_v4();
+        let movie = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            dvd,
+            BaseItemKind::Series,
+            "A",
+            r#"{"DisplayOrder":"dvd"}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            blank,
+            BaseItemKind::Series,
+            "B",
+            r#"{"DisplayOrder":""}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            collection,
+            BaseItemKind::BoxSet,
+            "C",
+            r#"{"DisplayOrder":"PremiereDate"}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            movie,
+            BaseItemKind::Movie,
+            "D",
+            r#"{"DisplayOrder":"dvd"}"#,
+        )
+        .await;
+        let svc = service(db.clone());
+        let mut rows = Vec::new();
+        for id in [dvd, blank, collection, movie] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let dtos = svc
+            .get_base_item_dtos(&rows, &DtoOptions::with_all_fields(false), None, None, true)
+            .await
+            .unwrap();
+        let orders: Vec<_> = dtos
+            .iter()
+            .map(|dto| dto.display_order.as_deref())
+            .collect();
+        assert_eq!(orders, [Some("dvd"), None, Some("PremiereDate"), None]);
     }
 
     // ---- Inherited / parent images (v12 DtoService.AddInheritedImages) -------

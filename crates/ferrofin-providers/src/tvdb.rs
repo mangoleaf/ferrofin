@@ -52,6 +52,45 @@ pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
     }
 }
 
+/// The raw `DisplayOrder` a series row stores (`SeasonInfo`/`EpisodeInfo.
+/// SeriesDisplayOrder`): empty when the row has none.
+#[must_use]
+pub fn display_order_of(data: Option<&str>) -> String {
+    data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("DisplayOrder")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// The ordering `TvdbSeasonProvider.GetMetadata` looks a season up in: the
+/// series' display order, `official` when blank (`:65-74`).
+#[must_use]
+pub fn season_lookup_order(display_order: &str) -> &str {
+    if display_order.trim().is_empty() {
+        DEFAULT_SEASON_TYPE
+    } else {
+        display_order
+    }
+}
+
+/// `TvdbClientManager.GetEpisodeTvdbId`'s season-number lookup for one
+/// episode: the TVDB ordering to ask, the season and the episode number. A
+/// season-less episode is in season 1; absolute order is always season 1
+/// except for specials, which use official order; an order the client does
+/// not know is official (the plugin's `switch` is case-sensitive).
+#[must_use]
+pub fn episode_lookup(
+    display_order: &str,
+    parent_index: Option<i32>,
+    index: i32,
+) -> (&str, i32, i32) {
+    let (order, season) = episode_image_order(display_order, parent_index.unwrap_or(1));
+    (order, season, index)
+}
+
 /// How long a resolved TVDB id is reused unless configured otherwise
 /// ([`TvdbClient::with_cache_duration`], the server's
 /// `FERROFIN_TVDB_CACHE_HOURS`): the plugin's `CacheDurationInHours` default
@@ -1313,6 +1352,51 @@ fn remote_id_to_string(value: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("", Some(2), 5, "official", 2, 5)]
+    #[case("", None, 5, "official", 1, 5)]
+    #[case("official", Some(0), 3, "official", 0, 3)]
+    #[case("dvd", Some(2), 5, "dvd", 2, 5)]
+    #[case("alttwo", None, 5, "alttwo", 1, 5)]
+    #[case("regional", Some(3), 1, "regional", 3, 1)]
+    #[case("absolute", Some(4), 61, "absolute", 1, 61)]
+    #[case("absolute", None, 61, "absolute", 1, 61)]
+    #[case("absolute", Some(0), 2, "official", 0, 2)]
+    // The plugin's switch is case-sensitive: anything else is aired order.
+    #[case("Absolute", Some(4), 61, "official", 4, 61)]
+    #[case("PremiereDate", Some(2), 5, "official", 2, 5)]
+    fn episode_lookup_follows_the_plugin_switch(
+        #[case] order: &str,
+        #[case] parent: Option<i32>,
+        #[case] index: i32,
+        #[case] expected_order: &str,
+        #[case] expected_season: i32,
+        #[case] expected_index: i32,
+    ) {
+        assert_eq!(
+            super::episode_lookup(order, parent, index),
+            (expected_order, expected_season, expected_index)
+        );
+    }
+
+    #[test]
+    fn display_order_is_read_raw_and_season_lookups_default_to_official() {
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":"dvd"}"#)),
+            "dvd"
+        );
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":null}"#)),
+            ""
+        );
+        assert_eq!(super::display_order_of(Some("not json")), "");
+        assert_eq!(super::display_order_of(None), "");
+        assert_eq!(super::season_lookup_order(""), "official");
+        assert_eq!(super::season_lookup_order("  "), "official");
+        assert_eq!(super::season_lookup_order("dvd"), "dvd");
+        assert_eq!(super::season_lookup_order("Absolute"), "Absolute");
+    }
+
     use super::*;
 
     #[test]

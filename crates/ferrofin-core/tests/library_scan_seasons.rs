@@ -76,6 +76,10 @@ const TVDB_SEASON: &str = r#"{"data": {"id": 77, "translations": {"overviewTrans
     {"language": "fra", "overview": "Saison TVDB."},
     {"language": "eng", "overview": "TVDB season."}]}}}"#;
 
+/// TheTVDB's `dvd`-ordered season 1 (id 76).
+const TVDB_DVD_SEASON: &str = r#"{"data": {"id": 76, "translations": {"overviewTranslations": [
+    {"language": "eng", "overview": "TVDB dvd season."}]}}}"#;
+
 /// How the stand-in answers TheMovieDb's series search and season.
 #[derive(Clone, Copy)]
 struct Answers {
@@ -91,7 +95,7 @@ const DEFAULT_ANSWERS: Answers = Answers {
 /// The stand-in's answer to request line `line`; `None` is a 404 (a miss,
 /// not a failure).
 fn answer(line: &str, answers: Answers) -> Option<&'static str> {
-    let routes: [(&str, &str); 11] = [
+    let routes: [(&str, &str); 14] = [
         ("/tvdb/login", r#"{"data": {"token": "tok"}}"#),
         (
             "/tvdb/search",
@@ -101,6 +105,15 @@ fn answer(line: &str, answers: Answers) -> Option<&'static str> {
             "/tvdb/series/121361/episodes/official",
             r#"{"data": {"episodes": [{"id": 9001, "seasonNumber": 1, "number": 1}]}}"#,
         ),
+        (
+            "/tvdb/series/121361/episodes/dvd",
+            r#"{"data": {"episodes": [{"id": 9002, "seasonNumber": 1, "number": 1}]}}"#,
+        ),
+        (
+            "/tvdb/episodes/9002/extended",
+            r#"{"data": {"id": 9002, "name": "Dvd cut", "characters": []}}"#,
+        ),
+        ("/tvdb/seasons/76/extended", TVDB_DVD_SEASON),
         ("/tvdb/series/121361/extended", TVDB_SERIES),
         ("/tvdb/seasons/77/extended", TVDB_SEASON),
         (
@@ -468,6 +481,35 @@ async fn a_tvdb_first_season_takes_tvdbs_overview_and_tmdbs_dates_and_cast(
         drain(&log)
     );
     assert_eq!(asked(&log, "/tvdb/seasons/77/extended"), 1);
+}
+
+/// `SeasonInfo`/`EpisodeInfo.SeriesDisplayOrder`: a series whose `tvshow.nfo`
+/// says `dvd` has its season read from the `dvd` season TheTVDB lists (76),
+/// never the official one (77), and its episode looked up under
+/// `/episodes/dvd` — with no request for the official ordering.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dvd_ordered_series_is_looked_up_in_dvd_order() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), season_order(&[TVDB, TMDB])).await;
+    std::fs::write(
+        tmp.path().join("tv/Show/tvshow.nfo"),
+        "<tvshow><title>Show</title><displayorder>dvd</displayorder></tvshow>",
+    )
+    .expect("tvshow.nfo");
+    let (base, log) = spawn_providers(DEFAULT_ANSWERS);
+
+    library.scanner(&base).scan_all().await.expect("scan");
+    let season = library.season().await;
+    assert_eq!(season.overview.as_deref(), Some("TVDB dvd season."));
+    assert_eq!(
+        asked(&log, "/tvdb/seasons/76/extended"),
+        1,
+        "{:?}",
+        drain(&log)
+    );
+    assert_eq!(asked(&log, "/tvdb/seasons/77/extended"), 0);
+    assert_eq!(asked(&log, "/tvdb/series/121361/episodes/dvd"), 1);
+    assert_eq!(asked(&log, "/tvdb/series/121361/episodes/official"), 0);
 }
 
 /// TheMovieDb first, with no overview for the season: TheTVDB's translated
