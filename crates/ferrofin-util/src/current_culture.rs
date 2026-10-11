@@ -18,6 +18,9 @@ pub use search_provider::CultureComparer;
 
 thread_local! {
     static CURRENT: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The ambient UI culture (`CultureInfo.CurrentUICulture`), set beside the
+    /// culture by the request localization and inherited by spawned work.
+    static CURRENT_UI: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Invalid culture names and unavailable ICU collation data.
@@ -294,10 +297,34 @@ fn base_parent(locale: &Locale) -> Option<String> {
         .map(|(parent, _)| parent.to_owned())
 }
 
+/// The ambient UI culture (`CultureInfo.CurrentUICulture`) of the current
+/// asynchronous context — the one a request, or the work it started, runs
+/// under — or `None` outside any request: there the UI culture is the server's
+/// configured one, not a value of this context.
+#[must_use]
+pub fn ambient_ui_culture() -> Option<String> {
+    CURRENT_UI.with(|current| current.borrow().clone())
+}
+
 /// Polls a future under a captured culture, including after thread migration.
+///
+/// The ambient UI culture is the one of the caller that creates the scope, so
+/// work spawned from a request keeps that request's UI culture as it keeps its
+/// culture.
 pub fn scope<F: Future>(culture: String, future: F) -> CultureFuture<F> {
+    scope_with_ui(culture, ambient_ui_culture(), future)
+}
+
+/// [`scope`] with an explicit UI culture (`None`: no ambient UI culture), as the
+/// request localization sets both `CurrentCulture` and `CurrentUICulture`.
+pub fn scope_with_ui<F: Future>(
+    culture: String,
+    ui_culture: Option<String>,
+    future: F,
+) -> CultureFuture<F> {
     CultureFuture {
         culture,
+        ui_culture,
         future: Box::pin(future),
     }
 }
@@ -305,13 +332,15 @@ pub fn scope<F: Future>(culture: String, future: F) -> CultureFuture<F> {
 /// A future carrying the culture of the caller that started its work.
 pub struct CultureFuture<F> {
     culture: String,
+    ui_culture: Option<String>,
     future: Pin<Box<F>>,
 }
 
-struct Restore(Option<String>);
+struct Restore(Option<String>, Option<String>);
 impl Drop for Restore {
     fn drop(&mut self) {
         CURRENT.with(|current| *current.borrow_mut() = self.0.take());
+        CURRENT_UI.with(|current| *current.borrow_mut() = self.1.take());
     }
 }
 
@@ -320,7 +349,8 @@ impl<F: Future> Future for CultureFuture<F> {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let previous = CURRENT.with(|current| current.replace(Some(this.culture.clone())));
-        let _restore = Restore(previous);
+        let previous_ui = CURRENT_UI.with(|current| current.replace(this.ui_culture.clone()));
+        let _restore = Restore(previous, previous_ui);
         this.future.as_mut().poll(context)
     }
 }
@@ -383,6 +413,32 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// The UI culture travels with the culture: a request sets both, work
+    /// started inside it keeps the request's, an inner scope without its own
+    /// inherits, and nothing leaks out of the future.
+    #[test]
+    fn the_ambient_ui_culture_follows_the_scope_that_set_it() {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert_eq!(ambient_ui_culture(), None);
+        let mut future = Box::pin(scope_with_ui("sv-SE".into(), Some("fr-FR".into()), async {
+            assert_eq!(capture(), "sv-SE");
+            assert_eq!(ambient_ui_culture().as_deref(), Some("fr-FR"));
+            // Spawned-style work captured here inherits both.
+            let inherited = scope(capture(), async { ambient_ui_culture() }).await;
+            assert_eq!(inherited.as_deref(), Some("fr-FR"));
+            // An inner scope may set its own.
+            let inner = scope_with_ui("de".into(), Some("de-DE".into()), async {
+                ambient_ui_culture()
+            })
+            .await;
+            assert_eq!(inner.as_deref(), Some("de-DE"));
+            assert_eq!(ambient_ui_culture().as_deref(), Some("fr-FR"));
+        }));
+        assert!(future.as_mut().poll(&mut context).is_ready());
+        assert_eq!(ambient_ui_culture(), None);
     }
 
     #[test]

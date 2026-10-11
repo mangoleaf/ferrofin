@@ -203,7 +203,9 @@ pub(crate) async fn request_culture_layer(
     next: Next,
 ) -> Response {
     let (culture, ui) = options.select(request.uri(), request.headers());
-    let mut response = current_culture::scope(culture, next.run(request)).await;
+    // Both `CurrentCulture` and `CurrentUICulture`, as `UseRequestLocalization`.
+    let mut response =
+        current_culture::scope_with_ui(culture, Some(ui.clone()), next.run(request)).await;
     // Startup sets ApplyCurrentCultureToResponseHeaders alongside these options.
     if let Ok(ui) = ui.parse() {
         response

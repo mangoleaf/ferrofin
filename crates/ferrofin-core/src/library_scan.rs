@@ -11471,12 +11471,12 @@ impl LibraryScanner {
             fallback = crate::localization_manager::LocalizationManager::new("");
             &fallback
         };
-        let name = localization.get_localized_string(&key);
+        let name = localization.get_server_localized_string(&key);
         if count == 1 {
             name
         } else {
             localization
-                .get_localized_string("NameExtraNumbered")
+                .get_server_localized_string("NameExtraNumbered")
                 .replace("{0}", &name)
                 .replace("{1}", &count.to_string())
         }

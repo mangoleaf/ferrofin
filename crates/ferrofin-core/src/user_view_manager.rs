@@ -262,7 +262,7 @@ impl FerrofinUserViewManager {
         };
         let name = self.localization.as_ref().map_or_else(
             || "Folders".to_owned(),
-            |localization| localization.get_localized_string("Folders"),
+            |localization| localization.get_server_localized_string("Folders"),
         );
         let mut previous = self.items.retrieve_item(id).await?;
         if let Some(row) = &mut previous

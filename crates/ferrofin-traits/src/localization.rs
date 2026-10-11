@@ -43,6 +43,12 @@ pub trait LocalizationManager: Send + Sync {
     /// and then to the phrase itself (C# `GetLocalizedString(phrase)`).
     fn get_localized_string(&self, phrase: &str) -> String;
 
+    /// A phrase localized in the *configured* server UI culture regardless of
+    /// the ambient request culture (C# `GetServerLocalizedString`): library view,
+    /// collection and extra names. [`Self::get_localized_string`] instead follows
+    /// the ambient UI culture (C# `CultureInfo.CurrentUICulture`).
+    fn get_server_localized_string(&self, phrase: &str) -> String;
+
     /// A phrase localized in `culture` (empty ⇒ the server UI culture), with
     /// the same fallbacks (C# `GetLocalizedString(phrase, culture)`).
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String;

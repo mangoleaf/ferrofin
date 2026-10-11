@@ -283,11 +283,22 @@ impl LocalizationManager {
         self
     }
 
-    /// Port of `GetLocalizedString(phrase)` / `GetServerLocalizedString`: the
-    /// phrase in the server's UI culture, falling back to `en-US`, then to the
-    /// phrase key itself.
+    /// Port of `GetLocalizedString(phrase)`: the phrase in the *ambient* UI
+    /// culture (`CultureInfo.CurrentUICulture` — the request's, or that of the
+    /// work a request started), falling back to `en-US`, then to the phrase key
+    /// itself. Outside any request there is no ambient culture, and the lookup
+    /// uses the configured server culture like an empty `CurrentUICulture.Name`.
     #[must_use]
     pub fn get_localized_string(&self, phrase: &str) -> String {
+        let ambient = ferrofin_util::current_culture::ambient_ui_culture().unwrap_or_default();
+        self.get_localized_string_for(phrase, &ambient)
+    }
+
+    /// Port of `GetServerLocalizedString(phrase)`: the phrase in the configured
+    /// server UI culture, whatever culture the calling request or worker runs
+    /// under (library view, collection and extra names).
+    #[must_use]
+    pub fn get_server_localized_string(&self, phrase: &str) -> String {
         self.get_localized_string_for(phrase, &(self.ui_culture)())
     }
 
@@ -788,6 +799,10 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
         LocalizationManager::get_localized_string(self, phrase)
     }
 
+    fn get_server_localized_string(&self, phrase: &str) -> String {
+        LocalizationManager::get_server_localized_string(self, phrase)
+    }
+
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String {
         LocalizationManager::get_localized_string_for(self, phrase, culture)
     }
@@ -822,6 +837,37 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// `GetLocalizedString(phrase)` reads the ambient `CurrentUICulture`;
+    /// `GetServerLocalizedString` the configured `UICulture`. A request in French
+    /// on a German-configured server sees French stream labels but German
+    /// library-view names, work it spawns keeps both, and outside any request
+    /// the ambient lookup is the configured culture.
+    #[tokio::test]
+    async fn ambient_and_server_localized_strings_use_their_own_cultures() {
+        use ferrofin_util::current_culture::{scope, scope_with_ui};
+        let server = LocalizationManager::default().with_ui_culture("de");
+        assert_eq!(server.get_localized_string("Default"), "Standard");
+        let request = scope_with_ui("fr".into(), Some("fr".into()), async {
+            let spawned = scope(ferrofin_util::current_culture::capture(), async {
+                (
+                    server.get_localized_string("Default"),
+                    server.get_server_localized_string("Default"),
+                )
+            })
+            .await;
+            (
+                server.get_localized_string("Default"),
+                server.get_server_localized_string("Default"),
+                spawned,
+            )
+        })
+        .await;
+        assert_eq!(request.0, "Par défaut");
+        assert_eq!(request.1, "Standard");
+        assert_eq!(request.2, ("Par défaut".to_owned(), "Standard".to_owned()));
+        assert_eq!(server.get_localized_string("Default"), "Standard");
+    }
 
     /// `GetLocalizedString`: the server UI culture, BCP-47 → resource mapping,
     /// case-insensitive phrase keys, en-US fallback, then the phrase itself.

@@ -2173,6 +2173,9 @@ impl LocalizationManager for FakeLocalization {
     fn get_localized_string(&self, phrase: &str) -> String {
         phrase.to_owned()
     }
+    fn get_server_localized_string(&self, phrase: &str) -> String {
+        phrase.to_owned()
+    }
     fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
         phrase.to_owned()
     }

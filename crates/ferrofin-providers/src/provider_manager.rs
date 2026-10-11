@@ -9340,6 +9340,9 @@ mod tests {
         fn get_localized_string(&self, _phrase: &str) -> String {
             unimplemented!()
         }
+        fn get_server_localized_string(&self, _phrase: &str) -> String {
+            unimplemented!()
+        }
         fn get_localized_string_for(&self, _phrase: &str, _culture: &str) -> String {
             unimplemented!()
         }
