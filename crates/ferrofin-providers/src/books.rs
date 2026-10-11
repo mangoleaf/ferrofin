@@ -692,16 +692,39 @@ fn parse_opf_date(value: &str) -> Option<OpfDate> {
     })
 }
 
+/// Whether the Comic Book Archive Cover Extractor handles `path` — a comic
+/// archive extension (`ComicImageProvider.GetImage`'s test), whether or not
+/// this port can open that archive type.
+#[must_use]
+pub fn is_comic_path(path: &str) -> bool {
+    COMIC_EXTENSIONS.contains(&extension_of(path).as_str())
+}
+
+/// Whether the EPUB cover extractor handles `path` (`EpubImageProvider.GetImage`
+/// tests for `.epub`).
+#[must_use]
+pub fn is_epub_path(path: &str) -> bool {
+    extension_of(path) == "epub"
+}
+
 /// The cover image bytes for a book, or `None` when none can be extracted.
 ///
 /// A comic's cover is its first page (`ComicImageProvider`); an EPUB's is the
 /// image its OPF declares as the cover (`EpubImageProvider`).
 #[must_use]
 pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
-    let extension = extension_of(path);
-    if extension == "epub" {
+    if is_epub_path(path) {
         return read_epub_cover(path);
     }
+    read_comic_cover(path)
+}
+
+/// A comic archive's cover: an entry named `cover.<ext>`, else its first page
+/// in name order (`ComicImageProvider`). `None` for an archive type this port
+/// cannot open (see [`READABLE_ARCHIVE_EXTENSIONS`]) or one with no image.
+#[must_use]
+pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
+    let extension = extension_of(path);
     if !READABLE_ARCHIVE_EXTENSIONS.contains(&extension.as_str()) {
         return None;
     }
@@ -735,8 +758,9 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
     Some((first, bytes))
 }
 
-/// The EPUB's declared cover image.
-fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
+/// The EPUB's declared cover image (`EpubImageProvider`).
+#[must_use]
+pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     let opf_path = read_epub_content_path(path)?;
     let opf = read_archive_entry_text(path, &opf_path.to_lowercase())?;
     // C# `ReadCoverPath` probes in order: a manifest item with

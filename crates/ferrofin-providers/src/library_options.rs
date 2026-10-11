@@ -319,8 +319,11 @@ pub mod fetcher_names {
 
     /// Comic archive comments and ComicInfo XML local reader.
     pub const COMIC: &str = "Comic Provider";
-    /// Embedded EPUB OPF metadata reader.
+    /// Embedded EPUB OPF metadata reader — and, under the same name, the EPUB
+    /// cover extractor (`EpubImageProvider.Name`).
     pub const EPUB: &str = "EPUB Metadata";
+    /// The comic archive cover extractor (`ComicImageProvider.Name`).
+    pub const COMIC_COVERS: &str = "Comic Book Archive Cover Extractor";
     /// Sidecar OPF metadata reader.
     pub const OPF: &str = "Open Packaging Format";
 
@@ -342,6 +345,7 @@ pub mod fetcher_names {
         AUDIO_IMAGES,
         SCREEN_GRABBER,
         COMIC,
+        COMIC_COVERS,
         EPUB,
         OPF,
     ];
@@ -555,13 +559,32 @@ fn local_providers() -> Vec<Provider> {
         ]
         .map(|name| Provider {
             name,
-            caps: &[Cap::LocalMetadata],
+            // The EPUB reader is also the EPUB cover extractor under one name
+            // (`EpubProvider` and `EpubImageProvider` both say "EPUB Metadata"),
+            // so its checkbox gates both.
+            caps: if name == fetcher_names::EPUB {
+                &[Cap::LocalMetadata, Cap::ImageFetcher]
+            } else {
+                &[Cap::LocalMetadata]
+            },
             types: &["Book"],
             default_enabled: true,
             compiled: true,
-            images: NO_IMAGES,
+            images: if name == fetcher_names::EPUB {
+                Some(book_cover_images)
+            } else {
+                NO_IMAGES
+            },
         }),
     );
+    providers.push(Provider {
+        name: fetcher_names::COMIC_COVERS,
+        caps: &[Cap::ImageFetcher],
+        types: &["Book"],
+        default_enabled: true,
+        compiled: true,
+        images: Some(book_cover_images),
+    });
     providers
 }
 
@@ -794,6 +817,12 @@ fn embedded_images(type_name: &str) -> &'static [ImageType] {
 /// provider — the same values [`crate::provider_manager`] already keeps for the
 /// remote-image search path.
 fn omdb_images(_type_name: &str) -> &'static [ImageType] {
+    &[ImageType::Primary]
+}
+
+/// The book cover extractors' `GetSupportedImages` (`ComicImageProvider` and
+/// `EpubImageProvider`: `Primary`).
+fn book_cover_images(_type_name: &str) -> &'static [ImageType] {
     &[ImageType::Primary]
 }
 

@@ -9794,6 +9794,7 @@ impl LibraryScanner {
             Plugin,
             Remote,
             Embedded,
+            BookCover,
         }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let extractor = if matches!(
@@ -9829,6 +9830,16 @@ impl LibraryScanner {
         }
         if dynamic_images && policy.image_enabled(short, extractor) {
             sources.push((extractor, Step::Embedded));
+        }
+        // A book's two cover extractors (`ComicImageProvider`,
+        // `EpubImageProvider`): dynamic providers like the embedded extractor,
+        // each behind its own checkbox and place in the image order.
+        if dynamic_images && short == "Book" {
+            for name in [fetcher_names::COMIC_COVERS, fetcher_names::EPUB] {
+                if policy.image_enabled(short, name) {
+                    sources.push((name, Step::BookCover));
+                }
+            }
         }
         sources.sort_by_key(|(name, _)| policy.image_order(short, name));
         for (name, source) in sources {
@@ -9874,6 +9885,9 @@ impl LibraryScanner {
                     );
                 }
                 Step::Embedded => {}
+                Step::BookCover => {
+                    self.add_book_cover(entity, name, policy, images).await;
+                }
             }
         }
     }
@@ -12297,29 +12311,29 @@ impl LibraryScanner {
         locked: bool,
         policy: FetcherPolicy<'_>,
     ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>, bool) {
-        let mut images = self.enrich_photo(entity, locked).await;
-        let (people, book_images, book_found) = self.enrich_book(entity, locked, policy).await;
-        images.extend(book_images);
+        let images = self.enrich_photo(entity, locked).await;
+        let (people, book_found) = self.enrich_book(entity, locked, policy).await;
         (people, images, book_found)
     }
 
     /// The book embedded-metadata pass — port of `ComicProvider`,
-    /// `ComicBookInfoProvider`, `EpubProvider` and `OpfProvider`, plus the two
-    /// cover extractors.
+    /// `ComicBookInfoProvider`, `EpubProvider` and `OpfProvider`.
     ///
     /// Fills only what the row still lacks, like every other local reader, and
-    /// returns the cast (writer/penciller/…) plus the cover image to persist.
+    /// returns the cast (writer/penciller/…). The covers are the two dynamic
+    /// image providers' job, in the ordered artwork pass
+    /// ([`extract_book_cover`](Self::extract_book_cover)).
     async fn enrich_book(
         &self,
         entity: &mut BaseItemEntity,
         locked: bool,
         policy: FetcherPolicy<'_>,
-    ) -> (Vec<PeopleEntity>, Vec<ItemImageInfo>, bool) {
+    ) -> (Vec<PeopleEntity>, bool) {
         if !entity.type_.ends_with(".Book") || locked {
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), false);
         }
         let Some(path) = entity.path.clone().filter(|p| !p.is_empty()) else {
-            return (Vec::new(), Vec::new(), false);
+            return (Vec::new(), false);
         };
         let read = {
             let path = path.clone();
@@ -12339,24 +12353,49 @@ impl LibraryScanner {
             }
             None => (Vec::new(), false),
         };
-        let images = if ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(
-            policy.options,
-            "Book",
-        )
-        .limit(ImageType::Primary)
-            > 0
-        {
-            self.extract_book_cover(entity, &path).await
-        } else {
-            Vec::new()
-        };
-        (people, images, found)
+        (people, found)
     }
 
-    /// Writes a book's embedded cover into its metadata art directory and
-    /// returns the image row — the shape `download_images` produces for a
-    /// remote fetch, so the artwork pass treats both the same.
-    async fn extract_book_cover(&self, entity: &BaseItemEntity, path: &str) -> Vec<ItemImageInfo> {
+    /// A book cover extractor's turn in the artwork pass: it fills a missing
+    /// Primary when the library's Primary limit allows one.
+    async fn add_book_cover(
+        &self,
+        entity: &BaseItemEntity,
+        provider: &str,
+        policy: FetcherPolicy<'_>,
+        images: &mut Vec<ItemImageInfo>,
+    ) {
+        let limit =
+            ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, "Book")
+                .limit(ImageType::Primary);
+        if limit > 0 && !images.iter().any(|i| i.image_type == ImageType::Primary) {
+            images.extend(self.extract_book_cover(entity, provider).await);
+        }
+    }
+
+    /// One of the two book cover extractors — `provider` is the checkbox name,
+    /// [`COMIC_COVERS`](fetcher_names::COMIC_COVERS) (a comic archive's cover
+    /// entry, else its first page) or [`EPUB`](fetcher_names::EPUB) (the cover
+    /// its OPF declares), each only for its own file type. Writes the cover
+    /// into the book's metadata art directory and returns the image row — the
+    /// shape `download_images` produces for a remote fetch, so the artwork pass
+    /// treats both the same. A stored extraction is reused.
+    async fn extract_book_cover(
+        &self,
+        entity: &BaseItemEntity,
+        provider: &str,
+    ) -> Vec<ItemImageInfo> {
+        let Some(path) = entity.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Vec::new();
+        };
+        let handles = if provider == fetcher_names::EPUB {
+            ferrofin_providers::books::is_epub_path(path)
+        } else {
+            ferrofin_providers::books::is_comic_path(path)
+        };
+        if !handles {
+            return Vec::new();
+        }
         let Some(meta_root) = &self.metadata_dir else {
             return Vec::new();
         };
@@ -12374,8 +12413,14 @@ impl LibraryScanner {
         // Inflating a comic archive can run to hundreds of megabytes; that is
         // blocking work and must not sit on an async worker thread.
         let owned = path.to_owned();
-        let cover =
-            tokio::task::spawn_blocking(move || ferrofin_providers::read_book_cover(&owned)).await;
+        let cover = tokio::task::spawn_blocking(move || {
+            if ferrofin_providers::books::is_epub_path(&owned) {
+                ferrofin_providers::books::read_epub_cover(&owned)
+            } else {
+                ferrofin_providers::books::read_comic_cover(&owned)
+            }
+        })
+        .await;
         let Some((name, bytes)) = cover.ok().flatten() else {
             return Vec::new();
         };
@@ -28074,6 +28119,7 @@ mod tests {
         let options = LibraryOptions {
             type_options: vec![ferrofin_model::configuration::TypeOptions {
                 type_: Some("Book".to_owned()),
+                image_fetchers: vec!["Comic Book Archive Cover Extractor".to_owned()],
                 image_options: vec![ferrofin_model::configuration::ImageOption {
                     type_: ferrofin_model::entities::ImageType::Primary,
                     limit,
@@ -28083,20 +28129,27 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut row = BaseItemEntity {
+        let row = BaseItemEntity {
             id: SERIES.to_owned(),
             type_: "MediaBrowser.Controller.Entities.Book".to_owned(),
             path: Some(book.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let (_, images, _) = scanner
-            .enrich_from_file(
-                &mut row,
-                false,
+        let mut images = Vec::new();
+        let mut cache = super::ArtworkCache::default();
+        scanner
+            .run_ordered_artwork(
+                Uuid::parse_str(SERIES).unwrap(),
+                &row,
+                &[],
                 super::FetcherPolicy {
                     options: Some(&options),
                     ..Default::default()
                 },
+                super::ImageFetch::MissingOnly,
+                true,
+                &mut images,
+                &mut cache,
             )
             .await;
         assert_eq!(images.len(), usize::try_from(limit).unwrap());
@@ -28105,6 +28158,70 @@ mod tests {
         if limit > 0 {
             assert_eq!(std::fs::read(dest).unwrap(), b"cover");
         }
+    }
+
+    /// The two cover extractors are image providers in their own right: a
+    /// comic's cover needs "Comic Book Archive Cover Extractor" ticked for
+    /// books ("EPUB Metadata" alone does not extract a `.cbz` cover), an EPUB's
+    /// needs "EPUB Metadata", and with neither nothing is extracted — all in the
+    /// artwork pass, so an image-only refresh runs them with no metadata read.
+    #[rstest::rstest]
+    #[case::comic_extractor_on("Comic.cbz", &["Comic Book Archive Cover Extractor"], true)]
+    #[case::epub_checkbox_does_not_cover_a_comic("Comic.cbz", &["EPUB Metadata"], false)]
+    #[case::none("Comic.cbz", &[], false)]
+    #[tokio::test]
+    async fn book_covers_follow_their_own_image_fetcher_checkbox(
+        #[case] file: &str,
+        #[case] fetchers: &[&str],
+        #[case] extracted: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let book = tmp.path().join(file);
+        std::fs::write(
+            &book,
+            [
+                80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 197, 134, 8, 141, 5, 0, 0, 0, 5, 0,
+                0, 0, 9, 0, 0, 0, 99, 111, 118, 101, 114, 46, 106, 112, 103, 99, 111, 118, 101,
+                114, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 0, 0, 0, 0, 33, 0, 197, 134, 8, 141, 5, 0,
+                0, 0, 5, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 99, 111,
+                118, 101, 114, 46, 106, 112, 103, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 55, 0, 0,
+                0, 44, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let (scanner, _) = artwork_fixture("http://127.0.0.1:1", tmp.path(), &[], false).await;
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Book".to_owned()),
+                image_fetchers: fetchers.iter().map(|name| (*name).to_owned()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let row = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Book".to_owned(),
+            path: Some(book.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        let mut cache = super::ArtworkCache::default();
+        scanner
+            .run_ordered_artwork(
+                Uuid::parse_str(SERIES).unwrap(),
+                &row,
+                &[],
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    ..Default::default()
+                },
+                super::ImageFetch::MissingOnly,
+                true,
+                &mut images,
+                &mut cache,
+            )
+            .await;
+        assert_eq!(images.len(), usize::from(extracted), "{fetchers:?}");
     }
 
     /// A book's embedded metadata (here a `.cbz`'s `<stem>.xml` ComicInfo
