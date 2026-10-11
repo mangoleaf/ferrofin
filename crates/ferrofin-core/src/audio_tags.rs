@@ -19,6 +19,14 @@ pub(super) struct AudioTagValues {
     pub(super) album_artists: Vec<String>,
     pub(super) genres: Vec<String>,
     pub(super) provider_ids: Vec<(String, String)>,
+    /// The album artists exactly as the tags name them (custom-split, with no
+    /// fallback to the performers): the people the prober credits, which
+    /// `PeopleHelper.AddPerson` trims and de-duplicates.
+    pub(super) credit_album_artists: Vec<String>,
+    /// The performers as the tags name them, likewise.
+    pub(super) credit_performers: Vec<String>,
+    /// The `COMPOSER` tag's values (split on the internal separator only).
+    pub(super) composers: Vec<String>,
 }
 
 /// Interprets unsplit embedded tags using the library's current settings.
@@ -40,6 +48,9 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
+            credit_album_artists: info.album_artists.clone(),
+            credit_performers: info.artists.clone(),
+            composers: Vec::new(),
         };
     };
     let prefer_nonstandard = options.is_some_and(|o| o.prefer_nonstandard_artists_tag);
@@ -73,6 +84,15 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
         &["albumartist", "album artist", "album_artist"],
         &["albumartists", "track.albumartists"],
     );
+    let credit_album_artists = album_artists.clone();
+    let credit_performers = artists.clone();
+    let composers: Vec<String> = read_tag(raw, &["composer"], path)
+        .map(|tag| {
+            tag.split(INTERNAL_VALUE_SEPARATOR)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     // Upstream applies this fallback after custom splitting, before dropping
     // blank names for storage. An explicit blank multivalue is not absence.
     let album_artists = if album_artists.is_empty() {
@@ -133,7 +153,68 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
         album_artists: distinct_case(album_artists),
         genres,
         provider_ids: provider_ids.into_iter().collect(),
+        credit_album_artists,
+        credit_performers,
+        composers,
     }
+}
+
+/// The people `AudioFileProber.FetchDataFromTags` credits an audio item with
+/// (`Name`, `PersonKind`), in upstream's order, before
+/// `PeopleHelper.AddPerson` trims and de-duplicates them.
+///
+/// A music track credits its album artists, performers and composers. An
+/// audiobook credits its authors (the album artists, else the performers), then
+/// the composers as narrators, then the performers who are not authors as cast.
+pub(super) fn credits(tags: &AudioTagValues, audiobook: bool) -> Vec<(String, &'static str)> {
+    let named = |name: &String| (!name.trim().is_empty()).then(|| name.trim().to_owned());
+    let mut people: Vec<(String, &'static str)> = Vec::new();
+    if audiobook {
+        let source = if tags.credit_album_artists.is_empty() {
+            &tags.credit_performers
+        } else {
+            &tags.credit_album_artists
+        };
+        let authors: HashSet<String> = source
+            .iter()
+            .filter_map(named)
+            .map(|name| upper_invariant(&name))
+            .collect();
+        people.extend(source.iter().filter_map(named).map(|name| (name, "Author")));
+        people.extend(
+            tags.composers
+                .iter()
+                .filter_map(named)
+                .map(|name| (name, "Narrator")),
+        );
+        people.extend(
+            tags.credit_performers
+                .iter()
+                .filter_map(named)
+                .filter(|name| !authors.contains(&upper_invariant(name)))
+                .map(|name| (name, "Actor")),
+        );
+    } else {
+        people.extend(
+            tags.credit_album_artists
+                .iter()
+                .filter_map(named)
+                .map(|name| (name, "AlbumArtist")),
+        );
+        people.extend(
+            tags.credit_performers
+                .iter()
+                .filter_map(named)
+                .map(|name| (name, "Artist")),
+        );
+        people.extend(
+            tags.composers
+                .iter()
+                .filter_map(named)
+                .map(|name| (name, "Composer")),
+        );
+    }
+    people
 }
 
 /// First present tag, sanitized as `AudioFileProber.GetSanitizedStringTag`.
@@ -299,6 +380,67 @@ mod tests {
             ),
             ..Default::default()
         }
+    }
+
+    /// `FetchDataFromTags`' people for a track: album artists, then performers,
+    /// then composers; blank names dropped; no fallback of album artists to the
+    /// performers (that fallback is only for the stored `AlbumArtists`).
+    #[test]
+    fn a_track_credits_album_artists_performers_and_composers() {
+        let sep = '\u{1f}';
+        let probed = info(&[
+            ("artist", &format!("Lead{sep} {sep}Guest")),
+            ("albumartist", &format!("The Band{sep}Lead")),
+            ("composer", &format!("Bach{sep}")),
+        ]);
+        let tags = for_library(&probed, None);
+        assert_eq!(
+            credits(&tags, false),
+            [
+                ("The Band".to_owned(), "AlbumArtist"),
+                ("Lead".to_owned(), "AlbumArtist"),
+                ("Lead".to_owned(), "Artist"),
+                ("Guest".to_owned(), "Artist"),
+                ("Bach".to_owned(), "Composer"),
+            ]
+        );
+        // The stored album artists still fall back to the performers.
+        let tags = for_library(&info_without_album_artist(), None);
+        assert_eq!(tags.album_artists, ["Solo"]);
+        assert_eq!(credits(&tags, false), [("Solo".to_owned(), "Artist")]);
+        // No tags, no credits.
+        assert!(credits(&for_library(&info(&[]), None), false).is_empty());
+    }
+
+    fn info_without_album_artist() -> MediaInfo {
+        info(&[("artist", "Solo")])
+    }
+
+    /// An audiobook credits its authors (album artists, else performers), the
+    /// composers as narrators, and the performers who are not authors as cast.
+    #[test]
+    fn an_audiobook_credits_authors_narrators_and_cast() {
+        let sep = '\u{1f}';
+        let tags = for_library(
+            &info(&[
+                ("albumartist", "Ann Author"),
+                ("artist", &format!("ann author{sep}Cara Cast")),
+                ("composer", &format!("Nate Narrator{sep}Nina Narrator")),
+            ]),
+            None,
+        );
+        assert_eq!(
+            credits(&tags, true),
+            [
+                ("Ann Author".to_owned(), "Author"),
+                ("Nate Narrator".to_owned(), "Narrator"),
+                ("Nina Narrator".to_owned(), "Narrator"),
+                ("Cara Cast".to_owned(), "Actor"),
+            ]
+        );
+        // With no album artist the performers are the authors, and nobody is cast.
+        let tags = for_library(&info(&[("artist", "Solo Author")]), None);
+        assert_eq!(credits(&tags, true), [("Solo Author".to_owned(), "Author")]);
     }
 
     #[test]

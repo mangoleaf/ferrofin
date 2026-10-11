@@ -5447,6 +5447,10 @@ impl LibraryScanner {
                 merge.keep_existing,
             )
         };
+        // The audio prober runs before the providers and replaces the credits
+        // with the tags' (`FetchDataFromTags`, only for an unlocked item): they
+        // stand unless a provider's answer replaces them in turn.
+        let credits = credits.or_else(|| rows.people.clone().filter(|_| !locked));
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
         let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
@@ -7665,6 +7669,7 @@ impl LibraryScanner {
         } else {
             Vec::new()
         };
+        let people = media_is_audio.then(|| audio_credits(entity, probed, policy.options));
         let allowed = policy
             .options
             .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
@@ -7713,6 +7718,7 @@ impl LibraryScanner {
             chapters,
             attachments,
             provider_ids,
+            people,
             save_attachments: !media_is_audio,
         }
     }
@@ -15179,6 +15185,10 @@ struct ProbeRows {
     attachments: Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>,
     /// Provider ids read from embedded audio tags.
     provider_ids: Vec<(String, String)>,
+    /// The people the audio prober credits from the tags (`UpdatePeople`):
+    /// `Some` for a probed audio item, even when it names nobody (an empty
+    /// credit list replaces the stored one); `None` otherwise.
+    people: Option<Vec<PeopleEntity>>,
     /// Whether the attachment rows are authoritative: a probe ran and the item
     /// is a video (`false` — no probe, or an audio file — leaves stored rows alone).
     save_attachments: bool,
@@ -15574,6 +15584,32 @@ fn apply_tmdb_episode(entity: &mut BaseItemEntity, d: &ferrofin_providers::tmdb:
     if entity.community_rating.is_none() {
         entity.community_rating = d.vote_average.map(f64::from);
     }
+}
+
+/// The credits `AudioFileProber.FetchDataFromTags` writes with
+/// `UpdatePeople` for a probed audio item: album artists, performers and
+/// composers of a track, or an audiobook's authors, narrators and cast. Rows
+/// carry no id, role or sort order, as upstream's `PersonInfo` here carries
+/// none; `update_people` trims and de-duplicates them like `AddPerson`.
+fn audio_credits(
+    entity: &BaseItemEntity,
+    info: &MediaInfo,
+    options: Option<&LibraryOptionsModel>,
+) -> Vec<PeopleEntity> {
+    let tags = crate::audio_tags::for_library(info, options);
+    let audiobook = entity.type_.ends_with("AudioBook");
+    crate::audio_tags::credits(&tags, audiobook)
+        .into_iter()
+        .map(|(name, kind)| PeopleEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            name,
+            person_type: Some(kind.to_owned()),
+            role: None,
+            primary_image_url: None,
+            provider_id: None,
+            sort_order: None,
+        })
+        .collect()
 }
 
 /// Applies embedded audio-tag metadata to a music row (fill-if-empty, so an NFO
