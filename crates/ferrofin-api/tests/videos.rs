@@ -39,6 +39,10 @@ use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
+/// A stacked movie: the first part of three.
+const STACKED_ID: Uuid = Uuid::from_u128(0x00A1_0002);
+/// [`STACKED_ID`]'s other parts.
+const PART_IDS: [Uuid; 2] = [Uuid::from_u128(0x00A1_0003), Uuid::from_u128(0x00A1_0004)];
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
@@ -334,8 +338,11 @@ impl LibraryManager for StreamLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID || id == Uuid::from_u128(0x00A1_0002))
-            .then(|| minimal_base_item(id, "A Movie", "Movie")))
+        Ok(match id {
+            ITEM_ID => Some(minimal_base_item(ITEM_ID, "A Movie", "Movie")),
+            STACKED_ID => Some(minimal_base_item(STACKED_ID, "Heist", "Movie")),
+            _ => None,
+        })
     }
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
         self.merged.lock().unwrap().push(ids.to_vec());
@@ -344,6 +351,23 @@ impl LibraryManager for StreamLibrary {
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.removed.lock().unwrap().push(item_id);
         Ok(())
+    }
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // ITEM_ID is a lone movie; STACKED_ID a stack of three parts, asked
+        // for as the requesting user.
+        assert_eq!(user.map(|u| u.username.as_str()), Some("alice"));
+        if video.id == STACKED_ID.to_string() {
+            Ok(vec![
+                minimal_base_item(PART_IDS[0], "Heist cd2", "Video"),
+                minimal_base_item(PART_IDS[1], "Heist cd3", "Video"),
+            ])
+        } else {
+            Ok(Vec::new())
+        }
     }
     async fn query_items(
         &self,
@@ -509,7 +533,12 @@ struct Harness {
 
 /// The ordinary-user harness.
 fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, false)
+    state_with(
+        path,
+        subtitles,
+        false,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
 /// The elevated harness, for the video routes that are `RequiresElevation`
@@ -517,12 +546,22 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
 /// `DELETE /Videos/{itemId}/AlternateSources`, and
 /// `DELETE /Videos/{itemId}/Subtitles/{index}`.
 fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, true)
+    state_with(
+        path,
+        subtitles,
+        true,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
 /// Builds a [`Harness`] serving `path` for streams and using `subtitles` for the
 /// subtitle routes.
-fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -> Harness {
+fn state_with(
+    path: &str,
+    subtitles: Arc<dyn SubtitleManager>,
+    elevated: bool,
+    dto: Arc<dyn ferrofin_traits::dto::DtoService>,
+) -> Harness {
     let merged = Arc::new(Mutex::new(Vec::new()));
     let removed = Arc::new(Mutex::new(Vec::new()));
     let bulk = Arc::new(Mutex::new(Vec::new()));
@@ -546,7 +585,7 @@ fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(ferrofin_api::test_support::FakeDto),
+        dto,
         Arc::new(OkAuth { elevated }),
         Arc::new(OkAuth { elevated }),
         Arc::new(FakeQuickConnect),
@@ -752,7 +791,7 @@ async fn merge_versions_merges_two_ids() {
     let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
-    let other = Uuid::from_u128(0x00A1_0002);
+    let other = STACKED_ID;
     let resp = router
         .oneshot(authed(
             "POST",
@@ -845,6 +884,98 @@ async fn additional_parts_empty_for_known_item() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["Items"].as_array().map(Vec::len), Some(0));
     assert_eq!(json["TotalRecordCount"].as_i64(), Some(0));
+}
+
+/// A [`DtoService`](ferrofin_traits::dto::DtoService) projecting each row to
+/// its id and name, and recording the owner it was given.
+struct PartsDto {
+    owners: Arc<Mutex<Vec<Option<Uuid>>>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::dto::DtoService for PartsDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
+        self.owners.lock().unwrap().push(owner_id);
+        Ok(items
+            .iter()
+            .map(|i| ferrofin_model::dto::BaseItemDto {
+                id: Uuid::parse_str(&i.id).unwrap(),
+                name: i.name.clone(),
+                ..Default::default()
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// Port of `VideosController.GetAdditionalPart`: a stacked video's other
+/// parts, in the order the library returns them, projected with the video as
+/// their owner, counted as a `QueryResult`.
+#[tokio::test]
+async fn additional_parts_of_a_stack_are_its_other_parts() {
+    let (_dir, path) = temp_media();
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let app = state_with(
+        &path,
+        no_subtitles(),
+        false,
+        Arc::new(PartsDto {
+            owners: owners.clone(),
+        }),
+    )
+    .app;
+    let resp = create_router(app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{STACKED_ID}/AdditionalParts"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = json["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Heist cd2", "Heist cd3"]);
+    assert_eq!(json["TotalRecordCount"].as_i64(), Some(2));
+    assert_eq!(json["StartIndex"].as_i64(), Some(0));
+    assert_eq!(*owners.lock().unwrap(), [Some(STACKED_ID)]);
 }
 
 #[tokio::test]

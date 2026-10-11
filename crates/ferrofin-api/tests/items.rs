@@ -2006,19 +2006,17 @@ fn two_item_state(item_id: Uuid, dto: Arc<dyn DtoService>, auth: Auth) -> (AppSt
 }
 
 /// `LibraryController.DeleteItem`: `!item.CanDelete(user)` is `401
-/// Unauthorized access` and nothing is deleted; allowed, the item's rows are
-/// deleted — and only them: upstream's `DeleteFileLocation = true` is an open
-/// work item (`PLAN_ITEM_FILE_DELETION.md`), so the library is not asked to
-/// delete files.
+/// Unauthorized access` and nothing is deleted; allowed, the item is deleted
+/// **with its files** (`DeleteOptions { DeleteFileLocation = true }`).
 #[tokio::test]
-async fn delete_item_asks_can_delete_and_deletes_the_rows_only() {
+async fn delete_item_asks_can_delete_and_deletes_the_files() {
     let item_id = Uuid::from_u128(0xAB51);
     let (state, deleted) = two_item_state(item_id, Arc::new(OkDto), alice());
     assert_eq!(
         delete(state, &format!("/Items/{item_id}")).await,
         StatusCode::NO_CONTENT
     );
-    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
 
     let (state, deleted) = two_item_state(item_id, Arc::new(DenyingDto(vec![item_id])), alice());
     assert_eq!(
@@ -2065,7 +2063,7 @@ async fn delete_items_stops_at_the_first_refused_id() {
         .await,
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
 
     let (state, deleted) = two_item_state(item_id, denying(), alice());
     assert_eq!(
@@ -2081,7 +2079,7 @@ async fn delete_items_stops_at_the_first_refused_id() {
         delete(state, &format!("/Items?ids={item_id},{missing},{item_id}")).await,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
 }
 
 /// An API key has no user, so `CanDelete(user)` is not asked (upstream's
@@ -2100,7 +2098,7 @@ async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
             ),
         );
         assert_eq!(delete(state, &uri).await, StatusCode::NO_CONTENT, "{uri}");
-        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
     }
     for (uri, expected) in [
         (format!("/Items/{item_id}"), StatusCode::NOT_FOUND),
@@ -2151,6 +2149,6 @@ async fn a_dropped_request_still_finishes_its_delete() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, false)]);
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
     }
 }

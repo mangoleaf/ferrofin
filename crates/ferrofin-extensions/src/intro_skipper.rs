@@ -940,17 +940,35 @@ impl DetectSegmentsTask {
         removed
     }
 
-    /// Publishes every stored item's segments (the plugin's `SegmentProvider`
-    /// as the Media Segment Scan runs it), logging a failed item and going on.
+    /// Publishes the stored segments of every item the Media Segment Scan
+    /// covers (the plugin's `SegmentProvider` as `MediaSegmentExtractionTask`
+    /// runs it over the library's items, [`queue::publishable`]), logging a
+    /// failed item and going on. A stored item no longer in the library —
+    /// deleted, or in a library that disables the plugin — is not published:
+    /// upstream's scan only walks the library.
     async fn publish_stored(&self) {
-        let items = match self.actions.stored_item_ids().await {
+        let stored = match self.actions.stored_item_ids().await {
             Ok(items) => items,
             Err(err) => {
                 tracing::error!(%err, "intro skipper: could not list stored segments to publish");
                 return;
             }
         };
-        for item_id in items {
+        let folders = match self.virtual_folders.get_virtual_folders().await {
+            Ok(folders) => folders,
+            Err(err) => {
+                tracing::error!(%err, "intro skipper: could not read the libraries to publish");
+                return;
+            }
+        };
+        let live = match queue::publishable(self.library.as_ref(), &folders, &stored).await {
+            Ok(live) => live,
+            Err(err) => {
+                tracing::error!(%err, "intro skipper: could not read the items to publish");
+                return;
+            }
+        };
+        for item_id in stored.into_iter().filter(|id| live.contains(id)) {
             if let Err(err) =
                 intro_store::refresh(self.actions.as_ref(), self.media_segments.as_ref(), item_id)
                     .await
@@ -3506,6 +3524,112 @@ mod tests {
 
         scan.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// With `UpdateMediaSegments` off the scan publishes the stored segments
+    /// itself, for the items Jellyfin's `MediaSegmentExtractionTask` walks —
+    /// the library's: a deleted episode's segments, which the plugin keeps
+    /// (its `OnItemRemoved` drops only the detection cache), are not
+    /// published again; a live episode's missing ones are.
+    #[tokio::test]
+    async fn the_scan_does_not_republish_a_deleted_item() {
+        let h = harness(&THREE_EPISODES, true, "{}", true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("detect");
+        let (live, gone) = (THREE_EPISODES[0].0, THREE_EPISODES[2].0);
+        assert_eq!(intros_of(&h.segments, gone).await.len(), 1);
+        intro_store::remove_published(h.segments.as_ref(), live)
+            .await
+            .expect("unpublish");
+        assert!(intros_of(&h.segments, live).await.is_empty());
+        h.persistence.delete_items(&[gone]).await.expect("delete");
+        assert!(
+            intros_of(&h.segments, gone).await.is_empty(),
+            "the delete takes the published segments"
+        );
+
+        let scan = MediaSegmentScanTask {
+            detect: Arc::new(configured(&h, r#"{"UpdateMediaSegments":false}"#)),
+        };
+        scan.execute(&TaskProgress::default()).await.expect("scan");
+        assert!(intros_of(&h.segments, gone).await.is_empty());
+        assert_eq!(intros_of(&h.segments, live).await.len(), 1);
+        assert!(
+            !h.actions.segments(gone).await.expect("tier").is_empty(),
+            "the plugin's own rows stay, as upstream's, for its clean task"
+        );
+    }
+
+    /// The items the Media Segment Scan offers the plugin, as
+    /// `MediaSegmentExtractionTask` and `RunSegmentPluginProviders` pick
+    /// them: an alternate version too (`IncludeOwnedItems`), never a missing
+    /// file or a directory (a disc rip: `File.Exists` is false), never one in
+    /// a library whose `DisabledMediaSegmentProviders` names the plugin in
+    /// any case, and one under no library by the default options (enabled).
+    #[tokio::test]
+    async fn the_segment_scan_offers_what_upstreams_task_does() {
+        use ferrofin_model::entities_media::VirtualFolderInfo;
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let media = h.cache.path().join("media");
+        let movie = ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+            .expect("stored type name");
+        let file = |rel: &str| {
+            let path = media.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, b"").expect("file");
+            path.to_string_lossy().into_owned()
+        };
+        let rip = media.join("on/Rip (2001)");
+        std::fs::create_dir_all(rip.join("VIDEO_TS")).expect("rip");
+        let (primary, alternate, missing, ripped, off, loose) = (
+            Uuid::from_u128(0xB1),
+            Uuid::from_u128(0xB2),
+            Uuid::from_u128(0xB3),
+            Uuid::from_u128(0xB4),
+            Uuid::from_u128(0xB5),
+            Uuid::from_u128(0xB6),
+        );
+        let row = |id: Uuid, path: String| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: movie.to_owned(),
+            path: Some(path),
+            ..BaseItemEntity::default()
+        };
+        let gone = file("on/Gone (2002).mkv");
+        let rows = vec![
+            row(primary, file("on/Film (2000)/Film - 2160p.mkv")),
+            BaseItemEntity {
+                owner_id: Some(guid_to_db(primary)),
+                primary_version_id: Some(guid_to_db(primary)),
+                ..row(alternate, file("on/Film (2000)/Film - 1080p.mkv"))
+            },
+            row(missing, gone.clone()),
+            row(ripped, rip.to_string_lossy().into_owned()),
+            row(off, file("off/Other (2003).mkv")),
+            row(loose, file("elsewhere/Loose (2004).mkv")),
+        ];
+        h.persistence.save_items(&rows).await.expect("seed");
+        std::fs::remove_file(&gone).expect("missing file");
+        let library = |location: &str, disabled: &[&str]| VirtualFolderInfo {
+            locations: vec![media.join(location).to_string_lossy().into_owned()],
+            library_options: Some(LibraryOptions {
+                disabled_media_segment_providers: disabled.iter().map(|&p| p.to_owned()).collect(),
+                ..LibraryOptions::default()
+            }),
+            ..VirtualFolderInfo::default()
+        };
+        let folders = [
+            library("on", &["Other"]),
+            library("off", &["intro SKIPPER"]),
+        ];
+        let ids = [primary, alternate, missing, ripped, off, loose];
+        let offered = queue::publishable(h.task.library.as_ref(), &folders, &ids)
+            .await
+            .expect("offered");
+        let expected: std::collections::HashSet<Uuid> = [primary, alternate, loose].into();
+        assert_eq!(offered, expected);
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and

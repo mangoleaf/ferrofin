@@ -112,10 +112,19 @@ Conventions:
   `LocationsExcluded` config + inactive-library eligibility filters, the two
   24-hour dashboard tasks, and the vendored settings page. Routes and tasks
   self-gate on the plugin's enabled flag (disabled → routes 404, tasks no-op).
-- Accepted divergences (do NOT "fix" during sync): Ferrofin models version
-  groups solely via the `PrimaryVersionId` pointer — the C# `OwnerId` /
-  `LocalAlternateVersions` / `LinkedAlternateVersions` / linked-child-reroute
-  machinery is Jellyfin-internal representation, not API surface. No
+- Divergence PENDING OWNER DECISION (D10 in
+  `brain/plans/PLAN_ITEM_FILE_DELETION.md`): the pinned plugin (`e6f58d6`,
+  `MergeVersionsManager.cs:211-233`) writes a merge as OWNED local versions —
+  each alternate gets `OwnerId` = the primary and the primary's
+  `LocalAlternateVersions` lists it, so the save writes `ChildType` 2 rows —
+  and its split (`:282-299`) unlinks local versions too. Ferrofin writes a
+  merge as a linked version (`PrimaryVersionId` plus a `ChildType` 3 row, as
+  core `VideosController.MergeVersions` does), never merges or splits an
+  owned row, and leaves `OwnerId`/type-2 rows to the scanner, which owns the
+  files it groups (`ItemPersistenceService::sync_local_versions`). An
+  adopted database's plugin merges (owned, type 2) therefore read as local
+  versions here. The linked-child reroute is not ported.
+- Accepted divergences (do NOT "fix" during sync): No
   `VideoType`/`Video3DFormat` columns in Ferrofin's schema, so primary selection
   cannot demote 3D/non-file videos (width ordering only). No `IndexNumberEnd`
   column, so that episode-key component is always empty. Upstream's

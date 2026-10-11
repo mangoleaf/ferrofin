@@ -744,9 +744,15 @@ async fn deletion_checks_visibility_before_permission_and_stops_in_input_order()
             StatusCode::OK
         );
     }
-    // Deletion in this baseline removes database rows only.
-    assert!(f.h.path("movies/Alpha (1999)/Alpha (1999).mkv").exists());
+    // A delete removes the item's files (`DeleteFileLocation = true`): the
+    // allowed movie's folder goes; the hidden one's and the one after the
+    // stop stay on disk.
+    assert!(!f.h.path("movies/Alpha (1999)").exists());
     assert!(f.h.path("more/Gamma (2001)/Gamma (2001).mkv").exists());
+    assert!(
+        f.h.path("movies/Epsilon (2003)/Epsilon (2003).mkv")
+            .exists()
+    );
     let (_, user) = call(
         &f.router,
         "GET",

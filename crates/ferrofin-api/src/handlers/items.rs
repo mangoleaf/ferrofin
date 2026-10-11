@@ -618,16 +618,24 @@ async fn require_can_delete(
     }
 }
 
+/// What both delete endpoints ask of the library: Jellyfin's
+/// `new DeleteOptions { DeleteFileLocation = true }` — the item's files go
+/// with it.
+fn delete_with_files() -> DeleteOptions {
+    DeleteOptions {
+        delete_file_location: true,
+        ..DeleteOptions::default()
+    }
+}
+
 /// `LibraryController.DeleteItem`'s body for one id, after the user check:
-/// resolve the item (`404`), ask `CanDelete(user)` (`401`), delete it.
-///
-/// TODO(parity, open work item): upstream deletes the media files
-/// (`new DeleteOptions { DeleteFileLocation = true }`); not ported yet, it
-/// waits on scanner parity, so only the item's rows go and its files stay on
-/// disk. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+/// resolve the item as the user (`404`), ask `CanDelete(user)` (`401`),
+/// delete it with its files.
 ///
 /// Resolve visibility before CanDelete: a hidden item is indistinguishable
-/// from a missing one, even when the caller may delete from every library.
+/// from a missing one, even when the caller may delete from every library
+/// (`_libraryManager.GetItemById<BaseItem>(itemId, user)`,
+/// `LibraryController.cs:380,425`).
 async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
     let item = state
         .library
@@ -635,22 +643,21 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
     require_can_delete(state, auth, &item).await?;
-    state
-        .library
-        .delete_item(id, &DeleteOptions::default())
-        .await?;
+    state.library.delete_item(id, &delete_with_files()).await?;
     Ok(())
 }
 
 /// Runs a delete request's work to completion even if the client goes away.
 ///
-/// axum drops a handler's future when the connection closes. The row delete
-/// itself is one transaction, but what follows its commit — re-syncing the
-/// `Data` of the playlists and collections that lost a member, and the
-/// `LibraryChanged` notice — would be skipped, and a `DELETE /Items?ids=`
-/// would stop between two items. Upstream's controller does not observe
-/// `RequestAborted` here, so its delete finishes; the work runs on its own
-/// task, which the request only awaits.
+/// axum drops a handler's future when the connection closes, which could
+/// stop a delete between its files and its rows, or half way through its
+/// paths. The row delete itself is one transaction, but what follows its
+/// commit — the extracted-data cleanup, re-syncing the `Data` of the
+/// playlists and collections that lost a member, and the `LibraryChanged`
+/// notice — would be skipped, and a `DELETE /Items?ids=` would stop between
+/// two items. Upstream's controller does not observe `RequestAborted` here,
+/// so its delete finishes; the work runs on its own task, which the request
+/// only awaits.
 async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
 where
     F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
@@ -666,13 +673,16 @@ where
         })?
 }
 
-/// `DELETE /Items/{itemId}` — deletes one item from the library.
+/// `DELETE /Items/{itemId}` — deletes one item from the library and the
+/// filesystem.
 ///
 /// Port of `LibraryController.DeleteItem`. A token whose user no longer
-/// exists, or a missing item, is a `404`; a user who may not delete the item
-/// (`CanDelete(user)`) is a `401`. Otherwise the item and everything under
-/// it are deleted from the library and the handler returns `204`; the media
-/// files stay on disk (see [`delete_one`]). The work finishes even if the
+/// exists, or a missing or hidden item, is a `404`; a user who may not
+/// delete the item (`CanDelete(user)`) is a `401`. Otherwise the item,
+/// everything under it and its files are deleted (`LibraryManager.DeleteItem`
+/// with `DeleteFileLocation = true`) and the handler returns `204`. When the
+/// item's first path cannot be deleted — a read-only mount — the request
+/// fails (`500`) with its rows in place. The work finishes even if the
 /// client disconnects.
 #[utoipa::path(
     delete,
@@ -707,7 +717,7 @@ struct DeleteItemsQuery {
     ids: Option<String>,
 }
 
-/// `DELETE /Items` — deletes several items by id.
+/// `DELETE /Items` — deletes several items by id, with their files.
 ///
 /// Port of `LibraryController.DeleteItems`, which is **per item, in order**,
 /// not all-or-nothing: each id is resolved (`404` if missing), checked

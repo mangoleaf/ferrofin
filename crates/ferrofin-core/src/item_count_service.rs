@@ -702,10 +702,14 @@ impl ItemCountService for FerrofinItemCountService {
             let mut sql = grouped_count(table);
             if table == "BaseItems" {
                 // Direct-child counts skip merged alternates too (a season's
-                // ChildCount is its DISTINCT episodes, not every version).
+                // ChildCount is its DISTINCT episodes, not every version), and
+                // a stacked part or local version, which belongs to its owner
+                // (`DescendantQueryHelper.IsDistinctLibraryItem`).
                 sql = sql.replace(
                     r#"WHERE "ParentId" IN ("#,
-                    r#"WHERE "PrimaryVersionId" IS NULL AND "ParentId" IN ("#,
+                    r#"WHERE "PrimaryVersionId" IS NULL
+                         AND ("OwnerId" IS NULL OR "ExtraType" IS NOT NULL)
+                         AND "ParentId" IN ("#,
                 );
             }
             let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
@@ -824,7 +828,8 @@ impl FerrofinItemCountService {
     ) -> Result<PlayedAndTotal, ServiceError> {
         let total: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "BaseItems"
-               WHERE "IsFolder" = 0 AND "PrimaryVersionId" IS NULL AND "IsVirtualItem" = 0"#,
+               WHERE "IsFolder" = 0 AND "PrimaryVersionId" IS NULL AND "IsVirtualItem" = 0
+                 AND ("OwnerId" IS NULL OR "ExtraType" IS NOT NULL)"#,
         )
         .fetch_one(self.db.pool())
         .await
@@ -982,7 +987,9 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 ///
 /// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
 /// their primary — counting them inflated every series/season episode total
-/// after a merge-versions pass.
+/// after a merge-versions pass. A stacked part or local version (owned, no
+/// `ExtraType`) belongs to its owner and is no item of its own; an extra
+/// is counted (`DescendantQueryHelper.IsDistinctLibraryItem`).
 ///
 /// `IsVirtualItem = 0` is upstream's, not an optimisation: BOTH
 /// `Folder.GetRecursiveChildCount` (Folder.cs:701-714) and the
@@ -1000,7 +1007,8 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
                          WHERE bi."Id" = a."ItemId"
                            AND bi."IsFolder" = 0
                            AND bi."IsVirtualItem" = 0
-                           AND bi."PrimaryVersionId" IS NULL){extra_where}
+                           AND bi."PrimaryVersionId" IS NULL
+                           AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)){extra_where}
              AND a."ParentItemId" IN ("#
     );
     sql.push_str(&placeholders(parents));
@@ -1050,6 +1058,7 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
 const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = r#"SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
    JOIN "UserData" ud ON ud."ItemId" = bi."Id"
    WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
+     AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)
      AND bi."IsVirtualItem" = 0 AND ud."UserId" = ?1 AND ud."Played" = 1"#;
 
 /// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
@@ -1607,6 +1616,102 @@ mod tests {
             .await
             .expect("linked child counts");
         assert_eq!(counts[&boxset], 2);
+    }
+
+    /// A stacked movie is one item (`DescendantQueryHelper.
+    /// IsDistinctLibraryItem`): its second part — owned by the primary, no
+    /// `ExtraType`, no `PrimaryVersionId` — is neither a child of its folder
+    /// nor a leaf of its own, in a folder's counts or the whole server's, so
+    /// the folder's unplayed badge clears once the primary is played. An
+    /// extra is still counted.
+    #[tokio::test]
+    async fn a_stacked_part_counts_as_no_item_of_its_own() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let folder = Uuid::from_u128(0x5F01);
+        let (primary, part, extra) = (
+            Uuid::from_u128(0x5F02),
+            Uuid::from_u128(0x5F03),
+            Uuid::from_u128(0x5F04),
+        );
+        seed_item(&db, folder, BaseItemKind::Folder).await;
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, part, BaseItemKind::Video).await;
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        for (child, parent, owner, extra_type) in [
+            (primary, Some(folder), None, None),
+            (part, Some(folder), Some(primary), None),
+            (extra, None, Some(primary), Some(2)),
+        ] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ParentId" = ?2, "OwnerId" = ?3, "ExtraType" = ?4
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(child))
+            .bind(parent.map(guid_to_db))
+            .bind(owner.map(guid_to_db))
+            .bind(extra_type)
+            .execute(db.writer())
+            .await
+            .expect("shape");
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(child))
+                .bind(guid_to_db(folder))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+        }
+        let user_id = Uuid::from_u128(0x5F0D);
+        let user = seed_user(&db, user_id).await;
+
+        let children = service
+            .get_child_count_batch(&[folder], None)
+            .await
+            .expect("child counts");
+        assert_eq!(children[&folder], 1, "the primary; the part is no child");
+        let before = service
+            .get_played_and_total_count_batch(&[folder], &user)
+            .await
+            .expect("batch");
+        assert_eq!((before[&folder].played, before[&folder].total), (0, 2));
+        let server = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        let leaves = server.total;
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(part))
+            .execute(db.writer())
+            .await
+            .expect("unown");
+        let unowned = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        assert_eq!(unowned.total, leaves + 1, "an unowned part is a leaf");
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(part))
+            .bind(guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("own");
+
+        seed_user_data(&db, user_id, primary, true, None).await;
+        seed_user_data(&db, user_id, extra, true, None).await;
+        let after = service
+            .get_played_and_total_count_batch(&[folder], &user)
+            .await
+            .expect("batch");
+        assert_eq!(
+            (after[&folder].played, after[&folder].total),
+            (2, 2),
+            "nothing left unplayed"
+        );
+        let server = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        assert_eq!((server.played, server.total), (2, leaves));
     }
 
     #[tokio::test]

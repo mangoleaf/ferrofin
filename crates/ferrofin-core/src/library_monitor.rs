@@ -390,6 +390,14 @@ impl FerrofinLibraryMonitor {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
+        // `IgnorePatterns.ShouldIgnore(path)` (`LibraryMonitor.cs:383`): a
+        // report of an ignored path — whatever its source — refreshes nothing.
+        // The native watcher filters its events the same way; a webhook or
+        // `/Library/Media/Updated` report reaches only this check.
+        if crate::resolvers::should_ignore_path(path) {
+            tracing::trace!(path, "change ignored (ignore patterns)");
+            return Ok(());
+        }
         if self.is_path_suppressed(path) {
             tracing::trace!(path, "change suppressed (server-initiated write)");
             return Ok(());
@@ -935,6 +943,26 @@ mod tests {
             .expect("report");
         tokio::time::sleep(Duration::from_secs(61)).await;
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// `ReportFileSystemChanged` returns on `IgnorePatterns.ShouldIgnore`
+    /// before anything else (`LibraryMonitor.cs:383`), for every reporter.
+    #[rstest::rstest]
+    #[case("/media/movies/Heat (1995)/sample.mkv")]
+    #[case("/media/movies/Heat (1995)/Sample/clip.mkv")]
+    #[case("/media/movies/Heat (1995)/._Heat.mkv")]
+    #[case("/media/movies/@eaDir/thumb.jpg")]
+    #[tokio::test]
+    async fn an_ignored_path_does_not_scan(#[case] path: &str) {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        monitor
+            .report_file_system_changed(path)
+            .await
+            .expect("report");
+        monitor.report_webhook_change(path).await.expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

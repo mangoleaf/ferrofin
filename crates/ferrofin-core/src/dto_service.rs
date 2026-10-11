@@ -68,7 +68,7 @@ use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType};
 use ferrofin_model::dto::{
     BaseItemDto, BaseItemPerson, ItemCounts, NameGuidPair, TrickplayInfoDto, UserItemDataDto,
 };
-use ferrofin_model::entities::{ExtraType, ImageType, LocationType, VideoType};
+use ferrofin_model::entities::{ExtraType, ImageType, LocationType};
 use ferrofin_model::querying::ItemFields;
 use uuid::Uuid;
 
@@ -163,10 +163,17 @@ struct Prefetched {
     /// Played/total leaf-descendant counts per folder item id (populated when
     /// user data is enabled and a user is present), for folder `UnplayedItemCount`.
     played_counts: HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>,
-    /// Merged alternate-version rows per primary item id (populated only when
-    /// the `MediaSources` field is requested), so a merged item reports its
-    /// extra selectable sources without a per-item query.
-    alternates: HashMap<Uuid, Vec<BaseItemEntity>>,
+    /// The rows the page items' version groups reach (populated only when
+    /// the `MediaSources` field is requested), so a video with versions
+    /// reports all of them as sources without a per-item query.
+    versions: crate::video_versions::VersionRows,
+    /// Of the rows in `versions`, those the user may open (populated only for
+    /// a user, on a page holding versions); `None` means every one.
+    version_visible: Option<std::collections::HashSet<Uuid>>,
+    /// The user's data for the page's version groups (populated only for a
+    /// user, with `MediaSources`, on a page holding versions), which puts the
+    /// version being resumed first.
+    version_user_data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>,
     /// How many alternate versions each primary has (populated when either
     /// the `MediaSources` or the `MediaSourceCount` field is requested; a
     /// primary with none is absent). Keyed by the PRIMARY, which for a page
@@ -351,6 +358,39 @@ fn parse_user_id(id: &str) -> Result<Uuid, ServiceError> {
 /// keys the prefetch maps, so a fallible signature would have to decide "skip
 /// the row" versus "fail the page" at fifteen call sites) — see the
 /// `parse_user_id` sibling for the cases where the fallback *was* observable.
+/// The DTO prefetch's [`VersionRowReader`](crate::video_versions::VersionRowReader):
+/// a version's primary straight from the database, the versions through the
+/// media-source manager's batch (the one the prefetch always used).
+struct DtoVersionReader<'a> {
+    db: &'a Database,
+    media_sources: &'a dyn MediaSourceManager,
+}
+
+#[async_trait::async_trait]
+impl crate::video_versions::VersionRowReader for DtoVersionReader<'_> {
+    async fn rows_by_id(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        crate::video_versions::DbVersionReader(self.db)
+            .rows_by_id(ids)
+            .await
+    }
+
+    async fn rows_by_primary(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+        self.media_sources.get_alternate_versions_batch(ids).await
+    }
+
+    async fn rows_by_primary_flagged(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        self.media_sources
+            .get_alternate_versions_batch_flagged(ids)
+            .await
+    }
+}
+
 fn row_id(item: &BaseItemEntity) -> Uuid {
     Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())
 }
@@ -1406,6 +1446,25 @@ impl FerrofinDtoService {
             .collect())
     }
 
+    /// The folders no delete may name: every library location and the data
+    /// directory's collections and playlists folders, each as stored and
+    /// expanded.
+    async fn protected_paths(&self) -> Result<crate::item_deletion::ProtectedPaths, ServiceError> {
+        let locations: Vec<String> = self
+            .collection_folder_locations()
+            .await?
+            .into_iter()
+            .flat_map(|folder| folder.physical_locations)
+            .flat_map(|location| [self.virtual_paths.expand(&location), location])
+            .collect();
+        let folders = crate::item_deletion::PROTECTED_DATA_FOLDERS
+            .iter()
+            .flat_map(|folder| [self.virtual_paths.expand(folder), (*folder).to_owned()]);
+        Ok(crate::item_deletion::ProtectedPaths::new(
+            locations, folders,
+        ))
+    }
+
     /// Reads everything the page's parent-image blocks need, in as few round
     /// trips as the tree is deep: one narrow row read per hop of the walk
     /// (the page's episodes share one series, so a hop is a handful of ids),
@@ -2309,46 +2368,33 @@ impl FerrofinDtoService {
         } else if options.contains_field(ItemFields::MediaSources)
             && (kinds::is_video(kind) || kinds::is_audio(kind))
         {
-            // The row and its streams are already prefetched, so assemble the
-            // static source directly — no per-item retrieve_item + streams_dto.
-            let streams = prefetched
-                .media_streams
-                .get(&item_id)
-                .cloned()
-                .unwrap_or_default();
-            let attachments = prefetched
-                .media_attachments
-                .get(&item_id)
-                .cloned()
-                .unwrap_or_default();
-            let mut sources = vec![
+            // The rows and their streams are already prefetched, so assemble
+            // the static sources directly — no per-item retrieve_item +
+            // streams_dto. Every version of the item is a source, its own
+            // first (`GetStaticMediaSources` → `Video.GetMediaSources`).
+            let streams = &prefetched.media_streams;
+            let attachments = &prefetched.media_attachments;
+            let mut sources = prefetched.versions.media_sources(item, |row| {
+                let id = row_id(row);
                 crate::media_source_manager::FerrofinMediaSourceManager::static_source(
-                    item,
-                    streams,
-                    attachments,
-                ),
-            ];
-            // Merged alternate versions report as additional selectable sources
-            // (C# `GetStaticMediaSources` includes `LinkedAlternateVersions`).
-            for alt in prefetched.alternates.get(&item_id).into_iter().flatten() {
-                let alt_streams = prefetched
-                    .media_streams
-                    .get(&row_id(alt))
-                    .cloned()
-                    .unwrap_or_default();
-                let alt_attachments = prefetched
-                    .media_attachments
-                    .get(&row_id(alt))
-                    .cloned()
-                    .unwrap_or_default();
-                sources.push(
-                    crate::media_source_manager::FerrofinMediaSourceManager::static_source(
-                        alt,
-                        alt_streams,
-                        alt_attachments,
-                    ),
-                );
+                    row,
+                    streams.get(&id).cloned().unwrap_or_default(),
+                    attachments.get(&id).cloned().unwrap_or_default(),
+                )
+            });
+            // A version the user may not open is no source for them; the item
+            // itself always is (`MediaSourceManager.cs:397-403`).
+            if let Some(visible) = &prefetched.version_visible {
+                sources.retain(|s| {
+                    s.id.as_deref()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .is_none_or(|id| id == item_id || visible.contains(&id))
+                });
             }
+            let resume = &prefetched.version_user_data;
+            crate::video_versions::put_resumed_version_first(item, &mut sources, |id| {
+                resume.get(&id)
+            });
             dto.media_sources = Some(sources);
         }
 
@@ -2380,7 +2426,16 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::CanDownload) {
             // C# `CanDownload()` is false by default and only true for playable media;
             // a by-name item is not a folder but still isn't downloadable.
-            let file_downloadable = !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv;
+            // `Video.CanDownload` (`Video.cs:444-452`): never a DVD or
+            // Blu-ray rip, whose path is a folder.
+            let disc = kinds::is_video(kind)
+                && matches!(
+                    crate::item_data::video_format(item.data.as_deref()).video_type,
+                    ferrofin_model::entities::VideoType::Dvd
+                        | ferrofin_model::entities::VideoType::BluRay
+                );
+            let file_downloadable =
+                !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv && !disc;
             dto.can_download =
                 Some(file_downloadable && perms.is_none_or(|p| p.enable_content_downloading));
         }
@@ -2725,12 +2780,25 @@ impl FerrofinDtoService {
 
         // Video extras.
         if kinds::is_video(kind) {
-            dto.video_type = Some(VideoType::VideoFile);
+            // `dto.VideoType = video.VideoType; dto.Video3DFormat = …;
+            // dto.IsoType = …` (DtoService.cs:1409-1411), read off `Data`.
+            let format = crate::item_data::video_format(item.data.as_deref());
+            dto.video_type = Some(format.video_type);
+            dto.video3d_format = format.video3d_format;
+            dto.iso_type = format.iso_type;
             dto.extra_type = item.extra_type.and_then(extra_type_from_disc);
             // C# only assigns when true, so the key is absent otherwise (the
             // `skip_serializing_if` on the DTO matches that omission).
             if prefetched.has_subtitles.contains(&item_id) {
                 dto.has_subtitles = Some(true);
+            }
+            // `if (video.AdditionalParts.Length != 0) dto.PartCount =
+            // video.AdditionalParts.Length + 1;` (DtoService.cs:1418-1421) —
+            // a stacked video counts itself and its other parts, read off its
+            // own `Data`; no `ItemFields` gate, no query.
+            let parts = crate::video_versions::additional_part_count(item.data.as_deref());
+            if parts != 0 {
+                dto.part_count = i32::try_from(parts + 1).ok();
             }
 
             // `MediaSourceCount` (v12 DtoService.cs:1319-1343): emitted only
@@ -2739,14 +2807,11 @@ impl FerrofinDtoService {
             // count (Video.cs:255-280) — so a page item that IS an alternate
             // reads the count prefetched under its primary's id.
             //
-            // TODO(parity): the per-user arm (`GetAllVersions().Count(v =>
-            // v.Id == video.Id || v.IsVisibleStandalone(user))`, :1334-1337)
-            // drops versions the user's parental policy hides. Ferrofin's
-            // alternate reads are not user-filtered — neither here nor in the
-            // `MediaSources` block above — so a hidden version still counts
-            // and still lists. Un-defer path: filter the alternate rows
-            // through the user's parental-rating/tag visibility in one place
-            // (the alternates prefetch) so both readers agree.
+            // The per-user arm (`GetAllVersions().Count(v => v.Id ==
+            // video.Id || v.IsVisibleStandalone(user))`, :1430-1444) counts
+            // only the versions the user may see, over the group the
+            // prefetch read (`version_visible`, the user's parental-rating
+            // and tag rules).
             if options.contains_field(ItemFields::MediaSourceCount) {
                 let primary_id = item
                     .primary_version_id
@@ -2758,8 +2823,17 @@ impl FerrofinDtoService {
                     .get(&primary_id)
                     .copied()
                     .unwrap_or(0);
-                if alternates > 0 {
-                    dto.media_source_count = i32::try_from(alternates + 1).ok();
+                let count = match &prefetched.version_visible {
+                    Some(visible) if alternates > 0 => prefetched
+                        .versions
+                        .all_version_ids(item)
+                        .into_iter()
+                        .filter(|id| *id == item_id || visible.contains(id))
+                        .count(),
+                    _ => alternates + 1,
+                };
+                if count != 1 {
+                    dto.media_source_count = i32::try_from(count).ok();
                 }
             }
 
@@ -3732,16 +3806,30 @@ impl FerrofinDtoService {
             .filter(|i| kinds::has_media_sources(row_kind(i)))
             .map(row_id)
             .collect();
-        // Merged alternate versions (rows pointing at a page item via
-        // `PrimaryVersionId`), so each item's extra selectable sources build
-        // without a per-item query; their streams join the stream batch below.
+        // Every row the page's version groups reach (`Video.
+        // GetAllItemsForMediaSources`): the versions pointing at a page item,
+        // the primary of a page item that is a version (up its pointer
+        // chain, and that primary's versions) and the versions of each
+        // version, level by level — so each item's sources build without a
+        // per-item query; their streams join the stream batch below. One
+        // query for a page with no versions on it, as before; the others run
+        // only when the page holds a version or a group.
         let want_sources = options.contains_field(ItemFields::MediaSources);
-        let alternates = if want_sources && !media_ids.is_empty() {
-            self.media_sources
-                .get_alternate_versions_batch(&media_ids)
-                .await?
+        let mut versions = if want_sources && !media_ids.is_empty() {
+            let media_rows: Vec<&BaseItemEntity> = items
+                .iter()
+                .filter(|i| kinds::has_media_sources(row_kind(i)))
+                .collect();
+            crate::video_versions::VersionRows::load(
+                &DtoVersionReader {
+                    db: &self.db,
+                    media_sources: self.media_sources.as_ref(),
+                },
+                &media_rows,
+            )
+            .await?
         } else {
-            HashMap::new()
+            crate::video_versions::VersionRows::default()
         };
         // `MediaSourceCount` needs only HOW MANY versions each page video has:
         // the full rows above when the page asked for the sources anyway,
@@ -3751,9 +3839,10 @@ impl FerrofinDtoService {
         // item that is itself an alternate counts its PRIMARY's versions
         // (Video.cs:255-280), so those primaries are counted too; the full
         // read never covers them.
-        let mut alternate_counts: HashMap<Uuid, usize> = alternates
+        let mut alternate_counts: HashMap<Uuid, usize> = media_ids
             .iter()
-            .map(|(primary, rows)| (*primary, rows.len()))
+            .map(|id| (*id, versions.version_count(*id)))
+            .filter(|(_, count)| *count > 0)
             .collect();
         if options.contains_field(ItemFields::MediaSourceCount) {
             let mut count_ids: Vec<Uuid> = items
@@ -3788,6 +3877,69 @@ impl FerrofinDtoService {
                 }
             }
         }
+        // `MediaSourceCount` for a user counts only the versions they may see
+        // (`GetAllVersions().Count(v => v.Id == video.Id ||
+        // v.IsVisibleStandalone(user))`, DtoService.cs:1430-1444), so a page
+        // that asked for the count alone reads the groups of the videos that
+        // have versions — none on a page without them.
+        if !want_sources && user.is_some() && options.contains_field(ItemFields::MediaSourceCount) {
+            let grouped: Vec<&BaseItemEntity> = items
+                .iter()
+                .filter(|i| kinds::is_video(row_kind(i)))
+                .filter(|i| {
+                    let primary = i
+                        .primary_version_id
+                        .as_deref()
+                        .and_then(|p| Uuid::parse_str(p).ok())
+                        .unwrap_or_else(|| row_id(i));
+                    alternate_counts.get(&primary).is_some_and(|c| *c > 0)
+                })
+                .collect();
+            if !grouped.is_empty() {
+                versions = crate::video_versions::VersionRows::load(
+                    &DtoVersionReader {
+                        db: &self.db,
+                        media_sources: self.media_sources.as_ref(),
+                    },
+                    &grouped,
+                )
+                .await?;
+            }
+        }
+        // `GetStaticMediaSources`' per-user filter (`MediaSourceManager.cs:
+        // 397-403`, `GetItemById(id, user) is not null`) and `MediaSourceCount`'s
+        // `IsVisibleStandalone(user)`: the versions the user may open, as one
+        // batched standalone-visibility pass over every version the page
+        // reaches. Only for a user, only when the page holds a version group.
+        let version_visible = match user {
+            Some(user) if versions.ids().next().is_some() => {
+                let ids: Vec<Uuid> = versions.ids().collect();
+                Some(
+                    self.library
+                        .get_visible_item_ids(&ids, user)
+                        .await?
+                        .into_iter()
+                        .collect::<std::collections::HashSet<Uuid>>(),
+                )
+            }
+            _ => None,
+        };
+        // `SetAlternateVersionResumeStates`: with a user, the version they are
+        // part-way through leads a primary's sources — the user data of every
+        // version on or reached from the page, in one read, and only when the
+        // page holds a version group.
+        let version_user_data = match user {
+            Some(user) if want_sources && versions.ids().next().is_some() => {
+                let mut wanted: Vec<Uuid> =
+                    media_ids.iter().copied().chain(versions.ids()).collect();
+                wanted.sort_unstable();
+                wanted.dedup();
+                self.user_data
+                    .get_user_data_batch(&wanted, parse_user_id(&user.id)?)
+                    .await?
+            }
+            _ => HashMap::new(),
+        };
         // The heavy per-item relations, bulk-loaded once for the page when their
         // field is requested (an all-fields list DTO otherwise fans out a query
         // per item for each — costly on the 2-connection pool).
@@ -3798,11 +3950,10 @@ impl FerrofinDtoService {
         let stream_ids: Vec<Uuid> = if media_ids.is_empty() {
             Vec::new()
         } else {
-            media_ids
-                .iter()
-                .copied()
-                .chain(alternates.values().flatten().map(row_id))
-                .collect()
+            let mut ids: Vec<Uuid> = media_ids.iter().copied().chain(versions.ids()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
         };
         // A source lists its attachments too (C# `MediaAttachments =
         // MediaSourceManager.GetMediaAttachments(item.Id)` on every static source);
@@ -3830,8 +3981,7 @@ impl FerrofinDtoService {
         )?;
         // An id listed here is another page item's alternate, so its streams are
         // read while projecting that item — it cannot be drained by its own.
-        let alt_referenced: std::collections::HashSet<Uuid> =
-            alternates.values().flatten().map(row_id).collect();
+        let alt_referenced: std::collections::HashSet<Uuid> = versions.ids().collect();
         let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
         let provider_ids = if options.contains_field(ItemFields::ProviderIds) || want_external_urls
         {
@@ -4222,7 +4372,9 @@ impl FerrofinDtoService {
             child_counts,
             linked_child_counts,
             played_counts,
-            alternates,
+            versions,
+            version_visible,
+            version_user_data,
             alternate_counts,
             has_subtitles,
             has_lyrics,
@@ -4256,6 +4408,15 @@ impl FerrofinDtoService {
             list_page,
             ..crate::item_deletion::DeleteFacts::default()
         };
+        // The protected folders ([`crate::item_deletion::ProtectedPaths`]):
+        // only a row whose path is a directory can be one, so they are read
+        // only for a page holding one.
+        if items
+            .iter()
+            .any(|item| item.path.is_some() && crate::item_data::path_is_directory(item))
+        {
+            facts.protected = self.protected_paths().await?;
+        }
         // `Video.IsActiveRecording`: an in-memory set, and only when the page
         // holds a video at all.
         if let Some(live_tv) = self.live_tv.get()
@@ -5186,6 +5347,237 @@ mod tests {
         assert_eq!(dto.media_sources.as_ref().map(Vec::len), Some(2));
     }
 
+    /// The per-user `MediaSourceCount` arm (`GetAllVersions().Count(v => v.Id
+    /// == video.Id || v.IsVisibleStandalone(user))`, DtoService.cs:1430-1444)
+    /// runs the library's standalone visibility: a version rated above the
+    /// user is not counted for them, while a user-less read counts it.
+    #[tokio::test]
+    async fn media_source_count_for_a_user_skips_versions_they_cannot_see() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let (open, rated) = (Uuid::new_v4(), Uuid::new_v4());
+        for (i, alt_id) in [open, rated].iter().enumerate() {
+            seed_named_item(&db, *alt_id, BaseItemKind::Video, &format!("Cut {i}")).await;
+            link_alternate_version(&db, *alt_id, movie_id).await;
+        }
+        let mut rated_row = fetch_item(&db, rated).await;
+        rated_row.official_rating = Some("R".to_owned());
+        crate::test_support::save_item(&db, &rated_row).await;
+        let mut user =
+            crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x9001)).await;
+        user.max_parental_rating_score = Some(13);
+        let items = crate::test_support::item_repository_over(db.clone());
+        let library = crate::library_manager::FerrofinLibraryManager::new(
+            items.clone(),
+            Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                db.clone(),
+            )),
+            Arc::new(
+                crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone()),
+            ),
+            Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                db.clone(),
+            )),
+        )
+        .with_visibility(Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            items,
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        )));
+        // The group as stored: the real repository's version read.
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(library),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let count_only = DtoOptions {
+            fields: vec![ItemFields::MediaSourceCount],
+            ..DtoOptions::default()
+        };
+        let movie = fetch_item(&db, movie_id).await;
+        let for_user = svc
+            .get_base_item_dto(&movie, &count_only, Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(for_user.media_source_count, Some(2), "the R cut is hidden");
+        let anyone = svc
+            .get_base_item_dto(&movie, &count_only, None, None)
+            .await
+            .unwrap();
+        assert_eq!(anyone.media_source_count, Some(3));
+    }
+
+    /// `PartCount` (DtoService.cs:1418-1421): a stacked video counts itself
+    /// and its other parts, with no `ItemFields` gate; any other video says
+    /// nothing.
+    #[tokio::test]
+    async fn part_count_counts_a_stacked_videos_parts() {
+        let db = test_db().await;
+        let stacked = Uuid::new_v4();
+        crate::test_support::seed_item_with_data(
+            &db,
+            stacked,
+            BaseItemKind::Movie,
+            "Heist",
+            r#"{"AdditionalParts":["/m/Heist cd2.mkv","/m/Heist cd3.mkv"],"VideoType":"VideoFile"}"#,
+        )
+        .await;
+        let lone = Uuid::new_v4();
+        crate::test_support::seed_item_with_data(
+            &db,
+            lone,
+            BaseItemKind::Movie,
+            "Ronin",
+            r#"{"AdditionalParts":[],"VideoType":"VideoFile"}"#,
+        )
+        .await;
+        let svc = service(db.clone());
+        let dtos = svc
+            .get_base_item_dtos(
+                &[fetch_item(&db, stacked).await, fetch_item(&db, lone).await],
+                &DtoOptions {
+                    fields: Vec::new(),
+                    ..DtoOptions::default()
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].part_count, Some(3));
+        assert_eq!(dtos[1].part_count, None);
+    }
+
+    /// A video's DTO carries its own `VideoType`, `IsoType` and
+    /// `Video3DFormat` (`DtoService.cs:1409-1411`) — `VideoFile` where its
+    /// `Data` names none.
+    #[tokio::test]
+    async fn a_videos_dto_reports_its_format() {
+        use ferrofin_model::entities::{IsoType, Video3DFormat, VideoType};
+        let db = test_db().await;
+        let mut ids = Vec::new();
+        for data in [
+            r#"{"VideoType":"Dvd"}"#,
+            r#"{"VideoType":"Iso","IsoType":"Dvd","Video3DFormat":"MVC"}"#,
+            r#"{"AdditionalParts":[]}"#,
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "M", data).await;
+            ids.push(fetch_item(&db, id).await);
+        }
+        let dtos = service(db.clone())
+            .get_base_item_dtos(
+                &ids,
+                &DtoOptions {
+                    fields: vec![ItemFields::CanDownload],
+                    ..DtoOptions::default()
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        // `Video.CanDownload` (`Video.cs:444-452`): a rip never downloads;
+        // a disc image or a file does.
+        assert_eq!(
+            dtos.iter().map(|d| d.can_download).collect::<Vec<_>>(),
+            [Some(false), Some(true), Some(true)]
+        );
+        let formats: Vec<_> = dtos
+            .iter()
+            .map(|d| (d.video_type, d.iso_type, d.video3d_format))
+            .collect();
+        assert_eq!(
+            formats,
+            [
+                (Some(VideoType::Dvd), None, None),
+                (
+                    Some(VideoType::Iso),
+                    Some(IsoType::Dvd),
+                    Some(Video3DFormat::Mvc)
+                ),
+                (Some(VideoType::VideoFile), None, None),
+            ]
+        );
+    }
+
+    /// `MediaSources` lists every version of a video, the queried one first
+    /// and each named by what sets it apart (`Video.GetMediaSources`): from a
+    /// local alternate as much as from its primary, both on one page.
+    #[tokio::test]
+    async fn every_version_lists_the_whole_group_its_own_source_first() {
+        let db = test_db().await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, primary, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, alternate, BaseItemKind::Movie, "Movie").await;
+        let mut row = fetch_item(&db, primary).await;
+        row.path = Some("/Movies/Movie/Movie.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.data =
+            Some(r#"{"LocalAlternateVersions":["/Movies/Movie/Movie - 4K.mkv"]}"#.to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        let mut row = fetch_item(&db, alternate).await;
+        row.path = Some("/Movies/Movie/Movie - 4K.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.owner_id = Some(guid_to_db(primary));
+        crate::test_support::save_item(&db, &row).await;
+        link_alternate_version(&db, alternate, primary).await;
+        let svc = service_with_sources(
+            db.clone(),
+            FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            },
+        );
+        let sources = DtoOptions {
+            fields: vec![ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let dtos = svc
+            .get_base_item_dtos(
+                &[
+                    fetch_item(&db, alternate).await,
+                    fetch_item(&db, primary).await,
+                ],
+                &sources,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let listed = |i: usize| -> Vec<(String, String)> {
+            dtos[i]
+                .media_sources
+                .iter()
+                .flatten()
+                .map(|s| (s.id.clone().unwrap(), s.name.clone().unwrap()))
+                .collect()
+        };
+        let (p, a) = (primary.simple().to_string(), alternate.simple().to_string());
+        assert_eq!(
+            listed(0),
+            [
+                (a.clone(), "4K".to_owned()),
+                (p.clone(), "Movie".to_owned())
+            ]
+        );
+        assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
     /// v12 assigns `Chapters` outside the `item is Video` block
     /// (DtoService.cs:1358-1361), so a folder, a series or a user view carries
     /// `[]` when the field is requested — 10.11.8 omitted the key there.
@@ -5828,6 +6220,9 @@ mod tests {
         /// When set, no primary has an alternate version — the single-version
         /// shape `MediaSourceCount` stays silent on.
         no_alternates: bool,
+        /// When set, the alternate versions are the rows stored here (the
+        /// real repository's read), not the canned one.
+        stored_alternates: Option<Database>,
     }
 
     #[async_trait]
@@ -5929,6 +6324,12 @@ mod tests {
             &self,
             primary_ids: &[Uuid],
         ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
+            if let Some(db) = &self.stored_alternates {
+                use crate::video_versions::VersionRowReader as _;
+                return crate::video_versions::DbVersionReader(db)
+                    .rows_by_primary(primary_ids)
+                    .await;
+            }
             // Every requested primary reports one canned alternate version.
             if self.no_alternates {
                 return Ok(HashMap::new());
@@ -9529,6 +9930,63 @@ mod tests {
                 assert_eq!(dto.can_delete, Some(on_a_page), "{what}: page DTO");
             }
         }
+    }
+
+    /// A library's own folder (its location `Folder`, or 1.3.x's phantom
+    /// album at the music library's root) is never `CanDelete`, even for an
+    /// administrator allowed to delete everywhere; a folder inside it is.
+    #[tokio::test]
+    async fn a_library_folder_is_never_deletable_in_the_dto() {
+        let db = test_db().await;
+        let (library, root, location, inside) = (
+            Uuid::from_u128(0xC0),
+            Uuid::from_u128(0xC1),
+            Uuid::from_u128(0xC2),
+            Uuid::from_u128(0xC3),
+        );
+        crate::test_support::seed_item_with_data(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Music",
+            r#"{"PhysicalLocationsList":["/media/music"]}"#,
+        )
+        .await;
+        seed_folder_item(&db, root, BaseItemKind::AggregateFolder, "root", None).await;
+        seed_folder_item(&db, location, BaseItemKind::MusicAlbum, "music", Some(root)).await;
+        crate::test_support::set_item_path(&db, location, "/media/music/").await;
+        seed_folder_item(
+            &db,
+            inside,
+            BaseItemKind::MusicAlbum,
+            "Album",
+            Some(location),
+        )
+        .await;
+        crate::test_support::set_item_path(&db, inside, "/media/music/Artist/Album").await;
+        let user = Uuid::from_u128(0x202);
+        let entity = crate::test_support::seed_named_user(&db, user, "deleter").await;
+        crate::user_data_manager::seed_content_permissions(
+            &db,
+            user,
+            &[
+                ferrofin_db::enums::PermissionKind::IsAdministrator,
+                ferrofin_db::enums::PermissionKind::EnableContentDeletion,
+            ],
+            &[],
+        )
+        .await;
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        assert!(
+            !svc.can_delete(&fetch_item(&db, location).await, &entity)
+                .await
+                .expect("can delete")
+        );
+        assert!(
+            svc.can_delete(&fetch_item(&db, inside).await, &entity)
+                .await
+                .expect("can delete")
+        );
     }
 
     /// A `ParentId` cycle ends the library walk at its depth cap: no library

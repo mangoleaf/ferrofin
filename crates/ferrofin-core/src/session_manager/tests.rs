@@ -2211,3 +2211,74 @@ async fn concurrent_logins_cannot_exceed_max_active_sessions() {
         .len();
     assert_eq!(live, 1, "and exactly one session may be live afterwards");
 }
+
+/// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): playing a
+/// version of the item the client shows reports the shown item as `ItemId`
+/// and the version as `MediaSourceId`, and the progress is kept against the
+/// version; a media source id that is no version of the item keeps the item.
+#[tokio::test]
+async fn progress_is_kept_against_the_version_the_media_source_names() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let (primary, version, stranger) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    for id in [primary, version, stranger] {
+        crate::test_support::seed_item(&db, id, BaseItemKind::Movie).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.run_time_ticks = Some(72_000_000_000);
+        if id == version {
+            row.owner_id = Some(guid_to_db(primary));
+            row.primary_version_id = Some(guid_to_db(primary));
+        }
+        crate::test_support::save_item(&db, &row).await;
+    }
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-v", "TV", "e", &user)
+        .await
+        .unwrap();
+    let report = |source: Uuid, ticks: i64| PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id: primary,
+        media_source_id: Some(source.simple().to_string()),
+        position_ticks: Some(ticks),
+        ..PlaybackProgressInfo::default()
+    };
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+    let position = |id: Uuid| {
+        let user_data = &user_data;
+        async move {
+            user_data
+                .get_user_data_dto(id, user_id)
+                .await
+                .unwrap()
+                .map_or(0, |d| d.playback_position_ticks)
+        }
+    };
+
+    let halfway = 36_000_000_000;
+    mgr.on_playback_progress(&report(version, halfway), false)
+        .await
+        .unwrap();
+    assert_eq!(position(version).await, halfway, "the version played");
+    assert_eq!(position(primary).await, 0, "not the item shown");
+
+    mgr.on_playback_progress(&report(stranger, halfway), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        position(primary).await,
+        halfway,
+        "no version of it: the item"
+    );
+    assert_eq!(position(stranger).await, 0);
+}

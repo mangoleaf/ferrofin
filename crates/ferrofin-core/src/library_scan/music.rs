@@ -10,9 +10,10 @@
 //! the album's stored row as it stood before the scan
 //! (`MetadataService.RefreshMetadata`'s `isFirstRefresh`/`requiresRefresh`
 //! and `GetProviders`, `MetadataService.cs:89-270,647-715`). So an unchanged
-//! album or artist runs nothing here and makes no request; a new, changed
-//! (folder mtime drift, D3), interval-expired, "Search for missing metadata"
-//! or "Replace all metadata" one runs its providers once, merged by
+//! album or artist runs nothing here and makes no request; a new,
+//! interval-expired, "Search for missing metadata" or "Replace all
+//! metadata" one runs its providers once (a folder has no `DateModified`
+//! to drift, so a changed directory is no trigger), merged by
 //! `RefreshWithProviders`' rule ([`merge_refresh`]).
 //!
 //! An artist known only by name (a compilation's album artist: no folder, no
@@ -119,17 +120,12 @@ pub(super) struct MusicRefresh<'r> {
     /// is a deliberate, harmless divergence
     /// ([`update_folder_aggregates`](LibraryScanner::update_folder_aggregates)).
     pub(super) aggregate: bool,
-    /// This pass stamps the item's `DateLastRefreshed` and writes its new
-    /// `DateModified`: the walk left both to it (owner decisions D1 and
-    /// D3: a refresh that fails or never runs leaves the item due).
+    /// This pass stamps the item's `DateLastRefreshed`: the walk left it to
+    /// it (a refresh that fails or never runs leaves the item due).
     pub(super) owns_stamp: bool,
     /// This pass decides whether the item is saved at all (`SaveInternal`):
     /// no walk refreshed it (a by-name artist).
     pub(super) owns_save: bool,
-    /// The item's folder mtime as the walk found it: the `DateModified`
-    /// `SaveInternal` stamps (`MetadataService.cs:244-255`). `None` for an
-    /// item with no folder, which keeps its stored value.
-    pub(super) date_modified: Option<chrono::DateTime<Utc>>,
 }
 
 /// Upstream's `isFullRefresh` (`MetadataService.cs:150`): `isFirstRefresh ||
@@ -637,7 +633,6 @@ impl LibraryScanner {
                 aggregate: full_refresh(&plan, &request),
                 owns_stamp: true,
                 owns_save: true,
-                date_modified: None,
             };
             if let Err(err) =
                 Box::pin(self.refresh_music_item(&work, run.cancel, &mut skipped)).await
@@ -706,7 +701,6 @@ impl LibraryScanner {
             aggregate: full_refresh(&plan, &request),
             owns_stamp: true,
             owns_save: true,
-            date_modified: None,
         };
         let mut skipped = super::SkippedItems::default();
         let saved = Box::pin(self.refresh_music_item(&work, run.cancel, &mut skipped)).await;
@@ -897,10 +891,10 @@ impl LibraryScanner {
         if answered && !stored.is_locked && heals_from_children(work.kind, &locked_fields) {
             restore_from_children(&mut row, &derived, work.kind);
         }
-        // A file fact, not a provider's: `SaveInternal` stamps the folder's
-        // mtime (`MetadataService.cs:244-255`) — the walk's, which it left
-        // to this pass when the refresh was this pass's to complete.
-        row.date_modified = work.date_modified.or(stored.date_modified);
+        // A file fact, not a provider's: `SaveInternal` stamps a file's
+        // mtime (`MetadataService.cs:244-255`), and an album or artist is a
+        // directory, which has none (D2).
+        row.date_modified = None;
         settle_sort_name(&mut row);
 
         // The remote image providers, keyed by the ids just settled.
@@ -1680,7 +1674,6 @@ impl LibraryScanner {
                 aggregate: true,
                 owns_stamp: remote,
                 owns_save: kind == MusicKind::ByNameArtist,
-                date_modified: None,
             })
             .collect();
         self.refresh_music(&work, ScanRun::defaults(), &mut Served::new())

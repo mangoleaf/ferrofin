@@ -152,3 +152,21 @@ fn test_empty() {
     let result = AudioBookListResolver::new(&options).resolve(&[]);
     assert!(result.is_empty());
 }
+
+/// With no file named after the book (or `audiobook`), the main version is
+/// `OrderBy(x => x.Container).ThenBy(x => x.Path).First()`: the default
+/// string comparer, culture order, where case only breaks ties — so
+/// `batman a` leads `Batman b` although `'B' < 'b'`.
+#[test]
+fn test_main_version_is_first_in_culture_order() {
+    let options = NamingOptions::new();
+    let files = metas(&["Batman/Batman b.mp3", "Batman/batman a.mp3"]);
+
+    let result = AudioBookListResolver::new(&options).resolve(&files);
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].files.len(), 1);
+    assert_eq!(result[0].files[0].path, "Batman/batman a.mp3");
+    assert_eq!(result[0].alternate_versions.len(), 1);
+    assert_eq!(result[0].alternate_versions[0].path, "Batman/Batman b.mp3");
+}

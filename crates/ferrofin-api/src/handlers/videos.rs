@@ -26,6 +26,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
+use ferrofin_traits::options::DtoOptions;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireDownload};
@@ -91,11 +92,12 @@ struct AdditionalPartsQuery {
 
 /// `GET /Videos/{itemId}/AdditionalParts` — the item's additional parts.
 ///
-/// Port of `VideosController.GetAdditionalPart`. Jellyfin returns the video's
-/// `GetAdditionalParts()` children (the split parts of a multi-file movie).
-/// Ferrofin does not model additional-part children at this seam, so a video with
-/// none yields an empty [`QueryResult`], matching the C# `else` branch (non-video
-/// items also return empty). A missing item is `404`.
+/// Port of `VideosController.GetAdditionalPart` (`VideosController.cs:
+/// 97-130`): for a video, its `GetAdditionalParts(user)` — the other files of
+/// a stacked movie, those the user may see, ordered by `SortName` — each
+/// projected with the video as its owner; for any other item, none. An empty
+/// item id means the (user) root folder, which is no video. A missing item is
+/// `404`.
 // Body schema omitted: `BaseItemDto` is self-referential and its derived
 // `utoipa::ToSchema` recurses without bound (a `ferrofin-model` DTO defect),
 // overflowing the OpenAPI generator when inlined — see `items::get_items`.
@@ -112,19 +114,41 @@ async fn get_additional_parts(
     Path(item_id): Path<Uuid>,
     Query(query): Query<AdditionalPartsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    // Honour the userId filter for parity (resolving a bad user is a 404); the
-    // resolved user is otherwise unused since no parts are attached.
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    let empty = || Json(QueryResult::from_items(Vec::new()));
     if item_id.is_nil() {
+        // The (user) root folder: it must exist, but it is no video.
         state
             .library
             .get_user_root_folder()
             .await?
             .ok_or_else(|| ApiError::NotFound("user root folder".into()))?;
-    } else {
-        require_visible_item(&state, item_id, user.as_ref()).await?;
+        return Ok(empty());
     }
-    Ok(Json(QueryResult::new(Some(0), Some(0), Vec::new())))
+    // `GetItemById<BaseItem>(itemId, user)`: an item the user cannot see is
+    // `null`, a `404`.
+    let video = require_visible_item(&state, item_id, user.as_ref()).await?;
+    let parts = state
+        .library
+        .get_additional_parts(&video, user.as_ref())
+        .await?;
+    if parts.is_empty() {
+        return Ok(empty());
+    }
+    // `_dtoService.GetBaseItemDto(i, dtoOptions, user, video)` per part: no
+    // visibility pass beyond the parts' own.
+    let dtos = state
+        .dto
+        .get_base_item_dtos(
+            &parts,
+            &DtoOptions::default(),
+            user.as_ref(),
+            Some(item_id),
+            true,
+        )
+        .await?;
+    // `new QueryResult<BaseItemDto>(items)`: the count is the items'.
+    Ok(Json(QueryResult::from_items(dtos)))
 }
 
 /// Query parameters for `POST /Videos/MergeVersions`.
@@ -233,7 +257,27 @@ async fn get_download(
     request: Request,
 ) -> Result<Response, ApiError> {
     require_visible_item(&state, item_id, auth.user.as_ref()).await?;
-    let path = stream_path(&state, item_id).await?;
+    let source = state
+        .media_sources
+        .get_static_media_sources(item_id, true, None)
+        .await?
+        .into_iter()
+        .find(|s| s.path.is_some())
+        .ok_or_else(|| ApiError::NotFound(format!("no direct stream for item {item_id}")))?;
+    // `Video.CanDownload` (`Video.cs:444-452`): a DVD or Blu-ray rip — a
+    // folder — never downloads; `GetDownload` throws `ArgumentException`
+    // (a `400`, `LibraryController.cs:686-699`).
+    if matches!(
+        source.video_type,
+        Some(
+            ferrofin_model::entities::VideoType::Dvd | ferrofin_model::entities::VideoType::BluRay
+        )
+    ) {
+        return Err(ApiError::BadRequest(
+            "Item does not support downloading".to_owned(),
+        ));
+    }
+    let path = source.path.unwrap_or_default();
     // The controller's CanDownload(user) check follows the policy check.
     // Administrators pass the policy, but an explicitly disabled download
     // permission still fails this per-item check. API keys have no user policy.

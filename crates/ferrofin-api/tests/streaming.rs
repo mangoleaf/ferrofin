@@ -209,6 +209,8 @@ impl UserManager for OkUsers {
 struct StreamSources {
     /// The on-disk path the static source points at.
     path: String,
+    /// The source's `VideoType` (a disc rip's is `Dvd`/`BluRay`).
+    video_type: Option<ferrofin_model::entities::VideoType>,
     /// Ids passed to `open_live_stream`/`close_live_stream`, for assertions.
     opened: Arc<Mutex<Vec<String>>>,
     closed: Arc<Mutex<Vec<String>>>,
@@ -252,7 +254,10 @@ impl MediaSourceManager for StreamSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        Ok(vec![MediaSourceInfo {
+            video_type: self.video_type,
+            ..static_source(&self.path)
+        }])
     }
     async fn open_live_stream(
         &self,
@@ -430,10 +435,19 @@ fn state(path: &str) -> Harness {
 }
 
 fn state_with_policy(path: &str, policy: ferrofin_model::users::UserPolicy) -> Harness {
+    state_with(path, policy, None)
+}
+
+fn state_with(
+    path: &str,
+    policy: ferrofin_model::users::UserPolicy,
+    video_type: Option<ferrofin_model::entities::VideoType>,
+) -> Harness {
     let opened = Arc::new(Mutex::new(Vec::new()));
     let closed = Arc::new(Mutex::new(Vec::new()));
     let sources = StreamSources {
         path: path.to_owned(),
+        video_type,
         opened: opened.clone(),
         closed: closed.clone(),
     };
@@ -588,6 +602,34 @@ async fn administrator_download_still_honors_the_item_permission() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!response.headers().contains_key("content-disposition"));
+}
+
+/// `Video.CanDownload` (`Video.cs:444-452`) is false for a DVD or Blu-ray
+/// rip, and `LibraryController.GetDownload` refuses it with an
+/// `ArgumentException` — a `400` (`LibraryController.cs:686-699`).
+#[tokio::test]
+async fn a_disc_rip_cannot_be_downloaded() {
+    for video_type in [
+        ferrofin_model::entities::VideoType::Dvd,
+        ferrofin_model::entities::VideoType::BluRay,
+    ] {
+        let (_dir, path) = temp_media();
+        let app = state_with(
+            &path,
+            ferrofin_model::users::UserPolicy {
+                enable_content_downloading: true,
+                ..Default::default()
+            },
+            Some(video_type),
+        )
+        .app;
+        let response = create_router(app)
+            .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{video_type:?}");
+        assert!(!response.headers().contains_key("content-disposition"));
+    }
 }
 
 #[tokio::test]

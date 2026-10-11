@@ -141,6 +141,9 @@ pub struct FerrofinStreamStatePlanner {
     /// Optional: `None` (the composition unit test) leaves the names empty —
     /// they are logging metadata, never load-bearing.
     library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// The configured libraries, which name the library an item's location
+    /// belongs to. `None` leaves the library name empty.
+    virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -179,6 +182,7 @@ impl FerrofinStreamStatePlanner {
             subtitles,
             supports_tonemapx,
             library: None,
+            virtual_folders: None,
         }
     }
 
@@ -190,6 +194,17 @@ impl FerrofinStreamStatePlanner {
         library: Arc<dyn ferrofin_traits::library::LibraryManager>,
     ) -> Self {
         self.library = Some(library);
+        self
+    }
+
+    /// Wires the configured libraries, which the transcode logs name an
+    /// item's library by.
+    #[must_use]
+    pub fn with_virtual_folders(
+        mut self,
+        folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    ) -> Self {
+        self.virtual_folders = Some(folders);
         self
     }
 
@@ -209,13 +224,17 @@ impl FerrofinStreamStatePlanner {
         };
         names.item_name = item.name.clone();
         names.series_name = item.series_name.clone();
-        if let Some(top) = item
-            .top_parent_id
-            .as_deref()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            && let Ok(Some(folder)) = library.get_item_by_id(top).await
+        // The library whose location holds the item (its `TopParentId` is
+        // that location's folder; a row an older scan wrote names the library).
+        if let Some(folders) = &self.virtual_folders
+            && let Ok(folders) = folders.get_virtual_folders().await
         {
-            names.library_name = folder.name;
+            names.library_name = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.name.clone());
         }
         names
     }

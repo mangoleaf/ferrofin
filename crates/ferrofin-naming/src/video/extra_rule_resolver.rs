@@ -24,7 +24,7 @@ pub fn get_extra_info(
 
     let file_name = path::file_name(path_str);
     let file_name_without_extension = path::file_name_without_extension(path_str);
-    // Trim trailing digits so things like `-trailer2` are recognised.
+    // Trim trailing digits so things like `-trailer2` or `sample1` are recognised.
     let trimmed_file_name_without_extension = file_name_without_extension.trim_end_matches(DIGITS);
     let full_directory = path::directory_name(path_str).unwrap_or("");
     let directory_name = path::file_name(full_directory);
@@ -38,7 +38,7 @@ pub fn get_extra_info(
 
         let is_match = match rule.rule_type {
             ExtraRuleType::Filename => {
-                file_name_without_extension.eq_ignore_ascii_case(&rule.token)
+                trimmed_file_name_without_extension.eq_ignore_ascii_case(&rule.token)
             }
             ExtraRuleType::Suffix => {
                 ends_with_ignore_ascii_case(trimmed_file_name_without_extension, &rule.token)

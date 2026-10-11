@@ -1070,20 +1070,26 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
     assert_eq!(scanner.scan_all().await.expect("rescan").unchanged, 1);
 }
 
-/// A new episode in an existing season: it is created, its season (whose
-/// directory mtime moved) is refreshed, and its sibling is left alone. The
-/// series is written only for the date of its newest episode
-/// (`UpdateDateLastMediaAdded`, which upstream's refresh of the series
-/// saves), and so its `DateLastSaved` moves.
+/// A new episode in an existing season: it is created, and its season and
+/// its sibling are left alone — the season too, though its directory's mtime
+/// moved: a directory has no `DateModified` (D2), and
+/// `BaseItem.RequiresRefresh` is false for a `MinValue` one
+/// (`BaseItem.cs:1721-1731`). The series is written only for the date of its
+/// newest episode (`UpdateDateLastMediaAdded`, which upstream's refresh of
+/// the series saves), and so its `DateLastSaved` moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
+async fn a_new_episode_leaves_its_season_and_its_siblings_alone() {
     let tmp = tempfile::tempdir().expect("tmp");
     let tv = tmp.path().join("tv");
     let season = tv.join("Show").join("Season 1");
     std::fs::create_dir_all(&season).expect("mkdir");
     std::fs::write(season.join("Show S01E01.mkv"), b"0123").expect("write");
+    // Two episodes already, so the new one leaves their mixed folder as it
+    // is (a second episode would flip the first's `IsInMixedFolder`, which
+    // upstream's `UpdateFromResolvedItem` saves).
+    std::fs::write(season.join("Show S01E03.mkv"), b"0123").expect("write");
     let (db, scanner) = library(tmp.path(), &tv, CollectionTypeOptions::tvshows, None).await;
-    assert_eq!(scanner.scan_all().await.expect("scan").created, 3);
+    assert_eq!(scanner.scan_all().await.expect("scan").created, 4);
     let saved = |path: PathBuf, kind: BaseItemKind| {
         let db = db.clone();
         async move {
@@ -1105,7 +1111,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         saved(season.clone(), BaseItemKind::Season).await,
     );
     // The directory mtime moves by whole seconds only on some filesystems;
-    // make the drift unambiguous.
+    // make the drift unambiguous, so the season's staying put is not luck.
     std::fs::write(season.join("Show S01E02.mkv"), b"0123").expect("new episode");
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
     std::fs::File::open(&season)
@@ -1117,8 +1123,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         scanner.scan_all().await.expect("rescan"),
         ScanOutcome {
             created: 1,
-            updated: 1,
-            unchanged: 2,
+            unchanged: 4,
             ..ScanOutcome::default()
         }
     );
@@ -1128,7 +1133,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         "its DateLastMediaAdded moved"
     );
     assert_eq!(saved(sibling, BaseItemKind::Episode).await, before.1);
-    assert_ne!(saved(season, BaseItemKind::Season).await, before.2);
+    assert_eq!(saved(season, BaseItemKind::Season).await, before.2);
 }
 
 /// A locked item: an unchanged rescan leaves it alone like any other; a
@@ -2720,10 +2725,12 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
     assert_eq!(number, Some(1));
 }
 
-/// Jellyfin stores a local movie version as a generic Video with a different
-/// path-derived id. Scanning it as a new Movie duplicated it in the library.
+/// Jellyfin 10.11 stores a local movie version as a generic Video with a
+/// different path-derived id. The scan plans a Movie there and moves the row
+/// to the Movie id (owner decision D9b) — one row, never a duplicate, its
+/// version link kept — and the next scan leaves it there.
 #[tokio::test(flavor = "multi_thread")]
-async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
+async fn adopted_generic_video_version_moves_to_the_movie_id_once() {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
     let tmp = tempfile::tempdir().unwrap();
@@ -2741,6 +2748,7 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
         .await
         .unwrap();
     let id = derive_item_id(BaseItemKind::Video, &path.to_string_lossy()).unwrap();
+    let movie = derive_item_id(BaseItemKind::Movie, &path.to_string_lossy()).unwrap();
     alternate.id = guid_to_db(id);
     alternate.path = Some(path.to_string_lossy().into_owned());
     alternate.type_ = "MediaBrowser.Controller.Entities.Video".to_owned();
@@ -2750,12 +2758,26 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
     persistence.save_items(&[alternate]).await.unwrap();
     for _ in 0..2 {
         fx.scan().await;
-        let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as(r#"SELECT "Id", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#)
-                .bind(path.to_string_lossy().as_ref())
-                .fetch_all(fx.db.pool())
-                .await
-                .unwrap();
-        assert_eq!(rows, vec![(guid_to_db(id), Some(primary.clone()))]);
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Type", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#,
+        )
+        .bind(path.to_string_lossy().as_ref())
+        .fetch_all(fx.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                guid_to_db(movie),
+                "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+                Some(primary.clone())
+            )]
+        );
+        let old: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id"=?"#)
+            .bind(guid_to_db(id))
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(old, 0);
     }
 }

@@ -473,32 +473,25 @@ impl FerrofinSimilarItemsManager {
         let Some(type_name) = seed.type_.rsplit('.').next() else {
             return SimilarityPlan::local_only();
         };
-        // The row's `TopParentId` is stored in the DB GUID form (uppercase,
-        // hyphenated) while `VirtualFolderInfo.item_id` is the display form
-        // (lowercase). Compare as parsed `Uuid`s, never as bytes.
-        let Some(top_parent) = seed
-            .top_parent_id
-            .as_deref()
-            .and_then(|id| Uuid::parse_str(id).ok())
-        else {
-            return SimilarityPlan::local_only();
-        };
         let Ok(folders) = library.get_virtual_folders().await else {
             return SimilarityPlan::local_only();
         };
-        let options = folders
-            .iter()
-            .find(|f| {
-                f.item_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) == Some(top_parent)
+        // The seed's library: its location's (or, on a row an older scan
+        // wrote, its collection folder's), as `GetLibraryOptions(item)`
+        // resolves it.
+        let options = ferrofin_model::entities_media::owning_library(
+            &folders,
+            seed.top_parent_id.as_deref(),
+            seed.path.as_deref(),
+        )
+        .and_then(|f| f.library_options.as_ref())
+        .and_then(|o| {
+            o.type_options.iter().find(|t| {
+                t.type_
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case(type_name))
             })
-            .and_then(|f| f.library_options.as_ref())
-            .and_then(|o| {
-                o.type_options.iter().find(|t| {
-                    t.type_
-                        .as_deref()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(type_name))
-                })
-            });
+        });
         let Some(options) = options else {
             // No saved selection: remote similarity is opt-in, so nothing runs
             // and the local scorer is the only provider there is.
