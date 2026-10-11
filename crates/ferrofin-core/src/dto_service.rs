@@ -276,6 +276,9 @@ impl Prefetched {
 }
 use crate::kinds;
 
+/// `(ItemValues.Type, clean value)` keys to resolve.
+type CleanKeys = Vec<(i32, String)>;
+
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
 /// multiple" (backdrops/chapters) — the single-image loop skips
 /// these so they are handled by their own limited fetch.
@@ -1576,7 +1579,26 @@ impl FerrofinDtoService {
         if want.is_empty() {
             return Ok(map);
         }
-        let keys: Vec<(i32, String)> = want.into_iter().collect();
+        // Artists and album artists link to an actual `MusicArtist` item found by
+        // its clean name (`LinkedChildrenService.FindArtists`), independent of
+        // the `ItemValues` rows; a name with no such item has no id at all.
+        let (artist_keys, keys): (CleanKeys, CleanKeys) = want
+            .into_iter()
+            .partition(|(value_type, _)| matches!(value_type, 0 | 1));
+        let artist_cleans: Vec<&String> = artist_keys
+            .iter()
+            .map(|(_, clean)| clean)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let artists =
+            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+                .await?;
+        for (value_type, clean) in artist_keys {
+            if let Some(id) = artists.get(&clean) {
+                map.entry(value_type).or_default().insert(clean, *id);
+            }
+        }
         // Two host variables per key.
         for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
             let ph = (0..chunk.len())
@@ -1584,13 +1606,7 @@ impl FerrofinDtoService {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                r#"SELECT iv."Type", iv."CleanValue",
-                   CASE WHEN iv."Type" IN (0, 1) THEN COALESCE(
-                       (SELECT artist."Id" FROM "BaseItems" artist
-                        WHERE artist."Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
-                          AND artist."CleanName" = iv."CleanValue"
-                        ORDER BY artist."SortName", artist."Id" LIMIT 1), iv."ItemValueId")
-                   ELSE iv."ItemValueId" END
+                r#"SELECT iv."Type", iv."CleanValue", iv."ItemValueId"
                    FROM "ItemValues" iv
                    WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
             );
@@ -1810,42 +1826,39 @@ impl FerrofinDtoService {
     /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are resolved from
     /// the shared `ItemValues` table (`Artist`/`AlbumArtist` value types).
     fn attach_artists(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
-        let artists = split_multi(item.artists.as_deref());
-        if !artists.is_empty() {
-            let items = artists
+        // The distinct, non-blank names that match an actual `MusicArtist` item
+        // (`GetArtists` → `FindArtists`), each paired with that item's id; a name
+        // that matches none is omitted rather than given a made-up id.
+        let pairs = |names: &[String]| -> Vec<NameGuidPair> {
+            let mut seen = std::collections::HashSet::new();
+            names
                 .iter()
-                .map(|name| NameGuidPair {
-                    name: Some(name.clone()),
-                    // Prefer the ALBUM-ARTIST value id: that is the one the
-                    // by-name materializer backs with a browsable MusicArtist
-                    // row, so a performer who is also an album artist links to
-                    // a real page instead of a dangling id. Pure performers
-                    // keep the Artist (0) value id until the artist-hierarchy
-                    // work lands.
-                    id: {
-                        // One clean-key computation serves both lookups.
-                        let clean = prefetched.clean_key(name);
-                        prefetched
-                            .lookup_clean(1, &clean)
-                            .unwrap_or_else(|| prefetched.value_id_clean(0, &clean))
-                    },
+                .filter(|name| !name.trim().is_empty() && seen.insert(name.as_str()))
+                .filter_map(|name| {
+                    let clean = prefetched.clean_key(name);
+                    // Both name kinds resolve to the same `MusicArtist` item.
+                    prefetched
+                        .lookup_clean(0, &clean)
+                        .or_else(|| prefetched.lookup_clean(1, &clean))
+                        .map(|id| NameGuidPair {
+                            name: Some(name.clone()),
+                            id,
+                        })
                 })
-                .collect();
-            dto.artists = Some(artists);
-            dto.artist_items = Some(items);
-        }
+                .collect()
+        };
 
-        let album_artists = split_multi(item.album_artists.as_deref());
-        if !album_artists.is_empty() {
+        // `IHasArtist`: `Artists` is the stored list (an empty array when there
+        // are none), `ArtistItems` its linked subset.
+        let artists = split_multi(item.artists.as_deref());
+        dto.artist_items = Some(pairs(&artists));
+        dto.artists = Some(artists);
+
+        // `IHasAlbumArtist` (not a music video).
+        if row_kind(item) != BaseItemKind::MusicVideo {
+            let album_artists = split_multi(item.album_artists.as_deref());
             dto.album_artist = album_artists.first().cloned();
-            let items = album_artists
-                .iter()
-                .map(|name| NameGuidPair {
-                    name: Some(name.clone()),
-                    id: prefetched.value_id(1, name), // 1 = AlbumArtist
-                })
-                .collect();
-            dto.album_artists = Some(items);
+            dto.album_artists = Some(pairs(&album_artists));
         }
     }
 
@@ -8765,6 +8778,9 @@ mod tests {
         // (1) row, which is the browsable one.
         let artist_id = seed_value(0, "Sigur Rós").await;
         let album_artist_id = seed_value(1, "sigur ros").await;
+        // The browsable artist: a `MusicArtist` item with that clean name.
+        let artist_item = Uuid::from_u128(0xA_9999);
+        crate::test_support::seed_music_artist_item(&db, artist_item, "Sigur Rós").await;
 
         let movie = Uuid::from_u128(0xA_1234);
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
@@ -8808,14 +8824,99 @@ mod tests {
         let genres = dtos[0].genre_items.as_ref().expect("genre items");
         assert_eq!(genres[0].id, genre_id, "genre id");
 
+        // The links are the `MusicArtist` item whose clean name matches
+        // (`FindArtists`), never an `ItemValues` id.
         let artists = dtos[1].artist_items.as_ref().expect("artist items");
-        assert_eq!(
-            artists[0].id, album_artist_id,
-            "performer prefers the AlbumArtist value id"
-        );
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].id, artist_item, "performer links to the item");
         assert_ne!(artists[0].id, artist_id);
+        assert_ne!(artists[0].id, album_artist_id);
         let album_artists = dtos[1].album_artists.as_ref().expect("album artists");
-        assert_eq!(album_artists[0].id, album_artist_id, "album-artist id");
+        assert_eq!(album_artists[0].id, artist_item, "album-artist id");
+    }
+
+    /// `DtoService` pairs only the distinct, non-blank artist names that match a
+    /// `MusicArtist` item; the plain `Artists` list stays whole, and a track or
+    /// album with no tags still carries empty arrays (the shape strict clients
+    /// expect). A music video has artists but no album artists.
+    #[tokio::test]
+    async fn artist_pairs_cover_only_names_with_a_music_artist_item() {
+        use crate::test_support::{seed_item_with_artists, seed_music_artist_item};
+        let db = test_db().await;
+        let artist = Uuid::from_u128(0xC_0001);
+        seed_music_artist_item(&db, artist, "Known").await;
+        let track = Uuid::from_u128(0xC_0002);
+        seed_item_with_artists(
+            &db,
+            track,
+            BaseItemKind::Audio,
+            "Track",
+            Some("Known|Known|Unknown|Known"),
+            Some("Unknown|Known"),
+        )
+        .await;
+        let bare = Uuid::from_u128(0xC_0003);
+        seed_named_item(&db, bare, BaseItemKind::Audio, "Bare").await;
+        let video = Uuid::from_u128(0xC_0004);
+        seed_item_with_artists(
+            &db,
+            video,
+            BaseItemKind::MusicVideo,
+            "Clip",
+            Some("Known"),
+            Some("Known"),
+        )
+        .await;
+        let mut rows = Vec::new();
+        for id in [track, bare, video] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let dtos = service(db)
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+
+        let names = |pairs: &Option<Vec<NameGuidPair>>| -> Vec<String> {
+            pairs
+                .as_ref()
+                .expect("a list")
+                .iter()
+                .map(|pair| pair.name.clone().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(
+            dtos[0].artists.as_deref(),
+            Some(
+                &[
+                    "Known".to_owned(),
+                    "Known".to_owned(),
+                    "Unknown".to_owned(),
+                    "Known".to_owned()
+                ][..]
+            ),
+            "the stored list is untouched"
+        );
+        assert_eq!(
+            names(&dtos[0].artist_items),
+            ["Known"],
+            "distinct, linked only"
+        );
+        assert_eq!(dtos[0].artist_items.as_ref().unwrap()[0].id, artist);
+        assert_eq!(names(&dtos[0].album_artists), ["Known"]);
+        assert_eq!(
+            dtos[0].album_artist.as_deref(),
+            Some("Unknown"),
+            "the first stored name"
+        );
+
+        assert_eq!(dtos[1].artists.as_deref(), Some(&[][..]));
+        assert_eq!(names(&dtos[1].artist_items), Vec::<String>::new());
+        assert_eq!(names(&dtos[1].album_artists), Vec::<String>::new());
+        assert_eq!(dtos[1].album_artist, None);
+
+        assert_eq!(names(&dtos[2].artist_items), ["Known"]);
+        assert_eq!(dtos[2].album_artists, None, "IHasArtist only");
+        assert_eq!(dtos[2].album_artist, None);
     }
 
     /// Every credit spelling on the page must resolve to the ONE by-name `Person`

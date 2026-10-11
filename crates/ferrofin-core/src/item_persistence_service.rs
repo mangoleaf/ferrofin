@@ -79,7 +79,7 @@ type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
 
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
-/// (tags, artists — handled elsewhere).
+/// (tags — handled elsewhere).
 ///
 /// Genre (2) is the one that needs a companion: Jellyfin keeps a **separate**
 /// `MusicGenre` item for the same value when the owner is a music item — one
@@ -87,7 +87,7 @@ type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
 /// alone. See [`music_genre_row`], which materializes it.
 fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
     match value_type {
-        1 => Some(BaseItemKind::MusicArtist),
+        0 | 1 => Some(BaseItemKind::MusicArtist),
         2 => Some(BaseItemKind::Genre),
         3 => Some(BaseItemKind::Studio),
         _ => None,
@@ -110,12 +110,12 @@ fn by_name_value_type(kind: BaseItemKind) -> Option<i32> {
 /// The stored CLR type name of the row [`by_name_kind`] names.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
-        // AlbumArtist (1) is the canonical artist identity — it materializes the
-        // browsable MusicArtist item (so /Artists + /Artists/AlbumArtists resolve
-        // real rows and artist bio/artwork attaches, keyed on MusicBrainzAlbumArtist).
-        // Artist (0, track performer) stays an ItemValue for filtering only, so a
-        // name that is both doesn't produce two MusicArtist rows.
-        1 => stored_type_name(BaseItemKind::MusicArtist),
+        // Every artist name — AlbumArtist (1) and performer Artist (0) alike —
+        // materializes a browsable MusicArtist item, as the artists validator
+        // makes one for each of `GetAllArtistNames()`; the insert is guarded by
+        // type and clean name, so a name that is both has one row. The track's
+        // `ArtistItems` link to these items by clean name.
+        0 | 1 => stored_type_name(BaseItemKind::MusicArtist),
         2 => stored_type_name(BaseItemKind::Genre),
         3 => stored_type_name(BaseItemKind::Studio),
         _ => None,
@@ -5370,9 +5370,9 @@ mod tests {
         assert_eq!(tags, 0, "tags are not browsable by-name items");
     }
 
-    // AlbumArtist (1) materializes a browsable MusicArtist row sharing the
-    // ItemValueId; Artist (0) stays a filter-only value (no MusicArtist row), so
-    // a name that is both does not produce a duplicate artist item.
+    // Every artist name — a performer (Artist, 0) and an album artist (1) alike —
+    // materializes one browsable MusicArtist row sharing an ItemValueId, so the
+    // track's `ArtistItems` can link to it; a name that is both has ONE row.
     #[tokio::test]
     async fn save_item_values_materializes_music_artist_items() {
         let db = test_db().await;
@@ -5392,8 +5392,7 @@ mod tests {
         .await
         .expect("save values");
 
-        // Exactly one MusicArtist row per distinct album-artist name, each id
-        // equal to its AlbumArtist ItemValueId. No row for the Artist-only name.
+        // Exactly one MusicArtist row per distinct artist name.
         let rows: Vec<(String, String)> = sqlx::query_as(
             r#"SELECT bi."Name", bi."Id"
                FROM "BaseItems" bi
@@ -5404,25 +5403,23 @@ mod tests {
         .await
         .expect("query artists");
         let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["Miles Davis", "Various Artists"]);
+        assert_eq!(
+            names,
+            vec!["John Coltrane", "Miles Davis", "Various Artists"]
+        );
         for (name, id) in &rows {
-            let value_id: String = sqlx::query_scalar(
-                r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = 1 AND "Value" = ?1"#,
+            // The id is the ItemValueId of whichever value of that name wrote
+            // the row first (the performer, for a name that is both).
+            let value_ids: Vec<String> = sqlx::query_scalar(
+                r#"SELECT "ItemValueId" FROM "ItemValues"
+                   WHERE "Type" IN (0, 1) AND "Value" = ?1"#,
             )
             .bind(name)
-            .fetch_one(db.pool())
+            .fetch_all(db.pool())
             .await
-            .expect("value id");
-            assert_eq!(id, &value_id, "artist item id is the AlbumArtist value id");
+            .expect("value ids");
+            assert!(value_ids.contains(id), "{name}: {id} not in {value_ids:?}");
         }
-        // The Artist-only performer got an ItemValue but no MusicArtist row.
-        let coltrane: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'John Coltrane'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("count");
-        assert_eq!(coltrane, 0);
     }
 
     /// The by-name materializer must be a NO-OP once the scanner has resolved a

@@ -11217,3 +11217,40 @@ mod folder_forced_sort_tests {
         );
     }
 }
+
+/// The id of the `MusicArtist` item for each clean artist name in `cleans`
+/// (`LinkedChildrenService.FindArtists`): a name with no such item is absent
+/// from the map; when several match, the first by sort name, then id.
+///
+/// # Errors
+///
+/// A database error.
+pub(crate) async fn music_artist_ids_by_clean_name(
+    db: &Database,
+    cleans: &[&String],
+) -> Result<HashMap<String, Uuid>, ServiceError> {
+    let mut ids: HashMap<String, Uuid> = HashMap::new();
+    for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            r#"SELECT "CleanName", "Id" FROM "BaseItems"
+               WHERE "Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
+                 AND "CleanName" IN ({placeholders})
+               ORDER BY "SortName", "Id""#,
+        );
+        let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+        for clean in chunk {
+            query = query.bind(clean.as_str());
+        }
+        let rows = query
+            .fetch_all(db.pool())
+            .await
+            .map_err(|error| ServiceError::backend(error.to_string()))?;
+        for (clean, id) in rows {
+            if let Ok(uuid) = Uuid::parse_str(&id) {
+                ids.entry(clean).or_insert(uuid);
+            }
+        }
+    }
+    Ok(ids)
+}
