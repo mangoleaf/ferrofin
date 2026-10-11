@@ -432,18 +432,20 @@ async fn serve_once(
     // muxer turns out to be missing, because waiting to learn whether it IS
     // missing is exactly the 15 ms serial spawn this removes; the answer is
     // simply discarded when the muxer is present.
+    // `MediaEncoder.SetFFmpegPath`'s middle rung: the encoding configuration's
+    // saved `EncoderAppPath`, between the command line and `$PATH`.
+    let saved_encoder_path = bootstrap::persisted_encoder_app_path(&config.config_dir);
     let (db, ffmpeg, fpcalc) = tokio::join!(
         open_database(config),
-        discover_ffmpeg(config, None),
+        discover_ffmpeg(config, saved_encoder_path.as_deref()),
         ferrofin_extensions::fingerprint::discover_fpcalc_async(),
     );
     boot_stage(started, "db+encoder probe");
     let db = db?;
 
     // ffmpeg is required for playback but not for the server to boot: warn and
-    // continue so the API comes up even on a host without ffmpeg installed.
-    // `system.json` EncoderAppPath is not yet loaded at this bootstrap stage, so
-    // no persisted fallback is supplied here.
+    // continue so the API comes up even on a host without ffmpeg installed
+    // (a documented difference from Jellyfin, which aborts startup).
     let ffmpeg = encoder_or_disabled(ffmpeg);
 
     // Wire every concrete manager into the shared AppState (the composition root).
