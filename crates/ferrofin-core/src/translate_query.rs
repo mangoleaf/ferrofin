@@ -2181,6 +2181,13 @@ fn pins_sort_plan(by: ItemSortBy, order: SortOrder, filter: &InternalItemsQuery)
 /// `bi."SortName"` column (rather than a correlated sub-select or another
 /// column).
 fn orders_by_sort_name_column(by: ItemSortBy, filter: &InternalItemsQuery) -> bool {
+    // The `ItemValues`-correlated keys are sub-selects of their own.
+    if matches!(
+        by,
+        ItemSortBy::Artist | ItemSortBy::AlbumArtist | ItemSortBy::Studio
+    ) {
+        return false;
+    }
     // The user-data keys become correlated sub-selects when a user is present;
     // without one they fall through to the column like everything else.
     if filter.user_id().is_some()
@@ -2412,8 +2419,16 @@ fn push_order_expression(
                     ItemSortBy::IsFavoriteOrLiked => r#""IsFavorite""#,
                     _ => r#""Played""#,
                 };
-                // `Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`.
-                if by == ItemSortBy::IsFavoriteOrLiked {
+                // `Select((bool?)f.IsFavorite).FirstOrDefault() ?? false`, and
+                // the same for the played flag: an item the user has no row for
+                // is not played, so it ties with one whose row says so (measured
+                // against Jellyfin 12.2: never-played items list by name,
+                // whether or not they carry a row).
+                let nullable_flag = matches!(
+                    by,
+                    ItemSortBy::IsFavoriteOrLiked | ItemSortBy::IsPlayed | ItemSortBy::IsUnplayed
+                );
+                if nullable_flag {
                     qb.push("COALESCE(");
                 }
                 qb.push(format!(
@@ -2422,7 +2437,7 @@ fn push_order_expression(
                 ))
                 .push_bind(uid)
                 .push(r#" ORDER BY oud."CustomDataKey" LIMIT 1)"#);
-                if by == ItemSortBy::IsFavoriteOrLiked {
+                if nullable_flag {
                     qb.push(", 0)");
                 }
                 // IsUnplayed inverts the played flag (OrderMapper sorts `!IsPlayed`).
@@ -2433,6 +2448,22 @@ fn push_order_expression(
             }
             _ => {}
         }
+    }
+    // `OrderMapper`'s `ItemValues`-correlated keys: the first value of the type
+    // by its clean (ordinal) text — `Studio`, `Artist`, `AlbumArtist`.
+    if let Some(value_type) = match by {
+        ItemSortBy::Artist => Some(0),
+        ItemSortBy::AlbumArtist => Some(1),
+        ItemSortBy::Studio => Some(3),
+        _ => None,
+    } {
+        qb.push(format!(
+            r#"(SELECT iv."CleanValue" FROM "ItemValuesMap" ivm
+                JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                WHERE ivm."ItemId" = bi."Id" AND iv."Type" = {value_type}
+                ORDER BY iv."CleanValue" LIMIT 1)"#
+        ));
+        return;
     }
     qb.push(order_column(by, filter.user_id().is_some()));
 }
@@ -2477,9 +2508,8 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
-        // Name/SortName, and the join-backed keys (`Artist`, `AlbumArtist`,
-        // `Studio`: v12 orders by the first ItemValue of the type — an open work
-        // item) fall back to SortName.
+        // Name/SortName fall back to SortName (the join-backed keys `Artist`,
+        // `AlbumArtist` and `Studio` are expressions of their own).
         _ => r#"bi."SortName""#,
     }
 }
