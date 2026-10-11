@@ -1423,6 +1423,24 @@ pub async fn build_app_state(
             Arc::clone(&providers),
         )
         .with_live_tv(Arc::clone(&live_tv))
+        // `GetPlaybackMediaSources`' forced probe of a `.strm` shortcut or an
+        // item with no main stream: a full refresh of that file with the
+        // remote content probe on, awaited before the sources are read again.
+        .with_remote_probe({
+            let scanner = Arc::clone(&library_scanner);
+            Arc::new(move |path: String| {
+                let scanner = Arc::clone(&scanner);
+                Box::pin(async move {
+                    let options = ferrofin_traits::providers::MetadataRefreshOptions {
+                        metadata_refresh_mode:
+                            ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+                        enable_remote_content_probe: true,
+                        ..Default::default()
+                    };
+                    scanner.scan_paths_with(&[path], &options).await.map(|_| ())
+                })
+            })
+        })
         // `GetPlaybackMediaSources`' per-user overwrite of
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.

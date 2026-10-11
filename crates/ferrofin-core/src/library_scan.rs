@@ -75,6 +75,7 @@ use crate::refresh_plan::{
     FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
     ProbeKind, RefreshRequest, StoredState,
 };
+use crate::shortcut;
 use music::{MusicKind, MusicRefresh};
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
@@ -1146,6 +1147,9 @@ fn probe_request(entity: &BaseItemEntity) -> Option<MediaInfoRequest> {
 struct ExternalProbe {
     resolvers: Arc<ExternalStreamResolvers>,
     internal_metadata_path: Option<String>,
+    /// The file the sidecars sit beside when it is not the one probed: a
+    /// `.strm` shortcut's own path, while ffprobe reads its remote target.
+    sidecar_path: Option<String>,
 }
 
 /// The scan-wide external-stream seam handed to the probe pipeline: the
@@ -1168,6 +1172,7 @@ impl ExternalProbeSeam {
                 .as_ref()
                 .map(|root| root.join(&dashless[..2]).join(&dashless))
                 .map(|p| p.to_string_lossy().into_owned()),
+            sidecar_path: None,
         }
     }
 }
@@ -1217,7 +1222,15 @@ fn spawn_probe(
                 return None;
             }
         };
-        if let (Some(external), Some(path)) = (external, request.media_source.path.as_deref()) {
+        let sidecar_path = external
+            .as_ref()
+            .and_then(|external| external.sidecar_path.clone());
+        if let (Some(external), Some(path)) = (
+            external,
+            sidecar_path
+                .as_deref()
+                .or(request.media_source.path.as_deref()),
+        ) {
             let target = external
                 .resolvers
                 .target_for(path, external.internal_metadata_path);
@@ -1279,6 +1292,9 @@ struct ProbePipeline<'a> {
     slots: Option<Arc<tokio::sync::Semaphore>>,
     fanout: Option<Arc<fanout::Budget>>,
     current: Option<usize>,
+    /// The remote target each `.strm` item probes instead of its own file, by
+    /// plan index — only in a refresh that enables the remote content probe.
+    shortcuts: std::collections::HashMap<usize, String>,
 }
 
 impl<'a> ProbePipeline<'a> {
@@ -1310,7 +1326,35 @@ impl<'a> ProbePipeline<'a> {
             slots: None,
             fanout: None,
             current: None,
+            shortcuts: std::collections::HashMap::new(),
         }
+    }
+
+    /// A `.strm` shortcut is never probed through its own file: a scan reads
+    /// only its target (`FFProbeVideoInfo`: `!item.IsShortcut ||
+    /// EnableRemoteContentProbe`), so its probe is dropped here — and with
+    /// `remote` the item instead probes the target the file names.
+    fn with_remote_content_probe(mut self, remote: bool) -> Self {
+        for (index, item) in self.planned.iter().enumerate() {
+            let Some(path) = item.entity.path.as_deref().filter(|p| shortcut::is_strm(p)) else {
+                continue;
+            };
+            if self.eligible.get(index).copied().flatten().is_none() {
+                continue;
+            }
+            // Blocking, but only a remote-probe refresh (one playback) reads here.
+            let target = remote
+                .then(|| std::fs::read_to_string(path).ok())
+                .flatten()
+                .and_then(|contents| shortcut::remote_target(&contents));
+            match target {
+                Some(target) => {
+                    self.shortcuts.insert(index, target);
+                }
+                None => self.eligible[index] = None,
+            }
+        }
+        self
     }
 
     fn with_fanout(mut self, fanout: Option<Arc<fanout::Budget>>) -> Self {
@@ -1366,8 +1410,13 @@ impl<'a> ProbePipeline<'a> {
         while self.next < self.eligible.len().min(self.decided) {
             let index = self.next;
             if self.eligible[index].is_some()
-                && let Some(request) = probe_request(&self.planned[index].entity)
+                && let Some(mut request) = probe_request(&self.planned[index].entity)
             {
+                let shortcut = self.shortcuts.get(&index);
+                if let Some(target) = shortcut {
+                    request.media_source.protocol = shortcut::path_protocol(target);
+                    request.media_source.path = Some(target.clone());
+                }
                 let permit = if self.current == Some(index) {
                     None
                 } else if let Some(budget) = &self.fanout {
@@ -1385,7 +1434,13 @@ impl<'a> ProbePipeline<'a> {
                     .externals
                     .as_ref()
                     .filter(|_| !request.media_is_audio)
-                    .map(|seam| seam.for_item(self.planned[index].id));
+                    .map(|seam| {
+                        let mut external = seam.for_item(self.planned[index].id);
+                        // The sidecars sit beside the `.strm`, not its target.
+                        external.sidecar_path =
+                            shortcut.and(self.planned[index].entity.path.clone());
+                        external
+                    });
                 let is_audio = request.media_is_audio;
                 self.inflight.push_back((
                     index,
@@ -4660,7 +4715,7 @@ impl LibraryScanner {
         // reads, so it runs `probe_concurrency` files ahead of this loop — as
         // far as the items whose refresh plan is known, i.e. to the end of the
         // stored-row window. The loop itself keeps plan order.
-        let mut probes = self.probe_pipeline(&planned);
+        let mut probes = self.probe_pipeline(&planned, run.options);
         let mut reported = 0;
         // What the closing passes take from the walk: the albums and artists
         // whose music refresh it decided, and those a lane refresh served
@@ -5246,6 +5301,7 @@ impl LibraryScanner {
             entity.parent_index_number = guesses.parent_index_number;
         }
         let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
+        Self::apply_shortcut(&mut entity, plan.probe).await;
         // "Identify → Apply" (`POST /Items/RemoteSearch/Apply`): the chosen
         // result rides on the options of the items the refresh covers.
         // `ApplySearchResult` (`MetadataService.cs:272-293`) hands a season or
@@ -7398,13 +7454,18 @@ impl LibraryScanner {
     /// need the naming options' extension/flag tables, the language lookup
     /// (the configured localization, else the default culture set — the
     /// lookup itself is culture-table-only), the encoder, and the filesystem.
-    fn probe_pipeline<'a>(&self, planned: &'a [Planned]) -> ProbePipeline<'a> {
+    fn probe_pipeline<'a>(
+        &self,
+        planned: &'a [Planned],
+        options: &MetadataRefreshOptions,
+    ) -> ProbePipeline<'a> {
         ProbePipeline::new(
             self.media_encoder.clone(),
             self.external_probe_seam(),
             planned,
             self.probe_concurrency,
         )
+        .with_remote_content_probe(options.enable_remote_content_probe)
         .sharing(Arc::clone(&self.probe_slots))
         .with_fanout(self.scan_fanout.clone())
     }
@@ -7620,6 +7681,29 @@ impl LibraryScanner {
     /// probe-eligible or ffprobe failed (missing ffmpeg, unreadable file) —
     /// both leave the row exactly as the plan built it, still browsable, so one
     /// bad file never aborts a whole library scan.
+    /// A `.strm` item's shortcut facts (`BaseVideoResolver`/`AudioResolver`
+    /// `IsShortcut`, `ProbeProvider.FetchShortcutInfo` `ShortcutPath`), written
+    /// into its `Data`. The target is read only when the probe runs; a file with
+    /// no usable remote line leaves the target the item already had.
+    async fn apply_shortcut(entity: &mut BaseItemEntity, probing: bool) {
+        let Some(path) = entity
+            .path
+            .clone()
+            .filter(|path| shortcut::is_strm(path))
+            .filter(|_| !entity.is_folder)
+            .filter(|_| matches!(entity.media_type.as_deref(), Some("Video" | "Audio")))
+        else {
+            return;
+        };
+        let mut fields = vec![("IsShortcut", Some(serde_json::json!(true)))];
+        if probing && let Some(target) = shortcut::read_target(&path).await {
+            fields.push(("ShortcutPath", Some(serde_json::json!(target))));
+        }
+        if let Some(data) = crate::item_data::merge_data_fields(entity.data.as_deref(), &fields) {
+            entity.data = Some(data);
+        }
+    }
+
     fn apply_probe(
         entity: &mut BaseItemEntity,
         probed: Option<&MediaInfo>,
@@ -15056,6 +15140,22 @@ fn merge_onto_stored(
     row
 }
 
+/// A `.strm` item's `IsShortcut`/`ShortcutPath` are the resolver's and the
+/// probe provider's own, not provider metadata: what this scan read lays over
+/// the saved row, and a scan that read nothing leaves the stored target be.
+fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
+    let data = crate::item_data::parse_data(scanned.data.as_deref());
+    let fields: Vec<_> = ["IsShortcut", "ShortcutPath"]
+        .into_iter()
+        .filter_map(|key| data.get(key).cloned().map(|value| (key, Some(value))))
+        .collect();
+    if !fields.is_empty()
+        && let Some(merged) = crate::item_data::merge_data_fields(row.data.as_deref(), &fields)
+    {
+        row.data = Some(merged);
+    }
+}
+
 /// Restores direct probe properties after the provider metadata merge. A
 /// completed video probe owns its nullable stream index regardless of the
 /// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
@@ -15093,6 +15193,7 @@ fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
 /// kind, `TotalBitrate` and the video `Width`/`Height` (a photo's come from
 /// its EXIF reader).
 fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_ran: bool) {
+    overlay_shortcut_data(row, scanned);
     if let Some(data) =
         crate::item_data::with_resolved_video_type(row.data.as_deref(), scanned.data.as_deref())
     {

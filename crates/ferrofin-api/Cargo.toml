@@ -44,6 +44,8 @@ libc.workspace = true
 tower.workspace = true
 tower-http = { workspace = true, features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 tokio = { workspace = true }
+# The proxy behind a static remote stream (a `.strm` shortcut's target).
+reqwest.workspace = true
 # The `Stream` impl behind the progressive Live TV response bodies.
 futures-core.workspace = true
 futures-util.workspace = true

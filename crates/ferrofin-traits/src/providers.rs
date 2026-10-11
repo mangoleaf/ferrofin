@@ -119,6 +119,12 @@ pub struct MetadataRefreshOptions {
     /// trickplay tiles during the refresh (upstream's `TrickplayProvider`
     /// honours it only in a `FullRefresh`).
     pub regenerate_trickplay: bool,
+    /// `MetadataRefreshOptions.EnableRemoteContentProbe`: probe a `.strm`
+    /// shortcut's remote target. A library scan never does
+    /// (`FFProbeVideoInfo`: `!item.IsShortcut || EnableRemoteContentProbe`);
+    /// opening an item for playback with a probe allowed does
+    /// (`MediaSourceManager.GetPlaybackMediaSources`).
+    pub enable_remote_content_probe: bool,
 }
 
 impl Default for MetadataRefreshOptions {
@@ -133,6 +139,7 @@ impl Default for MetadataRefreshOptions {
             remove_old_metadata: false,
             force_save: false,
             regenerate_trickplay: false,
+            enable_remote_content_probe: false,
         }
     }
 }
@@ -162,6 +169,7 @@ impl MetadataRefreshOptions {
                 || replace_all_images
                 || replace_all_metadata,
             regenerate_trickplay,
+            enable_remote_content_probe: false,
         }
     }
 }

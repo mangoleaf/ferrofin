@@ -18,22 +18,120 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Resolves the direct-play file path for an item's first static media source.
+/// What a static (direct-play) request is served from: the first static media
+/// source with a path — a file on disk, or a remote URL the item stands for
+/// (a `.strm` shortcut's target).
+pub(crate) struct StaticSource {
+    /// The file path or remote URL.
+    pub path: String,
+    /// The protocol the path is read over.
+    pub protocol: ferrofin_model::media_info::MediaProtocol,
+}
+
+/// Resolves the direct-play source for an item's first static media source.
 ///
 /// Ports the direct-stream lookup shared by the streaming controllers: the item's
-/// static (non-probed) source's on-disk `Path`. Returns `404` when the item has no
-/// static media source, or that source has no on-disk path (nothing to
+/// static (non-probed) source's `Path` and `Protocol`. Returns `404` when the
+/// item has no static media source, or that source has no path (nothing to
 /// direct-stream). The transcoding parameters the controllers accept are ignored
 /// here — only the static path is served.
-pub(crate) async fn stream_path(state: &AppState, item_id: Uuid) -> Result<String, ApiError> {
+pub(crate) async fn static_source(
+    state: &AppState,
+    item_id: Uuid,
+) -> Result<StaticSource, ApiError> {
     let sources = state
         .media_sources
         .get_static_media_sources(item_id, true, None)
         .await?;
     sources
         .into_iter()
-        .find_map(|s| s.path)
+        .find_map(|source| {
+            Some(StaticSource {
+                path: source.path?,
+                protocol: source.protocol,
+            })
+        })
         .ok_or_else(|| ApiError::NotFound(format!("no direct stream for item {item_id}")))
+}
+
+/// Serves a static source: a file with `Range` support, an HTTP(S) target by
+/// proxying it, anything else is refused.
+///
+/// Port of the static branches of `VideosController.GetVideoStream`: an HTTP
+/// input goes through `GetStaticRemoteStreamResult`, any other non-file
+/// protocol is `400 Input protocol … cannot be streamed statically`.
+pub(crate) async fn serve_static_source(
+    source: StaticSource,
+    request: Request,
+) -> Result<Response, ApiError> {
+    use ferrofin_model::media_info::MediaProtocol;
+    match source.protocol {
+        MediaProtocol::File => serve_static_file(&source.path, request).await,
+        MediaProtocol::Http => serve_remote_static(&source.path, request).await,
+        other => Err(ApiError::BadRequest(format!(
+            "Input protocol {other:?} cannot be streamed statically"
+        ))),
+    }
+}
+
+/// `FileStreamResponseHelpers.GetStaticRemoteStreamResult`: relays the remote
+/// target's body to the client, forwarding the client's `Range` and answering
+/// with the upstream status, `Accept-Ranges` (`none` when the upstream does not
+/// offer ranges), `Content-Range`, `Content-Length` and `Content-Type`
+/// (`application/octet-stream` when it names none).
+async fn serve_remote_static(url: &str, request: Request) -> Result<Response, ApiError> {
+    use axum::http::{HeaderValue, StatusCode, header};
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(reqwest::Client::new);
+    let method = if request.method() == axum::http::Method::HEAD {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+    let mut upstream = client.request(method, url);
+    if let Some(range) = request
+        .headers()
+        .get(header::RANGE)
+        .filter(|range| !range.is_empty())
+    {
+        upstream = upstream.header(header::RANGE, range.as_bytes());
+    }
+    let response = upstream.send().await.map_err(|error| {
+        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+            "remote stream request failed: {error}"
+        )))
+    })?;
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let headers = response.headers();
+    let accept_ranges = headers.get(header::ACCEPT_RANGES).cloned();
+    let supports_range = status == StatusCode::PARTIAL_CONTENT
+        || accept_ranges
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains("bytes"));
+    let mut builder = Response::builder().status(status).header(
+        header::ACCEPT_RANGES,
+        accept_ranges.unwrap_or_else(|| {
+            HeaderValue::from_static(if supports_range { "bytes" } else { "none" })
+        }),
+    );
+    for name in [header::CONTENT_RANGE, header::CONTENT_LENGTH] {
+        if let Some(value) = headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = builder.header(
+        header::CONTENT_TYPE,
+        headers
+            .get(header::CONTENT_TYPE)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream")),
+    );
+    let body = Body::from_stream(response.bytes_stream());
+    builder
+        .body(body)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 /// Serves the file at `path` for `request` **with range processing disabled**.

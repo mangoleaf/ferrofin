@@ -16,7 +16,7 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
-use crate::handlers::streaming::{serve_static_file, stream_path};
+use crate::handlers::streaming::{serve_static_file, serve_static_source, static_source};
 use crate::state::AppState;
 
 /// `GET`/`HEAD /Videos/{itemId}/stream` — serve the item's video file.
@@ -34,8 +34,8 @@ async fn get_video_stream(
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     crate::handlers::hls::validate_stream_request(&req)?;
     if req.is_static {
-        let path = stream_path(&state, item_id).await?;
-        return serve_static_file(&path, request).await;
+        let source = static_source(&state, item_id).await?;
+        return serve_static_source(source, request).await;
     }
     crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
 }
@@ -59,8 +59,8 @@ async fn get_video_stream_by_container(
     );
     crate::handlers::hls::validate_stream_request(&req)?;
     if req.is_static {
-        let path = stream_path(&state, item_id).await?;
-        return serve_static_file(&path, request).await;
+        let source = static_source(&state, item_id).await?;
+        return serve_static_source(source, request).await;
     }
     crate::handlers::hls::transcode_stream_fallback(&state, item_id, false, req, request).await
 }

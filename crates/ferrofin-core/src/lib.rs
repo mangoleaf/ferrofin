@@ -228,6 +228,7 @@ pub mod server_discovery;
 pub mod session_bus;
 pub mod session_manager;
 pub mod session_websocket_listener;
+mod shortcut;
 pub mod similar_items_manager;
 mod similar_items_repository;
 pub mod subtitle_downloader;

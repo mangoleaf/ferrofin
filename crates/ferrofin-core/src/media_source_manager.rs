@@ -73,6 +73,9 @@ pub struct FerrofinMediaSourceManager {
     /// Guarded by a `std::sync::Mutex` because the guard never spans an
     /// `.await`.
     open_streams: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
+    /// Refreshes an item's file with the remote content probe on
+    /// (`GetPlaybackMediaSources`' forced `FullRefresh`), awaiting the result.
+    remote_probe: Option<RemoteProbe>,
     /// What a live stream's probe found, keyed by the open token that names it.
     ///
     /// Port of `LiveStreamHelper`'s `{cache}/mediainfo/{md5(cacheKey)}.json`
@@ -111,7 +114,50 @@ impl FerrofinMediaSourceManager {
             localization: None,
             open_streams: Arc::new(Mutex::new(HashMap::new())),
             probe_cache: Arc::new(Mutex::new(HashMap::new())),
+            remote_probe: None,
         }
+    }
+
+    /// The path of the item a playback must refresh with the remote probe
+    /// first (`GetPlaybackMediaSources`): a `.strm`, or a video/audio item whose
+    /// first source (never a placeholder) has no stream of its main type.
+    async fn playback_probe_path(
+        &self,
+        item_id: Uuid,
+        sources: &[MediaSourceInfo],
+    ) -> Result<Option<String>, ServiceError> {
+        let Some(first) = sources
+            .first()
+            .filter(|source| source.type_ != MediaSourceType::Placeholder)
+        else {
+            return Ok(None);
+        };
+        let Some(item) = self.items.retrieve_item(item_id).await? else {
+            return Ok(None);
+        };
+        let Some(path) = item.path.clone().filter(|path| !path.is_empty()) else {
+            return Ok(None);
+        };
+        let lacks = |wanted: MediaStreamType| {
+            first
+                .media_streams
+                .iter()
+                .all(|stream| stream.stream_type != wanted)
+        };
+        let probe = crate::shortcut::is_strm(&path)
+            || (item.media_type.as_deref() == Some("Video") && lacks(MediaStreamType::Video))
+            || (item.media_type.as_deref() == Some("Audio") && lacks(MediaStreamType::Audio));
+        Ok(probe.then_some(path))
+    }
+
+    /// Wires the refresh a playback with a probe allowed forces on a `.strm`
+    /// shortcut or an item with no main stream: given the item's path it
+    /// refreshes it with `EnableRemoteContentProbe` and a `FullRefresh`, and
+    /// returns once the new probe is stored.
+    #[must_use]
+    pub fn with_remote_probe(mut self, probe: RemoteProbe) -> Self {
+        self.remote_probe = Some(probe);
+        self
     }
 
     /// Wires the Live TV manager so playback can resolve channel ids to their
@@ -390,12 +436,61 @@ impl FerrofinMediaSourceManager {
             bitrate: item.total_bitrate.and_then(|b| i32::try_from(b).ok()),
             ..Default::default()
         };
+        apply_remote_shortcut(&mut source, item);
+        // `info.SupportsDirectStream = MediaSourceManager.SupportsDirectStream(
+        // info.Path, info.Protocol)` for any source that still has a path.
+        if source.supports_direct_stream && source.path.as_deref().is_some_and(|p| !p.is_empty()) {
+            source.supports_direct_stream =
+                supports_direct_stream(source.path.as_deref(), source.protocol);
+        }
         // Sum the internal streams' bit rates into the source total
         // (`MediaSourceInfo.InferTotalBitrate`).
         source.infer_total_bitrate(false);
         source
     }
 }
+
+/// `BaseItem.GetVersionInfo`'s shortcut arm: a video `.strm` whose
+/// `ShortcutPath` names a remote target is served from that target (remote,
+/// over its own protocol, with the container the remote probe found). A target
+/// on the local file protocol is never followed — a `.strm` could otherwise
+/// name any file the server can read — so the source keeps the `.strm` path.
+fn apply_remote_shortcut(source: &mut MediaSourceInfo, item: &BaseItemEntity) {
+    if item.media_type.as_deref() != Some("Video") {
+        return;
+    }
+    let data = crate::item_data::parse_data(item.data.as_deref());
+    if data.get("IsShortcut").and_then(serde_json::Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(target) = crate::item_data::read_data_string(&data, "ShortcutPath")
+        .filter(|target| !target.is_empty())
+    else {
+        return;
+    };
+    let protocol = crate::shortcut::path_protocol(&target);
+    if protocol == MediaProtocol::File {
+        return;
+    }
+    source.is_remote = true;
+    source.path = Some(target);
+    source.protocol = protocol;
+    if let Some(container) =
+        crate::item_data::read_data_string(&data, "Container").filter(|c| !c.is_empty())
+    {
+        source.container = Some(container);
+    }
+}
+
+/// Refreshes the item at a path with the remote content probe enabled.
+pub type RemoteProbe = Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServiceError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// The C# type name whose MD5 prefixes every Live TV `OpenToken` and
 /// `LiveStreamId`.
@@ -995,7 +1090,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         &self,
         item_id: Uuid,
         user_id: Uuid,
-        _allow_media_probe: bool,
+        allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         // Playback sources build on the static sources; the per-user bitrate/profile
@@ -1004,6 +1099,18 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         let mut sources = self
             .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
             .await?;
+        // `GetPlaybackMediaSources`: a `.strm` shortcut, or an item whose main
+        // stream is missing, is refreshed in full with the remote probe on
+        // before it is played, and its sources are read again.
+        if allow_media_probe
+            && let Some(probe) = &self.remote_probe
+            && let Some(path) = self.playback_probe_path(item_id, &sources).await?
+        {
+            probe(path).await?;
+            sources = self
+                .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
+                .await?;
+        }
         sort_media_sources(&mut sources);
         Ok(sources)
     }
@@ -1617,6 +1724,161 @@ mod tests {
             Arc::new(StubEncoder),
             Arc::new(StubProvider),
         )
+    }
+
+    /// Seeds a movie row at `path` carrying `data` (its serialized `Data`).
+    async fn seed_strm(db: &Database, id: Uuid, path: &str, data: &str) {
+        seed_item(db, id, BaseItemKind::Movie).await;
+        let mut entity = crate::test_support::fetch_item(db, id).await;
+        entity.path = Some(path.to_owned());
+        entity.data = Some(data.to_owned());
+        entity.media_type = Some("Video".to_owned());
+        crate::test_support::save_item(db, &entity).await;
+    }
+
+    /// `BaseItem.GetVersionInfo`'s shortcut arm: a `.strm` whose `ShortcutPath`
+    /// is remote is served from that URL — remote, over its protocol, direct
+    /// streamable unless it is a playlist — while a target on the local file
+    /// protocol is never followed, and an item that is not a shortcut ignores a
+    /// stray `ShortcutPath`.
+    #[tokio::test]
+    async fn a_remote_shortcut_target_is_the_source_and_a_local_one_never_is() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let remote = Uuid::from_u128(0x201);
+        let playlist = Uuid::from_u128(0x202);
+        let local = Uuid::from_u128(0x203);
+        let plain = Uuid::from_u128(0x204);
+        seed_strm(
+            &db,
+            remote,
+            "/lib/a.strm",
+            r#"{"IsShortcut":true,"ShortcutPath":"https://origin/a.mp4","Container":"mp4"}"#,
+        )
+        .await;
+        seed_strm(
+            &db,
+            playlist,
+            "/lib/b.strm",
+            r#"{"IsShortcut":true,"ShortcutPath":"http://origin/b.m3u8"}"#,
+        )
+        .await;
+        seed_strm(
+            &db,
+            local,
+            "/lib/c.strm",
+            r#"{"IsShortcut":true,"ShortcutPath":"/etc/passwd"}"#,
+        )
+        .await;
+        seed_strm(
+            &db,
+            plain,
+            "/lib/d.mkv",
+            r#"{"ShortcutPath":"http://origin/d.mp4"}"#,
+        )
+        .await;
+        let source = |id| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_static_media_sources(id, false, None)
+                    .await
+                    .expect("sources")
+                    .remove(0)
+            }
+        };
+
+        let remote = source(remote).await;
+        assert_eq!(remote.path.as_deref(), Some("https://origin/a.mp4"));
+        assert_eq!(remote.protocol, MediaProtocol::Http);
+        assert!(remote.is_remote && remote.supports_direct_stream);
+        assert_eq!(remote.container.as_deref(), Some("mp4"));
+
+        let playlist = source(playlist).await;
+        assert_eq!(playlist.protocol, MediaProtocol::Http);
+        assert!(playlist.is_remote);
+        assert!(
+            !playlist.supports_direct_stream,
+            "an `.m3u8` is not streamed raw"
+        );
+
+        for kept in [source(local).await, source(plain).await] {
+            assert_eq!(kept.protocol, MediaProtocol::File);
+            assert!(!kept.is_remote);
+            assert!(kept.path.as_deref().is_some_and(|p| p.starts_with("/lib/")));
+        }
+    }
+
+    /// `GetPlaybackMediaSources`: with a probe allowed, a `.strm` — and a video
+    /// with no video stream — is refreshed with the remote probe first and its
+    /// sources are read again; with no probe allowed, or a source that already
+    /// has its stream, nothing is refreshed.
+    #[tokio::test]
+    async fn playback_refreshes_a_shortcut_or_a_streamless_item_before_reading_its_sources() {
+        let db = test_db().await;
+        let strm = Uuid::from_u128(0x211);
+        let probed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let probe: RemoteProbe = {
+            let db = db.clone();
+            let probed = Arc::clone(&probed);
+            Arc::new(move |path: String| {
+                let db = db.clone();
+                let probed = Arc::clone(&probed);
+                Box::pin(async move {
+                    probed.lock().unwrap().push(path.clone());
+                    // The refresh stores the remote target it read.
+                    let mut entity = crate::test_support::fetch_item(&db, strm).await;
+                    entity.data = Some(
+                        r#"{"IsShortcut":true,"ShortcutPath":"http://origin/a.mp4"}"#.to_owned(),
+                    );
+                    crate::test_support::save_item(&db, &entity).await;
+                    let _ = path;
+                    Ok(())
+                })
+            })
+        };
+        let mgr = manager(&db).with_remote_probe(probe);
+        let streamless = Uuid::from_u128(0x212);
+        seed_strm(&db, strm, "/lib/a.strm", r#"{"IsShortcut":true}"#).await;
+        seed_strm(&db, streamless, "/lib/b.mkv", "{}").await;
+        let user = Uuid::from_u128(0x2FF);
+
+        // No probe allowed: the shortcut is served as it stands.
+        let sources = mgr
+            .get_playback_media_sources(strm, user, false, false)
+            .await
+            .unwrap();
+        assert_eq!(sources[0].path.as_deref(), Some("/lib/a.strm"));
+        assert!(probed.lock().unwrap().is_empty());
+
+        // Allowed: refreshed, then re-read as the remote target.
+        let sources = mgr
+            .get_playback_media_sources(strm, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(probed.lock().unwrap().as_slice(), ["/lib/a.strm"]);
+        assert_eq!(sources[0].path.as_deref(), Some("http://origin/a.mp4"));
+        assert!(sources[0].is_remote);
+
+        // A video with no video stream is refreshed too; one with a stream is not.
+        mgr.get_playback_media_sources(streamless, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(probed.lock().unwrap().len(), 2);
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(
+                streamless,
+                &[ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                    stream_type: 1,
+                    codec: Some("h264".to_owned()),
+                    ..Default::default()
+                }],
+            )
+            .await
+            .unwrap();
+        mgr.get_playback_media_sources(streamless, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(probed.lock().unwrap().len(), 2, "its stream is present");
     }
 
     /// The tuner URL every fake channel plays.

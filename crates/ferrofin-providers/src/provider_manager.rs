@@ -1610,6 +1610,7 @@ impl LocalProviderManager {
             remove_old_metadata: options.remove_old_metadata,
             force_save: options.force_save,
             regenerate_trickplay: options.regenerate_trickplay,
+            enable_remote_content_probe: options.enable_remote_content_probe,
         }
     }
 
