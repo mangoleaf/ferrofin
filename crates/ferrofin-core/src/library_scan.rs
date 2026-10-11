@@ -2712,6 +2712,14 @@ impl PassTimings {
 /// (`AlbumMetadataService.cs:58-59`), an `AudioBook` being an `Audio`.
 const ALBUM_RUNTIME_CHILDREN: &[BaseItemKind] = &[BaseItemKind::Audio, BaseItemKind::AudioBook];
 
+/// Whether a planned row is a library file resolved as a plain `Video`
+/// (`ResolveVideo<Video>`): the type is exactly `…Entities.Video` and the row
+/// owns nothing and is owned by nothing (an extra or alternate version also has
+/// the type, but takes its identity from its owner's resolution).
+fn is_home_video(entity: &BaseItemEntity) -> bool {
+    entity.type_ == "MediaBrowser.Controller.Entities.Video" && entity.owner_id.is_none()
+}
+
 /// The children whose runtime a folder artist sums: `ArtistMetadataService.
 /// GetChildrenForMetadataUpdates` is `GetRecursiveChildren(i => i is
 /// IHasArtist && !i.IsFolder)` (`ArtistMetadataService.cs:43-53`) — the
@@ -4396,6 +4404,7 @@ impl LibraryScanner {
             .filter(|p| {
                 p.entity.type_.ends_with(".Movie")
                     || p.entity.type_.ends_with(".MusicVideo")
+                    || is_home_video(&p.entity)
                     || p.entity.owner_id.is_some()
             })
             .filter_map(|p| p.entity.path.clone())
@@ -4455,6 +4464,21 @@ impl LibraryScanner {
                 if row.item_type == "MediaBrowser.Controller.Entities.Video" {
                     item.entity.type_.clone_from(&row.item_type);
                 }
+            }
+            // A home video planned at a path that already holds a row of this
+            // library — a `Movie` an earlier scan made of it, or an adopted
+            // `Video` — keeps that row's identity (and so its user data, links
+            // and history); only the type moves to `Video`.
+            if is_home_video(&item.entity)
+                && !existing.contains(&item.id)
+                && let Some(row) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| versions.get(path).or_else(|| existing_movies.get(path)))
+            {
+                item.id = row.id;
+                item.entity.id = guid_to_db(row.id);
             }
             if item.entity.owner_id.is_some()
                 && !existing.contains(&item.id)
@@ -11032,12 +11056,14 @@ impl LibraryScanner {
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
                     ) => {
-                        let kind =
-                            if folder.collection_type == Some(CollectionTypeOptions::musicvideos) {
-                                BaseItemKind::MusicVideo
-                            } else {
-                                BaseItemKind::Movie
-                            };
+                        // `MovieResolver`: a music video library resolves
+                        // `MusicVideo`s, a home-video library plain `Video`s
+                        // (`ResolveVideo<Video>`), everything else `Movie`s.
+                        let kind = match folder.collection_type {
+                            Some(CollectionTypeOptions::musicvideos) => BaseItemKind::MusicVideo,
+                            Some(CollectionTypeOptions::homevideos) => BaseItemKind::Video,
+                            _ => BaseItemKind::Movie,
+                        };
                         self.plan_movies(location, location, cf, kind, &ctx, &mut out);
                         // Upstream folds the separate `photos` collection type
                         // into `homevideos`, where photos are resolved only when
@@ -11483,7 +11509,13 @@ impl LibraryScanner {
             return;
         }
         let entries = self.list(dir, ctx);
-        let movie = (dir != root)
+        // `FindMovie` yields a title's own-folder movie only outside photo
+        // collections (`!isPhotosCollection && result.Items.Count == 1`): in a
+        // home-video library a folder of videos is just a folder, and each file
+        // resolves on its own (`ResolveVideo<Video>`, in a mixed folder, named by
+        // its file stem).
+        let home_video = kind == BaseItemKind::Video;
+        let movie = (dir != root && !home_video)
             .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
             .flatten();
         let own_folder = movie.is_some();
@@ -11600,11 +11632,14 @@ impl LibraryScanner {
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
                 .map_or_else(|| (entry.name.clone(), None), |info| (info.name, info.year));
+            // `parseName: false` (music videos, home videos): the file stem
+            // stands and no year is read from it.
+            let year = year.filter(|_| !home_video);
             // Port of MovieResolver: a movie in its OWN folder is named from that folder
             // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
             // file in the library root keeps its clean_date_time-parsed name (year stripped).
             // ProductionYear is still populated either way.
-            let name = if kind == BaseItemKind::MusicVideo {
+            let name = if kind == BaseItemKind::MusicVideo || home_video {
                 file_stem(&entry.path)
             } else if own_folder {
                 folder_name(dir).unwrap_or(clean_name)

@@ -522,8 +522,9 @@ async fn a_photo_toggle_removes_existing_photos_and_rediscovers_them_when_enable
         &lib.media.join("Album").to_string_lossy(),
     )
     .unwrap();
+    // A home-video library resolves its files as plain `Video`s.
     let movie = derive_item_id(
-        BaseItemKind::Movie,
+        BaseItemKind::Video,
         &lib.media.join("clip.mkv").to_string_lossy(),
     )
     .unwrap();
@@ -599,4 +600,136 @@ async fn disabling_photos_does_not_prune_an_unreachable_location() {
     lib.scanner.scan_all().await.unwrap();
     assert!(lib.row(photo).await.is_none());
     assert!(lib.media.join("Album/A.jpg").is_file());
+}
+
+/// `MovieResolver` in a home-video library (`ResolveVideo<Video>`,
+/// `parseName: false`): every video file is a plain `Video` in a mixed folder,
+/// named by its file stem with no year read from it — a lone file in its own
+/// folder is no title's "own-folder movie" there (`FindMovie` only makes one
+/// outside photo collections). The movie and music-video libraries keep their
+/// own kinds and naming.
+#[tokio::test]
+async fn a_home_video_library_resolves_plain_videos_named_by_their_file_stem() {
+    let lib = Library::of_type(
+        &[
+            "Charlie Video.mkv",
+            "Trips/Beach Day (2021).mkv",
+            "Trips/Solo/Only.mkv",
+        ],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    lib.scanner.scan_all().await.unwrap();
+    for (file, name) in [
+        ("Charlie Video.mkv", "Charlie Video"),
+        ("Trips/Beach Day (2021).mkv", "Beach Day (2021)"),
+        ("Trips/Solo/Only.mkv", "Only"),
+    ] {
+        let path = lib.media.join(file).to_string_lossy().into_owned();
+        let video = lib
+            .row(derive_item_id(BaseItemKind::Video, &path).unwrap())
+            .await
+            .unwrap_or_else(|| panic!("{file} is a Video"));
+        assert_eq!(
+            video.type_, "MediaBrowser.Controller.Entities.Video",
+            "{file}"
+        );
+        assert_eq!(video.name.as_deref(), Some(name), "{file}");
+        assert_eq!(video.production_year, None, "{file}: no year from the name");
+        assert!(!video.is_movie, "{file}");
+        assert!(video.is_in_mixed_folder, "{file}");
+        assert_eq!(video.media_type.as_deref(), Some("Video"), "{file}");
+        assert!(
+            lib.row(derive_item_id(BaseItemKind::Movie, &path).unwrap())
+                .await
+                .is_none(),
+            "{file} is not a Movie"
+        );
+    }
+
+    // Controls: movies and music videos keep their kinds and naming.
+    let movies = Library::of_type(
+        &["Heat (1995)/Heat (1995).mkv"],
+        CollectionTypeOptions::movies,
+    )
+    .await;
+    movies.scanner.scan_all().await.unwrap();
+    let heat = movies
+        .row(
+            derive_item_id(
+                BaseItemKind::Movie,
+                &movies
+                    .media
+                    .join("Heat (1995)/Heat (1995).mkv")
+                    .to_string_lossy(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("a movie");
+    assert_eq!(heat.name.as_deref(), Some("Heat (1995)"));
+    assert!(heat.is_movie);
+    let clips = Library::of_type(
+        &["Artist - Song (2001).mkv"],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    clips.scanner.scan_all().await.unwrap();
+    let clip = clips
+        .row(
+            derive_item_id(
+                BaseItemKind::MusicVideo,
+                &clips
+                    .media
+                    .join("Artist - Song (2001).mkv")
+                    .to_string_lossy(),
+            )
+            .unwrap(),
+        )
+        .await
+        .expect("a music video");
+    assert_eq!(clip.name.as_deref(), Some("Artist - Song (2001)"));
+    assert!(!clip.is_movie);
+}
+
+/// A home video an earlier scan stored as a `Movie` keeps its row — id, and so
+/// its user data and links — when the scan resolves it as a `Video`: the type
+/// moves, no second row appears, and the old `Movie` identity is not left
+/// behind.
+#[tokio::test]
+async fn a_home_video_stored_as_a_movie_keeps_its_row_when_it_becomes_a_video() {
+    let lib = Library::of_type(&["Charlie Video.mkv"], CollectionTypeOptions::homevideos).await;
+    let path = lib
+        .media
+        .join("Charlie Video.mkv")
+        .to_string_lossy()
+        .into_owned();
+    let movie_id = derive_item_id(BaseItemKind::Movie, &path).unwrap();
+    // What the previous build stored for the file.
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id","Type","Name","Path","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+            "IsRepeat","IsSeries","IsVirtualItem","MediaType","TopParentId","ParentId")
+           VALUES (?1,'MediaBrowser.Controller.Entities.Movies.Movie','Charlie Video',?2,0,1,0,1,
+                   0,0,0,'Video',?3,?3)"#,
+    )
+    .bind(guid_to_db(movie_id))
+    .bind(&path)
+    .bind(guid_to_db(lib.cf))
+    .execute(lib.db.pool())
+    .await
+    .unwrap();
+
+    lib.scanner.scan_all().await.unwrap();
+    lib.scanner.scan_all().await.unwrap();
+
+    let kept = lib.row(movie_id).await.expect("the row survives");
+    assert_eq!(kept.type_, "MediaBrowser.Controller.Entities.Video");
+    assert!(!kept.is_movie);
+    let at_path: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Path" = ?1"#)
+        .bind(&path)
+        .fetch_one(lib.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(at_path, 1, "one row for the file, not a second beside it");
 }
