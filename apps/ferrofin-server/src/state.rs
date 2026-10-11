@@ -377,10 +377,14 @@ pub async fn build_app_state(
     // them against this server's directories (`BaseItemRepository.Map`).
     let virtual_paths =
         ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
+    // Live TV is built after the repository and must not be owned by it, so the
+    // repository asks it for the files being recorded through this late slot.
+    let active_recordings = ferrofin_core::ActiveRecordingSlot::default();
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
-            .with_virtual_paths(virtual_paths.clone()),
+            .with_virtual_paths(virtual_paths.clone())
+            .with_active_recordings(Arc::clone(&active_recordings)),
     );
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
         Arc::new(FerrofinItemCountService::new(db.clone()).with_root_ids(root_folder_ids));
@@ -776,6 +780,18 @@ pub async fn build_app_state(
         }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
+    let recording_source = Arc::downgrade(&live_tv);
+    active_recordings
+        .set(Arc::new(move || {
+            let live_tv = recording_source.upgrade();
+            Box::pin(async move {
+                match live_tv {
+                    Some(live_tv) => live_tv.active_recording_paths().await,
+                    None => Ok(Vec::new()),
+                }
+            })
+        }))
+        .ok();
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
         Arc::new(FerrofinDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn ferrofin_traits::security::ApiKeyManager> =

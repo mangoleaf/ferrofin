@@ -276,7 +276,7 @@ pub use external_data_manager::FerrofinExternalDataManager;
 pub use file_system::FerrofinFileSystem;
 pub use item_count_service::FerrofinItemCountService;
 pub use item_persistence_service::FerrofinItemPersistenceService;
-pub use item_repository::FerrofinItemRepository;
+pub use item_repository::{ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository};
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::FerrofinKeyframeRepository;
 pub use library_manager::FerrofinLibraryManager;

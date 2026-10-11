@@ -43,6 +43,7 @@ use ferrofin_traits::persistence::{
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::{db_err, media_stream_type_disc};
 use crate::item_type_lookup::stored_type_name;
+use crate::kinds::is_video;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_item_list_query,
     build_latest_music_albums_query, build_query, media_type_name, non_blank, push_in_list,
@@ -75,7 +76,22 @@ pub struct FerrofinItemRepository {
     /// database stores in image paths (see
     /// [`FerrofinItemRepository::with_virtual_paths`]).
     virtual_paths: VirtualPathExpander,
+    /// The files Live TV is writing right now, bound late by the composition
+    /// root (see [`FerrofinItemRepository::with_active_recordings`]).
+    active_recordings: ActiveRecordingSlot,
 }
+
+/// What the files Live TV is recording right now are, asked when needed.
+pub type ActiveRecordingSource = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<String>, ServiceError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// A late-bound [`ActiveRecordingSource`]: the Live TV manager is built after
+/// the repository it must not own, so the composition root fills this once.
+pub type ActiveRecordingSlot = Arc<std::sync::OnceLock<ActiveRecordingSource>>;
 
 impl std::fmt::Debug for FerrofinItemRepository {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -195,6 +211,7 @@ impl FerrofinItemRepository {
             db,
             item_type_lookup,
             virtual_paths: VirtualPathExpander::identity(),
+            active_recordings: ActiveRecordingSlot::default(),
             roots: None,
         }
     }
@@ -220,6 +237,26 @@ impl FerrofinItemRepository {
     pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
         self.virtual_paths = virtual_paths;
         self
+    }
+
+    /// Installs the slot the composition root later fills with Live TV's
+    /// active-recording paths (`RecordingsManager.GetActiveRecordingInfo`), which
+    /// `Video.SourceType` consults to key a video under Live TV rather than its
+    /// channel. Without it no video is an active recording.
+    #[must_use]
+    pub fn with_active_recordings(mut self, slot: ActiveRecordingSlot) -> Self {
+        self.active_recordings = slot;
+        self
+    }
+
+    /// The paths Live TV is recording to, empty until the source is bound.
+    async fn active_recording_paths(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, ServiceError> {
+        match self.active_recordings.get() {
+            Some(source) => Ok(source().await?.into_iter().collect()),
+            None => Ok(std::collections::HashSet::new()),
+        }
     }
 
     /// The C# `ItemsController.GetItems` **non-query** branch, or `None` when
@@ -615,6 +652,19 @@ impl FerrofinItemRepository {
                 .or_default()
                 .push(candidate);
         }
+        // `Video.SourceType` is `LiveTV` while its file is being recorded, which
+        // takes the item out of the channel arm below. Asked only when a video
+        // could be keyed by its channel.
+        let active = if rows.iter().any(|row| {
+            row.external_id.as_ref().is_some_and(|id| !id.is_empty())
+                && row.channel_id.is_some()
+                && row.path.is_some()
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video)
+        }) {
+            self.active_recording_paths().await?
+        } else {
+            std::collections::HashSet::new()
+        };
         let mut selected = HashMap::new();
         for row in rows {
             let Some(candidates) = by_item.remove(&row.id) else {
@@ -637,7 +687,10 @@ impl FerrofinItemRepository {
                     .as_deref()
                     .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())),
             };
+            let recording = row.path.as_ref().is_some_and(|path| active.contains(path))
+                && crate::item_type_lookup::kind_from_type_name(&row.type_).is_some_and(is_video);
             if channel
+                && !recording
                 && let Some(external) = row.external_id.as_ref().filter(|value| !value.is_empty())
             {
                 // Derived classes prepend their provider keys ahead of BaseItem;
@@ -10525,6 +10578,66 @@ mod folder_get_result_tests {
                 .unwrap()),
             [movie]
         );
+    }
+
+    /// `Video.SourceType` is `LiveTV` while the file is being recorded, so the
+    /// recording is keyed by its own id, not by its channel's external id; a
+    /// video that is not recording (or any other kind) keeps the channel key.
+    #[tokio::test]
+    async fn an_active_recording_is_not_keyed_by_its_channel_external_id() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let slot = ActiveRecordingSlot::default();
+        let repo = repository(&db).with_active_recordings(Arc::clone(&slot));
+        let mut cases = Vec::new();
+        for (kind, path, wants_external) in [
+            (BaseItemKind::Movie, "/rec/active.ts", false),
+            (BaseItemKind::Movie, "/rec/finished.ts", true),
+            (BaseItemKind::Episode, "/rec/active.ts", false),
+            (BaseItemKind::Folder, "/rec/active.ts", true),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, "recording").await;
+            let mut entity = crate::test_support::fetch_item(&db, id).await;
+            entity.path = Some(path.to_owned());
+            entity.channel_id = Some(guid_to_db(Uuid::new_v4()));
+            entity.external_id = Some("channel-key".to_owned());
+            crate::test_support::save_item(&db, &entity).await;
+            // The canonical own-id row and the channel-keyed row disagree on
+            // favorite: only the key the item really has decides.
+            seed_user_data(&db, user_id, id, false, None).await;
+            sqlx::query(r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played") VALUES (?1,?2,'channel-key',1,0,0,0)"#)
+                .bind(guid_to_db(id)).bind(guid_to_db(user_id)).execute(db.writer()).await.unwrap();
+            cases.push((id, wants_external));
+        }
+        let ordered: Vec<_> = cases.iter().map(|(id, _)| *id).collect();
+        let favorites = || async {
+            let rows = ordered_rows(&repo, &ordered).await;
+            ids(&repo
+                .filter_folder_children(
+                    rows,
+                    &InternalItemsQuery {
+                        is_favorite: Some(true),
+                        user: Some(user.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap())
+        };
+        // Nothing bound yet: no recording is active, so every item has its channel key.
+        assert_eq!(favorites().await, ordered);
+        slot.set(Arc::new(|| {
+            Box::pin(async { Ok(vec!["/rec/active.ts".to_owned()]) })
+        }))
+        .ok();
+        let expected: Vec<_> = cases
+            .iter()
+            .filter(|(_, wants_external)| *wants_external)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(favorites().await, expected);
     }
 
     #[tokio::test]
