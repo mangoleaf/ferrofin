@@ -353,6 +353,60 @@ struct ProcessMetrics {
     gauges: metrics_wiring::SamplerGauges,
 }
 
+/// Applies a restore scheduled by `POST /Backup/Restore`, before the database
+/// is opened. Returns the failure of a restore rejected before it wrote
+/// anything (to be recorded once the activity log exists); a restore that
+/// failed part-way aborts the boot.
+fn apply_scheduled_restore(
+    config: &Config,
+) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+    Ok(
+        match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
+            Ok(Some(archive)) => {
+                tracing::warn!(archive = %archive.display(), "restored backup");
+                None
+            }
+            Ok(None) => None,
+            // Extraction began and failed: the trees may be half replaced. Jellyfin
+            // throws out of startup here; booting on them would let the web client
+            // (which reads "the server answers again" as success) announce a
+            // restore that did not happen.
+            Err(failure) if failure.partially_applied => {
+                tracing::error!(error = %failure, "scheduled backup restore failed part-way");
+                return Err(anyhow::anyhow!(
+                    "the scheduled backup restore failed part-way and the data directory may be \
+                 partly restored: {failure}"
+                ));
+            }
+            // Rejected before anything was written (missing or foreign archive):
+            // the server boots on its untouched data and records the failure in the
+            // activity log, where an administrator will see it.
+            Err(failure) => {
+                tracing::error!(error = %failure, "scheduled backup restore was rejected");
+                Some(failure)
+            }
+        },
+    )
+}
+
+/// Records a rejected restore in the activity log: the only durable,
+/// administrator-visible trace of it.
+async fn record_restore_failure(
+    activity: &dyn ferrofin_traits::activity::ActivityManager,
+    failure: &ferrofin_api::handlers::backup::RestoreFailure,
+) {
+    let entry = ferrofin_traits::activity::ActivityLogCreate {
+        name: "Restoring the backup failed".to_owned(),
+        type_: "BackupRestoreFailed".to_owned(),
+        overview: Some(failure.to_string()),
+        severity: ferrofin_model::activity::LogLevel::Error,
+        ..Default::default()
+    };
+    if let Err(error) = activity.create_entry(entry).await {
+        tracing::warn!(%error, "could not record the failed restore in the activity log");
+    }
+}
+
 /// One server lifetime: boot, serve until drained, tear the host down, and
 /// report whether an API restart was requested (`true` → the caller runs it
 /// again). A signal-initiated drain always reports `false`.
@@ -365,11 +419,7 @@ async fn serve_once(
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
-    match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
-        Ok(Some(archive)) => tracing::warn!(archive = %archive.display(), "restored backup"),
-        Ok(None) => {}
-        Err(e) => tracing::error!(error = %e, "scheduled backup restore failed"),
-    }
+    let restore_failure = apply_scheduled_restore(config)?;
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
@@ -401,6 +451,9 @@ async fn serve_once(
         .await
         .context("failed to assemble application state")?;
     boot_stage(started, "app state wired");
+    if let Some(failure) = &restore_failure {
+        record_restore_failure(wired.state.activity.as_ref(), failure).await;
+    }
 
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
