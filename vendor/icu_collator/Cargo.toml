@@ -8,6 +8,11 @@
 # If you are reading this file be aware that the original Cargo.toml
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
+#
+# Ferrofin: vendored from crates.io icu_collator 2.3.1 for the one-line Jamo
+# fix in src/elements.rs (see PATCHED.md). The upstream tests, benches and
+# their data are not vendored; their [[test]]/[[bench]] targets and
+# dev-dependencies are removed here.
 
 [package]
 edition = "2024"
@@ -20,8 +25,6 @@ include = [
     "data/**/*",
     "src/**/*",
     "examples/**/*",
-    "benches/**/*",
-    "tests/**/*",
     "Cargo.toml",
     "LICENSE",
     "README.md",
@@ -88,15 +91,6 @@ unstable = []
 [lib]
 name = "icu_collator"
 path = "src/lib.rs"
-
-[[test]]
-name = "tests"
-path = "tests/tests.rs"
-
-[[bench]]
-name = "bench"
-path = "benches/bench.rs"
-harness = false
 
 [dependencies.databake]
 version = "0.2.0"
@@ -168,16 +162,6 @@ default-features = false
 [dependencies.zerovec]
 version = "0.11.8"
 default-features = false
-
-[dev-dependencies.atoi]
-version = "2.0.0"
-
-[dev-dependencies.icu_normalizer_data]
-version = "~2.3.0"
-default-features = false
-
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies.criterion]
-version = "0.5.0"
 
 [lints.clippy]
 alloc_instead_of_core = "warn"
