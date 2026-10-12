@@ -8,8 +8,9 @@
 //!
 //! The 12.2 fixture (`tests/data/jellyfin-12.2-schema.sql`) is the
 //! `jellyfin-12.0-schema.sql` dump — the owner's real library after one
-//! `jellyfin/jellyfin:12.0` boot (the realistic adoption case; a fresh 12.0
-//! install differs only by lacking `IX_CustomItemDisplayPreferences_UserId`) —
+//! `jellyfin/jellyfin:12.0` boot (the realistic adoption case; a fresh 12.0,
+//! 12.1 or 12.2 install differs only by lacking
+//! `IX_CustomItemDisplayPreferences_UserId`, which `0041` adds on adoption) —
 //! with the two indexes 12.2's only schema migration
 //! (`20261002210711_MakeOwnerIdIndexesPartial`) makes partial replaced by the
 //! text a fresh Jellyfin 12.2 install stores. That is the drop-in contract.
@@ -278,11 +279,35 @@ async fn has_sqlite_stat1(pool: &SqlitePool) -> bool {
         > 0
 }
 
+/// The one statement a fresh Jellyfin 12.x install lacks next to the schema
+/// pins: `20210320181425_AddIndexesAndCollations` drops it, so only databases
+/// that predate that drop (like the ones the pins were dumped from) carry it.
+const CUSTOM_PREFS_USER_INDEX: &str = "CREATE INDEX \"IX_CustomItemDisplayPreferences_UserId\" \
+     ON \"CustomItemDisplayPreferences\"(\n  \"UserId\"\n);";
+
+/// `schema` in the shape a fresh Jellyfin install has. Booting the portable
+/// 12.0, 12.1 and 12.2 tarballs on empty directories (2026-10-12) showed this
+/// index to be the only shape difference from the pins (`sqlite_sequence` and
+/// `sqlite_stat1` aside; EF's DDL whitespace differs, which `snapshot` ignores).
+fn fresh_install_schema(schema: &str) -> String {
+    assert!(
+        schema.contains(CUSTOM_PREFS_USER_INDEX),
+        "the pin carries the index"
+    );
+    schema.replace(CUSTOM_PREFS_USER_INDEX, "")
+}
+
 /// Adoption must land every generation on the one schema a fresh database has
 /// — Ferrofin's own `FerrofinIX_` indexes included. A 12.0/12.1 database
 /// baselines `0032`, so the duplicate `FerrofinIX_BaseItems_*` set `0009`/`0014`
 /// created survives there unless `0039` drops it; a 12.2 database baselines
 /// `0040` and must still match the partial `OwnerId` pair a fresh chain builds.
+///
+/// Each generation is checked as an upgraded install (every optional id present,
+/// the schema pin as dumped) and, for 12.x, as a fresh Jellyfin install: no
+/// optional id (the set a fresh install records, pinned against the captured
+/// truth by `database.rs`'s `adopts_a_fresh_jellyfin_12_x_install`) and no
+/// `IX_CustomItemDisplayPreferences_UserId`, which `0041` restores.
 #[tokio::test]
 async fn adopted_and_fresh_databases_converge_on_one_schema() {
     let fresh = Database::connect_in_memory().await.expect("fresh connect");
@@ -292,27 +317,47 @@ async fn adopted_and_fresh_databases_converge_on_one_schema() {
 
     // Every generation is checked before failing, so one run names them all.
     let mut divergences = Vec::new();
-    for generation in &JELLYFIN_GENERATIONS {
+    let fresh_install_rows = JELLYFIN_GENERATIONS
+        .iter()
+        .filter(|g| g.name.starts_with("12."))
+        .map(|g| (g, true));
+    let rows = JELLYFIN_GENERATIONS
+        .iter()
+        .map(|g| (g, false))
+        .chain(fresh_install_rows);
+    for (generation, fresh_install) in rows {
         let ids: BTreeSet<&str> = generation
             .migration_ids
             .iter()
             .chain(generation.additional_ids)
-            .filter(|id| !generation.optional_ids.contains(id))
+            .chain(generation.optional_ids)
+            .filter(|id| !fresh_install || !generation.optional_ids.contains(id))
             .copied()
             .collect();
         let ids: Vec<&str> = ids.into_iter().collect();
+        let route = if fresh_install {
+            "fresh install"
+        } else {
+            "upgraded"
+        };
+        let name = format!("{} ({route}, {} ids)", generation.name, ids.len());
+        let schema = if fresh_install {
+            fresh_install_schema(generation_schema(generation.name))
+        } else {
+            generation_schema(generation.name).to_owned()
+        };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("jellyfin.db");
-        seed_jellyfin_fixture(&path, generation_schema(generation.name), &ids).await;
+        seed_jellyfin_fixture(&path, &schema, &ids).await;
 
         let adopted = Database::connect_sized(&format!("sqlite://{}", path.display()), Some(2))
             .await
-            .unwrap_or_else(|e| panic!("{}: adoption failed: {e}", generation.name));
+            .unwrap_or_else(|e| panic!("{name}: adoption failed: {e}"));
         adopted
             .run_migrations()
             .await
-            .unwrap_or_else(|e| panic!("{}: migrate failed: {e}", generation.name));
+            .unwrap_or_else(|e| panic!("{name}: migrate failed: {e}"));
         assert_eq!(
             adopted
                 .adoption_state()
@@ -320,11 +365,10 @@ async fn adopted_and_fresh_databases_converge_on_one_schema() {
                 .expect("adoption state")
                 .map(|s| s.generation),
             Some(generation.name.to_owned()),
-            "the database was adopted as its own generation"
+            "{name}: the database was adopted as its own generation"
         );
 
         let (tables, indexes) = snapshot(adopted.pool()).await;
-        let name = generation.name;
         if tables != fresh_snapshot.0 {
             let differing: Vec<_> = tables
                 .keys()
