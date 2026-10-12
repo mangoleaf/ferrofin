@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use ferrofin_db::Database;
+use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
@@ -27,8 +28,8 @@ use crate::db_error::db_err;
 use crate::item_data::{import_membership, parse_data, read_linked_children};
 use crate::item_folders::{MovedFolders, move_item_folders};
 use crate::item_persistence_service::{
-    FerrofinItemPersistenceService, RekeyKind, alternate_version_child_type, detach_user_data,
-    move_user_data, rekey_rows, user_weights,
+    FerrofinItemPersistenceService, REPAIR_PARTITION, RekeyKind, alternate_version_child_type,
+    detach_user_data, move_user_data, rekey_rows, user_weights,
 };
 use crate::item_type_lookup::{
     IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
@@ -91,6 +92,10 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
     }
+    // After the merges, which fold rows of one item under several keys (as
+    // upstream's 20260508 merges run before its 20260912 harmonize); it logs
+    // its own summary, which needs the group count too.
+    harmonize_conflicting_user_data(db).await?;
     let stripped = strip_embedded_linked_children(db).await?;
     if stripped > 0 {
         tracing::info!(
@@ -1986,9 +1991,226 @@ async fn merge_peoples_rows(db: &Database) -> Result<usize, ServiceError> {
     Ok(deleted)
 }
 
+/// The `FerrofinMeta` key of [`harmonize_conflicting_user_data`].
+const HARMONIZE_KEY: &str = "user_data_harmonized_v122";
+
+/// The extension of the snapshot [`harmonize_conflicting_user_data`] takes:
+/// `jellyfin.db` → `jellyfin.db.pre-harmonize`.
+const HARMONIZE_SNAPSHOT_EXTENSION: &str = "db.pre-harmonize";
+
+/// The next page of `(ItemId, UserId)` groups whose `UserData` rows disagree,
+/// after the keyset `(?2, ?3)`, at most `?4` of them — upstream's `GroupBy`
+/// (`20260912120000_HarmonizeConflictingUserData.cs:45-56`). `MIN`/`MAX`
+/// skip NULLs as EF's translation does, and `IS NOT` is EF's null-aware `!=`
+/// on the nullable date. The placeholder item (`?1`) is detached history,
+/// the retention mirror, and never a conflict. Its id has no hex letters, so
+/// the comparison holds however a database cases its GUIDs; the group keys
+/// are bound back exactly as stored.
+///
+/// Upstream compares the dates as `DateTime`s; here they are text, written
+/// two ways for one instant: EF trims trailing fraction zeros
+/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), Ferrofin's
+/// `datetime_to_db` always writes seven digits (`… 09.5330000`). So each
+/// date is padded to the seven-digit form first — exact to the tick (100 ns),
+/// which `julianday` (milliseconds) is not, and ordered like the instant.
+/// A database Ferrofin has run on holds both forms, and a group that only
+/// differs in that way is no conflict.
+const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
+   WHERE "ItemId" <> ?1
+     AND ("ItemId" > ?2 OR ("ItemId" = ?2 AND "UserId" > ?3))
+   GROUP BY "ItemId", "UserId"
+   HAVING COUNT(*) > 1
+      AND (MIN("PlaybackPositionTicks") <> MAX("PlaybackPositionTicks")
+        OR MIN("PlayCount") <> MAX("PlayCount")
+        OR MIN("Played") <> MAX("Played")
+        OR MIN("IsFavorite") <> MAX("IsFavorite")
+        OR MIN(CASE WHEN instr("LastPlayedDate", '.') = 0 THEN "LastPlayedDate" || '.0000000'
+                    ELSE substr("LastPlayedDate" || '0000000', 1, 27) END)
+           IS NOT
+           MAX(CASE WHEN instr("LastPlayedDate", '.') = 0 THEN "LastPlayedDate" || '.0000000'
+                    ELSE substr("LastPlayedDate" || '0000000', 1, 27) END))
+   ORDER BY "ItemId", "UserId"
+   LIMIT ?4"#;
+
+/// The port of Jellyfin 12.2's `HarmonizeConflictingUserData`
+/// (`Jellyfin.Server/Migrations/Routines/20260912120000_HarmonizeConflictingUserData.cs:40-129`):
+/// when one item holds several `UserData` rows for a user (one per
+/// `CustomDataKey`, often fossils of earlier incarnations of the same item)
+/// and they disagree, every row takes the values of the most recent play.
+///
+/// - The winner is the row with the latest `LastPlayedDate` (NULL last), then
+///   the highest `PlayCount`, then the highest `PlaybackPositionTicks`
+///   (upstream's order, `:98-102`), then — Ferrofin's tiebreak, where upstream
+///   keeps whichever row the database returned first — the lowest
+///   `CustomDataKey`.
+/// - The other rows of the group get exactly its `AudioStreamIndex`,
+///   `IsFavorite`, `LastPlayedDate`, `Likes`, `PlaybackPositionTicks`,
+///   `PlayCount`, `Played`, `Rating` and `SubtitleStreamIndex` (`:108-119`).
+///   The date is copied as the winner's stored text, not re-formatted, so a
+///   harmonized group agrees byte for byte. `CustomDataKey` and
+///   `RetentionDate` stay.
+/// - Rows on the placeholder item are detached history (the retention
+///   mirror) and are never touched, nor are the `FerrofinUserDataRetention*`
+///   snapshot tables: retention recovers from both.
+///
+/// With no conflict it only marks itself done. Otherwise a file-backed
+/// database is first copied once to `<db>.pre-harmonize` (owner decision D5;
+/// upstream backs up before the routine unconditionally). The groups are then
+/// harmonized in keyset order, [`REPAIR_PARTITION`] groups per write
+/// transaction (upstream: 500 per `SaveChanges`). The `FerrofinMeta` key is
+/// set only after the last partition, so a boot that dies mid-way finishes on
+/// the next one; the groups already harmonized no longer conflict and drop
+/// out of the query.
+///
+/// This is a one-time pass, like upstream's routine. The scanner's and the
+/// runtime's folds (`rekey_items`, `merge_one`) resolve history per key and
+/// can leave an item's keys disagreeing again later — and so can the boot
+/// repairs that re-key items after [`run_all`] (`run_rehome_local_versions`
+/// and `run_rekey_virtual_seasons`, called from
+/// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
+/// Keeping keys in agreement at save time is a separate work item (parity
+/// review A6).
+///
+/// Returns the number of rows updated, and logs one summary when it
+/// changed something.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query, the snapshot or the marker write
+/// fails.
+pub async fn harmonize_conflicting_user_data(db: &Database) -> Result<usize, ServiceError> {
+    harmonize_in_partitions(db, REPAIR_PARTITION).await
+}
+
+/// [`harmonize_conflicting_user_data`] with `partition` groups per
+/// transaction.
+async fn harmonize_in_partitions(db: &Database, partition: i64) -> Result<usize, ServiceError> {
+    if !once(db, HARMONIZE_KEY).await? {
+        return Ok(0);
+    }
+    let mut groups = conflicting_groups(db, ("", ""), partition).await?;
+    if groups.is_empty() {
+        done(db, HARMONIZE_KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db
+        .snapshot_once(HARMONIZE_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before harmonizing conflicting user data"
+        );
+    }
+    let page = usize::try_from(partition).unwrap_or(usize::MAX);
+    let (mut rows, mut harmonized) = (0usize, 0usize);
+    loop {
+        rows += harmonize_groups(db, &groups).await?;
+        harmonized += groups.len();
+        tracing::debug!(
+            groups = harmonized,
+            rows,
+            "harmonized a partition of conflicting user data"
+        );
+        let (Some((item, user)), true) = (groups.last(), groups.len() == page) else {
+            break;
+        };
+        groups = conflicting_groups(db, (item, user), partition).await?;
+        if groups.is_empty() {
+            break;
+        }
+    }
+    done(db, HARMONIZE_KEY).await?;
+    tracing::info!(
+        rows,
+        groups = harmonized,
+        "repaired conflicting user data so every row of an item agrees"
+    );
+    Ok(rows)
+}
+
+/// The next `limit` conflicting groups after `after` ([`CONFLICTING_GROUPS`]).
+async fn conflicting_groups(
+    db: &Database,
+    after: (&str, &str),
+    limit: i64,
+) -> Result<Vec<(String, String)>, ServiceError> {
+    sqlx::query_as(CONFLICTING_GROUPS)
+        .bind(PLACEHOLDER_ID)
+        .bind(after.0)
+        .bind(after.1)
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// Harmonizes one partition of groups in one write transaction. Returns the
+/// rows updated: every row of a group but its winner.
+async fn harmonize_groups(
+    db: &Database,
+    groups: &[(String, String)],
+) -> Result<usize, ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut updated = 0u64;
+    for (item, user) in groups {
+        let rows: Vec<UserDataEntity> =
+            sqlx::query_as(r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#)
+                .bind(item)
+                .bind(user)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let Some(winner) = rows.iter().max_by(|a, b| winner_order(a, b)) else {
+            continue;
+        };
+        // The date as the winner stores it: a re-format would change EF's
+        // trimmed text and leave the group differing as text.
+        updated += sqlx::query(
+            r#"UPDATE "UserData" SET
+                 "AudioStreamIndex" = ?1, "IsFavorite" = ?2,
+                 "LastPlayedDate" = (
+                   SELECT w."LastPlayedDate" FROM "UserData" w
+                   WHERE w."ItemId" = ?9 AND w."UserId" = ?10 AND w."CustomDataKey" = ?11),
+                 "Likes" = ?3, "PlaybackPositionTicks" = ?4, "PlayCount" = ?5,
+                 "Played" = ?6, "Rating" = ?7, "SubtitleStreamIndex" = ?8
+               WHERE "ItemId" = ?9 AND "UserId" = ?10 AND "CustomDataKey" <> ?11"#,
+        )
+        .bind(winner.audio_stream_index)
+        .bind(winner.is_favorite)
+        .bind(winner.likes)
+        .bind(winner.playback_position_ticks)
+        .bind(winner.play_count)
+        .bind(winner.played)
+        .bind(winner.rating)
+        .bind(winner.subtitle_stream_index)
+        .bind(item)
+        .bind(user)
+        .bind(&winner.custom_data_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(usize::try_from(updated).unwrap_or(usize::MAX))
+}
+
+/// The harmonize winner rule as an ordering, greatest wins: `LastPlayedDate`
+/// (a NULL date is the least), then `PlayCount`, then
+/// `PlaybackPositionTicks`, then the *lower* `CustomDataKey` — unique within
+/// a group, so exactly one row wins.
+fn winner_order(a: &UserDataEntity, b: &UserDataEntity) -> std::cmp::Ordering {
+    a.last_played_date
+        .cmp(&b.last_played_date)
+        .then(a.play_count.cmp(&b.play_count))
+        .then(a.playback_position_ticks.cmp(&b.playback_position_ticks))
+        .then_with(|| b.custom_data_key.cmp(&a.custom_data_key))
+}
+
 #[cfg(test)]
 mod tests {
-    use ferrofin_db::store::guid_to_db;
+    use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
 
@@ -3359,5 +3581,540 @@ mod tests {
             .expect("count");
         assert_eq!(left, 1);
         assert_eq!(merge_duplicate_people(&db).await.expect("again"), 0);
+    }
+
+    /// The user every harmonize test plays as (upstream's `_userId`).
+    const HARMONIZE_USER: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+
+    /// One `UserData` row of a harmonize test — upstream's `Row` helper
+    /// (`HarmonizeConflictingUserDataTests.cs:113-127`) plus the columns
+    /// it leaves at their defaults.
+    #[derive(Clone, Copy, Default)]
+    struct Play<'a> {
+        key: &'a str,
+        last_played: Option<(i32, u32, u32)>,
+        count: i32,
+        position: i64,
+        played: bool,
+        favorite: bool,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+        likes: Option<bool>,
+        rating: Option<f64>,
+        retention: Option<(i32, u32, u32)>,
+    }
+
+    fn day((y, m, d): (i32, u32, u32)) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    /// Inserts `play` for [`HARMONIZE_USER`] on the item stored as `item`.
+    async fn insert_play(db: &Database, item: &str, play: Play<'_>) {
+        insert_play_as(db, item, HARMONIZE_USER, play).await;
+    }
+
+    /// Inserts `play` for `user` on the item stored as `item`.
+    async fn insert_play_as(db: &Database, item: &str, user: Uuid, play: Play<'_>) {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+                "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks", "Played",
+                "Rating", "RetentionDate", "SubtitleStreamIndex")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        )
+        .bind(item)
+        .bind(guid_to_db(user))
+        .bind(play.key)
+        .bind(play.audio)
+        .bind(play.favorite)
+        .bind(opt_datetime_to_db(play.last_played.map(day)))
+        .bind(play.likes)
+        .bind(play.count)
+        .bind(play.position)
+        .bind(play.played)
+        .bind(play.rating)
+        .bind(opt_datetime_to_db(play.retention.map(day)))
+        .bind(play.subtitle)
+        .execute(db.writer())
+        .await
+        .expect("insert user data");
+    }
+
+    /// The rows stored on `item`, by `CustomDataKey`.
+    async fn plays(db: &Database, item: &str) -> Vec<UserDataEntity> {
+        sqlx::query_as(r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 ORDER BY "CustomDataKey""#)
+            .bind(item)
+            .fetch_all(db.pool())
+            .await
+            .expect("user data")
+    }
+
+    /// Overwrites the stored `LastPlayedDate` text of `item`'s `key` row — a
+    /// date as another writer formats it.
+    async fn set_date_text(db: &Database, item: &str, key: &str, text: &str) {
+        sqlx::query(
+            r#"UPDATE "UserData" SET "LastPlayedDate" = ?3
+               WHERE "ItemId" = ?1 AND "CustomDataKey" = ?2"#,
+        )
+        .bind(item)
+        .bind(key)
+        .bind(text)
+        .execute(db.writer())
+        .await
+        .expect("date text");
+    }
+
+    /// The stored `LastPlayedDate` texts of `item`'s rows, by key.
+    async fn date_texts(db: &Database, item: &str) -> Vec<Option<String>> {
+        sqlx::query_scalar(
+            r#"SELECT "LastPlayedDate" FROM "UserData" WHERE "ItemId" = ?1
+               ORDER BY "CustomDataKey""#,
+        )
+        .bind(item)
+        .fetch_all(db.pool())
+        .await
+        .expect("date texts")
+    }
+
+    /// A migrated file-backed database `name` in `dir`.
+    async fn open_file_db(dir: &std::path::Path, name: &str) -> Database {
+        let url = format!("sqlite://{}", dir.join(name).display());
+        let db = Database::connect(&url).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// A user and one stored item per id, the ids as stored.
+    async fn seed_harmonize(db: &Database, items: &[Uuid]) -> Vec<String> {
+        seed_user(db, HARMONIZE_USER).await;
+        let mut stored = Vec::with_capacity(items.len());
+        for &item in items {
+            seed_item(db, item, BaseItemKind::Folder).await;
+            stored.push(guid_to_db(item));
+        }
+        stored
+    }
+
+    /// Upstream's two rows of one item from two eras of itself.
+    const RECENT: Play<'static> = Play {
+        key: "497698",
+        last_played: Some((2023, 8, 14)),
+        count: 9,
+        position: 0,
+        played: true,
+        favorite: false,
+        audio: None,
+        subtitle: None,
+        likes: None,
+        rating: None,
+        retention: None,
+    };
+    const FOSSIL: Play<'static> = Play {
+        key: "tt3480822",
+        last_played: Some((2021, 12, 31)),
+        count: 7,
+        position: 490,
+        played: false,
+        ..RECENT
+    };
+
+    /// `Perform_ConflictingRows_CollapsesToMostRecentPlay`: both rows of the
+    /// conflicting item end as the most recent play; an item whose rows
+    /// already agree is untouched.
+    #[tokio::test]
+    async fn harmonize_collapses_conflicting_rows_to_the_most_recent_play() {
+        let db = test_db().await;
+        let ids = seed_harmonize(
+            &db,
+            &[
+                Uuid::from_u128(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa),
+                Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
+            ],
+        )
+        .await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        let agreed = Play {
+            key: "121",
+            last_played: Some((2022, 1, 1)),
+            count: 2,
+            position: 77,
+            ..RECENT
+        };
+        insert_play(&db, &ids[1], agreed).await;
+        insert_play(
+            &db,
+            &ids[1],
+            Play {
+                key: "tt0167261",
+                ..agreed
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        let rows = plays(&db, &ids[0]).await;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(row.played);
+            assert_eq!(row.playback_position_ticks, 0);
+            assert_eq!(row.play_count, 9);
+        }
+        assert!(
+            plays(&db, &ids[1])
+                .await
+                .iter()
+                .all(|row| row.playback_position_ticks == 77)
+        );
+    }
+
+    /// `Perform_DetachedRows_AreLeftAlone`: rows on the placeholder item
+    /// belong to no item, so they keep their state for the next item that
+    /// claims one of their keys — and so does the retention snapshot beside
+    /// them.
+    #[tokio::test]
+    async fn harmonize_leaves_detached_rows_and_retention_snapshots_alone() {
+        // No hex letters: the placeholder compares equal however a database
+        // cases its GUIDs.
+        assert!(!PLACEHOLDER_ID.bytes().any(|b| b.is_ascii_alphabetic()));
+        let db = test_db().await;
+        seed_harmonize(&db, &[]).await;
+        insert_play(&db, PLACEHOLDER_ID, RECENT).await;
+        insert_play(&db, PLACEHOLDER_ID, FOSSIL).await;
+        let snapshot = r#"SELECT "ItemId", "CustomDataKey", "PlayCount",
+                 "PlaybackPositionTicks", "Played", "LastPlayedDate"
+               FROM "FerrofinUserDataRetentionSnapshots""#;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinUserDataRetentionSnapshots"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "LastPlayedDate",
+                "PlayCount", "PlaybackPositionTicks", "Played", "RetentionDate")
+               VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', ?1, 'tt3480822', 0,
+                       '2021-12-31 00:00:00.0000000', 7, 490, 0,
+                       '2026-01-01 00:00:00.0000000')"#,
+        )
+        .bind(guid_to_db(HARMONIZE_USER))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let before: Vec<(String, String, i64, i64, bool, String)> =
+            sqlx::query_as(snapshot).fetch_all(db.pool()).await.unwrap();
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 0);
+
+        let rows = plays(&db, PLACEHOLDER_ID).await;
+        assert_eq!(rows[0].playback_position_ticks, 0);
+        assert_eq!(rows[1].playback_position_ticks, 490);
+        let after: Vec<(String, String, i64, i64, bool, String)> =
+            sqlx::query_as(snapshot).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(after, before);
+    }
+
+    /// The repair runs once (from [`run_all`] here): a second call writes
+    /// nothing, even over a conflict that appeared since — the scan's folds
+    /// are not this pass's business.
+    #[tokio::test]
+    async fn harmonize_runs_once() {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa), Uuid::from_u128(0xbbbb)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        run_all(&db).await.unwrap();
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
+        assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
+
+        insert_play(&db, &ids[1], RECENT).await;
+        insert_play(&db, &ids[1], FOSSIL).await;
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 0);
+        let untouched = plays(&db, &ids[1]).await;
+        assert_eq!((untouched[0].play_count, untouched[1].play_count), (9, 7));
+    }
+
+    /// With date, count and position equal, the lower `CustomDataKey` wins —
+    /// Ferrofin's tiebreak, so the result never depends on row order.
+    #[rstest::rstest]
+    #[case::lower_key_favorite(true, false, true)]
+    #[case::lower_key_not_favorite(false, true, false)]
+    #[tokio::test]
+    async fn harmonize_ties_go_to_the_lower_custom_data_key(
+        #[case] lower: bool,
+        #[case] higher: bool,
+        #[case] expected: bool,
+    ) {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: "tt3480822",
+                favorite: higher,
+                ..RECENT
+            },
+        )
+        .await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                favorite: lower,
+                ..RECENT
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        assert!(
+            plays(&db, &ids[0])
+                .await
+                .iter()
+                .all(|row| row.is_favorite == expected)
+        );
+    }
+
+    /// A dated play beats an undated one however often that was played; the
+    /// losers take exactly the nine played-state columns and keep their key
+    /// and `RetentionDate`.
+    #[tokio::test]
+    async fn harmonize_copies_the_nine_columns_of_the_dated_winner() {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        let winner = Play {
+            key: "tt0167261",
+            last_played: Some((2020, 5, 1)),
+            count: 1,
+            position: 300,
+            played: false,
+            favorite: true,
+            audio: Some(2),
+            subtitle: Some(3),
+            likes: Some(true),
+            rating: Some(8.0),
+            retention: None,
+        };
+        insert_play(&db, &ids[0], winner).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: "121",
+                count: 50,
+                played: true,
+                retention: Some((2026, 1, 1)),
+                ..Play::default()
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        let rows = plays(&db, &ids[0]).await;
+        let kept = UserDataEntity {
+            item_id: ids[0].clone(),
+            user_id: guid_to_db(HARMONIZE_USER),
+            custom_data_key: "tt0167261".to_owned(),
+            audio_stream_index: Some(2),
+            is_favorite: true,
+            last_played_date: Some(day((2020, 5, 1))),
+            likes: Some(true),
+            play_count: 1,
+            playback_position_ticks: 300,
+            played: false,
+            rating: Some(8.0),
+            retention_date: None,
+            subtitle_stream_index: Some(3),
+        };
+        assert_eq!(rows[1], kept, "the winner keeps its own values");
+        let expected = UserDataEntity {
+            custom_data_key: "121".to_owned(),
+            retention_date: Some(day((2026, 1, 1))),
+            ..kept
+        };
+        assert_eq!(rows[0], expected);
+    }
+
+    /// The winner's date is copied as stored: EF's trimmed text stays
+    /// trimmed on every row, so the group agrees byte for byte and no longer
+    /// conflicts (a resumed pass would otherwise count it again).
+    #[rstest::rstest]
+    #[case::whole_seconds("2023-08-14 00:00:00")]
+    #[case::trimmed_fraction("2023-08-14 17:35:09.533")]
+    #[tokio::test]
+    async fn harmonize_copies_the_winners_stored_date_text(#[case] text: &str) {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        set_date_text(&db, &ids[0], RECENT.key, text).await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        assert_eq!(
+            date_texts(&db, &ids[0]).await,
+            [Some(text.to_owned()), Some(text.to_owned())]
+        );
+        assert!(
+            conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// One instant written two ways — EF trims fraction zeros, Ferrofin
+    /// writes seven digits — is no conflict: nothing is written (not even
+    /// the other columns, which differ) and no snapshot is taken. Exact to
+    /// the tick: dates one tick apart do conflict.
+    #[rstest::rstest]
+    #[case::trimmed_fraction("2026-05-14 17:35:09.533", "2026-05-14 17:35:09.5330000", false)]
+    #[case::whole_seconds("2023-08-14 00:00:00", "2023-08-14 00:00:00.0000000", false)]
+    #[case::same_text("2026-08-08 19:14:59.4740651", "2026-08-08 19:14:59.4740651", false)]
+    #[case::one_tick_apart("2026-08-08 19:14:59.474065", "2026-08-08 19:14:59.4740651", true)]
+    #[tokio::test]
+    async fn harmonize_compares_dates_by_instant_not_by_text(
+        #[case] ef: &str,
+        #[case] ferrofin: &str,
+        #[case] conflict: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = open_file_db(tmp.path(), "jellyfin.db").await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: FOSSIL.key,
+                likes: Some(true),
+                ..RECENT
+            },
+        )
+        .await;
+        set_date_text(&db, &ids[0], RECENT.key, ef).await;
+        set_date_text(&db, &ids[0], FOSSIL.key, ferrofin).await;
+        let before = plays(&db, &ids[0]).await;
+
+        let written = harmonize_conflicting_user_data(&db).await.unwrap();
+
+        assert_eq!(written, usize::from(conflict));
+        assert_eq!(
+            tmp.path().join("jellyfin.db.pre-harmonize").exists(),
+            conflict
+        );
+        if !conflict {
+            assert_eq!(plays(&db, &ids[0]).await, before);
+        }
+    }
+
+    /// Partitions commit one by one and the marker waits for the last: a
+    /// pass that dies mid-way leaves the harmonized groups harmonized and
+    /// the rest for the next boot, which finishes them. With one group per
+    /// partition, a page boundary falls between two users of one item (the
+    /// keyset's `"ItemId" = ?2 AND "UserId" > ?3` branch).
+    #[tokio::test]
+    async fn harmonize_resumes_after_a_failed_partition() {
+        let db = test_db().await;
+        let ids = seed_harmonize(
+            &db,
+            &[
+                Uuid::from_u128(0x1000),
+                Uuid::from_u128(0x2000),
+                Uuid::from_u128(0x3000),
+            ],
+        )
+        .await;
+        let second = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        crate::test_support::seed_named_user(&db, second, "second").await;
+        for id in &ids {
+            insert_play(&db, id, RECENT).await;
+            insert_play(&db, id, FOSSIL).await;
+        }
+        insert_play_as(&db, &ids[0], second, RECENT).await;
+        insert_play_as(&db, &ids[0], second, FOSSIL).await;
+        let fossils = || async {
+            sqlx::query_as::<_, (String, String)>(
+                r#"SELECT "ItemId", "UserId" FROM "UserData" WHERE "PlayCount" = 7
+                   ORDER BY "ItemId", "UserId""#,
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(fossils().await.len(), 4);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"CREATE TRIGGER "fail_last" BEFORE UPDATE ON "UserData"
+               WHEN OLD."ItemId" = '{}' BEGIN SELECT RAISE(ABORT, 'boom'); END"#,
+            ids[2]
+        )))
+        .execute(db.writer())
+        .await
+        .unwrap();
+
+        assert!(harmonize_in_partitions(&db, 1).await.is_err());
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_none());
+        // Both users of the first item and the second item were harmonized;
+        // only the failed partition's group is left.
+        assert_eq!(
+            fossils().await,
+            [(ids[2].clone(), guid_to_db(HARMONIZE_USER))]
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_last""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(harmonize_in_partitions(&db, 1).await.unwrap(), 1);
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
+        assert!(fossils().await.is_empty());
+    }
+
+    /// A file-backed database is copied to `<db>.pre-harmonize` before a
+    /// conflict is harmonized — the copy still holds the fossil's state —
+    /// and not at all when there is none.
+    #[tokio::test]
+    async fn harmonize_snapshots_only_when_rows_conflict() {
+        use sqlx::Connection;
+        let tmp = tempfile::tempdir().unwrap();
+        let quiet = open_file_db(tmp.path(), "quiet.db").await;
+        let ids = seed_harmonize(&quiet, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&quiet, &ids[0], RECENT).await;
+        insert_play(
+            &quiet,
+            &ids[0],
+            Play {
+                key: "tt3480822",
+                ..RECENT
+            },
+        )
+        .await;
+        assert_eq!(harmonize_conflicting_user_data(&quiet).await.unwrap(), 0);
+        assert!(!tmp.path().join("quiet.db.pre-harmonize").exists());
+
+        let db = open_file_db(tmp.path(), "jellyfin.db").await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+        let backup = tmp.path().join("jellyfin.db.pre-harmonize");
+        assert!(backup.is_file());
+        let mut snapshot = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&backup)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+        let fossil: i64 = sqlx::query_scalar(
+            r#"SELECT "PlayCount" FROM "UserData" WHERE "ItemId" = ?1 AND "CustomDataKey" = ?2"#,
+        )
+        .bind(&ids[0])
+        .bind(FOSSIL.key)
+        .fetch_one(&mut snapshot)
+        .await
+        .unwrap();
+        assert_eq!(fossil, 7, "the snapshot predates the writes");
+        assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
     }
 }

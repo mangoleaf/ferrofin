@@ -71,8 +71,9 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// (`RefreshCleanNamesAndValues`, `RefreshForcedSortNames`). Each partition is
 /// read with one keyset query and its rewrites committed as one transaction,
 /// which bounds both the memory a pass holds and the length of any single
-/// write lock.
-const REPAIR_PARTITION: i64 = 10_000;
+/// write lock. `adoption_repairs::harmonize_conflicting_user_data` reuses it
+/// as its partition size in conflict groups (upstream batches 500).
+pub(crate) const REPAIR_PARTITION: i64 = 10_000;
 
 /// One `Season` row as `recompute_season_keys` reads it:
 /// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
