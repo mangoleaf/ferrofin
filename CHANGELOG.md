@@ -33,6 +33,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 36 shell tests passed.
 
 ### Parity
+- Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
+  and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
+  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
   relationships, version links, `GetCleanValue`, forced sort names, localized user-view
   consolidation

@@ -95,13 +95,14 @@ fn num_cpus_for_analysis() -> usize {
 const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`). This is the version the vendored OpenAPI contract targets — i.e.
-/// "Ferrofin speaks Jellyfin 10.11.8's API" — NOT Ferrofin's own crate version
-/// (`CARGO_PKG_VERSION`, used only for build/log lines). Clients gate on it:
-/// jellyfin-web's SDK refuses any server below `MINIMUM_VERSION = 10.10.0` with an
-/// "Update Required" screen, so reporting Ferrofin's `0.1.0` locks the web client out.
-/// Keep this in sync with `contracts/jellyfin-openapi-*.json`.
-const JELLYFIN_API_VERSION: &str = "10.11.8";
+/// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
+/// (12.2.0; handlers are verified against `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
+/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
+/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
+/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
+/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
+const JELLYFIN_API_VERSION: &str = "12.2.0";
 
 /// The host a Live TV live stream's buffered file is served from.
 ///
