@@ -2402,6 +2402,42 @@ struct ItemsDateOracleRow {
     utc: Option<String>,
 }
 
+/// The UTC instant `row` binds to on this host. Dublin's spring gap and
+/// autumn fold resolve through the zone's standard offset (.NET's
+/// `NoThrowOnInvalidTime`; Ferrofin's `mktime` with `tm_isdst = 0`), and the
+/// host's tzdata decides which offset that is: the main format makes Irish
+/// Standard Time (+01:00) standard with a negative winter DST, the rearguard
+/// format (Ubuntu's, so GitHub's runners) makes GMT standard. The oracle ran
+/// on main-format data; on a rearguard host .NET reads the same TZif as
+/// Ferrofin and answers an hour later.
+#[cfg(unix)]
+fn host_utc(row: &ItemsDateOracleRow) -> Option<chrono::DateTime<chrono::Utc>> {
+    let utc = row.utc.as_deref()?.parse().unwrap();
+    let transition = row.timezone == "Europe/Dublin"
+        && ["2026-03-29T01:30:00", "2026-10-25T01:30:00"]
+            .iter()
+            .any(|wall| row.raw.starts_with(wall));
+    if transition && winter_is_standard_time() {
+        return Some(utc + chrono::Duration::hours(1));
+    }
+    Some(utc)
+}
+
+/// Whether the process's zone (`TZ`) reports mid-January as standard time:
+/// false for a main-format Europe/Dublin, whose winter GMT is the DST.
+#[cfg(unix)]
+fn winter_is_standard_time() -> bool {
+    let january: libc::time_t = 1_768_478_400; // 2026-01-15T12:00:00Z
+    // SAFETY: localtime_r reads the zone the child process started with
+    // (`TZ`), writes one zero-initialized tm and returns null only when the
+    // time is unrepresentable.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        assert!(!libc::localtime_r(&raw const january, &raw mut tm).is_null());
+        tm.tm_isdst == 0
+    }
+}
+
 #[cfg(unix)]
 fn items_date_oracle_rows() -> Vec<ItemsDateOracleRow> {
     if let Ok(path) = std::env::var("FERROFIN_ITEMS_DATE_ORACLE") {
@@ -2563,10 +2599,10 @@ async fn items_get_result_local_dates_match_dotnet_child_process() {
                 "{path}?recursive=true&minPremiereDate={encoded}&maxPremiereDate={encoded}"
             );
             let (status, query) = capture_items_date_socket_query(&uri).await;
-            if let Some(expected) = row.utc.as_deref() {
+            if let Some(expected) = host_utc(row) {
                 assert_eq!(status, StatusCode::OK, "{zone}: {uri}");
                 let query = query.expect("query_items ran");
-                let expected = Some(expected.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+                let expected = Some(expected);
                 assert_eq!(query.min_premiere_date, expected, "min {zone}: {uri}");
                 assert_eq!(query.max_premiere_date, expected, "max {zone}: {uri}");
             } else {
