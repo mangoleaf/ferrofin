@@ -405,6 +405,10 @@ fn a_disc_folder_does_not_compare_its_mtime_for_the_probe() {
 #[case::nfo_older(LocalMetadataFormat::Nfo, -3_600_000, false)]
 #[case::xml_1s_newer(LocalMetadataFormat::Xml, 1_000, true)]
 #[case::xml_same_time(LocalMetadataFormat::Xml, 0, false)]
+#[case::book_1s_newer(LocalMetadataFormat::Book, 1_000, true)]
+#[case::book_1ms_newer(LocalMetadataFormat::Book, 1, true)]
+#[case::book_same_time(LocalMetadataFormat::Book, 0, false)]
+#[case::book_older(LocalMetadataFormat::Book, -1_000, false)]
 fn a_local_sidecar_newer_than_the_last_save_rereads_local_metadata_only(
     #[case] format: LocalMetadataFormat,
     #[case] newer_ms: i64,

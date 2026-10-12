@@ -190,7 +190,7 @@ struct Prefetched {
     /// must be `false` and not absent when there is none.
     has_lyrics: std::collections::HashSet<Uuid>,
     /// The requesting user's content permissions (populated only when the
-    /// `CanDelete`/`CanDownload` fields are requested and a user is present),
+    /// `CanDelete`/`CanDownload`/`PlayAccess` fields are requested and a user is present),
     /// so the whole page gates on one permissions query.
     content_permissions: Option<ContentPermissions>,
     /// Everything the page's `CanDelete` reads besides the rows (empty unless
@@ -283,16 +283,16 @@ impl Prefetched {
 }
 use crate::kinds;
 
+/// `(ItemValues.Type, clean value)` keys to resolve.
+type CleanKeys = Vec<(i32, String)>;
+
 /// The `ImageType` discriminants that the C# `ItemImageInfo` marks as "allows
-/// multiple" (backdrops/chapters/screenshots) — the single-image loop skips
+/// multiple" (backdrops/chapters) — the single-image loop skips
 /// these so they are handled by their own limited fetch.
 ///
 /// Mirrors `BaseItem.AllowsMultipleImages`.
 fn allows_multiple_images(image_type: ImageType) -> bool {
-    matches!(
-        image_type,
-        ImageType::Backdrop | ImageType::Screenshot | ImageType::Chapter
-    )
+    matches!(image_type, ImageType::Backdrop | ImageType::Chapter)
 }
 
 /// Reads an [`ImageType`] from its stored `BaseItemImageInfos.ImageType`
@@ -485,6 +485,36 @@ fn image_orientation_from_name(value: &str) -> Option<ferrofin_model::drawing::I
 /// unrecognized stored `Type` (the conservative default used across the crate).
 fn row_kind(item: &BaseItemEntity) -> BaseItemKind {
     kind_from_type_name(&item.type_).unwrap_or(BaseItemKind::Folder)
+}
+
+/// BaseItem.CanDownload and the Video/Audio/AudioBook/Book/Photo overrides.
+/// The same predicate backs both the DTO and the download endpoint.
+fn can_download_file(item: &BaseItemEntity, kind: BaseItemKind) -> bool {
+    // Photo deliberately returns true upstream, even without a local path.
+    if kind == BaseItemKind::Photo {
+        return true;
+    }
+    if !item
+        .path
+        .as_deref()
+        .is_some_and(|p| !p.is_empty() && crate::media_info_resolver::is_file_protocol(p))
+    {
+        return false;
+    }
+    if kinds::is_video(kind) {
+        let data = crate::item_data::parse_data(item.data.as_deref());
+        let video_type = data.get("VideoType");
+        return !video_type.is_some_and(|value| {
+            matches!(value.as_i64(), Some(2 | 3))
+                || value.as_str().is_some_and(|v| {
+                    v.eq_ignore_ascii_case("Dvd") || v.eq_ignore_ascii_case("BluRay")
+                })
+        });
+    }
+    matches!(
+        kind,
+        BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::Book
+    )
 }
 
 /// Whether this kind is a Live TV channel (C# `item is LiveTvChannel`). Both
@@ -1608,7 +1638,26 @@ impl FerrofinDtoService {
         if want.is_empty() {
             return Ok(map);
         }
-        let keys: Vec<(i32, String)> = want.into_iter().collect();
+        // Artists and album artists link to an actual `MusicArtist` item found by
+        // its clean name (`LinkedChildrenService.FindArtists`), independent of
+        // the `ItemValues` rows; a name with no such item has no id at all.
+        let (artist_keys, keys): (CleanKeys, CleanKeys) = want
+            .into_iter()
+            .partition(|(value_type, _)| matches!(value_type, 0 | 1));
+        let artist_cleans: Vec<&String> = artist_keys
+            .iter()
+            .map(|(_, clean)| clean)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let artists =
+            crate::item_repository::music_artist_ids_by_clean_name(&self.db, &artist_cleans)
+                .await?;
+        for (value_type, clean) in artist_keys {
+            if let Some(id) = artists.get(&clean) {
+                map.entry(value_type).or_default().insert(clean, *id);
+            }
+        }
         // Two host variables per key.
         for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK / 2) {
             let ph = (0..chunk.len())
@@ -1616,13 +1665,7 @@ impl FerrofinDtoService {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                r#"SELECT iv."Type", iv."CleanValue",
-                   CASE WHEN iv."Type" IN (0, 1) THEN COALESCE(
-                       (SELECT artist."Id" FROM "BaseItems" artist
-                        WHERE artist."Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
-                          AND artist."CleanName" = iv."CleanValue"
-                        ORDER BY artist."SortName", artist."Id" LIMIT 1), iv."ItemValueId")
-                   ELSE iv."ItemValueId" END
+                r#"SELECT iv."Type", iv."CleanValue", iv."ItemValueId"
                    FROM "ItemValues" iv
                    WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
             );
@@ -1842,42 +1885,39 @@ impl FerrofinDtoService {
     /// `IHasArtist`/`IHasAlbumArtist` blocks). Artist item ids are resolved from
     /// the shared `ItemValues` table (`Artist`/`AlbumArtist` value types).
     fn attach_artists(dto: &mut BaseItemDto, item: &BaseItemEntity, prefetched: &Prefetched) {
-        let artists = split_multi(item.artists.as_deref());
-        if !artists.is_empty() {
-            let items = artists
+        // The distinct, non-blank names that match an actual `MusicArtist` item
+        // (`GetArtists` → `FindArtists`), each paired with that item's id; a name
+        // that matches none is omitted rather than given a made-up id.
+        let pairs = |names: &[String]| -> Vec<NameGuidPair> {
+            let mut seen = std::collections::HashSet::new();
+            names
                 .iter()
-                .map(|name| NameGuidPair {
-                    name: Some(name.clone()),
-                    // Prefer the ALBUM-ARTIST value id: that is the one the
-                    // by-name materializer backs with a browsable MusicArtist
-                    // row, so a performer who is also an album artist links to
-                    // a real page instead of a dangling id. Pure performers
-                    // keep the Artist (0) value id until the artist-hierarchy
-                    // work lands.
-                    id: {
-                        // One clean-key computation serves both lookups.
-                        let clean = prefetched.clean_key(name);
-                        prefetched
-                            .lookup_clean(1, &clean)
-                            .unwrap_or_else(|| prefetched.value_id_clean(0, &clean))
-                    },
+                .filter(|name| !name.trim().is_empty() && seen.insert(name.as_str()))
+                .filter_map(|name| {
+                    let clean = prefetched.clean_key(name);
+                    // Both name kinds resolve to the same `MusicArtist` item.
+                    prefetched
+                        .lookup_clean(0, &clean)
+                        .or_else(|| prefetched.lookup_clean(1, &clean))
+                        .map(|id| NameGuidPair {
+                            name: Some(name.clone()),
+                            id,
+                        })
                 })
-                .collect();
-            dto.artists = Some(artists);
-            dto.artist_items = Some(items);
-        }
+                .collect()
+        };
 
-        let album_artists = split_multi(item.album_artists.as_deref());
-        if !album_artists.is_empty() {
+        // `IHasArtist`: `Artists` is the stored list (an empty array when there
+        // are none), `ArtistItems` its linked subset.
+        let artists = split_multi(item.artists.as_deref());
+        dto.artist_items = Some(pairs(&artists));
+        dto.artists = Some(artists);
+
+        // `IHasAlbumArtist` (not a music video).
+        if row_kind(item) != BaseItemKind::MusicVideo {
+            let album_artists = split_multi(item.album_artists.as_deref());
             dto.album_artist = album_artists.first().cloned();
-            let items = album_artists
-                .iter()
-                .map(|name| NameGuidPair {
-                    name: Some(name.clone()),
-                    id: prefetched.value_id(1, name), // 1 = AlbumArtist
-                })
-                .collect();
-            dto.album_artists = Some(items);
+            dto.album_artists = Some(pairs(&album_artists));
         }
     }
 
@@ -2186,9 +2226,20 @@ impl FerrofinDtoService {
 
         // User-specific play-state.
         if user.is_some() {
-            // C# `item.GetPlayAccess(user)` — Full unless parental control blocks it (not ported).
+            // C# `BaseItem.GetPlayAccess`: the saved playback permission alone,
+            // with no administrator exception or additional parental check.
             if options.contains_field(ItemFields::PlayAccess) {
-                dto.play_access = Some(ferrofin_model::library::PlayAccess::Full);
+                dto.play_access = Some(
+                    if prefetched
+                        .content_permissions
+                        .as_ref()
+                        .is_some_and(|policy| policy.enable_media_playback)
+                    {
+                        ferrofin_model::library::PlayAccess::Full
+                    } else {
+                        ferrofin_model::library::PlayAccess::None
+                    },
+                );
             }
             if options.enable_user_data {
                 dto.user_data = take_or_clone(&mut prefetched.user_data, &item_id, repeated);
@@ -2409,10 +2460,6 @@ impl FerrofinDtoService {
         .await?;
 
         let perms = prefetched.content_permissions.as_ref();
-        // Live TV channels/programmes hard-override CanDownload to false
-        // upstream (`LiveTvProgram` keeps the `BaseItem` default — no file to
-        // download); CanDelete's own overrides live in `item_deletion`.
-        let live_tv = is_live_tv_channel(kind) || is_live_tv_program(kind);
         if options.contains_field(ItemFields::CanDelete) {
             // C# `user is null ? item.CanDelete() : item.CanDelete(user)` — the
             // one implementation the delete endpoints answer `401` by, so the
@@ -2424,20 +2471,10 @@ impl FerrofinDtoService {
             ));
         }
         if options.contains_field(ItemFields::CanDownload) {
-            // C# `CanDownload()` is false by default and only true for playable media;
-            // a by-name item is not a folder but still isn't downloadable.
-            // `Video.CanDownload` (`Video.cs:444-452`): never a DVD or
-            // Blu-ray rip, whose path is a folder.
-            let disc = kinds::is_video(kind)
-                && matches!(
-                    crate::item_data::video_format(item.data.as_deref()).video_type,
-                    ferrofin_model::entities::VideoType::Dvd
-                        | ferrofin_model::entities::VideoType::BluRay
-                );
-            let file_downloadable =
-                !item.is_folder && !kinds::is_item_by_name(kind) && !live_tv && !disc;
-            dto.can_download =
-                Some(file_downloadable && perms.is_none_or(|p| p.enable_content_downloading));
+            dto.can_download = Some(
+                can_download_file(item, kind)
+                    && (user.is_none() || perms.is_some_and(|p| p.enable_content_downloading)),
+            );
         }
 
         Ok(dto)
@@ -3038,6 +3075,27 @@ impl FerrofinDtoService {
             dto.status = fields.status;
         }
 
+        // `if (item is IHasDisplayOrder hasDisplayOrder) dto.DisplayOrder =
+        // hasDisplayOrder.DisplayOrder;` (`DtoService.cs:1207-1210`): a
+        // series' episode ordering and a collection's child ordering, both
+        // kept in the `Data` blob. The web editor's "Display order" select
+        // reads it.
+        if kind == BaseItemKind::Series {
+            let order = ferrofin_providers::tvdb::display_order_of(item.data.as_deref());
+            dto.display_order = Some(order).filter(|order| !order.is_empty());
+        } else if kind == BaseItemKind::BoxSet {
+            // `BoxSet`'s constructor sets `DisplayOrder = "PremiereDate"`, which
+            // stands until the set stores one of its own (a stored blank one
+            // is written back as it is).
+            let data = crate::item_data::parse_data(item.data.as_deref());
+            dto.display_order = Some(
+                data.get("DisplayOrder")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("PremiereDate")
+                    .to_owned(),
+            );
+        }
+
         // Production locations.
         if options.contains_field(ItemFields::ProductionLocations) {
             let locations = split_multi(item.production_locations.as_deref());
@@ -3575,6 +3633,10 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
             }
         }
         Ok(dto)
+    }
+
+    async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        Ok(can_download_file(item, row_kind(item)))
     }
 
     async fn can_delete(
@@ -4331,13 +4393,14 @@ impl FerrofinDtoService {
                 .into_iter()
                 .collect()
         };
-        // One permissions read gates the whole page's CanDelete/CanDownload
-        // (C# `BaseItem.CanDelete(user)`/`CanDownload(user)` per item), and
+        // One permissions read gates the whole page's CanDelete/CanDownload/PlayAccess
+        // (C# `BaseItem` permission methods per item), and
         // CanDelete's other inputs are read once for the page too.
         let content_permissions = match user {
             Some(user)
                 if options.contains_field(ItemFields::CanDelete)
-                    || options.contains_field(ItemFields::CanDownload) =>
+                    || options.contains_field(ItemFields::CanDownload)
+                    || options.contains_field(ItemFields::PlayAccess) =>
             {
                 self.user_data
                     .get_content_permissions(parse_user_id(&user.id)?)
@@ -5475,7 +5538,10 @@ mod tests {
         ] {
             let id = Uuid::new_v4();
             crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "M", data).await;
-            ids.push(fetch_item(&db, id).await);
+            // `CanDownload` needs a file path (`IsFileProtocol`).
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(format!("/media/{id}"));
+            ids.push(row);
         }
         let dtos = service(db.clone())
             .get_base_item_dtos(
@@ -6864,6 +6930,65 @@ mod tests {
         assert_eq!(dtos[2].air_days, None, "only a Series carries them");
     }
 
+    /// `if (item is IHasDisplayOrder hasDisplayOrder) dto.DisplayOrder = …`
+    /// (`DtoService.cs:1207-1210`): a series and a collection carry it from
+    /// their `Data` blob; a blank or missing value, and every other kind, do
+    /// not.
+    #[tokio::test]
+    async fn series_and_collection_dtos_carry_their_display_order() {
+        let db = test_db().await;
+        let dvd = Uuid::new_v4();
+        let blank = Uuid::new_v4();
+        let collection = Uuid::new_v4();
+        let movie = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            dvd,
+            BaseItemKind::Series,
+            "A",
+            r#"{"DisplayOrder":"dvd"}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            blank,
+            BaseItemKind::Series,
+            "B",
+            r#"{"DisplayOrder":""}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            collection,
+            BaseItemKind::BoxSet,
+            "C",
+            r#"{"DisplayOrder":"PremiereDate"}"#,
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            movie,
+            BaseItemKind::Movie,
+            "D",
+            r#"{"DisplayOrder":"dvd"}"#,
+        )
+        .await;
+        let svc = service(db.clone());
+        let mut rows = Vec::new();
+        for id in [dvd, blank, collection, movie] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let dtos = svc
+            .get_base_item_dtos(&rows, &DtoOptions::with_all_fields(false), None, None, true)
+            .await
+            .unwrap();
+        let orders: Vec<_> = dtos
+            .iter()
+            .map(|dto| dto.display_order.as_deref())
+            .collect();
+        assert_eq!(orders, [Some("dvd"), None, Some("PremiereDate"), None]);
+    }
+
     // ---- Inherited / parent images (v12 DtoService.AddInheritedImages) -------
 
     /// The exact test-data shape: an episode with no images, under a season
@@ -7892,6 +8017,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_eligibility_agrees_between_endpoint_single_and_page_dtos() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Download").await;
+        let original = fetch_item(&db, id).await;
+        let svc = service(db);
+        let options = DtoOptions {
+            fields: vec![ItemFields::CanDownload],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        for (kind, path, data, expected) in [
+            (BaseItemKind::Movie, Some("/media/a.mkv"), None, true),
+            (
+                BaseItemKind::Movie,
+                Some("https://cdn.example/a.mkv"),
+                None,
+                false,
+            ),
+            (
+                BaseItemKind::Video,
+                Some("/media/disc"),
+                Some(r#"{"VideoType":"Dvd"}"#),
+                false,
+            ),
+            (
+                BaseItemKind::Movie,
+                Some("/media/disc"),
+                Some(r#"{"VideoType":3}"#),
+                false,
+            ),
+            (
+                BaseItemKind::Video,
+                Some("/media/a.iso"),
+                Some(r#"{"VideoType":"Iso"}"#),
+                true,
+            ),
+            (BaseItemKind::Audio, Some("/media/a.flac"), None, true),
+            (
+                BaseItemKind::Audio,
+                Some("https://cdn.example/a.flac"),
+                None,
+                false,
+            ),
+            (BaseItemKind::AudioBook, Some("/media/a.m4b"), None, true),
+            (BaseItemKind::Book, Some("/media/a.epub"), None, true),
+            (BaseItemKind::Book, None, None, false),
+            (
+                BaseItemKind::Photo,
+                Some("https://cdn.example/a.jpg"),
+                None,
+                true,
+            ),
+            (BaseItemKind::Folder, Some("/media"), None, false),
+            (BaseItemKind::Playlist, Some("/media/a.m3u"), None, false),
+            (
+                BaseItemKind::LiveTvChannel,
+                Some("/media/a.ts"),
+                None,
+                false,
+            ),
+        ] {
+            let mut item = original.clone();
+            item.type_ = crate::item_type_lookup::stored_type_name(kind)
+                .unwrap()
+                .to_owned();
+            item.path = path.map(str::to_owned);
+            item.data = data.map(str::to_owned);
+            assert_eq!(
+                svc.can_download(&item).await.unwrap(),
+                expected,
+                "{kind:?} {path:?}"
+            );
+            let single = svc
+                .get_base_item_dto(&item, &options, None, None)
+                .await
+                .unwrap();
+            let page = svc
+                .get_base_item_dtos(&[item], &options, None, None, true)
+                .await
+                .unwrap();
+            assert_eq!(single.can_download, Some(expected));
+            assert_eq!(page[0].can_download, Some(expected));
+        }
+    }
+
+    #[tokio::test]
     async fn can_delete_true_for_non_virtual_item() {
         let db = test_db().await;
         let id = Uuid::new_v4();
@@ -8256,6 +8469,7 @@ mod tests {
             id,
             &[
                 image_info(ImageType::Primary, "/primary.jpg", Some("LKO2")),
+                image_info(ImageType::Screenshot, "/screenshot.png", Some("SHOT")),
                 image_info(ImageType::Backdrop, "/backdrop.jpg", None),
             ],
         )
@@ -8269,6 +8483,7 @@ mod tests {
 
         let image_tags = dto.image_tags.as_ref().expect("image tags");
         assert_eq!(image_tags[&ImageType::Primary], "tag:/primary.jpg");
+        assert_eq!(image_tags[&ImageType::Screenshot], "tag:/screenshot.png");
         assert_eq!(
             dto.backdrop_image_tags.as_deref(),
             Some(&["tag:/backdrop.jpg".to_owned()][..])
@@ -8276,6 +8491,10 @@ mod tests {
         // Blurhash recorded under the primary image's tag.
         let hashes = dto.image_blur_hashes.as_ref().expect("blur hashes");
         assert_eq!(hashes[&ImageType::Primary]["tag:/primary.jpg"], "LKO2");
+        assert_eq!(
+            hashes[&ImageType::Screenshot]["tag:/screenshot.png"],
+            "SHOT"
+        );
         // Aspect ratio comes from the fake processor's 400x200 → 2.0.
         assert_eq!(dto.primary_image_aspect_ratio, Some(2.0));
     }
@@ -8965,6 +9184,9 @@ mod tests {
         // (1) row, which is the browsable one.
         let artist_id = seed_value(0, "Sigur Rós").await;
         let album_artist_id = seed_value(1, "sigur ros").await;
+        // The browsable artist: a `MusicArtist` item with that clean name.
+        let artist_item = Uuid::from_u128(0xA_9999);
+        crate::test_support::seed_music_artist_item(&db, artist_item, "Sigur Rós").await;
 
         let movie = Uuid::from_u128(0xA_1234);
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
@@ -9008,14 +9230,99 @@ mod tests {
         let genres = dtos[0].genre_items.as_ref().expect("genre items");
         assert_eq!(genres[0].id, genre_id, "genre id");
 
+        // The links are the `MusicArtist` item whose clean name matches
+        // (`FindArtists`), never an `ItemValues` id.
         let artists = dtos[1].artist_items.as_ref().expect("artist items");
-        assert_eq!(
-            artists[0].id, album_artist_id,
-            "performer prefers the AlbumArtist value id"
-        );
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].id, artist_item, "performer links to the item");
         assert_ne!(artists[0].id, artist_id);
+        assert_ne!(artists[0].id, album_artist_id);
         let album_artists = dtos[1].album_artists.as_ref().expect("album artists");
-        assert_eq!(album_artists[0].id, album_artist_id, "album-artist id");
+        assert_eq!(album_artists[0].id, artist_item, "album-artist id");
+    }
+
+    /// `DtoService` pairs only the distinct, non-blank artist names that match a
+    /// `MusicArtist` item; the plain `Artists` list stays whole, and a track or
+    /// album with no tags still carries empty arrays (the shape strict clients
+    /// expect). A music video has artists but no album artists.
+    #[tokio::test]
+    async fn artist_pairs_cover_only_names_with_a_music_artist_item() {
+        use crate::test_support::{seed_item_with_artists, seed_music_artist_item};
+        let db = test_db().await;
+        let artist = Uuid::from_u128(0xC_0001);
+        seed_music_artist_item(&db, artist, "Known").await;
+        let track = Uuid::from_u128(0xC_0002);
+        seed_item_with_artists(
+            &db,
+            track,
+            BaseItemKind::Audio,
+            "Track",
+            Some("Known|Known|Unknown|Known"),
+            Some("Unknown|Known"),
+        )
+        .await;
+        let bare = Uuid::from_u128(0xC_0003);
+        seed_named_item(&db, bare, BaseItemKind::Audio, "Bare").await;
+        let video = Uuid::from_u128(0xC_0004);
+        seed_item_with_artists(
+            &db,
+            video,
+            BaseItemKind::MusicVideo,
+            "Clip",
+            Some("Known"),
+            Some("Known"),
+        )
+        .await;
+        let mut rows = Vec::new();
+        for id in [track, bare, video] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let dtos = service(db)
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+
+        let names = |pairs: &Option<Vec<NameGuidPair>>| -> Vec<String> {
+            pairs
+                .as_ref()
+                .expect("a list")
+                .iter()
+                .map(|pair| pair.name.clone().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(
+            dtos[0].artists.as_deref(),
+            Some(
+                &[
+                    "Known".to_owned(),
+                    "Known".to_owned(),
+                    "Unknown".to_owned(),
+                    "Known".to_owned()
+                ][..]
+            ),
+            "the stored list is untouched"
+        );
+        assert_eq!(
+            names(&dtos[0].artist_items),
+            ["Known"],
+            "distinct, linked only"
+        );
+        assert_eq!(dtos[0].artist_items.as_ref().unwrap()[0].id, artist);
+        assert_eq!(names(&dtos[0].album_artists), ["Known"]);
+        assert_eq!(
+            dtos[0].album_artist.as_deref(),
+            Some("Unknown"),
+            "the first stored name"
+        );
+
+        assert_eq!(dtos[1].artists.as_deref(), Some(&[][..]));
+        assert_eq!(names(&dtos[1].artist_items), Vec::<String>::new());
+        assert_eq!(names(&dtos[1].album_artists), Vec::<String>::new());
+        assert_eq!(dtos[1].album_artist, None);
+
+        assert_eq!(names(&dtos[2].artist_items), ["Known"]);
+        assert_eq!(dtos[2].album_artists, None, "IHasArtist only");
+        assert_eq!(dtos[2].album_artist, None);
     }
 
     /// Every credit spelling on the page must resolve to the ONE by-name `Person`
@@ -9771,6 +10078,84 @@ mod tests {
             item_count: 99,
         };
         assert_eq!(total_item_count(&counts), 11);
+    }
+
+    #[tokio::test]
+    async fn saved_playback_permission_controls_single_and_page_play_access() {
+        use ferrofin_model::{library::PlayAccess, users::UserPolicy};
+        use ferrofin_traits::library::UserManager;
+
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let manager = crate::FerrofinUserManager::new(db.clone());
+        let (svc, _tmp) = service_with_real_permissions(&db).await;
+        let options = DtoOptions {
+            fields: vec![ItemFields::PlayAccess],
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        let mut rows = Vec::new();
+        for kind in [
+            BaseItemKind::Movie,
+            BaseItemKind::Audio,
+            BaseItemKind::Folder,
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, "Playable item").await;
+            rows.push(fetch_item(&db, id).await);
+        }
+
+        for admin in [false, true] {
+            for enabled in [false, true, false] {
+                manager
+                    .update_policy(
+                        user_id,
+                        &UserPolicy {
+                            is_administrator: admin,
+                            enable_media_playback: enabled,
+                            ..UserPolicy::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let want = Some(if enabled {
+                    PlayAccess::Full
+                } else {
+                    PlayAccess::None
+                });
+                let page = svc
+                    .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+                    .await
+                    .unwrap();
+                for (row, dto) in rows.iter().zip(page) {
+                    assert_eq!(dto.play_access, want, "page: admin={admin}");
+                    let single = svc
+                        .get_base_item_dto(row, &options, Some(&user), None)
+                        .await
+                        .unwrap();
+                    assert_eq!(single.play_access, want, "single: admin={admin}");
+                }
+            }
+        }
+        let anonymous = svc
+            .get_base_item_dto(&rows[0], &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(anonymous.play_access, None);
+        let omitted = svc
+            .get_base_item_dto(
+                &rows[0],
+                &DtoOptions {
+                    fields: vec![],
+                    ..options
+                },
+                Some(&user),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(omitted.play_access, None);
     }
 
     // ---- CanDelete(user): one answer for the DTO and the delete endpoints ----

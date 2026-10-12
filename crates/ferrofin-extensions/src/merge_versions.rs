@@ -1995,7 +1995,7 @@ mod tests {
             plugins,
             fingerprinter: None,
             ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
-            cache_dir: std::env::temp_dir(),
+            cache_dir: std::env::temp_dir().into(),
             merge_versions: svc,
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),

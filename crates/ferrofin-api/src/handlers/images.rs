@@ -55,7 +55,7 @@ use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::image_upload::{
@@ -138,6 +138,16 @@ pub(crate) struct ImageQuery {
 }
 
 impl ImageQuery {
+    /// A query naming only a cache `tag` and an output `format`, as the
+    /// splashscreen route accepts.
+    pub(crate) fn tagged(tag: Option<String>, format: Option<String>) -> Self {
+        Self {
+            format,
+            tag,
+            ..Self::default()
+        }
+    }
+
     /// Whether the request asks for any transform (resize/format/blur); a plain
     /// request serves the stored original untouched.
     fn wants_transform(&self) -> bool {
@@ -400,7 +410,7 @@ fn select_image(
 /// This is the shared tail of every image route once an image row is resolved.
 /// A remote (`http(s)`) path has no local file to serve without the not-yet-ported
 /// image processor, so it is a `404` (the contract's not-found outcome).
-async fn serve_image_file(
+pub(crate) async fn serve_image_file(
     state: &AppState,
     item_id: Uuid,
     image: &ItemImageInfo,
@@ -646,7 +656,7 @@ async fn serve_item_image(
 async fn authorize_image_item(
     state: &AppState,
     id: Uuid,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
 ) -> Result<ItemResolved, ApiError> {
     if let Some(user) = auth.ok().and_then(|auth| auth.0.user) {
         require_item(state, id, Some(&user)).await?;
@@ -674,7 +684,7 @@ async fn authorize_image_item(
 )]
 async fn get_item_image(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((item_id, image_type)): Path<(Uuid, String)>,
     Query(query): Query<ImageQuery>,
     request: Request,
@@ -708,7 +718,7 @@ async fn get_item_image(
 )]
 async fn get_item_image_by_index(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(query): Query<ImageQuery>,
     request: Request,
@@ -750,7 +760,7 @@ async fn get_item_image_by_index(
 #[allow(clippy::type_complexity)]
 async fn get_item_image_parametrized(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((
         item_id,
         image_type,
@@ -1055,7 +1065,7 @@ by_name_image_handlers!(
 )]
 async fn get_user_image(
     State(state): State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -1063,7 +1073,7 @@ async fn get_user_image(
     // An explicit id is public; without one, use the authenticated caller.
     let user_id = query
         .user_id
-        .or_else(|| auth.ok().map(|RequireAuth(info)| info.user_id()))
+        .or_else(|| auth.ok().map(|AuthenticatedIdentity(info)| info.user_id()))
         .filter(|id| !id.is_nil())
         .ok_or_else(|| ApiError::BadRequest("UserId is required if unauthenticated".to_owned()))?;
     state
@@ -1165,7 +1175,7 @@ async fn delete_user_image(
 /// and ignored, as upstream does.
 async fn get_user_image_legacy(
     state: State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
@@ -1178,7 +1188,7 @@ async fn get_user_image_legacy(
 /// path-scoped form of `GET /UserImage`.
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
-    auth: Result<RequireAuth, ApiError>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
     Path((user_id, _image_type, image_index)): Path<(Uuid, String, i32)>,
     Query(mut query): Query<ImageQuery>,
     request: Request,
@@ -1275,14 +1285,16 @@ async fn set_item_image(
 
 /// `POST /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed upload.
 ///
-/// Port of `ImageController.SetItemImageByIndex`.
+/// Port of `ImageController.SetItemImageByIndex`. Jellyfin accepts the route
+/// index but saves without it: multi-image types append and single-image types
+/// replace their sole image, just as on the unindexed upload route.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Images/{imageType}/{imageIndex}",
     params(
         ("itemId" = String, Path, description = "The item id"),
         ("imageType" = String, Path, description = "The image type"),
-        ("imageIndex" = i32, Path, description = "The image index"),
+        ("imageIndex" = i32, Path, description = "Unused image index"),
     ),
     responses(
         (status = 204, description = "Image saved"),
@@ -1294,7 +1306,7 @@ async fn set_item_image(
 async fn set_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
+    Path((item_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1303,15 +1315,7 @@ async fn set_item_image_by_index(
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    save_item_image(
-        &state,
-        item_id,
-        image_type,
-        Some(image_index),
-        content_type,
-        &body,
-    )
-    .await
+    save_item_image(&state, item_id, image_type, None, content_type, &body).await
 }
 
 /// `DELETE /Items/{itemId}/Images/{imageType}` — delete an item's image.
@@ -1420,10 +1424,19 @@ async fn update_item_image_index(
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_ref()).await?;
-    state
+    let swapped = state
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)
         .await?;
+    if swapped {
+        state
+            .providers
+            .update_to_repository(
+                item_id,
+                ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+            )
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

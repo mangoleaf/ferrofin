@@ -21,6 +21,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+pub mod listen;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
@@ -29,7 +30,7 @@ pub mod state;
 pub mod vaapi_probe;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -38,7 +39,7 @@ use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
-use axum::serve::{Listener as _, ListenerExt as _};
+use axum::serve::Listener as _;
 use tower::Layer as _;
 use tower_http::services::ServeDir;
 
@@ -123,6 +124,9 @@ fn encoder_or_disabled(discovered: anyhow::Result<FfmpegPaths>) -> FfmpegPaths {
                 "ffmpeg unavailable — transcoding/playback will be disabled until configured",
             );
             FfmpegPaths {
+                encoder_app_path_display: e
+                    .downcast_ref::<bootstrap::ValidatedFfmpegPath>()
+                    .map(|validated| validated.path.clone()),
                 ffmpeg: "ffmpeg".into(),
                 ffprobe: "ffprobe".into(),
                 capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -350,6 +354,60 @@ struct ProcessMetrics {
     gauges: metrics_wiring::SamplerGauges,
 }
 
+/// Applies a restore scheduled by `POST /Backup/Restore`, before the database
+/// is opened. Returns the failure of a restore rejected before it wrote
+/// anything (to be recorded once the activity log exists); a restore that
+/// failed part-way aborts the boot.
+fn apply_scheduled_restore(
+    config: &Config,
+) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+    Ok(
+        match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
+            Ok(Some(archive)) => {
+                tracing::warn!(archive = %archive.display(), "restored backup");
+                None
+            }
+            Ok(None) => None,
+            // Extraction began and failed: the trees may be half replaced. Jellyfin
+            // throws out of startup here; booting on them would let the web client
+            // (which reads "the server answers again" as success) announce a
+            // restore that did not happen.
+            Err(failure) if failure.partially_applied => {
+                tracing::error!(error = %failure, "scheduled backup restore failed part-way");
+                return Err(anyhow::anyhow!(
+                    "the scheduled backup restore failed part-way and the data directory may be \
+                 partly restored: {failure}"
+                ));
+            }
+            // Rejected before anything was written (missing or foreign archive):
+            // the server boots on its untouched data and records the failure in the
+            // activity log, where an administrator will see it.
+            Err(failure) => {
+                tracing::error!(error = %failure, "scheduled backup restore was rejected");
+                Some(failure)
+            }
+        },
+    )
+}
+
+/// Records a rejected restore in the activity log: the only durable,
+/// administrator-visible trace of it.
+async fn record_restore_failure(
+    activity: &dyn ferrofin_traits::activity::ActivityManager,
+    failure: &ferrofin_api::handlers::backup::RestoreFailure,
+) {
+    let entry = ferrofin_traits::activity::ActivityLogCreate {
+        name: "Restoring the backup failed".to_owned(),
+        type_: "BackupRestoreFailed".to_owned(),
+        overview: Some(failure.to_string()),
+        severity: ferrofin_model::activity::LogLevel::Error,
+        ..Default::default()
+    };
+    if let Err(error) = activity.create_entry(entry).await {
+        tracing::warn!(%error, "could not record the failed restore in the activity log");
+    }
+}
+
 /// One server lifetime: boot, serve until drained, tear the host down, and
 /// report whether an API restart was requested (`true` → the caller runs it
 /// again). A signal-initiated drain always reports `false`.
@@ -362,11 +420,7 @@ async fn serve_once(
     // A restore scheduled by `POST /Backup/Restore` (then restart) is applied
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
-    match ferrofin_api::handlers::backup::apply_pending_restore(&boot_tree_roots(config)) {
-        Ok(Some(archive)) => tracing::warn!(archive = %archive.display(), "restored backup"),
-        Ok(None) => {}
-        Err(e) => tracing::error!(error = %e, "scheduled backup restore failed"),
-    }
+    let restore_failure = apply_scheduled_restore(config)?;
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
@@ -378,18 +432,20 @@ async fn serve_once(
     // muxer turns out to be missing, because waiting to learn whether it IS
     // missing is exactly the 15 ms serial spawn this removes; the answer is
     // simply discarded when the muxer is present.
+    // `MediaEncoder.SetFFmpegPath`'s middle rung: the encoding configuration's
+    // saved `EncoderAppPath`, between the command line and `$PATH`.
+    let saved_encoder_path = bootstrap::persisted_encoder_app_path(&config.config_dir);
     let (db, ffmpeg, fpcalc) = tokio::join!(
         open_database(config),
-        discover_ffmpeg(config, None),
+        discover_ffmpeg(config, saved_encoder_path.as_deref()),
         ferrofin_extensions::fingerprint::discover_fpcalc_async(),
     );
     boot_stage(started, "db+encoder probe");
     let db = db?;
 
     // ffmpeg is required for playback but not for the server to boot: warn and
-    // continue so the API comes up even on a host without ffmpeg installed.
-    // `system.json` EncoderAppPath is not yet loaded at this bootstrap stage, so
-    // no persisted fallback is supplied here.
+    // continue so the API comes up even on a host without ffmpeg installed
+    // (a documented difference from Jellyfin, which aborts startup).
     let ffmpeg = encoder_or_disabled(ffmpeg);
 
     // Wire every concrete manager into the shared AppState (the composition root).
@@ -398,6 +454,9 @@ async fn serve_once(
         .await
         .context("failed to assemble application state")?;
     boot_stage(started, "app state wired");
+    if let Some(failure) = &restore_failure {
+        record_restore_failure(wired.state.activity.as_ref(), failure).await;
+    }
 
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
@@ -478,19 +537,17 @@ async fn serve_once(
     // `Router::layer`, which runs per-matched-route, too late to re-route).
 
     boot_stage(started, "router mounted");
-    let addr = SocketAddr::new(config.bind_addr, config.port);
-    let listener = bind_listener(addr).await?;
-    let bound_addr = listener.local_addr()?;
-    wired.app_host.set_bound_http_port(bound_addr.port());
+    let (listeners, addresses, bound_port) = bind_http_listeners(config, &wired.state)?;
+    wired.app_host.set_bound_http_port(bound_port);
     let discovery = start_discovery(&wired, config.discovery_bind_addr).await;
     let discovery_abort = discovery
         .as_ref()
         .map(tokio::task::JoinHandle::abort_handle);
     boot_stage(started, "listener bound");
-    tracing::info!(%addr, "ferrofin-server listening");
+    tracing::info!(addresses = ?addresses, "ferrofin-server listening");
 
     let serve_result = serve_until_drained(
-        listener,
+        listeners,
         router,
         announce_shutdown(
             shutdown_rx,
@@ -577,7 +634,7 @@ async fn stop_background_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) {
 /// reading, so a restart during playback never came back. Dropping the serve
 /// future past the deadline aborts the remaining connections.
 async fn serve_until_drained(
-    listener: axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>,
+    listeners: Vec<listen::Listener>,
     router: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     timeout_secs: u32,
@@ -587,25 +644,46 @@ async fn serve_until_drained(
     let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
         .layer(app);
     let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
-    let serve =
-        axum::serve(
-            listener,
-            // `with_connect_info` so handlers can read the client's socket address
-            // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
-            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                SocketAddr,
-            >(app),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            let _ = drain_started_tx.send(());
+    // One serve loop per listening address, all stopped by the same trigger.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let mut stop = stop_rx.clone();
+        let app = app.clone();
+        servers.spawn(async move {
+            axum::serve(
+                listener,
+                // `with_connect_info` so handlers can read the client's socket address
+                // (e.g. `GET /System/Endpoint` reporting `IsLocal` for a loopback peer).
+                axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                    SocketAddr,
+                >(app),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stop.wait_for(|stopped| *stopped).await;
+            })
+            .await
         });
+    }
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stop_tx.send(true);
+        let _ = drain_started_tx.send(());
+    });
     let deadline = async move {
         let _ = drain_started_rx.await;
         tokio::time::sleep(std::time::Duration::from_secs(u64::from(timeout_secs))).await;
     };
+    let serve = async {
+        while let Some(finished) = servers.join_next().await {
+            finished
+                .context("a listener task failed")?
+                .context("server error")?;
+        }
+        Ok(())
+    };
     tokio::select! {
-        result = serve => result.context("server error"),
+        result = serve => result,
         () = deadline => {
             tracing::warn!(
                 timeout_s = timeout_secs,
@@ -614,6 +692,53 @@ async fn serve_until_drained(
             Ok(())
         }
     }
+}
+
+/// Plans and binds this lifetime's HTTP listeners, returning them with the
+/// addresses they were planned on and the port clients are told about (the
+/// first listener's; every address shares it).
+fn bind_http_listeners(
+    config: &Config,
+    state: &ferrofin_api::state::AppState,
+) -> anyhow::Result<(Vec<listen::Listener>, Vec<SocketAddr>, u16)> {
+    let addresses = listen_addresses(config, state);
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "the network settings leave no address to listen on (IPv4 and IPv6 are both disabled)"
+    );
+    let listeners = listen::bind_all(&addresses)?;
+    let port = listeners
+        .first()
+        .context("no listener was bound")?
+        .local_addr()?
+        .port();
+    Ok((listeners, addresses, port))
+}
+
+/// The addresses this lifetime listens on: the operator's startup bind when
+/// they pinned one, otherwise Jellyfin's `GetAllBindInterfaces` over the saved
+/// network settings (`LocalNetworkAddresses`, `EnableIPv4`/`EnableIPv6`).
+fn listen_addresses(config: &Config, state: &ferrofin_api::state::AppState) -> Vec<SocketAddr> {
+    let interfaces: Vec<listen::BindInterface> = state
+        .network
+        .as_ref()
+        .and_then(|network| network.read().ok())
+        .map(|network| {
+            network
+                .get_all_bind_interfaces(false)
+                .into_iter()
+                .map(|interface| listen::BindInterface {
+                    address: interface.address,
+                    index: u32::try_from(interface.index).unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    listen::plan_addresses(
+        config.bind_addr_explicit.then_some(config.bind_addr),
+        config.port,
+        &interfaces,
+    )
 }
 
 /// Cancels every scheduled task currently running (best-effort: a task that
@@ -642,13 +767,10 @@ fn boot_tree_roots(config: &Config) -> ferrofin_api::handlers::backup::TreeRoots
         &config.config_dir,
         &config.database_path(),
     );
-    if let Some(metadata) = std::fs::read_to_string(config.config_dir.join("system.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|cfg| cfg.get("MetadataPath")?.as_str().map(str::to_owned))
-        .filter(|p| !p.trim().is_empty())
+    if let Some(metadata) =
+        ferrofin_api::handlers::backup::restored_metadata_root(&config.config_dir)
     {
-        roots.metadata = PathBuf::from(metadata);
+        roots.metadata = metadata;
     }
     roots
 }
@@ -699,17 +821,6 @@ impl Signals {
     }
 }
 
-/// Binds the HTTP listener, with Nagle's algorithm off on every connection it
-/// accepts (see [`disable_nagle`]).
-async fn bind_listener(
-    addr: SocketAddr,
-) -> anyhow::Result<axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>> {
-    Ok(tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind {addr}"))?
-        .tap_io(disable_nagle as fn(&mut tokio::net::TcpStream)))
-}
-
 /// Turns Nagle's algorithm off on every accepted connection (`TCP_NODELAY`).
 ///
 /// Kestrel — the server Jellyfin runs on — sets `NoDelay` on accepted sockets by
@@ -729,7 +840,7 @@ async fn bind_listener(
 /// A failure to set the option is logged and ignored: it is an optimisation, not
 /// a correctness requirement, and a connection that cannot take the sockopt must
 /// still be served.
-fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "failed to set TCP_NODELAY on an accepted connection");
     }
@@ -962,6 +1073,23 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt as _;
 
+    #[test]
+    fn disabled_encoder_retains_only_a_successfully_validated_ffmpeg_display() {
+        let validated = std::path::PathBuf::from("/owned/ffmpeg");
+        let partial = anyhow::anyhow!("ffprobe validation failed").context(
+            super::bootstrap::ValidatedFfmpegPath {
+                path: validated.clone(),
+            },
+        );
+        let disabled = super::encoder_or_disabled(Err(partial));
+        assert_eq!(disabled.encoder_app_path_display, Some(validated));
+        assert_eq!(disabled.ffmpeg, std::path::PathBuf::from("ffmpeg"));
+        assert_eq!(disabled.ffprobe, std::path::PathBuf::from("ffprobe"));
+        assert!(!disabled.chromaprint_muxer);
+        let invalid = super::encoder_or_disabled(Err(anyhow::anyhow!("ffmpeg validation failed")));
+        assert_eq!(invalid.encoder_app_path_display, None);
+    }
+
     #[tokio::test]
     async fn background_teardown_releases_sockets_before_returning() {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -973,10 +1101,19 @@ mod tests {
             drop(socket);
         });
         super::stop_background_tasks(vec![task]).await;
-        let rebound = tokio::net::UdpSocket::bind(address)
-            .await
-            .expect("released before return");
-        drop(rebound);
+        // A child another test forks at this moment holds a copy of every
+        // open socket until it execs, so the port may stay taken for a few
+        // milliseconds after this process closed it; one never released
+        // stays taken.
+        let mut rebound = tokio::net::UdpSocket::bind(address).await;
+        for _ in 0..100 {
+            if rebound.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            rebound = tokio::net::UdpSocket::bind(address).await;
+        }
+        drop(rebound.expect("released before return"));
     }
 
     /// An upper-casing test transformer.
@@ -1287,7 +1424,7 @@ mod tests {
     /// (asserted first, so the test fails loudly if the platform ever changes
     /// that premise and makes the assertion below vacuous), and `axum::serve`
     /// adds nothing of its own. Drop the `.tap_io(disable_nagle)` from
-    /// [`bind_listener`] — or stub `disable_nagle` out — and the second
+    /// [`listen::bind`] — or stub `disable_nagle` out — and the second
     /// assertion fails.
     #[tokio::test]
     async fn accepted_connections_have_nagle_disabled() {
@@ -1310,9 +1447,7 @@ mod tests {
         drop((raw, client, plain));
 
         // The real thing: whatever `run` binds must hand out no-delay sockets.
-        let mut listener = super::bind_listener("127.0.0.1:0".parse().expect("addr"))
-            .await
-            .expect("bind");
+        let mut listener = super::listen::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
         let addr = listener.local_addr().expect("addr");
         let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let (served, _) = listener.accept().await;

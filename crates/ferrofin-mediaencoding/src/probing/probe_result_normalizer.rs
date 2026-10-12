@@ -213,6 +213,9 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
         info.media_source.media_attachments = media_attachments;
 
         if is_audio {
+            // AudioFileProber applies its library settings to the original
+            // values, not these general-purpose normalized artist arrays.
+            info.raw_audio_tags = Some(tags.clone());
             set_audio_runtime_ticks(&data, &mut info);
             set_audio_info_from_tags(&mut info, &tags);
         } else {

@@ -94,14 +94,25 @@ async fn require_access(
     required: SyncPlayAccess,
 ) -> Result<(), ApiError> {
     let mgr = manager(state)?;
-    // An API-key caller has no user row. Upstream evaluates the policy against
-    // `GetUserId()` and refuses, so this is a `403` — not the `400` that
-    // `resolve_user` reports for a user-less request.
+    // SyncPlayAccessHandler still resolves a user after the default handler.
+    // UserManager.GetUserById rejects an API key's empty user id before the
+    // handler can test for a missing row.
+    if auth.user_id().is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let Some(user) = resolve_user_opt(state, auth, None).await? else {
-        return Err(ApiError::Forbidden(
-            "SyncPlay requires a signed-in user.".to_owned(),
-        ));
+        return Err(ApiError::NotFound("SyncPlay user".to_owned()));
     };
+    // SyncPlayAccessRequirement inherits DefaultAuthorizationRequirement.
+    // Its administrator success remains satisfied when this handler does not
+    // grant the narrower requirement; it never issues an unconditional Fail.
+    if auth
+        .user_policy
+        .as_ref()
+        .is_some_and(|p| p.is_administrator)
+    {
+        return Ok(());
+    }
     let access = SyncPlayUserAccessType::from_stored(user.sync_play_access);
     let permitted = match required {
         // `user.SyncPlayAccess is CreateAndJoinGroups or JoinGroups

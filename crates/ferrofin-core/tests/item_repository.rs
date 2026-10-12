@@ -971,6 +971,7 @@ async fn linked_child_ancestor_filter_finds_collections_of_a_library() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one user and library, every play-state order
 async fn user_data_sorts_order_by_play_state() {
     use ferrofin_db::entities::users::UserEntity;
     use ferrofin_model::dto::SortOrder;
@@ -1065,6 +1066,57 @@ async fn user_data_sorts_order_by_play_state() {
             .expect("query");
         let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
         assert_eq!(names, ["Often", "Rarely"], "sort {sort:?}");
+    }
+
+    // An item the user has no row for is not played: it ties with one whose row
+    // says unplayed (here by name) rather than sorting ahead of it as a NULL
+    // would — measured against Jellyfin 12.2.
+    let mut maybe = item(Uuid::from_u128(0x903), BaseItemKind::Movie, "Maybe");
+    maybe.id = maybe.id.to_uppercase();
+    maybe.top_parent_id = Some(library.to_string().to_uppercase());
+    let mut never = item(Uuid::from_u128(0x904), BaseItemKind::Movie, "Never");
+    never.id = never.id.to_uppercase();
+    never.top_parent_id = Some(library.to_string().to_uppercase());
+    persist.save_items(&[maybe, never]).await.expect("save");
+    sqlx::query(
+        r#"INSERT INTO "UserData"
+           ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played")
+           VALUES (?1,?2,?3,0,0,0,0)"#,
+    )
+    .bind(Uuid::from_u128(0x903).to_string().to_uppercase())
+    .bind(user_id.to_string().to_uppercase())
+    .bind(Uuid::from_u128(0x903).to_string())
+    .execute(db.writer())
+    .await
+    .expect("an unplayed row");
+    for (sort, direction, expected) in [
+        (
+            ItemSortBy::IsPlayed,
+            SortOrder::Ascending,
+            ["Maybe", "Never", "Often", "Rarely"],
+        ),
+        (
+            ItemSortBy::IsPlayed,
+            SortOrder::Descending,
+            ["Often", "Rarely", "Maybe", "Never"],
+        ),
+        (
+            ItemSortBy::IsUnplayed,
+            SortOrder::Ascending,
+            ["Often", "Rarely", "Maybe", "Never"],
+        ),
+    ] {
+        let rows = repository
+            .get_item_list(&InternalItemsQuery {
+                user: Some(user.clone()),
+                include_item_types: vec![BaseItemKind::Movie],
+                order_by: vec![(sort, direction)],
+                ..Default::default()
+            })
+            .await
+            .expect("query");
+        let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, expected, "{sort:?} {direction:?}");
     }
 }
 
@@ -1567,4 +1619,143 @@ fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::Ferrofi
             "/tmp/ferrofin-test/web",
         )),
     )
+}
+
+#[tokio::test]
+async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
+    use ferrofin_model::entities_media::ParentalRatingScore;
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let links = ferrofin_core::FerrofinLinkedChildrenService::new(db.clone());
+    let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "adult");
+    child.inherited_parental_rating_value = Some(18);
+    persist.save_items(&[child]).await.unwrap();
+    let mut parents = Vec::new();
+    for (id, name, score) in [(0x991, "rated", Some(10)), (0x992, "unrated", None)] {
+        let mut parent = item(Uuid::from_u128(id), BaseItemKind::BoxSet, name);
+        parent.inherited_parental_rating_value = score;
+        parents.push(parent);
+    }
+    persist.save_items(&parents).await.unwrap();
+    for parent in &parents {
+        links
+            .upsert_linked_child(
+                Uuid::parse_str(&parent.id).unwrap(),
+                Uuid::from_u128(0x990),
+                0,
+            )
+            .await
+            .unwrap();
+    }
+    let query = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::BoxSet],
+        max_parental_rating: Some(ParentalRatingScore::new(12, None)),
+        ..Default::default()
+    };
+    let found = repo(&db).get_item_list(&query).await.unwrap();
+    assert_eq!(
+        found.iter().map(|i| i.name.as_deref()).collect::<Vec<_>>(),
+        vec![Some("rated")]
+    );
+    // A child below the limit admits an unrated container too.
+    let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
+    child.inherited_parental_rating_value = Some(12);
+    child.inherited_parental_rating_sub_value = Some(0);
+    persist.save_items(&[child]).await.unwrap();
+    assert_eq!(repo(&db).get_item_list(&query).await.unwrap().len(), 2);
+}
+
+/// `OrderMapper`'s `ItemValues`-correlated keys: `Studio`, `Artist` and
+/// `AlbumArtist` order by the item's first value of that type by its clean text
+/// (ordinal, so `…10` precedes `…2`), an item without one first — read off a
+/// Jellyfin 12.2 oracle (`REC Studio:Asc/Des`), where Ferrofin used to fall
+/// back to `SortName`.
+#[tokio::test]
+async fn item_value_sorts_order_by_the_first_value_of_the_type() {
+    use ferrofin_db::enums::ItemValueType;
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let mut rows = Vec::new();
+    for (n, name) in ["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut row = item(
+            Uuid::from_u128(0xA00 + n as u128),
+            BaseItemKind::Movie,
+            name,
+        );
+        row.id = row.id.to_uppercase();
+        rows.push(row);
+    }
+    persist.save_items(&rows).await.expect("save");
+    let id = |n: u128| Uuid::from_u128(0xA00 + n);
+    // Alpha: Zed; Bravo: Alpha Studio 10 then Zed (the first by text wins);
+    // Charlie: none; Delta: Alpha Studio 2; Echo: Beta. Artists: Alpha, Charlie
+    // and Echo have one each.
+    let typed = |kind: ItemValueType, value: &str| (i32::from(kind), value.to_owned());
+    for (n, values) in [
+        (
+            0,
+            vec![
+                typed(ItemValueType::Studios, "Zed Studio"),
+                typed(ItemValueType::Artist, "Mid Artist"),
+            ],
+        ),
+        (
+            1,
+            vec![
+                typed(ItemValueType::Studios, "Zed Studio"),
+                typed(ItemValueType::Studios, "Alpha Studio 10"),
+            ],
+        ),
+        (2, vec![typed(ItemValueType::Artist, "Aardvark")]),
+        (3, vec![typed(ItemValueType::Studios, "Alpha Studio 2")]),
+        (
+            4,
+            vec![
+                typed(ItemValueType::Studios, "Beta Studio"),
+                typed(ItemValueType::Artist, "Zulu"),
+            ],
+        ),
+    ] {
+        persist
+            .save_item_values(id(n), &values)
+            .await
+            .expect("item values");
+    }
+    let order = |by: ItemSortBy, direction: SortOrder| {
+        let repository = &repository;
+        async move {
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Movie],
+                    order_by: vec![(by, direction)],
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+                .into_iter()
+                .filter_map(|row| row.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        order(ItemSortBy::Studio, SortOrder::Ascending).await,
+        ["Charlie", "Bravo", "Delta", "Echo", "Alpha"]
+    );
+    assert_eq!(
+        order(ItemSortBy::Studio, SortOrder::Descending).await,
+        ["Alpha", "Echo", "Delta", "Bravo", "Charlie"]
+    );
+    assert_eq!(
+        order(ItemSortBy::Artist, SortOrder::Ascending).await,
+        ["Bravo", "Delta", "Charlie", "Alpha", "Echo"],
+        "no artist first, then by name (ties by SortName)"
+    );
 }

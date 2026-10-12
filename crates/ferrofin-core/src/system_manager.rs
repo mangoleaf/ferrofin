@@ -307,23 +307,21 @@ impl FerrofinSystemManager {
         self
     }
 
-    /// The transcode temp path.
-    ///
-    /// In C# this is `EncodingOptions.TranscodingTempPath` (a separate config
-    /// store owned by the encoding layer, out of this unit's scope). The
-    /// override is injected via [`SystemHostFacts::transcoding_temp_path`]; absent
-    /// that, it defaults to `{cache}/transcodes`, matching Jellyfin's default.
-    fn transcode_path(&self) -> String {
-        self.facts
+    /// Resolves and prepares the same live transcode root as the media consumers.
+    fn transcode_path(&self) -> Result<String, ServiceError> {
+        if let Some(path) = self
+            .facts
             .transcoding_temp_path
-            .clone()
-            .filter(|p| !p.trim().is_empty())
-            .unwrap_or_else(|| {
-                std::path::Path::new(&self.paths.cache_path())
-                    .join("transcodes")
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .as_ref()
+            .filter(|path| !path.is_empty())
+        {
+            ferrofin_util::directory_path::prepare_transcode_directory(std::path::Path::new(path))
+                .map_err(|error| {
+                    ServiceError::backend(format!("prepare transcode directory {path}: {error}"))
+                })?;
+            return Ok(path.clone());
+        }
+        self.paths.prepare_transcode_path()
     }
 }
 
@@ -348,7 +346,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
     async fn get_system_info(&self, request: &RequestContext) -> Result<SystemInfo, ServiceError> {
         let cfg = self.configuration_manager.configuration().await?;
         let local_address = self.application_host.get_smart_api_url(request).await.ok();
-        let transcode = self.transcode_path();
+        let transcode = self.transcode_path()?;
         let internal_metadata = self.paths.internal_metadata_path();
 
         #[allow(deprecated)]
@@ -424,7 +422,7 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             self.paths.cache_path(),
             self.paths.log_directory_path(),
             self.paths.internal_metadata_path(),
-            self.transcode_path(),
+            self.transcode_path()?,
         ];
         for (_, _, folders) in &library_folders {
             paths.extend(folders.iter().cloned());
@@ -543,6 +541,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        deprecated,
+        reason = "verify the legacy SystemInfo path beside the current storage projection"
+    )]
+    async fn system_reports_the_live_transcode_root_and_storage_together() {
+        let (mgr, _) = build().await;
+        let root = tempfile::tempdir().expect("transcode root");
+        for child in ["first", "second"] {
+            let transcode = root.path().join(child);
+            mgr.paths
+                .set_transcode_path(Some(transcode.to_str().expect("path")));
+            let info = mgr
+                .get_system_info(&RequestContext::default())
+                .await
+                .expect("info");
+            let storage = mgr.get_system_storage_info().await.expect("storage");
+            assert_eq!(info.transcoding_temp_path.as_deref(), transcode.to_str());
+            assert_eq!(
+                storage.transcoding_temp_folder.path,
+                transcode.to_string_lossy()
+            );
+            assert!(transcode.join(".jellyfin-transcode").is_file());
+        }
+        mgr.paths.set_transcode_path(None);
+        let info = mgr
+            .get_system_info(&RequestContext::default())
+            .await
+            .expect("default info");
+        assert_eq!(info.transcoding_temp_path, Some(mgr.paths.transcode_path()));
+    }
+
+    #[tokio::test]
     async fn system_info_carries_host_and_config_facts() {
         let (mgr, _) = build().await;
         let info = mgr
@@ -586,6 +616,65 @@ mod tests {
         assert_eq!(storage.cache_folder.used_space, 50);
         assert!(storage.libraries.is_empty());
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)] // Both dashboard API generations must report the same roots.
+    async fn dashboard_info_and_storage_follow_effective_directory_changes() {
+        let (mgr, _) = build().await;
+        let original = mgr.configuration_manager.configuration().await.unwrap();
+        let before = mgr.get_system_storage_info().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let metadata = root.path().join("metadata");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::create_dir(&metadata).unwrap();
+        let mut changed = (*original).clone();
+        changed.cache_path = Some(cache.to_string_lossy().into_owned());
+        changed.metadata_path = metadata.to_string_lossy().into_owned();
+        mgr.configuration_manager
+            .update_configuration(&changed)
+            .await
+            .unwrap();
+        let info = mgr
+            .get_system_info(&RequestContext::default())
+            .await
+            .unwrap();
+        let storage = mgr.get_system_storage_info().await.unwrap();
+        assert_eq!(
+            info.cache_path.as_deref(),
+            Some(storage.cache_folder.path.as_str())
+        );
+        assert_eq!(
+            info.internal_metadata_path.as_deref(),
+            Some(storage.internal_metadata_folder.path.as_str())
+        );
+        assert_eq!(storage.cache_folder.path, cache.to_string_lossy());
+        assert_eq!(
+            storage.image_cache_folder.path,
+            cache.join("images").to_string_lossy()
+        );
+        assert_eq!(
+            storage.internal_metadata_folder.path,
+            metadata.to_string_lossy()
+        );
+        assert_eq!(
+            storage.transcoding_temp_folder.path,
+            cache.join("transcodes").to_string_lossy()
+        );
+        mgr.configuration_manager
+            .update_configuration(&original)
+            .await
+            .unwrap();
+        let cleared = mgr.get_system_storage_info().await.unwrap();
+        assert_eq!(
+            cleared.cache_folder.path, storage.cache_folder.path,
+            "cache reset needs restart"
+        );
+        assert_eq!(
+            cleared.internal_metadata_folder.path,
+            before.internal_metadata_folder.path
+        );
     }
 
     // The real filesystem probe reports the live free/used bytes of the disk the

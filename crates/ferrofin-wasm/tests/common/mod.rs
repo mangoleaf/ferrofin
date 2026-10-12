@@ -5,7 +5,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -1047,4 +1047,46 @@ pub fn metadata_provider_fixture(id: &str, provider_name: &str, answer: LookupAn
         .replace("(data (i32.const 488) \"Movie\")", &data)
         .replace(original_info, &provider_info)
         .replace(original_lookup, &lookup)
+}
+
+/// Stores a real movie under an isolated library path for live policy tests.
+pub async fn persisted_movie_library(
+    db: &ferrofin_db::Database,
+    media: &std::path::Path,
+    id: Uuid,
+) -> Arc<dyn LibraryManager> {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    std::fs::create_dir_all(media).unwrap();
+    let path = media.join("fixture.mkv");
+    std::fs::write(&path, b"fixture video").unwrap();
+    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+        db.clone(),
+    ));
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            name: Some("Policy fixture".to_owned()),
+            type_: ferrofin_core::item_type_lookup::stored_type_name(
+                ferrofin_model::data::BaseItemKind::Movie,
+            )
+            .unwrap()
+            .to_owned(),
+            path: Some(path.to_string_lossy().into_owned()),
+            date_created: Some(chrono::Utc::now()),
+            run_time_ticks: Some(5_000_000_000),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence,
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+    ))
 }

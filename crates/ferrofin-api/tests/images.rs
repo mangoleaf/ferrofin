@@ -224,7 +224,7 @@ impl AuthService for OkAuth {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -246,7 +246,7 @@ impl AuthorizationContext for OkAuth {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -348,7 +348,7 @@ impl LibraryManager for StubLibrary {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // Mirror the real manager's 400 guard so the "wrong type" test exercises
         // it, then record the accepted swap.
         if !matches!(image_type, ImageType::Backdrop | ImageType::Chapter) {
@@ -358,7 +358,8 @@ impl LibraryManager for StubLibrary {
             .lock()
             .expect("lock")
             .push((item_id, image_type, index1, index2));
-        Ok(())
+        // Index 99 stands for a slot that does not exist: upstream does nothing.
+        Ok(index2 != 99)
     }
 
     async fn get_named_item(
@@ -619,11 +620,15 @@ impl UserManager for StubUsers {
     }
 }
 
+type SavedImage = (Uuid, String, ImageType, Option<i32>);
+
 /// A [`ProviderManager`] recording `save_image`/`delete_image` and returning a
 /// canned remote image + provider.
 struct StubProviders {
-    saved: Arc<Mutex<Vec<(Uuid, String)>>>,
+    saved: Arc<Mutex<Vec<SavedImage>>>,
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+    /// The `ImageUpdate` repository saves requested through `update_to_repository`.
+    updates: Arc<Mutex<Vec<Uuid>>>,
 }
 
 #[async_trait]
@@ -664,13 +669,15 @@ impl ProviderManager for StubProviders {
         item_id: Uuid,
         _content: &[u8],
         mime_type: &str,
-        _image_type: ImageType,
-        _image_index: Option<i32>,
+        image_type: ImageType,
+        image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        self.saved
-            .lock()
-            .expect("lock")
-            .push((item_id, mime_type.to_owned()));
+        self.saved.lock().expect("lock").push((
+            item_id,
+            mime_type.to_owned(),
+            image_type,
+            image_index,
+        ));
         Ok(())
     }
     async fn delete_image(
@@ -711,6 +718,14 @@ impl ProviderManager for StubProviders {
         _item_id: Uuid,
         _update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn update_to_repository(
+        &self,
+        item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        self.updates.lock().expect("lock").push(item_id);
         Ok(())
     }
     async fn get_external_id_infos(
@@ -760,6 +775,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         providers: Arc::new(StubProviders {
             saved: Arc::new(Mutex::new(Vec::new())),
             deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
         }),
         elevated: false,
     }
@@ -1210,21 +1226,49 @@ async fn set_item_image_saves_and_returns_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let saved = s.providers.saved.lock().expect("lock");
-    assert_eq!(saved.as_slice(), [(ITEM_ID, "image/png".to_owned())]);
+    assert_eq!(
+        saved.as_slice(),
+        [(ITEM_ID, "image/png".to_owned(), ImageType::Primary, None)]
+    );
 }
 
 #[tokio::test]
-async fn set_item_image_by_index_saves() {
+async fn indexed_upload_ignores_every_bound_index_for_single_and_multiple_images() {
     let s = elevated_stubs(String::new(), String::new());
-    let (status, _) = send(
-        &s,
-        "POST",
-        &format!("/Items/{ITEM_ID}/Images/Backdrop/2"),
-        Some(("image/jpeg", "aGk=")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(s.providers.saved.lock().expect("lock").len(), 1);
+    let mut expected = Vec::new();
+    for (kind, image_type) in [
+        ("Backdrop", ImageType::Backdrop),
+        ("Primary", ImageType::Primary),
+    ] {
+        for index in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
+            let (status, _) = send(
+                &s,
+                "POST",
+                &format!("/Items/{ITEM_ID}/Images/{kind}/{index}"),
+                Some(("image/png", "aGk=")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{kind}/{index}");
+            expected.push((ITEM_ID, "image/png".to_owned(), image_type, None));
+        }
+    }
+    assert_eq!(*s.providers.saved.lock().expect("lock"), expected);
+}
+
+#[tokio::test]
+async fn indexed_upload_rejects_unbound_indices_without_saving() {
+    let s = elevated_stubs(String::new(), String::new());
+    for index in ["2147483648", "-2147483649", "invalid"] {
+        let (status, _) = send(
+            &s,
+            "POST",
+            &format!("/Items/{ITEM_ID}/Images/Backdrop/{index}"),
+            Some(("image/png", "aGk=")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(s.providers.saved.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]
@@ -1318,6 +1362,26 @@ async fn update_item_image_index_swaps_and_returns_204() {
         s.library.swaps.lock().expect("lock").as_slice(),
         [(ITEM_ID, ImageType::Backdrop, 1, 3)]
     );
+}
+
+#[tokio::test]
+async fn update_item_image_index_saves_the_item_only_after_a_real_swap() {
+    let s = elevated_stubs(String::new(), String::new());
+    for (new_index, expected_saves) in [(3, 1), (99, 1)] {
+        let (status, _) = send(
+            &s,
+            "POST",
+            &format!("/Items/{ITEM_ID}/Images/Backdrop/1/Index?newIndex={new_index}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            s.providers.updates.lock().expect("lock").len(),
+            expected_saves
+        );
+    }
+    assert_eq!(*s.providers.updates.lock().expect("lock"), [ITEM_ID]);
 }
 
 #[tokio::test]

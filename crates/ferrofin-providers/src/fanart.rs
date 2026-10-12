@@ -37,6 +37,9 @@ struct FanartImage {
     language: Option<String>,
     likes: Option<String>,
     season: Option<String>,
+    /// When the image was added (`yyyy-MM-dd HH:mm:ss`); the season thumb's
+    /// reported size is only trusted after [`WORKING_THUMB_DIMENSIONS`].
+    added: Option<String>,
 }
 
 /// The movie response (`/movies/{id}`).
@@ -65,6 +68,10 @@ struct MovieRoot {
 /// The series response (`/tv/{id}`).
 #[derive(Debug, Default, Deserialize)]
 struct SeriesRoot {
+    #[serde(default)]
+    seasonposter: Vec<FanartImage>,
+    #[serde(default)]
+    seasonbanner: Vec<FanartImage>,
     #[serde(default)]
     hdtvlogo: Vec<FanartImage>,
     #[serde(default)]
@@ -124,10 +131,7 @@ pub struct FanartClient {
     limiter: RateLimiter,
     /// Optional user personal key (`client_key`), raising limits/freshness.
     personal_key: Option<String>,
-    /// The preferred artwork language for the ordering (Ferrofin has no per-item
-    /// metadata-language plumbing yet, so this is fixed at construction).
-    // ponytail: fixed language — thread the library's metadata language through
-    // if per-library artwork language selection is wanted.
+    /// The preferred artwork language for this request's ordering.
     language: String,
     /// The web-service base (const in production; overridable in tests).
     base_url: String,
@@ -158,6 +162,15 @@ impl FanartClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: &str) -> Self {
         base_url.clone_into(&mut self.base_url);
+        self
+    }
+
+    /// Selects the item's preferred artwork language. Clones share the HTTP
+    /// client and rate limiter, so each library can rank the same response
+    /// without changing another library's preference.
+    #[must_use]
+    pub fn with_language(mut self, language: &str) -> Self {
+        language.clone_into(&mut self.language);
         self
     }
 
@@ -234,6 +247,54 @@ impl FanartClient {
         populate(&mut out, &root.tvthumb, ImageType::Thumb, 1000, false);
         populate(&mut out, &root.tvbanner, ImageType::Banner, 1000, false);
         populate(&mut out, &root.tvposter, ImageType::Primary, 1000, false);
+        self.sort(&mut out);
+        out
+    }
+
+    /// One season's artwork out of the series' fanart document, ranked. Port of
+    /// the plugin's `SeasonProvider.GetImages`/`AddImages`: season posters,
+    /// banners and thumbs and the show backgrounds, each kept only when its
+    /// `season` is the number `season` (a background with no numeric season is
+    /// therefore never a season's).
+    ///
+    /// `tvdb_series_id` is the **series'** TVDb id. Upstream reads the season
+    /// item's own `Tmdb`/`Tvdb` id instead, which names the season and not a
+    /// fanart.tv show, so it finds nothing outside coincidences; this asks the
+    /// document the filter was written for.
+    pub async fn season_images(&self, tvdb_series_id: &str, season: i32) -> Vec<TmdbImage> {
+        let Some(root): Option<SeriesRoot> = self.fetch("tv", tvdb_series_id).await else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        // (array, type, width, height) — verbatim from `AddImages`.
+        populate_season(
+            &mut out,
+            &root.seasonposter,
+            ImageType::Primary,
+            (1000, 1426),
+            season,
+        );
+        populate_season(
+            &mut out,
+            &root.seasonbanner,
+            ImageType::Banner,
+            (1000, 185),
+            season,
+        );
+        populate_season(
+            &mut out,
+            &root.seasonthumb,
+            ImageType::Thumb,
+            (1000, 562),
+            season,
+        );
+        populate_season(
+            &mut out,
+            &root.showbackground,
+            ImageType::Backdrop,
+            (1920, 1080),
+            season,
+        );
         self.sort(&mut out);
         out
     }
@@ -325,6 +386,90 @@ impl FanartClient {
     }
 }
 
+/// The date after which fanart.tv's reported thumb dimensions are reliable
+/// (`Constants.WorkingThumbImageDimensions`).
+const WORKING_THUMB_DIMENSIONS: (i32, u32, u32) = (2016, 1, 8);
+
+/// Whether `added` (fanart's `yyyy-MM-dd HH:mm:ss`, or a bare date) is on or
+/// after [`WORKING_THUMB_DIMENSIONS`].
+fn added_after_working_thumbs(added: Option<&str>) -> bool {
+    let Some(added) = added.map(str::trim).filter(|added| !added.is_empty()) else {
+        return false;
+    };
+    let date = chrono::NaiveDateTime::parse_from_str(added, "%Y-%m-%d %H:%M:%S")
+        .map(|stamp| stamp.date())
+        .or_else(|_| chrono::NaiveDate::parse_from_str(added, "%Y-%m-%d"));
+    let (year, month, day) = WORKING_THUMB_DIMENSIONS;
+    date.is_ok_and(|date| {
+        chrono::NaiveDate::from_ymd_opt(year, month, day).is_some_and(|floor| date >= floor)
+    })
+}
+
+/// `SeasonProvider.PopulateImages`: the images of one fanart array whose
+/// `season` parses to `season`, as [`TmdbImage`]s with the array's fixed size
+/// (a thumb added before the dimensions became reliable is 500×281), the `00`
+/// language normalised away, `http` upgraded to `https` and `likes` as the
+/// rating.
+fn populate_season(
+    out: &mut Vec<TmdbImage>,
+    images: &[FanartImage],
+    image_type: ImageType,
+    (width, height): (i32, i32),
+    season: i32,
+) {
+    for img in images {
+        let Some(url) = img.url.as_deref().filter(|url| !url.is_empty()) else {
+            continue;
+        };
+        let Some(image_season) = img
+            .season
+            .as_deref()
+            .filter(|season| !season.is_empty())
+            .and_then(|season| season.trim().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if image_season != season {
+            continue;
+        }
+        let (width, height) = if image_type == ImageType::Thumb
+            && !added_after_working_thumbs(img.added.as_deref())
+        {
+            (500, 281)
+        } else {
+            (width, height)
+        };
+        let language = img
+            .language
+            .as_deref()
+            .filter(|language| !language.eq_ignore_ascii_case("00"))
+            .map(str::to_owned);
+        out.push(TmdbImage {
+            image_type,
+            url: https_upgrade(url),
+            width: Some(width),
+            height: Some(height),
+            community_rating: img.likes.as_deref().and_then(|likes| likes.parse().ok()),
+            vote_count: None,
+            language,
+        });
+    }
+}
+
+/// `url.Replace("http://", "https://", OrdinalIgnoreCase)`.
+fn https_upgrade(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    let mut out = String::with_capacity(url.len() + 1);
+    let mut rest = 0;
+    while let Some(at) = lower[rest..].find("http://") {
+        out.push_str(&url[rest..rest + at]);
+        out.push_str("https://");
+        rest += at + "http://".len();
+    }
+    out.push_str(&url[rest..]);
+    out
+}
+
 /// Appends one fanart array as [`TmdbImage`]s: empty urls skipped, `"00"`/season
 /// languages normalized, `likes` → community rating, the fixed per-type width as
 /// the sort key. `allow_season_all` keeps `season == "all"` images (backgrounds);
@@ -377,7 +522,90 @@ mod tests {
             language: Some(lang.to_owned()),
             likes: Some(likes.to_owned()),
             season: None,
+            added: None,
         }
+    }
+
+    fn season_img(season: &str, added: &str, language: &str, likes: &str) -> FanartImage {
+        FanartImage {
+            url: Some(format!(
+                "http://assets.fanart.tv/{season}-{language}-{likes}.jpg"
+            )),
+            language: Some(language.to_owned()),
+            likes: Some(likes.to_owned()),
+            season: Some(season.to_owned()),
+            added: Some(added.to_owned()),
+        }
+    }
+
+    /// `SeasonProvider.PopulateImages`: only the requested season's images, at
+    /// the array's size, `https`, with `00` as no language.
+    #[test]
+    fn season_images_keep_only_the_requested_season_at_the_plugins_sizes() {
+        let images = vec![
+            season_img("2", "2019-01-01 00:00:00", "en", "7"),
+            season_img("3", "2019-01-01 00:00:00", "en", "9"),
+            season_img("all", "2019-01-01 00:00:00", "en", "9"),
+            season_img("", "2019-01-01 00:00:00", "en", "9"),
+            season_img("02", "2019-01-01 00:00:00", "00", "1"),
+            FanartImage {
+                url: Some(String::new()),
+                ..season_img("2", "", "en", "1")
+            },
+        ];
+        let mut out = Vec::new();
+        populate_season(&mut out, &images, ImageType::Primary, (1000, 1426), 2);
+        assert_eq!(out.len(), 2, "season 2 and its zero-padded twin");
+        assert_eq!(out[0].url, "https://assets.fanart.tv/2-en-7.jpg");
+        assert_eq!((out[0].width, out[0].height), (Some(1000), Some(1426)));
+        assert_eq!(out[0].community_rating, Some(7.0));
+        assert_eq!(out[1].language, None, "\"00\" is no language");
+    }
+
+    /// A thumb added before 2016-01-08 (or with no usable date) is 500×281;
+    /// later ones keep the array's 1000×562.
+    #[test]
+    fn season_thumbs_trust_their_size_only_after_the_working_date() {
+        let images = vec![
+            season_img("1", "2015-12-31 23:59:59", "en", "1"),
+            season_img("1", "2016-01-08 00:00:00", "en", "1"),
+            season_img("1", "2016-01-08", "en", "1"),
+            season_img("1", "not a date", "en", "1"),
+            season_img("1", "", "en", "1"),
+        ];
+        let mut out = Vec::new();
+        populate_season(&mut out, &images, ImageType::Thumb, (1000, 562), 1);
+        let sizes: Vec<_> = out.iter().map(|i| (i.width, i.height)).collect();
+        assert_eq!(
+            sizes,
+            [
+                (Some(500), Some(281)),
+                (Some(1000), Some(562)),
+                (Some(1000), Some(562)),
+                (Some(500), Some(281)),
+                (Some(500), Some(281)),
+            ]
+        );
+        // Only thumbs are subject to the rule.
+        let mut backgrounds = Vec::new();
+        populate_season(
+            &mut backgrounds,
+            &images[..1],
+            ImageType::Backdrop,
+            (1920, 1080),
+            1,
+        );
+        assert_eq!(backgrounds[0].width, Some(1920));
+    }
+
+    #[test]
+    fn http_is_upgraded_to_https_case_insensitively_everywhere() {
+        assert_eq!(
+            https_upgrade("HTTP://a/b?u=http://c"),
+            "https://a/b?u=https://c"
+        );
+        assert_eq!(https_upgrade("https://a"), "https://a");
+        assert_eq!(https_upgrade("ftp://a"), "ftp://a");
     }
 
     #[test]
@@ -491,6 +719,12 @@ mod tests {
             order,
             vec!["wide-en-high", "wide-en-low", "wide-de", "narrow-en"]
         );
+        let german = client.clone().with_language("de");
+        german.sort(&mut images);
+        assert_eq!(images[0].url, "wide-de", "language wins over likes");
+        assert_eq!(images[3].url, "narrow-en", "width wins over language");
+        client.sort(&mut images);
+        assert_eq!(images[0].url, "wide-en-high", "request clones are isolated");
     }
 
     #[test]
@@ -530,7 +764,13 @@ mod tests {
             (
                 "/tv/",
                 r#"{"tvposter":[{"id":"1","url":"/tp.jpg","lang":"en","likes":"5"}],
-                    "seasonthumb":[{"id":"2","url":"/st.jpg","lang":"en","season":"2","likes":"1"}]}"#
+                    "seasonposter":[{"id":"3","url":"http://x/sp2.jpg","lang":"en","season":"2","likes":"4"},
+                                    {"id":"4","url":"/sp3.jpg","lang":"en","season":"3","likes":"9"}],
+                    "seasonbanner":[{"id":"5","url":"/sb2.jpg","lang":"en","season":"2","likes":"2"}],
+                    "showbackground":[{"id":"6","url":"/bg-all.jpg","lang":"en","season":"all","likes":"1"},
+                                      {"id":"7","url":"/bg2.jpg","lang":"en","season":"2","likes":"3"}],
+                    "seasonthumb":[{"id":"2","url":"/st.jpg","lang":"en","season":"2","likes":"1",
+                                    "added":"2018-05-05 10:00:00"}]}"#
                     .to_owned(),
             ),
             (
@@ -553,6 +793,23 @@ mod tests {
         let series = c.series_images("121361").await;
         assert!(series.iter().any(|i| i.image_type == ImageType::Primary));
         assert!(!series.iter().any(|i| i.image_type == ImageType::Thumb));
+
+        // Season 2's own artwork only, widest first: poster 1000, banner 1000,
+        // thumb 1000 (added after the working date), backdrop 1920.
+        let season = c.season_images("121361", 2).await;
+        let kinds: Vec<_> = season.iter().map(|i| i.image_type).collect();
+        assert_eq!(
+            kinds,
+            [
+                ImageType::Backdrop,
+                ImageType::Primary,
+                ImageType::Banner,
+                ImageType::Thumb
+            ],
+            "{season:?}"
+        );
+        assert_eq!(season[1].url, "https://x/sp2.jpg");
+        assert!(c.season_images("121361", 9).await.is_empty());
 
         let artist = c.artist_images("mbid").await;
         assert!(artist.iter().any(|i| i.image_type == ImageType::Primary));

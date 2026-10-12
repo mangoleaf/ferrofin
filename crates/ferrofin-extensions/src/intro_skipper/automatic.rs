@@ -381,7 +381,7 @@ mod tests {
             .execute(&TaskProgress::default())
             .await
             .expect("first");
-        let erase = || std::fs::remove_dir_all(&h.task.cache_dir).expect("drop the cache");
+        let erase = || std::fs::remove_dir_all(h.task.cache_dir.resolve()).expect("drop the cache");
         erase();
         let first = h.calls.load(Ordering::SeqCst);
         h.task

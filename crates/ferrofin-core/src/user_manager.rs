@@ -9,7 +9,7 @@
 //! Password hashing is delegated to the injected [`AuthenticationManager`]
 //! providers (the built-in [`DefaultAuthenticationProvider`] plus the fallback
 //! [`InvalidAuthProvider`]); this manager never touches crypto directly. The C#
-//! `_userLock` per-user async mutex is dropped: SQLite gives us exactly one
+//! login lock serializes authentication for each user; SQLite gives us one
 //! writer connection, so an operation whose guard reads run **inside** its
 //! writing transaction is already atomic against every other writer. That is
 //! load-bearing rather than incidental — a guard evaluated on the *read* pool
@@ -20,10 +20,8 @@
 //! separately).
 //!
 //! Faithful port simplifications, each flagged:
-//! - `authenticate_user` cannot consult a `NetworkManager` (no such trait exists
-//!   yet), so the C# "remote access disabled and caller not on the LAN" check is
-//!   omitted; the disabled-account, lockout, and parental-schedule checks are
-//!   preserved.
+//! - `authenticate_user` shares the configured network policy with HTTP auth,
+//!   and enforces disabled accounts, remote access, lockout and access schedules.
 //! - `get_user_dto` assembles the full [`UserDto`](ferrofin_model::dto::UserDto)
 //!   (policy + configuration) from the `Users` row and its
 //!   `Permissions`/`Preferences`/`AccessSchedules`, including the profile-image
@@ -31,8 +29,9 @@
 //! - `update_policy` persists the flat `Users` columns, permissions, list-valued
 //!   preferences, and access schedules in one transaction.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -62,14 +61,18 @@ use crate::user_entity_ext::{
 };
 
 /// The C# type name of the default password-reset provider, stored on
-/// `User.PasswordResetProviderId` for a freshly created user. The reset-provider
-/// subsystem itself is deferred; only the id is needed to match upstream rows.
+/// `User.PasswordResetProviderId` for a freshly created user. The built-in
+/// recovery workflow is served by the API and is the only registered choice.
 pub const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 
 /// The default username assigned during first-run bootstrap when the host user
 /// name is unusable (C# `"MyJellyfinUser"`).
 const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
+
+type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
+
+mod user_repository;
 
 /// The concrete user manager.
 ///
@@ -81,6 +84,8 @@ const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 #[derive(Clone)]
 pub struct FerrofinUserManager {
     db: Database,
+    login_locks: Arc<LoginLocks>,
+    network: Option<Arc<RwLock<ferrofin_networking::NetworkManager>>>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
@@ -104,7 +109,7 @@ pub struct FerrofinUserManager {
     /// The directory user profile images are written under
     /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
     /// rejects uploads until a directory is configured.
-    profile_image_dir: Option<std::path::PathBuf>,
+    profile_image_dir: Option<DirectoryPath>,
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
 }
 
@@ -124,6 +129,98 @@ impl FerrofinUserManager {
         Self::with_providers(db, Vec::new())
     }
 
+    /// Weak entries retain only active/waiting login locks, not every username
+    /// ever presented. Clones of this manager share the same lock registry.
+    fn login_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .login_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let entry = locks.entry(key.to_owned()).or_default();
+        if let Some(lock) = entry.upgrade() {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            *entry = Arc::downgrade(&lock);
+            lock
+        }
+    }
+
+    /// Enabled providers selected by the saved ID; an unknown ID fails closed.
+    async fn authentication_providers_for(
+        &self,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<&dyn AuthenticationManager>, ServiceError> {
+        let wanted = user
+            .map(|u| u.authentication_provider_id.as_str())
+            .filter(|id| !id.is_empty());
+        let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
+        for provider in &self.providers {
+            if provider.is_enabled().await?
+                && wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id))
+            {
+                candidates.push(provider.as_ref());
+            }
+        }
+        if candidates.is_empty() {
+            candidates.push(&self.invalid_provider);
+        }
+        Ok(candidates)
+    }
+
+    /// Providers may update an existing user or provision one under a canonical
+    /// username. Reload their changes before evaluating the resulting policy.
+    async fn authenticate_with_providers(
+        &self,
+        username: &str,
+        password: &str,
+        user: Option<UserEntity>,
+    ) -> Result<(Option<UserEntity>, bool), ServiceError> {
+        for provider in self.authentication_providers_for(user.as_ref()).await? {
+            let result = match provider
+                .authenticate(username, password, user.as_ref())
+                .await
+            {
+                Ok(result) => result,
+                Err(ServiceError::Unauthorized(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let id = provider_id(provider.name());
+            let mut resolved = if let Some(user) = &user {
+                self.fetch_user(
+                    Uuid::parse_str(&user.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?,
+                )
+                .await?
+            } else if id != DEFAULT_AUTH_PROVIDER_ID {
+                self.get_user_by_name(&result.username).await?
+            } else {
+                None
+            };
+            if user.is_none()
+                && let Some(new_user) = &resolved
+                && let Some(policy) = provider.new_user_policy()
+            {
+                let uid = Uuid::parse_str(&new_user.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                self.update_policy(uid, &policy).await?;
+                resolved = self.fetch_user(uid).await?;
+            }
+            if let Some(user) = &mut resolved
+                && !user.authentication_provider_id.eq_ignore_ascii_case(id)
+            {
+                user_repository::set_authentication_provider(self.db.writer(), &user.id, id)
+                    .await
+                    .map_err(db_err)?;
+                id.clone_into(&mut user.authentication_provider_id);
+                self.auth_cache.clear();
+            }
+            return Ok((resolved, true));
+        }
+        Ok((user, false))
+    }
+
     /// Records a failed login: increments the invalid-attempt counter, locks the
     /// account out once the threshold is hit, and logs the security-audit `warn!`
     /// lines (never the attempted password).
@@ -133,7 +230,7 @@ impl FerrofinUserManager {
         let attempts = user.invalid_login_attempt_count + 1;
         if user
             .login_attempts_before_lockout
-            .is_some_and(|max| max > 0 && attempts >= max)
+            .is_some_and(|max| attempts >= max)
         {
             set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true).await?;
             // A locked-out account's cached auth must not outlive the lock.
@@ -163,6 +260,7 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        self.auth_cache.clear();
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -181,6 +279,8 @@ impl FerrofinUserManager {
         providers.extend(extra);
         Self {
             db,
+            login_locks: Arc::new(Mutex::new(HashMap::new())),
+            network: None,
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
@@ -190,6 +290,33 @@ impl FerrofinUserManager {
             profile_image_dir: None,
             image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
+        }
+    }
+
+    /// Shares the live network policy used by HTTP authorization and trusted
+    /// proxy resolution, so saved LAN definitions also govern password login.
+    #[must_use]
+    pub fn with_network(
+        mut self,
+        network: Arc<RwLock<ferrofin_networking::NetworkManager>>,
+    ) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    fn is_local_client(&self, remote: &str) -> bool {
+        static DEFAULT_NETWORK: LazyLock<ferrofin_networking::NetworkManager> =
+            LazyLock::new(|| {
+                ferrofin_networking::NetworkManager::live(
+                    ferrofin_networking::NetworkConfiguration::default(),
+                )
+            });
+        match &self.network {
+            Some(network) => network
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_in_local_network_str(remote),
+            None => DEFAULT_NETWORK.is_in_local_network_str(remote),
         }
     }
 
@@ -259,8 +386,8 @@ impl FerrofinUserManager {
     /// Sets the directory user profile images are stored under, enabling
     /// [`save_profile_image`](ferrofin_traits::library::UserManager::save_profile_image).
     #[must_use]
-    pub fn with_profile_image_dir(mut self, dir: std::path::PathBuf) -> Self {
-        self.profile_image_dir = Some(dir);
+    pub fn with_profile_image_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.profile_image_dir = Some(dir.into());
         self
     }
 
@@ -755,6 +882,8 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        let login_lock = self.login_lock(&guid_to_db(user_id));
+        let _login_guard = login_lock.lock().await;
         let user = self.require_user(user_id).await?;
 
         if new_password.trim().is_empty()
@@ -765,10 +894,15 @@ impl UserManager for FerrofinUserManager {
             ));
         }
 
-        // The C# providers mutate the user's `Password` in place; our
-        // `AuthenticationManager::change_password` is a no-op by design, so the
-        // built-in default's hash formatter produces the stored value and this
-        // manager owns the write (see `auth_providers`).
+        let candidates = self.authentication_providers_for(Some(&user)).await?;
+        let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
+        provider.change_password(&user, new_password).await?;
+        if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
+            self.auth_cache.clear();
+            return Ok(());
+        }
+        // The built-in provider supplies the hash while this manager owns its
+        // database write. External providers own their credential store.
         let hash = self.default_provider.format_password_hash(new_password)?;
         sqlx::query(
             r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
@@ -790,48 +924,21 @@ impl UserManager for FerrofinUserManager {
         remote_endpoint: &str,
         is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError> {
-        let _ = remote_endpoint; // No NetworkManager yet — see module docs.
         if username.trim().is_empty() {
             return Err(ServiceError::invalid_input("username must not be empty"));
         }
 
         let user = self.get_user_by_name(username).await?;
+        // Authentication reads the user before password verification and writes
+        // its counters afterwards. A writer transaction alone cannot serialize
+        // that whole span. Match C#'s per-user lock and reload inside it.
+        let login_lock = self.login_lock(user.as_ref().map_or("", |user| user.id.as_str()));
+        let _login_guard = login_lock.lock().await;
+        let user = self.get_user_by_name(username).await?;
 
-        // Select the candidate providers (C# `GetAuthenticationProviders(user)`):
-        // when the user names a specific provider, only the matching enabled one
-        // is tried; if none matches, the always-rejecting fallback stands in.
-        let wanted = user
-            .as_ref()
-            .map(|u| u.authentication_provider_id.as_str())
-            .filter(|id| !id.is_empty());
-        let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
-        for provider in &self.providers {
-            if !provider.is_enabled().await? {
-                continue;
-            }
-            if wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id)) {
-                candidates.push(provider.as_ref());
-            }
-        }
-        if candidates.is_empty() {
-            candidates.push(&self.invalid_provider);
-        }
-
-        // Try each candidate in turn (C# `AuthenticateLocalUser`).
-        let mut success = false;
-        for provider in candidates {
-            match provider
-                .authenticate(username, password, user.as_ref())
-                .await
-            {
-                Ok(_) => {
-                    success = true;
-                    break;
-                }
-                Err(ServiceError::Unauthorized(_)) => {}
-                Err(other) => return Err(other),
-            }
-        }
+        let (user, success) = self
+            .authenticate_with_providers(username, password, user)
+            .await?;
 
         let Some(mut user) = user else {
             // No such user: an auth failure regardless of provider result. Security
@@ -848,6 +955,14 @@ impl UserManager for FerrofinUserManager {
                 "The {} account is currently disabled. Please consult with your administrator.",
                 user.username
             )));
+        }
+
+        if !self.is_local_client(remote_endpoint)
+            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
+        {
+            return Err(ServiceError::Forbidden(
+                "remote access is not permitted for this user".to_owned(),
+            ));
         }
 
         if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
@@ -888,6 +1003,7 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
+        self.auth_cache.clear();
         Ok(Some(user))
     }
 
@@ -911,8 +1027,8 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
-        // Only the built-in default reset provider is ported; the reset flow
-        // itself is deferred, but its identity is surfaced so clients can list it.
+        // Unknown saved IDs fall back to this sole registered provider, just
+        // as UserManager.GetPasswordResetProviders does upstream.
         Ok(vec![NameIdPair {
             name: Some("Default Password Reset Provider".to_owned()),
             id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),
@@ -1094,8 +1210,10 @@ impl UserManager for FerrofinUserManager {
         // Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
         // permission flag, the access schedules (replaced wholesale) and the
         // list-valued preferences the policy carries.
-        self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
+        let login_lock = self.login_lock(&id);
+        let _login_guard = login_lock.lock().await;
+        self.require_user(user_id).await?;
 
         // "The default number of login attempts is 3, but for some god forsaken
         // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
@@ -1143,7 +1261,7 @@ impl UserManager for FerrofinUserManager {
         let unrated: Vec<String> = policy
             .block_unrated_items
             .iter()
-            .map(|u| format!("{u:?}"))
+            .map(|u| u.json_name().into_owned())
             .collect();
         let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
         for (kind, values) in [
@@ -1508,18 +1626,7 @@ fn policy_permissions(policy: &UserPolicy) -> [(PermissionKind, bool); 24] {
 
 /// Parses a stored `BlockUnratedItems` entry into an [`UnratedItem`].
 fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
-    match value {
-        "Movie" => Some(UnratedItem::Movie),
-        "Trailer" => Some(UnratedItem::Trailer),
-        "Series" => Some(UnratedItem::Series),
-        "Music" => Some(UnratedItem::Music),
-        "Book" => Some(UnratedItem::Book),
-        "LiveTvChannel" => Some(UnratedItem::LiveTvChannel),
-        "LiveTvProgram" => Some(UnratedItem::LiveTvProgram),
-        "ChannelContent" => Some(UnratedItem::ChannelContent),
-        "Other" => Some(UnratedItem::Other),
-        _ => None,
-    }
+    crate::query_restrictions::parse_unrated(value).ok()
 }
 
 #[cfg(test)]
@@ -1535,8 +1642,10 @@ mod tests {
             Arc::new(ferrofin_drawing::NullImageEncoder),
             dir.path().join("cache"),
         ));
+        let current = Arc::new(std::sync::RwLock::new(dir.path().join("users")));
+        let source = Arc::clone(&current);
         let mgr = FerrofinUserManager::new(db)
-            .with_profile_image_dir(dir.path().join("users"))
+            .with_profile_image_dir(DirectoryPath::live(move || source.read().unwrap().clone()))
             .with_image_processor(processor);
         let user = mgr.create_user("synthetic-avatar").await.unwrap();
         assert!(
@@ -1564,6 +1673,8 @@ mod tests {
                 .as_deref(),
             Some(first.as_str())
         );
+        let replacement = dir.path().join("new-root/users");
+        *current.write().unwrap() = replacement.clone();
         mgr.save_profile_image(&user, b"replacement", "image/jpeg", ".jpg")
             .await
             .unwrap();
@@ -1574,6 +1685,20 @@ mod tests {
             .primary_image_tag
             .unwrap();
         assert_ne!(first, second);
+        let info = mgr
+            .get_profile_image(Uuid::parse_str(&user.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::path::Path::new(&info.path).starts_with(&replacement));
+        assert!(std::path::Path::new(&info.path).is_file());
+        assert!(
+            dir.path()
+                .join("users")
+                .join(&user.id)
+                .join("profile.png")
+                .is_file()
+        );
         mgr.clear_profile_image(&user).await.unwrap();
         assert!(
             mgr.get_user_dto(&user, None)
@@ -2143,6 +2268,99 @@ mod tests {
         ));
     }
 
+    #[rstest::rstest]
+    #[case(0, Some(3))]
+    #[case(-1, None)]
+    #[case(-2, Some(1))]
+    #[case(2, Some(2))]
+    #[tokio::test]
+    async fn saved_lockout_sentinels_are_enforced(
+        #[case] threshold: i32,
+        #[case] locked_at: Option<i64>,
+    ) {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db);
+        let user = mgr.create_user("sentinel").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        let mut policy = UserPolicy {
+            login_attempts_before_lockout: threshold,
+            ..UserPolicy::default()
+        };
+        mgr.update_policy(uid, &policy).await.unwrap();
+        for attempt in 1..=5 {
+            let result = mgr
+                .authenticate_user("sentinel", "wrong", "127.0.0.1", true)
+                .await;
+            if locked_at.is_some_and(|limit| attempt > limit) {
+                assert!(matches!(result, Err(ServiceError::Forbidden(_))));
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+        }
+        let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+        assert_eq!(user.invalid_login_attempt_count, locked_at.unwrap_or(5));
+        assert_eq!(
+            mgr.get_user_dto(&user, None)
+                .await
+                .unwrap()
+                .policy
+                .unwrap()
+                .is_disabled,
+            locked_at.is_some()
+        );
+        policy.is_disabled = false;
+        policy.invalid_login_attempt_count = 0;
+        mgr.update_policy(uid, &policy).await.unwrap();
+        assert!(
+            mgr.authenticate_user("sentinel", "", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(-1, 24)]
+    #[case(5, 5)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_failures_do_not_lose_counts(
+        #[case] threshold: i32,
+        #[case] expected: i64,
+    ) {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db);
+        let user = mgr.create_user("concurrent").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        mgr.update_policy(
+            uid,
+            &UserPolicy {
+                login_attempts_before_lockout: threshold,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(24));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..24 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                mgr.authenticate_user("concurrent", "wrong", "127.0.0.1", true)
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(matches!(
+                result.unwrap(),
+                Ok(None) | Err(ServiceError::Forbidden(_))
+            ));
+        }
+        let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+        assert_eq!(user.invalid_login_attempt_count, expected);
+    }
+
     #[tokio::test]
     async fn lockout_disables_after_threshold() {
         #[derive(Default)]
@@ -2276,3 +2494,7 @@ mod tests {
         assert_eq!(providers[0].id.as_deref(), Some(DEFAULT_AUTH_PROVIDER_ID));
     }
 }
+
+#[cfg(test)]
+#[path = "user_manager/provider_tests.rs"]
+mod provider_tests;

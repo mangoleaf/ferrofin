@@ -70,7 +70,7 @@ pub const METRIC_NAMES: &[&str] = &[
 /// The closing passes of a library validation, in the order they run — the
 /// `pass` label set of [`SCAN_PASS_DURATION_SECONDS`] (the fields of the
 /// "post-scan passes complete" log line, without their `_ms`).
-pub const SCAN_PASSES: [&str; 9] = [
+pub const SCAN_PASSES: [&str; 10] = [
     "music",
     "album_covers",
     "years",
@@ -80,6 +80,7 @@ pub const SCAN_PASSES: [&str; 9] = [
     "studios",
     "library_images",
     "dynamic_images",
+    "collections",
 ];
 
 /// The default boundaries (seconds) of both duration histograms: 1–2.5–5 per
@@ -369,7 +370,7 @@ impl ScanInstruments {
     }
 
     /// Records the closing passes of one completed library validation.
-    fn passes_finished(&self, timings: &[(&'static str, Duration); 9]) {
+    fn passes_finished(&self, timings: &[(&'static str, Duration); SCAN_PASSES.len()]) {
         for (pass, elapsed) in timings {
             self.passes
                 .record(elapsed.as_secs_f64(), &[KeyValue::new("pass", *pass)]);
@@ -465,7 +466,7 @@ pub(crate) fn lane_refresh_finished(
 
 /// Records the closing passes of one completed library validation, in
 /// [`SCAN_PASSES`] order. A no-op until [`install`].
-pub(crate) fn passes_finished(timings: &[(&'static str, Duration); 9]) {
+pub(crate) fn passes_finished(timings: &[(&'static str, Duration); SCAN_PASSES.len()]) {
     if let Some(instruments) = INSTRUMENTS.get() {
         instruments.passes_finished(timings);
     }

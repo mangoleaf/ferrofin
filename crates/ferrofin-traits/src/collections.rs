@@ -16,9 +16,8 @@
 //!   ([`PlaylistCreationRequest`]/[`PlaylistCreationResult`]/
 //!   [`PlaylistUpdateRequest`]/[`PlaylistUserUpdateRequest`]/
 //!   [`PlaylistUserPermissions`]).
-//! - The `CollapseItemsWithinBoxSets` helper (operates on the un-ported domain
-//!   `BaseItem` tree) and the `.NET` collection events are dropped; they
-//!   resurface as `ferrofin-core` logic in Wave 6.
+//! - Collection collapsing consumes item rows; `.NET` collection events remain
+//!   outside the trait surface.
 //! - `IEnumerable`/`IReadOnlyCollection` → `Vec`; `Task<T>` → `async fn ->
 //!   Result<T, ServiceError>`.
 //!
@@ -89,6 +88,18 @@ pub trait CollectionManager: Send + Sync {
         user_id: Uuid,
         item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Substitute visible collections for their Movie/Series members, retaining
+    /// the order and identity of the other children (Folder post-filter path).
+    async fn collapse_items_within_box_sets(
+        &self,
+        _items: &[BaseItemEntity],
+        _user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Err(ServiceError::backend(
+            "collection collapsing is not configured",
+        ))
+    }
 
     /// Gets the folder collections are stored under, creating it if requested.
     async fn get_collections_folder(

@@ -41,7 +41,12 @@ static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegPaths {
-    /// The validated `ffmpeg` executable path.
+    /// The validated startup ffmpeg path to persist in the dashboard display.
+    ///
+    /// Independent of ffprobe/runtime availability: native SetFFmpegPath saves
+    /// this value as soon as ffmpeg validates, before later probing.
+    pub encoder_app_path_display: Option<PathBuf>,
+    /// The `ffmpeg` executable path (a bare fallback when discovery failed).
     pub ffmpeg: PathBuf,
     /// The validated `ffprobe` executable path.
     pub ffprobe: PathBuf,
@@ -62,6 +67,22 @@ pub struct FfmpegPaths {
     /// path — that second spawn was 34 ms of an 88 ms cold start. The test is
     /// the same substring match the extension performed itself.
     pub chromaprint_muxer: bool,
+}
+
+/// Context retained when ffmpeg validates but the later ffprobe validation fails.
+#[derive(Debug)]
+pub(crate) struct ValidatedFfmpegPath {
+    pub(crate) path: PathBuf,
+}
+
+impl std::fmt::Display for ValidatedFfmpegPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "validated ffmpeg executable `{}`",
+            self.path.display()
+        )
+    }
 }
 
 impl FfmpegPaths {
@@ -449,14 +470,14 @@ fn spawn_pool_sampler(db: &Database) {
 ///
 /// Resolution order for the ffmpeg path:
 /// 1. `config.ffmpeg_path` (`--ffmpeg` / `FERROFIN_FFMPEG_PATH`);
-/// 2. `system_encoder_path` — the persisted `system.json` `EncoderAppPath`, if
-///    the caller has one;
+/// 2. `system_encoder_path` — the encoding configuration's saved
+///    `EncoderAppPath` ([`persisted_encoder_app_path`]), if the caller has one;
 /// 3. `ffmpeg` resolved on `$PATH`.
 ///
 /// The chosen candidate is validated by running `<candidate> -version` and
 /// requiring exit `0` plus output beginning `ffmpeg version`. The ffprobe path
-/// is `config.ffprobe_path` if set, else the ffmpeg basename with `ffmpeg`
-/// replaced by `ffprobe`; it is `-version`-validated the same way.
+/// is `config.ffprobe_path` if set, else [`derive_ffprobe_path`]'s port of
+/// `FfprobePathRegex`; it is `-version`-validated the same way.
 ///
 /// Alongside validation this runs the whole capability probe round — the
 /// enumerations (`-encoders`, `-decoders`, `-filters`, `-hwaccels`, `-muxers`),
@@ -526,13 +547,18 @@ pub async fn discover_ffmpeg(
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
         .with_context(|| format!("ffmpeg validation failed (resolved via {method})"))?;
-    ffprobe_ok.with_context(|| {
-        format!(
-            "ffprobe validation failed (derived from `{}`)",
-            ffmpeg.display()
-        )
-    })?;
+    ffprobe_ok
+        .with_context(|| {
+            format!(
+                "ffprobe validation failed (derived from `{}`)",
+                ffmpeg.display()
+            )
+        })
+        .context(ValidatedFfmpegPath {
+            path: ffmpeg.clone(),
+        })?;
 
+    let pkey_pause_supported = probe_runtime_pause(&ffmpeg, ffmpeg_version).await;
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
         .encoders(encoders)
@@ -542,7 +568,8 @@ pub async fn discover_ffmpeg(
         // `RuntimeInformation.OSArchitecture == Arm64`; only the Apple Silicon
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
-        .low_priority_hwaccel_flag(low_priority_hwaccel_flag);
+        .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
+        .pkey_pause_supported(pkey_pause_supported);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
     }
@@ -565,6 +592,7 @@ pub async fn discover_ffmpeg(
         platform = ?capabilities.platform(),
         tonemapx = capabilities.supports_filter("tonemapx"),
         libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
+        pkey_pause_supported,
         chromaprint_muxer,
         "media encoder ready"
     );
@@ -573,11 +601,65 @@ pub async fn discover_ffmpeg(
     // path was not taken.
     tracing::debug!(capabilities = ?capabilities, "media encoder capabilities");
     Ok(FfmpegPaths {
+        encoder_app_path_display: Some(ffmpeg.clone()),
         ffmpeg,
         ffprobe,
         capabilities,
         chromaprint_muxer,
     })
+}
+
+/// Detects Jellyfin-ffmpeg's explicit pause key from its interactive help.
+///
+/// Matches EncoderValidator.CheckSupportedRuntimeKey's input/duration and
+/// exact, case-sensitive help description. An absent key or failed probe does
+/// not grant keyboard support; the manager separately checks the legacy gate.
+async fn probe_runtime_pause(ffmpeg: &Path, version: Option<FfmpegVersion>) -> bool {
+    use tokio::io::AsyncWriteExt as _;
+    let duration = if version.is_some_and(|version| version >= FfmpegVersion::new(7, 0)) {
+        "10000"
+    } else {
+        "1000"
+    };
+    let input = format!("nullsrc=s=1x1:d={duration}");
+    let probe = async {
+        let mut child = tokio::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-f",
+                "lavfi",
+                "-i",
+                &input,
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(b"?").await?;
+            // Closing stdin matches disposing EncoderValidator's test writer.
+            stdin.shutdown().await?;
+        }
+        let output = child.wait_with_output().await?;
+        Ok::<_, std::io::Error>(
+            String::from_utf8_lossy(&output.stderr).contains("p      pause transcoding"),
+        )
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), probe).await {
+        Ok(Ok(supported)) => supported,
+        Ok(Err(error)) => {
+            tracing::warn!(%error,"ffmpeg runtime pause probe failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("ffmpeg runtime pause probe timed out");
+            false
+        }
+    }
 }
 
 /// Runs the whole startup probe round against an already-resolved pair of
@@ -846,35 +928,71 @@ fn resolve_ffmpeg_candidate(
         return Ok((explicit.clone(), "config (--ffmpeg / FERROFIN_FFMPEG_PATH)"));
     }
     if let Some(system) = system_encoder_path.filter(|s| !s.is_empty()) {
-        return Ok((PathBuf::from(system), "system.json EncoderAppPath"));
+        return Ok((
+            PathBuf::from(system),
+            "encoding configuration EncoderAppPath",
+        ));
     }
     if let Some(found) = which_on_path("ffmpeg") {
         return Ok((found, "$PATH"));
     }
     anyhow::bail!(
-        "no ffmpeg found: set --ffmpeg / FERROFIN_FFMPEG_PATH, configure system.json \
+        "no ffmpeg found: set --ffmpeg / FERROFIN_FFMPEG_PATH, configure the encoding \
          EncoderAppPath, or install ffmpeg on $PATH"
     )
 }
 
-/// Derives the ffprobe path from a resolved ffmpeg path by replacing `ffmpeg`
-/// with `ffprobe` in the final path component (parity with Jellyfin's
-/// `FfprobePathRegex`). If the file name does not contain `ffmpeg`, the sibling
-/// `ffprobe` is used.
+/// Derives the ffprobe path from a resolved ffmpeg path.
+///
+/// Port of `MediaEncoder.FfprobePathRegex`
+/// (`[^\/\\]+?(\.[^\/\\\n.]+)?$` replaced with `ffprobe$1`): the whole final
+/// path component is replaced by `ffprobe`, keeping only a trailing `.ext`.
+/// `jellyfin-ffmpeg` and `ffmpeg-static` both become `ffprobe`; `ffmpeg.exe`
+/// becomes `ffprobe.exe`; `ffmpeg-6.1` becomes `ffprobe.1`. Both `/` and `\` end a
+/// directory component, whatever the platform.
 fn derive_ffprobe_path(ffmpeg: &Path) -> PathBuf {
-    let file_name = ffmpeg
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("ffmpeg");
-    let probe_name = if file_name.contains("ffmpeg") {
-        file_name.replace("ffmpeg", "ffprobe")
-    } else {
-        "ffprobe".to_owned()
-    };
-    match ffmpeg.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(probe_name),
-        _ => PathBuf::from(probe_name),
+    let path = ffmpeg.to_string_lossy();
+    let split = path.rfind(['/', '\\']).map_or(0, |at| at + 1);
+    let (directory, name) = path.split_at(split);
+    // `(\.[^.]+)?` after at least one character: the last dot-suffix, when the
+    // dot is not the name's first character.
+    let extension = name
+        .rfind('.')
+        .filter(|dot| *dot > 0 && *dot + 1 < name.len() && !name.contains('\n'))
+        .map_or("", |dot| &name[dot..]);
+    PathBuf::from(format!("{directory}ffprobe{extension}"))
+}
+
+/// The ffmpeg path an administrator saved in the named encoding configuration
+/// (`EncoderAppPath`), which `MediaEncoder.SetFFmpegPath` prefers over `$PATH`
+/// when no command-line/environment path is given.
+///
+/// Reads `{config}/users/named/encoding.json` (the live store); a server whose
+/// configuration has not been saved by Ferrofin yet falls back to the adopted
+/// Jellyfin `{config}/encoding.xml`. A missing, unreadable or blank value is
+/// "not configured" — startup must not fail on it.
+#[must_use]
+pub fn persisted_encoder_app_path(config_dir: &Path) -> Option<String> {
+    let json = config_dir.join("users").join("named").join("encoding.json");
+    if let Ok(raw) = std::fs::read_to_string(&json) {
+        return serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()?
+            .get("EncoderAppPath")?
+            .as_str()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned);
     }
+    let xml = std::fs::read_to_string(config_dir.join("encoding.xml")).ok()?;
+    let start = xml.find("<EncoderAppPath>")? + "<EncoderAppPath>".len();
+    let end = xml[start..].find("</EncoderAppPath>")? + start;
+    let value = xml[start..end]
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    Some(value.trim().to_owned()).filter(|path| !path.is_empty())
 }
 
 /// Looks up `program` on the process `$PATH`, returning the first
@@ -970,9 +1088,108 @@ mod tests {
 
     #[test]
     fn derive_ffprobe_handles_suffixed_basename() {
-        // A versioned/wrapped name still gets the substring replaced.
+        // `FfprobePathRegex` replaces the whole name and keeps only `.ext`.
         let probe = derive_ffprobe_path(Path::new("/opt/ffmpeg/bin/ffmpeg-6.1"));
-        assert_eq!(probe, PathBuf::from("/opt/ffmpeg/bin/ffprobe-6.1"));
+        assert_eq!(probe, PathBuf::from("/opt/ffmpeg/bin/ffprobe.1"));
+    }
+
+    /// `FfprobePathRegex` over names the old substring rule got wrong: the whole
+    /// final component becomes `ffprobe`, only `.ext` survives, and either
+    /// separator ends the directory.
+    #[test]
+    fn derive_ffprobe_follows_the_upstream_regex() {
+        for (ffmpeg, expected) in [
+            (
+                "/usr/lib/jellyfin-ffmpeg/jellyfin-ffmpeg",
+                "/usr/lib/jellyfin-ffmpeg/ffprobe",
+            ),
+            ("/opt/bin/ffmpeg-static", "/opt/bin/ffprobe"),
+            ("/opt/bin/ffmpeg.exe", "/opt/bin/ffprobe.exe"),
+            (r"C:\tools\ffmpeg.exe", r"C:\tools\ffprobe.exe"),
+            ("/opt/bin/ffmpeg.v2.sh", "/opt/bin/ffprobe.sh"),
+            ("/opt/bin/.ffmpeg", "/opt/bin/ffprobe"),
+            ("/opt/bin/ffmpeg.", "/opt/bin/ffprobe"),
+            ("/opt/bin/", "/opt/bin/ffprobe"),
+            ("ffmpeg.exe", "ffprobe.exe"),
+        ] {
+            assert_eq!(
+                derive_ffprobe_path(Path::new(ffmpeg)),
+                PathBuf::from(expected),
+                "{ffmpeg}"
+            );
+        }
+    }
+
+    /// `SetFFmpegPath`'s middle rung: the saved encoding configuration's
+    /// `EncoderAppPath`, from the live JSON store or the adopted XML, and
+    /// "not configured" for every unusable shape.
+    #[test]
+    fn the_saved_encoder_path_comes_from_json_then_adopted_xml() {
+        let write = |dir: &Path, relative: &str, body: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            persisted_encoder_app_path(tmp.path()),
+            None,
+            "nothing saved"
+        );
+
+        // Adopted Jellyfin XML (before Ferrofin has saved its own store).
+        write(
+            tmp.path(),
+            "encoding.xml",
+            "<EncodingOptions><EncoderAppPathDisplay>/shown</EncoderAppPathDisplay>\
+             <EncoderAppPath>/opt/a&amp;b/ffmpeg</EncoderAppPath></EncodingOptions>",
+        );
+        assert_eq!(
+            persisted_encoder_app_path(tmp.path()).as_deref(),
+            Some("/opt/a&b/ffmpeg"),
+            "the display field is not the selector"
+        );
+        write(
+            tmp.path(),
+            "encoding.xml",
+            "<EncodingOptions><EncoderAppPath /></EncodingOptions>",
+        );
+        assert_eq!(
+            persisted_encoder_app_path(tmp.path()),
+            None,
+            "self-closing is blank"
+        );
+        write(
+            tmp.path(),
+            "encoding.xml",
+            "<EncodingOptions><EncoderAppPath>  </EncoderAppPath></EncodingOptions>",
+        );
+        assert_eq!(persisted_encoder_app_path(tmp.path()), None, "blank");
+
+        // The live store wins once it exists, even over an XML that names another.
+        write(
+            tmp.path(),
+            "encoding.xml",
+            "<EncodingOptions><EncoderAppPath>/from/xml</EncoderAppPath></EncodingOptions>",
+        );
+        write(
+            tmp.path(),
+            "users/named/encoding.json",
+            r#"{"EncoderAppPath":" /from/json/ffmpeg ","EncoderAppPathDisplay":"/shown"}"#,
+        );
+        assert_eq!(
+            persisted_encoder_app_path(tmp.path()).as_deref(),
+            Some("/from/json/ffmpeg")
+        );
+        for unusable in [
+            r#"{"EncoderAppPath":""}"#,
+            r#"{"EncoderAppPath":null}"#,
+            "{}",
+            "not json",
+        ] {
+            write(tmp.path(), "users/named/encoding.json", unusable);
+            assert_eq!(persisted_encoder_app_path(tmp.path()), None, "{unusable}");
+        }
     }
 
     #[test]
@@ -1000,7 +1217,7 @@ mod tests {
         let cfg = config_with_ffmpeg(None);
         let (path, method) = resolve_ffmpeg_candidate(&cfg, Some("/sys/ffmpeg")).unwrap();
         assert_eq!(path, PathBuf::from("/sys/ffmpeg"));
-        assert!(method.contains("system.json"));
+        assert!(method.contains("encoding configuration"));
     }
 
     #[test]
@@ -1365,6 +1582,7 @@ mod tests {
             .await
             .expect("discovery succeeds");
         assert_eq!(paths.ffmpeg, ffmpeg);
+        assert_eq!(paths.encoder_app_path_display.as_ref(), Some(&ffmpeg));
         assert_eq!(paths.ffprobe, tmp.path().join("ffprobe"));
         // Every leg of the capability round parsed the fake's tables.
         let caps = &paths.capabilities;
@@ -1413,6 +1631,52 @@ mod tests {
             cfg!(target_os = "linux"),
             "the OS version is read on Linux and, until phase 6, nowhere else"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovered_ffmpeg_display_survives_missing_or_failing_ffprobe() {
+        for missing in [true, false] {
+            let tmp = tempfile::tempdir().expect("owned binaries");
+            let ffmpeg = write_fake_ffmpeg(tmp.path(), "ffmpeg", "ffmpeg");
+            if !missing {
+                // Validating this executable as ffprobe rejects its ffmpeg banner.
+                write_fake_ffmpeg(tmp.path(), "ffprobe", "ffmpeg");
+            }
+            let mut cfg = config_with_ffmpeg(Some(ffmpeg.to_str().expect("path")));
+            cfg.ffprobe_path = None;
+            let error = discover_ffmpeg(&cfg, None)
+                .await
+                .expect_err("probe validation fails");
+            assert_eq!(
+                error
+                    .downcast_ref::<ValidatedFfmpegPath>()
+                    .map(|validated| &validated.path),
+                Some(&ffmpeg)
+            );
+            assert!(
+                format!("{error:#}").contains("ffprobe validation failed"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_ffmpeg_never_attaches_a_display_even_when_ffprobe_also_fails() {
+        let tmp = tempfile::tempdir().expect("owned binaries");
+        let invalid_ffmpeg = write_fake_ffmpeg(tmp.path(), "ffmpeg", "ffprobe");
+        let mut cfg = config_with_ffmpeg(Some(invalid_ffmpeg.to_str().expect("path")));
+        cfg.ffprobe_path = None;
+        let error = discover_ffmpeg(&cfg, None)
+            .await
+            .expect_err("ffmpeg validation fails first");
+        assert!(error.downcast_ref::<ValidatedFfmpegPath>().is_none());
+        assert!(
+            format!("{error:#}").contains("ffmpeg validation failed"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("ffprobe validation failed"));
     }
 
     #[cfg(unix)]

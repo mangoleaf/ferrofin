@@ -99,6 +99,17 @@ pub struct MediaStreamQuery {
     pub index: Option<i32>,
 }
 
+/// An immediate Folder child together with the source of its membership.
+/// Linked-only children need the owning playlist/collection's per-user check;
+/// a physical child that is also linked retains its physical membership.
+#[derive(Debug, Clone)]
+pub struct FolderChild {
+    /// The stored child row.
+    pub item: BaseItemEntity,
+    /// True when membership comes only from a LinkedChildren edge.
+    pub linked: bool,
+}
+
 /// Filter selecting media attachments to fetch.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.MediaAttachmentQuery`.
@@ -210,6 +221,46 @@ pub trait ItemRepository: Send + Sync {
     /// # Errors
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Applies the pinned `UserViewBuilder.Filter` rules to already-visible
+    /// immediate children. Preserves input order; sorting, grouping, adjacency,
+    /// counting and paging belong to the caller. Request-only query filters
+    /// outside that source whitelist are ignored.
+    async fn filter_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child filtering is not implemented",
+        ))
+    }
+
+    /// Sorts an already-filtered child set without grouping or paging. Name
+    /// sorts use the pinned stable ordinal comparison; an empty OrderBy keeps
+    /// input order. Other sorts retain the repository's existing consumer.
+    async fn sort_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child sorting is not implemented",
+        ))
+    }
+
+    /// Loads immediate physical children followed by linked children in source
+    /// order. Does not filter, group or page; the Folder consumer applies access
+    /// and the pinned GetResult pipeline to these rows.
+    async fn get_folder_children(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<FolderChild>, ServiceError> {
+        let _ = query;
+        Err(ServiceError::backend("folder children are not implemented"))
+    }
 
     /// Batch extra owners for video versions and the series allowed to group.
     async fn get_extra_owner_ids_batch(
@@ -427,27 +478,34 @@ pub trait ItemRepository: Send + Sync {
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
-    /// Port of the persistence side of `BaseItem.SwapImagesAsync`: C# swaps the
-    /// on-disk files backing the two rows and clears their cached dimensions;
-    /// against the stored image rows the equivalent is to exchange the two rows'
-    /// `Path` (and reset `Width`/`Height` to `0` and stamp `DateModified`), so the
-    /// image that was at `index1` now resolves at `index2` and vice versa.
+    /// Port of `BaseItem.SwapImagesAsync`: exchanges the **contents** of the two
+    /// image files (each row keeps its path), then clears the rows' cached
+    /// dimensions and blur hash and re-reads their modified times from the
+    /// files, so the image that was at `index1` is now served at `index2` and
+    /// vice versa.
     ///
     /// Indices are `0`-based positions **within** the `image_type` group, in the
     /// same order [`get_image_infos`](Self::get_image_infos) returns. When either
     /// index is out of range the swap is a no-op (mirroring C#'s "nothing to do"
-    /// when `GetImageInfo` returns `null`).
+    /// when `GetImageInfo` returns `null`); so is a slot against itself, whose
+    /// file copy onto itself would throw upstream.
+    ///
+    /// Returns whether the two files were swapped — the only case in which
+    /// upstream reaches its repository save. A missing slot, or a non-local
+    /// (remote) path on either side, is "nothing to do".
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] on a storage failure.
+    /// [`ServiceError::Backend`] when a file cannot be exchanged (missing, not
+    /// writable) — the rows and the other file are left as they were — or on a
+    /// storage failure.
     async fn swap_item_images(
         &self,
         item_id: Uuid,
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<bool, ServiceError>;
 
     /// Gets genres with their item counts.
     async fn get_genres(
@@ -1339,6 +1397,21 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// The repository save an image mutation performs after it changed an item
+    /// (`BaseItem.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate)`): stamps
+    /// the row's `DateLastSaved` (so its Etag moves) and announces `ItemUpdated`
+    /// to the library-changed notifier. Returns whether the row exists.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
     /// Writes an existing row's `DateLastMediaAdded`, when it differs, with
     /// its `DateLastSaved` stamp and nothing else — the targeted write of
     /// [`folder_last_media_added`](Self::folder_last_media_added)'s answer,
@@ -1495,10 +1568,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
-    /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
+    /// Replaces a multiple-image slot or appends beyond the current last slot.
+    /// Single-image types retain the ordinary replacement operation.
+    ///
+    /// # Errors
+    /// Returns a storage failure. Hosts supporting indexed artwork override this
+    /// compatibility adapter; single-image stores use `set_item_image`.
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        _index: usize,
+    ) -> Result<(), ServiceError> {
+        self.set_item_image(item_id, image).await
+    }
+
+    /// Deletes one item image of `image_type`, returning the on-disk path of
     /// the removed rows so the caller can delete the files
-    /// (`ImageController.DeleteItemImage`). `index` is reserved for per-index
-    /// deletes; the current store deletes every row of the type.
+    /// (`ImageController.DeleteItemImage`). Deletes one slot in insertion order;
+    /// an omitted index selects zero and an invalid index removes nothing.
     ///
     /// The default removes nothing.
     ///
@@ -2199,6 +2287,19 @@ pub trait PeopleRepository: Send + Sync {
             map.insert(id, people);
         }
         Ok(map)
+    }
+
+    /// Derives each name's configured by-name Person item id, in input order.
+    ///
+    /// This is the read-only identity half of Jellyfin's GetPerson: it uses
+    /// Person.GetPath and the configured item-id mode, never a credit-row id
+    /// or a generic matching-name row. Callers must verify the derived item
+    /// exists and is a Person. An unwired identity yields missing slots.
+    async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
     }
 
     /// Replaces an item's people with the given set, materializing a browsable

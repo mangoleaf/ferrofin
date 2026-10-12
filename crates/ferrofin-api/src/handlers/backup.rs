@@ -492,6 +492,31 @@ async fn restore_backup(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Why a scheduled restore did not apply.
+#[derive(Debug)]
+pub struct RestoreFailure {
+    /// The archive the marker named, when it named one.
+    pub archive: Option<PathBuf>,
+    /// What went wrong.
+    pub error: std::io::Error,
+    /// Whether extraction had begun: the trees may be partly replaced, and the
+    /// server must not boot on them (Jellyfin's failed restore throws out of
+    /// startup). `false` for a missing, foreign or unreadable archive, which
+    /// touched nothing.
+    pub partially_applied: bool,
+}
+
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.archive {
+            Some(archive) => write!(f, "restoring {}: {}", archive.display(), self.error),
+            None => write!(f, "restoring a backup: {}", self.error),
+        }
+    }
+}
+
+impl std::error::Error for RestoreFailure {}
+
 /// Applies a restore scheduled by `POST /Backup/Restore`, if one is pending.
 ///
 /// The composition root calls this at boot BEFORE the database is opened: it
@@ -505,26 +530,45 @@ async fn restore_backup(
 ///
 /// # Errors
 ///
-/// The extraction's I/O error; the marker is removed either way.
-pub fn apply_pending_restore(roots: &TreeRoots) -> std::io::Result<Option<PathBuf>> {
+/// A [`RestoreFailure`]; the marker is removed either way. A failure before
+/// extraction began leaves the trees untouched ([`RestoreFailure::
+/// partially_applied`] is `false`); one during it does not.
+pub fn apply_pending_restore(roots: &TreeRoots) -> Result<Option<PathBuf>, RestoreFailure> {
     let dir = roots.program_data.join("data").join(BACKUPS_DIR);
     let marker = dir.join(RESTORE_PENDING_FILE);
     let Ok(name) = std::fs::read_to_string(&marker) else {
         return Ok(None);
     };
     let _ = std::fs::remove_file(&marker);
+    let untouched = |archive: Option<PathBuf>, error: std::io::Error| RestoreFailure {
+        archive,
+        error,
+        partially_applied: false,
+    };
     let name = Path::new(name.trim())
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| std::io::Error::other("restore-pending marker names no archive"))?;
+        .ok_or_else(|| {
+            untouched(
+                None,
+                std::io::Error::other("restore-pending marker names no archive"),
+            )
+        })?;
     let archive = dir.join(name);
     if !read_manifest(&archive).is_some_and(|m| restorable(&m)) {
-        return Err(std::io::Error::other(format!(
-            "{} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive",
-            archive.display()
-        )));
+        return Err(untouched(
+            Some(archive.clone()),
+            std::io::Error::other(format!(
+                "{} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive",
+                archive.display()
+            )),
+        ));
     }
-    restore_archive(&archive, roots)?;
+    restore_archive(&archive, roots).map_err(|error| RestoreFailure {
+        archive: Some(archive.clone()),
+        error,
+        partially_applied: true,
+    })?;
     Ok(Some(archive))
 }
 
@@ -542,49 +586,73 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
     let file = std::fs::File::open(archive_path)?;
     let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
     let db_entry = format!("data/{DB_FILE_NAME}");
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(std::io::Error::other)?;
-        let Some(enclosed) = entry.enclosed_name() else {
-            continue; // path-traversal guard (zip-slip)
-        };
-        if enclosed == Path::new(&db_entry) {
-            let tmp = roots.database.with_extension("restore-tmp");
-            {
-                let mut out = std::fs::File::create(&tmp)?;
-                std::io::copy(&mut entry, &mut out)?;
-                out.sync_all()?;
+    let mut roots = roots.clone();
+    // Two passes: everything but the metadata tree first, so the restored
+    // `system.json` can name where the metadata belongs. The roots known at
+    // boot come from the configuration being replaced; a backup whose
+    // configuration relocates the metadata tree must put its metadata where
+    // that configuration will look for it, not beside the old one.
+    for metadata_pass in [false, true] {
+        if metadata_pass && let Some(restored) = restored_metadata_root(&roots.config) {
+            roots.metadata = restored;
+        }
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(std::io::Error::other)?;
+            let Some(enclosed) = entry.enclosed_name() else {
+                continue; // path-traversal guard (zip-slip)
+            };
+            if enclosed.starts_with("metadata") != metadata_pass {
+                continue;
             }
-            for sidecar in ["-wal", "-shm"] {
-                let mut name = roots.database.as_os_str().to_owned();
-                name.push(sidecar);
-                match std::fs::remove_file(&name) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+            if enclosed == Path::new(&db_entry) {
+                let tmp = roots.database.with_extension("restore-tmp");
+                {
+                    let mut out = std::fs::File::create(&tmp)?;
+                    std::io::copy(&mut entry, &mut out)?;
+                    out.sync_all()?;
                 }
+                for sidecar in ["-wal", "-shm"] {
+                    let mut name = roots.database.as_os_str().to_owned();
+                    name.push(sidecar);
+                    match std::fs::remove_file(&name) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                std::fs::rename(&tmp, &roots.database)?;
+                continue;
             }
-            std::fs::rename(&tmp, &roots.database)?;
-            continue;
+            let dest =
+                if let Some((root, rest)) = roots.trees().into_iter().find_map(|(prefix, root)| {
+                    enclosed.strip_prefix(prefix).ok().map(|r| (root, r))
+                }) {
+                    root.join(rest)
+                } else {
+                    continue;
+                };
+            if entry.is_dir() {
+                continue;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut entry, &mut out)?;
         }
-        let dest = if let Some((root, rest)) = roots
-            .trees()
-            .into_iter()
-            .find_map(|(prefix, root)| enclosed.strip_prefix(prefix).ok().map(|r| (root, r)))
-        {
-            root.join(rest)
-        } else {
-            continue;
-        };
-        if entry.is_dir() {
-            continue;
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut out = std::fs::File::create(&dest)?;
-        std::io::copy(&mut entry, &mut out)?;
     }
     Ok(())
+}
+
+/// The `MetadataPath` the restored configuration names, when it names one:
+/// read from `system.json` in the (just restored) configuration directory.
+pub fn restored_metadata_root(config_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(config_dir.join("system.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|cfg| cfg.get("MetadataPath")?.as_str().map(str::to_owned))
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
 }
 
 /// Registers this controller's real routes onto `router`.
@@ -665,6 +733,123 @@ mod tests {
 
         // A non-archive path yields no manifest.
         assert!(read_manifest(tmp.path()).is_none());
+    }
+
+    /// A restore that fails after extraction began leaves the trees partly
+    /// replaced, which the boot must not paper over; a marker that names no
+    /// archive touches nothing.
+    #[test]
+    fn a_restore_failing_mid_extraction_is_reported_as_partial() {
+        use super::{apply_pending_restore, write_backup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("program");
+        std::fs::create_dir_all(program_data.join("config")).unwrap();
+        std::fs::write(program_data.join("ferrofin.db"), b"DB").unwrap();
+        std::fs::write(program_data.join("config/system.json"), b"{}").unwrap();
+        let roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        let manifest = write_backup(
+            &tmp.path().join("backups"),
+            &roots,
+            BackupOptions::default(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // The target's `config` is a file, so extracting `config/system.json`
+        // cannot succeed.
+        let boot = tmp.path().join("boot");
+        let backups = boot.join("data").join(super::BACKUPS_DIR);
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(boot.join("config"), b"in the way").unwrap();
+        let archive = std::path::PathBuf::from(&manifest.path);
+        std::fs::copy(&archive, backups.join(archive.file_name().unwrap())).unwrap();
+        std::fs::write(
+            backups.join(super::RESTORE_PENDING_FILE),
+            archive.file_name().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        let boot_roots =
+            TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
+
+        let failure = apply_pending_restore(&boot_roots).unwrap_err();
+        assert!(failure.partially_applied, "{failure}");
+        assert!(failure.archive.is_some());
+        // The marker is consumed either way, so a retry cannot loop the boot.
+        assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
+
+        // A marker naming no file at all touches nothing.
+        std::fs::write(backups.join(super::RESTORE_PENDING_FILE), "").unwrap();
+        let nameless = apply_pending_restore(&boot_roots).unwrap_err();
+        assert!(!nameless.partially_applied);
+        assert!(nameless.archive.is_none());
+        assert!(nameless.to_string().starts_with("restoring a backup:"));
+    }
+
+    /// A backup whose configuration relocates the metadata tree restores its
+    /// metadata where that restored configuration looks for it, not beside the
+    /// roots known before the configuration was replaced.
+    #[test]
+    fn restored_metadata_follows_the_restored_configuration() {
+        use super::{restore_archive, write_backup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("program");
+        let relocated = tmp.path().join("relocated-metadata");
+        std::fs::create_dir_all(program_data.join("config")).unwrap();
+        std::fs::create_dir_all(relocated.join("library")).unwrap();
+        std::fs::write(program_data.join("ferrofin.db"), b"DB").unwrap();
+        std::fs::write(
+            program_data.join("config/system.json"),
+            serde_json::json!({ "MetadataPath": relocated }).to_string(),
+        )
+        .unwrap();
+        std::fs::write(relocated.join("library/poster.jpg"), b"art").unwrap();
+        let backups = tmp.path().join("backups");
+        // The backing-up server's metadata root is the relocated one.
+        let mut roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        roots.metadata = relocated.clone();
+        let manifest = write_backup(
+            &backups,
+            &roots,
+            BackupOptions {
+                metadata: true,
+                ..BackupOptions::default()
+            },
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        // Restore on a server whose current configuration says nothing about
+        // the relocation: its boot roots put metadata under its own tree.
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let boot_roots =
+            TreeRoots::defaults(&target, &target.join("config"), &target.join("ferrofin.db"));
+        restore_archive(std::path::Path::new(&manifest.path), &boot_roots).unwrap();
+        std::fs::remove_dir_all(&relocated).unwrap();
+        // Run again now that the relocated root is gone: it must be recreated.
+        restore_archive(std::path::Path::new(&manifest.path), &boot_roots).unwrap();
+
+        assert_eq!(
+            std::fs::read(relocated.join("library/poster.jpg")).unwrap(),
+            b"art",
+            "metadata lands where the restored system.json points"
+        );
+        assert!(
+            !target.join("metadata").exists(),
+            "nothing is left under the boot-time metadata root"
+        );
     }
 
     #[test]
@@ -754,9 +939,12 @@ mod tests {
             "marker consumed"
         );
         assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
-        // A marker naming a missing archive errors once and is dropped.
+        // A marker naming a missing archive errors once and is dropped; nothing
+        // was written, so the server may still boot.
         std::fs::write(boot_backups.join(super::RESTORE_PENDING_FILE), "gone.zip").unwrap();
-        assert!(super::apply_pending_restore(&boot_roots).is_err());
+        let rejected = super::apply_pending_restore(&boot_roots).unwrap_err();
+        assert!(!rejected.partially_applied);
+        assert!(rejected.to_string().contains("gone.zip"), "{rejected}");
         assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
         // A foreign archive (Jellyfin's engine) is refused, marker dropped.
         let foreign = boot_backups.join("jellyfin-backup.zip");
@@ -773,7 +961,11 @@ mod tests {
             "jellyfin-backup.zip",
         )
         .unwrap();
-        assert!(super::apply_pending_restore(&boot_roots).is_err());
+        assert!(
+            !super::apply_pending_restore(&boot_roots)
+                .unwrap_err()
+                .partially_applied
+        );
         assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
 
         // Listing the backups directory finds the archive, newest first.
@@ -876,7 +1068,7 @@ mod tests {
 
         // The authed fake state's paths point under the temp dir; start clean.
         let backups = std::env::temp_dir()
-            .join("ferrofin-api-test-data")
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .join("backups");
         let _ = std::fs::remove_dir_all(&backups);
 

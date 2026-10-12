@@ -153,6 +153,7 @@ mod tests {
                 },
                 "discovery-test",
             ));
+            configuration.add_configuration_listener(host.configuration_listener());
             Self {
                 _directory: directory,
                 host,
@@ -265,7 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_response_uses_refreshed_friendly_name() {
+    async fn next_response_uses_saved_friendly_name_without_manual_refresh() {
         let fixture = Fixture::new().await;
         let (address, task) = fixture.start().await;
         let client = client().await;
@@ -280,11 +281,6 @@ mod tests {
             .update_configuration(&configuration)
             .await
             .expect("save new name");
-        fixture
-            .host
-            .refresh_server_name()
-            .await
-            .expect("refresh host name");
         assert_eq!(
             reply(&client, address, b"who is JellyfinServer?").await["Name"],
             "New name"

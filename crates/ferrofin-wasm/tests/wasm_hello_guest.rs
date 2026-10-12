@@ -162,14 +162,16 @@ async fn real_guest_loads_runs_and_reports_rss() {
         .expect("analyze must succeed: query-items + write-media-segments + http-fetch");
 
     // query-items → the canned movie; write-media-segments → provider-scoped
-    // replace with one Intro segment.
+    // replace with one Intro segment, under the loaded producer's Jellyfin
+    // provider id (the MD5 of its lower-cased display name).
     let expected_item: uuid::Uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01".parse().unwrap();
-    let expected_provider = "wasm:3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01";
+    let expected_provider =
+        ferrofin_traits::media_segments::media_segment_provider_id("Hello Ferrofin");
     {
         let deleted = segment_store.deleted.lock().unwrap();
         assert_eq!(
             deleted.as_slice(),
-            &[(expected_item, expected_provider.to_owned())]
+            &[(expected_item, expected_provider.clone())]
         );
         let created = segment_store.created.lock().unwrap();
         assert_eq!(created.len(), 1);

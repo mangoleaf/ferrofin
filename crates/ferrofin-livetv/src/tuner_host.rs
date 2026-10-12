@@ -237,7 +237,11 @@ impl TunerHost for M3uTunerHost {
 
     async fn get_channels(&self, tuner: &TunerHostInfo) -> Result<Vec<TunerChannel>, ServiceError> {
         let url = tuner.url.as_deref().unwrap_or_default();
-        let body = self.fetcher.fetch(url).await?;
+        // `M3uParser.GetListingsStream` presents the tuner's user agent.
+        let body = self
+            .fetcher
+            .fetch_as(url, tuner.user_agent.as_deref())
+            .await?;
         Ok(parse_m3u(&body)
             .into_iter()
             .map(|ch| TunerChannel {
@@ -351,6 +355,41 @@ mod tests {
 
     fn m3u_host(body: &str) -> M3uTunerHost {
         M3uTunerHost::new(Arc::new(Canned(body.to_owned())))
+    }
+
+    /// The M3U host fetches the playlist as the tuner's configured user agent.
+    #[tokio::test]
+    async fn the_m3u_host_fetches_with_the_tuners_user_agent() {
+        struct Recording(std::sync::Mutex<Vec<Option<String>>>);
+
+        #[async_trait::async_trait]
+        impl SourceFetcher for Recording {
+            async fn fetch(&self, _url: &str) -> Result<String, ServiceError> {
+                Ok(String::new())
+            }
+            async fn fetch_as(
+                &self,
+                _url: &str,
+                user_agent: Option<&str>,
+            ) -> Result<String, ServiceError> {
+                self.0.lock().unwrap().push(user_agent.map(str::to_owned));
+                Ok(String::new())
+            }
+        }
+        let fetcher = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let host = M3uTunerHost::new(fetcher.clone());
+        for user_agent in [Some("VLC/3.0".to_owned()), None] {
+            let tuner = TunerHostInfo {
+                url: Some("http://iptv.example/list.m3u".to_owned()),
+                user_agent,
+                ..TunerHostInfo::default()
+            };
+            host.get_channels(&tuner).await.expect("lineup");
+        }
+        assert_eq!(
+            *fetcher.0.lock().unwrap(),
+            [Some("VLC/3.0".to_owned()), None]
+        );
     }
 
     #[test]

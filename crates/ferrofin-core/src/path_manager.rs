@@ -7,10 +7,8 @@
 //!
 //! Port departures dictated by the trait shape (the C# methods take a
 //! `BaseItem`; the trait passes an `item_id` plus the item's `media_path`):
-//! - `GetChapterImagePath` names the file `{DateModified.Ticks}_{position}.jpg`
-//!   in C#. The trait carries no modified timestamp, so the file is named by the
-//!   chapter position ticks alone (`{position}.jpg`). This still uniquely
-//!   addresses a chapter image within an item's folder.
+//! - `GetChapterImagePath` carries the video's modified timestamp and names the
+//!   file `{DateModified.Ticks}_{position}.jpg`, matching the source cache key.
 //! - `GetInternalMetadataPath` special-cases channel items; without the source
 //!   type the non-channel layout (`{metadata}/library/{id2}/{id}`) is always
 //!   used, which is the case for every item that has chapter images.
@@ -171,12 +169,13 @@ impl PathManager for FerrofinPathManager {
         item_id: Uuid,
         media_path: &str,
         chapter_position_ticks: i64,
+        date_modified_ticks: i64,
     ) -> String {
-        // C# prefixes with the item's DateModified ticks; the trait does not
-        // carry it, so the position ticks alone name the file.
         let folder = self.chapter_image_folder_path(item_id, media_path);
         PathBuf::from(folder)
-            .join(format!("{chapter_position_ticks}.jpg"))
+            .join(format!(
+                "{date_modified_ticks}_{chapter_position_ticks}.jpg"
+            ))
             .to_string_lossy()
             .into_owned()
     }
@@ -291,6 +290,47 @@ mod tests {
         let with_media =
             m.trickplay_directory(id, MediaLocation::of_file("/media/movie.mkv"), true);
         assert_eq!(with_media, "/media/movie.trickplay");
+        assert_eq!(
+            m.trickplay_directory(id, MediaLocation::of_file("/media/Movie.Name.mkv"), true),
+            "/media/Movie.Name.trickplay"
+        );
+        assert_eq!(
+            m.trickplay_directory(id, MediaLocation::of_file("/media/Movie.Other.mkv"), true),
+            "/media/Movie.Other.trickplay"
+        );
+    }
+
+    #[test]
+    fn trickplay_sidecar_extension_matches_dotnet_for_leaf_names() {
+        let (_tmp, manager) = manager();
+        let id = Uuid::from_u128(0x4c32);
+        for (media, expected) in [
+            ("/media/.mkv", "/media/.trickplay"),
+            ("/media/.hidden", "/media/.trickplay"),
+            ("/media/.媒体", "/media/.trickplay"),
+            ("/media/.hidden.mkv", "/media/.hidden.trickplay"),
+            ("/media/..mkv", "/media/..trickplay"),
+            ("/media/Movie.Name.mkv", "/media/Movie.Name.trickplay"),
+            ("/media/Movie.Other.mkv", "/media/Movie.Other.trickplay"),
+            ("/media/movie", "/media/movie.trickplay"),
+            ("/media/movie.", "/media/movie.trickplay"),
+            ("/media/.hidden.", "/media/.hidden.trickplay"),
+        ] {
+            assert_eq!(
+                manager.trickplay_directory(id, MediaLocation::of_file(media), true),
+                expected,
+                "{media}"
+            );
+            assert_eq!(
+                manager.trickplay_directory(id, MediaLocation::of_file(media), false),
+                manager.trickplay_directory(
+                    id,
+                    MediaLocation::of_file("/media/ordinary.mkv"),
+                    false
+                ),
+                "the internal GUID layout does not depend on the leaf filename"
+            );
+        }
     }
 
     /// `Path.Combine(item.ContainingFolderPath, Path.ChangeExtension(
@@ -337,8 +377,8 @@ mod tests {
         let id = Uuid::parse_str("0a1b2c3d-4e5f-6789-abcd-ef0123456789").unwrap();
         let folder = m.chapter_image_folder_path(id, "/media/movie.mkv");
         assert!(folder.contains("/library/0a/0a1b2c3d4e5f6789abcdef0123456789/chapters"));
-        let path = m.chapter_image_path(id, "/media/movie.mkv", 12_345);
-        assert!(path.ends_with("/chapters/12345.jpg"));
+        let path = m.chapter_image_path(id, "/media/movie.mkv", 12_345, 678_900);
+        assert!(path.ends_with("/chapters/678900_12345.jpg"));
     }
 
     #[test]

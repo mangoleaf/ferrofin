@@ -2,7 +2,7 @@
 //! **inline WAT fixtures** compiled at test time via the `wat` crate — no
 //! `.wasm` binaries in the repo (artifact policy, docs/EXTENSIONS.md).
 //!
-//! The fixture component implements the `ferrofin:plugin@0.2.0` world by
+//! The fixture component implements the `ferrofin:plugin@0.5.0` world by
 //! hand at the canonical-ABI level. Its `run-task` export dispatches on the
 //! task id so one component covers every containment path:
 //! `ok` succeeds · `boom` returns an orderly guest error · `trap` hits
@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::EventManager;
+use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
 use ferrofin_wasm::{WasmPluginHost, WasmSettings};
 
@@ -734,4 +735,595 @@ async fn analysis_driver_skips_disabled_plugins_and_guests_cannot_touch_the_wate
         ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark").is_none(),
         "disabled plugins are skipped by the analysis pass"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_watermark() {
+    use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
+    use ferrofin_traits::media_segments::MediaSegmentManager;
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    // Count actual guest analysis calls through the fixture's existing `count` export.
+    let wat = FIXTURE_WAT.replace("(func (export \"scan-media\") (param i32) (result i32)",
+        "(func (export \"scan-media\") (param i32) (result i32) (global.set $events (i32.add (global.get $events) (i32.const 1)))");
+    write_fixture(dir.path(), "analyzer", &wat);
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let name = host.plugins()[0].descriptor.name.clone();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+        db.clone(),
+    ));
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    let library: Arc<dyn LibraryManager> = Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+    ));
+    let blocked = uuid::Uuid::new_v4();
+    let allowed = uuid::Uuid::new_v4();
+    let blocked_path = dir.path().join("blocked");
+    let allowed_path = dir.path().join("allowed");
+    std::fs::create_dir_all(&blocked_path).unwrap();
+    std::fs::create_dir_all(&allowed_path).unwrap();
+    let row = |id: uuid::Uuid, root: &std::path::Path, date| {
+        ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: ferrofin_core::item_type_lookup::stored_type_name(
+                ferrofin_model::data::BaseItemKind::Movie,
+            )
+            .unwrap()
+            .to_owned(),
+            path: Some(root.join("movie.mkv").to_string_lossy().into_owned()),
+            date_created: chrono::DateTime::from_timestamp_micros(date),
+            ..Default::default()
+        }
+    };
+    persistence
+        .save_items(&[
+            row(blocked, &blocked_path, 10),
+            row(allowed, &allowed_path, 20),
+        ])
+        .await
+        .unwrap();
+    let folders = Arc::new(ferrofin_core::FerrofinVirtualFolderManager::new(
+        dir.path().join("views"),
+    ));
+    let mut options = ferrofin_model::configuration::LibraryOptions {
+        path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+            path: blocked_path.to_string_lossy().into_owned(),
+        }],
+        disabled_media_segment_providers: vec![name.to_uppercase()],
+        ..Default::default()
+    };
+    folders
+        .add_virtual_folder("Blocked", None, &options)
+        .await
+        .unwrap();
+    folders
+        .add_virtual_folder(
+            "Allowed",
+            None,
+            &ferrofin_model::configuration::LibraryOptions {
+                path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                    path: allowed_path.to_string_lossy().into_owned(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let manager = Arc::new(
+        ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
+            .with_virtual_folders(folders.clone()),
+    );
+    ferrofin_traits::media_segments::MediaSegmentProvider::cache_segments(
+        &ferrofin_core::CachedMediaSegmentProvider::new(
+            name.clone(),
+            plugin_id,
+            plugins.clone(),
+            vec![ferrofin_model::data::BaseItemKind::Movie],
+            dir.path().join(format!("{plugin_id}.segments")),
+        ),
+        blocked,
+        &[],
+    )
+    .await
+    .unwrap();
+    for provider in host.media_segment_providers(&plugins) {
+        manager.register_segment_provider(provider);
+    }
+    assert_eq!(manager.registered_segment_providers()[0].name, name);
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library,
+        media_segments: manager,
+        plugins: plugins.clone(),
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        analysis: Arc::new(tokio::sync::Semaphore::new(1)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+    });
+    let task = host.analysis_task(&plugins).unwrap();
+    let progress = ferrofin_core::TaskProgress::default();
+    task.execute(&progress).await.unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('1'), "{count}");
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").unwrap(),
+        b"20"
+    );
+    let pending: Vec<uuid::Uuid> = serde_json::from_slice(
+        &ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending, [blocked]);
+    options.disabled_media_segment_providers.clear();
+    folders
+        .update_library_options("Blocked", &options)
+        .await
+        .unwrap();
+    task.execute(&progress).await.unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('2'), "{count}");
+    assert!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
+            .is_none()
+    );
+    task.execute(&progress).await.unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('2'), "{count}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persisted_task_producer_registration_is_restored_only_for_a_loaded_guest() {
+    use ferrofin_traits::media_segments::MediaSegmentProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let wat = FIXTURE_WAT.replace(
+        "(i32.store (i32.const 1156) (i32.const 1))",
+        "(i32.store (i32.const 1156) (i32.const 0))",
+    );
+    write_fixture(dir.path(), "task-only", &wat);
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    assert!(host.media_segment_providers(&plugins).is_empty());
+    let descriptor = host.plugins()[0].descriptor.clone();
+    let output_dir = dir.path().join(format!("{}.segments", descriptor.id));
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(output_dir.join(".ferrofin-config-incomplete"), b"partial").unwrap();
+    assert!(
+        host.media_segment_providers(&plugins).is_empty(),
+        "failed or empty publication directories cannot register a task producer"
+    );
+    // A successful producer write persists this cache. No arbitrary DB provider rows are inspected.
+    let producer = ferrofin_core::CachedMediaSegmentProvider::new(
+        descriptor.name.clone(),
+        descriptor.id,
+        plugins.clone(),
+        vec![ferrofin_model::data::BaseItemKind::Movie],
+        dir.path().join(format!("{}.segments", descriptor.id)),
+    );
+    producer
+        .cache_segments(uuid::Uuid::new_v4(), &[])
+        .await
+        .unwrap();
+    drop(host);
+    let load_dir = dir.path().to_path_buf();
+    let restarted = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let providers = restarted.media_segment_providers(&plugins);
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].name(), descriptor.name);
+    for entry in std::fs::read_dir(&output_dir).unwrap().flatten() {
+        if entry
+            .path()
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| uuid::Uuid::parse_str(stem).is_ok())
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert_eq!(
+        restarted.media_segment_providers(&plugins).len(),
+        1,
+        "successful producer identity survives final-item cleanup"
+    );
+    std::fs::create_dir(
+        dir.path()
+            .join(format!("{}.segments", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.media_segment_providers(&plugins).len(),
+        1,
+        "an unloaded descriptor cannot become a provider"
+    );
+}
+
+/// Saves a real off/on transition during the guest's first output gate.
+struct SwitchDuringWriteFolders {
+    inner: Arc<ferrofin_core::FerrofinVirtualFolderManager>,
+    reads: std::sync::atomic::AtomicUsize,
+    provider_name: String,
+}
+#[async_trait::async_trait]
+impl ferrofin_traits::library::VirtualFolderManager for SwitchDuringWriteFolders {
+    async fn get_virtual_folders(
+        &self,
+    ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+        let mut folders = self.inner.get_virtual_folders().await?;
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            let mut options = folders[0].library_options.clone().unwrap();
+            options.disabled_media_segment_providers = vec![self.provider_name.clone()];
+            self.inner
+                .update_library_options("Movies", &options)
+                .await?;
+            folders = self.inner.get_virtual_folders().await?;
+            // The setting is already enabled again when the guest/driver receives its result.
+            options.disabled_media_segment_providers.clear();
+            self.inner
+                .update_library_options("Movies", &options)
+                .await?;
+        }
+        Ok(folders)
+    }
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+        options: &ferrofin_model::configuration::LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.inner
+            .add_virtual_folder(name, collection_type, options)
+            .await
+    }
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
+        self.inner.remove_virtual_folder(name).await
+    }
+    async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError> {
+        self.inner.rename_virtual_folder(name, new_name).await
+    }
+    async fn add_media_path(
+        &self,
+        name: &str,
+        path: &ferrofin_model::configuration::MediaPathInfo,
+    ) -> Result<(), ServiceError> {
+        self.inner.add_media_path(name, path).await
+    }
+    async fn update_media_path(
+        &self,
+        name: &str,
+        path: &ferrofin_model::configuration::MediaPathInfo,
+    ) -> Result<(), ServiceError> {
+        self.inner.update_media_path(name, path).await
+    }
+    async fn remove_media_path(&self, name: &str, path: &str) -> Result<(), ServiceError> {
+        self.inner.remove_media_path(name, path).await
+    }
+    async fn update_library_options(
+        &self,
+        name: &str,
+        options: &ferrofin_model::configuration::LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        self.inner.update_library_options(name, options).await
+    }
+}
+
+/// The existing guest plus an actual canonical host import called from scan-media.
+fn policy_writer_wat() -> String {
+    let prelude = r#"
+  (type $host-interface (instance
+    (type $segment0 (record (field "segment-type" string) (field "start-ticks" s64) (field "end-ticks" s64)))
+    (export "media-segment" (type $segment (eq $segment0)))
+    (type $write (func (param "item-id" string) (param "segments" (list $segment)) (result (result (error string)))))
+    (export "write-media-segments" (func (type $write)))
+  ))
+  (import "ferrofin:plugin/host@0.5.0" (instance $host (type $host-interface)))
+  (alias export $host "write-media-segments" (func $write))
+  (core module $mem
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 32768))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ret i32)
+      (local.set $ret (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $ret)))
+  (core instance $mem (instantiate $mem))
+  (core func $write (canon lower (func $write) (memory (core memory $mem "memory")) (realloc (core func $mem "realloc")) string-encoding=utf8))
+  (core instance $host-lowered (export "write" (func $write)))
+"#;
+    FIXTURE_WAT
+        .replace("(memory (export \"memory\") 1)", "(import \"mem\" \"memory\" (memory 1)) (export \"memory\" (memory 0))")
+        .replace("(core module $m", "(core module $m (import \"host\" \"write\" (func $write (param i32 i32 i32 i32 i32)))")
+        .replace("(core instance $i (instantiate $m))", "(core instance $i (instantiate $m (with \"mem\" (instance $mem)) (with \"host\" (instance $host-lowered))))")
+        .replace("(func (export \"scan-media\") (param i32) (result i32)",
+            "(func (export \"scan-media\") (param i32) (result i32) (global.set $events (i32.add (global.get $events) (i32.const 1))) (call $write (i32.load (local.get 0)) (i32.load (i32.add (local.get 0) (i32.const 4))) (i32.const 0) (i32.const 0) (i32.const 2048))")
+        .replace("(component", &format!("(component{prelude}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_before_reply() {
+    use ferrofin_traits::library::VirtualFolderManager;
+    use ferrofin_traits::media_segments::MediaSegmentManager;
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "policy-writer", &policy_writer_wat());
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let item = uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap();
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let media = dir.path().join("media");
+    let library = common::persisted_movie_library(&db, &media, item).await;
+    assert_eq!(
+        host.plugins().len(),
+        1,
+        "the policy writer must instantiate"
+    );
+    let inner = Arc::new(ferrofin_core::FerrofinVirtualFolderManager::new(
+        dir.path().join("views"),
+    ));
+    inner
+        .add_virtual_folder(
+            "Movies",
+            None,
+            &ferrofin_model::configuration::LibraryOptions {
+                path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let folders = Arc::new(SwitchDuringWriteFolders {
+        inner: inner.clone(),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+        provider_name: host.plugins()[0].descriptor.name.clone(),
+    });
+    let manager = Arc::new(
+        ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
+            .with_virtual_folders(folders),
+    );
+    let historical = ferrofin_model::media_segments::MediaSegmentDto {
+        item_id: item,
+        type_: ferrofin_model::media_segments::MediaSegmentType::Intro,
+        start_ticks: 1,
+        end_ticks: 100,
+        ..Default::default()
+    };
+    ferrofin_traits::media_segments::MediaSegmentProvider::cache_segments(
+        &ferrofin_core::CachedMediaSegmentProvider::new(
+            host.plugins()[0].descriptor.name.clone(),
+            host.plugins()[0].descriptor.id,
+            plugins.clone(),
+            vec![ferrofin_model::data::BaseItemKind::Movie],
+            dir.path()
+                .join(format!("{}.segments", host.plugins()[0].descriptor.id)),
+        ),
+        item,
+        &[historical],
+    )
+    .await
+    .unwrap();
+    for provider in host.media_segment_providers(&plugins) {
+        manager.register_segment_provider(provider);
+    }
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library,
+        media_segments: manager.clone(),
+        plugins: plugins.clone(),
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        analysis: Arc::new(tokio::sync::Semaphore::new(1)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+    });
+    let task = host.analysis_task(&plugins).unwrap();
+    let progress = ferrofin_core::TaskProgress::default();
+    let state = dir
+        .path()
+        .join(format!("{}.state.json", host.plugins()[0].descriptor.id));
+    let snapshot = dir.path().join(format!(
+        "{}.segments/{item}.json",
+        host.plugins()[0].descriptor.id
+    ));
+    task.execute(&progress).await.unwrap();
+    assert!(
+        inner.get_virtual_folders().await.unwrap()[0]
+            .library_options
+            .as_ref()
+            .unwrap()
+            .disabled_media_segment_providers
+            .is_empty()
+    );
+    let retained: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
+        serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+    assert_eq!(
+        retained.len(),
+        1,
+        "the real host suppressed the first guest's empty replacement"
+    );
+    let pending: Vec<uuid::Uuid> = serde_json::from_slice(
+        &ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pending, [item]);
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('1'), "{count}");
+    task.execute(&progress).await.unwrap();
+    let replaced: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
+        serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+    assert!(replaced.is_empty());
+    assert!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
+            .is_none()
+    );
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('2'), "{count}");
+    task.execute(&progress).await.unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('2'), "{count}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer() {
+    use ferrofin_traits::media_segments::MediaSegmentManager;
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    let wat = FIXTURE_WAT.replace("(func (export \"scan-media\") (param i32) (result i32)",
+        "(func (export \"scan-media\") (param i32) (result i32) (global.set $events (i32.add (global.get $events) (i32.const 1)))");
+    write_fixture(dir.path(), "state-only", &wat);
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    assert!(host.media_segment_providers(&plugins).is_empty());
+    let library = Arc::new(common::OneMovieLibrary {
+        seen: std::sync::Mutex::new(None),
+    });
+    let item = uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap();
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[ferrofin_traits::library::LibraryManager::get_item_by_id(
+            library.as_ref(),
+            item,
+        )
+        .await
+        .unwrap()
+        .unwrap()])
+        .await
+        .unwrap();
+    let folders = Arc::new(ferrofin_core::FerrofinVirtualFolderManager::new(
+        dir.path().join("views"),
+    ));
+    folders
+        .add_virtual_folder(
+            "Movies",
+            None,
+            &ferrofin_model::configuration::LibraryOptions {
+                path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                    path: "/".to_owned(),
+                }],
+                disabled_media_segment_providers: vec![host.plugins()[0].descriptor.name.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let manager = Arc::new(
+        ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
+            .with_virtual_folders(folders),
+    );
+    for candidate in host.media_segment_provider_candidates(&plugins) {
+        assert!(
+            !manager
+                .adopt_loaded_segment_provider(candidate)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(manager.registered_segment_providers().is_empty());
+    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
+        handle: tokio::runtime::Handle::current(),
+        library,
+        media_segments: manager.clone(),
+        plugins: plugins.clone(),
+        lyrics: Arc::new(common::StubLyrics::default()),
+        subtitles: Arc::new(common::StubSubtitles::default()),
+        collections: Arc::new(common::StubCollections::default()),
+        media_streams: Arc::new(common::StubStreams),
+        extractor: Arc::new(common::StubExtractor::default()),
+        analysis: Arc::new(tokio::sync::Semaphore::new(1)),
+        users: Arc::new(common::StubUsers),
+        user_data: Arc::new(common::StubUserData),
+        tv: Arc::new(common::StubTv),
+    });
+    let task = host.analysis_task(&plugins).unwrap();
+    task.execute(&ferrofin_core::TaskProgress::default())
+        .await
+        .unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('1'), "{count}");
+    task.execute(&ferrofin_core::TaskProgress::default())
+        .await
+        .unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('1'), "{count}");
+    assert!(manager.registered_segment_providers().is_empty());
 }

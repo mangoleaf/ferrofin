@@ -10,11 +10,9 @@
 //! [`ChapterEntity`](ferrofin_db::entities::base_items::ChapterEntity) and the wire
 //! [`ChapterInfo`] the trait speaks.
 //!
-//! Deferred (documented, per the unit-8 minimal-manager rule): chapter *image*
-//! extraction/refresh (`RefreshChapterImages`) needs the un-ported `Video`
-//! domain object plus an `IImageProcessor`/directory service and lands in a
-//! later wave; the [`ChapterInfo::image_tag`] a DTO would carry is therefore not
-//! computed here (left `None`).
+//! Chapter-image reconciliation and extraction are shared by scans and the
+//! scheduled task through [`crate::chapter_image_extractor::ChapterImageExtractor`].
+//! Image cache tags are computed by the DTO layer.
 
 use std::sync::Arc;
 
@@ -31,7 +29,7 @@ use ferrofin_traits::persistence::ChapterRepository;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::is_video;
 
-/// The concrete (minimal) chapter manager.
+/// The concrete chapter-row manager.
 #[derive(Clone)]
 pub struct FerrofinChapterManager {
     repository: Arc<dyn ChapterRepository>,
@@ -73,7 +71,7 @@ impl FerrofinChapterManager {
     }
 
     /// Maps a persistence [`ChapterEntity`] onto the wire [`ChapterInfo`]. The
-    /// `image_tag` (a DTO-layer image cache tag) is a documented deferral.
+    /// `image_tag` is supplied by the DTO layer when requested.
     fn to_info(entity: ChapterEntity) -> ChapterInfo {
         ChapterInfo {
             start_position_ticks: entity.start_position_ticks,

@@ -34,12 +34,37 @@ use uuid::Uuid;
 use crate::error::ServiceError;
 use crate::system::ServerApplicationPaths;
 
+/// An immutable snapshot published after a configuration save succeeds.
+#[derive(Debug, Clone)]
+pub enum ConfigurationUpdate {
+    /// The committed main server configuration.
+    Server(Arc<ServerConfiguration>),
+    /// A committed named configuration, with its normalized key and JSON body.
+    Named {
+        /// Case-normalized store key.
+        key: String,
+        /// The JSON that was committed to the store.
+        json: Arc<str>,
+    },
+}
+
+/// A synchronous configuration observer. Callbacks must finish promptly and
+/// must not recursively save configuration. They run after persistence and
+/// before the save completes, without holding the configuration's read lock.
+pub type ConfigurationListener = dyn Fn(&ConfigurationUpdate) + Send + Sync;
+
 /// Provides access to the server's configuration and application paths.
 ///
 /// Port of `IServerConfigurationManager` with its generic `IConfigurationManager`
 /// base collapsed to concrete accessors (see the module docs).
 #[async_trait]
 pub trait ServerConfigurationManager: Send + Sync {
+    /// Announces a named save performed by a store outside this manager.
+    ///
+    /// Call only after persistence and the store's synchronous live updates
+    /// succeed. Lightweight test managers without observers may ignore it.
+    fn named_configuration_updated(&self, _key: &str, _json: Arc<str>) {}
+
     /// The resolved application paths.
     ///
     /// Returned as an `Arc<dyn>` so the paths object stays shareable and this

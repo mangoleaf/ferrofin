@@ -412,7 +412,7 @@ impl ScheduledTask for DeleteTranscodeFileTask {
             tracing::info!("skipping transcode-directory sweep: playback is active");
             return Ok(());
         }
-        let dir = PathBuf::from(self.paths.transcode_path());
+        let dir = PathBuf::from(self.paths.prepare_transcode_path()?);
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let cutoff = SystemTime::now() - std::time::Duration::from_hours(24);
@@ -741,7 +741,11 @@ impl ScheduledTask for MoveTrickplayImagesTask {
                 .collect();
             seen.dedup();
             for item_id in seen {
-                if let Err(e) = self.trickplay.move_generated_trickplay_data(item_id).await {
+                if let Err(e) = self
+                    .trickplay
+                    .move_generated_library_trickplay_data(item_id)
+                    .await
+                {
                     tracing::warn!(item = %item_id, error = %e, "error moving trickplay files");
                 } else {
                     moved += 1;

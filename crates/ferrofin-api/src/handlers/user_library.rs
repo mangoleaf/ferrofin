@@ -109,10 +109,11 @@ async fn save_and_return(
     user_id: Uuid,
     item_id: Uuid,
     update: &UpdateUserItemDataDto,
+    reason: ferrofin_model::entities::UserDataSaveReason,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     state
         .user_data
-        .save_user_data(user_id, item_id, update)
+        .save_user_data_with_reason(user_id, item_id, update, reason)
         .await?;
     let dto = state
         .user_data
@@ -255,7 +256,14 @@ async fn set_favorite(
         is_favorite: Some(is_favorite),
         ..UpdateUserItemDataDto::default()
     };
-    save_and_return(state, user_uuid, resolved_item, &update).await
+    save_and_return(
+        state,
+        user_uuid,
+        resolved_item,
+        &update,
+        ferrofin_model::entities::UserDataSaveReason::UpdateUserRating,
+    )
+    .await
 }
 
 /// Query parameters for `POST /UserItems/{itemId}/Rating`.
@@ -390,7 +398,14 @@ async fn update_item_user_data(
         .get_item_by_id_for_user(item_id, Some(&user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    save_and_return(&state, user_uuid, item_id, &update).await
+    save_and_return(
+        &state,
+        user_uuid,
+        item_id,
+        &update,
+        ferrofin_model::entities::UserDataSaveReason::UpdateUserData,
+    )
+    .await
 }
 
 /// `GET /Items/Root` — the user root folder.

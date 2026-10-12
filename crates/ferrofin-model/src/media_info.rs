@@ -21,6 +21,17 @@ use crate::dlna::PlaybackErrorCode;
 use crate::dto::{BaseItemPerson, MediaSourceInfo};
 use crate::entities_media::{ChapterInfo, MediaStream};
 
+/// Validates a streaming container or codec name.
+/// Port of EncodingHelper.ContainerValidationRegexStr: ASCII letters/digits
+/// and `-._,|`, with at most 40 characters (including an empty value).
+#[must_use]
+pub fn is_valid_stream_identifier(value: &str) -> bool {
+    value.len() <= 40
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b',' | b'|')
+        })
+}
+
 /// Enum `MediaProtocol` — how a media source is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -311,6 +322,12 @@ pub struct MediaInfo {
     #[serde(flatten)]
     pub media_source: MediaSourceInfo,
 
+    /// Unsplit, lowercased-key embedded audio tags from the encoder. Kept
+    /// internally so the audio prober can apply live library options after
+    /// probing; this is never part of the HTTP DTO or its schema.
+    #[serde(skip)]
+    pub raw_audio_tags: Option<HashMap<String, String>>,
+
     /// Gets or sets the chapters.
     pub chapters: Vec<ChapterInfo>,
 
@@ -381,6 +398,23 @@ pub struct MediaInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_identifiers_preserve_native_boundary_and_reject_path_separators() {
+        for value in ["", "..", "-._,|", "hevc,h264", &"x".repeat(40)] {
+            assert!(is_valid_stream_identifier(value), "{value:?}");
+        }
+        for value in [
+            "ts/../../outside",
+            "ts\\outside",
+            "mkv mp4",
+            "mkv\n",
+            "mätroska",
+            &"x".repeat(41),
+        ] {
+            assert!(!is_valid_stream_identifier(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn media_protocol_default_and_round_trip() {
@@ -549,5 +583,21 @@ mod tests {
         assert!(json.get("Protocol").is_some());
         let back: MediaInfo = serde_json::from_value(json).unwrap();
         assert_eq!(info, back);
+    }
+    #[test]
+    fn raw_audio_tags_remain_internal_and_cannot_be_supplied_through_json() {
+        let info = MediaInfo {
+            raw_audio_tags: Some(HashMap::from([(
+                "artist".to_owned(),
+                "unsplit / artist".to_owned(),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(info.clone().raw_audio_tags, info.raw_audio_tags);
+        let mut json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("RawAudioTags").is_none());
+        json["RawAudioTags"] = serde_json::json!({"artist":"untrusted"});
+        let decoded: MediaInfo = serde_json::from_value(json).unwrap();
+        assert!(decoded.raw_audio_tags.is_none());
     }
 }

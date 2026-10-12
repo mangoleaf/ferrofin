@@ -1,7 +1,7 @@
 //! Port of `EncodingConfigurationStore` + `EncodingConfigurationFactory`.
 
 use ferrofin_common::configuration::{
-    ConfigurationFactory, ConfigurationStore, ValidatingConfiguration,
+    ConfigurationFactory, ConfigurationStore, ConfigurationValidationError, ValidatingConfiguration,
 };
 use ferrofin_model::configuration::EncodingOptions;
 
@@ -81,23 +81,30 @@ impl<D: DirChecker> ValidatingConfiguration for EncodingConfigurationStore<D> {
     ///
     /// The `old_config`/`new_config` bodies are the JSON-serialized
     /// [`EncodingOptions`].
-    fn validate(&self, old_config: &str, new_config: &str) -> Result<(), String> {
+    fn validate(
+        &self,
+        old_config: &str,
+        new_config: &str,
+    ) -> Result<(), ConfigurationValidationError> {
+        use ConfigurationValidationError::{DirectoryNotFound, InvalidOperation};
         let old: EncodingOptions = serde_json::from_str(old_config)
-            .map_err(|e| format!("invalid old encoding configuration: {e}"))?;
+            .map_err(|e| InvalidOperation(format!("invalid old encoding configuration: {e}")))?;
         let new: EncodingOptions = serde_json::from_str(new_config)
-            .map_err(|e| format!("invalid new encoding configuration: {e}"))?;
+            .map_err(|e| InvalidOperation(format!("invalid new encoding configuration: {e}")))?;
 
         let new_path = new.transcoding_temp_path.as_deref().unwrap_or_default();
         if !new_path.trim().is_empty()
             && old.transcoding_temp_path.as_deref() != Some(new_path)
             && !self.dir_checker.directory_exists(new_path)
         {
-            return Err(format!("{new_path} does not exist."));
+            return Err(DirectoryNotFound(format!("{new_path} does not exist.")));
         }
 
         let new_encoder = new.encoder_app_path.as_deref().unwrap_or_default();
         if !new_encoder.trim().is_empty() && old.encoder_app_path.as_deref() != Some(new_encoder) {
-            return Err("Unable to update encoder app path.".to_owned());
+            return Err(InvalidOperation(
+                "Unable to update encoder app path.".to_owned(),
+            ));
         }
 
         Ok(())
@@ -168,7 +175,7 @@ mod tests {
         let mut new = opts();
         new.transcoding_temp_path = Some("/does/not/exist".to_owned());
         let err = store.validate(&json(&old), &json(&new)).unwrap_err();
-        assert_eq!(err, "/does/not/exist does not exist.");
+        assert_eq!(err.to_string(), "/does/not/exist does not exist.");
     }
 
     #[test]
@@ -196,6 +203,6 @@ mod tests {
         let mut new = opts();
         new.encoder_app_path = Some("/usr/bin/ffmpeg".to_owned());
         let err = store.validate(&json(&old), &json(&new)).unwrap_err();
-        assert_eq!(err, "Unable to update encoder app path.");
+        assert_eq!(err.to_string(), "Unable to update encoder app path.");
     }
 }

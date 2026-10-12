@@ -268,16 +268,19 @@ fn parity_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
         "/tmdb/movie/901" => json!({"id":901,"title":"Mapped movie","original_title":"Original movie","original_language":"ja",
             "overview":"Mapped overview", "videos":{"results":[{"site":"YouTube","type":"Trailer","key":"mapped","name":"Trailer"}]}, "production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"mapped keyword"}]},
             "belongs_to_collection":{"id":99,"name":"Mapped collection"},"poster_path":"/mapped-tmdb.png","credits":{"cast":[],"crew":[]}}),
+        "/tmdb/movie/901/images" => json!({"posters":[{"file_path":"/mapped-tmdb.png","width":640,"height":960}],"backdrops":[],"logos":[]}),
         "/fanart/movies/901" => json!({"movieposter":[{"url":art("mapped-fanart"),"lang":"en"}]}),
         "/tvdb/login" => json!({"data":{"token":"test"}}),
         "/tvdb/search/remoteid/tt123456" | "/tvdb/search/remoteid/777" => json!({"data":[{"series":{"id":42}}]}),
         "/tvdb/series/42/extended" => json!({"data":{"id":42,"name":"Mapped series","overview":"TVDB series overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped series"}],"overviewTranslations":[{"language":"eng","overview":"TVDB series overview"}]},
             "averageRuntime":42,"slug":"mapped-series","lists":[{"id":9,"isOfficial":true}],
             "remoteIds":[{"sourceName":"IMDB","id":"tt123456"}],
             "artworks":[{"type":2,"image":art("mapped-tvdb")}]
         }}),
         "/tvdb/series/42/episodes/official" => json!({"data":{"episodes":[{"id":43,"seasonNumber":1,"number":1}]}}),
         "/tvdb/episodes/43/extended" => json!({"data":{"id":43,"name":"Mapped episode","overview":"TVDB episode overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped episode"}],"overviewTranslations":[{"language":"eng","overview":"TVDB episode overview"}]},
             "airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,
             "remoteIds":[{"sourceName":"IMDB","id":"tt123457"}],"characters":[]}}),
         "/fanart/tv/42" => json!({"tvposter":[{"url":art("mapped-series-fanart"),"lang":"en"}]}),
@@ -317,6 +320,37 @@ fn omdb_answer(target: &str) -> Option<String> {
     None
 }
 
+/// Movie detail and image-list replies are separate provider requests.
+fn movie_answer(id: &str) -> Option<String> {
+    if let Some(id) = id.strip_suffix("/images") {
+        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+        let posters = if *title == "Alpha" {
+            json!([{"file_path":"/alpha-poster.png","width":640,"height":960}])
+        } else {
+            json!([])
+        };
+        return Some(json!({"posters":posters,"backdrops":[],"logos":[]}).to_string());
+    }
+    let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+    // Alpha alone has artwork and a cast member: the artwork and person
+    // requests of every row are then Alpha's (or nobody's).
+    let (poster, cast) = if *title == "Alpha" {
+        (
+            r#""poster_path": "/alpha-poster.png","#,
+            r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
+                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
+        )
+    } else {
+        ("", "[]")
+    };
+    Some(format!(
+        r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
+                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
+                "release_dates": {{"results": []}}}}"#,
+        trailer(title)
+    ))
+}
+
 /// The stand-in's answer to `target` (path + query), `None` for a 404.
 fn answer(target: &str) -> Option<String> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -337,24 +371,7 @@ fn answer(target: &str) -> Option<String> {
         return Some(format!(r#"{{"results": [{}]}}"#, hits.join(",")));
     }
     if let Some(id) = path.strip_prefix("/tmdb/movie/") {
-        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
-        // Alpha alone has artwork and a cast member: the artwork and person
-        // requests of every row are then Alpha's (or nobody's).
-        let (poster, cast) = if *title == "Alpha" {
-            (
-                r#""poster_path": "/alpha-poster.png","#,
-                r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
-                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
-            )
-        } else {
-            ("", "[]")
-        };
-        return Some(format!(
-            r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
-                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
-                "release_dates": {{"results": []}}}}"#,
-            trailer(title)
-        ));
+        return movie_answer(id);
     }
     if path == "/tmdb/person/501" {
         return Some(
@@ -369,6 +386,9 @@ fn answer(target: &str) -> Option<String> {
         let mut parts = rest.split('/');
         let id = parts.next()?;
         let (title, _) = SHOWS.iter().find(|(_, s)| s.to_string() == id)?;
+        if rest.ends_with("/images") {
+            return Some(json!({"posters":[],"backdrops":[],"logos":[],"stills":[]}).to_string());
+        }
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
@@ -1186,6 +1206,7 @@ impl Harness {
                 tvdb: Some(format!("{}/tvdb", providers.base)),
                 fanart: Some(format!("{}/fanart", providers.base)),
                 audiodb: Some(format!("{}/audiodb", providers.base)),
+                lrclib: Some(format!("{}/lrclib", providers.base)),
             },
             // A passwordless administrator: no PBKDF2 round in a debug build.
             admin_password: String::new(),
@@ -1757,8 +1778,35 @@ fn assert_provider_counts_agree(seen: &Seen, row: &str) {
     );
 }
 
+/// Whether this test should run here: the server's log subscriber is
+/// process-wide (`init_tracing`'s `try_init`), so a second server booted in
+/// the same process logs into the first one's directory and never sees its
+/// own watcher start. Under `cargo test`, which runs this file's tests on
+/// threads of one process, each re-runs itself alone in a child process and
+/// reports its result; nextest already gives every test a process of its own.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("FERROFIN_SCAN_MATRIX_CHILD").is_some()
+    {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("FERROFIN_SCAN_MATRIX_CHILD", "1")
+        .status()
+        .expect("run the test in its own process");
+    assert!(
+        status.success(),
+        "{name} failed in its own process: {status}"
+    );
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scan_reprocesses_only_what_changed() {
+    if !in_own_process("a_scan_reprocesses_only_what_changed") {
+        return;
+    }
     let h = Harness::boot().await;
     let started = Instant::now();
     rows(&h).await;
@@ -1768,6 +1816,18 @@ async fn a_scan_reprocesses_only_what_changed() {
     subtitle_probe_failure_is_quiet(&h).await;
     omdb_works_without_an_operator_key(&h).await;
     eprintln!("matrix rows took {:?}", started.elapsed());
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subtitle_downloads_survive_rescans_and_probe_failure() {
+    if !in_own_process("subtitle_downloads_survive_rescans_and_probe_failure") {
+        return;
+    }
+    let h = Harness::boot().await;
+    subtitles_are_downloaded_during_scan(&h).await;
+    std::fs::remove_file(&h.stubs.ffprobe).expect("make ffprobe unavailable");
+    subtitle_probe_failure_is_quiet(&h).await;
     h.shutdown().await;
 }
 
@@ -2760,6 +2820,7 @@ async fn subtitle_probe_failure_is_quiet(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(&id, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
     assert!(of(&seen.requests, "opensubtitles").is_empty());
     assert_eq!(
         std::fs::read(movie.with_extension("eng.srt")).unwrap(),
@@ -2857,13 +2918,15 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
     assert!(
         seen.requests
             .iter()
-            .any(|r| r.contains("/image/mapped-fanart.png"))
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+        "{seen:?}"
     );
     assert!(
         !seen
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb"))
+            .any(|r| r.contains("/image/mapped-fanart.png")),
+        "{seen:?}"
     );
     let id = h.id(&movie).await;
     let dto = h.item(&id).await;
@@ -2882,8 +2945,9 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         !quiet.writes.contains_key("BaseItemImageInfos"),
         "{quiet:?}"
     );
-    // An explicit library order overrides the default on image replacement.
-    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["TheMovieDb", "FanArt"]);
+    // Movie providers default to TMDB before FanArt (pinned intrinsic order).
+    // An explicit reversed library order overrides that on replacement.
+    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["FanArt", "TheMovieDb"]);
     h.post(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
@@ -2897,7 +2961,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         reordered
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+            .any(|r| r.contains("/image/mapped-fanart.png")),
         "{reordered:?}"
     );
 

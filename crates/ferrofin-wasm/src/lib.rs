@@ -480,6 +480,37 @@ impl WasmPluginHost {
             .collect()
     }
 
+    /// Actual loaded producers proven by their own persisted output/identity.
+    /// Analysis targets alone do not declare a media-segment role.
+    #[must_use]
+    pub fn media_segment_providers(
+        &self,
+        plugins: &Arc<dyn PluginManager>,
+    ) -> Vec<Arc<dyn ferrofin_traits::media_segments::MediaSegmentProvider>> {
+        self.plugins
+            .iter()
+            .filter(|plugin| {
+                let cache = plugin
+                    .state_path
+                    .with_file_name(format!("{}.segments", plugin.descriptor.id));
+                has_persisted_segment_output(&cache, plugin.descriptor.id)
+            })
+            .map(|plugin| cached_segment_provider(plugin, plugins))
+            .collect()
+    }
+    /// Loaded-only candidates for startup adoption of their exact former wasm:UUID rows.
+    /// These are not advertised until output evidence is found by the manager.
+    #[must_use]
+    pub fn media_segment_provider_candidates(
+        &self,
+        plugins: &Arc<dyn PluginManager>,
+    ) -> Vec<Arc<dyn ferrofin_traits::media_segments::MediaSegmentProvider>> {
+        self.plugins
+            .iter()
+            .map(|plugin| cached_segment_provider(plugin, plugins))
+            .collect()
+    }
+
     /// Arms the `query-items` / `write-media-segments` host functions with
     /// their backing managers. Called once by the composition root after the
     /// managers exist; a guest calling these before that (i.e. during its
@@ -586,6 +617,53 @@ impl WasmPluginHost {
             }
         }
     }
+}
+
+fn cached_segment_provider(
+    plugin: &LoadedPlugin,
+    plugins: &Arc<dyn PluginManager>,
+) -> Arc<dyn ferrofin_traits::media_segments::MediaSegmentProvider> {
+    Arc::new(
+        ferrofin_core::CachedMediaSegmentProvider::new(
+            plugin.descriptor.name.clone(),
+            plugin.descriptor.id,
+            Arc::clone(plugins),
+            capabilities::segment_item_kinds(),
+            plugin
+                .state_path
+                .with_file_name(format!("{}.segments", plugin.descriptor.id)),
+        )
+        .with_legacy_ids(vec![format!("wasm:{}", plugin.descriptor.id)]),
+    )
+}
+
+/// Empty directories and incomplete atomic temp files do not prove a producer role.
+fn has_persisted_segment_output(cache: &Path, plugin_id: Uuid) -> bool {
+    if std::fs::read(cache.join("producer.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Uuid>(&bytes).ok())
+        == Some(plugin_id)
+    {
+        return true;
+    }
+    std::fs::read_dir(cache).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| Uuid::parse_str(stem).is_ok())
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+                && std::fs::read(&path).is_ok_and(|bytes| {
+                    serde_json::from_slice::<Vec<ferrofin_model::media_segments::MediaSegmentDto>>(
+                        &bytes,
+                    )
+                    .is_ok()
+                })
+        })
+    })
 }
 
 /// Longest accepted provider-descriptor name in bytes — a dashboard display
@@ -1384,6 +1462,9 @@ async fn plugin_pass_prelude(
 /// watermark (unix microseconds of the newest item already offered).
 const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
 
+// Library-disabled items must remain eligible after another library advances the watermark.
+const SEGMENT_POLICY_PENDING_KEY: &str = "host:segment-policy-pending";
+
 /// The dashboard task driving every analyzer plugin's `scan-media` pass:
 /// for each ENABLED plugin with non-empty `scan-targets`, offers each item
 /// newer than the plugin's watermark exactly once (host-tracked, in the
@@ -1396,6 +1477,7 @@ struct WasmMediaAnalysisTask {
     plugins: Vec<Arc<LoadedPlugin>>,
     plugin_manager: Arc<dyn PluginManager>,
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    state_total_cap: usize,
 }
 
 #[allow(clippy::unnecessary_literal_bound)] // the trait pins `-> &str`
@@ -1414,6 +1496,7 @@ impl ScheduledTask for WasmMediaAnalysisTask {
         "Library"
     }
 
+    #[allow(clippy::too_many_lines)] // producer policy preserves the existing offer-once watermark
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Err(ServiceError::backend(
@@ -1446,11 +1529,27 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     .flatten(),
                 ..Default::default()
             };
-            let items = cx
+            let mut items = cx
                 .library
                 .get_item_list(&query)
                 .await
                 .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
+            let pending: std::collections::HashSet<Uuid> =
+                capabilities::get_state(Some(&plugin.state_path), SEGMENT_POLICY_PENDING_KEY)
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    .unwrap_or_default();
+            if !pending.is_empty() {
+                let deferred = cx
+                    .library
+                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                        item_ids: pending.iter().copied().collect(),
+                        ..Default::default()
+                    })
+                    .await?;
+                items.extend(deferred);
+            }
+            let mut still_pending = std::collections::HashSet::new();
+            let mut seen = std::collections::HashSet::new();
             let mut new_watermark = watermark;
             let mut offered = 0u32;
             let mut failed = 0u32;
@@ -1459,11 +1558,35 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                 // NULL-dated items read as epoch: offered on the first
                 // (unfiltered) pass, then permanently behind the watermark.
                 let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
-                if created <= watermark {
+                let item_id = uuid::Uuid::parse_str(&entity.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                if !seen.insert(item_id) || (created <= watermark && !pending.contains(&item_id)) {
+                    continue;
+                }
+                new_watermark = new_watermark.max(created);
+                if cx
+                    .media_segments
+                    .is_registered_segment_provider(&format!("wasm:{}", plugin.descriptor.id))
+                    && !cx
+                        .media_segments
+                        .is_provider_enabled(item_id, &plugin.descriptor.name)
+                        .await?
+                {
+                    still_pending.insert(item_id);
                     continue;
                 }
                 let item = capabilities::summarize(&entity, None);
-                if let Err(e) = plugin.runtime.scan_media(item, config.clone()).await {
+                let outcome = plugin.runtime.scan_media(item, config.clone()).await;
+                let result = match outcome {
+                    Ok(outcome) => {
+                        if outcome.policy_skipped {
+                            still_pending.insert(item_id);
+                        }
+                        outcome.result
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(e) = result {
                     // Per-item detail stays at debug (volume scales with
                     // library size); one aggregated warn per pass below.
                     tracing::debug!(
@@ -1489,11 +1612,34 @@ impl ScheduledTask for WasmMediaAnalysisTask {
                     "scan-media failures this pass (items offered once; not retried)"
                 );
             }
+            if still_pending != pending {
+                let bytes = if still_pending.is_empty() {
+                    None
+                } else {
+                    let mut ids: Vec<_> = still_pending.into_iter().collect();
+                    ids.sort_unstable();
+                    Some(
+                        serde_json::to_vec(&ids)
+                            .map_err(|error| ServiceError::backend(error.to_string()))?,
+                    )
+                };
+                // Persist deferred identities before the watermark can move past them.
+                if let Err(error) = capabilities::set_state_capped(
+                    Some(&plugin.state_path),
+                    SEGMENT_POLICY_PENDING_KEY,
+                    bytes,
+                    self.state_total_cap,
+                ) {
+                    warn!(plugin=plugin.descriptor.name, %error, "could not persist library-disabled analysis items; watermark retained");
+                    continue;
+                }
+            }
             if new_watermark > watermark
-                && let Err(e) = capabilities::set_state(
+                && let Err(e) = capabilities::set_state_capped(
                     Some(&plugin.state_path),
                     SCAN_WATERMARK_KEY,
                     Some(new_watermark.to_string().into_bytes()),
+                    self.state_total_cap,
                 )
             {
                 warn!(
@@ -1546,6 +1692,7 @@ impl WasmPluginHost {
             plugins: analyzers,
             plugin_manager: Arc::clone(plugin_manager),
             collaborators: Arc::clone(&self.collaborators),
+            state_total_cap: self.settings.state_limit_mb as usize * 1024 * 1024,
         }))
     }
 }

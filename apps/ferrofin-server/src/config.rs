@@ -168,14 +168,8 @@ enum DbPoolFileValue {
 /// Not here, and why:
 /// - MusicBrainz and the studio artwork repository: each has a real setting
 ///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
-/// - LrcLib and ListenBrainz: a scan never calls them (lyrics come from the
-///   "Download missing lyrics" task, similar artists on request), as upstream.
-/// - OpenSubtitles: a scan does not call it yet. Upstream's probe downloads
-///   missing subtitles when a library sets `SubtitleDownloadLanguages`
-///   (`FFProbeVideoInfo.AddExternalSubtitlesAsync`); that is not ported yet,
-///   and Ferrofin downloads them only in the "Download missing subtitles"
-///   task. Porting it needs an `opensubtitles` entry here, or the end-to-end
-///   scan test would reach the real API.
+/// - LrcLib: the scheduled lyric-download test uses `lrclib`; scans never
+///   download lyrics. ListenBrainz is only called for similar artists on request.
 /// - Image CDNs other than TMDb's: their URLs come from the provider answers
 ///   (fanart.tv, TheTVDB, TheAudioDB), which a mock serves.
 #[doc(hidden)]
@@ -196,6 +190,8 @@ pub struct ProviderEndpoints {
     pub fanart: Option<String>,
     /// Replaces TheAudioDB's API root (`…/api/v1/json/{key}`).
     pub audiodb: Option<String>,
+    /// Replaces `https://lrclib.net` for scheduled-lyrics integration tests.
+    pub lrclib: Option<String>,
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -229,6 +225,12 @@ pub struct Config {
 
     /// Address the HTTP listener binds to. Parsed from `bind_addr`.
     pub bind_addr: IpAddr,
+
+    /// Whether the operator chose `bind_addr` (flag, `FERROFIN_BIND_ADDR` or
+    /// `config.toml`). When they did, that one address is the listener; when
+    /// they did not, the dashboard's network settings (`LocalNetworkAddresses`,
+    /// `EnableIPv4`/`EnableIPv6`) decide, as Jellyfin's `GetAllBindInterfaces`.
+    pub bind_addr_explicit: bool,
 
     /// Internal discovery transport seam: production uses UDP 7359; test fixtures
     /// disable it or select an isolated loopback endpoint. Not a file/env setting.
@@ -531,11 +533,12 @@ impl Config {
             .or(file.web_dir)
             .unwrap_or_else(|| data_dir.join("web"));
 
-        let bind_addr_str = cli
+        let chosen_bind = cli
             .bind_addr
             .or_else(|| env.var("FERROFIN_BIND_ADDR"))
-            .or(file.bind_addr)
-            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
+            .or(file.bind_addr);
+        let bind_addr_explicit = chosen_bind.is_some();
+        let bind_addr_str = chosen_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
         let bind_addr: IpAddr = bind_addr_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
@@ -641,6 +644,7 @@ impl Config {
             cache_dir,
             web_dir,
             bind_addr,
+            bind_addr_explicit,
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
             provider_endpoints: ProviderEndpoints::default(),
             port,
@@ -782,6 +786,7 @@ impl Config {
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
+            bind_addr_explicit: true,
             discovery_bind_addr: None,
             provider_endpoints: ProviderEndpoints::default(),
             port: 0,

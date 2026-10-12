@@ -176,3 +176,86 @@ mod quota_tests {
         assert!(send(&http, &other.base_url).await.is_ok());
     }
 }
+
+/// Recognizes JPEG, PNG, GIF and WebP magic before persisting plugin artwork.
+/// This identifies the file format; image processing validates its dimensions.
+#[must_use]
+pub fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Successful automatic image download, with enough information to avoid
+/// duplicates and preserve the response's actual image format.
+#[derive(Debug)]
+pub struct ArtworkDownload {
+    /// Complete response body.
+    pub bytes: Vec<u8>,
+    /// Resolved image media type.
+    pub content_type: String,
+    /// Reported body length, for Jellyfin's backdrop duplicate check.
+    pub content_length: Option<u64>,
+}
+
+/// How automatic acquisition handles a failed candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkDownloadFailure {
+    /// A stale/forbidden URL: try the next candidate from this provider.
+    Skip,
+    /// Transport or another HTTP error: stop this provider's image-type pass.
+    Stop,
+}
+
+pub(crate) async fn download_artwork(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
+    let response = send(http, url)
+        .await
+        .map_err(|_| ArtworkDownloadFailure::Stop)?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => {
+            return Err(ArtworkDownloadFailure::Skip);
+        }
+        status if !status.is_success() => return Err(ArtworkDownloadFailure::Stop),
+        _ => {}
+    }
+    let declared = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|header| header.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty());
+    let content_type = resolve_content_type(declared.as_deref(), url);
+    if let Some(reason) = non_image_reason(&content_type) {
+        crate::rate_limit::note_request_failure();
+        tracing::warn!(%reason, "artwork provider returned a non-image response");
+        return Err(ArtworkDownloadFailure::Stop);
+    }
+    let content_length = response.content_length();
+    let bytes = response
+        .counted_bytes()
+        .await
+        .map_err(|_| ArtworkDownloadFailure::Stop)?;
+    Ok(ArtworkDownload {
+        bytes,
+        content_type,
+        content_length,
+    })
+}

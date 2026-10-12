@@ -31,6 +31,16 @@ pub trait LyricManager: Send + Sync {
     /// Searches remote providers for lyrics matching an audio item.
     async fn search_lyrics(&self, item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError>;
 
+    /// Searches for a scheduled lyric download using the owning library's
+    /// selected providers and order. Manual searches remain unrestricted.
+    /// Existing implementations inherit their ordinary search behavior.
+    async fn search_lyrics_automatically(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        self.search_lyrics(item_id).await
+    }
+
     /// Downloads a remote lyric by id and attaches it to the audio item.
     async fn download_lyrics(
         &self,
@@ -106,6 +116,11 @@ pub struct RemoteLyricInfo {
 pub trait LyricProvider: Send + Sync {
     /// The provider's stable display name (e.g. `LrcLib`).
     fn name(&self) -> &'static str;
+
+    /// Default search priority, matching Jellyfin IHasOrder (zero when absent).
+    fn order(&self) -> i32 {
+        0
+    }
 
     /// Searches this provider for lyrics matching `request` (song name /
     /// artists / album / duration). Ids in the results are provider-local.

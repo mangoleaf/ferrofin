@@ -101,7 +101,12 @@ impl AuthService for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -116,7 +121,12 @@ impl AuthorizationContext for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -226,7 +236,15 @@ fn static_source(path: &str) -> MediaSourceInfo {
     MediaSourceInfo {
         id: Some(ITEM_ID.to_string()),
         path: Some(path.to_owned()),
-        protocol: MediaProtocol::File,
+        // A remote target (a `.strm` shortcut's) is read over its own protocol.
+        protocol: if path.starts_with("http") {
+            MediaProtocol::Http
+        } else if path.starts_with("rtsp") {
+            MediaProtocol::Rtsp
+        } else {
+            MediaProtocol::File
+        },
+        is_remote: !path.starts_with('/'),
         type_: MediaSourceType::Default,
         supports_direct_play: true,
         supports_direct_stream: true,
@@ -693,7 +711,10 @@ async fn video_stream_serves_file() {
     let app = state(&path, no_subtitles()).app;
     let router = create_router(app);
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -709,7 +730,10 @@ async fn video_stream_serves_full_body() {
     let path = media.path.clone();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -727,7 +751,7 @@ async fn video_stream_range_request_is_206_with_content_range() {
     let response = router
         .oneshot(
             Request::builder()
-                .uri(format!("/Videos/{ITEM_ID}/stream"))
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
                 .header("Authorization", "Bearer token")
                 .header(header::RANGE, "bytes=2-5")
                 .body(Body::empty())
@@ -760,10 +784,101 @@ async fn video_stream_missing_file_is_404() {
     let path = path.to_string_lossy().into_owned();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Serves `contents` over HTTP on a loopback port, with `Range` support (the
+/// remote origin a `.strm` shortcut points at), and returns its URL.
+async fn remote_origin(contents: &'static [u8]) -> String {
+    use tower_http::services::ServeFile;
+    let dir = std::env::temp_dir().join(format!("ferrofin-origin-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("movie.mkv");
+    std::fs::write(&file, contents).unwrap();
+    let app = axum::Router::new().route_service("/movie.mkv", ServeFile::new(file));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}/movie.mkv")
+}
+
+/// `GetStaticRemoteStreamResult`: a static stream of a source the item takes
+/// from a remote HTTP target is relayed from it — whole, and with the client's
+/// `Range` forwarded so the answer is the upstream's `206` and `Content-Range`.
+#[tokio::test]
+async fn a_static_remote_stream_is_relayed_with_its_range() {
+    let url = remote_origin(b"0123456789").await;
+    let router = create_router(state(&url, no_subtitles()).app);
+    let whole = router
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(whole.status(), StatusCode::OK);
+    assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(whole.headers()[header::CONTENT_LENGTH], "10");
+    let bytes = axum::body::to_bytes(whole.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"0123456789");
+
+    let part = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
+                .header("Authorization", "Bearer token")
+                .header(header::RANGE, "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+    let bytes = axum::body::to_bytes(part.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"2345");
+}
+
+/// Only an HTTP target is relayed: any other non-file protocol is
+/// `400 Input protocol … cannot be streamed statically`, and an origin that
+/// cannot be reached is a server error, not a file `404`.
+#[tokio::test]
+async fn a_static_stream_of_another_protocol_is_refused_and_a_dead_origin_fails() {
+    let rtsp = create_router(state("rtsp://camera/feed", no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rtsp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing listens on this port any more.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/movie.mkv", listener.local_addr().unwrap())
+    };
+    let down = create_router(state(&dead, no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 // ---- Version-group management ----------------------------------------------

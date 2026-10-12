@@ -67,6 +67,7 @@ async fn wasm_plugin_surfaces_on_plugins_api_and_its_task_runs() {
         .expect("open db");
     db.run_migrations().await.expect("migrations");
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -376,6 +377,7 @@ async fn repository_install_stages_plugin_and_flags_restart() {
         .expect("open db");
     db.run_migrations().await.expect("migrations");
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),

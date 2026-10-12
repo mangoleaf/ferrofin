@@ -157,6 +157,16 @@ fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
     }
 }
 
+fn season_entity(id: Uuid, number: i64) -> BaseItemEntity {
+    let mut season = item_entity(id, &format!("Season {number}"), "Season");
+    season.index_number = Some(number);
+    season.series_id = Some(Uuid::nil().to_string());
+    season.parent_id = Some(SERIES_ID.to_string());
+    season.series_presentation_unique_key = Some("key-The Series".to_owned());
+    season.path = Some(format!("/media/season{number}"));
+    season
+}
+
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
 struct OkAuth;
 
@@ -360,7 +370,7 @@ impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(match id {
             _ if id == SERIES_ID => Some(item_entity(SERIES_ID, "The Series", "Series")),
-            _ if id == SEASON_ID => Some(item_entity(SEASON_ID, "Season 1", "Season")),
+            _ if id == SEASON_ID => Some(season_entity(SEASON_ID, 1)),
             _ => None,
         })
     }
@@ -369,20 +379,31 @@ impl LibraryManager for StubLibrary {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use ferrofin_model::data::BaseItemKind;
+        let mut items = Vec::new();
         if query.include_item_types.contains(&BaseItemKind::Season) {
-            Ok(vec![
-                item_entity(Uuid::from_u128(0x01), "Season 1", "Season"),
-                item_entity(Uuid::from_u128(0x02), "Season 2", "Season"),
-            ])
-        } else {
-            // Episodes (or the Upcoming episode query).
-            Ok(vec![
-                item_entity(Uuid::from_u128(0xE1), "Episode 1", "Episode"),
-                item_entity(Uuid::from_u128(0xE2), "Episode 2", "Episode"),
-                item_entity(Uuid::from_u128(0xE3), "Episode 3", "Episode"),
-            ])
+            items.extend([
+                season_entity(SEASON_ID, 1),
+                season_entity(Uuid::from_u128(0x02), 2),
+            ]);
         }
+        if query.include_item_types.contains(&BaseItemKind::Episode) {
+            items.extend((1..=3).map(|index| {
+                let mut item = item_entity(
+                    Uuid::from_u128(0xE0 + index),
+                    &format!("Episode {index}"),
+                    "Episode",
+                );
+                item.parent_index_number = Some(1);
+                item.index_number = Some(i64::try_from(index).unwrap());
+                item.season_id = Some(Uuid::nil().to_string());
+                item.parent_id = Some(SERIES_ID.to_string());
+                item.path = Some(format!("/media/episode{index}.mkv"));
+                item
+            }));
+        }
+        Ok(items)
     }
+
     async fn query_items(
         &self,
         _q: &InternalItemsQuery,
@@ -713,6 +734,52 @@ async fn similar_rows_always_carry_provider_ids() {
             result.items.iter().all(|i| i.provider_ids.is_some()),
             "{path}: {body:?}",
             body = String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_season_number_has_no_episodes_and_existing_number_resolves_its_season() {
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=99")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert!(result.items.is_empty());
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=1")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.items.len(), 3);
+}
+
+#[tokio::test]
+async fn episode_adjacency_is_applied_after_start_filter_before_paging() {
+    let middle = Uuid::from_u128(0xE2);
+    let (_, body) = get(&format!(
+        "/Shows/{SERIES_ID}/Episodes?season=1&adjacentTo={middle}&startIndex=1&limit=1"
+    ))
+    .await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.total_record_count, 3);
+    assert_eq!(result.items[0].id, middle);
+    let absent = Uuid::new_v4();
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?adjacentTo={absent}")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert!(result.items.is_empty());
+}
+
+#[tokio::test]
+async fn nil_episode_adjacency_is_ignored_and_empty_relation_ids_use_the_actual_parent() {
+    for suffix in [
+        format!("season=1&adjacentTo={}", Uuid::nil()),
+        format!("seasonId={SEASON_ID}&adjacentTo={}", Uuid::nil()),
+    ] {
+        let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?{suffix}")).await;
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.total_record_count, 3);
+        assert_eq!(
+            result.items.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [
+                Uuid::from_u128(0xE1),
+                Uuid::from_u128(0xE2),
+                Uuid::from_u128(0xE3)
+            ]
         );
     }
 }

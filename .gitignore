@@ -50,5 +50,7 @@ adoption/fixtures/
 **/*.boot.log
 **/*.boot2.log
 **/*.server.log
+# ffmpeg stderr logs a transcode writes (FFmpeg.Transcode-*.log, FFmpeg.Remux-*.log, …)
+**/FFmpeg.*.log
 **/*.smoke.txt
 **/*.smoke2.txt

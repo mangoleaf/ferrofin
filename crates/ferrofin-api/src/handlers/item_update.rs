@@ -20,10 +20,8 @@
 //! episodes, an album's onto its tracks (each child's own `LockedFields`
 //! honoured), and a change of `LockData` onto every descendant of a folder.
 //!
-//! TODO(parity, open work item): two parts of `UpdateItem` are not ported
-//! yet — the `request.People` write (`_libraryManager.UpdatePeople`) and the
-//! `FullRefresh`/`ReplaceAllMetadata` refresh queued when a series'
-//! `DisplayOrder` changes (`ItemUpdateController.cs:83-86,120-132`).
+//! TODO(parity, open work item): one part of `UpdateItem` is not ported yet —
+//! the `request.People` write (`_libraryManager.UpdatePeople`).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -77,6 +75,13 @@ pub(crate) async fn update_item(
     // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
     let lock_changed = item.is_locked != request.lock_data.unwrap_or(false);
     let current_tags = split_list(item.tags.as_deref());
+    // `displayOrderChanged`: only a series, compared case-insensitively with
+    // null as empty (`ItemUpdateController.cs:83-86`).
+    let series_display_order_changed = BaseItemKind::from_stored_type_name(&item.type_)
+        == Some(BaseItemKind::Series)
+        && !stored_display_order(&item)
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(request.display_order.as_deref().unwrap_or_default());
     // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
@@ -113,6 +118,18 @@ pub(crate) async fn update_item(
             .await?;
     }
     cascade_to_children(&state, &item, &request, &current_tags).await?;
+    // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
+    // ReplaceAllMetadata, High)` (`:120-132`): the episodes are renumbered under
+    // the new order.
+    if series_display_order_changed {
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::FullRefresh,
+            replace_all_metadata: true,
+            ..MetadataRefreshOptions::default()
+        };
+        queue_item_refresh(&state, &item, item_id, &options).await?;
+    }
     // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
     // new lock (`ItemUpdateController.cs:104-113`).
     if lock_changed && item.is_folder {
@@ -121,7 +138,22 @@ pub(crate) async fn update_item(
             child.is_locked = item.is_locked;
         }
         state.library.update_items(&descendants, None).await?;
+        for child in &descendants {
+            if let Ok(id) = Uuid::parse_str(&child.id) {
+                state
+                    .providers
+                    .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+                    .await?;
+            }
+        }
     }
+    state
+        .providers
+        .save_metadata(
+            item_id,
+            ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -205,6 +237,10 @@ pub(crate) struct UpdateItemRequest {
     /// would reject bodies Ferrofin's contract accepts.
     #[serde(default)]
     provider_ids: Option<std::collections::HashMap<String, String>>,
+    /// `IHasDisplayOrder.DisplayOrder` — a series' episode ordering, a box
+    /// set's member ordering — assigned as sent, a null clearing it.
+    #[serde(default)]
+    display_order: Option<String>,
 }
 
 /// Deserializes `LockedFields` the way `JsonStringEnumConverter` reads an
@@ -277,6 +313,16 @@ fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
         .clone_from(&request.preferred_metadata_language);
     item.is_locked = request.lock_data.unwrap_or(false);
 
+    // `if (item is IHasDisplayOrder hasDisplayOrder) hasDisplayOrder.DisplayOrder
+    // = request.DisplayOrder` (`ItemUpdateController.cs:412-415`): kept in the
+    // row's `Data`, where the series and the box set read it from.
+    if matches!(
+        BaseItemKind::from_stored_type_name(&item.type_),
+        Some(BaseItemKind::Series | BaseItemKind::BoxSet)
+    ) {
+        set_stored_display_order(item, request.display_order.as_deref());
+    }
+
     if let Some(album) = &request.album {
         item.album = Some(album.clone());
     }
@@ -294,6 +340,36 @@ fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
             .collect::<Vec<_>>();
         item.album_artists = Some(join_distinct(&names));
     }
+}
+
+/// The `DisplayOrder` kept in the row's `Data`, if any.
+fn stored_display_order(item: &BaseItemEntity) -> Option<String> {
+    item.data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("DisplayOrder")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Stores `order` as the row's `DisplayOrder` in its `Data`; `None` removes it.
+fn set_stored_display_order(item: &mut BaseItemEntity, order: Option<&str>) {
+    let mut data: serde_json::Map<String, serde_json::Value> = item
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_default();
+    match order {
+        Some(order) => {
+            data.insert("DisplayOrder".to_owned(), order.into());
+        }
+        None => {
+            data.remove("DisplayOrder");
+        }
+    }
+    item.data = (!data.is_empty()).then(|| serde_json::Value::Object(data).to_string());
 }
 
 /// `Folder.GetRecursiveChildren()` (`Folder.cs:1627-1682`): every physical
@@ -496,6 +572,12 @@ async fn cascade_to_children(
         cascade_onto(child, locked, official_rating, custom_rating, &tags);
     }
     state.library.update_items(&children, None).await?;
+    for id in ids {
+        state
+            .providers
+            .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .await?;
+    }
     Ok(())
 }
 
@@ -873,23 +955,32 @@ async fn refresh_item(
     // merge, with the probe (upstream probes inside `RefreshMetadata`, so a
     // "Search for missing metadata" re-probes the file and a Default refresh
     // of an unchanged one does not), the NFO and every metadata provider.
-    let route = refresh_route(&state, &item, item_id).await?;
-    if let Some(target) = route.scan {
-        state.library.queue_refresh_scan(target, &options).await?;
-    }
-    if !route.item {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-
-    // An item with no file of its own — a box set, a playlist, a view, a
-    // virtual season, a person, a by-name artist — refreshes through the
-    // provider queue: the enqueue spawns the refresh and this request 204s
-    // immediately, like the C# queued refresh.
-    state
-        .providers
-        .queue_refresh(item_id, &options, RefreshPriority::High)
-        .await?;
+    queue_item_refresh(&state, &item, item_id, &options).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Queues the refresh `options` ask of `item`: the scan that covers it (a
+/// folder's subtree, a file's own path), and for an item with no file of its
+/// own — a box set, a playlist, a view, a virtual season, a person, a by-name
+/// artist — the provider queue, which spawns the refresh and returns at once,
+/// like the C# queued refresh.
+async fn queue_item_refresh(
+    state: &AppState,
+    item: &BaseItemEntity,
+    item_id: Uuid,
+    options: &MetadataRefreshOptions,
+) -> Result<(), ApiError> {
+    let route = refresh_route(state, item, item_id).await?;
+    if let Some(target) = route.scan {
+        state.library.queue_refresh_scan(target, options).await?;
+    }
+    if route.item {
+        state
+            .providers
+            .queue_refresh(item_id, options, RefreshPriority::High)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Registers the item-refresh + content-type routes.

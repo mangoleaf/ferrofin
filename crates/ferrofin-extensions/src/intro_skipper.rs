@@ -10,10 +10,12 @@
 //! what makes jellyfin-web show the "Skip Intro" / "Skip Credits" button.
 //!
 //! It surfaces on `/Plugins` as "Intro Skipper"; its analysis runs as the
-//! `IntroSkipperDetectSegmentsTask` scheduled task and as the provider behind the
-//! "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`). The task
-//! self-gates on the plugin's enabled flag; without a Chromaprint backend it
-//! warns and runs the analyzers that do not need one.
+//! `IntroSkipperDetectSegmentsTask` scheduled task and, before the providers,
+//! in the "Media Segment Scan" dashboard task (`TaskExtractMediaSegments`,
+//! D5); its registered segment provider serves the stored segments to that
+//! scan, as the plugin's `SegmentProvider` does. The task self-gates on the
+//! plugin's enabled flag; without a Chromaprint backend it warns and runs the
+//! analyzers that do not need one.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -23,13 +25,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use ferrofin_chromaprint::AnalysisMode;
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
+use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentGenerationRequest};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{
     self as intro_store, IntroSkipperAnalysis, IntroSkipperSettings,
 };
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
-use ferrofin_traits::media_segments::MediaSegmentManager;
+use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -124,9 +129,60 @@ impl Extension for IntroSkipperExtension {
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
             Arc::new(MediaSegmentScanTask {
                 detect: Arc::clone(&detect),
+                providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+                    Arc::clone(&cx.library),
+                    Arc::clone(&cx.media_segments),
+                ),
             }),
             Arc::new(CleanCacheTask { detect }),
         ]
+    }
+
+    fn media_segment_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn MediaSegmentProvider>> {
+        vec![Arc::new(SegmentProvider {
+            plugins: Arc::clone(&cx.plugins),
+            store: Arc::clone(&cx.intro_skipper),
+        })]
+    }
+}
+
+/// The plugin's `SegmentProvider`: what the plugin's store holds for an
+/// episode or movie, none for an excluded episode
+/// ([`intro_store::published`]). The core "Media Segment Scan" runs it over
+/// the library; it analyses nothing.
+struct SegmentProvider {
+    plugins: Arc<dyn PluginManager>,
+    store: Arc<dyn intro_store::IntroSkipperStore>,
+}
+
+#[async_trait]
+impl MediaSegmentProvider for SegmentProvider {
+    fn name(&self) -> &str {
+        intro_store::PROVIDER_NAME
+    }
+    /// The namespace segments were written under before the provider id.
+    fn legacy_ids(&self) -> Vec<String> {
+        vec!["IntroSkipper".to_owned()]
+    }
+    async fn supports(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        if !matches!(
+            queue::kind(item),
+            Some(BaseItemKind::Episode | BaseItemKind::Movie)
+        ) {
+            return Ok(false);
+        }
+        Ok(self
+            .plugins
+            .get_plugin(EXTENSION_ID)
+            .await?
+            .is_some_and(|plugin| plugin.enabled))
+    }
+    async fn get_segments(
+        &self,
+        request: &MediaSegmentGenerationRequest,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        let stored = self.store.segments_unless_excluded(request.item_id).await?;
+        Ok(intro_store::published(request.item_id, &stored))
     }
 }
 
@@ -140,7 +196,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
         plugins: Arc::clone(&cx.plugins),
         fingerprinter: cx.fingerprinter.clone(),
         ffmpeg: Arc::clone(&cx.ffmpeg),
-        cache_dir: cx.cache_dir.join("introskipper"),
+        cache_dir: cx.cache_dir.child("introskipper"),
         running: Arc::clone(&cx.intro_skipper_runtime.running),
         runtime: Arc::clone(&cx.intro_skipper_runtime),
         actions: Arc::clone(&cx.intro_skipper),
@@ -283,49 +339,37 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
     }
 }
 
-/// The "Media Segment Scan" task — port of Jellyfin's
-/// `MediaSegmentExtractionTask` (`TaskExtractMediaSegments`), which runs every
-/// media-segment provider over the library. Ferrofin's one segment provider is
-/// the Intro Skipper, so the scan drives the same detection pass as
-/// [`DetectSegmentsTask`] (which self-gates on the plugin's enabled flag, the
-/// `fpcalc` binary, and its one-pass-at-a-time latch; re-runs replace only the
-/// provider's own segments and reuse the on-disk fingerprint cache).
+/// The "Media Segment Scan" task (`TaskExtractMediaSegments`), which this
+/// extension registers in place of the core one while it is loaded: the
+/// detection pass first (owner decision D5: the scan keeps running
+/// detection), then the core `MediaSegmentExtractionTask`, which runs every
+/// registered segment provider — this plugin's [`SegmentProvider`], which
+/// publishes what detection stored, and any other — over the library.
 struct MediaSegmentScanTask {
     detect: Arc<DetectSegmentsTask>,
+    providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask,
 }
 
-#[allow(clippy::unnecessary_literal_bound)]
 #[async_trait]
 impl ScheduledTask for MediaSegmentScanTask {
     fn key(&self) -> &str {
-        "TaskExtractMediaSegments"
+        self.providers.key()
     }
     fn name(&self) -> &str {
-        "Media Segment Scan"
+        self.providers.name()
     }
     fn description(&self) -> &str {
-        "Extracts or obtains media segments from MediaSegment enabled plugins."
+        self.providers.description()
     }
     fn category(&self) -> &str {
-        "Library"
+        self.providers.category()
     }
     fn default_triggers(&self) -> Vec<ferrofin_model::tasks::TaskTriggerInfo> {
-        vec![ferrofin_model::tasks::TaskTriggerInfo {
-            type_: ferrofin_model::tasks::TaskTriggerInfoType::IntervalTrigger,
-            interval_ticks: Some(12 * 3600 * 10_000_000),
-            ..ferrofin_model::tasks::TaskTriggerInfo::default()
-        }]
+        self.providers.default_triggers()
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         self.detect.execute(progress).await?;
-        // Upstream this task runs the plugin's `SegmentProvider`, which
-        // publishes the stored segments whatever `UpdateMediaSegments` says;
-        // detection here publishes only when it is on, so the scan publishes
-        // the rest itself.
-        if self.detect.enabled().await && !self.detect.load_config().await.update_media_segments {
-            self.detect.publish_stored().await;
-        }
-        Ok(())
+        self.providers.execute(progress).await
     }
 }
 
@@ -663,7 +707,7 @@ struct DetectSegmentsTask {
     fingerprinter: Option<Arc<dyn Fingerprinter>>,
     /// Silence and keyframe detection, the audio duration probe.
     ffmpeg: Arc<dyn FfmpegService>,
-    cache_dir: PathBuf,
+    cache_dir: ferrofin_util::directory_path::DirectoryPath,
     /// `true` while an analysis pass is running (the runtime's latch).
     running: Arc<AtomicBool>,
     /// The shared run state.
@@ -911,7 +955,7 @@ impl DetectSegmentsTask {
         live: &HashSet<Uuid>,
         config: &IntroSkipperConfig,
     ) -> u64 {
-        let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
+        let mut entries = match tokio::fs::read_dir(self.cache_dir.resolve()).await {
             Ok(entries) => entries,
             Err(err) => {
                 tracing::debug!(%err, "intro skipper: no cache to clean");
@@ -938,44 +982,6 @@ impl DetectSegmentsTask {
             }
         }
         removed
-    }
-
-    /// Publishes the stored segments of every item the Media Segment Scan
-    /// covers (the plugin's `SegmentProvider` as `MediaSegmentExtractionTask`
-    /// runs it over the library's items, [`queue::publishable`]), logging a
-    /// failed item and going on. A stored item no longer in the library —
-    /// deleted, or in a library that disables the plugin — is not published:
-    /// upstream's scan only walks the library.
-    async fn publish_stored(&self) {
-        let stored = match self.actions.stored_item_ids().await {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::error!(%err, "intro skipper: could not list stored segments to publish");
-                return;
-            }
-        };
-        let folders = match self.virtual_folders.get_virtual_folders().await {
-            Ok(folders) => folders,
-            Err(err) => {
-                tracing::error!(%err, "intro skipper: could not read the libraries to publish");
-                return;
-            }
-        };
-        let live = match queue::publishable(self.library.as_ref(), &folders, &stored).await {
-            Ok(live) => live,
-            Err(err) => {
-                tracing::error!(%err, "intro skipper: could not read the items to publish");
-                return;
-            }
-        };
-        for item_id in stored.into_iter().filter(|id| live.contains(id)) {
-            if let Err(err) =
-                intro_store::refresh(self.actions.as_ref(), self.media_segments.as_ref(), item_id)
-                    .await
-            {
-                tracing::error!(%err, %item_id, "intro skipper: publishing media segments failed");
-            }
-        }
     }
 
     /// `ScanSeason`'s background body: `EraseSeasonAsync(eraseCache: true)`
@@ -1054,7 +1060,7 @@ impl DetectSegmentsTask {
             Some(WireMode::Commercial) => Some(&["commercial"]),
             Some(WireMode::Unrecognized(_)) => return Ok(0),
         };
-        let mut entries = match tokio::fs::read_dir(&self.cache_dir).await {
+        let mut entries = match tokio::fs::read_dir(self.cache_dir.resolve()).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(err) => return Err(ServiceError::backend(err.to_string())),
@@ -1157,7 +1163,7 @@ impl DetectSegmentsTask {
             .fingerprint(&entry.path, start, end, options)
             .await?;
         if config.cache_fingerprints {
-            let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
+            let _ = tokio::fs::create_dir_all(self.cache_dir.resolve()).await;
             let _ = tokio::fs::write(&cache, encode_points(&points)).await;
         }
         Ok(points)
@@ -1193,7 +1199,7 @@ impl DetectSegmentsTask {
         }
         let found = detect.await?;
         if enabled && let Ok(bytes) = serde_json::to_vec(&found) {
-            let _ = tokio::fs::create_dir_all(&self.cache_dir).await;
+            let _ = tokio::fs::create_dir_all(self.cache_dir.resolve()).await;
             let _ = tokio::fs::write(&cache, bytes).await;
         }
         Ok(found)
@@ -1698,6 +1704,8 @@ mod tests {
                 id: guid_to_db(*id),
                 type_: type_name.to_owned(),
                 path: Some(real(path)),
+                // As a scan stores a video (the Media Segment Scan reads it).
+                media_type: Some("Video".to_owned()),
                 // Episodes of SEASON, in order.
                 parent_id: Some(guid_to_db(SEASON)),
                 index_number: Some(index),
@@ -1744,7 +1752,7 @@ mod tests {
                 }),
                 fingerprinter,
                 ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
-                cache_dir: cache.path().join("introskipper"),
+                cache_dir: cache.path().join("introskipper").into(),
                 running: Arc::clone(&runtime.running),
                 runtime: Arc::clone(&runtime),
                 virtual_folders: Arc::new(MediaLibrary(media.to_string_lossy().into_owned())),
@@ -2021,17 +2029,57 @@ mod tests {
             intros_of(&h.segments, EP_A).await.is_empty(),
             "not published yet"
         );
-        let scan = MediaSegmentScanTask {
-            detect: Arc::new(h.task.clone()),
-        };
-        scan.execute(&TaskProgress::default()).await.expect("scan");
+        register_provider(&h);
+        scan_task(&h)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("scan");
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
         assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
     }
 
+    /// The Media Segment Scan the extension registers (D5), over `h`.
+    fn scan_task(h: &Harness) -> MediaSegmentScanTask {
+        MediaSegmentScanTask {
+            detect: Arc::new(h.task.clone()),
+            providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+                Arc::clone(&h.task.library),
+                Arc::clone(&h.segments),
+            ),
+        }
+    }
+
+    /// The Media Segment Scan keeps upstream's identity and runs detection
+    /// before the providers (D5): a scan alone detects and publishes.
+    #[tokio::test]
+    async fn media_segment_scan_task_drives_the_same_detection() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        register_provider(&h);
+        let scan = scan_task(&h);
+        assert_eq!(scan.key(), "TaskExtractMediaSegments");
+        assert_eq!(scan.name(), "Media Segment Scan");
+        assert!(!scan.description().is_empty());
+        assert_eq!(scan.category(), "Library");
+        let triggers = scan.default_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].interval_ticks, Some(12 * 3600 * 10_000_000));
+
+        scan.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// Registers the plugin's `SegmentProvider` with the harness's manager.
+    fn register_provider(h: &Harness) {
+        h.segments
+            .register_segment_provider(Arc::new(SegmentProvider {
+                plugins: Arc::clone(&h.task.plugins),
+                store: Arc::clone(&h.task.actions),
+            }));
+    }
+
     /// The cache files a detection run left behind for `id`.
     pub(super) fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
-        std::fs::read_dir(&h.task.cache_dir)
+        std::fs::read_dir(h.task.cache_dir.resolve())
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -3351,7 +3399,7 @@ mod tests {
             .set_episode_ids(vanished, WireMode::Introduction, &[gone], "H")
             .await
             .expect("stale state");
-        let dir = &h.task.cache_dir;
+        let dir = &h.task.cache_dir.resolve();
         let stale_files = [
             format!("{gone}.intro2.0-450.fp"),
             format!("{EP_A}.intro.0-450.fp"),
@@ -3506,130 +3554,63 @@ mod tests {
         assert!(h.calls.load(Ordering::SeqCst) > cached, "re-fingerprinted");
     }
 
-    // ---- the Media Segment Scan task ---------------------------------------
-
+    /// The plugin's `SegmentProvider`: an episode or movie while the plugin
+    /// is enabled, and what the store holds for it — nothing for an excluded
+    /// episode.
     #[tokio::test]
-    async fn media_segment_scan_task_drives_the_same_detection() {
+    async fn the_segment_provider_serves_the_store() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
-        let scan = MediaSegmentScanTask {
-            detect: Arc::new(h.task.clone()),
-        };
-        assert_eq!(scan.key(), "TaskExtractMediaSegments");
-        assert_eq!(scan.name(), "Media Segment Scan");
-        assert!(!scan.description().is_empty());
-        assert_eq!(scan.category(), "Library");
-        let triggers = scan.default_triggers();
-        assert_eq!(triggers.len(), 1);
-        assert_eq!(triggers[0].interval_ticks, Some(12 * 3600 * 10_000_000));
-
-        scan.execute(&TaskProgress::default()).await.expect("run");
-        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
-    }
-
-    /// With `UpdateMediaSegments` off the scan publishes the stored segments
-    /// itself, for the items Jellyfin's `MediaSegmentExtractionTask` walks —
-    /// the library's: a deleted episode's segments, which the plugin keeps
-    /// (its `OnItemRemoved` drops only the detection cache), are not
-    /// published again; a live episode's missing ones are.
-    #[tokio::test]
-    async fn the_scan_does_not_republish_a_deleted_item() {
-        let h = harness(&THREE_EPISODES, true, "{}", true).await;
         h.task
             .execute(&TaskProgress::default())
             .await
             .expect("detect");
-        let (live, gone) = (THREE_EPISODES[0].0, THREE_EPISODES[2].0);
-        assert_eq!(intros_of(&h.segments, gone).await.len(), 1);
-        intro_store::remove_published(h.segments.as_ref(), live)
+        let provider = SegmentProvider {
+            plugins: Arc::clone(&h.task.plugins),
+            store: Arc::clone(&h.task.actions),
+        };
+        assert_eq!(provider.name(), "Intro Skipper");
+        let episode = h
+            .task
+            .library
+            .get_item_by_id(EP_A)
             .await
-            .expect("unpublish");
-        assert!(intros_of(&h.segments, live).await.is_empty());
-        h.persistence.delete_items(&[gone]).await.expect("delete");
+            .expect("read")
+            .expect("episode");
+        assert!(provider.supports(&episode).await.expect("supports"));
+        let season = BaseItemEntity {
+            type_: ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Season)
+                .expect("stored type name")
+                .to_owned(),
+            ..episode.clone()
+        };
+        assert!(!provider.supports(&season).await.expect("supports"));
+        let request = |item_id| MediaSegmentGenerationRequest {
+            item_id,
+            ..MediaSegmentGenerationRequest::default()
+        };
+        let served = provider.get_segments(&request(EP_A)).await.expect("get");
         assert!(
-            intros_of(&h.segments, gone).await.is_empty(),
-            "the delete takes the published segments"
+            served.iter().any(|s| s.type_ == MediaSegmentType::Intro),
+            "{served:?}"
+        );
+        h.actions
+            .set_excluded(SEASON, EP_A, true)
+            .await
+            .expect("exclude");
+        assert!(
+            provider
+                .get_segments(&request(EP_A))
+                .await
+                .expect("get")
+                .is_empty()
         );
 
-        let scan = MediaSegmentScanTask {
-            detect: Arc::new(configured(&h, r#"{"UpdateMediaSegments":false}"#)),
+        let disabled = harness(&TWO_EPISODES, false, "{}", true).await;
+        let provider = SegmentProvider {
+            plugins: Arc::clone(&disabled.task.plugins),
+            store: Arc::clone(&disabled.task.actions),
         };
-        scan.execute(&TaskProgress::default()).await.expect("scan");
-        assert!(intros_of(&h.segments, gone).await.is_empty());
-        assert_eq!(intros_of(&h.segments, live).await.len(), 1);
-        assert!(
-            !h.actions.segments(gone).await.expect("tier").is_empty(),
-            "the plugin's own rows stay, as upstream's, for its clean task"
-        );
-    }
-
-    /// The items the Media Segment Scan offers the plugin, as
-    /// `MediaSegmentExtractionTask` and `RunSegmentPluginProviders` pick
-    /// them: an alternate version too (`IncludeOwnedItems`), never a missing
-    /// file or a directory (a disc rip: `File.Exists` is false), never one in
-    /// a library whose `DisabledMediaSegmentProviders` names the plugin in
-    /// any case, and one under no library by the default options (enabled).
-    #[tokio::test]
-    async fn the_segment_scan_offers_what_upstreams_task_does() {
-        use ferrofin_model::entities_media::VirtualFolderInfo;
-        let h = harness(&TWO_EPISODES, true, "{}", true).await;
-        let media = h.cache.path().join("media");
-        let movie = ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Movie)
-            .expect("stored type name");
-        let file = |rel: &str| {
-            let path = media.join(rel);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-            std::fs::write(&path, b"").expect("file");
-            path.to_string_lossy().into_owned()
-        };
-        let rip = media.join("on/Rip (2001)");
-        std::fs::create_dir_all(rip.join("VIDEO_TS")).expect("rip");
-        let (primary, alternate, missing, ripped, off, loose) = (
-            Uuid::from_u128(0xB1),
-            Uuid::from_u128(0xB2),
-            Uuid::from_u128(0xB3),
-            Uuid::from_u128(0xB4),
-            Uuid::from_u128(0xB5),
-            Uuid::from_u128(0xB6),
-        );
-        let row = |id: Uuid, path: String| BaseItemEntity {
-            id: guid_to_db(id),
-            type_: movie.to_owned(),
-            path: Some(path),
-            ..BaseItemEntity::default()
-        };
-        let gone = file("on/Gone (2002).mkv");
-        let rows = vec![
-            row(primary, file("on/Film (2000)/Film - 2160p.mkv")),
-            BaseItemEntity {
-                owner_id: Some(guid_to_db(primary)),
-                primary_version_id: Some(guid_to_db(primary)),
-                ..row(alternate, file("on/Film (2000)/Film - 1080p.mkv"))
-            },
-            row(missing, gone.clone()),
-            row(ripped, rip.to_string_lossy().into_owned()),
-            row(off, file("off/Other (2003).mkv")),
-            row(loose, file("elsewhere/Loose (2004).mkv")),
-        ];
-        h.persistence.save_items(&rows).await.expect("seed");
-        std::fs::remove_file(&gone).expect("missing file");
-        let library = |location: &str, disabled: &[&str]| VirtualFolderInfo {
-            locations: vec![media.join(location).to_string_lossy().into_owned()],
-            library_options: Some(LibraryOptions {
-                disabled_media_segment_providers: disabled.iter().map(|&p| p.to_owned()).collect(),
-                ..LibraryOptions::default()
-            }),
-            ..VirtualFolderInfo::default()
-        };
-        let folders = [
-            library("on", &["Other"]),
-            library("off", &["intro SKIPPER"]),
-        ];
-        let ids = [primary, alternate, missing, ripped, off, loose];
-        let offered = queue::publishable(h.task.library.as_ref(), &folders, &ids)
-            .await
-            .expect("offered");
-        let expected: std::collections::HashSet<Uuid> = [primary, alternate, loose].into();
-        assert_eq!(offered, expected);
+        assert!(!provider.supports(&episode).await.expect("supports"));
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and

@@ -80,7 +80,7 @@ type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
 
 /// Maps an `ItemValues.Type` discriminant to the stored `BaseItems.Type` name of
 /// its browsable by-name item, or [`None`] for value types with no browse tab
-/// (tags, artists — handled elsewhere).
+/// (tags — handled elsewhere).
 ///
 /// Genre (2) is the one that needs a companion: Jellyfin keeps a **separate**
 /// `MusicGenre` item for the same value when the owner is a music item — one
@@ -88,7 +88,7 @@ type SeasonKeyRow = (String, Option<String>, Option<i64>, Option<String>);
 /// alone. See [`music_genre_row`], which materializes it.
 fn by_name_kind(value_type: i32) -> Option<BaseItemKind> {
     match value_type {
-        1 => Some(BaseItemKind::MusicArtist),
+        0 | 1 => Some(BaseItemKind::MusicArtist),
         2 => Some(BaseItemKind::Genre),
         3 => Some(BaseItemKind::Studio),
         _ => None,
@@ -111,12 +111,12 @@ fn by_name_value_type(kind: BaseItemKind) -> Option<i32> {
 /// The stored CLR type name of the row [`by_name_kind`] names.
 fn by_name_type_name(value_type: i32) -> Option<&'static str> {
     match value_type {
-        // AlbumArtist (1) is the canonical artist identity — it materializes the
-        // browsable MusicArtist item (so /Artists + /Artists/AlbumArtists resolve
-        // real rows and artist bio/artwork attaches, keyed on MusicBrainzAlbumArtist).
-        // Artist (0, track performer) stays an ItemValue for filtering only, so a
-        // name that is both doesn't produce two MusicArtist rows.
-        1 => stored_type_name(BaseItemKind::MusicArtist),
+        // Every artist name — AlbumArtist (1) and performer Artist (0) alike —
+        // materializes a browsable MusicArtist item, as the artists validator
+        // makes one for each of `GetAllArtistNames()`; the insert is guarded by
+        // type and clean name, so a name that is both has one row. The track's
+        // `ArtistItems` link to these items by clean name.
+        0 | 1 => stored_type_name(BaseItemKind::MusicArtist),
         2 => stored_type_name(BaseItemKind::Genre),
         3 => stored_type_name(BaseItemKind::Studio),
         _ => None,
@@ -961,7 +961,9 @@ impl FerrofinItemPersistenceService {
         // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
         // whole-value lookup first, unrated parts skipped, case-insensitive
         // tables), so the pass runs once more under a new key.
-        const META_KEY: &str = "rating_levels_v121";
+        // Earlier Ferrofin builds loaded only the US table. Re-run once with
+        // the complete upstream dataset so existing non-US rows are filtered.
+        const META_KEY: &str = "rating_levels_all_countries";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -3258,6 +3260,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let written = sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(item_id))
+            .bind(datetime_to_db(chrono::Utc::now()))
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?
+            .rows_affected()
+            > 0;
+        if written && let Some(changed) = self.changed.get() {
+            // `ItemUpdated`, as every other repository save announces it.
+            let item =
+                sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(item_id))
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .map_err(db_err)?;
+            if let Some(item) = item {
+                changed.record_updated(&[item]);
+            }
+        }
+        Ok(written)
+    }
+
     async fn never_refreshed_ids(
         &self,
         kind: BaseItemKind,
@@ -3444,30 +3470,91 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        index: usize,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::entities::ImageType;
+        if image.image_type != ImageType::Backdrop {
+            return self.set_item_image(item_id, image).await;
+        }
+        let item = guid_to_db(item_id);
+        let kind = image_type_to_disc(image.image_type);
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2 ORDER BY rowid"#,
+        ).bind(&item).bind(kind).fetch_all(&mut *tx).await.map_err(db_err)?;
+        if let Some(id) = rows.get(index) {
+            // UPDATE preserves both identity and insertion order of this slot.
+            sqlx::query(
+                r#"UPDATE "BaseItemImageInfos" SET "Path" = ?2, "Width" = ?3,
+                "Height" = ?4, "Blurhash" = ?5, "DateModified" = ?6 WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(&item)
+            .bind(kind)
+            .bind(&image.path)
+            .bind(i64::from(image.width))
+            .bind(i64::from(image.height))
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
+            .bind(datetime_to_db(image.date_modified))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn delete_item_image(
         &self,
         item_id: Uuid,
         image_type: ferrofin_model::entities::ImageType,
-        _index: Option<i32>,
+        index: Option<i32>,
     ) -> Result<Vec<String>, ServiceError> {
+        let index = index.unwrap_or(0);
+        // BaseItem.GetImageInfo uses ElementAtOrDefault: invalid slots do nothing.
+        if index < 0 {
+            return Ok(Vec::new());
+        }
         let item = guid_to_db(item_id);
         let disc = image_type_to_disc(image_type);
-        // Collect the on-disk paths before deleting so the caller can remove files.
-        let paths: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#,
+        // Select and remove one slot atomically on the writer. Insertion order
+        // matches get_image_infos, and RETURNING names only the deleted file.
+        sqlx::query_scalar(
+            r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = (
+                SELECT "Id" FROM "BaseItemImageInfos"
+                WHERE "ItemId" = ?1 AND "ImageType" = ?2
+                ORDER BY rowid LIMIT 1 OFFSET ?3
+            ) RETURNING "Path""#,
         )
         .bind(&item)
         .bind(disc)
-        .fetch_all(self.db.pool())
+        .bind(index)
+        .fetch_all(self.db.writer())
         .await
-        .map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 AND "ImageType" = ?2"#)
-            .bind(&item)
-            .bind(disc)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        Ok(paths)
+        .map_err(db_err)
     }
 
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
@@ -6214,6 +6301,194 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn indexed_image_deletion_preserves_siblings_and_compacts_slots() {
+        use ferrofin_model::entities::ImageType;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for id in [item, other] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        // Deliberately descending IDs: slots are insertion order, not GUID order.
+        for (id, owner, kind, path) in [
+            (9_u128, item, 2, "first.png"),
+            (8, item, 2, "middle.png"),
+            (7, item, 2, "last.png"),
+            (6, item, 0, "primary.png"),
+            (5, other, 2, "other.png"),
+            (4, item, 8, "screenshot-first.png"),
+            (3, item, 8, "screenshot-last.png"),
+        ] {
+            sqlx::query(r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height") VALUES (?1,?2,?3,?4,0,0)"#)
+                .bind(guid_to_db(Uuid::from_u128(id))).bind(guid_to_db(owner))
+                .bind(kind).bind(path).execute(db.writer()).await.unwrap();
+        }
+        for index in [-1, 3, i32::MAX] {
+            assert!(
+                store
+                    .delete_item_image(item, ImageType::Backdrop, Some(index))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, Some(1))
+                .await
+                .unwrap(),
+            ["middle.png"]
+        );
+        // The last image becomes index 1, retaining its row identity.
+        let remaining: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId"=?1 AND "ImageType"=2 ORDER BY rowid"#,
+        ).bind(guid_to_db(item)).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            remaining,
+            [
+                guid_to_db(Uuid::from_u128(9)),
+                guid_to_db(Uuid::from_u128(7))
+            ]
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, Some(1))
+                .await
+                .unwrap(),
+            ["last.png"]
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, None)
+                .await
+                .unwrap(),
+            ["first.png"]
+        );
+        assert!(
+            store
+                .delete_item_image(item, ImageType::Backdrop, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .delete_item_image(item, ImageType::Screenshot, Some(0))
+                .await
+                .unwrap(),
+            ["screenshot-first.png"]
+        );
+        let paths: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos" ORDER BY rowid"#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(paths, ["primary.png", "other.png", "screenshot-last.png"]);
+    }
+
+    #[tokio::test]
+    async fn indexed_screenshot_writes_replace_the_single_image() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::test_support::item_repository_over(db);
+        for (index, path) in [
+            (0, "first.png"),
+            (1, "second.png"),
+            (usize::MAX, "last.png"),
+        ] {
+            let image = ItemImageInfo {
+                image_type: ImageType::Screenshot,
+                path: path.to_owned(),
+                date_modified: chrono::Utc::now(),
+                width: 2,
+                height: 3,
+                blur_hash: None,
+            };
+            store
+                .set_item_image_at_index(item, &image, index)
+                .await
+                .unwrap();
+            let images = repo.get_image_infos(item).await.unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].path, path);
+            assert_eq!((images[0].width, images[0].height), (2, 3));
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_images_preserve_insertion_order_and_replacement_identity() {
+        use chrono::Utc;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        store
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(item),
+                type_: "MediaBrowser.Controller.Entities.Movie".into(),
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        // Reverse GUID order exposes a reader that confuses UUID sorting with slots.
+        for (id, path) in [(2_u128, "first.png"), (1, "second.png")] {
+            sqlx::query(r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height") VALUES (?1,?2,2,?3,0,0)"#)
+                .bind(guid_to_db(Uuid::from_u128(id))).bind(guid_to_db(item)).bind(path)
+                .execute(db.writer()).await.unwrap();
+        }
+        let repo = crate::test_support::item_repository_over(db.clone());
+        assert_eq!(
+            repo.get_image_infos(item)
+                .await
+                .unwrap()
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["first.png", "second.png"]
+        );
+        let image = |path: &str| ItemImageInfo {
+            path: path.into(),
+            image_type: ImageType::Backdrop,
+            date_modified: Utc::now(),
+            width: 3,
+            height: 4,
+            blur_hash: Some("hash".into()),
+        };
+        store
+            .set_item_image_at_index(item, &image("new-first.png"), 0)
+            .await
+            .unwrap();
+        store
+            .set_item_image_at_index(item, &image("third.png"), 2)
+            .await
+            .unwrap();
+        let images = repo.get_image_infos(item).await.unwrap();
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.path.as_str())
+                .collect::<Vec<_>>(),
+            ["new-first.png", "second.png", "third.png"]
+        );
+        assert_eq!((images[0].width, images[0].height), (3, 4));
+        let first_id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemImageInfos" WHERE "ItemId"=?1 AND "Path"='new-first.png'"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(first_id, guid_to_db(Uuid::from_u128(2)));
+    }
+
+    #[tokio::test]
     async fn retention_delete_resolves_keys_across_chunks_and_existing_placeholders() {
         let db = test_db().await;
         let user = Uuid::new_v4();
@@ -7243,9 +7518,9 @@ mod tests {
         assert_eq!(tags, 0, "tags are not browsable by-name items");
     }
 
-    // AlbumArtist (1) materializes a browsable MusicArtist row sharing the
-    // ItemValueId; Artist (0) stays a filter-only value (no MusicArtist row), so
-    // a name that is both does not produce a duplicate artist item.
+    // Every artist name — a performer (Artist, 0) and an album artist (1) alike —
+    // materializes one browsable MusicArtist row sharing an ItemValueId, so the
+    // track's `ArtistItems` can link to it; a name that is both has ONE row.
     #[tokio::test]
     async fn save_item_values_materializes_music_artist_items() {
         let db = test_db().await;
@@ -7265,8 +7540,7 @@ mod tests {
         .await
         .expect("save values");
 
-        // Exactly one MusicArtist row per distinct album-artist name, each id
-        // equal to its AlbumArtist ItemValueId. No row for the Artist-only name.
+        // Exactly one MusicArtist row per distinct artist name.
         let rows: Vec<(String, String)> = sqlx::query_as(
             r#"SELECT bi."Name", bi."Id"
                FROM "BaseItems" bi
@@ -7277,25 +7551,23 @@ mod tests {
         .await
         .expect("query artists");
         let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["Miles Davis", "Various Artists"]);
+        assert_eq!(
+            names,
+            vec!["John Coltrane", "Miles Davis", "Various Artists"]
+        );
         for (name, id) in &rows {
-            let value_id: String = sqlx::query_scalar(
-                r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = 1 AND "Value" = ?1"#,
+            // The id is the ItemValueId of whichever value of that name wrote
+            // the row first (the performer, for a name that is both).
+            let value_ids: Vec<String> = sqlx::query_scalar(
+                r#"SELECT "ItemValueId" FROM "ItemValues"
+                   WHERE "Type" IN (0, 1) AND "Value" = ?1"#,
             )
             .bind(name)
-            .fetch_one(db.pool())
+            .fetch_all(db.pool())
             .await
-            .expect("value id");
-            assert_eq!(id, &value_id, "artist item id is the AlbumArtist value id");
+            .expect("value ids");
+            assert!(value_ids.contains(id), "{name}: {id} not in {value_ids:?}");
         }
-        // The Artist-only performer got an ItemValue but no MusicArtist row.
-        let coltrane: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'John Coltrane'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("count");
-        assert_eq!(coltrane, 0);
     }
 
     /// The by-name materializer must be a NO-OP once the scanner has resolved a
@@ -9691,12 +9963,18 @@ mod tests {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let localization = crate::localization_manager::LocalizationManager::new("US");
-        let cases: [RatingCase; 5] = [
+        service
+            .mark_repair_done("rating_levels_v121")
+            .await
+            .unwrap();
+        let cases: [RatingCase; 7] = [
             (0x7A01, Some("12"), Some(12), None),
             (0x7A02, Some("TV-MA"), Some(17), Some(1)),
             (0x7A03, Some("Rated R"), Some(17), Some(0)),
             (0x7A04, Some("unknown-junk"), None, None),
             (0x7A05, None, None, None),
+            (0x7A06, Some("FSK-18"), Some(18), None),
+            (0x7A07, Some("CA:R"), Some(18), Some(1)),
         ];
         for (id, rating, _, _) in cases {
             let id = Uuid::from_u128(id);
@@ -9721,11 +9999,11 @@ mod tests {
             .await
             .expect("repair");
 
-        // Four rated rows plus every unrated one (upstream's blank-rating
+        // Six rated rows plus every unrated one (upstream's blank-rating
         // update matches the migration placeholder too).
         assert_eq!(
             updated,
-            4 + u64::try_from(unrated_rows).expect("count fits")
+            6 + u64::try_from(unrated_rows).expect("count fits")
         );
         for (id, rating, score, sub_score) in cases {
             let row = fetch_item(&db, Uuid::from_u128(id)).await;

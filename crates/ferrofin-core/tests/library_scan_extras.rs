@@ -109,6 +109,17 @@ impl Fixture {
         }
     }
 
+    /// Reads NFO sidecars with the given release-date pattern.
+    fn with_release_date_format(mut self, format: &'static str) -> Self {
+        self.scanner = self.scanner.with_nfo_configuration(move || {
+            ferrofin_providers::xbmc::config::NfoConfiguration {
+                release_date_format: format.to_owned(),
+                ..Default::default()
+            }
+        });
+        self
+    }
+
     async fn row(&self, relative: &str) -> BaseItemEntity {
         sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Path" = ?"#)
             .bind(self.media.join(relative).to_string_lossy().as_ref())
@@ -126,7 +137,14 @@ impl Fixture {
     }
 
     async fn assert_browse(&self, expected: usize) {
+        self.assert_browse_split(expected, expected).await;
+    }
+
+    /// The library's children: `direct` of them in a flat listing, `all` in a
+    /// recursive one (a plain subfolder lists its own children one level down).
+    async fn assert_browse_split(&self, direct: usize, all: usize) {
         for recursive in [false, true] {
+            let expected = if recursive { all } else { direct };
             let rows = self
                 .repo
                 .get_item_list(&InternalItemsQuery {
@@ -373,6 +391,138 @@ async fn nested_release_and_mixed_folders_do_not_lend_the_wrong_owner() {
     assert!(!other.is_in_mixed_folder);
     assert!(f.row("Mixed/First.mkv").await.is_in_mixed_folder);
     assert!(f.row("Mixed/Second.mkv").await.is_in_mixed_folder);
+}
+
+/// The saved `ReleaseDateFormat` is the pattern a sidecar's dates are read
+/// with: a date written in another pattern is not a date at all.
+#[tokio::test]
+async fn nfo_release_dates_are_read_with_the_saved_pattern() {
+    for (format, written, expected_date) in [
+        ("dd.MM.yyyy", "05.12.2010", Some("2010-12-05")),
+        ("MMMM d, yyyy", "December 5, 2010", Some("2010-12-05")),
+        ("yyyy-MM-dd", "05.12.2010", None),
+        ("dd.MM.yyyy", "2010-12-05", None),
+    ] {
+        let f = Fixture::new(&[MOVIE])
+            .await
+            .with_release_date_format(format);
+        std::fs::write(
+            f.media.join("Heat (1995)/movie.nfo"),
+            format!("<movie><title>Dated</title><premiered>{written}</premiered></movie>"),
+        )
+        .unwrap();
+        f.scanner.scan_all().await.unwrap();
+        let row = f.row(MOVIE).await;
+        assert_eq!(row.name.as_deref(), Some("Dated"), "{format}");
+        let date = row.premiere_date.map(|d| d.format("%Y-%m-%d").to_string());
+        assert_eq!(date.as_deref(), expected_date, "{format} / {written}");
+    }
+}
+
+/// `MovieNfoSaver.GetMovieSavePaths`: `movie.nfo` is searched before the
+/// file's own `.nfo`, so it wins when both exist.
+#[tokio::test]
+async fn movie_nfo_is_searched_before_the_files_own_sidecar() {
+    let f = Fixture::new(&[MOVIE]).await;
+    let dir = f.media.join("Heat (1995)");
+    std::fs::write(
+        dir.join("movie.nfo"),
+        "<movie><title>From movie.nfo</title></movie>",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("Heat.nfo"),
+        "<movie><title>From Heat.nfo</title></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(MOVIE).await.name.as_deref(), Some("From movie.nfo"));
+}
+
+/// The Video/MusicVideo readers share the movie parser and search order.
+#[tokio::test]
+async fn music_video_sidecars_are_read() {
+    let f = Fixture::with_type(
+        &["Artist - Song (2001).mkv"],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    std::fs::write(
+        f.media.join("Artist - Song (2001).nfo"),
+        "<musicvideo><title>Local video title</title><plot>Sidecar plot</plot></musicvideo>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let row = f.row("Artist - Song (2001).mkv").await;
+    assert!(row.type_.ends_with(".MusicVideo"), "{}", row.type_);
+    assert_eq!(row.name.as_deref(), Some("Local video title"));
+    assert_eq!(row.overview.as_deref(), Some("Sidecar plot"));
+}
+
+/// `SeasonNfoProvider` reads `season.nfo`; failing that,
+/// `SeriesNfoSeasonProvider` names the season from the series' `tvshow.nfo`.
+#[tokio::test]
+async fn a_season_is_named_from_the_series_nfo_unless_it_has_its_own() {
+    const EPISODE: &str = "Show/Season 01/Show S01E01.mkv";
+    const TVSHOW: &str = "<tvshow><title>Show</title>\
+        <namedseason number=\"1\">First Arc</namedseason>\
+        <namedseason number=\"2\">Second Arc</namedseason></tvshow>";
+    let f = Fixture::with_type(&[EPISODE], CollectionTypeOptions::tvshows).await;
+    std::fs::write(f.media.join("Show/tvshow.nfo"), TVSHOW).unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("First Arc")
+    );
+
+    // A season.nfo that reads takes precedence; tvshow.nfo is not consulted.
+    let season_nfo = f.media.join("Show/Season 01/season.nfo");
+    std::fs::write(&season_nfo, "<season><title>Own Name</title></season>").unwrap();
+    // Newer than the NFO provider's one-minute save tolerance.
+    std::fs::File::options()
+        .write(true)
+        .open(&season_nfo)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(300))
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("Own Name")
+    );
+}
+
+/// Editing the series NFO alone is enough for the next scan to re-read it.
+#[tokio::test]
+async fn a_series_nfo_edit_renames_the_season_on_the_next_scan() {
+    const EPISODE: &str = "Show/Season 01/Show S01E01.mkv";
+    let f = Fixture::with_type(&[EPISODE], CollectionTypeOptions::tvshows).await;
+    let tvshow = f.media.join("Show/tvshow.nfo");
+    std::fs::write(
+        &tvshow,
+        "<tvshow><namedseason number=\"1\">Before</namedseason></tvshow>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row("Show/Season 01").await.name.as_deref(),
+        Some("Before")
+    );
+    // The sidecar must be newer than the NFO save tolerance (one minute).
+    std::fs::write(
+        &tvshow,
+        "<tvshow><namedseason number=\"1\">After</namedseason></tvshow>",
+    )
+    .unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(300);
+    std::fs::File::options()
+        .write(true)
+        .open(&tvshow)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row("Show/Season 01").await.name.as_deref(), Some("After"));
 }
 
 #[tokio::test]
@@ -642,7 +792,12 @@ async fn extras_in_ineligible_folders_are_cleaned_without_deleting_movies() {
         (planned.extra_type, planned.owner_id)
     );
     assert!(f.media.join(EXTRA).exists());
-    f.assert_browse(2).await;
+    // `Heat (1995)` holds a video in a subfolder, so it is no title's own
+    // folder but a plain `Folder`: the library lists only it in a flat listing,
+    // and below it `Heat.mkv` and `Release` (the title in its own folder). An
+    // extras-named folder below the top is never resolved
+    // (`CoreResolutionIgnoreRule`), so it is no `Folder`.
+    f.assert_browse_split(1, 3).await;
 }
 
 #[tokio::test]
@@ -770,7 +925,10 @@ async fn plain_space_samples_follow_multi_item_resolution() {
             .await
             .unwrap();
         assert_eq!(mixed_sample, 0);
-        f.assert_browse(5).await;
+        // The movie in its own folder and the loose one are direct children;
+        // `Mixed` and `Sample Title` (a folder whose only video is a sample)
+        // are plain folders listing theirs one level down.
+        f.assert_browse_split(4, 7).await;
         assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
     }
 }
@@ -1540,6 +1698,7 @@ async fn an_extras_named_folder_at_the_top_holds_movies() {
 /// photos is a `PhotoAlbum` its clips hang off and that owns the folder's
 /// extras; a disc rip is one `Video` for its folder.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one library, every resolver in it
 async fn a_home_video_library_resolves_clips_albums_and_rips() {
     let f = Fixture::with_type(
         &[
@@ -1583,7 +1742,12 @@ async fn a_home_video_library_resolves_clips_albums_and_rips() {
     );
     assert_eq!(day.production_year, None, "names are not parsed");
     assert!(!day.is_in_mixed_folder, "the folder's lone clip");
-    assert_eq!(day.parent_id.as_ref(), Some(&library));
+    // A folder no resolver claims is a plain `Folder` (`FolderResolver`)
+    // its clips hang off.
+    let trip = f.row("Trip (2019)").await;
+    assert!(trip.type_.ends_with("Entities.Folder"), "{}", trip.type_);
+    assert_eq!(trip.parent_id.as_ref(), Some(&library));
+    assert_eq!(day.parent_id.as_ref(), Some(&trip.id));
 
     let album = f.row("Album").await;
     assert!(album.type_.ends_with(".PhotoAlbum"), "{}", album.type_);
@@ -1602,11 +1766,13 @@ async fn a_home_video_library_resolves_clips_albums_and_rips() {
     assert!(!rip.is_in_mixed_folder);
     assert!(!rip.is_movie);
     assert_eq!(rip.name.as_deref(), Some("Rip"));
+    // It holds both `VIDEO_TS` and `BDMV`: the first child listed decides
+    // (`BaseVideoResolver.ResolveVideo` walks `FileSystemChildren` unsorted),
+    // so either disc type, by the filesystem's listing order.
+    let data = rip.data.as_deref().unwrap_or_default();
     assert!(
-        rip.data
-            .as_deref()
-            .unwrap_or_default()
-            .contains(r#""VideoType":"Dvd""#)
+        data.contains(r#""VideoType":"Dvd""#) || data.contains(r#""VideoType":"BluRay""#),
+        "{data}"
     );
 
     // A nested album hangs off its album; its clip off it.
@@ -1623,10 +1789,13 @@ async fn a_home_video_library_resolves_clips_albums_and_rips() {
     for id in [&album.id, &inner.id, &deep.id, &library] {
         assert!(ancestors.contains(id), "{id} in {ancestors:?}");
     }
-    // A clip in a plain folder of an album hangs off the album and, alone
-    // in a folder no album is, owns that folder's extras.
+    // A plain folder of an album is a `Folder` under it; its clip hangs off
+    // the folder and, alone in a folder no album is, owns its extras.
+    let plain = f.row("Album/Plain").await;
+    assert!(plain.type_.ends_with("Entities.Folder"), "{}", plain.type_);
+    assert_eq!(plain.parent_id.as_ref(), Some(&album.id));
     let walk = f.row("Album/Plain/Walk.mp4").await;
-    assert_eq!(walk.parent_id.as_ref(), Some(&album.id));
+    assert_eq!(walk.parent_id.as_ref(), Some(&plain.id));
     assert!(!walk.is_in_mixed_folder);
     assert_eq!(
         f.row("Album/Plain/extras/Bloop.mp4")
@@ -1654,8 +1823,8 @@ async fn a_home_video_library_resolves_clips_albums_and_rips() {
 }
 
 /// Without `EnablePhotos` a home-video library has no albums
-/// (`PhotoAlbumResolver.cs:50-51`): a folder's lone clip hangs off the library
-/// and owns the folder's extras.
+/// (`PhotoAlbumResolver.cs:50-51`): the folder is a plain `Folder`
+/// (`FolderResolver`), and its lone clip hangs off it and owns its extras.
 #[tokio::test]
 async fn a_home_video_library_without_photos_has_no_albums() {
     let f = Fixture::with_options(
@@ -1672,8 +1841,14 @@ async fn a_home_video_library_without_photos_has_no_albums() {
     )
     .await;
     f.scanner.scan_all().await.unwrap();
+    let folder = f.row("Album").await;
+    assert!(
+        folder.type_.ends_with("Entities.Folder"),
+        "{}",
+        folder.type_
+    );
     let beach = f.row("Album/Beach.mp4").await;
-    assert_eq!(beach.parent_id, Some(guid_to_db(f.library)));
+    assert_eq!(beach.parent_id, Some(folder.id));
     assert!(!beach.is_in_mixed_folder);
     assert_eq!(
         f.row("Album/extras/trailer.mp4").await.owner_id.as_ref(),

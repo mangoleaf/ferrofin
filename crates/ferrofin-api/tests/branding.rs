@@ -74,49 +74,6 @@ fn user() -> UserEntity {
     }
 }
 
-/// An auth stub that authenticates as an API key.
-///
-/// `POST`/`DELETE /Branding/Splashscreen` are `RequiresElevation` upstream and
-/// gated with `RequireAdmin` here; an API key satisfies that policy without a
-/// user/policy lookup, exactly as C# does. (`GET` is anonymous either way.)
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(user()),
-            // Must agree with `authenticate`: the router's auth layer inserts
-            // THIS value as a request extension and `RequireAuth` prefers it,
-            // so dropping `is_api_key` here silently downgrades every request
-            // to a non-elevated one.
-            is_api_key: true,
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            token: Some("tok".into()),
-            user: Some(user()),
-            is_api_key: true,
-            is_authenticated: true,
-            ..Default::default()
-        })
-    }
-}
-
 /// A [`ServerApplicationPaths`] whose `data_path` is a per-test directory.
 struct TmpPaths {
     data: String,
@@ -214,6 +171,63 @@ fn make_config(branding: BrandingOptions, data_path: &str) -> Arc<StubConfig> {
 /// Builds an [`AppState`] whose configuration manager is `config`; every other
 /// manager is a panic fake.
 fn state(config: Arc<StubConfig>) -> AppState {
+    state_as(config, &Caller::Key)
+}
+
+/// Who the stub auth services say is calling.
+enum Caller {
+    /// An API key: elevated (the default for every test above).
+    Key,
+    /// A signed-in user who is not an administrator.
+    Regular,
+    /// No credentials at all.
+    Anonymous,
+}
+
+#[async_trait]
+impl AuthService for Caller {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(match self {
+            Self::Key => AuthorizationInfo {
+                token: Some("tok".into()),
+                user: Some(user()),
+                is_api_key: true,
+                is_authenticated: true,
+                ..Default::default()
+            },
+            Self::Regular => AuthorizationInfo {
+                token: Some("tok".into()),
+                user: Some(user()),
+                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy::default())),
+                is_authenticated: true,
+                ..Default::default()
+            },
+            Self::Anonymous => AuthorizationInfo::default(),
+        })
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for Caller {
+    async fn get_authorization_info(
+        &self,
+        request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        self.authenticate(request).await
+    }
+}
+
+fn state_as(config: Arc<StubConfig>, caller: &Caller) -> AppState {
+    let auth = || {
+        Arc::new(match caller {
+            Caller::Key => Caller::Key,
+            Caller::Regular => Caller::Regular,
+            Caller::Anonymous => Caller::Anonymous,
+        })
+    };
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -229,8 +243,8 @@ fn state(config: Arc<StubConfig>) -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        auth(),
+        auth(),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -432,4 +446,82 @@ async fn splashscreen_delete_no_location_is_204() {
     let config = make_config(default_branding(), "/tmp");
     let (status, _) = send(config, "DELETE", "/Branding/Splashscreen", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// Drives one GET as `caller`, returning the status, headers and body.
+async fn get_as(
+    config: Arc<StubConfig>,
+    caller: &Caller,
+    uri: &str,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Authorization", "Bearer token")
+        .body(Body::empty())
+        .expect("request");
+    let response = create_router(state_as(config, caller))
+        .oneshot(request)
+        .await
+        .expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec();
+    (status, headers, bytes)
+}
+
+/// `GetSplashscreen`: `!SplashscreenEnabled && !User.IsInRole(Administrator)`
+/// is a 404, so an administrator (or API key) previews a disabled splashscreen
+/// that a signed-in user or an anonymous caller cannot see.
+#[tokio::test]
+async fn a_disabled_splashscreen_is_visible_to_administrators_only() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"png-bytes").expect("splash");
+    let data_path = dir.to_string_lossy().into_owned();
+    let config = make_config(default_branding(), &data_path);
+
+    let (status, _, body) = get_as(config.clone(), &Caller::Key, "/Branding/Splashscreen").await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"png-bytes"[..])
+    );
+    for caller in [Caller::Regular, Caller::Anonymous] {
+        let (status, ..) = get_as(config.clone(), &caller, "/Branding/Splashscreen").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    // Enabled, everyone sees it.
+    let mut enabled = default_branding();
+    enabled.splashscreen_enabled = true;
+    let config = make_config(enabled, &data_path);
+    for caller in [Caller::Regular, Caller::Anonymous] {
+        let (status, ..) = get_as(config.clone(), &caller, "/Branding/Splashscreen").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `tag` earns the 365-day immutable caching of `GetImageResult`; without
+/// one the response is plain `public`.
+#[tokio::test]
+async fn a_tagged_splashscreen_is_immutable_cacheable() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"png-bytes").expect("splash");
+    let mut branding = default_branding();
+    branding.splashscreen_enabled = true;
+    let config = make_config(branding, &dir.to_string_lossy());
+
+    let (_, plain, _) = get_as(config.clone(), &Caller::Anonymous, "/Branding/Splashscreen").await;
+    assert_eq!(plain["cache-control"], "public");
+    let (_, tagged, _) = get_as(config, &Caller::Anonymous, "/Branding/Splashscreen?tag=abc").await;
+    assert_eq!(
+        tagged["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(tagged["etag"], "\"abc\"");
+    let _ = std::fs::remove_dir_all(&dir);
 }

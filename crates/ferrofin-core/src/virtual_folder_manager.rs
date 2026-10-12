@@ -21,12 +21,9 @@
 //!   stores `system.json` in place of C# `system.xml`). The per-library options
 //!   are therefore `options.json`; the shortcut and marker files are byte-for-byte
 //!   the same as C#.
-//! - **The `refresh_library` flag and the `ILibraryMonitor` stop/start dance are
-//!   dropped.** The scan pipeline and filesystem watcher are later-wave
-//!   subsystems, so a mutation takes effect on disk immediately and the requested
-//!   refresh is a no-op (the same stance `queue_library_scan` takes today).
-//! - The `ExpandVirtualPath`/`ReverseVirtualPath` network-share remapping is the
-//!   identity here (no virtual-path substitution is configured at this seam).
+//! - The API coordinates the library refresh and monitor stop/start around
+//!   these filesystem mutations.
+//! - The configured virtual-path expander resolves adopted shortcut tokens.
 //! - When an item store is attached ([`with_item_store`](FerrofinVirtualFolderManager::with_item_store)),
 //!   add/remove also creates/deletes the library's `CollectionFolder` `BaseItem`,
 //!   and `GetVirtualFolders` projects its deterministic id onto
@@ -96,6 +93,8 @@ pub struct FerrofinVirtualFolderManager {
     /// library with a null `ItemId`) and that `/UserViews` returns. `None` in unit
     /// tests keeps the manager filesystem-only.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// Storage and physical root for preserving pre-D1 library children.
+    physical_root: Option<(ferrofin_db::Database, uuid::Uuid)>,
     /// The item *reader*, set by the composition root alongside
     /// [`persistence`](Self::persistence). Only the orphan prune needs it: it has
     /// to enumerate the `UserRootFolder`'s existing `CollectionFolder` children to
@@ -165,6 +164,7 @@ impl FerrofinVirtualFolderManager {
             root: default_user_views_path.into(),
             scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence: None,
+            physical_root: None,
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -192,6 +192,27 @@ impl FerrofinVirtualFolderManager {
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
         self
+    }
+
+    /// Enables atomic conversion of legacy library children before removing
+    /// their collection folder. Media identities and metadata remain intact.
+    #[must_use]
+    pub fn with_physical_root(mut self, db: ferrofin_db::Database, root: uuid::Uuid) -> Self {
+        self.physical_root = Some((db, root));
+        self
+    }
+
+    async fn preserve_legacy_children(&self, id: uuid::Uuid) -> Result<(), ServiceError> {
+        if let Some((db, aggregate)) = &self.physical_root {
+            crate::library_structure_repository::preserve_children(
+                db,
+                id,
+                *aggregate,
+                &self.id_derivation,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Attaches the item reader used by
@@ -507,6 +528,9 @@ impl FerrofinVirtualFolderManager {
         if stale.is_empty() {
             return Ok(0);
         }
+        for id in &stale {
+            self.preserve_legacy_children(*id).await?;
+        }
         persistence.delete_items(&stale).await?;
         if let Ok(mut set) = self.parented.lock() {
             for id in &stale {
@@ -641,6 +665,24 @@ impl FerrofinVirtualFolderManager {
         Some(imported)
     }
 
+    /// `SyncLibraryOptionsToLocations`: restore paths represented by shortcuts
+    /// when the counts differ. Existing option entries are preserved upstream.
+    async fn sync_options_to_locations(
+        &self,
+        folder_path: &Path,
+        options: &mut LibraryOptions,
+    ) -> Result<(), ServiceError> {
+        let locations = self.resolve_locations(folder_path).await?;
+        if !locations.is_empty() && locations.len() != options.path_infos.len() {
+            for path in locations {
+                if !options.path_infos.iter().any(|info| info.path == path) {
+                    options.path_infos.push(MediaPathInfo { path });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes `options` to a folder's `options.json` (C# `SaveLibraryOptions`).
     async fn save_options(
         folder_path: &Path,
@@ -683,12 +725,26 @@ impl FerrofinVirtualFolderManager {
     /// Resolves one `.mblink` shortcut to its target path (its whole text
     /// content, with a trailing separator trimmed — `MbLinkShortcutHandler.Resolve`).
     async fn resolve_shortcut(shortcut: &Path) -> Option<String> {
-        let content = tokio::fs::read_to_string(shortcut).await.ok()?;
-        let trimmed = content.trim_end_matches(['/', '\\']).to_owned();
-        if trimmed.is_empty() {
+        let mut content = tokio::fs::read_to_string(shortcut).await.ok()?;
+        // Path.TrimEndingDirectorySeparator removes one native separator,
+        // stopping at the root (including a Windows drive/prefix when present).
+        let root_length: usize = Path::new(&content)
+            .components()
+            .take_while(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            })
+            .map(|component| component.as_os_str().len())
+            .sum();
+        if content.len() > root_length && content.ends_with(std::path::is_separator) {
+            content.pop();
+        }
+        if content.is_empty() {
             None
         } else {
-            Some(trimmed)
+            Some(content)
         }
     }
 
@@ -739,7 +795,12 @@ impl FerrofinVirtualFolderManager {
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
-        let target = target.trim_end_matches(['/', '\\']);
+        // A filesystem root must retain its separator to match the shortcut.
+        let target = if Path::new(target).has_root() && Path::new(target).parent().is_none() {
+            target
+        } else {
+            target.trim_end_matches(['/', '\\'])
+        };
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -928,9 +989,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // Every configured media path must exist on disk (C# validation before
         // any side effect).
         for path_info in &options.path_infos {
-            if !tokio::fs::try_exists(&path_info.path)
+            if !tokio::fs::metadata(&path_info.path)
                 .await
-                .unwrap_or(false)
+                .is_ok_and(|metadata| metadata.is_dir())
             {
                 return Err(ServiceError::invalid_input(format!(
                     "the specified path does not exist: {}.",
@@ -987,6 +1048,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         if let (Some(persistence), Some(id)) =
             (&self.persistence, self.collection_folder_id(&folder_path))
         {
+            self.preserve_legacy_children(id).await?;
             persistence.delete_items(std::slice::from_ref(&id)).await?;
         }
         tokio::fs::remove_dir_all(&folder_path)
@@ -1034,6 +1096,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // case-only hop reassigns `current` to a temporary uuid directory, whose
         // id is not the one to delete.
         let vacated = self.collection_folder_id(&current);
+        if let Some(id) = vacated {
+            self.preserve_legacy_children(id).await?;
+        }
 
         // A case-only rename hops through a temporary directory so a
         // case-insensitive filesystem does not treat it as a no-op (C# path).
@@ -1056,11 +1121,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // the very next read (ids are path-derived), and nothing would ever remove
         // the first. This is what `LibraryManager.ValidateTopLibraryFolders` does
         // for upstream after a rename; do it eagerly here so a caller that passed
-        // `refreshLibrary=false` still converges. Deleting the row takes the
-        // children an older scan hung off it with it
-        // (`FK_BaseItems_BaseItems_ParentId … ON DELETE CASCADE`), which is why
-        // the API layer rescans the renamed library unconditionally; what hangs
-        // off its locations' folders stays, as the renamed library lists them.
+        // `refreshLibrary=false` still converges. Legacy children were moved
+        // transactionally before the directory rename; the physical hierarchy
+        // survives deletion of the old collection folder.
         if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
             persistence.delete_items(std::slice::from_ref(&id)).await?;
             if let Ok(mut set) = self.parented.lock() {
@@ -1082,9 +1145,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         if path_info.path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
         }
-        if !tokio::fs::try_exists(&path_info.path)
+        if !tokio::fs::metadata(&path_info.path)
             .await
-            .unwrap_or(false)
+            .is_ok_and(|metadata| metadata.is_dir())
         {
             return Err(ServiceError::not_found("the path does not exist"));
         }
@@ -1094,6 +1157,8 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
         let mut options = Self::load_options(&folder_path).await;
         options.path_infos.push(path_info.clone());
+        self.sync_options_to_locations(&folder_path, &mut options)
+            .await?;
         Self::save_options(&folder_path, &options).await?;
         self.forget_setup(&folder_path);
         Ok(())
@@ -1102,20 +1167,14 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     async fn update_media_path(
         &self,
         virtual_folder_name: &str,
-        path_info: &MediaPathInfo,
+        _path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let mut options = Self::load_options(&folder_path).await;
-        // Replace the matching entry (by path); append when it is new.
-        if let Some(existing) = options
-            .path_infos
-            .iter_mut()
-            .find(|i| i.path == path_info.path)
-        {
-            *existing = path_info.clone();
-        } else {
-            options.path_infos.push(path_info.clone());
-        }
+        // The pinned UpdateMediaPath synchronizes existing shortcut locations;
+        // it does not add or replace the caller's Path. AddMediaPath owns that.
+        self.sync_options_to_locations(&folder_path, &mut options)
+            .await?;
         Self::save_options(&folder_path, &options).await?;
         self.forget_setup(&folder_path);
         Ok(())
@@ -1546,6 +1605,80 @@ mod tests {
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shortcut_resolution_trims_one_native_separator_and_preserves_root() {
+        let (tmp, _mgr) = manager();
+        let shortcut = tmp.path().join("case.mblink");
+        for (input, expected) in [
+            ("/", Some("/")),
+            ("//", Some("/")),
+            ("///", Some("//")),
+            ("/media/", Some("/media")),
+            ("/media//", Some("/media/")),
+            ("/media\\", Some("/media\\")),
+            ("relative/", Some("relative")),
+            ("/media/\n", Some("/media/\n")),
+            (" ", Some(" ")),
+            ("", None),
+        ] {
+            tokio::fs::write(&shortcut, input).await.unwrap();
+            assert_eq!(
+                FerrofinVirtualFolderManager::resolve_shortcut(&shortcut)
+                    .await
+                    .as_deref(),
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn root_location_round_trips_ownership_and_removal_without_scanning() {
+        let (_tmp, _db, mgr) = manager_with_store().await;
+        mgr.add_virtual_folder(
+            "Root",
+            None,
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo { path: "/".into() }],
+                enable_realtime_monitor: false,
+                save_subtitles_with_media: false,
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        assert_eq!(folders[0].locations, ["/"]);
+        assert_eq!(mgr.get_physical_paths().await.unwrap(), ["/"]);
+        let owner = ferrofin_model::entities_media::owning_library(
+            &folders,
+            None,
+            Some("/tmp/disposable/movie.mkv"),
+        )
+        .unwrap();
+        assert_eq!(owner.name.as_deref(), Some("Root"));
+        assert!(
+            !owner
+                .library_options
+                .as_ref()
+                .unwrap()
+                .save_subtitles_with_media
+        );
+        mgr.remove_media_path("Root", "/").await.unwrap();
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(folders[0].locations.is_empty());
+        assert!(
+            folders[0]
+                .library_options
+                .as_ref()
+                .unwrap()
+                .path_infos
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2014,6 +2147,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn media_roots_must_be_directories_before_mutating_library_options() {
+        let (tmp, mgr) = manager();
+        let file = tmp.path().join("file.mkv");
+        std::fs::write(&file, "fixture").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        assert!(
+            mgr.add_virtual_folder("File", None, &opts_with_paths(std::slice::from_ref(&file)))
+                .await
+                .is_err()
+        );
+        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let media = media_dir(&tmp, "media");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
+            .await
+            .unwrap();
+        assert!(
+            mgr.add_media_path("Lib", &MediaPathInfo { path: file })
+                .await
+                .is_err()
+        );
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(folder.locations, vec![media.clone()]);
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            vec![MediaPathInfo { path: media }]
+        );
+    }
+
+    #[tokio::test]
+    async fn path_update_syncs_shortcuts_without_adding_the_request_path() {
+        let (tmp, mgr) = manager();
+        let first = media_dir(&tmp, "first");
+        let second = media_dir(&tmp, "second");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&first)))
+            .await
+            .unwrap();
+        let root = mgr.require_folder("Lib").await.unwrap();
+        FerrofinVirtualFolderManager::create_shortcut(
+            &root,
+            &MediaPathInfo {
+                path: second.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        mgr.update_media_path(
+            "Lib",
+            &MediaPathInfo {
+                path: "/never-added".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            vec![
+                MediaPathInfo { path: first },
+                MediaPathInfo { path: second }
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn media_path_ops_require_existing_library() {
         let (tmp, mgr) = manager();
         let media = media_dir(&tmp, "m");
@@ -2092,6 +2289,74 @@ mod tests {
 
         // Only the realtime-enabled library's locations are watch roots.
         assert_eq!(mgr.watch_roots().await, vec![watched]);
+    }
+
+    #[tokio::test]
+    async fn monitor_restart_applies_saved_options_and_keeps_a_shared_enabled_root() {
+        use crate::library_monitor::FerrofinLibraryMonitor;
+        use crate::resolvers::FileSystemWatcher;
+        use async_trait::async_trait;
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::library::LibraryMonitor;
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Watcher(Mutex<BTreeSet<String>>);
+
+        #[async_trait]
+        impl FileSystemWatcher for Watcher {
+            async fn watch(&self, path: &str) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().insert(path.to_owned());
+                Ok(())
+            }
+
+            async fn unwatch(&self, path: &str) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().remove(path);
+                Ok(())
+            }
+
+            async fn unwatch_all(&self) -> Result<(), ServiceError> {
+                self.0.lock().unwrap().clear();
+                Ok(())
+            }
+        }
+
+        let (tmp, mgr) = manager();
+        let one = media_dir(&tmp, "one");
+        let shared = media_dir(&tmp, "shared");
+        let mut first = opts_with_paths(&[one.clone(), shared.clone()]);
+        first.enable_realtime_monitor = true;
+        let mut second = opts_with_paths(std::slice::from_ref(&shared));
+        second.enable_realtime_monitor = true;
+        mgr.add_virtual_folder("First", None, &first).await.unwrap();
+        mgr.add_virtual_folder("Second", None, &second)
+            .await
+            .unwrap();
+        let mgr = Arc::new(mgr);
+        let watcher = Arc::new(Watcher::default());
+        let monitor = FerrofinLibraryMonitor::new(watcher.clone(), mgr.clone());
+
+        for (enabled, expected) in [
+            (true, BTreeSet::from([one.clone(), shared.clone()])),
+            (false, BTreeSet::from([shared.clone()])),
+            (true, BTreeSet::from([one, shared])),
+        ] {
+            first.enable_realtime_monitor = enabled;
+            mgr.update_library_options("First", &first).await.unwrap();
+            monitor.stop().await.unwrap();
+            assert!(watcher.0.lock().unwrap().is_empty());
+            monitor.start().await.unwrap();
+            assert_eq!(*watcher.0.lock().unwrap(), expected);
+        }
+
+        first.enable_realtime_monitor = false;
+        second.enable_realtime_monitor = false;
+        mgr.update_library_options("First", &first).await.unwrap();
+        mgr.update_library_options("Second", &second).await.unwrap();
+        monitor.stop().await.unwrap();
+        monitor.start().await.unwrap();
+        assert!(watcher.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

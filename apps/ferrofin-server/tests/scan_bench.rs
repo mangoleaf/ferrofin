@@ -177,7 +177,7 @@ async fn scan_bench() {
                     analyze_duration: None,
                     probe_size: None,
                     threads: 0,
-                    temp_dir: tmp.path().join("temp"),
+                    temp_dir: tmp.path().join("temp").into(),
                     ffmpeg_version: None,
                 },
             )),

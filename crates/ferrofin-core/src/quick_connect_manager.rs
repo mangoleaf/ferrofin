@@ -590,6 +590,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_toggle_gates_pending_and_authorized_requests_without_losing_them() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(tmp.path()),
+            )
+            .await
+            .expect("load"),
+        );
+        let mgr =
+            FerrofinQuickConnect::new(config.clone(), Arc::new(FakeSessionManager::default()));
+        let pending = mgr.try_connect(&auth_info()).await.expect("initiate");
+        let user = Uuid::new_v4();
+        let mut settings = config.snapshot();
+        settings.quick_connect_available = false;
+        config
+            .update_configuration(&settings)
+            .await
+            .expect("disable");
+        assert!(!mgr.is_enabled().await.expect("enabled"));
+        assert!(matches!(
+            mgr.try_connect(&auth_info()).await,
+            Err(ServiceError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            mgr.check_request_status(pending.secret.expose()).await,
+            Err(ServiceError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            mgr.authorize_request(user, &pending.code).await,
+            Err(ServiceError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            mgr.get_authorized_request(pending.secret.expose()).await,
+            Err(ServiceError::Unauthorized(_))
+        ));
+
+        settings.quick_connect_available = true;
+        config
+            .update_configuration(&settings)
+            .await
+            .expect("enable");
+        assert!(
+            mgr.authorize_request(user, &pending.code)
+                .await
+                .expect("authorize retained request")
+        );
+        assert_eq!(
+            mgr.get_authorized_request(pending.secret.expose())
+                .await
+                .expect("exchange")
+                .user_id,
+            user
+        );
+        settings.quick_connect_available = false;
+        config
+            .update_configuration(&settings)
+            .await
+            .expect("disable authorized request");
+        assert!(matches!(
+            mgr.get_authorized_request(pending.secret.expose()).await,
+            Err(ServiceError::Unauthorized(_))
+        ));
+        settings.quick_connect_available = true;
+        config
+            .update_configuration(&settings)
+            .await
+            .expect("enable again");
+        assert_eq!(
+            mgr.get_authorized_request(pending.secret.expose())
+                .await
+                .expect("retained authorization")
+                .user_id,
+            user
+        );
+    }
+
+    #[tokio::test]
     async fn full_pairing_flow() {
         let mgr = manager(true);
         let user_id = Uuid::new_v4();

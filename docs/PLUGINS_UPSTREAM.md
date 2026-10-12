@@ -84,7 +84,9 @@ Conventions:
   - **Automatic analysis:** library changes arrive through the event bus (D8),
     debounced by `LibraryUpdateDuration` and batched, so a batch with any
     addition waits as an addition, and image-only updates are not told apart.
-  - **Media Segment Scan** (`TaskExtractMediaSegments`) runs detection (D5).
+  - **Media Segment Scan** (`TaskExtractMediaSegments`) runs detection (D5),
+    then every registered segment provider — the plugin's `SegmentProvider`
+    publishing what detection stored, as upstream's scan runs it.
   - **Support bundle:** the version line also names Ferrofin's; the ffmpeg
     checks run when the bundle is asked for (upstream: at start); the bundle
     names the Chromaprint backend.

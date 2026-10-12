@@ -1329,6 +1329,105 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     remove_provider_id(instance, provider.as_name());
 }
 
+/// Numeric/date snapshot used to sort normal episodes and positioned specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiredEpisodeOrder {
+    /// Physical parent season number.
+    pub season: Option<i64>,
+    /// Episode number within its parent season.
+    pub episode: Option<i64>,
+    /// Known premiere date, used to break regular episode ties.
+    pub premiere: Option<chrono::DateTime<chrono::Utc>>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Episode before which a special airs.
+    pub airs_before_episode: Option<i64>,
+}
+
+impl AiredEpisodeOrder {
+    /// Whether this snapshot represents season zero.
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.season.unwrap_or(-1) == 0
+    }
+
+    /// Compare aired positions exactly as Jellyfin's `AiredEpisodeOrderComparer`.
+    #[must_use]
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_special(), other.is_special()) {
+            (true, true) => self.special_value().cmp(&other.special_value()),
+            (false, false) => self.compare_episodes(other),
+            (false, true) => self.compare_episode_to_special(other),
+            (true, false) => other.compare_episode_to_special(self).reverse(),
+        }
+    }
+
+    /// `CompareEpisodeToSpecial(x = self, y = special)`.
+    fn compare_episode_to_special(&self, special: &Self) -> std::cmp::Ordering {
+        let x_season = self.season.unwrap_or(-1);
+        let y_season = special
+            .airs_after_season
+            .or(special.airs_before_season)
+            .unwrap_or(-1);
+        if x_season != y_season {
+            return x_season.cmp(&y_season);
+        }
+        // Special comes after the episode's season.
+        if special.airs_after_season.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        // Special comes before the season.
+        let Some(y_episode) = special.airs_before_episode else {
+            return std::cmp::Ordering::Greater;
+        };
+        // Can't really compare if this happens.
+        let Some(x_episode) = self.episode else {
+            return std::cmp::Ordering::Equal;
+        };
+        // Special comes before the episode it names.
+        if x_episode == y_episode {
+            return std::cmp::Ordering::Greater;
+        }
+        x_episode.cmp(&y_episode)
+    }
+
+    /// `GetSpecialCompareValue`: season, then airs-after, then the episode
+    /// it airs before, then the special's own number.
+    fn special_value(&self) -> i64 {
+        let mut value = self
+            .airs_after_season
+            .or(self.airs_before_season)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000);
+        if self.airs_after_season.is_some() {
+            value = value.saturating_add(1_000_000);
+        }
+        value = value.saturating_add(self.airs_before_episode.unwrap_or(0).saturating_mul(1_000));
+        value.saturating_add(self.episode.unwrap_or(0))
+    }
+
+    /// `CompareEpisodes`: `(season ?? -1) * 1000 + (episode ?? -1)`, then the
+    /// premiere dates when both are known.
+    fn compare_episodes(&self, other: &Self) -> std::cmp::Ordering {
+        let value = |o: &Self| {
+            o.season
+                .unwrap_or(-1)
+                .saturating_mul(1_000)
+                .saturating_add(o.episode.unwrap_or(-1))
+        };
+        let by_number = value(self).cmp(&value(other));
+        if by_number != std::cmp::Ordering::Equal {
+            return by_number;
+        }
+        match (self.premiere, other.premiere) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2013,5 +2112,139 @@ mod tests {
         assert!(json.get("LibraryOptions").is_some());
         let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, info);
+    }
+}
+
+#[cfg(test)]
+mod aired_episode_order_tests {
+    use super::AiredEpisodeOrder;
+    use rstest::rstest;
+    use std::cmp::Ordering;
+    fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+        value.parse().unwrap()
+    }
+    /// A comparer operand: `(season, episode, before_season, after_season,
+    /// before_episode, premiere)`.
+    fn order(
+        season: Option<i64>,
+        episode: Option<i64>,
+        before_season: Option<i64>,
+        after_season: Option<i64>,
+        before_episode: Option<i64>,
+        premiere: Option<&str>,
+    ) -> AiredEpisodeOrder {
+        AiredEpisodeOrder {
+            season,
+            episode,
+            premiere: premiere.map(ts),
+            airs_before_season: before_season,
+            airs_after_season: after_season,
+            airs_before_episode: before_episode,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        order(None, None, None, None, None, None),
+        order(None, None, None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(2), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(0), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(2), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, Some(1), None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), None, None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(3), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Less
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        Ordering::Greater
+    )]
+    fn aired_episode_order_compare(
+        #[case] x: AiredEpisodeOrder,
+        #[case] y: AiredEpisodeOrder,
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(x.compare(&y), expected);
+        assert_eq!(y.compare(&x), expected.reverse());
     }
 }

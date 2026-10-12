@@ -15,6 +15,7 @@ tokio = { workspace = true, features = ["sync"] }
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
+ferrofin-util.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

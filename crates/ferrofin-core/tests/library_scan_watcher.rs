@@ -860,6 +860,27 @@ impl Captured {
 /// above the refreshed item, and `pruned` for a removed row.
 #[tokio::test]
 async fn every_processed_item_is_logged_with_why() {
+    // The thread-local subscriber below sees only what `tracing`'s
+    // process-wide callsite cache lets through, which a concurrently running
+    // test can switch off for these lines before it is installed. Under
+    // `cargo test` (one process, tests on threads) the test re-runs itself
+    // alone in a child process; nextest already gives it a process of its own.
+    if std::env::var_os("NEXTEST").is_none()
+        && std::env::var_os("FERROFIN_LOG_CAPTURE_CHILD").is_none()
+    {
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "every_processed_item_is_logged_with_why",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FERROFIN_LOG_CAPTURE_CHILD", "1")
+            .status()
+            .expect("run the test in its own process");
+        assert!(status.success(), "failed in its own process: {status}");
+        return;
+    }
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = tv(tmp.path()).await;
     let season = fx.media.join("Show").join("Season 1");

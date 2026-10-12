@@ -37,7 +37,7 @@ use ferrofin_model::subtitles::FontFile;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::image_upload::decode_base64;
@@ -83,8 +83,8 @@ async fn require_item(
 ///
 /// Port of `SubtitleController.DeleteSubtitle`: `404` when the item is missing,
 /// else `204`. The manager drops the external subtitle stream at `index` and its
-/// sidecar file (deleting a non-existent index is idempotent). Elevation policy
-/// is deferred to the auth layer.
+/// sidecar file (deleting a non-existent index is idempotent). Upstream requires
+/// elevation here, independently of the subtitle-management permission.
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/Subtitles/{index}",
@@ -131,7 +131,8 @@ struct UploadSubtitleDto {
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
 /// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager); with no
 /// subtitle-provider host wired the manager rejects the write (`400`), otherwise
-/// a metadata refresh is queued and `204` returned. Elevation policy is deferred.
+/// a metadata refresh is queued and `204` returned. Subtitle management is
+/// checked before decoding or writing the upload.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -146,7 +147,7 @@ struct UploadSubtitleDto {
 )]
 async fn upload_subtitle(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path(item_id): Path<Uuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
@@ -194,7 +195,7 @@ struct RemoteSearchQuery {
 )]
 async fn search_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, language)): Path<(Uuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
@@ -233,7 +234,7 @@ async fn search_remote_subtitles(
 )]
 async fn download_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, subtitle_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
@@ -264,7 +265,7 @@ async fn download_remote_subtitles(
 )]
 async fn get_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(_auth): RequireSubtitleManagement,
     Path(subtitle_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let result = state.subtitles.get_remote_subtitles(&subtitle_id).await?;

@@ -112,6 +112,12 @@ struct ItemRow<'a> {
     /// `Studios` — the pipe-joined studio list a series carries, which is where
     /// a season's/episode's `SeriesStudio` comes from.
     studios: Option<&'a str>,
+    /// `Artists` — the pipe-joined performer names of a music item.
+    artists: Option<&'a str>,
+    /// `AlbumArtists` — the pipe-joined album artist names.
+    album_artists: Option<&'a str>,
+    /// `CleanName`, which by-name lookups join on.
+    clean_name: Option<&'a str>,
 }
 
 /// The one `BaseItems` insert every item fixture goes through.
@@ -174,9 +180,9 @@ async fn insert_base_item_raw_id(
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "ParentId",
             "TopParentId", "SeriesPresentationUniqueKey", "ParentIndexNumber",
             "IndexNumber", "Data", "MediaType", "PresentationUniqueKey",
-            "SeriesId", "Studios")
+            "SeriesId", "Studios", "Artists", "AlbumArtists", "CleanName")
            VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   ?14, ?15)"#,
+                   ?14, ?15, ?16, ?17, ?18)"#,
     )
     .bind(raw_id)
     .bind(type_name(kind))
@@ -197,9 +203,53 @@ async fn insert_base_item_raw_id(
     .bind(presentation_key)
     .bind(opt_guid_to_db(row.series_id))
     .bind(row.studios)
+    .bind(row.artists)
+    .bind(row.album_artists)
+    .bind(row.clean_name)
     .execute(db.writer())
     .await
     .expect("insert item");
+}
+
+/// Inserts a music item carrying `Artists`/`AlbumArtists` columns (pipe-joined
+/// names), as a scan stores a track's or album's tags.
+pub async fn seed_item_with_artists(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    artists: Option<&str>,
+    album_artists: Option<&str>,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            artists,
+            album_artists,
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
+/// Inserts the browsable `MusicArtist` item for `name`, with the clean name
+/// by-name lookups join on.
+pub async fn seed_music_artist_item(db: &Database, id: Uuid, name: &str) {
+    let clean = crate::text_util::get_clean_value(name);
+    insert_base_item(
+        db,
+        id,
+        BaseItemKind::MusicArtist,
+        &ItemRow {
+            name,
+            clean_name: Some(&clean),
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts a named `BaseItems` row carrying a `Data` JSON blob — the column

@@ -20,6 +20,7 @@
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -51,7 +52,7 @@ pub struct OmdbClient {
     /// Where responses are cached (`{cache}/omdb`), when the composition
     /// root wired one ([`Self::with_cache_dir`]); without it every lookup is
     /// a request.
-    cache_dir: Option<PathBuf>,
+    cache_dir: Option<DirectoryPath>,
     /// The OMDb plugin's dashboard settings (`CastAndCrew`).
     plugin: crate::plugin_config::ConfigSource,
 }
@@ -109,8 +110,8 @@ impl OmdbClient {
     /// `{cache}/omdb`, where C# `GetDataFilePath`/`GetSeasonFilePath` keep
     /// them.
     #[must_use]
-    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
-        self.cache_dir = Some(dir);
+    pub fn with_cache_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.cache_dir = Some(dir.into());
         self
     }
 
@@ -895,13 +896,22 @@ mod tests {
     #[tokio::test]
     async fn a_title_record_is_cached_on_disk_for_a_day() {
         let cache = tempfile::tempdir().unwrap();
+        let current = std::sync::Arc::new(std::sync::RwLock::new(cache.path().to_path_buf()));
+        let source = std::sync::Arc::clone(&current);
         let server = MockServer::start(vec![("/", movie_body())]).await;
         let client = OmdbClient::new("key")
             .with_base_url(&server.base_url)
-            .with_cache_dir(cache.path().to_path_buf());
+            .with_cache_dir(DirectoryPath::live(move || {
+                source.read().expect("path").clone()
+            }));
         let file = cache.path().join("tt1375666.json");
         assert!(client.item("1375666").await.is_some());
         assert!(file.exists(), "cached under the `tt` id");
+        let replacement = tempfile::tempdir().expect("cache");
+        *current.write().expect("path") = replacement.path().to_path_buf();
+        assert!(client.item("1375666").await.is_some());
+        assert!(replacement.path().join("tt1375666.json").is_file());
+        *current.write().expect("path") = cache.path().to_path_buf();
         drop(server);
 
         assert!(

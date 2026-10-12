@@ -5,6 +5,7 @@
 //! runtime [`Handle`] captured at wiring time.
 
 use std::io::Read as _;
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::debug;
@@ -531,6 +532,15 @@ pub fn next_up(cx: &Collaborators, user_id: &str, limit: u32) -> Result<Vec<Item
     Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
 }
 
+/// Host-only result of a validated producer write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentWriteOutcome {
+    /// Producer output and served projection were persisted.
+    Written,
+    /// Live library or plugin policy suppressed output; analyzers must retain the item.
+    PolicySkipped,
+}
+
 /// Executes `write-media-segments` for a guest: replaces the segments this
 /// plugin previously wrote for the item (its provider id scopes the delete),
 /// leaving other providers' and user-authored segments alone.
@@ -544,6 +554,56 @@ pub fn write_media_segments(
     item_id: &str,
     segments: &[MediaSegment],
 ) -> Result<(), String> {
+    write_media_segments_using_provider(cx, provider_id, provider_id, None, item_id, segments)
+        .map(|_| ())
+}
+
+/// Persist output from the authenticated loaded guest and register its real identity.
+/// A task-only producer is advertised only after a successful output write.
+///
+/// # Errors
+/// The same validation/persistence errors as `write_media_segments`, plus plugin state/cache errors.
+pub fn write_media_segments_from_plugin(
+    cx: &Collaborators,
+    provider_name: &str,
+    provider_id: &str,
+    state_path: Option<&Path>,
+    item_id: &str,
+    segments: &[MediaSegment],
+) -> Result<SegmentWriteOutcome, String> {
+    write_media_segments_using_provider(
+        cx,
+        provider_name,
+        provider_id,
+        state_path,
+        item_id,
+        segments,
+    )
+}
+
+/// Playable kinds accepted by task-only segment producers without analyzer targets.
+#[must_use]
+pub(crate) fn segment_item_kinds() -> Vec<ferrofin_model::data::BaseItemKind> {
+    use ferrofin_model::data::BaseItemKind;
+    vec![
+        BaseItemKind::Video,
+        BaseItemKind::Movie,
+        BaseItemKind::Episode,
+        BaseItemKind::MusicVideo,
+        BaseItemKind::Trailer,
+        BaseItemKind::Audio,
+        BaseItemKind::AudioBook,
+    ]
+}
+
+fn write_media_segments_using_provider(
+    cx: &Collaborators,
+    provider_name: &str,
+    provider_id: &str,
+    state_path: Option<&Path>,
+    item_id: &str,
+    segments: &[MediaSegment],
+) -> Result<SegmentWriteOutcome, String> {
     let item: Uuid = item_id
         .parse()
         .map_err(|_| format!("item-id `{item_id}` is not a valid UUID"))?;
@@ -566,17 +626,54 @@ pub fn write_media_segments(
     }
 
     cx.handle.block_on(async {
-        cx.media_segments
-            .delete_provider_segments(item, provider_id, None)
+        if !cx
+            .media_segments
+            .is_provider_enabled(item, provider_name)
             .await
-            .map_err(|e| format!("clearing previous segments failed: {e}"))?;
-        for dto in &parsed {
-            cx.media_segments
-                .create_segment(dto, provider_id)
-                .await
-                .map_err(|e| format!("writing segment failed: {e}"))?;
+            .map_err(|error| format!("media-segment library policy: {error}"))?
+        {
+            return Ok(SegmentWriteOutcome::PolicySkipped);
         }
-        Ok(())
+        let producer = if let Some(state_path) = state_path {
+            let id: Uuid = provider_id
+                .strip_prefix("wasm:")
+                .ok_or("invalid loaded producer namespace")?
+                .parse()
+                .map_err(|_| "invalid loaded producer id")?;
+            if !cx
+                .plugins
+                .get_plugin(id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some_and(|plugin| plugin.enabled)
+            {
+                return Ok(SegmentWriteOutcome::PolicySkipped);
+            }
+            Some(std::sync::Arc::new(
+                ferrofin_core::CachedMediaSegmentProvider::new(
+                    provider_name.to_owned(),
+                    id,
+                    std::sync::Arc::clone(&cx.plugins),
+                    segment_item_kinds(),
+                    state_path.with_file_name(format!("{id}.segments")),
+                )
+                .with_legacy_ids(vec![provider_id.to_owned()]),
+            ))
+        } else {
+            None
+        };
+        if let Some(producer) = producer {
+            cx.media_segments
+                .replace_loaded_producer_segments(item, producer, &parsed)
+                .await
+                .map_err(|error| format!("persisting producer output failed: {error}"))?;
+        } else {
+            cx.media_segments
+                .replace_producer_segments(item, provider_id, None, &parsed)
+                .await
+                .map_err(|error| format!("writing segments failed: {error}"))?;
+        }
+        Ok(SegmentWriteOutcome::Written)
     })
 }
 
@@ -872,6 +969,24 @@ pub fn set_state(
     set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
 }
 
+type StateWriteLocks =
+    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<()>>>;
+
+fn state_write_lock(path: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<StateWriteLocks>> =
+        std::sync::OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| std::sync::Mutex::new(StateWriteLocks::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(std::sync::Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
 /// [`set_state`] with an explicit total cap (the host passes the
 /// operator-configured limit; the default wrapper serves tests/tools).
 ///
@@ -884,6 +999,10 @@ pub fn set_state_capped(
     total_cap: usize,
 ) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
+    let lock = state_write_lock(path);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = state_after_set(path, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
     let tmp = path.with_extension("tmp");
