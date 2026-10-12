@@ -1665,7 +1665,7 @@ fn push_resumable_predicate(
         // in no version group at all have no sibling that could eliminate
         // them, so short-circuit the scan for those." (`:586-602`)
         //
-        // The short-circuit is `FerrofinIX_BaseItems_PrimaryVersionId`'s one
+        // The short-circuit is `IX_BaseItems_PrimaryVersionId`'s one
         // job — partial on `PrimaryVersionId IS NOT NULL`, exactly as v12's
         // (`BaseItemConfiguration.cs:64-68`), so it can serve nothing else.
         // `IS` is EF's `==` on two nullable dates (both NULL ties); `>` is
@@ -2367,7 +2367,7 @@ fn push_order_expression(
             // candidate rows × the user's ~5.4k rows). Two arms: the item's
             // own row on `IX_UserData_ItemId_UserId_LastPlayedDate`, and its
             // alternates' rows — `alt` first, on the partial
-            // `FerrofinIX_BaseItems_PrimaryVersionId`, then the same index
+            // `IX_BaseItems_PrimaryVersionId`, then the same index
             // by the alternate's id. `CROSS JOIN` pins that order: left to
             // itself the planner re-drives the arm from `IX_UserData_UserId`
             // and walks the user's rows per candidate again (300 ms).

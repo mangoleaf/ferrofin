@@ -1684,7 +1684,7 @@ impl FerrofinItemRepository {
         // returned by `/Genres` beside the real genre, and `/Genres` and
         // `/MusicGenres`, which query the same `ItemValueType`, stop being
         // distinguishable. It is also the leading column of
-        // `FerrofinIX_BaseItems_Type_CleanName`, so constraining it keeps this
+        // `IX_BaseItems_Type_CleanName`, so constraining it keeps this
         // an index seek instead of a scan of every item.
         qb.push(r#" FROM "BaseItems" AS bi WHERE bi."Type" = "#)
             .push_bind(return_type.to_owned());
@@ -1883,7 +1883,7 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
     } = scope;
     // `+`: a plan pin, like the one on `TopParentId` below. Unpinned, the
     // planner drives the semijoin from every content row of the kind
-    // (`FerrofinIX_BaseItems_Type_…`, `Type=?`) and probes the value per
+    // (`IX_BaseItems_Type_…`, `Type=?`) and probes the value per
     // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
     // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
     if inner == InnerScope::Page && !content_type_names.is_empty() {
@@ -3727,7 +3727,7 @@ struct FlaggedRow {
 /// The statement [`rows_by_primary_flagged`] runs over `n` primary ids: the
 /// rows pointing at them (never the placeholder row, never one pointing at
 /// itself), each with whether a row points at IT — an `EXISTS` the partial
-/// `FerrofinIX_BaseItems_PrimaryVersionId` answers by one seek per row.
+/// `IX_BaseItems_PrimaryVersionId` answers by one seek per row.
 pub(crate) fn rows_by_primary_flagged_sql(n: usize) -> String {
     format!(
         r#"SELECT b.*, EXISTS (SELECT 1 FROM "BaseItems" x
