@@ -104,6 +104,7 @@ fn parse_file_subtitle_extensions_not_matched_returns_null(#[case] path: &str) {
 #[case("MyVideo.sami")]
 #[case("MyVideo.srt")]
 #[case("MyVideo.vtt")]
+#[case("MyVideo.idx")] // VobSub index (upstream 39c2885fd6)
 fn parse_file_subtitle_extensions_matched_returns_path(#[case] path: &str) {
     let options = NamingOptions::new();
     let loc = MockLocalization;

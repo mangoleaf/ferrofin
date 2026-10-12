@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 /// The branding options.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 pub struct BrandingOptions {
     /// Gets or sets the login disclaimer.
     #[serde(skip_serializing_if = "Option::is_none")]

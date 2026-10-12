@@ -186,6 +186,7 @@ async fn boot() -> Harness {
     db.run_migrations().await.expect("migrations");
 
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: std::path::PathBuf::from("ffmpeg"),
         ffprobe: std::path::PathBuf::from("ffprobe"),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -485,7 +486,7 @@ async fn step_playback_info(router: &axum::Router, auth_header: &str, harness: &
     );
 }
 
-/// Step 6 — `GET /Videos/{id}/stream` with a `Range` header direct-plays the
+/// Step 6 — `GET /Videos/{id}/stream?Static=true` with a `Range` header direct-plays the
 /// file: `206 Partial Content` + a matching `Content-Range`, serving exactly the
 /// requested bytes.
 async fn step_ranged_stream(router: &axum::Router, harness: &Harness) {
@@ -493,7 +494,7 @@ async fn step_ranged_stream(router: &axum::Router, harness: &Harness) {
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/Videos/{}/stream", harness.movie_id))
+                .uri(format!("/Videos/{}/stream?Static=true", harness.movie_id))
                 .header(header::RANGE, "bytes=0-3")
                 .body(Body::empty())
                 .unwrap(),

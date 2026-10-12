@@ -131,6 +131,21 @@ struct RecordingLibrary {
 
 #[async_trait]
 impl LibraryManager for RecordingLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_list(
         &self,
         query: &InternalItemsQuery,
@@ -263,10 +278,12 @@ impl LibraryManager for RecordingLibrary {
     }
 }
 
-/// A [`LibraryMonitor`] that records every reported path.
+/// A [`LibraryMonitor`] that records every reported path — the webhooks'
+/// in `reported`, anything reported as the filesystem watcher's in `watcher`.
 #[derive(Default)]
 struct RecordingMonitor {
     reported: Mutex<Vec<String>>,
+    watcher: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -288,6 +305,10 @@ impl LibraryMonitor for RecordingMonitor {
         Ok(())
     }
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
+        self.watcher.lock().unwrap().push(path.to_owned());
+        Ok(())
+    }
+    async fn report_webhook_change(&self, path: &str) -> Result<(), ServiceError> {
         self.reported.lock().unwrap().push(path.to_owned());
         Ok(())
     }
@@ -339,6 +360,11 @@ fn router_with_auth(
 
 /// The paths the monitor observed, in report order.
 fn reported(monitor: &RecordingMonitor) -> Vec<String> {
+    // Every webhook reports as a webhook, so its scan is tagged `webhook`.
+    assert!(
+        monitor.watcher.lock().unwrap().is_empty(),
+        "a webhook reported its path as the filesystem watcher"
+    );
     monitor.reported.lock().unwrap().clone()
 }
 
@@ -433,6 +459,31 @@ async fn media_updated_reports_each_body_path() {
         reported(&monitor),
         vec!["/a/x.mkv".to_owned(), "/b/y.mkv".to_owned()]
     );
+}
+
+/// Sonarr (v5-develop) and Radarr (develop) `MediaBrowserProxy.Update` post
+/// this exact body: Newtonsoft's `CamelCasePropertyNamesContractResolver`,
+/// `Formatting.Indented`, nulls omitted. Jellyfin's binder ignores member-name
+/// case, so it scans; before the shared binder folded names, Ferrofin answered
+/// 204 and scanned nothing.
+#[tokio::test]
+async fn media_updated_binds_the_arr_camel_case_webhook() {
+    for (body, path) in [
+        (
+            "{\n  \"updates\": [\n    {\n      \"path\": \"/tv/The Wire\",\n      \"updateType\": \"Created\"\n    }\n  ]\n}",
+            "/tv/The Wire",
+        ),
+        // `updateType` is null (omitted) when a batch mixes change kinds.
+        (
+            "{\n  \"updates\": [\n    {\n      \"path\": \"/movies/Heat\"\n    }\n  ]\n}",
+            "/movies/Heat",
+        ),
+    ] {
+        let (router, monitor) = router_with(seeded_items());
+        let status = post(router, "/Library/Media/Updated", Some(body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(reported(&monitor), vec![path.to_owned()], "{body}");
+    }
 }
 
 #[tokio::test]

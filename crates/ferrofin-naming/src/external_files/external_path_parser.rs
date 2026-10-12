@@ -47,14 +47,25 @@ impl<'a, L: LocalizationManager> ExternalPathParser<'a, L> {
         let matches_extension =
             |exts: &[String]| exts.iter().any(|e| e.eq_ignore_ascii_case(extension));
 
-        let supported = match self.profile_type {
-            DlnaProfileType::Subtitle => {
-                matches_extension(&self.naming_options.subtitle_file_extensions)
-            }
-            DlnaProfileType::Audio => matches_extension(&self.naming_options.audio_file_extensions),
-            DlnaProfileType::Lyric => matches_extension(&self.naming_options.lyric_file_extensions),
-            _ => false,
-        };
+        // .idx carries VobSub per-track language metadata. Recognize it here rather
+        // than adding it to NamingOptions.SubtitleFileExtensions, which also gates
+        // subtitle uploads/saves.
+        let is_vob_sub_index = self.profile_type == DlnaProfileType::Subtitle
+            && extension.eq_ignore_ascii_case(".idx");
+
+        let supported = is_vob_sub_index
+            || match self.profile_type {
+                DlnaProfileType::Subtitle => {
+                    matches_extension(&self.naming_options.subtitle_file_extensions)
+                }
+                DlnaProfileType::Audio => {
+                    matches_extension(&self.naming_options.audio_file_extensions)
+                }
+                DlnaProfileType::Lyric => {
+                    matches_extension(&self.naming_options.lyric_file_extensions)
+                }
+                _ => false,
+            };
         if !supported {
             return None;
         }

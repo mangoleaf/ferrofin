@@ -84,7 +84,7 @@ impl FerrofinMediaStreamRepository {
         let mut matching = Vec::new();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = stream_type_probe_sql(chunk.len());
-            let mut query = sqlx::query_scalar::<_, String>(&sql)
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
                 .bind(i64::from(media_stream_type_disc(stream_type)));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
@@ -129,8 +129,8 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         }
         sql.push_str(r#" ORDER BY "StreamIndex""#);
 
-        let mut query =
-            sqlx::query_as::<_, MediaStreamInfoEntity>(&sql).bind(guid_to_db(filter.item_id));
+        let mut query = sqlx::query_as::<_, MediaStreamInfoEntity>(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(filter.item_id));
         if let Some(index) = filter.index {
             query = query.bind(i64::from(index));
         }
@@ -159,7 +159,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
                 r#"SELECT * FROM "MediaStreamInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "StreamIndex""#,
             );
-            let mut query = sqlx::query_as::<_, MediaStreamInfoEntity>(&sql);
+            let mut query = sqlx::query_as::<_, MediaStreamInfoEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -222,6 +222,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
                 ?, ?, ?, ?)"#
         );
 
+        let insert_sql: std::sync::Arc<str> = insert_sql.into();
         let item_id_db = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
@@ -230,7 +231,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             .await
             .map_err(db_err)?;
         for s in streams {
-            sqlx::query(&insert_sql)
+            sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
                 .bind(&item_id_db)
                 .bind(s.stream_index)
                 .bind(&s.aspect_ratio)
@@ -460,7 +461,7 @@ mod tests {
         let db = test_db().await;
         let sql = super::stream_type_probe_sql(50);
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
         for _ in 0..51 {
             query = query.bind("x");
         }

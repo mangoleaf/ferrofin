@@ -436,7 +436,7 @@ pub fn fixed_sw_scale_filter(
                 "crop=iw:ih/2:0:0,{TAIL},scale={w}:trunc({w}/dar/2)*2"
             )),
             // MVC is not a frame-packed layout, so there is nothing to crop.
-            Video3DFormat::Mvc => None,
+            Video3DFormat::Mvc | Video3DFormat::Unrecognized(_) => None,
         };
         if let Some(filter) = filter {
             return filter;

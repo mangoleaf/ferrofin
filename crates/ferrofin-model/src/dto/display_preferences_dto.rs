@@ -11,25 +11,47 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// An enum representing the axis that should be scrolled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ScrollDirection {
     /// Horizontal scrolling direction.
     #[default]
     Horizontal,
     /// Vertical scrolling direction.
     Vertical,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ScrollDirection, None, {
+        Horizontal => ("Horizontal", 0),
+        Vertical => ("Vertical", 1),
+    }
 }
 
 /// An enum representing the sorting order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SortOrder {
     /// Sort in increasing order.
     #[default]
     Ascending,
     /// Sort in decreasing order.
     Descending,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SortOrder, None, {
+        Ascending => ("Ascending", 0),
+        Descending => ("Descending", 1),
+    }
 }
 
 /// Display preferences for any item that supports them (usually folders).

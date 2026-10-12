@@ -677,6 +677,32 @@ impl ferrofin_traits::plugins::PluginRequestHandler for RecordingRequestHandler 
     }
 }
 
+/// Query keys reach the route as sent (no server-side key folding), so the
+/// credential strip must match every spelling ASP.NET would read as the token.
+#[tokio::test]
+async fn plugin_route_strips_the_api_key_in_any_casing() {
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let state = authed_state_with_plugins(Arc::new(RecordingPlugins::default()))
+        .with_plugin_request_handler(handler.clone());
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/Plugins/{}/web/hook?x=1&ApiKey=tok&APIKEY=tok&Api_Key=tok&apikey=tok&y=2",
+                    known_id()
+                ))
+                .header("X-Emby-Token", "tok")
+                .body(Body::from("payload"))
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let seen = handler.seen.lock().unwrap().clone().expect("captured");
+    assert_eq!(seen.query, "x=1&y=2", "every api-key spelling stripped");
+}
+
 #[tokio::test]
 async fn plugin_route_strips_credentials_and_reserved_headers() {
     let handler = Arc::new(RecordingRequestHandler::default());
@@ -687,7 +713,7 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/Plugins/{}/web/hook?x=1&api_key=SECRET&y=2",
+                    "/Plugins/{}/web/hook?x=1&api_key=SECRET&%41piKey=SECRET2&API_KEY=SECRET3&api%5Fkey&y=2&x=%2526",
                     known_id()
                 ))
                 .header("Authorization", "Token super-secret")
@@ -717,7 +743,10 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
     let seen = handler.seen.lock().unwrap().clone().expect("captured");
     assert_eq!(seen.method, "POST");
     assert_eq!(seen.path, "/hook");
-    assert_eq!(seen.query, "x=1&y=2", "api_key stripped from the query");
+    assert_eq!(
+        seen.query, "x=1&y=2&x=%2526",
+        "all credential spellings stripped; other raw pairs preserved"
+    );
     let names: Vec<&str> = seen.headers.iter().map(|(n, _)| n.as_str()).collect();
     assert!(
         !names.contains(&"authorization")

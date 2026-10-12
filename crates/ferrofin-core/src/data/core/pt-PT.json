@@ -108,5 +108,18 @@
     "CleanupUserDataTaskDescription": "Apaga todos os dados de utilizador (estados de reprodução, favoritos, etc) de arquivos média não presentes há 90 dias ou mais.",
     "CleanupUserDataTask": "Limpeza de dados de utilizador",
     "Original": "Original",
-    "LyricDownloadFailureFromForItem": "Erro ao descarregar letras de {0} para {1}"
+    "LyricDownloadFailureFromForItem": "Erro ao descarregar letras de {0} para {1}",
+    "NameExtraDeletedScene": "Cena eliminada",
+    "NameExtraInterview": "Entrevista",
+    "NameExtraUnknown": "Extra",
+    "NameExtraBehindTheScenes": "Bastidores",
+    "NameExtraSample": "Amostra",
+    "NameExtraScene": "Cena",
+    "NameExtraClip": "Excerto",
+    "NameExtraFeaturette": "Minidocumentário",
+    "NameExtraThemeSong": "Tema musical",
+    "NameExtraThemeVideo": "Vídeo temático",
+    "NameExtraShort": "Curta-metragem",
+    "NameExtraNumbered": "{0} {1}",
+    "NameExtraTrailer": "Trailer"
 }

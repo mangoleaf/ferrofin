@@ -12,9 +12,9 @@
 //!   the configuration directory. The wire shape is unchanged — it is the same
 //!   [`ServerConfiguration`] the API returns.
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
-//!   the metadata path against the filesystem. The event bus is out of scope for
-//!   this unit; the metadata-path validation is preserved
-//!   ([`validate_metadata_path`](Self::validate_metadata_path)): a new, non-empty
+//!   the metadata path against the filesystem. Successful saves notify registered
+//!   observers; the metadata-path validation is preserved
+//!   ([`prepare_metadata_path`]): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
 //!   reproduced by pushing the new `MetadataPath` into the shared
@@ -57,8 +57,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use ferrofin_model::branding::BrandingOptions;
-use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};
-use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, ServerConfiguration};
+use ferrofin_traits::configuration::{
+    ConfigurationListener, ConfigurationUpdate, ServerConfigurationManager,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -211,7 +213,26 @@ pub struct FerrofinServerConfigurationManager {
     config_file: PathBuf,
     branding_file: PathBuf,
     encoding_file: PathBuf,
-    configuration: RwLock<Arc<ServerConfiguration>>,
+    metadata_file: PathBuf,
+    /// The `metadata.json` the last "unusable" warning was logged for, so a
+    /// broken document warns once per change, not on every read.
+    metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
+    configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
+}
+
+/// A file a warning was logged for, by its modification time (`None` when
+/// it has none to read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarnedFile(Option<std::time::SystemTime>);
+
+/// Hands the two settings that shape item ids to id derivation.
+fn publish_item_id_policy(configuration: &ServerConfiguration) {
+    crate::item_type_lookup::set_item_id_policy(
+        configuration.enable_case_sensitive_item_ids,
+        configuration.enable_normalized_item_by_name_ids,
+    );
 }
 
 impl std::fmt::Debug for FerrofinServerConfigurationManager {
@@ -243,6 +264,11 @@ impl FerrofinServerConfigurationManager {
     /// request path enforces it (`ferrofin_api::ip_access`).
     const NETWORK_FILE_NAME: &'static str = "network.json";
 
+    /// The on-disk metadata configuration file name (Jellyfin's named
+    /// `metadata` configuration, `MetadataConfigurationStore`): the "Date
+    /// added behavior for new content" the library scan dates new items by.
+    const METADATA_FILE_NAME: &'static str = "metadata.json";
+
     /// Loads (or initializes) the configuration for the given paths.
     ///
     /// If `{configuration-directory}/system.json` exists it is parsed. If it
@@ -273,6 +299,7 @@ impl FerrofinServerConfigurationManager {
         let named_dir = user_config_dir.join(Self::NAMED_SUBDIR);
         let branding_file = named_dir.join(Self::BRANDING_FILE_NAME);
         let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
+        let metadata_file = named_dir.join(Self::METADATA_FILE_NAME);
 
         // The named configurations live in their own files and are read on
         // demand, so adoption has to materialize them or the imported values
@@ -312,6 +339,17 @@ impl FerrofinServerConfigurationManager {
                 ferrofin_networking::NetworkConfiguration::default(),
                 "NetworkConfiguration",
                 config_import::NETWORK_XML_DENY,
+            )
+            .await?;
+            // "Date added behavior for new content": the library scan dates
+            // every new item by it, so an operator who chose "Use date
+            // scanned into the library" keeps that choice.
+            seed_named(
+                &config_dir.join("metadata.xml"),
+                &metadata_file,
+                MetadataConfiguration::default(),
+                "MetadataConfiguration",
+                &[],
             )
             .await
         };
@@ -381,15 +419,156 @@ impl FerrofinServerConfigurationManager {
             }
         }
 
+        initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
+        initialize_transcode_path(&paths, &encoding_file).await?;
+
+        prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
+        publish_item_id_policy(&configuration);
 
         Ok(Self {
             paths,
             config_file,
             branding_file,
             encoding_file,
-            configuration: RwLock::new(Arc::new(configuration)),
+            metadata_file,
+            metadata_warned: std::sync::Mutex::new(None),
+            configuration: Arc::new(RwLock::new(Arc::new(configuration))),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Persists the validated startup executable for the dashboard's read-only display.
+    ///
+    /// Executable selection remains a startup operation. Failed ffmpeg validation
+    /// must not call this method; a later ffprobe failure still preserves the display.
+    /// A failed legacy XML adoption leaves JSON absent for its next-boot retry, so
+    /// the display remains unavailable until that configuration can be imported.
+    ///
+    /// # Errors
+    /// Returns an error if the encoding document cannot be serialized or saved.
+    pub async fn set_encoder_app_path_display(&self, path: &str) -> Result<(), ServiceError> {
+        let _save = self.write_lock.lock().await;
+        let legacy_encoding = self.config_file.with_file_name("encoding.xml");
+        if !self.encoding_file.exists() && legacy_encoding.exists() {
+            tracing::warn!(
+                legacy_path = %legacy_encoding.display(),
+                "resolved encoder display was not saved while legacy encoding adoption is pending; repair the XML and restart to retry"
+            );
+            return Ok(());
+        }
+        let mut options = match self.get_encoding_options().await {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(%error, "loading encoding configuration failed; using defaults");
+                EncodingOptions::default()
+            }
+        };
+        options.encoder_app_path_display = Some(path.to_owned());
+        let json = serde_json::to_string_pretty(&options).map_err(|error| {
+            ServiceError::backend(format!("serialize encoding configuration: {error}"))
+        })?;
+        let file = self.encoding_file.clone();
+        let committed: Arc<str> = json.clone().into();
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&file, json.as_bytes())
+                .map_err(|error| io_err("write resolved encoder path", &file, &error))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("encoding writer: {error}")))??;
+        self.named_configuration_updated("encoding", committed);
+        Ok(())
+    }
+
+    /// Subscribes to successful main, branding, and named-store saves.
+    ///
+    /// The host registers listeners while constructing its services. A
+    /// listener receives the exact committed snapshot; failed saves emit none.
+    /// Keep captured service references weak if they own this manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener registry's lock is poisoned.
+    pub fn add_configuration_listener(&self, listener: Arc<ConfigurationListener>) {
+        self.listeners
+            .write()
+            .expect("configuration listener lock poisoned")
+            .push(listener);
+    }
+
+    /// The metadata configuration as saved now — C#
+    /// `GetMetadataConfiguration()` (`MetadataConfigurationExtensions.cs:12`,
+    /// `GetConfiguration<MetadataConfiguration>("metadata")`): the document
+    /// `POST /System/Configuration/metadata` writes, read on every call, so
+    /// a dashboard change applies to the next reader without a restart.
+    ///
+    /// A document never saved is the default. One that cannot be read or
+    /// parsed is the default too (upstream's `ConfigurationHelper` falls back
+    /// the same way), and says so at `warn` once per change of the file (its
+    /// modification time): the library scan reads this on every plan pass —
+    /// each scan, watcher batch and item refresh — and would otherwise repeat
+    /// the same warning for each.
+    ///
+    /// A synchronous read of one small local file: its readers are the scan's
+    /// planning pass, which stats every path it resolves the same way.
+    #[must_use]
+    pub fn metadata_configuration(&self) -> MetadataConfiguration {
+        let bytes = match std::fs::read(&self.metadata_file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.metadata_usable();
+                return MetadataConfiguration::default();
+            }
+            Err(e) => {
+                if self.first_metadata_warning() {
+                    tracing::warn!(
+                        path = %self.metadata_file.display(),
+                        error = %e,
+                        "could not read the metadata configuration; using its defaults"
+                    );
+                }
+                return MetadataConfiguration::default();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(config) => {
+                self.metadata_usable();
+                config
+            }
+            Err(e) => {
+                if self.first_metadata_warning() {
+                    tracing::warn!(
+                        path = %self.metadata_file.display(),
+                        error = %e,
+                        "the saved metadata configuration is not valid; using its defaults"
+                    );
+                }
+                MetadataConfiguration::default()
+            }
+        }
+    }
+
+    /// Whether the unusable `metadata.json` as it stands now has not been
+    /// warned about yet; records that it now has.
+    fn first_metadata_warning(&self) -> bool {
+        let mtime = std::fs::metadata(&self.metadata_file)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut warned = self
+            .metadata_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+    }
+
+    /// Forgets the last warning once the document reads again, so breaking
+    /// it later warns anew whatever its modification time.
+    fn metadata_usable(&self) {
+        self.metadata_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// A shared handle to the current configuration.
@@ -447,33 +626,31 @@ impl FerrofinServerConfigurationManager {
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)
     }
-
-    /// Validates a proposed metadata path, mirroring C# `ValidateMetadataPath`.
-    ///
-    /// A new, non-empty path that differs from the current one must already
-    /// exist as a directory; otherwise the update is rejected. An unchanged or
-    /// blank path is always accepted.
-    fn validate_metadata_path(&self, new_path: &str) -> Result<(), ServiceError> {
-        if new_path.trim().is_empty() {
-            return Ok(());
-        }
-        // Read through the shared handle: this only needs one field, so a deep
-        // clone of the whole document would be pure waste.
-        let current = self.snapshot_shared();
-        if new_path == current.metadata_path {
-            return Ok(());
-        }
-        if !PathBuf::from(new_path).is_dir() {
-            return Err(ServiceError::InvalidInput(format!(
-                "metadata path does not exist: {new_path}"
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        if key.eq_ignore_ascii_case("encoding") {
+            match serde_json::from_str::<EncodingOptions>(&json) {
+                Ok(options) => self
+                    .paths
+                    .set_transcode_path(options.transcoding_temp_path.as_deref()),
+                Err(error) => {
+                    tracing::warn!(%error, "committed encoding configuration could not update transcode path");
+                }
+            }
+        }
+
+        notify_listeners(
+            &self.listeners,
+            &ConfigurationUpdate::Named {
+                key: key.to_ascii_lowercase(),
+                json,
+            },
+        );
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
     }
@@ -486,26 +663,52 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         &self,
         configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
-        // ReplaceConfiguration: validate, persist, then apply side effects.
-        self.validate_metadata_path(&configuration.metadata_path)?;
-        write_config(&self.config_file, configuration).await?;
-
-        // Build the replacement outside the lock, then swap the pointer: the
-        // write section is a single pointer store, and readers holding an older
-        // handle keep a consistent view of the document they took.
+        // Hold the writer through validation, persistence, publication and
+        // notification. A cancelled caller must not leave disk ahead of memory.
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let old_metadata = self.snapshot_shared().metadata_path.clone();
+        let old_cache = self.snapshot_shared().cache_path.clone();
         let replacement = Arc::new(configuration.clone());
-        {
-            let mut guard = self
-                .configuration
-                .write()
-                .expect("configuration lock poisoned");
-            *guard = replacement;
-        }
-
-        // OnConfigurationUpdated → UpdateMetadataPath.
-        self.paths
-            .set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
-        Ok(())
+        let json = serde_json::to_vec_pretty(configuration)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
+        let path = self.config_file.clone();
+        let current = Arc::clone(&self.configuration);
+        let paths = Arc::clone(&self.paths);
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
+            if let Some(cache) = replacement
+                .cache_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                let cache_path = PathBuf::from(cache);
+                if old_cache.as_deref() != Some(cache) {
+                    if !cache_path.is_dir() {
+                        return Err(ServiceError::not_found(format!(
+                            "cache path does not exist: {cache}"
+                        )));
+                    }
+                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
+                    std::fs::File::create_new(&probe)
+                        .and_then(|_| std::fs::remove_file(&probe))
+                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
+                }
+                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
+                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
+            }
+            ferrofin_util::file_helper::atomic_write(&path, &json)
+                .map_err(|e| io_err("write configuration", &path, &e))?;
+            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            publish_item_id_policy(&replacement);
+            paths.set_cache_path(replacement.cache_path.as_deref());
+            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
+            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -520,16 +723,27 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
-        if let Some(parent) = self.branding_file.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io_err("create configuration directory", parent, &e))?;
-        }
-        let json = serde_json::to_vec_pretty(branding)
-            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?;
-        tokio::fs::write(&self.branding_file, json)
-            .await
-            .map_err(|e| io_err("write branding", &self.branding_file, &e))
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let json: Arc<str> = serde_json::to_string_pretty(branding)
+            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?
+            .into();
+        let path = self.branding_file.clone();
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+                .map_err(|e| io_err("write branding", &path, &e))?;
+            notify_listeners(
+                &listeners,
+                &ConfigurationUpdate::Named {
+                    key: "branding".into(),
+                    json,
+                },
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
@@ -541,6 +755,86 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
         serde_json::from_slice::<EncodingOptions>(&bytes)
             .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+    }
+}
+
+/// A changed dashboard directory must already exist and accept a write.
+/// Startup and unchanged paths are created if absent, as in UpdateMetadataPath.
+fn prepare_metadata_path(
+    paths: &FerrofinServerApplicationPaths,
+    proposed: &str,
+    previous: Option<&str>,
+) -> Result<(), ServiceError> {
+    let metadata = if proposed.trim().is_empty() {
+        PathBuf::from(paths.default_internal_metadata_path())
+    } else {
+        PathBuf::from(proposed)
+    };
+    if !proposed.trim().is_empty() && previous.is_some_and(|old| old != proposed) {
+        if !metadata.is_dir() {
+            return Err(ServiceError::not_found(format!(
+                "metadata path does not exist: {proposed}"
+            )));
+        }
+        let probe = metadata.join(uuid::Uuid::new_v4().to_string());
+        std::fs::File::create_new(&probe)
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| io_err("validate metadata directory", &metadata, &e))?;
+    }
+    std::fs::create_dir_all(&metadata)
+        .map_err(|e| io_err("prepare metadata directory", &metadata, &e))
+}
+
+fn initialize_cache_path(
+    paths: &FerrofinServerApplicationPaths,
+    configured: Option<&str>,
+) -> Result<(), ServiceError> {
+    let cache = configured
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(|| PathBuf::from(paths.cache_path()), PathBuf::from);
+    FerrofinServerApplicationPaths::prepare_cache_path(&cache)
+        .map_err(|e| io_err("prepare cache directory", &cache, &e))?;
+    paths.set_cache_path(configured);
+    Ok(())
+}
+
+/// Loads the named encoding path after cache initialization and prepares it.
+/// Read/parse failures retain defaults; filesystem preparation still fails startup.
+async fn initialize_transcode_path(
+    paths: &FerrofinServerApplicationPaths,
+    encoding_file: &std::path::Path,
+) -> Result<(), ServiceError> {
+    let encoding = match tokio::fs::read(encoding_file).await {
+        Ok(bytes) => match serde_json::from_slice::<EncodingOptions>(&bytes) {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(%error, "loading encoding configuration for transcode path failed; using defaults");
+                EncodingOptions::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => EncodingOptions::default(),
+        Err(error) => {
+            tracing::warn!(%error, "reading encoding configuration for transcode path failed; using defaults");
+            EncodingOptions::default()
+        }
+    };
+    paths.set_transcode_path(encoding.transcoding_temp_path.as_deref());
+    paths.prepare_transcode_path()?;
+    Ok(())
+}
+
+fn notify_listeners(
+    listeners: &RwLock<Vec<Arc<ConfigurationListener>>>,
+    update: &ConfigurationUpdate,
+) {
+    // Release the registry lock before invoking listeners so a callback can
+    // inspect configuration or register another observer without deadlocking.
+    let callbacks = listeners
+        .read()
+        .expect("configuration listener lock poisoned")
+        .clone();
+    for callback in callbacks {
+        callback(update);
     }
 }
 
@@ -790,6 +1084,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_override_is_live_persisted_and_clear_requires_fresh_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let original = paths.cache_path();
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut config = mgr.snapshot();
+        for name in ["cache-one", "cache-two"] {
+            let cache = tmp.path().join(name);
+            std::fs::create_dir(&cache).expect("cache");
+            config.cache_path = Some(cache.to_string_lossy().into_owned());
+            mgr.update_configuration(&config).await.expect("save");
+            assert_eq!(paths.cache_path(), cache.to_string_lossy());
+            assert_eq!(
+                paths.image_cache_path(),
+                cache.join("images").to_string_lossy()
+            );
+            assert!(cache.join(".jellyfin-cache").is_file());
+            assert!(
+                std::fs::read_to_string(cache.join("CACHEDIR.TAG"))
+                    .expect("tag")
+                    .starts_with("Signature: 8a477f597d28d172789f06886806bc55\n")
+            );
+        }
+        let reloaded_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&reloaded_paths))
+            .await
+            .expect("reload");
+        assert_eq!(reloaded_paths.cache_path(), paths.cache_path());
+        config.cache_path = Some("  ".into());
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_ne!(paths.cache_path(), original);
+        let restarted_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&restarted_paths))
+            .await
+            .expect("restart");
+        assert_eq!(restarted_paths.cache_path(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_paths_preserve_saved_configuration_and_live_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let previous = std::fs::read(&mgr.config_file).expect("config");
+        let original = paths.cache_path();
+        let mut config = mgr.snapshot();
+        config.cache_path = Some(tmp.path().join("missing").to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        let incompatible = tmp.path().join("config-root");
+        std::fs::create_dir(&incompatible).expect("mkdir");
+        std::fs::write(incompatible.join(".jellyfin-config"), "").expect("marker");
+        config.cache_path = Some(incompatible.to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(std::fs::read(&mgr.config_file).expect("config"), previous);
+        assert_eq!(paths.cache_path(), original);
+        assert!(!incompatible.join(".jellyfin-cache").exists());
+    }
+
+    #[tokio::test]
     async fn update_persists_and_syncs_metadata_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
@@ -888,7 +1251,7 @@ mod tests {
         ));
     }
 
-    /// `validate_metadata_path` reads the live document, so an unchanged path is
+    /// Metadata-path validation reads the live document, so an unchanged path is
     /// accepted even after the configuration has been replaced.
     #[tokio::test]
     async fn metadata_path_validation_reads_the_current_document() {
@@ -952,6 +1315,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_encoder_display_preserves_options_and_persists_across_restart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut options = EncodingOptions {
+            encoding_thread_count: 7,
+            encoder_app_path: Some("configured-executable".into()),
+            encoder_app_path_display: Some("old-display".into()),
+            ..EncodingOptions::default()
+        };
+        ferrofin_util::file_helper::atomic_write(
+            &mgr.encoding_file,
+            &serde_json::to_vec(&options).expect("serialize"),
+        )
+        .expect("save original");
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display");
+        options.encoder_app_path_display = Some("/resolved/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+        let restarted = FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("restart");
+        assert_eq!(
+            restarted.get_encoding_options().await.expect("encoding"),
+            options
+        );
+        mgr.set_encoder_app_path_display("/new/ffmpeg")
+            .await
+            .expect("changed executable");
+        options.encoder_app_path_display = Some("/new/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_initializes_absent_or_malformed_encoding_config() {
+        for malformed in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .expect("load");
+            if malformed {
+                ferrofin_util::file_helper::atomic_write(&mgr.encoding_file, b"bad json")
+                    .expect("corrupt config");
+            }
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .expect("display");
+            assert_eq!(
+                mgr.get_encoding_options().await.expect("encoding"),
+                EncodingOptions {
+                    encoder_app_path_display: Some("/resolved/ffmpeg".into()),
+                    ..EncodingOptions::default()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_reports_persistence_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        std::fs::create_dir_all(&mgr.encoding_file).expect("block destination");
+        assert!(
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .is_err()
+        );
+        assert!(mgr.encoding_file.is_dir());
+    }
+
+    #[tokio::test]
+    async fn transcode_path_loads_saved_root_and_publishes_committed_updates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let encoding_file =
+            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        let first = tmp.path().join("first-transcodes");
+        let first_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(first.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, first_json.as_bytes())
+            .expect("save startup configuration");
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        assert_eq!(PathBuf::from(paths.transcode_path()), first);
+        assert!(first.join(".jellyfin-transcode").is_file());
+        let operation = paths.transcode_path();
+        let second = tmp.path().join("second-transcodes");
+        let second_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(second.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, second_json.as_bytes())
+            .expect("persist named update");
+        mgr.named_configuration_updated("ENCODING", second_json.into());
+        assert_eq!(PathBuf::from(paths.transcode_path()), second);
+        assert_eq!(PathBuf::from(operation), first);
+        assert!(
+            !second.exists(),
+            "save publication does not create the directory"
+        );
+        paths.prepare_transcode_path().expect("operation starts");
+        assert!(second.join(".jellyfin-transcode").is_file());
+        let restarted = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("restart");
+        assert_eq!(
+            PathBuf::from(restarted.concrete_paths().transcode_path()),
+            second
+        );
+        mgr.named_configuration_updated("encoding", Arc::from(r#"{"TranscodingTempPath":""}"#));
+        assert_eq!(
+            PathBuf::from(paths.transcode_path()),
+            PathBuf::from(paths.cache_path()).join("transcodes")
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_path_rejects_conflicting_startup_markers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let transcode = PathBuf::from(paths.cache_path()).join("transcodes");
+        let nested = transcode.join("nested");
+        std::fs::create_dir_all(&nested).expect("directory");
+        std::fs::write(nested.join(".jellyfin-data"), b"").expect("wrong owner");
+        assert!(
+            FerrofinServerConfigurationManager::load(paths)
+                .await
+                .is_err()
+        );
+        assert!(!transcode.join(".jellyfin-transcode").exists());
+    }
+
+    #[tokio::test]
     async fn encoding_options_default_then_reads_persisted_document() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
@@ -1012,6 +1518,46 @@ mod tests {
         assert!(mgr.get_encoding_options().await.is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_directory_write_failure_preserves_config_and_clearing_resets_live_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let original = paths.internal_metadata_path();
+        let valid = tmp.path().join("custom-metadata");
+        std::fs::create_dir(&valid).expect("mkdir");
+        let mut config = mgr.snapshot();
+        config.metadata_path = valid.to_string_lossy().into_owned();
+        mgr.update_configuration(&config).await.expect("save valid");
+        assert_eq!(paths.internal_metadata_path(), config.metadata_path);
+        let previous = std::fs::read(&mgr.config_file).expect("read config");
+        let blocked = tmp.path().join("readonly");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555))
+            .expect("readonly");
+        config.metadata_path = blocked.to_string_lossy().into_owned();
+        let cannot_write = std::fs::File::create(blocked.join("probe")).is_err();
+        let result = mgr.update_configuration(&config).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        if cannot_write {
+            assert!(matches!(result, Err(ServiceError::Backend(_))));
+            assert_eq!(
+                std::fs::read(&mgr.config_file).expect("read config"),
+                previous
+            );
+            assert_eq!(paths.internal_metadata_path(), valid.to_string_lossy());
+        }
+        config.metadata_path = String::new();
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_eq!(paths.internal_metadata_path(), original);
+        assert!(std::path::Path::new(&original).is_dir());
+    }
+
     #[tokio::test]
     async fn update_rejects_missing_metadata_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1026,7 +1572,7 @@ mod tests {
             .update_configuration(&cfg)
             .await
             .expect_err("should reject");
-        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
     /// A fresh install is 12.0's `false`; an adopted `system.xml` carries its
@@ -1357,6 +1903,42 @@ mod tests {
             !mgr.encoding_file.exists(),
             "nothing was written, so the next boot tries again"
         );
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("pending adoption is preserved");
+        assert!(
+            !mgr.encoding_file.exists(),
+            "display update must not suppress a later XML import"
+        );
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("encoding"),
+            EncodingOptions::default()
+        );
+        std::fs::write(dir.join("encoding.xml"),
+            "<EncodingOptions><EncodingThreadCount>7</EncodingThreadCount><DownMixAudioBoost>1.5</DownMixAudioBoost></EncodingOptions>")
+            .expect("repair XML");
+        let restarted = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("retry import");
+        assert_eq!(
+            restarted
+                .get_encoding_options()
+                .await
+                .expect("adopted")
+                .encoding_thread_count,
+            7
+        );
+        restarted
+            .set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display after import");
+        let actual = restarted.get_encoding_options().await.expect("updated");
+        assert_eq!(actual.encoding_thread_count, 7);
+        assert_eq!(actual.down_mix_audio_boost.to_bits(), 1.5_f64.to_bits());
+        assert_eq!(
+            actual.encoder_app_path_display.as_deref(),
+            Some("/resolved/ffmpeg")
+        );
     }
 
     #[tokio::test]
@@ -1415,5 +1997,234 @@ mod tests {
             ferrofin_model::entities::HardwareAccelerationType::none,
             "the operator turned it off; adoption must not turn it back on"
         );
+    }
+
+    /// `GetMetadataConfiguration()`: the default until the dashboard saves
+    /// one, then what it saved, read live; a document that will not parse
+    /// is the default.
+    #[tokio::test]
+    async fn the_metadata_configuration_is_read_live_from_the_named_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert_eq!(
+            mgr.metadata_configuration(),
+            MetadataConfiguration::default()
+        );
+        assert!(
+            mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+
+        // What `POST /System/Configuration/metadata` writes for "Use date
+        // scanned into the library".
+        std::fs::create_dir_all(mgr.metadata_file.parent().expect("named dir")).expect("mkdir");
+        std::fs::write(
+            &mgr.metadata_file,
+            br#"{"UseFileCreationTimeForDateAdded":false}"#,
+        )
+        .expect("save");
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+
+        std::fs::write(
+            &mgr.metadata_file,
+            b"{\"UseFileCreationTimeForDateAdded\": fal",
+        )
+        .expect("corrupt");
+        assert_eq!(
+            mgr.metadata_configuration(),
+            MetadataConfiguration::default()
+        );
+    }
+
+    /// Counts the `WARN` events logged while it is the default subscriber.
+    struct CountWarnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A broken `metadata.json` warns once per change of the file, not on
+    /// every read (each scan, watcher batch and item refresh reads it); a
+    /// document that reads again resets that, so breaking it anew warns.
+    #[tokio::test]
+    async fn a_broken_metadata_configuration_warns_once_per_change() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CountWarnings(Arc::clone(&warnings))),
+        );
+        let count = || warnings.load(std::sync::atomic::Ordering::SeqCst);
+        let write = |body: &[u8], at: u64| {
+            std::fs::write(&mgr.metadata_file, body).expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&mgr.metadata_file)
+                .expect("open")
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(at))
+                .expect("mtime");
+        };
+        std::fs::create_dir_all(mgr.metadata_file.parent().expect("named dir")).expect("mkdir");
+
+        write(b"{\"UseFileCreationTimeForDateAdded\": fal", 1_000_000_000);
+        for _ in 0..3 {
+            assert_eq!(
+                mgr.metadata_configuration(),
+                MetadataConfiguration::default()
+            );
+        }
+        assert_eq!(count(), 1, "one warning for three reads of the same file");
+
+        write(b"not json either", 1_000_000_100);
+        let _ = mgr.metadata_configuration();
+        let _ = mgr.metadata_configuration();
+        assert_eq!(count(), 2, "a changed file warns again, once");
+
+        write(
+            br#"{"UseFileCreationTimeForDateAdded":false}"#,
+            1_000_000_200,
+        );
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert_eq!(count(), 2, "a valid document does not warn");
+        write(b"{", 1_000_000_100);
+        let _ = mgr.metadata_configuration();
+        assert_eq!(count(), 3, "broken again after it read: warns anew");
+    }
+
+    /// Adoption carries Jellyfin's `metadata.xml` over, so "Use date scanned
+    /// into the library" survives the move.
+    #[tokio::test]
+    async fn adoption_imports_the_date_added_behavior() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        std::fs::write(
+            tmp.path().join("config").join("metadata.xml"),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <MetadataConfiguration>\
+             <UseFileCreationTimeForDateAdded>false</UseFileCreationTimeForDateAdded>\
+             </MetadataConfiguration>",
+        )
+        .expect("metadata.xml");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert!(mgr.metadata_file.exists(), "seeded as the named JSON");
+    }
+    #[tokio::test]
+    async fn observers_see_committed_snapshots_and_no_failed_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .unwrap(),
+        );
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        let weak = Arc::downgrade(&manager);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            let manager = weak.upgrade().unwrap();
+            if let ConfigurationUpdate::Server(config) = update {
+                let saved: ServerConfiguration =
+                    serde_json::from_slice(&std::fs::read(&manager.config_file).unwrap()).unwrap();
+                assert_eq!(saved.server_name, config.server_name);
+                assert_eq!(manager.snapshot_shared().server_name, config.server_name);
+                assert_eq!(
+                    manager.paths.internal_metadata_path(),
+                    manager.paths.default_internal_metadata_path()
+                );
+            }
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in 0..20 {
+            let manager = Arc::clone(&manager);
+            jobs.spawn(async move {
+                let mut config = manager.snapshot();
+                config.server_name = format!("server-{index}");
+                manager.update_configuration(&config).await.unwrap();
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(updates.lock().unwrap().len(), 20);
+        let previous = manager.snapshot_shared();
+        let bytes = std::fs::read(&manager.config_file).unwrap();
+        let mut invalid = (*previous).clone();
+        invalid.metadata_path = tmp.path().join("missing").to_string_lossy().into_owned();
+        assert!(manager.update_configuration(&invalid).await.is_err());
+        assert_eq!(std::fs::read(&manager.config_file).unwrap(), bytes);
+        // A persistence failure must not publish an event or swap the live Arc.
+        std::fs::remove_file(&manager.config_file).unwrap();
+        std::fs::create_dir(&manager.config_file).unwrap();
+        let mut rejected = (*previous).clone();
+        rejected.server_name = "must-not-publish".into();
+        assert!(manager.update_configuration(&rejected).await.is_err());
+        assert!(Arc::ptr_eq(&previous, &manager.snapshot_shared()));
+        assert_eq!(updates.lock().unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn branding_and_named_stores_publish_the_committed_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .unwrap();
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let branding = BrandingOptions {
+            custom_css: Some("body { color: red; }".into()),
+            ..Default::default()
+        };
+        manager.update_branding(&branding).await.unwrap();
+        manager
+            .named_configuration_updated("NETWORK", Arc::from(r#"{"EnableRemoteAccess":false}"#));
+        {
+            let events = updates.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            let ConfigurationUpdate::Named { key, json } = &events[0] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "branding");
+            assert_eq!(
+                json.as_bytes(),
+                std::fs::read(&manager.branding_file).unwrap()
+            );
+            let ConfigurationUpdate::Named { key, json } = &events[1] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "network");
+            assert_eq!(&**json, r#"{"EnableRemoteAccess":false}"#);
+        }
+        std::fs::remove_file(&manager.branding_file).unwrap();
+        std::fs::create_dir(&manager.branding_file).unwrap();
+        assert!(manager.update_branding(&branding).await.is_err());
+        assert_eq!(updates.lock().unwrap().len(), 2);
     }
 }

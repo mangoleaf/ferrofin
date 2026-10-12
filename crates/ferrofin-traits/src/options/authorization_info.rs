@@ -1,7 +1,10 @@
 //! Port of `MediaBrowser.Controller.Net.AuthorizationInfo`.
 
+use std::sync::Arc;
+
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::secret::Secret;
+use ferrofin_model::users::UserPolicy;
 use uuid::Uuid;
 
 /// The authorization context resolved for an incoming request.
@@ -10,7 +13,7 @@ use uuid::Uuid;
 /// property becomes an [`Option`]`<`[`UserEntity`]`>` (the persistence row).
 /// This is a server-side request-context value, never serialized over the wire,
 /// so it carries no serde derives (and [`UserEntity`] has none either).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AuthorizationInfo {
     /// The device id supplied by the client.
     pub device_id: Option<String>,
@@ -32,6 +35,10 @@ pub struct AuthorizationInfo {
 
     /// The authenticated user, if the token resolved to one.
     pub user: Option<UserEntity>,
+
+    /// Policy resolved with the user token, sharing its cache invalidation.
+    /// Absent for API keys and requests without a resolved user.
+    pub user_policy: Option<Arc<UserPolicy>>,
 
     /// Whether the token authenticated successfully.
     pub is_authenticated: bool,

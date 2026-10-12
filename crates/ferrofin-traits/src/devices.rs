@@ -104,6 +104,20 @@ pub trait DeviceManager: Send + Sync {
         device_id: &str,
     ) -> Result<bool, ServiceError>;
 
+    /// Checks a page of device IDs with the same semantics as `can_access_device`.
+    /// Production implementations can resolve the user's access policy once.
+    async fn can_access_devices(
+        &self,
+        user: &UserEntity,
+        device_ids: &[&str],
+    ) -> Result<Vec<bool>, ServiceError> {
+        let mut allowed = Vec::with_capacity(device_ids.len());
+        for id in device_ids {
+            allowed.push(self.can_access_device(user, id).await?);
+        }
+        Ok(allowed)
+    }
+
     /// Updates a device's options (currently just its custom name).
     async fn update_device_options(
         &self,

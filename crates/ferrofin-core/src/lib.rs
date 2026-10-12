@@ -91,8 +91,12 @@
 //!   resolves images through an injected `Arc<dyn ImageProcessor>`, honors the
 //!   [`DtoOptions`](ferrofin_traits::options::DtoOptions) field/image toggles, and
 //!   reuses the [`kinds`] helpers to branch on an item's kind (the C#
-//!   subclass type-tests). LiveTV program/channel enrichment and active-recording
-//!   rewrites are deferred (their sibling seams are not injected into this unit).
+//!   subclass type-tests). LiveTV channel/programme enrichment runs through the
+//!   late-bound Live TV manager, and `CanDelete` is upstream's `CanDelete(user)`
+//!   in full (`item_deletion::can_delete`). The active-recording rewrite
+//!   (`DtoService.cs:443-466`) is an open work item: the files being written
+//!   are known (`LiveTvManager::active_recording_paths`), the rewrite is not
+//!   applied yet.
 //!
 //! ## Unit 7 — session manager + WebSocket wiring
 //!
@@ -156,11 +160,14 @@ pub mod aggregate_folder;
 pub mod api_key_manager;
 pub mod app_paths;
 pub mod application_host;
+mod audio_tags;
 pub mod auth_cache;
 pub mod auth_providers;
 pub mod authorization_context;
 pub mod by_name_store;
+pub mod cached_media_segment_provider;
 pub mod channel_manager;
+pub mod chapter_image_extractor;
 pub mod chapter_manager;
 pub mod chapter_repository;
 pub mod client_event_logger;
@@ -175,18 +182,25 @@ pub mod dto_service;
 pub mod dynamic_images;
 pub mod event_manager;
 pub mod external_data_manager;
+mod extra_owners_repository;
 pub mod file_system;
+pub mod intro_skipper_repository;
 pub mod item_count_service;
 pub mod item_data;
+mod item_deletion;
+pub(crate) mod item_folders;
 pub mod item_persistence_service;
 pub mod item_repository;
 pub mod item_type_lookup;
+pub mod item_visibility;
+mod item_visibility_repository;
 pub mod keyframe_repository;
 pub mod kinds;
 pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
 pub mod library_scan;
+mod library_structure_repository;
 pub mod linked_children_service;
 pub mod live_tv_import;
 pub mod localization_manager;
@@ -204,16 +218,22 @@ pub mod path_manager;
 pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
+mod query_restrictions;
 pub mod quick_connect_manager;
+use ferrofin_providers::refresh_plan;
 pub mod resolvers;
+pub mod scan_metrics;
+pub mod scan_progress;
 pub mod scheduled_tasks;
 pub mod search_manager;
 pub mod server_discovery;
 pub mod session_bus;
 pub mod session_manager;
 pub mod session_websocket_listener;
+mod shortcut;
 pub mod similar_items_manager;
 mod similar_items_repository;
+pub mod subtitle_downloader;
 pub mod subtitle_manager;
 pub mod sync_play_manager;
 pub mod system_manager;
@@ -221,13 +241,16 @@ pub mod text_util;
 pub mod translate_query;
 pub mod trickplay_manager;
 pub mod tv_series_manager;
+mod user_data_key_repository;
 pub mod user_data_keys;
 pub mod user_data_manager;
+mod user_data_retention_repository;
 pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_root_folder;
 pub mod user_view_manager;
 pub mod user_view_repository;
+pub mod video_versions;
 pub mod virtual_folder_manager;
 pub mod virtual_paths;
 pub mod years;
@@ -242,6 +265,7 @@ pub use app_paths::FerrofinServerApplicationPaths;
 pub use application_host::{FerrofinServerApplicationHost, HostNetworkInfo};
 pub use auth_providers::{DefaultAuthenticationProvider, InvalidAuthProvider};
 pub use authorization_context::{FerrofinAuthService, FerrofinAuthorizationContext};
+pub use cached_media_segment_provider::CachedMediaSegmentProvider;
 pub use channel_manager::FerrofinChannelManager;
 pub use chapter_manager::FerrofinChapterManager;
 pub use chapter_repository::FerrofinChapterRepository;
@@ -256,14 +280,17 @@ pub use external_data_manager::FerrofinExternalDataManager;
 pub use file_system::FerrofinFileSystem;
 pub use item_count_service::FerrofinItemCountService;
 pub use item_persistence_service::FerrofinItemPersistenceService;
-pub use item_repository::FerrofinItemRepository;
+pub use item_repository::{ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository};
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::FerrofinKeyframeRepository;
 pub use library_manager::FerrofinLibraryManager;
 pub use library_monitor::{
     FerrofinLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
 };
-pub use library_scan::LibraryScanner;
+pub use library_scan::{
+    LaneRefresh, LibraryScanner, PriorityLane, ScanCancel, ScanOutcome, ScanPasses, ScanProgress,
+    ScanRun,
+};
 pub use linked_children_service::FerrofinLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::FerrofinLyricManager;

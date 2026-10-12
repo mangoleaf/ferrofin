@@ -319,6 +319,75 @@ pub fn user_data_keys(item: &KeySource<'_>, series: Option<&KeySource<'_>>) -> V
     }
 }
 
+/// Private recovery identities preserve provider and media-type provenance.
+/// The compatible UserData keys above remain unchanged. Derive each provider
+/// separately through the same rules (including series suffixes and extras),
+/// so equal bare numbers from different providers cannot share a snapshot.
+pub(crate) fn retention_keys(item: &KeySource<'_>, series: Option<&KeySource<'_>>) -> Vec<String> {
+    let own = item.item_id.to_string();
+    let bare_item = without_providers(item);
+    let bare_series = series.map(without_providers);
+    let baseline = user_data_keys(&bare_item, bare_series.as_ref());
+    let current = user_data_keys(item, series);
+    let qualified = |namespace: &str, key: &str| {
+        serde_json::json!([format!("{:?}", item.kind), namespace, key]).to_string()
+    };
+    let mut keys = vec![qualified("guid", &own)];
+    for key in &baseline {
+        if key != &own && !key.is_empty() && current.contains(key) {
+            keys.push(qualified("metadata", key));
+        }
+    }
+    for provider in [
+        "Tmdb",
+        "Imdb",
+        "Tvdb",
+        "Custom",
+        "MusicBrainzAlbum",
+        "MusicBrainzReleaseGroup",
+        "MusicBrainzArtist",
+    ] {
+        let selected_item = with_one_provider(item, provider);
+        let selected_series = series.map(|s| with_one_provider(s, provider));
+        for key in user_data_keys(&selected_item, selected_series.as_ref()) {
+            if !key.is_empty() && !baseline.contains(&key) {
+                keys.push(qualified(provider, &key));
+            }
+        }
+    }
+    keys
+}
+
+fn without_providers<'a>(source: &KeySource<'a>) -> KeySource<'a> {
+    KeySource {
+        tmdb: None,
+        imdb: None,
+        tvdb: None,
+        custom: None,
+        musicbrainz_album: None,
+        musicbrainz_release_group: None,
+        musicbrainz_artist: None,
+        ..*source
+    }
+}
+
+fn with_one_provider<'a>(source: &KeySource<'a>, provider: &str) -> KeySource<'a> {
+    let mut selected = without_providers(source);
+    match provider {
+        "Tmdb" => selected.tmdb = source.tmdb,
+        "Imdb" => selected.imdb = source.imdb,
+        "Tvdb" => selected.tvdb = source.tvdb,
+        "Custom" => selected.custom = source.custom,
+        "MusicBrainzAlbum" => selected.musicbrainz_album = source.musicbrainz_album,
+        "MusicBrainzReleaseGroup" => {
+            selected.musicbrainz_release_group = source.musicbrainz_release_group;
+        }
+        "MusicBrainzArtist" => selected.musicbrainz_artist = source.musicbrainz_artist,
+        _ => unreachable!("fixed provider list"),
+    }
+    selected
+}
+
 /// Every series key with `suffix` appended — a `Season`'s derivation.
 fn series_derived(series: Option<&KeySource<'_>>, suffix: &str) -> Vec<String> {
     let Some(series) = series else {

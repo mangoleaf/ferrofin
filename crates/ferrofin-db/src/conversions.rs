@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn media_segment_rejects_bad_type() {
+    fn media_segment_preserves_unnamed_type() {
         let entity = MediaSegmentEntity {
             id: Uuid::from_u128(1).to_string(),
             end_ticks: 0,
@@ -170,13 +170,10 @@ mod tests {
             start_ticks: 0,
             type_: 99,
         };
-        assert!(matches!(
-            MediaSegmentDto::try_from(entity),
-            Err(DbError::InvalidEnumValue {
-                enum_name: "MediaSegmentType",
-                value: 99,
-            })
-        ));
+        assert_eq!(
+            MediaSegmentDto::try_from(entity).expect("convert").type_,
+            MediaSegmentType::Unrecognized(99)
+        );
     }
 
     #[test]
@@ -381,18 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn base_item_image_rejects_bad_image_type() {
-        assert!(matches!(
-            ImageInfo::try_from(base_item_image(13)),
-            Err(DbError::InvalidEnumValue {
-                enum_name: "ImageType",
-                value: 13,
-            })
-        ));
+    fn base_item_image_preserves_unnamed_image_type() {
+        assert_eq!(
+            ImageInfo::try_from(base_item_image(13))
+                .expect("convert")
+                .image_type,
+            ImageType::Unrecognized(13)
+        );
     }
 
     /// Builds an `ActivityLogEntity` with the given `LogSeverity` discriminant,
-    /// for exercising `log_level_from_i32`.
+    /// for exercising the `LogLevel` conversion.
     fn activity_log(log_severity: i32) -> ActivityLogEntity {
         ActivityLogEntity {
             id: 1,
@@ -427,14 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn activity_log_rejects_bad_severity() {
-        assert!(matches!(
-            ActivityLogEntry::try_from(activity_log(7)),
-            Err(DbError::InvalidEnumValue {
-                enum_name: "LogLevel",
-                value: 7,
-            })
-        ));
+    fn activity_log_keeps_an_undefined_severity() {
+        let dto = ActivityLogEntry::try_from(activity_log(7)).expect("converts");
+        assert_eq!(dto.severity, LogLevel::Unrecognized(7));
     }
 
     /// Builds a `DisplayPreferencesEntity` with the given `IndexBy` and
@@ -493,14 +484,13 @@ mod tests {
     }
 
     #[test]
-    fn display_preferences_rejects_bad_scroll_direction() {
-        assert!(matches!(
-            DisplayPreferencesDto::try_from(display_preferences(None, 9)),
-            Err(DbError::InvalidEnumValue {
-                enum_name: "ScrollDirection",
-                value: 9,
-            })
-        ));
+    fn display_preferences_preserves_unnamed_scroll_direction() {
+        assert_eq!(
+            DisplayPreferencesDto::try_from(display_preferences(None, 9))
+                .expect("convert")
+                .scroll_direction,
+            ScrollDirection::Unrecognized(9)
+        );
     }
 
     #[test]

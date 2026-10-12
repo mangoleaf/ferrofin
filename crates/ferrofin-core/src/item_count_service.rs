@@ -16,16 +16,70 @@ use ferrofin_db::enums::ItemValueType;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
+use sqlx::{Execute, QueryBuilder, Sqlite};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemCountService, NameItemRow, PlayedAndTotal};
+use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow, PlayedAndTotal};
 
 use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{QueryShape, build_query};
+use crate::translate_query::{QueryShape, append_parental_restrictions, build_query};
+
+/// Adds the same rating predicate as browsing before an existing aggregate's
+/// GROUP BY. Its suffix contains no parameters, so the original bind order is
+/// retained. Related-id aggregates correlate a primary-key lookup; by-name
+/// aggregates already have the `bi` row in hand.
+fn restrict_count_query<'q>(
+    mut query: impl Execute<'q, Sqlite>,
+    filter: &InternalItemsQuery,
+    related_id: Option<&str>,
+) -> Result<QueryBuilder<Sqlite>, ServiceError> {
+    let arguments = query
+        .take_arguments()
+        .map_err(|error| ServiceError::backend(error.to_string()))?
+        .unwrap_or_default();
+    let sql = query.sql();
+    let (prefix, suffix) = sql
+        .as_str()
+        .rsplit_once(" GROUP BY ")
+        .map_or((sql.as_str(), None), |(prefix, suffix)| {
+            (prefix, Some(suffix))
+        });
+    let mut qb = QueryBuilder::with_arguments(prefix, arguments);
+    let restricted = crate::translate_query::has_parental_restrictions(filter);
+    if restricted {
+        if let Some(id) = related_id {
+            qb.push(format!(
+                r#" AND EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = {id}"#
+            ));
+        }
+        append_parental_restrictions(&mut qb, filter, "bi");
+        if related_id.is_some() {
+            qb.push(")");
+        }
+    }
+    if let Some(suffix) = suffix {
+        qb.push(" GROUP BY ").push(suffix);
+    }
+    Ok(qb)
+}
+
+/// `BaseItem.DisplayExtraTypes`: Unknown, Clip, BehindTheScenes,
+/// DeletedScene, Interview, Scene, Sample, Featurette and Short. Trailer (2)
+/// has its own count; theme media (8/9) and NULL are excluded. The OwnerId
+/// index keeps the query scoped to the requested page, including parentless extras.
+fn extra_counts_sql(owner_count: usize) -> String {
+    format!(
+        r#"SELECT "OwnerId",
+            SUM(CASE WHEN "ExtraType" IN (0,1,3,4,5,6,7,10,11) THEN 1 ELSE 0 END),
+            SUM(CASE WHEN "ExtraType" = 2 THEN 1 ELSE 0 END)
+           FROM "BaseItems" WHERE "OwnerId" IN ({}) GROUP BY "OwnerId""#,
+        placeholders(owner_count)
+    )
+}
 
 /// The concrete item-count service.
 #[derive(Clone)]
@@ -70,6 +124,11 @@ impl FerrofinItemCountService {
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = preferences.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         // Reuse the translated filter to constrain the matching item set, then
         // intersect with the ancestor's descendant closure.
         let matching = {
@@ -89,7 +148,8 @@ impl FerrofinItemCountService {
             );
             sql.push_str(&placeholders(matching.len()));
             sql.push(')');
-            let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(ancestor_id));
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
+                .bind(guid_to_db(ancestor_id));
             for id in &matching {
                 query = query.bind(id.as_str());
             }
@@ -110,7 +170,8 @@ impl FerrofinItemCountService {
         );
         sql.push_str(&placeholders(descendants.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
+        let mut query =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
         for id in &descendants {
             query = query.bind(id.as_str());
         }
@@ -130,6 +191,7 @@ impl FerrofinItemCountService {
         rows: &[NameItemRow<'_>],
         related_item_kinds: &[BaseItemKind],
         mut out: HashMap<Uuid, ItemCounts>,
+        access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
         // Each row's Name comes from the caller's already-projected row — the
         // page was read out of `BaseItems` to build the DTOs, so re-selecting
@@ -159,14 +221,20 @@ impl FerrofinItemCountService {
         for chunk in distinct_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
-            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             for name in chunk {
                 query = query.bind(*name);
             }
             for t in &type_names {
                 query = query.bind(*t);
             }
-            for (name, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            for (name, type_, count) in restricted
+                .build_query_as::<(String, String, i64)>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+            {
                 by_name
                     .entry(name)
                     .or_default()
@@ -193,6 +261,7 @@ impl FerrofinItemCountService {
         rows: &[NameItemRow<'_>],
         related_item_kinds: &[BaseItemKind],
         mut out: HashMap<Uuid, ItemCounts>,
+        access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
         // The row's Name is already in hand from the page the caller projected.
         let year_by_id: Vec<(Uuid, i64)> = rows
@@ -222,14 +291,20 @@ impl FerrofinItemCountService {
         let mut by_year: HashMap<i64, HashMap<String, i32>> = HashMap::new();
         for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = production_year_counts_sql(chunk.len(), type_names.len());
-            let mut query = sqlx::query_as::<_, (i64, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe(sql));
             for year in chunk {
                 query = query.bind(*year);
             }
             for t in &type_names {
                 query = query.bind(*t);
             }
-            for (year, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            for (year, type_, count) in restricted
+                .build_query_as::<(i64, String, i64)>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+            {
                 by_year
                     .entry(year)
                     .or_default()
@@ -248,6 +323,34 @@ impl FerrofinItemCountService {
 
 #[async_trait]
 impl ItemCountService for FerrofinItemCountService {
+    async fn get_extra_counts_batch(
+        &self,
+        owner_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
+        let mut counts = HashMap::new();
+        for chunk in owner_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = extra_counts_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (owner, special_features, local_trailers) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                if let Ok(owner) = Uuid::parse_str(&owner) {
+                    counts.insert(
+                        owner,
+                        ExtraCounts {
+                            special_features: i32::try_from(special_features).unwrap_or(i32::MAX),
+                            local_trailers: i32::try_from(local_trailers).unwrap_or(i32::MAX),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(counts)
+    }
+
     async fn get_count(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
         // Same `AddUserToQuery` confinement the item queries get: a user who may
         // see one library must be counted over that library, not the server.
@@ -255,6 +358,9 @@ impl ItemCountService for FerrofinItemCountService {
         // catalogue's totals — numbers it could not then browse to.
         let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::Count);
         let count: i64 = qb
             .build_query_scalar::<i64>()
@@ -274,6 +380,9 @@ impl ItemCountService for FerrofinItemCountService {
         // endpoint's CPU on a large library.
         let scoped = crate::item_repository::scope_to_user_libraries(&self.db, filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         let mut qb = build_query(filter, QueryShape::TypeCounts);
         let rows = qb
             .build_query_as::<(String, i64)>()
@@ -338,6 +447,8 @@ impl ItemCountService for FerrofinItemCountService {
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, access_filter).await?;
+        let access_filter = preferences.as_ref().unwrap_or(access_filter);
         // Every row reports counts (zeros when its CleanName is missing),
         // matching the per-item form's defaults.
         let mut out: HashMap<Uuid, ItemCounts> = rows
@@ -353,7 +464,9 @@ impl ItemCountService for FerrofinItemCountService {
         // C# `ItemCountService` Person branch (`m.People.Name == item.Name`). The
         // CleanName/ItemValues path below would count zero for a Person.
         if kind == BaseItemKind::Person {
-            return self.people_name_counts(rows, related_item_kinds, out).await;
+            return self
+                .people_name_counts(rows, related_item_kinds, out, access_filter)
+                .await;
         }
         // A `Year` counts by `ProductionYear`, not by a value name
         // (`ItemCountService.cs:170-181`); routing it through the clean-value
@@ -369,7 +482,7 @@ impl ItemCountService for FerrofinItemCountService {
         // query.Years = [year];`.
         if kind == BaseItemKind::Year {
             return self
-                .production_year_counts(rows, related_item_kinds, out)
+                .production_year_counts(rows, related_item_kinds, out, access_filter)
                 .await;
         }
         // The C# `switch`'s `default:` arm returns an empty `ItemCounts`. Any
@@ -396,13 +509,7 @@ impl ItemCountService for FerrofinItemCountService {
 
         // Count the related items carrying each clean value, grouped by value
         // and type — one query per chunk covers the whole page.
-        // ponytail: no access-scoping `bi."Id" IN (...)` clause — Ferrofin implements no per-user
-        // parental/library restriction yet, so `access_filter` (user-only) matches every item.
-        // The previous code materialized the *entire* accessible id set and bound it as a giant
-        // IN — run once PER name-item (N per page), each a full-library scan that filtered
-        // nothing. Re-introduce access scoping as a SQL predicate (subquery/join), not an
-        // app-materialized id list, when real access restrictions land.
-        let _ = access_filter;
+        // Apply access predicates inside SQL before aggregating each value.
         // Dedupe by borrowing from `clean_by_id`; the chunks bind straight through
         // to sqlx as `&str`, so no clean value is copied on this path.
         let distinct_cleans: Vec<&str> = clean_by_id
@@ -415,14 +522,20 @@ impl ItemCountService for FerrofinItemCountService {
         for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = item_value_counts_sql(chunk.len(), type_names.len(), value_types);
 
-            let mut query = sqlx::query_as::<_, (String, String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             for clean in chunk {
                 query = query.bind(*clean);
             }
             for t in &type_names {
                 query = query.bind(*t);
             }
-            for (clean, type_, count) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            for (clean, type_, count) in restricted
+                .build_query_as::<(String, String, i64)>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+            {
                 by_clean
                     .entry(clean)
                     .or_default()
@@ -467,6 +580,11 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
+        let preferences = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = preferences.as_ref().unwrap_or(filter);
+        let descendants =
+            crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
+        let filter = descendants.as_ref().unwrap_or(filter);
         // Linked-children played/total: count the parent's LinkedChildren that
         // match the filter and are played. Only the direct linked children are
         // counted; recursive linked-folder descent is deferred.
@@ -485,7 +603,8 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(matching.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(guid_to_db(parent_id));
+        let mut query =
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(parent_id));
         for id in &matching {
             query = query.bind(id.as_str());
         }
@@ -503,7 +622,8 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(children.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(guid_to_db(user_id));
+        let mut query =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql)).bind(guid_to_db(user_id));
         for id in &children {
             query = query.bind(id.as_str());
         }
@@ -539,11 +659,20 @@ impl ItemCountService for FerrofinItemCountService {
         };
 
         let total_sql = grouped("", "");
-        let mut total_q = sqlx::query_as::<_, (String, i64)>(&total_sql);
+        let mut total_q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(total_sql));
         for id in &ids {
             total_q = total_q.bind(id.as_str());
         }
-        let totals = total_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let mut access_filter = InternalItemsQuery::default();
+        access_filter.set_user(user.clone());
+        let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
+        let access_filter = preferences.unwrap_or(access_filter);
+        let mut total_q = restrict_count_query(total_q, &access_filter, Some(r#"a."ItemId""#))?;
+        let totals = total_q
+            .build_query_as::<(String, i64)>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
 
         // Played subset: the same closure, joined to this user's played `UserData`.
         // `CROSS JOIN` is the join-order pin, not a different join — see
@@ -556,11 +685,17 @@ impl ItemCountService for FerrofinItemCountService {
             r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
         );
         // The `?` for UserId precedes the `ParentItemId` in-list, so bind it first.
-        let mut played_q = sqlx::query_as::<_, (String, i64)>(&played_sql).bind(user.id.as_str());
+        let mut played_q = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(played_sql))
+            .bind(user.id.as_str());
         for id in &ids {
             played_q = played_q.bind(id.as_str());
         }
-        let played_rows = played_q.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let mut played_q = restrict_count_query(played_q, &access_filter, Some(r#"a."ItemId""#))?;
+        let played_rows = played_q
+            .build_query_as::<(String, i64)>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
         let played_by_parent: HashMap<String, i64> = played_rows.into_iter().collect();
 
         let mut by_parent: HashMap<String, PlayedAndTotal> = HashMap::with_capacity(totals.len());
@@ -594,14 +729,23 @@ impl ItemCountService for FerrofinItemCountService {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn get_child_count_batch(
         &self,
         parent_ids: &[Uuid],
-        _user_id: Option<Uuid>,
+        user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError> {
         if parent_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let mut access_filter = InternalItemsQuery::default();
+        if let Some(id) = user_id
+            && let Some(user) = crate::item_repository::query_user(&self.db, id).await?
+        {
+            access_filter.set_user(user);
+        }
+        let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
+        let access_filter = preferences.unwrap_or(access_filter);
         // C# `ItemCountService.GetChildCountBatch`: one grouped count of direct
         // `BaseItems` children plus one of `LinkedChildren` rows; a parent with
         // linked children reports those instead of its hierarchical children.
@@ -609,8 +753,12 @@ impl ItemCountService for FerrofinItemCountService {
         // A Jellyfin library is virtual, so its children hang off its physical
         // folders and grouping on the raw `ParentId` would report 0 for every
         // library on an adopted database — the same translation the item
-        // repository does for a browse (`physical_folders_by_view`). Empty, and
-        // so a no-op, on a Ferrofin-written database.
+        // repository does for a browse. The library itself is counted too:
+        // a Ferrofin scan saves the rows it plans under the collection
+        // folder, so an adopted library's children are split between the two
+        // until every row is saved (`library_top_parents_by_view`; no row
+        // hangs off both, so the sum counts each once). Empty, and so a
+        // no-op, on a Ferrofin-written database.
         //
         // Two more translations come from the root pair. `Folder.GetChildren`
         // (Folder.cs:1348-1360) delegates the physical root's children to the
@@ -625,7 +773,8 @@ impl ItemCountService for FerrofinItemCountService {
         };
         let resolved_parents: Vec<Uuid> = parent_ids.iter().copied().map(as_user_root).collect();
         let by_view =
-            crate::item_repository::physical_folders_by_view(&self.db, &resolved_parents).await?;
+            crate::item_repository::library_top_parents_by_view(&self.db, &resolved_parents)
+                .await?;
         let counted: Vec<Uuid> = resolved_parents
             .iter()
             .flat_map(|p| match by_view.get(p) {
@@ -650,17 +799,33 @@ impl ItemCountService for FerrofinItemCountService {
             let mut sql = grouped_count(table);
             if table == "BaseItems" {
                 // Direct-child counts skip merged alternates too (a season's
-                // ChildCount is its DISTINCT episodes, not every version).
+                // ChildCount is its DISTINCT episodes, not every version), and
+                // a stacked part or local version, which belongs to its owner
+                // (`DescendantQueryHelper.IsDistinctLibraryItem`).
                 sql = sql.replace(
                     r#"WHERE "ParentId" IN ("#,
-                    r#"WHERE "PrimaryVersionId" IS NULL AND "ParentId" IN ("#,
+                    r#"WHERE "PrimaryVersionId" IS NULL
+                         AND ("OwnerId" IS NULL OR "ExtraType" IS NOT NULL)
+                         AND "ParentId" IN ("#,
                 );
             }
-            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
             for id in &ids {
                 query = query.bind(id.as_str());
             }
-            into.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+            let id = if table == "BaseItems" {
+                r#""BaseItems"."Id""#
+            } else {
+                r#""LinkedChildren"."ChildId""#
+            };
+            let mut query = restrict_count_query(query, &access_filter, Some(id))?;
+            into.extend(
+                query
+                    .build_query_as::<(String, i64)>()
+                    .fetch_all(self.db.pool())
+                    .await
+                    .map_err(db_err)?,
+            );
         }
 
         // The virtual children — one tiny indexed count, issued only when the
@@ -720,7 +885,7 @@ impl ItemCountService for FerrofinItemCountService {
         );
         sql.push_str(&placeholders(ids.len()));
         sql.push_str(r#") GROUP BY "ParentId""#);
-        let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+        let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
         for id in &ids {
             query = query.bind(id.as_str());
         }
@@ -770,15 +935,31 @@ impl FerrofinItemCountService {
         &self,
         user: &UserEntity,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        let total: i64 = sqlx::query_scalar(
-            r#"SELECT COUNT(*) FROM "BaseItems"
-               WHERE "IsFolder" = 0 AND "PrimaryVersionId" IS NULL AND "IsVirtualItem" = 0"#,
-        )
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        let played: i64 = sqlx::query_scalar(WHOLE_SERVER_PLAYED_COUNT_SQL)
-            .bind(user.id.as_str())
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(user.clone());
+        let preferences = crate::query_restrictions::resolve(&self.db, &filter).await?;
+        let filter = preferences.unwrap_or(filter);
+        let mut total_query = restrict_count_query(
+            sqlx::query(
+                r#"SELECT COUNT(*) FROM "BaseItems" bi
+               WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL AND bi."IsVirtualItem" = 0
+                 AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)"#,
+            ),
+            &filter,
+            None,
+        )?;
+        let total: i64 = total_query
+            .build_query_scalar()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        let mut played_query = restrict_count_query(
+            sqlx::query(WHOLE_SERVER_PLAYED_COUNT_SQL).bind(user.id.as_str()),
+            &filter,
+            None,
+        )?;
+        let played: i64 = played_query
+            .build_query_scalar()
             .fetch_one(self.db.pool())
             .await
             .map_err(db_err)?;
@@ -930,7 +1111,9 @@ fn people_name_counts_sql(names: usize, types: usize) -> String {
 ///
 /// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
 /// their primary — counting them inflated every series/season episode total
-/// after a merge-versions pass.
+/// after a merge-versions pass. A stacked part or local version (owned, no
+/// `ExtraType`) belongs to its owner and is no item of its own; an extra
+/// is counted (`DescendantQueryHelper.IsDistinctLibraryItem`).
 ///
 /// `IsVirtualItem = 0` is upstream's, not an optimisation: BOTH
 /// `Folder.GetRecursiveChildCount` (Folder.cs:701-714) and the
@@ -948,7 +1131,8 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
                          WHERE bi."Id" = a."ItemId"
                            AND bi."IsFolder" = 0
                            AND bi."IsVirtualItem" = 0
-                           AND bi."PrimaryVersionId" IS NULL){extra_where}
+                           AND bi."PrimaryVersionId" IS NULL
+                           AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)){extra_where}
              AND a."ParentItemId" IN ("#
     );
     sql.push_str(&placeholders(parents));
@@ -998,7 +1182,8 @@ fn folder_leaf_count_sql(parents: usize, extra_join: &str, extra_where: &str) ->
 const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = r#"SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
    JOIN "UserData" ud ON ud."ItemId" = bi."Id"
    WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
-     AND bi."IsVirtualItem" = 0 AND ud."UserId" = ?1 AND ud."Played" = 1"#;
+     AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)
+     AND bi."IsVirtualItem" = 0 AND ud."UserId" = ? AND ud."Played" = 1"#;
 
 /// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
 /// (genre / music genre / studio / artist): `cleans` bound clean values,
@@ -1107,6 +1292,47 @@ fn placeholders(n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn extra_counts_batch_chunks_deduplicates_and_uses_owner_index() {
+        let db = crate::test_support::test_db().await;
+        let owner = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, owner, BaseItemKind::Movie, "Movie").await;
+        let extra = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, extra, BaseItemKind::Video, "Clip").await;
+        let mut row = crate::test_support::fetch_item(&db, extra).await;
+        row.owner_id = Some(guid_to_db(owner));
+        row.extra_type = Some(1);
+        crate::test_support::save_item(&db, &row).await;
+        let svc = FerrofinItemCountService::new(db.clone());
+        assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
+        let mut owners = vec![Uuid::new_v4(); ferrofin_db::BATCH_BIND_CHUNK + 1];
+        owners[0] = owner;
+        owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
+        let counts = svc.get_extra_counts_batch(&owners).await.unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(
+            counts[&owner],
+            ExtraCounts {
+                special_features: 1,
+                local_trailers: 0
+            }
+        );
+        let sql = format!("EXPLAIN QUERY PLAN {}", extra_counts_sql(1));
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(owner))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            plan.iter().any(|r| r
+                .3
+                .contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
+            "{plan:?}"
+        );
+        db.close().await;
+        assert!(svc.get_extra_counts_batch(&[owner]).await.is_err());
+    }
+
     use super::*;
     use crate::test_support::{
         fetch_item, seed_child_item, seed_item, seed_item_genre, seed_item_value,
@@ -1270,6 +1496,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parental_rating_applies_to_counts_before_aggregation() {
+        use ferrofin_traits::persistence::LinkedChildrenService;
+        let db = test_db().await;
+        let service = svc(&db);
+        let (folder, adult, child, mut user) = seed_folder_tree(&db).await;
+        user.max_parental_rating_score = Some(12);
+        sqlx::query(r#"UPDATE "Users" SET "MaxParentalRatingScore" = 12 WHERE "Id" = ?"#)
+            .bind(&user.id)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        for (id, rating) in [(adult, 18), (child, 10)] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = ?, "ParentId" = ?, "ProductionYear" = 2020 WHERE "Id" = ?"#)
+                .bind(rating).bind(guid_to_db(folder)).bind(guid_to_db(id)).execute(db.writer()).await.unwrap();
+            seed_item_genre(&db, id, "Shared").await;
+        }
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(user.clone());
+        let batch = service
+            .get_played_and_total_count_batch(&[folder], &user)
+            .await
+            .unwrap();
+        assert_eq!((batch[&folder].played, batch[&folder].total), (0, 1));
+        assert_eq!(
+            service
+                .get_child_count_batch(&[folder], filter.user_id())
+                .await
+                .unwrap()[&folder],
+            1
+        );
+        let whole = service.whole_server_leaf_counts(&user).await.unwrap();
+        let mut unrestricted_user = user.clone();
+        unrestricted_user.max_parental_rating_score = None;
+        let unrestricted = service
+            .whole_server_leaf_counts(&unrestricted_user)
+            .await
+            .unwrap();
+        assert_eq!(whole.played, 0);
+        assert_eq!(whole.total, unrestricted.total - 1);
+        for (kind, name) in [
+            (BaseItemKind::Genre, "Shared"),
+            (BaseItemKind::Year, "2020"),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, name).await;
+            set_clean_name(&db, id, &name.to_lowercase()).await;
+            let counts = service
+                .get_item_counts_for_name_item(kind, id, &[BaseItemKind::Movie], &filter)
+                .await
+                .unwrap();
+            assert_eq!(counts.movie_count, 1, "{kind:?}");
+        }
+        let collection = Uuid::new_v4();
+        seed_item(&db, collection, BaseItemKind::BoxSet).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        links
+            .upsert_linked_child(collection, adult, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_child_count_batch(&[collection], filter.user_id())
+                .await
+                .unwrap()[&collection],
+            0
+        );
+        links
+            .upsert_linked_child(collection, child, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .get_child_count_batch(&[collection], filter.user_id())
+                .await
+                .unwrap()[&collection],
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn played_and_total_over_descendant_closure() {
         let db = test_db().await;
         let service = svc(&db);
@@ -1328,6 +1634,8 @@ mod tests {
     /// Nothing carries a `CollectionFolder`'s id as `ParentId` on an adopted
     /// database, so grouping on the raw column reports 0 while the very same
     /// browse returns the items — the two would disagree in one response.
+    /// Until a Ferrofin scan saves the row, that is: then it hangs off the
+    /// collection folder itself, and the library counts both kinds.
     #[tokio::test]
     async fn a_jellyfin_library_counts_its_physical_folder_s_children() {
         let db = test_db().await;
@@ -1361,6 +1669,15 @@ mod tests {
             physical,
         )
         .await;
+        // A row a Ferrofin scan saved: under the collection folder itself.
+        seed_child_item(
+            &db,
+            Uuid::from_u128(0xE107),
+            BaseItemKind::Episode,
+            "c",
+            view,
+        )
+        .await;
         // An ordinary folder alongside it, to prove the translation is scoped.
         seed_named_item(&db, plain, BaseItemKind::Folder, "Other").await;
         seed_child_item(
@@ -1376,7 +1693,10 @@ mod tests {
             .get_child_count_batch(&[view, plain], None)
             .await
             .expect("child counts");
-        assert_eq!(counts[&view], 2, "the view counts through its folder");
+        assert_eq!(
+            counts[&view], 3,
+            "the view counts through its folder, and its own children"
+        );
         assert_eq!(counts[&plain], 1, "an ordinary parent counts its own");
     }
 
@@ -1500,6 +1820,102 @@ mod tests {
             .await
             .expect("linked child counts");
         assert_eq!(counts[&boxset], 2);
+    }
+
+    /// A stacked movie is one item (`DescendantQueryHelper.
+    /// IsDistinctLibraryItem`): its second part — owned by the primary, no
+    /// `ExtraType`, no `PrimaryVersionId` — is neither a child of its folder
+    /// nor a leaf of its own, in a folder's counts or the whole server's, so
+    /// the folder's unplayed badge clears once the primary is played. An
+    /// extra is still counted.
+    #[tokio::test]
+    async fn a_stacked_part_counts_as_no_item_of_its_own() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let folder = Uuid::from_u128(0x5F01);
+        let (primary, part, extra) = (
+            Uuid::from_u128(0x5F02),
+            Uuid::from_u128(0x5F03),
+            Uuid::from_u128(0x5F04),
+        );
+        seed_item(&db, folder, BaseItemKind::Folder).await;
+        seed_item(&db, primary, BaseItemKind::Movie).await;
+        seed_item(&db, part, BaseItemKind::Video).await;
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        for (child, parent, owner, extra_type) in [
+            (primary, Some(folder), None, None),
+            (part, Some(folder), Some(primary), None),
+            (extra, None, Some(primary), Some(2)),
+        ] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ParentId" = ?2, "OwnerId" = ?3, "ExtraType" = ?4
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(child))
+            .bind(parent.map(guid_to_db))
+            .bind(owner.map(guid_to_db))
+            .bind(extra_type)
+            .execute(db.writer())
+            .await
+            .expect("shape");
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(child))
+                .bind(guid_to_db(folder))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+        }
+        let user_id = Uuid::from_u128(0x5F0D);
+        let user = seed_user(&db, user_id).await;
+
+        let children = service
+            .get_child_count_batch(&[folder], None)
+            .await
+            .expect("child counts");
+        assert_eq!(children[&folder], 1, "the primary; the part is no child");
+        let before = service
+            .get_played_and_total_count_batch(&[folder], &user)
+            .await
+            .expect("batch");
+        assert_eq!((before[&folder].played, before[&folder].total), (0, 2));
+        let server = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        let leaves = server.total;
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(part))
+            .execute(db.writer())
+            .await
+            .expect("unown");
+        let unowned = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        assert_eq!(unowned.total, leaves + 1, "an unowned part is a leaf");
+        sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(part))
+            .bind(guid_to_db(primary))
+            .execute(db.writer())
+            .await
+            .expect("own");
+
+        seed_user_data(&db, user_id, primary, true, None).await;
+        seed_user_data(&db, user_id, extra, true, None).await;
+        let after = service
+            .get_played_and_total_count_batch(&[folder], &user)
+            .await
+            .expect("batch");
+        assert_eq!(
+            (after[&folder].played, after[&folder].total),
+            (2, 2),
+            "nothing left unplayed"
+        );
+        let server = service
+            .whole_server_leaf_counts(&user)
+            .await
+            .expect("server");
+        assert_eq!((server.played, server.total), (2, leaves));
     }
 
     #[tokio::test]
@@ -2361,13 +2777,34 @@ mod tests {
         assert_eq!(counts.movie_count, 2, "both movie credits counted");
         assert_eq!(counts.series_count, 1);
         assert_eq!(counts.item_count, 3);
+        sqlx::query(r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = 18 WHERE "Id" = ?"#)
+            .bind(guid_to_db(Uuid::from_u128(0xCC10)))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        let mut user = seed_user(&db, Uuid::new_v4()).await;
+        user.max_parental_rating_score = Some(12);
+        let filter = InternalItemsQuery {
+            user: Some(user),
+            ..Default::default()
+        };
+        let counts = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Person,
+                person,
+                &[BaseItemKind::Movie, BaseItemKind::Series],
+                &filter,
+            )
+            .await
+            .unwrap();
+        assert_eq!((counts.movie_count, counts.series_count), (1, 1));
     }
 
     /// `EXPLAIN QUERY PLAN` for one statement, as the `detail` column of each
     /// step in outer-to-inner order.
     async fn query_plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
         for _ in 0..binds {
             query = query.bind("x");
         }
@@ -2647,7 +3084,8 @@ mod tests {
                 join,
                 r#" AND ud."UserId" = ? AND ud."Played" = 1"#,
             );
-            let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(user.id.as_str());
+            let mut q =
+                sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql)).bind(user.id.as_str());
             for id in &ids {
                 q = q.bind(id.as_str());
             }

@@ -3,6 +3,9 @@
   "__requires": [],
   "title": "Ferrofin \u2014 Golden Signals",
   "uid": "ferrofin-golden-signals",
+  "tags": [
+    "ferrofin"
+  ],
   "editable": true,
   "schemaVersion": 39,
   "version": 1,
@@ -12,6 +15,18 @@
     "from": "now-1h",
     "to": "now"
   },
+  "links": [
+    {
+      "title": "Ferrofin",
+      "type": "dashboards",
+      "tags": [
+        "ferrofin"
+      ],
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
   "templating": {
     "list": [
       {
@@ -22,6 +37,27 @@
         "refresh": 1,
         "hide": 0,
         "current": {}
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(http_requests_received_total, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "ferrofin",
+          "value": "ferrofin"
+        },
+        "sort": 1
       }
     ]
   },
@@ -77,7 +113,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_requests_received_total[$__rate_interval]))",
+          "expr": "sum(rate(http_requests_received_total{job=~\"$job\"}[$__rate_interval]))",
           "legendFormat": "req/s"
         }
       ]
@@ -121,7 +157,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(http_requests_in_progress)",
+          "expr": "sum(http_requests_in_progress{job=~\"$job\"})",
           "legendFormat": "in flight"
         }
       ]
@@ -165,7 +201,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_sessions_active",
+          "expr": "ferrofin_sessions_active{job=~\"$job\"}",
           "legendFormat": "sessions"
         }
       ]
@@ -209,7 +245,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_playback_streams_active",
+          "expr": "ferrofin_playback_streams_active{job=~\"$job\"}",
           "legendFormat": "streams"
         }
       ]
@@ -260,7 +296,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (controller) (rate(http_requests_received_total[$__rate_interval]))",
+          "expr": "sum by (controller) (rate(http_requests_received_total{job=~\"$job\"}[$__rate_interval]))",
           "legendFormat": "{{controller}}"
         }
       ]
@@ -323,7 +359,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])) by (le))",
           "legendFormat": "p50"
         },
         {
@@ -332,7 +368,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])) by (le))",
           "legendFormat": "p95"
         },
         {
@@ -341,7 +377,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])) by (le))",
           "legendFormat": "p99"
         }
       ]
@@ -405,7 +441,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[$__rate_interval])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=~\"$job\"}[$__rate_interval])) by (le))",
           "legendFormat": "p99"
         }
       ]
@@ -481,7 +517,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * (sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(http_requests_received_total[$__rate_interval])), 1)",
+          "expr": "100 * (sum(rate(http_requests_received_total{job=~\"$job\", code=~\"5..\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(http_requests_received_total{job=~\"$job\"}[$__rate_interval])), 1)",
           "legendFormat": "5xx %"
         }
       ]
@@ -532,7 +568,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_requests_received_total{code=~\"4..\"}[$__rate_interval])) or vector(0)",
+          "expr": "sum(rate(http_requests_received_total{job=~\"$job\", code=~\"4..\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "4xx"
         },
         {
@@ -541,7 +577,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_requests_received_total{code=~\"5..\"}[$__rate_interval])) or vector(0)",
+          "expr": "sum(rate(http_requests_received_total{job=~\"$job\", code=~\"5..\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "5xx"
         }
       ]
@@ -604,7 +640,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * rate(process_cpu_seconds_total[$__rate_interval]) / clamp_min(process_cpu_count, 1)",
+          "expr": "100 * rate(process_cpu_seconds_total{job=~\"$job\"}[$__rate_interval]) / clamp_min(process_cpu_count{job=~\"$job\"}, 1)",
           "legendFormat": "cpu %"
         }
       ]
@@ -655,7 +691,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_working_set_bytes",
+          "expr": "process_working_set_bytes{job=~\"$job\"}",
           "legendFormat": "working set"
         }
       ]
@@ -706,8 +742,370 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_connections{job=~\"$job\"} - ferrofin_db_pool_idle_connections{job=~\"$job\"}",
           "legendFormat": "{{pool}}"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Library scans",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 101,
+      "type": "stat",
+      "title": "Scan in progress",
+      "description": "1 while a library scan is running.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 4,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "blue",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "idle",
+                  "index": 0
+                },
+                "1": {
+                  "text": "scanning",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "max(ferrofin_library_scan_in_progress{job=~\"$job\"})",
+          "legendFormat": "in progress"
+        }
+      ],
+      "links": [
+        {
+          "title": "Library scans dashboard",
+          "url": "/d/ferrofin-library-scans?${__url_time_range}&${__all_variables}"
+        }
+      ]
+    },
+    {
+      "id": 102,
+      "type": "stat",
+      "title": "Since last scheduled scan",
+      "description": "Per scraped instance: how long ago its last scheduled (or startup-triggered) scan completed. Past the task interval (12 h by default) the scheduled scan is not running or not completing. Reads back 7d, so a restart does not blank it; an instance with no scan of its own in that time (the pod a rollout just started) shows the latest of the pods its job has replaced \u2014 never a live sibling's \u2014 and a replaced pod drops out instead of lingering red.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 39,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 46800
+              },
+              {
+                "color": "red",
+                "value": 90000
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "time() - max by (instance) ((last_over_time(ferrofin_library_scan_last_completed_timestamp_seconds{job=~\"$job\", trigger=~\"schedule|startup\"}[7d]) and on (instance) up{job=~\"$job\"}) or on (instance) (up{job=~\"$job\"} * 0 + on (job) group_left max by (job) (last_over_time(ferrofin_library_scan_last_completed_timestamp_seconds{job=~\"$job\", trigger=~\"schedule|startup\"}[7d]) unless on (instance) up{job=~\"$job\"})))",
+          "legendFormat": "{{instance}}",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "links": [
+        {
+          "title": "Library scans dashboard",
+          "url": "/d/ferrofin-library-scans?${__url_time_range}&${__all_variables}"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "type": "timeseries",
+      "title": "Scans by trigger and result",
+      "description": "Library scan passes that ended in each interval.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 39,
+        "w": 8,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*failed.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*stopped.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*cancelled.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*skipped.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (trigger, result) (increase(ferrofin_library_scans_total{job=~\"$job\"}[$__rate_interval])) > 0",
+          "legendFormat": "{{trigger}} {{result}}"
+        }
+      ],
+      "interval": "5m",
+      "links": [
+        {
+          "title": "Library scans dashboard",
+          "url": "/d/ferrofin-library-scans?${__url_time_range}&${__all_variables}"
+        }
+      ]
+    },
+    {
+      "id": 104,
+      "type": "stat",
+      "title": "Provider failures (1h)",
+      "description": "Metadata provider requests that failed or were skipped (cooldown, open circuit) in the last hour.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 39,
+        "w": 6,
+        "h": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(ferrofin_metadata_provider_requests_total{job=~\"$job\", result=~\"failed|skipped\"}[1h])) or vector(0)",
+          "legendFormat": "failed/skipped"
+        }
+      ],
+      "links": [
+        {
+          "title": "Library scans dashboard",
+          "url": "/d/ferrofin-library-scans?${__url_time_range}&${__all_variables}"
         }
       ]
     }

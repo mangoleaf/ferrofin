@@ -117,7 +117,7 @@ async fn unicode_query_cost() {
         let mut samples = Vec::new();
         for _ in 0..21 {
             let start = std::time::Instant::now();
-            let count: i64 = sqlx::query_scalar(&query)
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
                 .bind(parameter)
                 .fetch_one(db.pool())
                 .await

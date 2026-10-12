@@ -1,0 +1,73 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Ferrofin
+Upstream-Contact: https://github.com/mangoleaf/ferrofin/issues
+Source: https://github.com/mangoleaf/ferrofin
+
+Files: *
+Copyright: Ferrofin contributors
+License: GPL-3
+Comment: Ferrofin is derived from the Jellyfin media server
+ (https://github.com/jellyfin/jellyfin), which it was written against as a
+ reference. It is an independent project, not affiliated with, endorsed by
+ or supported by the Jellyfin project.
+ .
+ /usr/bin/ferrofin-server statically links third-party Rust crates and C
+ libraries, which keep their own permissive licenses (among them MIT,
+ Apache-2.0, BSD and ISC); SQLite is public domain and jemalloc is
+ BSD-2-Clause.
+
+Files: crates/ferrofin-extensions/assets/introskipper/*
+Copyright: Intro Skipper contributors
+License: GPL-3
+Comment: The Intro Skipper plugin's settings page, copied from
+ https://github.com/intro-skipper/intro-skipper at the revision pinned in
+ crates/ferrofin-extensions/build.rs.
+
+Files: crates/ferrofin-extensions/assets/filetransformation/*
+Copyright: File Transformation contributors
+License: GPL-3
+Comment: The File Transformation plugin's settings page, copied from
+ https://github.com/IAmParadox27/jellyfin-plugin-file-transformation at the
+ revision pinned in crates/ferrofin-extensions/build.rs.
+
+Files: crates/ferrofin-extensions/assets/mergeversions/*
+Copyright: 2019 Claus Vium
+License: Expat
+Comment: The Merge Versions plugin's settings page, copied from
+ https://github.com/danieladov/jellyfin-plugin-mergeversions at the
+ revision pinned in crates/ferrofin-extensions/build.rs.
+
+License: GPL-3
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, version 3 of the License.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.

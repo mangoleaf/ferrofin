@@ -63,7 +63,7 @@ work across subsystems:
 | `provider` | metadata provider name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
-| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` |
+| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`) |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 
 `Uuid`s via `tracing::field::display()`. Values born inside a function:

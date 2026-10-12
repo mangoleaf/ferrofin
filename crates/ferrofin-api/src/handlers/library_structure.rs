@@ -24,7 +24,7 @@
 //! mirroring the `finally` block of each C# controller action.
 
 use axum::Router;
-use axum::extract::{Json, Query, State};
+use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// Restarts the library monitor so its watch set matches the just-mutated
@@ -125,7 +125,10 @@ struct AddVirtualFolderQuery {
     #[serde(default)]
     name: Option<String>,
     /// The collection type of the library.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     collection_type: Option<CollectionTypeOptions>,
     /// The media paths (comma-delimited).
     #[serde(default)]
@@ -162,7 +165,7 @@ async fn add_virtual_folder(
     body: Option<JsonBody<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
-    if name.trim().is_empty() {
+    if name.trim().is_empty() || name.trim() != name || name.contains('\n') {
         return Err(ApiError::BadRequest(
             "Library name cannot be empty or have leading/trailing spaces.".to_owned(),
         ));
@@ -288,35 +291,17 @@ async fn rename_virtual_folder(
         .virtual_folders
         .rename_virtual_folder(&name, &new_name)
         .await?;
-    // Deliberate divergence from `LibraryStructureController.RenameVirtualFolder`,
-    // which runs `ValidateTopLibraryFolders(ct, removeRoot: true)` only when
-    // `refreshLibrary` is set and otherwise just delays 1 s and restarts the
-    // monitor. Ferrofin derives a library's item id from its directory path, so
-    // the rename necessarily re-keys the row: the manager deletes the row the
-    // vacated directory backed (upstream's `ValidateTopLibraryFolders` leg) and
-    // the new path mints a fresh one, which cascades the old row's children away.
-    // Upstream can skip the refresh because it keeps the stale row (and its
-    // children) until the next scan; here, skipping it would leave the renamed
-    // library empty. So the rescan is unconditional.
-    //
-    // It is scoped to the renamed library WHEN its id resolves, which is the
-    // normal case. If it does not, the fallback is a FULL library scan — more
-    // than upstream would queue for the same request, and on a large install a
-    // dashboard rename would then kick a whole pass. That arm is logged at WARN
-    // rather than left silent, because a full pass nobody asked for should be
-    // attributable.
-    tracing::debug!(
-        refresh_library = query.refresh_library,
-        "renamed a library; rescanning it regardless, because its item id is derived from its path"
-    );
+    // Materialize the renamed collection folder even without a refresh, so its
+    // physical locations can be browsed immediately. Media rows survive the
+    // collection-folder identity change; only the requested refresh scans them.
     let scope = library_id_by_name(&state, &new_name).await;
-    if scope.is_none() {
+    if query.refresh_library && scope.is_none() {
         tracing::warn!(
             new_name,
             "renamed library has no resolvable item id; falling back to a FULL library scan"
         );
     }
-    after_structure_change(&state, true, scope).await;
+    after_structure_change(&state, query.refresh_library, scope).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -490,6 +475,7 @@ struct UpdateLibraryOptionsBody {
     /// The library item id.
     #[serde(default)]
     #[schema(value_type = Option<String>)]
+    #[serde(with = "ferrofin_model::json::guid::option")]
     id: Option<Uuid>,
     /// The library name (Ferrofin's filesystem seam resolves by name; see below).
     #[serde(default)]
@@ -579,4 +565,12 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Library/VirtualFolders/Paths/Update",
             post(update_media_path),
         )
+}
+crate::query::query_parameters! {
+    AddVirtualFolderQuery {
+        "paths" => ',',
+    } => [("post", "/Library/VirtualFolders")];
+    RemoveVirtualFolderQuery {} => [("delete", "/Library/VirtualFolders")];
+    RenameVirtualFolderQuery {} => [("post", "/Library/VirtualFolders/Name")];
+    MediaPathQuery {} => [("post", "/Library/VirtualFolders/Paths"), ("delete", "/Library/VirtualFolders/Paths")];
 }

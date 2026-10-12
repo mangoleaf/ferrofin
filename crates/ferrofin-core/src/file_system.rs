@@ -119,11 +119,21 @@ fn total_size(_path: &str) -> u64 {
 
 impl FileSystem for FerrofinFileSystem {
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo> {
-        let Ok(read_dir) = fs::read_dir(path) else {
-            return Vec::new();
-        };
+        self.try_get_file_system_entries(path).unwrap_or_default()
+    }
+
+    fn try_get_file_system_entries(
+        &self,
+        path: &str,
+    ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
+        let listing_failed =
+            |err: std::io::Error| ServiceError::backend(format!("listing {path} failed: {err}"));
+        let read_dir = fs::read_dir(path).map_err(listing_failed)?;
         let mut entries = Vec::new();
-        for entry in read_dir.flatten() {
+        for entry in read_dir {
+            // An entry that fails to read makes the listing incomplete: what
+            // it is cannot be told, so the whole listing is a failure.
+            let entry = entry.map_err(listing_failed)?;
             let full_path = entry.path();
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
             entries.push(FileSystemEntryInfo {
@@ -136,7 +146,7 @@ impl FileSystem for FerrofinFileSystem {
                 },
             });
         }
-        entries
+        Ok(entries)
     }
 
     fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
@@ -160,6 +170,10 @@ impl FileSystem for FerrofinFileSystem {
 
     fn directory_exists(&self, path: &str) -> bool {
         Path::new(path).is_dir()
+    }
+
+    fn path_exists(&self, path: &str) -> bool {
+        stat_says_exists(path, fs::metadata(path).map(|m| m.is_file() || m.is_dir()))
     }
 
     fn validate_writable(&self, path: &str) -> Result<(), ServiceError> {
@@ -217,8 +231,59 @@ impl FileSystem for FerrofinFileSystem {
     }
 }
 
+/// Reads a stat of `path` (`Ok(is a file or a directory)`) the way the
+/// prune's safety net needs it: only "no such file" (or a path component
+/// that is not a directory) means gone. Any other failure — a permission
+/// error, an I/O error, a stale or disconnected network mount, a timeout —
+/// says nothing about whether the file is there, so it counts as present:
+/// a flaky mount must never delete an item and its user data.
+fn stat_says_exists(path: &str, stat: std::io::Result<bool>) -> bool {
+    match stat {
+        Ok(is_file_or_dir) => is_file_or_dir,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        Err(err) => {
+            tracing::debug!(path, %err, "could not stat a path; counting it as present");
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Only "not found" and "not a directory" mean gone; every other stat
+    /// failure (EACCES, EIO, ESTALE, ENOTCONN, ETIMEDOUT) counts as present.
+    #[test]
+    fn only_a_missing_path_is_gone() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::stat_says_exists("/p", Ok(true)));
+        assert!(
+            !super::stat_says_exists("/p", Ok(false)),
+            "a socket or a fifo"
+        );
+        for gone in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            assert!(!super::stat_says_exists("/p", Err(Error::from(gone))));
+        }
+        for unknown in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::TimedOut,
+            ErrorKind::NotConnected,
+            ErrorKind::StaleNetworkFileHandle,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                super::stat_says_exists("/p", Err(Error::from(unknown))),
+                "{unknown:?}"
+            );
+        }
+    }
+
     use super::*;
 
     /// The non-pseudo rows of `ferrofin-dv4-jellyfin-1:/proc/mounts`, verbatim.

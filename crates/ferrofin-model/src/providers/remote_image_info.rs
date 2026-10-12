@@ -24,18 +24,22 @@ pub struct RemoteImageInfo {
 
     /// Gets or sets the height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
 
     /// Gets or sets the width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
 
     /// Gets or sets the community rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub community_rating: Option<f64>,
 
     /// Gets or sets the vote count.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub vote_count: Option<i32>,
 
     /// Gets or sets the language.

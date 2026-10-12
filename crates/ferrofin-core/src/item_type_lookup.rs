@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BASE_ITEM_KIND_NAMES, BaseItemKind};
 use ferrofin_traits::persistence::ItemTypeLookup as ItemTypeLookupTrait;
 
 /// The fully-qualified stored type names for the music-related kinds
@@ -23,143 +23,6 @@ pub(crate) const MUSIC_GENRE_TYPES: &[&str] = &[
     "MediaBrowser.Controller.Entities.MusicVideo",
     "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
     "MediaBrowser.Controller.Entities.Audio.MusicArtist",
-];
-
-/// The `(kind, stored-type-name)` pairs, copied from the C#
-/// `ItemTypeLookup.BaseItemKindNames` dictionary. Kinds with no dedicated
-/// `BaseItem` subclass in the C# table (e.g. `AudioBook`, `Program`) are omitted,
-/// exactly as upstream omits them.
-const BASE_ITEM_KIND_NAMES: &[(BaseItemKind, &str)] = &[
-    (
-        BaseItemKind::AggregateFolder,
-        "MediaBrowser.Controller.Entities.AggregateFolder",
-    ),
-    (
-        BaseItemKind::Audio,
-        "MediaBrowser.Controller.Entities.Audio.Audio",
-    ),
-    (
-        BaseItemKind::AudioBook,
-        "MediaBrowser.Controller.Entities.AudioBook",
-    ),
-    (
-        BaseItemKind::BasePluginFolder,
-        "MediaBrowser.Controller.Entities.BasePluginFolder",
-    ),
-    (BaseItemKind::Book, "MediaBrowser.Controller.Entities.Book"),
-    (
-        BaseItemKind::BoxSet,
-        "MediaBrowser.Controller.Entities.Movies.BoxSet",
-    ),
-    (
-        BaseItemKind::Channel,
-        "MediaBrowser.Controller.Channels.Channel",
-    ),
-    (
-        BaseItemKind::CollectionFolder,
-        "MediaBrowser.Controller.Entities.CollectionFolder",
-    ),
-    (
-        BaseItemKind::Episode,
-        "MediaBrowser.Controller.Entities.TV.Episode",
-    ),
-    (
-        BaseItemKind::Folder,
-        "MediaBrowser.Controller.Entities.Folder",
-    ),
-    (
-        BaseItemKind::Genre,
-        "MediaBrowser.Controller.Entities.Genre",
-    ),
-    (
-        BaseItemKind::ManualPlaylistsFolder,
-        "Emby.Server.Implementations.Playlists.ManualPlaylistsFolder",
-    ),
-    (
-        BaseItemKind::Movie,
-        "MediaBrowser.Controller.Entities.Movies.Movie",
-    ),
-    (
-        BaseItemKind::LiveTvChannel,
-        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
-    ),
-    (
-        BaseItemKind::LiveTvProgram,
-        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
-    ),
-    (
-        BaseItemKind::MusicAlbum,
-        "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
-    ),
-    (
-        BaseItemKind::MusicArtist,
-        "MediaBrowser.Controller.Entities.Audio.MusicArtist",
-    ),
-    (
-        BaseItemKind::MusicGenre,
-        "MediaBrowser.Controller.Entities.Audio.MusicGenre",
-    ),
-    (
-        BaseItemKind::MusicVideo,
-        "MediaBrowser.Controller.Entities.MusicVideo",
-    ),
-    (
-        BaseItemKind::Person,
-        "MediaBrowser.Controller.Entities.Person",
-    ),
-    (
-        BaseItemKind::Photo,
-        "MediaBrowser.Controller.Entities.Photo",
-    ),
-    (
-        BaseItemKind::PhotoAlbum,
-        "MediaBrowser.Controller.Entities.PhotoAlbum",
-    ),
-    (
-        BaseItemKind::Playlist,
-        "MediaBrowser.Controller.Playlists.Playlist",
-    ),
-    (
-        BaseItemKind::PlaylistsFolder,
-        "Emby.Server.Implementations.Playlists.PlaylistsFolder",
-    ),
-    (
-        BaseItemKind::Season,
-        "MediaBrowser.Controller.Entities.TV.Season",
-    ),
-    (
-        BaseItemKind::Series,
-        "MediaBrowser.Controller.Entities.TV.Series",
-    ),
-    (
-        BaseItemKind::Studio,
-        "MediaBrowser.Controller.Entities.Studio",
-    ),
-    (
-        BaseItemKind::Trailer,
-        "MediaBrowser.Controller.Entities.Trailer",
-    ),
-    (
-        BaseItemKind::TvChannel,
-        "MediaBrowser.Controller.LiveTv.LiveTvChannel",
-    ),
-    (
-        BaseItemKind::TvProgram,
-        "MediaBrowser.Controller.LiveTv.LiveTvProgram",
-    ),
-    (
-        BaseItemKind::UserRootFolder,
-        "MediaBrowser.Controller.Entities.UserRootFolder",
-    ),
-    (
-        BaseItemKind::UserView,
-        "MediaBrowser.Controller.Entities.UserView",
-    ),
-    (
-        BaseItemKind::Video,
-        "MediaBrowser.Controller.Entities.Video",
-    ),
-    (BaseItemKind::Year, "MediaBrowser.Controller.Entities.Year"),
 ];
 
 /// Returns the shared kind → stored-type-name map, built once on first use.
@@ -180,10 +43,47 @@ fn kind_names() -> &'static HashMap<BaseItemKind, String> {
 /// has no dedicated stored type (matching the C# dictionary's coverage).
 #[must_use]
 pub fn stored_type_name(kind: BaseItemKind) -> Option<&'static str> {
-    BASE_ITEM_KIND_NAMES
-        .iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, name)| *name)
+    kind.stored_type_name()
+}
+
+/// `ServerConfiguration.EnableCaseSensitiveItemIds` (default **true**): when
+/// false every item id key is lowercased (`GetNewItemIdInternal`).
+static CASE_SENSITIVE_ITEM_IDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// `ServerConfiguration.EnableNormalizedItemByNameIds` (default **true**): when
+/// true a by-name item's id key is lowercased even if item ids are otherwise
+/// case-sensitive (`GetItemByNameId`).
+static NORMALIZED_BY_NAME_IDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Publishes the two server settings that shape item ids. The configuration
+/// manager calls it when the configuration loads and whenever it changes, so
+/// the next derivation sees the saved values as upstream's live reads do.
+/// Changing them changes the ids derived from then on; nothing rewrites ids
+/// already stored.
+pub fn set_item_id_policy(case_sensitive_item_ids: bool, normalized_by_name_ids: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CASE_SENSITIVE_ITEM_IDS.store(case_sensitive_item_ids, Relaxed);
+    NORMALIZED_BY_NAME_IDS.store(normalized_by_name_ids, Relaxed);
+}
+
+/// Whether an item-id key is lowercased: always for a by-name id when
+/// `normalized_by_name_ids`, and for any id when ids are not case-sensitive.
+fn lowercases_key(by_name: bool) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    key_is_lowercased(
+        CASE_SENSITIVE_ITEM_IDS.load(Relaxed),
+        NORMALIZED_BY_NAME_IDS.load(Relaxed),
+        by_name,
+    )
+}
+
+/// `GetNewItemIdInternal`'s `forceCaseInsensitive || !EnableCaseSensitiveItemIds`,
+/// where only a by-name id forces case-insensitivity (with
+/// `EnableNormalizedItemByNameIds`).
+const fn key_is_lowercased(case_sensitive: bool, normalized_by_name: bool, by_name: bool) -> bool {
+    !case_sensitive || (by_name && normalized_by_name)
 }
 
 /// How stable item ids are derived from kind + path — a **per-database** mode.
@@ -248,7 +148,12 @@ pub fn derive_item_id_with(
                 .as_deref()
                 .and_then(|data| path.strip_prefix(data))
                 .map(|rel| rel.trim_start_matches(['/', '\\']).replace('/', "\\"));
-            rewritten.unwrap_or_else(|| path.to_owned())
+            let key = rewritten.unwrap_or_else(|| path.to_owned());
+            if lowercases_key(false) {
+                ferrofin_util::string_extensions::lower_invariant(&key)
+            } else {
+                key
+            }
         }
         IdDerivation::LegacyLowercase => path.to_lowercase(),
     };
@@ -269,7 +174,7 @@ pub fn derive_item_id_with(
 /// resolved a different one).
 #[must_use]
 pub fn person_path(people_path: &str, name: &str) -> String {
-    let valid = valid_filename(name);
+    let valid = item_by_name_folder_name(name);
     match valid.chars().find(|c| c.is_alphanumeric()) {
         Some(prefix) => format!("{people_path}/{prefix}/{valid}"),
         None => format!("{people_path}/{valid}"),
@@ -325,8 +230,10 @@ fn by_name_item_id_with_casing(
             let key = rewritten.unwrap_or_else(|| path.to_owned());
             if previous {
                 key.to_lowercase()
-            } else {
+            } else if lowercases_key(true) {
                 ferrofin_util::string_extensions::lower_invariant(&key)
+            } else {
+                key
             }
         }
         IdDerivation::LegacyLowercase => path.to_lowercase(),
@@ -344,7 +251,7 @@ fn by_name_item_id_with_casing(
 /// first-letter subfolder (unlike people).
 #[must_use]
 pub fn by_name_path(root: &str, name: &str) -> String {
-    let valid = valid_filename(name);
+    let valid = item_by_name_folder_name(name);
     format!("{root}/{valid}")
 }
 
@@ -359,6 +266,42 @@ pub fn year_path(year_root: &str, name: &str) -> String {
 #[must_use]
 pub fn year_item_id(mode: &IdDerivation, year_root: &str, name: &str) -> Option<uuid::Uuid> {
     by_name_item_id(mode, BaseItemKind::Year, &year_path(year_root, name))
+}
+
+/// The id of a season with no folder of its own (a series' episodes sit in
+/// its folder, or in a folder that names no season) — the port of
+/// `SeriesMetadataService.CreateSeasonAsync`, which keys it by its series,
+/// number and name rather than a path: `GetNewItemId(series.Id +
+/// (seasonNumber ?? -1).ToString(InvariantCulture) + seasonName,
+/// typeof(Season))`. `series.Id` concatenates in `Guid`'s
+/// default format (lowercase, hyphenated) and the name is the one the season
+/// was created with. Under [`IdDerivation::Jellyfin`] the key keeps its case
+/// (`EnableCaseSensitiveItemIds`), as every other scanned id; verified
+/// against every path-less season of a real 12.1 database.
+#[must_use]
+pub fn virtual_season_id(
+    mode: &IdDerivation,
+    series_id: uuid::Uuid,
+    number: Option<i32>,
+    name: &str,
+) -> Option<uuid::Uuid> {
+    let key = format!("{series_id}{}{name}", number.unwrap_or(-1));
+    derive_item_id_with(mode, BaseItemKind::Season, &key)
+}
+
+/// The id older Ferrofin scans gave a season with no folder of its own: the
+/// one derived from the synthetic path `{series_dir}/#virtual-season-{n}`
+/// (`-1` for no number). The boot repair
+/// ([`crate::adoption_repairs::rekey_virtual_seasons`]) recognises such a
+/// season by it and moves it to its [`virtual_season_id`].
+#[must_use]
+pub fn legacy_virtual_season_id(
+    mode: &IdDerivation,
+    series_dir: &str,
+    number: Option<i64>,
+) -> Option<uuid::Uuid> {
+    let path = format!("{series_dir}/#virtual-season-{}", number.unwrap_or(-1));
+    derive_item_id_with(mode, BaseItemKind::Season, &path)
 }
 
 /// The `UserRootFolder` item id for the default user-views directory —
@@ -385,6 +328,45 @@ pub fn user_root_folder_id(
 #[must_use]
 pub fn aggregate_folder_id(mode: &IdDerivation, root_folder_path: &str) -> Option<uuid::Uuid> {
     derive_item_id_with(mode, BaseItemKind::AggregateFolder, root_folder_path)
+}
+
+/// The most UTF-8 bytes a by-name entity's folder name may take
+/// (`BaseItem.MaxItemByNameFolderNameBytes`): well under the 255 bytes of
+/// common Linux filesystems, so the files inside still fit `MAX_PATH`.
+const MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES: usize = 128;
+
+/// `BaseItem.GetItemByNameFolderName`: [`valid_filename`], and — for a name
+/// that would not fit a path component — a readable prefix, `-`, and the MD5
+/// of the whole sanitized name, in at most 128 UTF-8 bytes. The cut is made on
+/// UTF-16 units like the original and never splits a surrogate pair.
+pub(crate) fn item_by_name_folder_name(name: &str) -> String {
+    bound_folder_name(valid_filename(name))
+}
+
+/// The length-bounding half of [`item_by_name_folder_name`], over an already
+/// sanitized name.
+fn bound_folder_name(valid: String) -> String {
+    if valid.len() <= MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES {
+        return valid;
+    }
+    let suffix = format!("-{}", ferrofin_common::extensions::get_md5(&valid).simple());
+    let budget = MAX_ITEM_BY_NAME_FOLDER_NAME_BYTES - suffix.len();
+    let units: Vec<u16> = valid.encode_utf16().collect();
+    // UTF-8 length of a UTF-16 prefix; a lone surrogate counts as U+FFFD.
+    let utf8_len = |end: usize| {
+        char::decode_utf16(units[..end].iter().copied())
+            .map(|unit| unit.map_or(3, char::len_utf8))
+            .sum::<usize>()
+    };
+    let mut length = units.len().min(budget);
+    while length > 0 && utf8_len(length) > budget {
+        length -= 1;
+    }
+    if length > 0 && (0xD800..0xDC00).contains(&units[length - 1]) {
+        length -= 1;
+    }
+    let prefix = String::from_utf16_lossy(&units[..length]);
+    format!("{}{suffix}", prefix.trim_end().trim_end_matches('.'))
 }
 
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
@@ -420,10 +402,7 @@ pub fn derive_item_id(kind: BaseItemKind, path: &str) -> Option<uuid::Uuid> {
 /// heuristics, search-hint mapping, …) so the mapping is spelled out once.
 #[must_use]
 pub fn kind_from_type_name(type_name: &str) -> Option<BaseItemKind> {
-    BASE_ITEM_KIND_NAMES
-        .iter()
-        .find(|(_, name)| *name == type_name)
-        .map(|(kind, _)| *kind)
+    BaseItemKind::from_stored_type_name(type_name)
 }
 
 /// The static item-kind lookup tables.
@@ -454,6 +433,78 @@ impl ItemTypeLookupTrait for ItemTypeLookup {
 
 #[cfg(test)]
 mod tests {
+    use super::{bound_folder_name, by_name_path, item_by_name_folder_name, key_is_lowercased};
+
+    /// The four settings combinations: a scanned id is lowercased only when
+    /// ids are not case-sensitive; a by-name id also when normalized.
+    #[test]
+    fn id_key_casing_follows_both_settings() {
+        for (case_sensitive, normalized, scanned, by_name) in [
+            (true, true, false, true),
+            (true, false, false, false),
+            (false, true, true, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                key_is_lowercased(case_sensitive, normalized, false),
+                scanned,
+                "scanned: case_sensitive={case_sensitive} normalized={normalized}"
+            );
+            assert_eq!(
+                key_is_lowercased(case_sensitive, normalized, true),
+                by_name,
+                "by-name: case_sensitive={case_sensitive} normalized={normalized}"
+            );
+        }
+    }
+
+    /// `BaseItem.GetItemByNameFolderName` against the upstream method run on
+    /// .NET 10 (a verbatim copy; the names hold no invalid file-name characters).
+    #[test]
+    fn by_name_folder_names_match_dotnet() {
+        let cases: Vec<(String, String)> = serde_json::from_str(include_str!(
+            "../tests/fixtures/item_by_name_folder_names.json"
+        ))
+        .unwrap();
+        assert!(cases.len() > 30);
+        for (name, expected) in cases {
+            // The oracle's file system passes names through, as upstream's
+            // test fixture does; the bound applies to the trimmed name.
+            let actual = bound_folder_name(name.trim().trim_end_matches('.').to_owned());
+            assert_eq!(actual, expected, "{name:?}");
+            assert!(actual.len() <= 128, "{name:?}");
+        }
+    }
+
+    /// The upstream xUnit cases (`BaseItemTests.GetItemByNameFolderName_*`).
+    #[test]
+    fn overlong_by_name_folder_names_stay_unique_and_stable() {
+        assert_eq!(
+            item_by_name_folder_name("Mairghread Scott."),
+            "Mairghread Scott"
+        );
+        let credits = vec!["Jerry Siegel (created by Superman)"; 20].join(", ");
+        let folder = item_by_name_folder_name(&credits);
+        assert!(folder.len() <= 128);
+        assert!(folder.starts_with("Jerry Siegel (created by Superman)"));
+        let prefix = "a".repeat(200);
+        assert_ne!(
+            item_by_name_folder_name(&format!("{prefix}Joe Shuster")),
+            item_by_name_folder_name(&format!("{prefix}Bob Kane"))
+        );
+        let long = "a".repeat(300);
+        assert_eq!(
+            item_by_name_folder_name(&long),
+            item_by_name_folder_name(&long)
+        );
+        // Paths built from a long name use the bounded folder.
+        let path = by_name_path("/meta/Genre", &long);
+        assert_eq!(
+            path.rsplit('/').next().unwrap(),
+            item_by_name_folder_name(&long)
+        );
+    }
+
     #[rstest::rstest]
     #[case("İpek", "İpek")]
     #[case("ΟΣ", "οσ")]
@@ -588,6 +639,78 @@ mod tests {
             ),
             Some(uuid::Uuid::parse_str("F137A2DD-21BB-C1B9-9AA5-C0F6BF02A805").expect("uuid")),
         );
+    }
+
+    /// Path-less seasons of a real Jellyfin 12.1 database (the adoption
+    /// fixture upgraded from 12.0; created by 10.11.x and 12.x alike), as
+    /// stored: `(Id, SeriesId, IndexNumber, Name)`. All 591 of its
+    /// path-less seasons derive this way.
+    #[rstest::rstest]
+    #[case(
+        "CC86EE2C-C78D-0F79-0BCE-1F8F8ADBB846",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(0),
+        "Specials"
+    )]
+    #[case(
+        "5D4284B7-8FBC-069E-80C2-644AED45F8B1",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(1),
+        "Season 1"
+    )]
+    #[case(
+        "59586EC5-7224-BFF1-5BA9-7E133D666050",
+        "79F46D55-6061-D8B9-EF8A-1C2FFD0D6856",
+        Some(12),
+        "Season 12"
+    )]
+    #[case(
+        "B8FFA3AC-6431-B12D-9ACE-B10DA99149BE",
+        "C3B1F536-2827-4088-EB52-C3518C9BFB9F",
+        Some(0),
+        "Specials"
+    )]
+    #[case(
+        "09293A86-BD86-819E-77DB-44AFA1F265EF",
+        "27A96C9A-7E57-DD56-A051-40190E9CF47F",
+        None,
+        "Season Unknown"
+    )]
+    fn virtual_season_id_matches_a_real_database(
+        #[case] id: &str,
+        #[case] series: &str,
+        #[case] number: Option<i32>,
+        #[case] name: &str,
+    ) {
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let series = uuid::Uuid::parse_str(series).expect("uuid");
+        assert_eq!(
+            super::virtual_season_id(&mode, series, number, name),
+            Some(uuid::Uuid::parse_str(id).expect("uuid"))
+        );
+    }
+
+    /// The id older Ferrofin scans gave a path-less season is the synthetic
+    /// path's, under either derivation.
+    #[test]
+    fn legacy_virtual_season_id_is_the_synthetic_paths() {
+        for mode in [
+            IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            IdDerivation::LegacyLowercase,
+        ] {
+            assert_eq!(
+                super::legacy_virtual_season_id(&mode, "/tv/Show", Some(2)),
+                derive_item_id_with(&mode, BaseItemKind::Season, "/tv/Show/#virtual-season-2")
+            );
+            assert_eq!(
+                super::legacy_virtual_season_id(&mode, "/tv/Show", None),
+                derive_item_id_with(&mode, BaseItemKind::Season, "/tv/Show/#virtual-season--1")
+            );
+        }
     }
 
     /// Oracle values from the same real 10.11.8 database: the `UserRootFolder`

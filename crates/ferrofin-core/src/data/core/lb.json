@@ -104,5 +104,17 @@
     "TaskKeyframeExtractorDescription": "Extrahéiert Schlësselbiller aus Videodateien, fir méi präzis HLS-Playlisten ze erstellen. Dës Aufgab kann eng längere Zäit daueren.",
     "TaskRefreshChannelsDescription": "Aktualiséiert Informatiounen iwwer Internetkanäl.",
     "TaskExtractMediaSegmentsDescription": "Extrahéiert oder kritt Mediesegmenter aus Plugins, déi MediaSegment ënnerstëtzen.",
-    "TaskOptimizeDatabaseDescription": "Kompriméiert d’Datebank a schneit de fräie Speicherplatz zou. Dës Aufgab no engem Bibliothéik-Scan oder anere Ännerungen, déi Datebankmodifikatioune mat sech bréngen, auszeféieren, kann d’Performance verbesseren."
+    "TaskOptimizeDatabaseDescription": "Kompriméiert d’Datebank a schneit de fräie Speicherplatz zou. Dës Aufgab no engem Bibliothéik-Scan oder anere Ännerungen, déi Datebankmodifikatioune mat sech bréngen, auszeféieren, kann d’Performance verbesseren.",
+    "NameExtraBehindTheScenes": "Hannert de Kulissen",
+    "NameExtraClip": "Clip",
+    "NameExtraDeletedScene": "Geläschte Scène",
+    "NameExtraFeaturette": "Featurette",
+    "NameExtraInterview": "Interview",
+    "NameExtraNumbered": "{0} {1}",
+    "NameExtraSample": "Beispill",
+    "NameExtraScene": "Scène",
+    "NameExtraShort": "Kuerzfilm",
+    "NameExtraThemeSong": "Theme-Lidd",
+    "NameExtraThemeVideo": "Theme-Video",
+    "NameExtraTrailer": "Bande-Annonce"
 }

@@ -53,8 +53,9 @@ pub use user_dto::UserDto;
 pub use user_item_data_dto::{UpdateUserItemDataDto, UserItemDataDto};
 
 /// The type of a media source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaSourceType {
     /// A default media source.
     Default = 0,
@@ -62,6 +63,17 @@ pub enum MediaSourceType {
     Grouping = 1,
     /// A placeholder media source, for example a disc that has to be inserted.
     Placeholder = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaSourceType, None, {
+        Default => ("Default", 0),
+        Grouping => ("Grouping", 1),
+        Placeholder => ("Placeholder", 2),
+    }
 }
 
 /// The type of a community rating.
@@ -103,7 +115,8 @@ pub use crate::live_tv::{ChannelType, ProgramAudio};
 ///
 /// Referenced by [`BaseItemDto::air_days`]; defined here as it is a .NET
 /// built-in with no dedicated port unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
+#[repr(i32)]
 pub enum DayOfWeek {
     /// Sunday.
     Sunday,
@@ -119,4 +132,19 @@ pub enum DayOfWeek {
     Friday,
     /// Saturday.
     Saturday,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DayOfWeek, None, {
+        Sunday => ("Sunday", 0),
+        Monday => ("Monday", 1),
+        Tuesday => ("Tuesday", 2),
+        Wednesday => ("Wednesday", 3),
+        Thursday => ("Thursday", 4),
+        Friday => ("Friday", 5),
+        Saturday => ("Saturday", 6),
+    }
 }

@@ -14,6 +14,7 @@ pub struct ImageInfo {
 
     /// Gets or sets the index of the image.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_index: Option<i32>,
 
     /// Gets or sets the image tag.
@@ -30,10 +31,12 @@ pub struct ImageInfo {
 
     /// Gets or sets the height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
 
     /// Gets or sets the width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
 
     /// Gets or sets the size.

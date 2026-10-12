@@ -637,7 +637,7 @@ fn append_playlist_video_range_field(builder: &mut String, state: &EncodingJobIn
                 }
                 _ => builder.push_str(",VIDEO-RANGE=PQ"),
             },
-            VideoRange::Unknown => {}
+            VideoRange::Unknown | VideoRange::Unrecognized(_) => {}
         }
     } else {
         // Currently we only encode to SDR.
@@ -1537,6 +1537,17 @@ mod tests {
             pl.contains("&segmentContainer=ts&AllowVideoStreamCopy=false\n"),
             "got: {pl}"
         );
+
+        // A `transcodeReasons` already in the query, in any casing, is not
+        // appended a second time.
+        let s = state(vec![video_stream(), audio_stream()]);
+        let req = HlsStreamRequest {
+            query_string: "?mediaSourceId=abc&transcodereasons=X&segmentContainer=ts".to_owned(),
+            transcode_reasons: Some("ContainerNotSupported".to_owned()),
+            ..request()
+        };
+        let pl = build_master_playlist(&plan(s), &req, &MasterPlaylistContext::default());
+        assert!(!pl.contains("TranscodeReasons="), "got: {pl}");
     }
 
     /// The subtitle group appears only with `SubtitleMethod=Hls` or

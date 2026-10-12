@@ -33,7 +33,7 @@ use ferrofin_model::dto::{
     UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::CollectionTypeOptions;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::media_info::LiveStreamRequest;
@@ -47,6 +47,125 @@ use crate::options::{
     DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery, ItemImageInfo,
 };
 use crate::persistence::ItemWithCounts;
+use crate::providers::MetadataRefreshOptions;
+
+/// Where a scan reports how far it got, in percent (0–100) — the
+/// `IProgress<double>` a scheduled task hands its work.
+pub type ScanProgressSink = std::sync::Arc<dyn Fn(f64) + Send + Sync>;
+
+/// Why a library scan runs — the request that started it: the `trigger` field
+/// of its `library_scan` span and log lines (`docs/conventions/LOGGING.md`'s
+/// vocabulary) and the bounded `trigger` label of the library-scan metrics
+/// (`contrib/metrics/README.md`). A label only: requests that coalesce into
+/// one scan run as one, under the trigger of the request that scan runs as —
+/// the queued request the later ones joined, or a queued full scan that took
+/// over the pending requests it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScanTrigger {
+    /// A request over the API: `POST /Library/Refresh`, an item's or a
+    /// folder's refresh, a library change, and the "Scan Media Library" task
+    /// started from the dashboard ("Scan All Libraries").
+    Api,
+    /// The "Scan Media Library" task's own interval, daily or weekly trigger.
+    Schedule,
+    /// The "Scan Media Library" task's startup trigger.
+    Startup,
+    /// The filesystem watcher (real-time monitoring).
+    Watcher,
+    /// An *arr webhook: `POST /Library/Series/Added`, `/Library/Series/Updated`,
+    /// `/Library/Movies/Added`, `/Library/Movies/Updated`,
+    /// `/Library/Media/Updated`.
+    Webhook,
+}
+
+impl ScanTrigger {
+    /// Every trigger, in a fixed order (the metric label set).
+    pub const ALL: [Self; 5] = [
+        Self::Api,
+        Self::Schedule,
+        Self::Startup,
+        Self::Watcher,
+        Self::Webhook,
+    ];
+
+    /// The trigger's name in logs, spans and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Schedule => "schedule",
+            Self::Startup => "startup",
+            Self::Watcher => "watcher",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    /// The scan trigger of a scheduled-task run started by `trigger` (the
+    /// task registry's `api` / `schedule` / `startup`). Anything else — a
+    /// run with no recorded trigger — is the task's own schedule.
+    #[must_use]
+    pub fn from_task_trigger(trigger: &str) -> Self {
+        match trigger {
+            "api" => Self::Api,
+            "startup" => Self::Startup,
+            _ => Self::Schedule,
+        }
+    }
+}
+
+impl std::fmt::Display for ScanTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a queued refresh scan covers — the item-less stand-in for the
+/// `Folder` a C# refresh validates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanTarget {
+    /// Every library (`RootFolder.ValidateChildren`).
+    All,
+    /// One library, by its CollectionFolder id
+    /// (`ProviderManager.RefreshCollectionFolderChildren`).
+    Library(Uuid),
+    /// The items at or under these filesystem paths — a folder's subtree
+    /// (`Folder.ValidateChildren` on a series, season, album…). Rows under
+    /// the paths whose files are gone are removed.
+    Paths(Vec<String>),
+    /// The paths the library monitor reports as changed — the disk watcher
+    /// and the *arr webhooks (`FileRefresher.ProcessPathChanges`). Each path
+    /// refreshes the nearest existing item at or above it
+    /// (`BaseItem.ChangedExternally`, a `Default` refresh) and validates that
+    /// item's subtree: new items are created, the rows whose files are gone
+    /// are removed. The folders above that item are carried for context
+    /// only — never refreshed — and no library-wide closing pass runs.
+    ///
+    /// ACCEPTED DIVERGENCE (approved by the owner on 2026-09-27): Ferrofin
+    /// keeps a series' `DateLastMediaAdded` current on a watcher event — the
+    /// closing folder aggregate pass writes that one column of a context
+    /// series when a new episode moves it — where upstream updates it only
+    /// on the series' own refresh (`MetadataService.cs:404-411`), i.e. at
+    /// the next library scan.
+    Changed(Vec<String>),
+    /// The file items at these paths refreshing themselves
+    /// (`ProviderManager.RefreshSingleItem`, a non-folder's `RefreshItem`):
+    /// a movie's, an episode's, a track's refresh, or an Identify of one. A
+    /// file that is gone is never removed by it — upstream's item refresh
+    /// deletes nothing — and it runs no library-wide closing pass.
+    Items(Vec<String>),
+    /// `ProviderManager.RefreshArtist`: the CHILDREN of `folders` — the
+    /// artist folders the artist's credited albums sit under — and the
+    /// artist itself (its own row, when it has a folder at `path`). The items
+    /// of `folders` themselves, other artists, are not refreshed.
+    Artist {
+        /// The artist's id.
+        id: Uuid,
+        /// The artist's own folder, when it is folder-backed.
+        path: Option<String>,
+        /// The artist folders whose children are validated.
+        folders: Vec<String>,
+    },
+}
 
 /// A search match: an item id paired with a relevance score.
 ///
@@ -152,6 +271,98 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Resolves an item as a user, returning `None` when it is missing or hidden.
+    /// A user-less request retains raw lookup semantics (for example API keys).
+    /// Storage and policy evaluation failures remain errors, never invisibility.
+    async fn get_item_by_id_for_user(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let Some(item) = self.get_item_by_id(id).await? else {
+            return Ok(None);
+        };
+        if let Some(user) = user
+            && !self.is_item_visible_standalone(&item, user).await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(item))
+    }
+
+    /// `BaseItem.IsVisible`: the item's own policy, used by parent browse gates.
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn is_item_visible(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Err(ServiceError::backend("item visibility is not configured"))
+    }
+
+    /// Applies the own-item IsVisible rule to a child set, preserving order.
+    /// Concrete managers batch policy and hierarchy reads for Folder consumers.
+    async fn filter_visible_items(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut visible = Vec::with_capacity(items.len());
+        for item in items {
+            if self.is_item_visible(&item, user).await? {
+                visible.push(item);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// `IsVisibleStandalone`: item, ancestor and library access with kind overrides.
+    /// Managers must supply policy evaluation; the default fails closed.
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Err(ServiceError::backend(
+            "standalone item visibility is not configured",
+        ))
+    }
+
+    /// Returns existing, standalone-visible IDs in input order.
+    /// Implementations can batch policy and hierarchy reads for queue checks.
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let mut visible = Vec::new();
+        for &id in ids {
+            if self
+                .get_item_by_id_for_user(id, Some(user))
+                .await?
+                .is_some()
+            {
+                visible.push(id);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Resolve the distinct physical owners whose extras an item presents.
+    /// Concrete managers batch movie-version links and grouped-series folders.
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, vec![id]))
+            })
+            .collect())
+    }
+
     /// Whether an item with `id` exists.
     ///
     /// Semantically `get_item_by_id(id).is_some()` — which is the default — but
@@ -212,20 +423,23 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// [`ServiceError::InvalidInput`] when `image_type` does not allow multiple
     /// images, or [`ServiceError::Backend`] on a storage failure.
+    ///
+    /// Returns whether a swap happened, i.e. whether the caller owes the
+    /// `ImageUpdate` repository save.
     async fn swap_images(
         &self,
         item_id: Uuid,
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         if !image_type_allows_multiple(image_type) {
             return Err(ServiceError::invalid_input(
                 "The change index operation is only applicable to backdrops and chapters",
             ));
         }
         let _ = (item_id, index1, index2);
-        Ok(())
+        Ok(false)
     }
 
     /// Gets an item's ancestor rows, nearest parent first, walking the
@@ -357,6 +571,44 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
+    /// The locked metadata fields (upstream's `BaseItem.LockedFields`) of
+    /// each of `item_ids`; an item with none is absent.
+    ///
+    /// The default knows of no locks, so the API-layer test doubles keep
+    /// compiling; the real manager reads `BaseItemMetadataFields`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the fields cannot be read.
+    async fn get_locked_fields_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        let _ = item_ids;
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Replaces an item's locked-field set — the write behind
+    /// `ItemUpdateController.UpdateItem`'s `item.LockedFields =
+    /// request.LockedFields`. `field_ids` are `MetadataField` values as the
+    /// client sent them, an unknown one included (upstream stores it too). Like the external ids, the set lives in its
+    /// own table, so it cannot ride along with
+    /// [`update_items`](Self::update_items).
+    ///
+    /// The default is a no-op (for test doubles).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the set cannot be persisted.
+    async fn update_item_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
+        Ok(())
+    }
+
     /// Deletes an item, honoring the given [`DeleteOptions`].
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
@@ -396,6 +648,26 @@ pub trait LibraryManager: Send + Sync {
         Err(ServiceError::backend(
             "remove_alternate_sources not supported",
         ))
+    }
+
+    /// The other parts of a stacked video, ordered by `SortName`.
+    ///
+    /// Port of `Video.GetAdditionalParts(user)` (`Video.cs:492-498`): one
+    /// `Video` item per path in the video's `AdditionalParts` (its id derived
+    /// from the path as a `Video`'s), those that exist and — with a user —
+    /// that the user may see (parental rating and tags). Empty for a video
+    /// that is not stacked, and for any other item.
+    ///
+    /// The default implementation reports the operation as unsupported (see
+    /// [`merge_versions`](Self::merge_versions)); `FerrofinLibraryManager`
+    /// overrides it.
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (video, user);
+        Err(ServiceError::backend("get_additional_parts not supported"))
     }
 
     /// Gets the people rows attached to an item.
@@ -761,14 +1033,14 @@ pub trait LibraryManager: Send + Sync {
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a full library scan, tagging the run's root span with why it was
-    /// triggered (`api` / `schedule` / `startup` / `watcher`) for log↔trace
-    /// correlation. Defaults to the plain [`queue_library_scan`](Self::queue_library_scan)
-    /// so existing implementations need no change; the real manager overrides it
+    /// Queues a full library scan, tagging the run's root span, its log lines
+    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
+    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
+    /// existing implementations need no change; the real manager overrides it
     /// to record the `trigger`.
     async fn queue_library_scan_with_trigger(
         &self,
-        _trigger: &'static str,
+        _trigger: ScanTrigger,
     ) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
@@ -783,6 +1055,70 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await
     }
 
+    /// Queues a scan of `target` whose items refresh with `options` — how
+    /// `POST /Items/{itemId}/Refresh` refreshes anything with a path
+    /// (`ProviderManager.RefreshItem`: a CollectionFolder refreshes its
+    /// physical folders, any other folder validates its own children, both
+    /// with the request's options, and a file item refreshes itself through
+    /// the same metadata service — here the scan of its one path, with the
+    /// scan's refresh decision, merge, probe, local readers and every
+    /// metadata provider). The folders above a path-scoped target are not
+    /// refreshed (their refresh modes are `None`), as upstream never
+    /// refreshes a folder's ancestors. The other scan entry points refresh
+    /// with the `MetadataRefreshOptions` constructor defaults.
+    ///
+    /// The default refuses: a manager without a scanner cannot honour the
+    /// options, and widening the request into a default full scan would
+    /// silently do something else.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager with no scanner, or whatever
+    /// queueing the scan surfaces.
+    async fn queue_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (target, options);
+        Err(ServiceError::backend(
+            "queue_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
+    /// [`queue_refresh_scan`](Self::queue_refresh_scan), returning only once
+    /// the refresh has run — the refresh `POST /Items/RemoteSearch/Apply/{id}`
+    /// awaits (`ProviderManager.RefreshFullItem`). It goes into the scan
+    /// queue's priority lane: ahead of every queued scan, and — while a scan
+    /// runs — served inside that scan between two of its items, so it waits
+    /// about one item, never a whole library scan. Returns `Ok(false)` when
+    /// it was stopped before it finished (the server is shutting down).
+    ///
+    /// With `options.search_result` set, the items the scan covers are looked
+    /// up by that chosen result (`MetadataService.ApplySearchResult`): their
+    /// local readers are skipped and the result's provider ids, name and year
+    /// pin the remote lookup, the fetcher it came from first. The item's own
+    /// ids become the result's (`item.SetProviderIds`, the controller's half
+    /// upstream) with the refresh's save of the item, so a refresh that fails
+    /// leaves no half-applied ids.
+    ///
+    /// The default refuses, as [`queue_refresh_scan`](Self::queue_refresh_scan)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager with no scanner, or the scan
+    /// failed.
+    async fn run_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (target, options);
+        Err(ServiceError::backend(
+            "run_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
     /// Runs a full library scan and returns only when it has FINISHED.
     ///
     /// The scheduled-task entry point, and the one place the difference from
@@ -794,11 +1130,41 @@ pub trait LibraryManager: Send + Sync {
     /// itself finished in 0 ms with the scan still writing — which is what the
     /// dashboard, and anything that waits on the task, would then believe.
     ///
+    /// `trigger` is why the task ran (its schedule, its startup trigger, or
+    /// the dashboard over the API); the scan's span, log lines and metrics
+    /// carry it. `progress`, when given, receives the scan's progress as it
+    /// runs (upstream's `IProgress<double>`: the items take 0–96 %, the
+    /// closing passes 96–100 %).
+    ///
+    /// Returns `Ok(true)` once the scan ran to its end, and `Ok(false)` when
+    /// it was stopped before it finished or refused because scanning has
+    /// shut down — upstream's `OperationCanceledException`, which the task
+    /// records as `Cancelled`.
+    ///
     /// Defaults to the queueing form so implementations with no scanner need no
     /// change; the real manager overrides it.
-    async fn run_library_scan(&self) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
+    ///
+    /// # Errors
+    ///
+    /// The scan failed (or panicked), so the task records `Failed`.
+    async fn run_library_scan(
+        &self,
+        trigger: ScanTrigger,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (trigger, progress);
+        self.queue_library_scan().await.map(|()| true)
     }
+
+    /// Stops scanning for good, as the host tears down: cancels the running
+    /// scan (it stops before its next item, the one in progress written
+    /// whole), drops the queued ones, refuses new ones, and returns once no
+    /// scan is running — before the database it writes to is closed or a
+    /// backup restore replaces its tree.
+    ///
+    /// A manager with no scanner runs no scan, so the default has nothing to
+    /// stop.
+    async fn shutdown_scans(&self) {}
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
@@ -812,7 +1178,7 @@ fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}
 /// `EnableVideoPlaybackTranscoding`, and its `SupportsDirectStream` becomes
 /// `EnablePlaybackRemuxing`. Everything else (photos, books, unknown media)
 /// is left as the source built it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlaybackPermissions {
     /// `PermissionKind.EnableVideoPlaybackTranscoding`.
     pub video_transcoding: bool,
@@ -820,6 +1186,48 @@ pub struct PlaybackPermissions {
     pub audio_transcoding: bool,
     /// `PermissionKind.EnablePlaybackRemuxing`.
     pub remuxing: bool,
+}
+
+impl From<&UserPolicy> for PlaybackPermissions {
+    fn from(policy: &UserPolicy) -> Self {
+        Self {
+            video_transcoding: policy.enable_video_playback_transcoding,
+            audio_transcoding: policy.enable_audio_playback_transcoding,
+            remuxing: policy.enable_playback_remuxing,
+        }
+    }
+}
+
+/// The user permissions `BaseItem.CanDelete(user)`, `CanDownload(user)` and
+/// `GetPlayAccess(user)` read, from [`UserDataManager::get_content_permissions`].
+///
+/// Upstream reads each with `user.HasPermission(PermissionKind.…)` and the
+/// folder list with `user.GetPreferenceValues<Guid>(PreferenceKind.
+/// EnableContentDeletionFromFolders)` (`BaseItem.cs:854-879`,
+/// `BoxSet.cs:107-110`, `Playlist.cs:273-276`, `BaseItem.cs:902-905`).
+// Each flag is one independent `Permissions` row, not a state to model.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentPermissions {
+    /// `PermissionKind.IsAdministrator` — deletes any playlist and any
+    /// collection. It grants nothing for ordinary media: an administrator
+    /// without "Allow media deletion" cannot delete a movie, as upstream.
+    pub is_administrator: bool,
+    /// `PermissionKind.EnableMediaPlayback` — controls `PlayAccess`, including
+    /// for administrators, who have no override for this permission.
+    pub enable_media_playback: bool,
+    /// `PermissionKind.EnableContentDeletion` — the dashboard's "Allow media
+    /// deletion" (any library).
+    pub enable_content_deletion: bool,
+    /// `PermissionKind.EnableContentDownloading`.
+    pub enable_content_downloading: bool,
+    /// `PermissionKind.EnableCollectionManagement` — deletes collections.
+    pub enable_collection_management: bool,
+    /// `PreferenceKind.EnableContentDeletionFromFolders` — the dashboard's
+    /// "Allow media deletion from" list: the libraries (`CollectionFolder`
+    /// ids) the user may delete from without the global permission. Values
+    /// that are not GUIDs are dropped.
+    pub content_deletion_folders: Vec<Uuid>,
 }
 
 impl PlaybackPermissions {
@@ -989,11 +1397,24 @@ pub trait UserManager: Send + Sync {
 
 fn _assert_object_safe_user_manager(_: &dyn UserManager) {}
 
+/// Observes a committed user-data write with its pinned save reason.
+/// The NFO consumer subscribes weakly so it may retain the user-data manager.
+#[async_trait]
+pub trait UserDataSaveListener: Send + Sync {
+    /// Handles a successfully persisted write. Listener failures must not undo it.
+    async fn user_data_saved(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError>;
+}
+
 /// Reads and writes per-user, per-item playback/rating data.
 ///
 /// Port of `IUserDataManager`. User/item arguments become [`Uuid`] identities;
-/// results are the [`UserItemDataDto`] presentation DTO. The C# `event
-/// UserDataSaved` is dropped (events are wired separately in `ferrofin-core`).
+/// results are the [`UserItemDataDto`] presentation DTO. The committed-write
+/// listener carries the source `UserDataSaved` reason to its NFO consumer.
 #[async_trait]
 pub trait UserDataManager: Send + Sync {
     /// Saves user data supplied as an update DTO.
@@ -1003,6 +1424,19 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
         user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError>;
+
+    /// Saves user data with the caller's source event reason.
+    /// The default preserves compatibility with implementations without listeners.
+    async fn save_user_data_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        user_data: &UpdateUserItemDataDto,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        let _ = reason;
+        self.save_user_data(user_id, item_id, user_data).await
+    }
 
     /// Gets the presentation DTO of a user's data for an item, or `None`.
     async fn get_user_data_dto(
@@ -1108,6 +1542,19 @@ pub trait UserDataManager: Send + Sync {
         reported_position_ticks: Option<i64>,
     ) -> Result<bool, ServiceError>;
 
+    /// Updates play state with PlaybackProgress or PlaybackFinished preserved.
+    async fn update_play_state_with_reason(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: ferrofin_model::entities::UserDataSaveReason,
+    ) -> Result<bool, ServiceError> {
+        let _ = reason;
+        self.update_play_state(user_id, item_id, reported_position_ticks)
+            .await
+    }
+
     /// Records that playback of an item just started for a user.
     ///
     /// Port of the user-data half of C# `SessionManager.OnPlaybackStart`:
@@ -1155,17 +1602,20 @@ pub trait UserDataManager: Send + Sync {
         item_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// The user's `(EnableContentDeletion, EnableContentDownloading)`
-    /// permissions, for the DTO builder's per-user `CanDelete`/`CanDownload`
-    /// gating (C# `BaseItem.CanDelete(user)` / `CanDownload(user)`).
+    /// The slice of the user's policy that `CanDelete(user)`, `GetPlayAccess(user)`
+    /// and `CanDownload(user)` read (C# `BaseItem.IsAuthorizedToDelete`, its
+    /// `BoxSet`/`Playlist` overrides, and `IsAuthorizedToDownload`), for the
+    /// DTO builder's per-user `CanDelete`/`CanDownload`/`PlayAccess` and the delete
+    /// endpoints' check, which use the same value.
     ///
-    /// `None` means "no policy known" — the caller falls back to the
-    /// file-level fact. The default returns that; the concrete manager reads
-    /// the `Permissions` rows.
+    /// `None` means "no policy known". `CanDownload` then falls back to the
+    /// file-level fact, while `CanDelete` is `false` and `PlayAccess` is `None`:
+    /// neither permission is granted on an unknown policy. The default returns `None`; the
+    /// concrete manager reads the `Permissions` and `Preferences` rows.
     async fn get_content_permissions(
         &self,
         user_id: Uuid,
-    ) -> Result<Option<(bool, bool)>, ServiceError> {
+    ) -> Result<Option<ContentPermissions>, ServiceError> {
         let _ = user_id;
         Ok(None)
     }
@@ -1208,6 +1658,19 @@ fn _assert_object_safe_user_data_manager(_: &dyn UserDataManager) {}
 pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Gets the top-level views including any the user hid from their home
+    /// screen. Used by profile settings so hidden views can be re-enabled.
+    /// Managers that do not implement hidden-view filtering can use the
+    /// ordinary view list for both requests.
+    async fn get_user_views_with_hidden(
+        &self,
+        user_id: Uuid,
+        include_hidden: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = include_hidden;
+        self.get_user_views(user_id).await
+    }
 
     /// Gets the server's media folders — the user-root children.
     ///
@@ -1370,6 +1833,28 @@ pub trait MediaSourceManager: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
+    /// [`Self::get_alternate_versions_batch`] with, beside each row, whether
+    /// it has versions of its own (some other row names it as its
+    /// `PrimaryVersionId`), read in the same query. The default flags every
+    /// row the unflagged form returns.
+    async fn get_alternate_versions_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<
+            Uuid,
+            Vec<(ferrofin_db::entities::base_items::BaseItemEntity, bool)>,
+        >,
+        ServiceError,
+    > {
+        Ok(self
+            .get_alternate_versions_batch(primary_ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
+    }
+
     /// Gets the media attachments of an item as presentation DTOs.
     async fn get_media_attachments(
         &self,
@@ -1424,13 +1909,6 @@ pub trait MediaSourceManager: Send + Sync {
 
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
-
-    /// Re-probes a leaf item's file (ffprobe) and rewrites its media streams and
-    /// duration/size — the media-info half of a metadata refresh. Used to correct
-    /// stale probe data (e.g. Dolby Vision fields added after the item was first
-    /// scanned) without a full library rescan. A folder/non-media/missing-path
-    /// item, or one with no encoder wired, is a successful no-op.
-    async fn refresh_media_streams(&self, item_id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_media_source_manager(_: &dyn MediaSourceManager) {}
@@ -1513,8 +1991,19 @@ pub trait LibraryMonitor: Send + Sync {
         refresh_path: bool,
     ) -> Result<(), ServiceError>;
 
-    /// Signals that `path` changed on disk.
+    /// Signals that `path` changed on disk, as the filesystem watcher saw it
+    /// (a refresh it starts is labelled [`ScanTrigger::Watcher`]).
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError>;
+
+    /// Signals that `path` changed on disk, as an *arr webhook reported it
+    /// (`POST /Library/{Series,Movies}/…`, `POST /Library/Media/Updated`):
+    /// upstream's same `ReportFileSystemChanged` — the same debounce and the
+    /// same refresh as the watcher's — except that a refresh it starts is
+    /// labelled [`ScanTrigger::Webhook`] in logs and metrics. Defaults to
+    /// [`report_file_system_changed`](Self::report_file_system_changed).
+    async fn report_webhook_change(&self, path: &str) -> Result<(), ServiceError> {
+        self.report_file_system_changed(path).await
+    }
 }
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}

@@ -46,9 +46,11 @@ const IGNORE_RULES: &[IgnoreRule] = &[
     IgnoreRule::ExtensionEquals("trickplay"),
     IgnoreRule::PathSegmentSuffix(".trickplay"),
     // Directories anywhere in the path.
+    // Files directly inside a sample folder (`**/sample/*`, `**/minta/*`):
+    // neither the folder itself nor anything deeper.
+    IgnoreRule::ParentSegmentEquals("sample"),
+    IgnoreRule::ParentSegmentEquals("minta"),
     IgnoreRule::PathSegmentEquals("metadata"),
-    IgnoreRule::PathSegmentEquals("sample"),
-    IgnoreRule::PathSegmentEquals("minta"),
     IgnoreRule::PathSegmentEquals("ps3_update"),
     IgnoreRule::PathSegmentEquals("ps3_vprm"),
     IgnoreRule::PathSegmentEquals("extrafanart"),
@@ -82,6 +84,10 @@ enum IgnoreRule {
     /// A `<stem>.<ext>` or `*.<stem>.<ext>` sample-clip pattern with a short
     /// extension (C# `**/sample.?`…`**/*.sample.?????`).
     SampleClip(&'static str),
+    /// The segment holding the last one equals this, case-insensitively: a
+    /// direct child of that directory (C# `**/<dir>/*`, whose `*` matches one
+    /// segment, so neither `<dir>` itself nor a deeper path).
+    ParentSegmentEquals(&'static str),
     /// Some path segment equals this, case-insensitively (a directory match).
     PathSegmentEquals(&'static str),
     /// Some path segment ends with this suffix, case-insensitively.
@@ -98,6 +104,9 @@ impl IgnoreRule {
                 file_name.rsplit_once('.').is_some_and(|(_, e)| e == ext)
             }
             IgnoreRule::SampleClip(stem) => is_sample_clip(file_name, stem),
+            IgnoreRule::ParentSegmentEquals(dir) => {
+                segments.len() >= 2 && segments[segments.len() - 2] == dir
+            }
             IgnoreRule::PathSegmentEquals(seg) => segments.contains(&seg),
             IgnoreRule::PathSegmentSuffix(suffix) => {
                 segments.iter().any(|s| s.ends_with(suffix)) || lower_path.ends_with(suffix)
@@ -170,6 +179,50 @@ fn _assert_object_safe_file_system_watcher(_: &dyn FileSystemWatcher) {}
 #[cfg(test)]
 mod tests {
     use super::should_ignore_path;
+
+    /// Upstream `IgnorePatternsTests.PathIgnored`, every `[InlineData]`.
+    #[rstest::rstest]
+    #[case("/media/small.jpg", true)]
+    #[case("/media/albumart.jpg", true)]
+    #[case("/media/movie.sample.mp4", true)]
+    #[case("/media/movie/sample.mp4", true)]
+    #[case("/media/movie/sample/movie.mp4", true)]
+    #[case("/foo/sample/bar/baz.mkv", false)]
+    #[case("/media/movies/the sample/the sample.mkv", false)]
+    #[case("/media/movies/sampler.mkv", false)]
+    #[case("/media/movies/#Recycle/test.txt", true)]
+    #[case("/media/movies/#recycle/", true)]
+    #[case("/media/movies/#recycle", true)]
+    #[case("thumbs.db", true)]
+    #[case(r"C:\media\movies\movie.avi", false)]
+    #[case("/media/.hiddendir/file.mp4", false)]
+    #[case("/media/dir/.hiddenfile.mp4", true)]
+    #[case("/media/dir/._macjunk.mp4", true)]
+    #[case("/volume1/video/Series/@eaDir", true)]
+    #[case("/volume1/video/Series/@eaDir/file.txt", true)]
+    #[case("/directory/@Recycle", true)]
+    #[case("/directory/@Recycle/file.mp3", true)]
+    #[case("/media/movies/.@__thumb", true)]
+    #[case("/media/movies/.@__thumb/foo-bar-thumbnail.png", true)]
+    #[case("/media/music/Foo B.A.R./epic.flac", false)]
+    #[case("/media/music/Foo B.A.R", false)]
+    #[case("/media/music/Foo B.A.R.", false)]
+    #[case("/movies/.zfs/snapshot/AutoM-2023-09", true)]
+    fn path_ignored(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(should_ignore_path(path), expected, "{path}");
+    }
+
+    /// `**/sample/*` takes a sample folder's direct children only: the folder
+    /// itself stays visible, so the scanner can see it as the `sample` extras
+    /// folder (PR #17964) — whatever its case.
+    #[rstest::rstest]
+    #[case("/media/Movie (2020)/Sample", false)]
+    #[case("/media/Movie (2020)/SAMPLE/clip.mkv", true)]
+    #[case("/media/Movie (2020)/minta/clip.mkv", true)]
+    #[case("/media/Movie (2020)/minta", false)]
+    fn a_sample_folder_hides_its_files_not_itself(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(should_ignore_path(path), expected, "{path}");
+    }
 
     #[test]
     fn ignores_artwork_and_sample_files() {

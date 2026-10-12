@@ -54,6 +54,9 @@ const IDLE_REAPER_SWEEP_SECS: u64 = 10;
 pub struct MediaEncodingExtras {
     /// Resolves item/series/library display names for the transcode logs.
     pub library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// The configured libraries, which name the library an item's location
+    /// belongs to in those logs.
+    pub virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     /// Supplies the item's trickplay tile resolutions for the master playlist.
     pub trickplay: Option<Arc<dyn ferrofin_traits::trickplay::TrickplayManager>>,
     /// Releases the live stream a killed job was reading.
@@ -102,10 +105,9 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
 ///
 /// `report_started` publishes what the job is — codecs, container, size,
 /// accelerator — the moment it spawns, which is what puts a transcode on the
-/// dashboard at all. `report_progress` stays a no-op: upstream fills the
-/// framerate and completion percentage from an ffmpeg progress reader that
-/// Ferrofin does not have yet. Building that reader is its own piece of work —
-/// see the ledger — and this is the seam it will report through.
+/// dashboard at all. The runtime calls it again with framerate, completion and
+/// bitrate from changed stderr statistics; `report_progress` remains the
+/// separate diagnostics hook and is not required by this adapter.
 struct LiveStreamReleasingReporter<R: LiveStreamReleaser> {
     releaser: R,
 }
@@ -226,7 +228,7 @@ pub fn build_media_encoding(
         Arc::clone(&media_sources),
         Arc::clone(&encoder),
         EncodingHelper::new(ffmpeg.capabilities.clone()),
-        config,
+        Arc::clone(&config),
         Arc::clone(&paths),
         Arc::clone(&subtitles),
         ffmpeg.supports_filter("tonemapx"),
@@ -235,19 +237,35 @@ pub fn build_media_encoding(
         Some(library) => planner.with_library(library),
         None => planner,
     };
+    let planner = match extras.virtual_folders.clone() {
+        Some(folders) => planner.with_virtual_folders(folders),
+        None => planner,
+    };
     let transcoder = TokioSegmentTranscoder::new();
     // A live transcode holds a tuner: the reporter releases it when the job dies.
     let reporter: Arc<dyn ferrofin_mediaencoding::SessionReporter> = match extras.sessions {
         Some(sessions) => Arc::new(LiveStreamReleasingReporter { releaser: sessions }),
         None => Arc::new(NoopSessionReporter),
     };
-    let manager = Arc::new(TranscodeManagerImpl::new(reporter));
+    let manager = Arc::new(
+        TranscodeManagerImpl::new(reporter)
+            .with_encoding_configuration(config)
+            .with_pause_keys(
+                ferrofin_mediaencoding::transcoding::throttler::PauseKeys::select(
+                    ffmpeg.capabilities.pkey_pause_supported(),
+                    ffmpeg.capabilities.ffmpeg_version(),
+                ),
+            ),
+    );
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
     // → the job dies and its partial files are cleaned up. Spawned only when a
     // runtime exists so the sync composition unit test can still call this.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
         handle.spawn(
             Arc::clone(&manager)
                 .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),
@@ -634,9 +652,6 @@ mod tests {
         async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
             Err(ServiceError::backend("no"))
         }
-        async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-            Ok(())
-        }
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -704,7 +719,7 @@ mod tests {
         fn trickplay_directory(
             &self,
             _item_id: Uuid,
-            _media_path: &str,
+            _media: ferrofin_traits::system::MediaLocation<'_>,
             _save_with_media: bool,
         ) -> String {
             String::new()
@@ -734,10 +749,15 @@ mod tests {
             _item_id: Uuid,
             _media_path: &str,
             _chapter_position_ticks: i64,
+            _date_modified_ticks: i64,
         ) -> String {
             String::new()
         }
-        fn extracted_data_paths(&self, _item_id: Uuid, _media_path: &str) -> Vec<String> {
+        fn extracted_data_paths(
+            &self,
+            _item_id: Uuid,
+            _media_path: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Vec<String> {
             Vec::new()
         }
     }
@@ -820,6 +840,7 @@ mod tests {
         });
         // The trio builds without panicking; every slot is a real trait object.
         let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -834,6 +855,7 @@ mod tests {
             &ffmpeg,
             MediaEncodingExtras {
                 library: None,
+                virtual_folders: None,
                 trickplay: None,
                 sessions: None,
             },
@@ -1107,11 +1129,20 @@ mod tests {
             attachments: Vec::new(),
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
-        let (config, paths) = config_and_paths();
+        let directory = tempfile::tempdir().expect("owned composition paths");
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            directory.path().join("data"),
+            directory.path().join("log"),
+            directory.path().join("config"),
+            directory.path().join("cache"),
+            directory.path().join("web"),
+        ));
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
             root: "/cache/att".to_owned(),
         });
         let ffmpeg = FfmpegPaths {
+            encoder_app_path_display: None,
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
@@ -1126,6 +1157,7 @@ mod tests {
             &ffmpeg,
             MediaEncodingExtras {
                 library: None,
+                virtual_folders: None,
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
             },

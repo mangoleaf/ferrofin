@@ -12,14 +12,18 @@
 //! `Authorization: Bearer <token>`.
 //!
 //! Faithful port notes (the C# is the oracle):
-//! - Translations: v4 returns a base `name`/`overview` plus per-language
-//!   translations; this port uses the base fields (English-default), matching
-//!   `ReturnOriginalLanguageOrDefault` when no translation is requested. The
-//!   language-fallback chain is a documented follow-up.
+//! - Translations: series and episodes keep their name/overview translations.
+//!   The scanner selects the configured metadata language, excluding name
+//!   aliases, under the plugin defaults: no fallback languages and no original
+//!   language fallback. The separate plugin configuration page remains an open
+//!   settings work item; it is not implemented by these library preferences.
+//!   Seasons select their translated overview through `IsMatch` too.
 //! - Episode ordering: TVDB has multiple orderings (`official` = aired, `dvd`,
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
 
+use crate::rate_limit::CountedBody as _;
+use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use std::sync::Mutex;
 
 use ferrofin_model::entities::ImageType;
@@ -35,6 +39,86 @@ const API_BASE: &str = "https://api4.thetvdb.com/v4";
 const PROJECT_API_KEY: &str = "7f7eed88-2530-4f84-8ee7-f154471b8f87";
 /// The default episode ordering — TVDB "official" (aired) order.
 pub const DEFAULT_SEASON_TYPE: &str = "official";
+
+/// TVDB's episode image provider uses supported series display orders; absolute
+/// episodes use season one except specials, which retain official numbering.
+#[must_use]
+pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
+    match order {
+        "absolute" if season == 0 => (DEFAULT_SEASON_TYPE, 0),
+        "absolute" => ("absolute", 1),
+        "regional" | "alternate" | "altdvd" | "dvd" | "alttwo" => (order, season),
+        _ => (DEFAULT_SEASON_TYPE, season),
+    }
+}
+
+/// The raw `DisplayOrder` a series row stores (`SeasonInfo`/`EpisodeInfo.
+/// SeriesDisplayOrder`): empty when the row has none.
+#[must_use]
+pub fn display_order_of(data: Option<&str>) -> String {
+    data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("DisplayOrder")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// The ordering `TvdbSeasonProvider.GetMetadata` looks a season up in: the
+/// series' display order, `official` when blank (`:65-74`).
+#[must_use]
+pub fn season_lookup_order(display_order: &str) -> &str {
+    if display_order.trim().is_empty() {
+        DEFAULT_SEASON_TYPE
+    } else {
+        display_order
+    }
+}
+
+/// `TvdbClientManager.GetEpisodeTvdbId`'s season-number lookup for one
+/// episode: the TVDB ordering to ask, the season and the episode number. A
+/// season-less episode is in season 1; absolute order is always season 1
+/// except for specials, which use official order; an order the client does
+/// not know is official (the plugin's `switch` is case-sensitive).
+#[must_use]
+pub fn episode_lookup(
+    display_order: &str,
+    parent_index: Option<i32>,
+    index: i32,
+) -> (&str, i32, i32) {
+    let (order, season) = episode_image_order(display_order, parent_index.unwrap_or(1));
+    (order, season, index)
+}
+
+/// How long a resolved TVDB id is reused unless configured otherwise
+/// ([`TvdbClient::with_cache_duration`], the server's
+/// `FERROFIN_TVDB_CACHE_HOURS`): the plugin's `CacheDurationInHours` default
+/// (`PluginConfiguration.cs:14`, `TvdbClientManager.cs:61`), for which its
+/// `GetEpisodeTvdbId` caches the episode id it found (`:585-683`) and its
+/// `GetSeriesExtendedByIdAsync` the series record a season's id is read
+/// from (`:251-271`).
+pub const DEFAULT_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// `(series id, season type, season, episode)` → the episode's TVDB id and
+/// when it was resolved.
+type EpisodeIdCache = std::collections::HashMap<(i64, String, i32, i32), (std::time::Instant, i64)>;
+
+/// Series id → the seasons its extended record lists and when it was read.
+type SeasonIdCache = std::collections::HashMap<i64, (std::time::Instant, Vec<TvdbSeasonRef>)>;
+
+/// One season a series' extended record lists (`SeasonBaseRecord`): what
+/// `TvdbSeasonProvider` picks a season's id by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TvdbSeasonRef {
+    /// The season's TVDB id.
+    id: i64,
+    /// The season number in its ordering.
+    number: i64,
+    /// The ordering it belongs to (`Type.Type`: `official`, `dvd`,
+    /// `absolute`, …).
+    season_type: String,
+}
 
 /// A credited person from TVDB (`Character`), mapped toward a Ferrofin person row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +157,10 @@ pub struct TvdbSeriesDetails {
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// First aired date (`YYYY-MM-DD`).
     pub premiere_date: Option<String>,
     /// Production year, derived from `firstAired`.
@@ -96,6 +184,8 @@ pub struct TvdbSeriesDetails {
     pub air_time: Option<String>,
     /// The URL slug (`TvdbSlug`).
     pub slug: Option<String>,
+    /// Official TVDB list ids, separated by semicolons as in the plugin.
+    pub collection_ids: Option<String>,
     /// Cross-provider ids resolved from `remoteIds`.
     pub imdb_id: Option<String>,
     /// The TMDB id, if TVDB carries one.
@@ -111,27 +201,47 @@ pub struct TvdbSeriesDetails {
 }
 
 impl TvdbSeriesDetails {
+    /// Applies the metadata language with the plugin's default empty fallback
+    /// list and `FallbackToOriginalLanguage=false`. Alias names are excluded.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+
     /// The artwork as plain type+URL [`RemoteImage`] pairs for the scan-download
     /// path.
     #[must_use]
     pub fn download_images(&self) -> Vec<RemoteImage> {
-        self.images
-            .iter()
-            .map(|i| RemoteImage {
-                image_type: i.image_type,
-                url: i.url.clone(),
-            })
-            .collect()
+        self.images.iter().cloned().map(RemoteImage::from).collect()
     }
 }
 
 /// Mapped episode metadata (`/episodes/{id}/extended`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TvdbEpisodeDetails {
+    /// The episode's own TVDB id.
+    pub tvdb_id: i64,
+    /// The episode's IMDb id.
+    pub imdb_id: Option<String>,
+    /// Special's position in aired order.
+    pub airs_before_episode: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
     /// The episode name.
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// Aired date (`YYYY-MM-DD`).
     pub aired: Option<String>,
     /// Production year, derived from `aired`.
@@ -142,15 +252,142 @@ pub struct TvdbEpisodeDetails {
     pub people: Vec<TvdbPerson>,
 }
 
-/// Mapped season metadata (`/seasons/{id}/extended`).
+impl TvdbEpisodeDetails {
+    /// Applies the metadata language with the plugin's default fallback rules.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+}
+
+fn translated_text(
+    translations: &[TvdbTranslation],
+    language: &str,
+    three_letter_names: &[String],
+    exclude_aliases: bool,
+) -> Option<String> {
+    translations
+        .iter()
+        .find(|translation| {
+            (!exclude_aliases || !translation.is_alias)
+                && translation_matches(&translation.language, language, three_letter_names)
+        })
+        .and_then(|translation| translation.text.clone())
+}
+
+/// Mapped season metadata (`/seasons/{id}/extended?meta=translations`, the
+/// plugin's `CustomSeasonExtendedRecord`).
+///
+/// A season record carries no base-language overview: its text is in its
+/// `translations` only, which is where `TvdbSeasonProvider` reads it from
+/// ([`translated_overview`](Self::translated_overview)).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TvdbSeasonDetails {
-    /// The season name, if any.
+    /// The season's own TVDB id (`season.Id`), which the plugin sets as the
+    /// season's `Tvdb` provider id (`SetTvdbId`, only when positive).
+    pub tvdb_id: Option<i64>,
+    /// The season's base-language name, if any.
     pub name: Option<String>,
-    /// The overview, if any.
-    pub overview: Option<String>,
     /// The poster/primary image URL, if any.
     pub image_url: Option<String>,
+    /// The name translations (`translations.nameTranslations`).
+    pub name_translations: Vec<TvdbTranslation>,
+    /// The overview translations (`translations.overviewTranslations`).
+    pub overview_translations: Vec<TvdbTranslation>,
+}
+
+/// One translation of a TVDB record's name or overview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TvdbTranslation {
+    /// TVDB's language code: ISO 639-2 (`eng`, `fra`), or one of its own
+    /// (`zhtw`, `pt`, `por`).
+    pub language: String,
+    /// The translated text; `None` when the translation carries none.
+    pub text: Option<String>,
+    /// An alias rather than the record's name in that language (`isAlias`).
+    pub is_alias: bool,
+}
+
+impl TvdbSeasonDetails {
+    /// The season's overview in `language` —
+    /// `TvdbSdkExtensions.GetTranslatedOverviewOrDefault` (`:89-101`): the
+    /// overview of the first translation in that language
+    /// ([`translation_matches`]), else of one in the plugin's
+    /// `FallbackLanguages`. Ferrofin exposes no TheTVDB settings page, so
+    /// those are the plugin's default — none — and a season TVDB has no
+    /// translation for in `language` gets no overview, as upstream's does.
+    #[must_use]
+    pub fn translated_overview(
+        &self,
+        language: &str,
+        three_letter_names: &[String],
+    ) -> Option<String> {
+        self.overview_translations
+            .iter()
+            .find(|t| translation_matches(&t.language, language, three_letter_names))
+            .and_then(|t| t.text.clone())
+    }
+}
+
+/// `TvdbCultureInfo.GetCultureInfo` (`TvdbCultureInfo.cs:30-44`) over the
+/// server's culture table (`ILocalizationManager.GetCultures`, which the
+/// plugin keeps): the ISO 639-2 codes (`ThreeLetterISOLanguageNames`) of the
+/// first culture whose display name, name, ISO 639-2 codes or two-letter code
+/// is `language` (any case); empty when none is.
+#[must_use]
+pub fn three_letter_language_names(
+    cultures: &[ferrofin_model::globalization::CultureDto],
+    language: &str,
+) -> Vec<String> {
+    cultures
+        .iter()
+        .find(|c| {
+            language.eq_ignore_ascii_case(&c.display_name)
+                || language.eq_ignore_ascii_case(&c.name)
+                || c.three_letter_iso_language_names
+                    .iter()
+                    .any(|n| language.eq_ignore_ascii_case(n))
+                || language.eq_ignore_ascii_case(&c.two_letter_iso_language_name)
+        })
+        .map(|c| c.three_letter_iso_language_names.clone())
+        .unwrap_or_default()
+}
+
+/// `TvdbSdkExtensions.IsMatch` (`:103-127`): whether a TVDB translation's
+/// `translation` language is the item's metadata `language`. TVDB's own codes
+/// for Traditional Chinese, Brazilian and European Portuguese are matched by
+/// name (`zh-TW` → `zhtw`, `pt-BR` → `pt`, `pt-PT` → `por`); any other
+/// language matches the ISO 639-2 codes of its culture —
+/// `three_letter_names`, the `ThreeLetterISOLanguageNames` the server's
+/// culture table lists for `language` (`TvdbCultureInfo.GetCultureInfo`,
+/// fed from `ILocalizationManager.GetCultures`). A blank `language` matches
+/// nothing.
+#[must_use]
+pub fn translation_matches(
+    translation: &str,
+    language: &str,
+    three_letter_names: &[String],
+) -> bool {
+    if language.trim().is_empty() {
+        return false;
+    }
+    let mapped = match language.to_lowercase().as_str() {
+        "zh-tw" => Some("zhtw"),
+        "pt-br" => Some("pt"),
+        "pt-pt" => Some("por"),
+        _ => None,
+    };
+    match mapped {
+        Some(mapped) => translation.eq_ignore_ascii_case(mapped),
+        None => three_letter_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(translation)),
+    }
 }
 
 /// Mapped person metadata (`/people/{id}/extended`).
@@ -232,8 +469,19 @@ struct ArtworkWire {
     height: Option<i32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtworkTypeWire {
+    id: Option<i64>,
+    name: Option<String>,
+    record_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SeriesExtendedWire {
+    translations: Option<TranslationsWire>,
+    lists: Option<Vec<ListWire>>,
+    seasons: Option<Vec<SeasonRefWire>>,
     name: Option<String>,
     slug: Option<String>,
     overview: Option<String>,
@@ -302,7 +550,21 @@ impl AirsDaysWire {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListWire {
+    id: Option<i64>,
+    #[serde(default)]
+    is_official: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EpisodeExtendedWire {
+    translations: Option<TranslationsWire>,
+    remote_ids: Option<Vec<RemoteIdWire>>,
+    airs_before_episode: Option<i64>,
+    airs_after_season: Option<i64>,
+    airs_before_season: Option<i64>,
     name: Option<String>,
     overview: Option<String>,
     aired: Option<String>,
@@ -310,11 +572,86 @@ struct EpisodeExtendedWire {
     characters: Option<Vec<CharacterWire>>,
 }
 
+/// A series record's `seasons` entry (`SeasonBaseRecord`).
+#[derive(Debug, Deserialize)]
+struct SeasonRefWire {
+    id: Option<i64>,
+    number: Option<i64>,
+    #[serde(rename = "type")]
+    season_type: Option<SeasonTypeWire>,
+}
+
+/// `SeasonType`: the ordering a season belongs to.
+#[derive(Debug, Deserialize)]
+struct SeasonTypeWire {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
+impl SeasonRefWire {
+    /// The season as the cache keeps it; `None` without an id, a number or
+    /// an ordering.
+    fn into_ref(self) -> Option<TvdbSeasonRef> {
+        Some(TvdbSeasonRef {
+            id: self.id.filter(|id| *id > 0)?,
+            number: self.number?,
+            season_type: self.season_type?.kind?,
+        })
+    }
+}
+
+/// The part of a series' extended record that lists its seasons — all the
+/// short record (`?short=true`) the season provider asks for is read for.
+#[derive(Debug, Deserialize)]
+struct SeriesSeasonsWire {
+    seasons: Option<Vec<SeasonRefWire>>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SeasonExtendedWire {
+    id: Option<i64>,
+    name: Option<String>,
+    image: Option<String>,
+    translations: Option<TranslationsWire>,
+}
+
+/// `TranslationExtended`, the `meta=translations` block.
+#[derive(Debug, Deserialize)]
+struct TranslationsWire {
+    #[serde(alias = "nameTranslations")]
+    name_translations: Option<Vec<TranslationWire>>,
+    #[serde(alias = "overviewTranslations")]
+    overview_translations: Option<Vec<TranslationWire>>,
+}
+
+/// One `Translation`.
+#[derive(Debug, Deserialize)]
+struct TranslationWire {
+    language: Option<String>,
     name: Option<String>,
     overview: Option<String>,
-    image: Option<String>,
+    #[serde(alias = "isAlias")]
+    is_alias: Option<bool>,
+}
+
+/// A translation list as [`TvdbTranslation`]s of the field `text` reads; an
+/// entry with no language is dropped (nothing can match it).
+fn translations_of(
+    list: Option<Vec<TranslationWire>>,
+    text: fn(TranslationWire) -> Option<String>,
+) -> Vec<TvdbTranslation> {
+    list.unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let language = t.language.clone().filter(|l| !l.is_empty())?;
+            let is_alias = t.is_alias.unwrap_or(false);
+            Some(TvdbTranslation {
+                language,
+                text: text(t),
+                is_alias,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,10 +669,24 @@ struct PersonExtendedWire {
 /// bearer token.
 pub struct TvdbClient {
     http: reqwest::Client,
+    limiter: RateLimiter,
     api_key: SecretString,
     pin: Option<String>,
     token: Mutex<Option<String>>,
     base_url: String,
+    /// The episode ids [`episode_by_number`](Self::episode_by_number)
+    /// resolved, kept for `cache_duration` as the
+    /// plugin keeps them, so a refresh repeated within that time asks for
+    /// the episode record only.
+    episode_ids: Mutex<EpisodeIdCache>,
+    /// The seasons each series' extended record listed, kept for
+    /// `cache_duration` as the plugin keeps the
+    /// record ([`season_id`](Self::season_id)).
+    season_ids: Mutex<SeasonIdCache>,
+    artwork_types: Mutex<Option<(std::time::Instant, Vec<ArtworkTypeWire>)>>,
+    /// How long both caches keep an entry: the plugin's
+    /// `CacheDurationInHours` ([`DEFAULT_CACHE_DURATION`] unless set).
+    cache_duration: std::time::Duration,
 }
 
 impl std::fmt::Debug for TvdbClient {
@@ -371,11 +722,25 @@ impl TvdbClient {
         };
         Self {
             http: reqwest::Client::new(),
+            limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
             token: Mutex::new(None),
             base_url: API_BASE.to_owned(),
+            episode_ids: Mutex::new(EpisodeIdCache::new()),
+            season_ids: Mutex::new(SeasonIdCache::new()),
+            artwork_types: Mutex::new(None),
+            cache_duration: DEFAULT_CACHE_DURATION,
         }
+    }
+
+    /// Sets how long resolved ids are reused — the plugin's
+    /// `CacheDurationInHours` setting, which covers the episode ids and each
+    /// series' season list.
+    #[must_use]
+    pub fn with_cache_duration(mut self, duration: std::time::Duration) -> Self {
+        self.cache_duration = duration;
+        self
     }
 
     /// Points the client at a different API root (a mock server in tests).
@@ -412,10 +777,10 @@ impl TvdbClient {
             .http
             .post(format!("{}/login", self.base_url))
             .json(&body)
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
-        let env: Envelope<LoginData> = resp.json().await.ok()?;
+        let env: Envelope<LoginData> = resp.counted_json().await.ok()?;
         let token = env.data?.token;
         if let Ok(mut guard) = self.token.lock() {
             *guard = Some(token.clone());
@@ -436,10 +801,10 @@ impl TvdbClient {
             .get(format!("{}{path}", self.base_url))
             .bearer_auth(token)
             .query(query)
-            .send()
+            .send_limited(&self.limiter)
             .await
             .ok()?;
-        let env: Envelope<T> = resp.json().await.ok()?;
+        let env: Envelope<T> = resp.counted_json().await.ok()?;
         env.data
     }
 
@@ -471,6 +836,37 @@ impl TvdbClient {
             .collect()
     }
 
+    /// Resolves an IMDb, Zap2It or TMDB id through TVDB's remote-id search.
+    /// Only series results are eligible; unrelated movie/person hits are ignored.
+    pub async fn series_by_remote_id(&self, remote_id: &str) -> Option<i64> {
+        #[derive(Deserialize)]
+        struct SeriesRef {
+            id: Option<i64>,
+        }
+        #[derive(Deserialize)]
+        struct Hit {
+            series: Option<SeriesRef>,
+        }
+        let remote_id = remote_id.trim();
+        if remote_id.is_empty() {
+            return None;
+        }
+        // Provider ids are alphanumeric (Zap2It also uses punctuation).
+        // Do not let malformed stored ids alter the URL path or query.
+        if !remote_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
+        {
+            return None;
+        }
+        let encoded = remote_id;
+        let hits: Vec<Hit> = self
+            .get(&format!("/search/remoteid/{encoded}"), &[])
+            .await?;
+        hits.into_iter()
+            .find_map(|hit| hit.series.and_then(|s| s.id).filter(|id| *id > 0))
+    }
+
     /// Fetches and maps full series metadata + artwork for `country_code`
     /// (three-letter ISO, for the content-rating pick). Port of
     /// `FetchSeriesMetadata`.
@@ -479,12 +875,16 @@ impl TvdbClient {
         tvdb_id: i64,
         country_code: &str,
     ) -> Option<TvdbSeriesDetails> {
-        let wire: SeriesExtendedWire = self
+        let mut wire: SeriesExtendedWire = self
             .get(
                 &format!("/series/{tvdb_id}/extended"),
                 &[("meta", "translations".to_owned())],
             )
             .await?;
+        // The full record lists the same seasons as the short one the
+        // season provider reads them from, so a season refreshed after its
+        // series resolves its id with no request of its own.
+        self.remember_seasons(tvdb_id, wire.seasons.take());
         Some(map_series(tvdb_id, wire, country_code))
     }
 
@@ -498,9 +898,29 @@ impl TvdbClient {
             )
             .await?;
         let production_year = wire.aired.as_deref().and_then(year_of);
+        let (names, overviews) = wire.translations.map_or((None, None), |t| {
+            (t.name_translations, t.overview_translations)
+        });
         Some(TvdbEpisodeDetails {
+            tvdb_id: episode_id,
+            imdb_id: wire
+                .remote_ids
+                .unwrap_or_default()
+                .into_iter()
+                .find(|id| {
+                    id.source_name
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("IMDB"))
+                })
+                .and_then(|id| id.id)
+                .map(|id| remote_id_to_string(&id)),
+            airs_before_episode: wire.airs_before_episode,
+            airs_after_season: wire.airs_after_season,
+            airs_before_season: wire.airs_before_season,
             name: wire.name,
             overview: wire.overview,
+            name_translations: translations_of(names, |t| t.name),
+            overview_translations: translations_of(overviews, |t| t.overview),
             aired: wire.aired,
             production_year,
             image_url: wire.image,
@@ -529,24 +949,189 @@ impl TvdbClient {
         struct EpisodesPayload {
             episodes: Option<Vec<EpisodeRef>>,
         }
-        let payload: EpisodesPayload = self
-            .get(
-                &format!("/series/{series_id}/episodes/{season_type}"),
-                &[
-                    ("season", season.to_string()),
-                    ("episodeNumber", number.to_string()),
-                ],
-            )
-            .await?;
-        let id = payload
-            .episodes?
-            .into_iter()
-            .find(|e| e.season_number == Some(season) && e.number == Some(number))
-            .and_then(|e| e.id)?;
+        let key = (series_id, season_type.to_owned(), season, number);
+        let cached = self.episode_ids.lock().ok().and_then(|ids| {
+            ids.get(&key)
+                .filter(|(at, _)| at.elapsed() < self.cache_duration)
+                .map(|(_, id)| *id)
+        });
+        let id = if let Some(id) = cached {
+            id
+        } else {
+            let payload: EpisodesPayload = self
+                .get(
+                    &format!("/series/{series_id}/episodes/{season_type}"),
+                    &[
+                        ("season", season.to_string()),
+                        ("episodeNumber", number.to_string()),
+                    ],
+                )
+                .await?;
+            let id = payload
+                .episodes?
+                .into_iter()
+                .find(|e| e.season_number == Some(season) && e.number == Some(number))
+                .and_then(|e| e.id)?;
+            // Only a found id is kept, as the plugin keeps it; the expired
+            // entries go on every write, so the map holds at most one TTL's
+            // worth of lookups.
+            if let Ok(mut ids) = self.episode_ids.lock() {
+                ids.retain(|_, (at, _)| at.elapsed() < self.cache_duration);
+                ids.insert(key, (std::time::Instant::now(), id));
+            }
+            id
+        };
         self.episode_details(id).await
     }
 
-    /// Fetches and maps a season's metadata. Port of `TvdbSeasonProvider`.
+    /// The TVDB id of season `number` of series `series_id` in the
+    /// `season_type` ordering — the identity step of `TvdbSeasonProvider.
+    /// GetMetadata` (`:76-90`): the first season the series' extended record
+    /// lists with that number and an ordering of that name (any case).
+    ///
+    /// The plugin reads the short record (`GetSeriesExtendedByIdAsync(…,
+    /// small: true)`) and caches it for `CacheDurationInHours`
+    /// (`TvdbClientManager.cs:251-271`); this keeps the record's season list
+    /// for `cache_duration`, also when [`series_details`](Self::series_details)
+    /// read the full record, which lists the same seasons. `None` when the
+    /// series lists no such season, or the record could not be read (a
+    /// failure, counted by the request).
+    pub async fn season_id(&self, series_id: i64, season_type: &str, number: i32) -> Option<i64> {
+        let pick = |seasons: &[TvdbSeasonRef]| {
+            seasons
+                .iter()
+                .find(|s| {
+                    s.number == i64::from(number) && s.season_type.eq_ignore_ascii_case(season_type)
+                })
+                .map(|s| s.id)
+        };
+        let cached = self.season_ids.lock().ok().and_then(|cache| {
+            cache
+                .get(&series_id)
+                .filter(|(at, _)| at.elapsed() < self.cache_duration)
+                .map(|(_, seasons)| pick(seasons))
+        });
+        if let Some(found) = cached {
+            return found;
+        }
+        let wire: SeriesSeasonsWire = self
+            .get(
+                &format!("/series/{series_id}/extended"),
+                &[("short", "true".to_owned())],
+            )
+            .await?;
+        let seasons = self.remember_seasons(series_id, wire.seasons);
+        pick(&seasons)
+    }
+
+    /// Keeps the seasons a series' extended record listed for
+    /// `cache_duration` and returns them. The expired entries go on every
+    /// write, so the map holds at most one cache duration's worth of series.
+    fn remember_seasons(
+        &self,
+        series_id: i64,
+        seasons: Option<Vec<SeasonRefWire>>,
+    ) -> Vec<TvdbSeasonRef> {
+        let seasons: Vec<TvdbSeasonRef> = seasons
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(SeasonRefWire::into_ref)
+            .collect();
+        if let Ok(mut cache) = self.season_ids.lock() {
+            cache.retain(|_, (at, _)| at.elapsed() < self.cache_duration);
+            cache.insert(series_id, (std::time::Instant::now(), seasons.clone()));
+        }
+        seasons
+    }
+
+    /// `TvdbSeasonImageProvider`: the selected ordering's artwork, falling
+    /// back to the official season only when the selected season has no art.
+    pub async fn season_images(
+        &self,
+        series_id: i64,
+        season_type: &str,
+        number: i32,
+    ) -> Vec<TmdbImage> {
+        #[derive(Deserialize)]
+        struct SeasonArtwork {
+            artwork: Option<Vec<ArtworkWire>>,
+        }
+        let Some(types) = self.image_types().await else {
+            return Vec::new();
+        };
+        let orders = if season_type.eq_ignore_ascii_case(DEFAULT_SEASON_TYPE) {
+            vec![DEFAULT_SEASON_TYPE]
+        } else {
+            vec![season_type, DEFAULT_SEASON_TYPE]
+        };
+        for order in orders {
+            let Some(id) = self.season_id(series_id, order, number).await else {
+                continue;
+            };
+            let Some(wire) = self
+                .get::<SeasonArtwork>(&format!("/seasons/{id}/extended"), &[])
+                .await
+            else {
+                continue;
+            };
+            let artwork = wire.artwork.unwrap_or_default();
+            if artwork.is_empty() {
+                continue;
+            }
+            return artwork
+                .into_iter()
+                .filter_map(|art| {
+                    let kind = types.iter().find(|kind| {
+                        kind.id.is_some()
+                            && kind.id == art.type_
+                            && kind
+                                .record_type
+                                .as_deref()
+                                .is_some_and(|record| record.eq_ignore_ascii_case("season"))
+                    })?;
+                    let image_type = match kind.name.as_deref()?.to_ascii_lowercase().as_str() {
+                        "poster" => ImageType::Primary,
+                        "banner" => ImageType::Banner,
+                        "background" => ImageType::Backdrop,
+                        "clearlogo" => ImageType::Logo,
+                        "clearart" => ImageType::Art,
+                        _ => return None,
+                    };
+                    Some(TmdbImage {
+                        image_type,
+                        url: art.image?,
+                        width: Some(art.width.unwrap_or(0)),
+                        height: Some(art.height.unwrap_or(0)),
+                        language: art.language,
+                        community_rating: None,
+                        vote_count: None,
+                    })
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    async fn image_types(&self) -> Option<Vec<ArtworkTypeWire>> {
+        // TvdbClientManager caches reference lists for seven days by default.
+        if let Some(types) = self.artwork_types.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_hours(168))
+                .map(|(_, types)| types.clone())
+        }) {
+            return Some(types);
+        }
+        let types: Vec<ArtworkTypeWire> = self.get("/artwork/types", &[]).await?;
+        if let Ok(mut cache) = self.artwork_types.lock() {
+            *cache = Some((std::time::Instant::now(), types.clone()));
+        }
+        Some(types)
+    }
+
+    /// Fetches and maps a season's record with its translations
+    /// (`GetSeasonByIdAsync`, `/seasons/{id}/extended?meta=translations`,
+    /// `TvdbClientManager.cs:309-327`).
     pub async fn season_details(&self, season_id: i64) -> Option<TvdbSeasonDetails> {
         let wire: SeasonExtendedWire = self
             .get(
@@ -554,10 +1139,15 @@ impl TvdbClient {
                 &[("meta", "translations".to_owned())],
             )
             .await?;
+        let (names, overviews) = wire.translations.map_or((None, None), |t| {
+            (t.name_translations, t.overview_translations)
+        });
         Some(TvdbSeasonDetails {
+            tvdb_id: wire.id.filter(|id| *id > 0),
             name: wire.name,
-            overview: wire.overview,
             image_url: wire.image,
+            name_translations: translations_of(names, |t| t.name),
+            overview_translations: translations_of(overviews, |t| t.overview),
         })
     }
 
@@ -579,8 +1169,8 @@ impl TvdbClient {
 
     /// Downloads an image by absolute URL, returning its bytes.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = self.http.get(url).send().await.ok()?;
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        let resp = crate::image_download::send(&self.http, url).await.ok()?;
+        resp.counted_bytes().await.ok()
     }
 }
 
@@ -632,6 +1222,9 @@ fn map_characters(characters: Option<Vec<CharacterWire>>) -> Vec<TvdbPerson> {
 /// content rating (country match then USA fallback), networks, remote ids, and
 /// artwork. Pure — the oracle for the mapping tests.
 fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> TvdbSeriesDetails {
+    let (names, overviews) = wire.translations.map_or((None, None), |t| {
+        (t.name_translations, t.overview_translations)
+    });
     let production_year = wire.first_aired.as_deref().and_then(year_of);
     // `lastAired` is the end date only for series that have ended.
     let end_date = wire
@@ -702,6 +1295,8 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         tvdb_id,
         name: wire.name,
         overview: wire.overview,
+        name_translations: translations_of(names, |t| t.name),
+        overview_translations: translations_of(overviews, |t| t.overview),
         premiere_date: wire.first_aired,
         production_year,
         end_date,
@@ -722,12 +1317,29 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
             .unwrap_or_default(),
         air_time: wire.airs_time.filter(|t| !t.is_empty()),
         slug: wire.slug,
+        collection_ids: official_collection_ids(wire.lists),
         imdb_id: find_remote("IMDB"),
-        tmdb_id: find_remote("TheMovieDB.com"),
+        tmdb_id: find_remote("TheMovieDB.com")
+            .map(|id| id.split('-').next().unwrap_or_default().to_owned()),
         zap2it_id: find_remote("Zap2It"),
         people: map_characters(wire.characters),
         images,
     }
+}
+
+/// TVDB's official list ids use the plugin's trailing-semicolon format.
+fn official_collection_ids(lists: Option<Vec<ListWire>>) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut ids = String::new();
+    for id in lists
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|list| list.is_official)
+        .filter_map(|list| list.id.filter(|id| *id > 0))
+    {
+        let _ = write!(ids, "{id};");
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// A `remoteIds` id is sometimes a JSON string, sometimes a number.
@@ -740,7 +1352,103 @@ fn remote_id_to_string(value: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("", Some(2), 5, "official", 2, 5)]
+    #[case("", None, 5, "official", 1, 5)]
+    #[case("official", Some(0), 3, "official", 0, 3)]
+    #[case("dvd", Some(2), 5, "dvd", 2, 5)]
+    #[case("alttwo", None, 5, "alttwo", 1, 5)]
+    #[case("regional", Some(3), 1, "regional", 3, 1)]
+    #[case("absolute", Some(4), 61, "absolute", 1, 61)]
+    #[case("absolute", None, 61, "absolute", 1, 61)]
+    #[case("absolute", Some(0), 2, "official", 0, 2)]
+    // The plugin's switch is case-sensitive: anything else is aired order.
+    #[case("Absolute", Some(4), 61, "official", 4, 61)]
+    #[case("PremiereDate", Some(2), 5, "official", 2, 5)]
+    fn episode_lookup_follows_the_plugin_switch(
+        #[case] order: &str,
+        #[case] parent: Option<i32>,
+        #[case] index: i32,
+        #[case] expected_order: &str,
+        #[case] expected_season: i32,
+        #[case] expected_index: i32,
+    ) {
+        assert_eq!(
+            super::episode_lookup(order, parent, index),
+            (expected_order, expected_season, expected_index)
+        );
+    }
+
+    #[test]
+    fn display_order_is_read_raw_and_season_lookups_default_to_official() {
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":"dvd"}"#)),
+            "dvd"
+        );
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":null}"#)),
+            ""
+        );
+        assert_eq!(super::display_order_of(Some("not json")), "");
+        assert_eq!(super::display_order_of(None), "");
+        assert_eq!(super::season_lookup_order(""), "official");
+        assert_eq!(super::season_lookup_order("  "), "official");
+        assert_eq!(super::season_lookup_order("dvd"), "dvd");
+        assert_eq!(super::season_lookup_order("Absolute"), "Absolute");
+    }
+
     use super::*;
+
+    #[test]
+    fn series_and_episode_localization_exclude_aliases_and_do_not_fall_back_to_base_text() {
+        let names = vec![
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Alias".into()),
+                is_alias: true,
+            },
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Deutsch".into()),
+                is_alias: false,
+            },
+            TvdbTranslation {
+                language: "eng".into(),
+                text: Some("English".into()),
+                is_alias: false,
+            },
+        ];
+        let overviews = vec![TvdbTranslation {
+            language: "deu".into(),
+            text: Some("Beschreibung".into()),
+            is_alias: false,
+        }];
+        let mut series = TvdbSeriesDetails {
+            name: Some("Base name".into()),
+            overview: Some("Base overview".into()),
+            name_translations: names.clone(),
+            overview_translations: overviews.clone(),
+            ..Default::default()
+        };
+        let mut episode = TvdbEpisodeDetails {
+            name: Some("Base episode".into()),
+            overview: Some("Base synopsis".into()),
+            name_translations: names,
+            overview_translations: overviews,
+            ..Default::default()
+        };
+        let codes = ["deu".to_owned(), "ger".to_owned()];
+        series.localize("de", &codes);
+        episode.localize("de", &codes);
+        assert_eq!(series.name.as_deref(), Some("Deutsch"));
+        assert_eq!(episode.name, series.name);
+        assert_eq!(series.overview.as_deref(), Some("Beschreibung"));
+        assert_eq!(episode.overview, series.overview);
+        series.localize("fr", &["fra".into()]);
+        episode.localize("fr", &["fra".into()]);
+        assert_eq!((series.name, series.overview), (None, None));
+        assert_eq!((episode.name, episode.overview), (None, None));
+    }
 
     fn series_fixture() -> SeriesExtendedWire {
         serde_json::from_str(
@@ -778,6 +1486,35 @@ mod tests {
             }"#,
         )
         .expect("valid series fixture")
+    }
+
+    #[tokio::test]
+    async fn remote_ids_resolve_only_series_and_episode_fields_survive() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"test"}}"#.into()),
+            ("/search/remoteid/tt123", r#"{"data":[{"movie":{"id":1}},{"series":{"id":0}},{"series":{"id":42}}]}"#.into()),
+            ("/search/remoteid/99", r#"{"data":[]}"#.into()),
+            ("/episodes/8/extended", r#"{"data":{"name":"Special","airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,"remoteIds":[{"sourceName":"IMDB","id":"tt456"}]}}"#.into()),
+        ]).await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        assert_eq!(client.series_by_remote_id("tt123").await, Some(42));
+        assert_eq!(client.series_by_remote_id("99").await, None);
+        assert_eq!(client.series_by_remote_id("bad?query").await, None);
+        assert_eq!(client.series_by_remote_id(" ").await, None);
+        let ep = client.episode_details(8).await.unwrap();
+        assert_eq!(ep.tvdb_id, 8);
+        assert_eq!(ep.imdb_id.as_deref(), Some("tt456"));
+        assert_eq!(ep.airs_before_episode, Some(2));
+        assert_eq!(ep.airs_before_season, Some(1));
+        assert_eq!(ep.airs_after_season, Some(0));
+    }
+
+    #[test]
+    fn series_maps_official_lists_and_normalizes_tmdb_urls() {
+        let wire = serde_json::from_str(r#"{"lists":[{"id":1,"isOfficial":true},{"id":2,"isOfficial":false},{"id":3,"isOfficial":true}],"remoteIds":[{"sourceName":"TheMovieDB.com","id":"1399-game-of-thrones"}]}"#).unwrap();
+        let details = map_series(42, wire, "usa");
+        assert_eq!(details.collection_ids.as_deref(), Some("1;3;"));
+        assert_eq!(details.tmdb_id.as_deref(), Some("1399"));
     }
 
     #[test]
@@ -987,5 +1724,153 @@ mod tests {
         assert!(format!("{c:?}").contains("TvdbClient"));
         let c = TvdbClient::with_config("userkey", "1234");
         assert_eq!(c.pin.as_deref(), Some("1234"));
+    }
+
+    /// An episode's resolved id is reused within the plugin's cache
+    /// duration: a second lookup of the same episode asks only for its
+    /// record; another episode is looked up again.
+    #[tokio::test]
+    async fn an_episode_id_is_resolved_once_per_cache_duration() {
+        use std::io::{Read as _, Write as _};
+        let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&lookups);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    r#"{"data":{"token":"tok"}}"#
+                } else if req.contains("/episodes/official") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":1},
+                        {"id":10,"seasonNumber":1,"number":2}]}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let c = TvdbClient::new().with_base_url(&format!("http://{addr}"));
+        for _ in 0..2 {
+            assert!(
+                c.episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 1)
+                    .await
+                    .is_some()
+            );
+        }
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            c.episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 2)
+                .await
+                .is_some()
+        );
+        assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// The configured cache duration (`FERROFIN_TVDB_CACHE_HOURS`, the
+    /// plugin's `CacheDurationInHours`) bounds both caches: once it has
+    /// passed, the episode id and the series' season list are read again.
+    #[tokio::test]
+    async fn the_cache_duration_bounds_both_caches() {
+        use std::io::{Read as _, Write as _};
+        let episode_lists = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let season_lists = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (episodes, seasons) = (
+            std::sync::Arc::clone(&episode_lists),
+            std::sync::Arc::clone(&season_lists),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    r#"{"data":{"token":"tok"}}"#
+                } else if req.contains("/episodes/official") {
+                    episodes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":1}]}}"#
+                } else if req.contains("/series/5/extended") {
+                    seasons.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"official"}}]}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let c = TvdbClient::new()
+            .with_base_url(&format!("http://{addr}"))
+            .with_cache_duration(std::time::Duration::from_nanos(1));
+        for _ in 0..2 {
+            assert_eq!(c.season_id(5, DEFAULT_SEASON_TYPE, 1).await, Some(51));
+            assert!(
+                c.episode_by_number(121_361, DEFAULT_SEASON_TYPE, 1, 1)
+                    .await
+                    .is_some()
+            );
+        }
+        assert_eq!(season_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(episode_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[rstest::rstest]
+    #[case("absolute", 0, "official", 0)]
+    #[case("absolute", 2, "absolute", 1)]
+    #[case("dvd", 2, "dvd", 2)]
+    #[case("invalid", 2, "official", 2)]
+    #[test]
+    fn episode_artwork_order(
+        #[case] input: &str,
+        #[case] season: i32,
+        #[case] expected: &str,
+        #[case] expected_season: i32,
+    ) {
+        assert_eq!(
+            super::episode_image_order(input, season),
+            (expected, expected_season)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing_order("missing", "[]", 1)]
+    #[case::empty_order("dvd", "[]", 1)]
+    #[case::unmapped_art_does_not_fall_back("dvd", r#"[{"type":99,"image":"unknown"}]"#, 0)]
+    #[tokio::test]
+    async fn season_artwork_uses_reference_types_and_official_fallback(
+        #[case] order: &str,
+        #[case] alternate: &str,
+        #[case] count: usize,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/artwork/types", r#"{"data":[{"id":71,"name":"Poster","recordType":"season"},{"id":72,"name":"Poster","recordType":"series"}]}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}]}}"#.to_owned()),
+            ("/seasons/51/extended", format!(r#"{{"data":{{"artwork":{alternate}}}}}"#)),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
+        ]).await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        let images = client.season_images(5, order, 1).await;
+        assert_eq!(images.len(), count);
+        if count > 0 {
+            assert_eq!(images[0].image_type, ImageType::Primary);
+            assert_eq!(images[0].url, "poster.jpg");
+            assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
+        }
+        assert!(client.artwork_types.lock().unwrap().is_some());
+        assert!(client.season_images(5, "official", 99).await.is_empty());
     }
 }

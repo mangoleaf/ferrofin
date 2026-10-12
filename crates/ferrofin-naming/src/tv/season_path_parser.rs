@@ -122,14 +122,14 @@ fn get_season_number_from_path(
 
     let is_mixed_library = !support_numeric_season_folders && !support_special_aliases;
 
-    if let Ok(Some(pre_match)) = process_pre().captures(&cleaned) {
+    if let Ok(Some(pre_match)) = process_pre().captures(cleaned.as_str()) {
         if is_mixed_library && !is_keyword_match(file_name) {
             return (None, false);
         }
         return check_match(&pre_match);
     }
 
-    if let Ok(Some(post_match)) = process_post().captures(&cleaned) {
+    if let Ok(Some(post_match)) = process_post().captures(cleaned.as_str()) {
         if is_mixed_library && !is_keyword_match(file_name) {
             return (None, false);
         }
@@ -143,7 +143,7 @@ fn is_keyword_match(text: &str) -> bool {
     season_keyword().is_match(text).unwrap_or(false)
 }
 
-fn check_match(captures: &fancy_regex::Captures<'_>) -> (Option<i32>, bool) {
+fn check_match(captures: &fancy_regex::Captures<'_, str>) -> (Option<i32>, bool) {
     match captures
         .name("seasonnumber")
         .and_then(|m| m.as_str().parse::<i32>().ok())

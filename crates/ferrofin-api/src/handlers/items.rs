@@ -18,10 +18,11 @@
 //! the persistence layer where portable and otherwise left to later waves; the
 //! handler maps the request faithfully onto the query struct.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -32,8 +33,23 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
 use crate::state::AppState;
+
+/// Resolves a user-addressed item before returning data or performing a side effect.
+/// Invisible and missing IDs deliberately have the same response.
+pub(crate) async fn require_visible_item(
+    state: &AppState,
+    item_id: Uuid,
+    user: Option<&UserEntity>,
+) -> Result<BaseItemEntity, ApiError> {
+    state
+        .library
+        .get_item_by_id_for_user(item_id, user)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
+}
 
 /// The effective user id for a request, porting C#
 /// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
@@ -183,6 +199,9 @@ struct ItemsQuery {
     /// Whether to search descendants recursively.
     #[serde(default)]
     recursive: Option<bool>,
+    /// Override collection collapsing for this folder browse.
+    #[serde(default)]
+    collapse_box_set_items: Option<bool>,
     /// A free-text search term.
     #[serde(default)]
     search_term: Option<String>,
@@ -210,6 +229,11 @@ struct ItemsQuery {
     /// Comma-delimited [`ItemFilter`](ferrofin_model::querying::ItemFilter) flags.
     #[serde(default)]
     filters: Option<String>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s an
+    /// item must have — Wholphin's genre grid asks for one `Backdrop` item per
+    /// genre and crashes on an item without one.
+    #[serde(default)]
+    image_types: Option<String>,
     /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate
     /// on each returned DTO (e.g. `Path`, `Genres`). Absent/empty ⇒ the base DTO.
     #[serde(default)]
@@ -244,6 +268,17 @@ struct ItemsQuery {
     /// Comma-delimited artist ids.
     #[serde(default)]
     artist_ids: Option<String>,
+    /// Comma-delimited artist ids to exclude.
+    #[serde(default)]
+    exclude_artist_ids: Option<String>,
+    /// Comma-delimited album artist ids — jellyfin-web's artist page sends
+    /// this for its Albums section.
+    #[serde(default)]
+    album_artist_ids: Option<String>,
+    /// Comma-delimited contributing artist ids — the artist page's
+    /// "Appears On" section.
+    #[serde(default)]
+    contributing_artist_ids: Option<String>,
     /// Comma-delimited album ids.
     #[serde(default)]
     album_ids: Option<String>,
@@ -262,14 +297,31 @@ struct ItemsQuery {
     /// Restrict to 4K items.
     #[serde(default, rename = "is4K")]
     is_4k: Option<bool>,
-    /// Restrict to HD items. The alias covers jellyfin-web's stable filter
-    /// dialog, which sends `IsHD` — the server's key fold only lowercases the
-    /// first character, leaving `isHD`.
-    #[serde(default, alias = "isHD")]
+    /// Restrict to HD items (jellyfin-web's filter dialog sends `IsHD`; keys
+    /// bind ignoring case).
+    #[serde(default)]
     is_hd: Option<bool>,
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
     #[serde(default, rename = "is3D")]
     is_3d: Option<bool>,
+    /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
+    #[serde(default)]
+    is_locked: Option<bool>,
+    /// Restrict to items with (or without) an overview.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_overview: Option<bool>,
+    /// Restrict to items with (or without) an IMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_imdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TMDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tmdb_id: Option<bool>,
+    /// Restrict to items with (or without) a TVDb provider id.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_tvdb_id: Option<bool>,
+    /// Restrict to items with (or without) a custom or official parental rating.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_parental_rating: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -301,6 +353,24 @@ struct ItemsQuery {
     /// Minimum critic rating.
     #[serde(default)]
     min_critic_rating: Option<f64>,
+    /// Inclusive lower premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    min_premiere_date: Option<DateTime<Utc>>,
+    /// Inclusive upper premiere-date bound, normalized to UTC.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+    )]
+    max_premiere_date: Option<DateTime<Utc>>,
+    /// Return this item and its immediate neighbours after sorting, before paging.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    adjacent_to: Option<Uuid>,
     /// Restrict to items whose name starts with this value.
     #[serde(default)]
     name_starts_with: Option<String>,
@@ -357,6 +427,36 @@ impl ItemsQuery {
     }
 }
 
+/// ASP.NET's string binder converts empty/whitespace query strings to null.
+/// Keep nonblank values byte-for-byte: leading/trailing spaces are part of the
+/// requested name boundary, not text to trim. Internal typed queries bypass
+/// this HTTP binding and retain their own source filter semantics.
+fn http_name_boundary(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// ASP.NET nullable booleans accept case-insensitive, trimmed true/false and
+/// bind empty or whitespace-only values to null; malformed values fail with 400.
+fn http_presence_filter<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if raw.trim().eq_ignore_ascii_case("true") {
+        Ok(Some(true))
+    } else if raw.trim().eq_ignore_ascii_case("false") {
+        Ok(Some(false))
+    } else {
+        Err(serde::de::Error::custom(format!("invalid boolean {raw:?}")))
+    }
+}
+
 /// `GET /Items` — a paged, filtered, user-scoped library query.
 ///
 /// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
@@ -385,57 +485,7 @@ async fn get_items(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
-    // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
-    let mut internal = InternalItemsQuery {
-        user: Some(user),
-        start_index: query.start_index,
-        limit: query.limit,
-        recursive: query.recursive.unwrap_or(false),
-        search_term: query.search_term.clone(),
-        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
-        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
-        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
-        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
-        item_ids: parse_csv_uuids(query.ids.as_deref())?,
-        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
-        genres: parse_pipe_strings(query.genres.as_deref()),
-        tags: parse_pipe_strings(query.tags.as_deref()),
-        official_ratings: parse_pipe_strings(query.official_ratings.as_deref()),
-        years: parse_csv_i32(query.years.as_deref())?,
-        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
-        studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
-        person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
-        artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
-        album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
-        is_favorite: query.is_favorite,
-        is_played: query.is_played,
-        is_movie: query.is_movie,
-        is_series: query.is_series,
-        is_4k: query.is_4k,
-        is_hd: query.is_hd,
-        is_3d: query.is_3d,
-        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
-        has_subtitles: query.has_subtitles,
-        has_trailer: query.has_trailer,
-        has_special_feature: query.has_special_feature,
-        has_theme_song: query.has_theme_song,
-        has_theme_video: query.has_theme_video,
-        index_number: query.index_number,
-        parent_index_number: query.parent_index_number,
-        min_community_rating: query.min_community_rating,
-        min_critic_rating: query.min_critic_rating,
-        name_starts_with: query.name_starts_with.clone(),
-        name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
-        name_less_than: query.name_less_than.clone(),
-        person: query.person.clone(),
-        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
-        ..InternalItemsQuery::default()
-    };
-    if let Some(parent) = query.parent_id {
-        internal.parent_id = parent;
-    }
+    let mut internal = items_query_options(&query, user)?;
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -443,6 +493,15 @@ async fn get_items(
     // parent really is the user root (an ABSENT `parentId` is, per
     // `LibraryManager.GetParentItem(null, userId)`).
     internal.user_root_children = !internal.recursive && internal.item_ids.is_empty();
+    // Explicit ids and text searches always return the requested titles.
+    if !internal.item_ids.is_empty()
+        || internal
+            .search_term
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        internal.collapse_box_set_items = Some(false);
+    }
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
     // no `isVirtualItem` query parameter to set it directly.
@@ -465,7 +524,20 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
+    let (parent_type, folder_policy) =
+        check_parent_visibility(&state, &auth, &mut internal).await?;
+    internal.parent_type = parent_type;
+    // Reuse the already-loaded parent for SourceType and UserView dispatch;
+    // only source consumers that call Folder's policy inherit global flags.
+    internal.apply_folder_display_options = folder_policy;
     redirect_container_browse(&state, &mut internal).await;
+    if !internal.item_ids.is_empty() {
+        // ItemsController clears query.Parent immediately before GetItems.
+        // Keep any linked-child ancestor constraint established by the
+        // BoxSet/Playlist redirect, but bypass parent/view child selection.
+        internal.set_parent(None);
+        internal.user_root_children = false;
+    }
 
     let result = state.library.query_items(&internal).await?;
     // The requested `Fields` plus the four image/user-data toggles (an
@@ -500,6 +572,76 @@ async fn get_items(
     )))
 }
 
+/// Convert HTTP query fields once, retaining the resolved user for DTO projection.
+fn items_query_options(
+    query: &ItemsQuery,
+    user: UserEntity,
+) -> Result<InternalItemsQuery, ApiError> {
+    Ok(InternalItemsQuery {
+        user: Some(user),
+        parent_id: query.parent_id.unwrap_or_default(),
+        start_index: query.start_index,
+        limit: query.limit,
+        recursive: query.recursive.unwrap_or(false),
+        collapse_box_set_items: query.collapse_box_set_items,
+        apply_folder_display_options: true,
+        search_term: query.search_term.clone(),
+        include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
+        exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
+        media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        image_types: parse_csv_enums_lenient(query.image_types.as_deref()),
+        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
+        item_ids: parse_csv_uuids(query.ids.as_deref())?,
+        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
+        genres: parse_pipe_strings(query.genres.as_deref()),
+        tags: parse_pipe_strings(query.tags.as_deref()),
+        official_ratings: parse_pipe_strings(query.official_ratings.as_deref()),
+        years: parse_csv_i32(query.years.as_deref())?,
+        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
+        studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
+        person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
+        artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
+        exclude_artist_ids: parse_csv_uuids(query.exclude_artist_ids.as_deref())?,
+        album_artist_ids: parse_csv_uuids(query.album_artist_ids.as_deref())?,
+        contributing_artist_ids: parse_csv_uuids(query.contributing_artist_ids.as_deref())?,
+        album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
+        is_favorite: query.is_favorite,
+        is_played: query.is_played,
+        is_movie: query.is_movie,
+        is_series: query.is_series,
+        is_4k: query.is_4k,
+        is_hd: query.is_hd,
+        is_3d: query.is_3d,
+        is_locked: query.is_locked,
+        has_overview: query.has_overview,
+        has_imdb_id: query.has_imdb_id,
+        has_tmdb_id: query.has_tmdb_id,
+        has_tvdb_id: query.has_tvdb_id,
+        has_parental_rating: query.has_parental_rating,
+        video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
+        has_subtitles: query.has_subtitles,
+        has_trailer: query.has_trailer,
+        has_special_feature: query.has_special_feature,
+        has_theme_song: query.has_theme_song,
+        has_theme_video: query.has_theme_video,
+        index_number: query.index_number,
+        parent_index_number: query.parent_index_number,
+        min_community_rating: query.min_community_rating,
+        min_critic_rating: query.min_critic_rating,
+        min_premiere_date: query.min_premiere_date,
+        max_premiere_date: query.max_premiere_date,
+        adjacent_to: query.adjacent_to,
+        name_starts_with: http_name_boundary(query.name_starts_with.as_deref()),
+        name_starts_with_or_greater: http_name_boundary(
+            query.name_starts_with_or_greater.as_deref(),
+        ),
+        name_less_than: http_name_boundary(query.name_less_than.as_deref()),
+        person: query.person.clone(),
+        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
+        ..InternalItemsQuery::default()
+    })
+}
+
 /// Query parameters for `GET /Items/{itemId}`.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -532,11 +674,15 @@ async fn get_item(
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let item = state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let item = if item_id.is_nil() {
+        state
+            .library
+            .get_user_root_folder()
+            .await?
+            .ok_or_else(|| ApiError::NotFound("user root folder".into()))?
+    } else {
+        require_visible_item(&state, item_id, Some(&user)).await?
+    };
     // A single-item fetch backs a detail page, so return the full DTO (overview,
     // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
     // detail view needs. Port of `UserLibraryController.GetItem`, which builds a
@@ -549,38 +695,119 @@ async fn get_item(
     Ok(Json(dto))
 }
 
-/// `DELETE /Items/{itemId}` — deletes one item from the library.
+/// `LibraryController.DeleteItem`'s gate (`LibraryController.cs:386-389` at
+/// master `96bca6f0bd`, and `:432-435` in `DeleteItems`): `if (user is not
+/// null && !item.CanDelete(user)) return Unauthorized("Unauthorized access")`.
 ///
-/// Port of `LibraryController.DeleteItem`. A missing item is a `404`; on success
-/// the item (and, for a folder, its subtree) is removed and the handler returns
-/// `204`. Physical file deletion is the filesystem layer's job (deferred), so the
-/// portable seam deletes the rows only.
+/// `CanDelete(user)` is asked of the DTO service — the very value it puts in
+/// the DTO's `CanDelete`, which is what jellyfin-web shows its "Delete" entry
+/// by — so the menu and the endpoint cannot disagree. Its inputs are the
+/// user's "Allow media deletion" / "Allow media deletion from" settings
+/// (`EnableContentDeletion` / `EnableContentDeletionFromFolders`), collection
+/// management for a collection, and ownership for a playlist. An API key has
+/// no user and is not asked, as upstream.
+async fn require_can_delete(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    item: &BaseItemEntity,
+) -> Result<(), ApiError> {
+    let Some(user) = auth.user.as_ref() else {
+        return Ok(());
+    };
+    if state.dto.can_delete(item, user).await? {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized("Unauthorized access".to_owned()))
+    }
+}
+
+/// What both delete endpoints ask of the library: Jellyfin's
+/// `new DeleteOptions { DeleteFileLocation = true }` — the item's files go
+/// with it.
+fn delete_with_files() -> DeleteOptions {
+    DeleteOptions {
+        delete_file_location: true,
+        ..DeleteOptions::default()
+    }
+}
+
+/// `LibraryController.DeleteItem`'s body for one id, after the user check:
+/// resolve the item as the user (`404`), ask `CanDelete(user)` (`401`),
+/// delete it with its files.
+///
+/// Resolve visibility before CanDelete: a hidden item is indistinguishable
+/// from a missing one, even when the caller may delete from every library
+/// (`_libraryManager.GetItemById<BaseItem>(itemId, user)`,
+/// `LibraryController.cs:380,425`).
+async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
+    let item = state
+        .library
+        .get_item_by_id_for_user(id, auth.user.as_ref())
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
+    require_can_delete(state, auth, &item).await?;
+    state.library.delete_item(id, &delete_with_files()).await?;
+    Ok(())
+}
+
+/// Runs a delete request's work to completion even if the client goes away.
+///
+/// axum drops a handler's future when the connection closes, which could
+/// stop a delete between its files and its rows, or half way through its
+/// paths. The row delete itself is one transaction, but what follows its
+/// commit — the extracted-data cleanup, re-syncing the `Data` of the
+/// playlists and collections that lost a member, and the `LibraryChanged`
+/// notice — would be skipped, and a `DELETE /Items?ids=` would stop between
+/// two items. Upstream's controller does not observe `RequestAborted` here,
+/// so its delete finishes; the work runs on its own task, which the request
+/// only awaits.
+async fn run_to_completion<F>(work: F) -> Result<(), ApiError>
+where
+    F: std::future::Future<Output = Result<(), ApiError>> + Send + 'static,
+{
+    // The request awaits the task, so its logs and spans stay under the
+    // request's (LOGGING.md §4: a spawned future carries its span explicitly).
+    tokio::spawn(tracing::Instrument::in_current_span(work))
+        .await
+        .map_err(|e| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::Backend(format!(
+                "delete task failed: {e}"
+            )))
+        })?
+}
+
+/// `DELETE /Items/{itemId}` — deletes one item from the library and the
+/// filesystem.
+///
+/// Port of `LibraryController.DeleteItem`. A token whose user no longer
+/// exists, or a missing or hidden item, is a `404`; a user who may not
+/// delete the item (`CanDelete(user)`) is a `401`. Otherwise the item,
+/// everything under it and its files are deleted (`LibraryManager.DeleteItem`
+/// with `DeleteFileLocation = true`) and the handler returns `204`. When the
+/// item's first path cannot be deleted — a read-only mount — the request
+/// fails (`500`) with its rows in place. The work finishes even if the
+/// client disconnects.
 #[utoipa::path(
     delete,
     path = "/Items/{itemId}",
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Item deleted"),
+        (status = 401, description = "Unauthorized access"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
 )]
 async fn delete_item(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Confirm the item exists first so a bogus id is a `404` (C# `GetItemById`
-    // null-check) rather than a silently-idempotent `204`.
-    state
-        .library
-        .get_item_by_id(item_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    state
-        .library
-        .delete_item(item_id, &DeleteOptions::default())
-        .await?;
+    // `if (user is null && !isApiKey) return NotFound();`
+    if auth.user.is_none() && !auth.is_api_key {
+        return Err(ApiError::NotFound(format!("user {}", auth.user_id())));
+    }
+    run_to_completion(async move { delete_one(&state, &auth, item_id).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -593,36 +820,41 @@ struct DeleteItemsQuery {
     ids: Option<String>,
 }
 
-/// `DELETE /Items` — deletes several items by id.
+/// `DELETE /Items` — deletes several items by id, with their files.
 ///
-/// Port of `LibraryController.DeleteItems`. Each id must resolve or the whole
-/// request is a `404` (matching C#'s per-item `NotFound()` short-circuit).
+/// Port of `LibraryController.DeleteItems`, which is **per item, in order**,
+/// not all-or-nothing: each id is resolved (`404` if missing), checked
+/// (`401` if the user may not delete it) and deleted before the next is
+/// looked at, so the ids before the first refused or missing one are
+/// already deleted when the request fails. The loop finishes even if the
+/// client disconnects, as upstream's does.
 #[utoipa::path(
     delete,
     path = "/Items",
     responses(
         (status = 204, description = "Items deleted"),
+        (status = 401, description = "Unauthorized access"),
         (status = 404, description = "An item was not found")
     ),
     tag = "ferrofin"
 )]
 async fn delete_items(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<DeleteItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let ids = parse_csv_uuids(query.ids.as_deref())?;
-    for id in ids {
-        state
-            .library
-            .get_item_by_id(id)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
-        state
-            .library
-            .delete_item(id, &DeleteOptions::default())
-            .await?;
+    // `if (!isApiKey && user is null) return Unauthorized("Unauthorized access");`
+    if auth.user.is_none() && !auth.is_api_key {
+        return Err(ApiError::Unauthorized("Unauthorized access".to_owned()));
     }
+    let ids = parse_csv_uuids(query.ids.as_deref())?;
+    run_to_completion(async move {
+        for id in ids {
+            delete_one(&state, &auth, id).await?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -782,6 +1014,7 @@ async fn get_ancestors(
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    require_visible_item(&state, item_id, user.as_ref()).await?;
     let mut chain = state
         .library
         .get_ancestors(item_id)
@@ -1148,6 +1381,186 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
     )
 }
 
+/// ItemsController uses IsVisible on its explicit parent, not standalone
+/// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
+/// Container-only browses re-root to UserRootFolder before the upstream check.
+async fn check_parent_visibility(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    query: &mut InternalItemsQuery,
+) -> Result<(Option<BaseItemKind>, bool), ApiError> {
+    use ferrofin_model::data::CollectionType;
+
+    if query.parent_id.is_nil() {
+        return Ok((None, true));
+    }
+    let parent = state
+        .library
+        .get_item_by_id(query.parent_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
+    let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
+    let rerooted = matches!(
+        query.include_item_types.as_slice(),
+        [BaseItemKind::BoxSet | BaseItemKind::Playlist]
+    ) && !matches!(kind, "BoxSet" | "Playlist");
+    if !auth.is_api_key
+        && kind != "UserRootFolder"
+        && !rerooted
+        && let Some(user) = query.user.as_ref()
+        && !state.library.is_item_visible(&parent, user).await?
+    {
+        return Err(ApiError::Unauthorized("Unauthorized access".into()));
+    }
+    let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        serde_json::from_value(serde_json::Value::String(
+            row.type_
+                .rsplit('.')
+                .next()
+                .unwrap_or(&row.type_)
+                .to_owned(),
+        ))
+        .ok()
+    };
+    // Folder.GetItems dispatches explicit IDs straight to the repository,
+    // before GetItemsInternal/UserViewBuilder can alter kinds or recursion.
+    // The controller still checks the actual parent before that dispatch,
+    // then clears query.Parent after the container redirect below.
+    if !query.item_ids.is_empty() {
+        return Ok((None, false));
+    }
+    let is_channel = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
+        row.type_.rsplit('.').next() == Some("Channel")
+            || row
+                .channel_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| !id.is_nil())
+    };
+    if kind != "UserView" {
+        return Ok((kind_from(&parent), !is_channel(&parent)));
+    }
+
+    // UserViewBuilder's movie/TV recursive base views call QueryRecursive;
+    // folders/direct repository/subnavigation builders do not auto-collapse.
+    // ViewType belongs to the parent row already read for access, including
+    // adopted numeric values; it is never a new client preference.
+    let (view_type, parent_id) = user_view_browse_context(&parent);
+    let direct = user_view_uses_direct_items(view_type);
+    if direct {
+        // These simple direct builders set their kind and recursive mode
+        // regardless of the request, then forward explicit collapse to SQL.
+        // Their automatic global grouping policy is intentionally absent.
+        if let Some(kind) = match view_type {
+            Some(CollectionType::Moviemovies) => Some(BaseItemKind::Movie),
+            Some(CollectionType::Tvshowseries) => Some(BaseItemKind::Series),
+            _ => None,
+        } {
+            query.include_item_types = vec![kind];
+            query.recursive = true;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&parent), false));
+    }
+    if matches!(
+        view_type,
+        Some(CollectionType::movies | CollectionType::tvshows)
+    ) {
+        if !query.recursive {
+            return Ok((kind_from(&parent), false));
+        }
+        query.folder_query_recursive = true;
+        if query.include_item_types.is_empty() {
+            query.include_item_types = if view_type == Some(CollectionType::movies) {
+                vec![BaseItemKind::Movie]
+            } else {
+                vec![
+                    BaseItemKind::Series,
+                    BaseItemKind::Season,
+                    BaseItemKind::Episode,
+                ]
+            };
+        }
+        if let Some(parent_id) = parent_id
+            && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+        {
+            return Ok((kind_from(&query_parent), true));
+        }
+        return Ok((kind_from(&parent), true));
+    }
+    // The default builder delegates to its actual display/relational parent
+    // when one exists; an unparented UserView uses GetResult over media-folder
+    // children and has no automatic grouping policy.
+    if let Some(parent_id) = parent_id
+        && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
+    {
+        if !query.recursive || kind_from(&query_parent) == Some(BaseItemKind::Season) {
+            // A default view delegates to that Season's GetItemsInternal even
+            // for recursive requests; its aired selection needs the real row.
+            query.parent_id = parent_id;
+            query.user_root_children = false;
+        }
+        return Ok((kind_from(&query_parent), !is_channel(&query_parent)));
+    }
+    Ok((kind_from(&parent), false))
+}
+
+/// Read UserView dispatch data from the parent already loaded for visibility.
+fn user_view_browse_context(
+    parent: &BaseItemEntity,
+) -> (Option<ferrofin_model::data::CollectionType>, Option<Uuid>) {
+    use ferrofin_model::data::CollectionType;
+    let data: serde_json::Value = parent
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str(data).ok())
+        .unwrap_or_default();
+    let view_type = data
+        .get("ViewType")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CollectionType>(value).ok());
+    let parent_id = data
+        .get("DisplayParentId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            parent
+                .parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        });
+    (view_type, parent_id)
+}
+
+/// These UserView builders use direct item selection rather than Folder policy.
+fn user_view_uses_direct_items(view_type: Option<ferrofin_model::data::CollectionType>) -> bool {
+    use ferrofin_model::data::CollectionType;
+    matches!(
+        view_type,
+        Some(
+            CollectionType::folders
+                | CollectionType::books
+                | CollectionType::Tvshowseries
+                | CollectionType::Tvgenres
+                | CollectionType::Tvgenre
+                | CollectionType::Tvlatest
+                | CollectionType::Tvnextup
+                | CollectionType::Tvresume
+                | CollectionType::Tvfavoriteseries
+                | CollectionType::Tvfavoriteepisodes
+                | CollectionType::Movielatest
+                | CollectionType::Movieresume
+                | CollectionType::Moviemovies
+                | CollectionType::Moviecollection
+                | CollectionType::Moviefavorites
+                | CollectionType::Moviegenres
+                | CollectionType::Moviegenre
+        )
+    )
+}
+
 /// Re-roots a BoxSet/Playlist-typed browse from a normal library parent onto a
 /// linked-child-ancestor constraint (port of `ItemsController.GetItems`'s
 /// `linkedChildAncestorIds` block).
@@ -1274,8 +1687,54 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/Items/{itemId}/Ancestors", get(get_ancestors))
 }
+crate::query::query_parameters! {
+    ItemsQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "imageTypes" => ',',
+        "fields" => ',',
+        "ids" => ',',
+        "excludeItemIds" => ',',
+        "genres" => '|',
+        "tags" => '|',
+        "officialRatings" => '|',
+        "years" => ',',
+        "genreIds" => ',',
+        "studioIds" => ',',
+        "personIds" => ',',
+        "artistIds" => ',',
+        "excludeArtistIds" => ',',
+        "albumArtistIds" => ',',
+        "contributingArtistIds" => ',',
+        "albumIds" => ',',
+        "videoTypes" => ',',
+        "locationTypes" => ',',
+        "excludeLocationTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items")];
+    ItemQuery {} => [("get", "/Items/{itemId}")];
+    DeleteItemsQuery {
+        "ids" => ',',
+    } => [("delete", "/Items")];
+    CountsQuery {} => [("get", "/Items/Counts")];
+    AncestorsQuery {} => [("get", "/Items/{itemId}/Ancestors")];
+    ResumeQuery {
+        "mediaTypes" => ',',
+        "excludeItemTypes" => ',',
+        "includeItemTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/UserItems/Resume")];
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     /// Both stored spellings of the playlists plugin folder are a direct-children
@@ -1297,6 +1756,124 @@ mod tests {
         for short in ["CollectionFolder", "Folder", "UserRootFolder", "Series"] {
             assert!(!is_direct_children_browse(short), "{short}");
         }
+    }
+
+    /// The query keys [`ItemsQuery`] binds: the field list serde hands
+    /// `deserialize_struct`, captured by a deserializer that reads nothing.
+    fn items_query_keys() -> &'static [&'static str] {
+        struct Keys<'a>(&'a mut &'static [&'static str]);
+        impl<'de> serde::Deserializer<'de> for Keys<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                *self.0 = fields;
+                Err(serde::de::Error::custom("keys captured"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+                enum identifier ignored_any
+            }
+        }
+        let mut keys: &'static [&'static str] = &[];
+        let _ = <ItemsQuery as serde::Deserialize>::deserialize(Keys(&mut keys));
+        keys
+    }
+
+    /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
+    /// does not bind yet. Each is an open port from `ItemsController.GetItems`
+    /// — bind it, honour it, and delete it here; the guard below fails on a
+    /// stale entry, so this list can only shrink.
+    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
+        "albums",
+        "artists",
+        // 12.1.0 only.
+        "audioLanguages",
+        "hasOfficialRating",
+        "isKids",
+        "isMissing",
+        "isNews",
+        "isPlaceHolder",
+        "isSports",
+        "isUnaired",
+        "maxHeight",
+        "maxOfficialRating",
+        "maxWidth",
+        "minDateLastSaved",
+        "minDateLastSavedForUser",
+        "minHeight",
+        "minOfficialRating",
+        "minWidth",
+        "personTypes",
+        "seriesStatus",
+        "studios",
+        // 12.1.0 only.
+        "subtitleLanguages",
+    ];
+
+    /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
+    /// route gate's pin, and 12.1.0, the latest Jellyfin, which adds
+    /// `audioLanguages` and `subtitleLanguages` — is bound by [`ItemsQuery`] or
+    /// listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
+    /// without a word, so a missing field is a filter the client asked for and
+    /// never got: `albumArtistIds` was one, and every artist page listed every
+    /// album in the library.
+    #[test]
+    fn items_query_binds_every_contract_parameter() {
+        let mut contract = BTreeSet::new();
+        for (version, raw) in [
+            (
+                "10.11.8",
+                include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
+            ),
+            (
+                "12.1.0",
+                include_str!("../../../../contracts/jellyfin-openapi-12.1.0.json"),
+            ),
+        ] {
+            let spec: serde_json::Value = serde_json::from_str(raw).expect("contract parses");
+            let parameters = spec["paths"]["/Items"]["get"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{version}: GET /Items lists its parameters"));
+            contract.extend(
+                parameters
+                    .iter()
+                    .filter_map(|p| p["name"].as_str().map(str::to_owned)),
+            );
+        }
+        let keys = items_query_keys();
+        assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
+        let unbound: BTreeSet<&str> = contract
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !keys.contains(name))
+            .collect();
+        let listed: BTreeSet<&str> = UNBOUND_ITEMS_PARAMETERS.iter().copied().collect();
+        assert_eq!(
+            unbound, listed,
+            "left: the contract parameters ItemsQuery drops; right: the open-port list. \
+             A newly dropped parameter must be bound, not listed; a bound one must leave the list"
+        );
+    }
+
+    /// `[FromQuery] bool? isLocked` → `IsLocked = isLocked`
+    /// (`ItemsController.cs:243,400`).
+    #[test]
+    fn items_query_reads_is_locked() {
+        let q: ItemsQuery = serde_urlencoded::from_str("isLocked=true").expect("parses");
+        assert_eq!(q.is_locked, Some(true));
+        let q: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
+        assert_eq!(q.is_locked, None);
     }
 
     // GET /Items must honour the camelCase `fields` param (the OpenAPI contract's casing, what
@@ -1364,5 +1941,26 @@ mod tests {
         let resume: ResumeQuery =
             serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
         assert_eq!(resume.exclude_active_sessions, Some(true));
+    }
+
+    /// The delete's task runs inside the request's span, so its logs and
+    /// spans stay under `http_request` (LOGGING.md §4).
+    #[tokio::test]
+    async fn the_delete_task_runs_in_the_requests_span() {
+        use tracing::Instrument as _;
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let span = tracing::info_span!("http_request");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = std::sync::Arc::clone(&seen);
+        run_to_completion(async move {
+            *record.lock().expect("lock") = tracing::Span::current()
+                .metadata()
+                .map(tracing::Metadata::name);
+            Ok(())
+        })
+        .instrument(span)
+        .await
+        .expect("ran");
+        assert_eq!(*seen.lock().expect("lock"), Some("http_request"));
     }
 }

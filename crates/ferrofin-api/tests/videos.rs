@@ -39,6 +39,10 @@ use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
+/// A stacked movie: the first part of three.
+const STACKED_ID: Uuid = Uuid::from_u128(0x00A1_0002);
+/// [`STACKED_ID`]'s other parts.
+const PART_IDS: [Uuid; 2] = [Uuid::from_u128(0x00A1_0003), Uuid::from_u128(0x00A1_0004)];
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
@@ -97,7 +101,12 @@ impl AuthService for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -112,7 +121,12 @@ impl AuthorizationContext for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -222,7 +236,15 @@ fn static_source(path: &str) -> MediaSourceInfo {
     MediaSourceInfo {
         id: Some(ITEM_ID.to_string()),
         path: Some(path.to_owned()),
-        protocol: MediaProtocol::File,
+        // A remote target (a `.strm` shortcut's) is read over its own protocol.
+        protocol: if path.starts_with("http") {
+            MediaProtocol::Http
+        } else if path.starts_with("rtsp") {
+            MediaProtocol::Rtsp
+        } else {
+            MediaProtocol::File
+        },
+        is_remote: !path.starts_with('/'),
         type_: MediaSourceType::Default,
         supports_direct_play: true,
         supports_direct_stream: true,
@@ -266,9 +288,6 @@ impl MediaSourceManager for StreamSources {
     }
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
-    }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
     }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
@@ -321,8 +340,27 @@ impl ferrofin_traits::merge_versions::MergeVersionsManager for FakeMergeVersions
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(ITEM_ID, "A Movie", "Movie")))
+        Ok(match id {
+            ITEM_ID => Some(minimal_base_item(ITEM_ID, "A Movie", "Movie")),
+            STACKED_ID => Some(minimal_base_item(STACKED_ID, "Heist", "Movie")),
+            _ => None,
+        })
     }
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
         self.merged.lock().unwrap().push(ids.to_vec());
@@ -331,6 +369,23 @@ impl LibraryManager for StreamLibrary {
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.removed.lock().unwrap().push(item_id);
         Ok(())
+    }
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // ITEM_ID is a lone movie; STACKED_ID a stack of three parts, asked
+        // for as the requesting user.
+        assert_eq!(user.map(|u| u.username.as_str()), Some("alice"));
+        if video.id == STACKED_ID.to_string() {
+            Ok(vec![
+                minimal_base_item(PART_IDS[0], "Heist cd2", "Video"),
+                minimal_base_item(PART_IDS[1], "Heist cd3", "Video"),
+            ])
+        } else {
+            Ok(Vec::new())
+        }
     }
     async fn query_items(
         &self,
@@ -496,7 +551,12 @@ struct Harness {
 
 /// The ordinary-user harness.
 fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, false)
+    state_with(
+        path,
+        subtitles,
+        false,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
 /// The elevated harness, for the video routes that are `RequiresElevation`
@@ -504,12 +564,22 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
 /// `DELETE /Videos/{itemId}/AlternateSources`, and
 /// `DELETE /Videos/{itemId}/Subtitles/{index}`.
 fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, true)
+    state_with(
+        path,
+        subtitles,
+        true,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
 /// Builds a [`Harness`] serving `path` for streams and using `subtitles` for the
 /// subtitle routes.
-fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -> Harness {
+fn state_with(
+    path: &str,
+    subtitles: Arc<dyn SubtitleManager>,
+    elevated: bool,
+    dto: Arc<dyn ferrofin_traits::dto::DtoService>,
+) -> Harness {
     let merged = Arc::new(Mutex::new(Vec::new()));
     let removed = Arc::new(Mutex::new(Vec::new()));
     let bulk = Arc::new(Mutex::new(Vec::new()));
@@ -533,7 +603,7 @@ fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(ferrofin_api::test_support::FakeDto),
+        dto,
         Arc::new(OkAuth { elevated }),
         Arc::new(OkAuth { elevated }),
         Arc::new(FakeQuickConnect),
@@ -641,7 +711,10 @@ async fn video_stream_serves_file() {
     let app = state(&path, no_subtitles()).app;
     let router = create_router(app);
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -657,7 +730,10 @@ async fn video_stream_serves_full_body() {
     let path = media.path.clone();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -675,7 +751,7 @@ async fn video_stream_range_request_is_206_with_content_range() {
     let response = router
         .oneshot(
             Request::builder()
-                .uri(format!("/Videos/{ITEM_ID}/stream"))
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
                 .header("Authorization", "Bearer token")
                 .header(header::RANGE, "bytes=2-5")
                 .body(Body::empty())
@@ -708,10 +784,101 @@ async fn video_stream_missing_file_is_404() {
     let path = path.to_string_lossy().into_owned();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Serves `contents` over HTTP on a loopback port, with `Range` support (the
+/// remote origin a `.strm` shortcut points at), and returns its URL.
+async fn remote_origin(contents: &'static [u8]) -> String {
+    use tower_http::services::ServeFile;
+    let dir = std::env::temp_dir().join(format!("ferrofin-origin-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("movie.mkv");
+    std::fs::write(&file, contents).unwrap();
+    let app = axum::Router::new().route_service("/movie.mkv", ServeFile::new(file));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}/movie.mkv")
+}
+
+/// `GetStaticRemoteStreamResult`: a static stream of a source the item takes
+/// from a remote HTTP target is relayed from it — whole, and with the client's
+/// `Range` forwarded so the answer is the upstream's `206` and `Content-Range`.
+#[tokio::test]
+async fn a_static_remote_stream_is_relayed_with_its_range() {
+    let url = remote_origin(b"0123456789").await;
+    let router = create_router(state(&url, no_subtitles()).app);
+    let whole = router
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(whole.status(), StatusCode::OK);
+    assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(whole.headers()[header::CONTENT_LENGTH], "10");
+    let bytes = axum::body::to_bytes(whole.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"0123456789");
+
+    let part = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
+                .header("Authorization", "Bearer token")
+                .header(header::RANGE, "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+    let bytes = axum::body::to_bytes(part.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"2345");
+}
+
+/// Only an HTTP target is relayed: any other non-file protocol is
+/// `400 Input protocol … cannot be streamed statically`, and an origin that
+/// cannot be reached is a server error, not a file `404`.
+#[tokio::test]
+async fn a_static_stream_of_another_protocol_is_refused_and_a_dead_origin_fails() {
+    let rtsp = create_router(state("rtsp://camera/feed", no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rtsp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing listens on this port any more.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/movie.mkv", listener.local_addr().unwrap())
+    };
+    let down = create_router(state(&dead, no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 // ---- Version-group management ----------------------------------------------
@@ -739,7 +906,7 @@ async fn merge_versions_merges_two_ids() {
     let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
-    let other = Uuid::from_u128(0x00A1_0002);
+    let other = STACKED_ID;
     let resp = router
         .oneshot(authed(
             "POST",
@@ -832,6 +999,98 @@ async fn additional_parts_empty_for_known_item() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["Items"].as_array().map(Vec::len), Some(0));
     assert_eq!(json["TotalRecordCount"].as_i64(), Some(0));
+}
+
+/// A [`DtoService`](ferrofin_traits::dto::DtoService) projecting each row to
+/// its id and name, and recording the owner it was given.
+struct PartsDto {
+    owners: Arc<Mutex<Vec<Option<Uuid>>>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::dto::DtoService for PartsDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
+        self.owners.lock().unwrap().push(owner_id);
+        Ok(items
+            .iter()
+            .map(|i| ferrofin_model::dto::BaseItemDto {
+                id: Uuid::parse_str(&i.id).unwrap(),
+                name: i.name.clone(),
+                ..Default::default()
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// Port of `VideosController.GetAdditionalPart`: a stacked video's other
+/// parts, in the order the library returns them, projected with the video as
+/// their owner, counted as a `QueryResult`.
+#[tokio::test]
+async fn additional_parts_of_a_stack_are_its_other_parts() {
+    let (_dir, path) = temp_media();
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let app = state_with(
+        &path,
+        no_subtitles(),
+        false,
+        Arc::new(PartsDto {
+            owners: owners.clone(),
+        }),
+    )
+    .app;
+    let resp = create_router(app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{STACKED_ID}/AdditionalParts"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = json["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Heist cd2", "Heist cd3"]);
+    assert_eq!(json["TotalRecordCount"].as_i64(), Some(2));
+    assert_eq!(json["StartIndex"].as_i64(), Some(0));
+    assert_eq!(*owners.lock().unwrap(), [Some(STACKED_ID)]);
 }
 
 #[tokio::test]

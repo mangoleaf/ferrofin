@@ -34,7 +34,7 @@
 //! - `GET /Items/{itemId}/ThemeMedia`'s soundtrack branch (no soundtrack
 //!   provider is ported — it is returned empty, exactly as C#).
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -51,8 +51,8 @@ use uuid::Uuid;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
-use crate::handlers::items::{resolve_user, user_uuid};
+use crate::extract::{JsonBody, Query};
+use crate::handlers::items::{resolve_user, resolve_user_opt, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
@@ -111,7 +111,7 @@ async fn theme_media(
     item_id: Uuid,
     extra_type: ExtraType,
 ) -> Result<ThemeMediaResult, ApiError> {
-    let user = resolve_user(state, auth, query.user_id).await?;
+    let user = resolve_user_opt(state, auth, query.user_id).await?;
 
     // The empty guid resolves to the (user) root folder; a real id must exist.
     let mut owner = if item_id.is_nil() {
@@ -123,7 +123,7 @@ async fn theme_media(
     } else {
         state
             .library
-            .get_item_by_id(item_id)
+            .get_item_by_id_for_user(item_id, user.as_ref())
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?
     };
@@ -137,10 +137,15 @@ async fn theme_media(
                 "stored item id is not a uuid: {e}"
             )))
         })?;
+        let mut owners = state
+            .library
+            .get_extra_owner_ids_batch(std::slice::from_ref(&owner))
+            .await?;
         let items = state
             .library
             .get_item_list(&InternalItemsQuery {
-                owner_ids: vec![owner_id],
+                user: user.clone(),
+                owner_ids: owners.remove(&owner_id).unwrap_or_else(|| vec![owner_id]),
                 extra_types: vec![extra_type],
                 order_by: order_by.clone(),
                 ..InternalItemsQuery::default()
@@ -173,7 +178,7 @@ async fn theme_media(
         .get_base_item_dtos(
             &items,
             &DtoOptions::default(),
-            Some(&user),
+            user.as_ref(),
             Some(owner_id),
             true,
         )
@@ -300,13 +305,13 @@ async fn get_theme_media(
 )]
 async fn get_file(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let item = state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let path = item
@@ -409,10 +414,17 @@ async fn get_physical_paths(
 #[serde(rename_all = "camelCase")]
 struct AvailableOptionsQuery {
     /// Optional. The library content (collection) type to scope the options to.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     library_content_type: Option<ferrofin_model::data::CollectionType>,
-    /// Optional. Whether this is a new library (accepted for parity; it only
-    /// affects `DefaultEnabled` flags, which are all empty at this seam).
+    /// Optional. Whether this is a new library (jellyfin-web's add-library
+    /// dialog sends `true`): it decides which fetchers and savers report
+    /// `DefaultEnabled` — the dialog's initial checkboxes — as upstream's
+    /// `IsSaverEnabledByDefault` / `IsMetadataFetcherEnabledByDefault` /
+    /// `IsImageFetcherEnabledByDefault` do (a plugin's fetcher starts
+    /// unticked in a new library).
     #[serde(default)]
     is_new_library: bool,
 }
@@ -471,12 +483,22 @@ async fn get_available_options(
     // `isNewLibrary` decides which providers report `DefaultEnabled` — it is the
     // add-library wizard's pre-ticked checkbox set, not a cosmetic hint. Ignoring
     // it pre-enabled every saver and remote fetcher on a new library.
-    Ok(Json(
-        state
-            .providers
-            .get_library_options_info(&item_types, query.is_new_library)
-            .await?,
-    ))
+    let mut options = state
+        .providers
+        .get_library_options_info(&item_types, query.is_new_library)
+        .await?;
+    options.media_segment_providers = state
+        .media_segments
+        .registered_segment_providers()
+        .into_iter()
+        .map(
+            |provider| ferrofin_model::configuration::LibraryOptionInfoDto {
+                name: Some(provider.name),
+                default_enabled: true,
+            },
+        )
+        .collect();
+    Ok(Json(options))
 }
 
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.
@@ -584,7 +606,8 @@ struct MediaUpdateInfoDto {
     updates: Vec<MediaUpdateInfoPathDto>,
 }
 
-/// Reports every changed `path` to the library monitor.
+/// Reports every changed `path` to the library monitor, as a webhook's
+/// (the scan it queues is tagged `trigger=webhook`).
 ///
 /// Ports the `foreach (item) _libraryMonitor.ReportFileSystemChanged(item.Path)`
 /// loop shared by all three webhook actions. Empty paths are skipped (the C#
@@ -597,10 +620,7 @@ async fn report_paths(
         if path.is_empty() {
             continue;
         }
-        state
-            .library_monitor
-            .report_file_system_changed(&path)
-            .await?;
+        state.library_monitor.report_webhook_change(&path).await?;
     }
     Ok(())
 }
@@ -738,10 +758,7 @@ async fn post_updated_media(
             .filter(|p| !p.is_empty())
             .ok_or_else(|| ApiError::BadRequest("Item path can't be null.".to_owned()))?;
         let _ = update.update_type; // Accepted for parity; the monitor ignores it.
-        state
-            .library_monitor
-            .report_file_system_changed(&path)
-            .await?;
+        state.library_monitor.report_webhook_change(&path).await?;
     }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -762,4 +779,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Library/Movies/Added", post(post_updated_movies))
         .route("/Library/Movies/Updated", post(post_updated_movies))
         .route("/Library/Media/Updated", post(post_updated_media))
+}
+crate::query::query_parameters! {
+    ThemeMediaQuery {
+        "sortBy" => ',',
+        "sortOrder" => ',',
+    } => [("get", "/Items/{itemId}/ThemeSongs"), ("get", "/Items/{itemId}/ThemeVideos"), ("get", "/Items/{itemId}/ThemeMedia")];
+    MediaFoldersQuery {} => [("get", "/Library/MediaFolders")];
+    AvailableOptionsQuery {} => [("get", "/Libraries/AvailableOptions")];
+    SeriesUpdatedQuery {} => [("post", "/Library/Series/Updated")];
+    MoviesUpdatedQuery {} => [("post", "/Library/Movies/Updated")];
 }

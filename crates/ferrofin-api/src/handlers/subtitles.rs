@@ -26,7 +26,7 @@
 
 use std::fmt::Write as _;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -37,9 +37,9 @@ use ferrofin_model::subtitles::FontFile;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -63,8 +63,17 @@ const FALLBACK_FONT_MAX_TOTAL_BYTES: i64 = 20 * 1024 * 1024;
 const FALLBACK_FONT_EXTENSIONS: &[&str] = &[".woff", ".woff2", ".ttf", ".otf"];
 
 /// Ensures an item exists, returning `404` otherwise.
-async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+async fn require_item(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     Ok(())
@@ -74,8 +83,8 @@ async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
 ///
 /// Port of `SubtitleController.DeleteSubtitle`: `404` when the item is missing,
 /// else `204`. The manager drops the external subtitle stream at `index` and its
-/// sidecar file (deleting a non-existent index is idempotent). Elevation policy
-/// is deferred to the auth layer.
+/// sidecar file (deleting a non-existent index is idempotent). Upstream requires
+/// elevation here, independently of the subtitle-management permission.
 #[utoipa::path(
     delete,
     path = "/Videos/{itemId}/Subtitles/{index}",
@@ -91,10 +100,10 @@ async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
 )]
 async fn delete_subtitle(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path((item_id, index)): Path<(Uuid, i32)>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     state.subtitles.delete_subtitles(item_id, index).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -122,7 +131,8 @@ struct UploadSubtitleDto {
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
 /// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager); with no
 /// subtitle-provider host wired the manager rejects the write (`400`), otherwise
-/// a metadata refresh is queued and `204` returned. Elevation policy is deferred.
+/// a metadata refresh is queued and `204` returned. Subtitle management is
+/// checked before decoding or writing the upload.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -137,11 +147,11 @@ struct UploadSubtitleDto {
 )]
 async fn upload_subtitle(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path(item_id): Path<Uuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let content = decode_base64(&body.data)
         .ok_or_else(|| ApiError::BadRequest("subtitle data is not valid base64".to_owned()))?;
     let response = SubtitleResponse {
@@ -185,11 +195,11 @@ struct RemoteSearchQuery {
 )]
 async fn search_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, language)): Path<(Uuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     // The manager enriches this from the resolved item (name/year/imdb/…) before
     // querying providers; the handler supplies the caller-visible fields.
     let request = SubtitleSearchRequest {
@@ -224,10 +234,10 @@ async fn search_remote_subtitles(
 )]
 async fn download_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(auth): RequireSubtitleManagement,
     Path((item_id, subtitle_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     // The C# logs-and-continues on a provider failure, still returning 204, then
     // queues a refresh. A download that succeeds queues the refresh too.
     if state
@@ -255,7 +265,7 @@ async fn download_remote_subtitles(
 )]
 async fn get_remote_subtitles(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(_auth): RequireSubtitleManagement,
     Path(subtitle_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let result = state.subtitles.get_remote_subtitles(&subtitle_id).await?;
@@ -292,24 +302,26 @@ fn parse_subtitle_format(segment: &str) -> String {
 
 /// Query parameters shared by the on-the-fly subtitle-conversion routes.
 ///
-/// The `PascalCase` aliases match the query keys the server emits in its own HLS
-/// subtitle-playlist links (`stream.vtt?CopyTimestamps=true&AddVttTimeMap=…`), so
-/// those `stream.vtt` requests bind correctly regardless of the client's casing.
+/// Keys bind ignoring case ([`crate::extract::Query`]), so the PascalCase keys
+/// the server emits in its own HLS subtitle-playlist links
+/// (`stream.vtt?CopyTimestamps=true&AddVttTimeMap=…`) reach these fields.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SubtitleStreamQuery {
     /// Optional. The end position of the subtitle in ticks.
-    #[serde(default, alias = "EndPositionTicks")]
+    #[serde(default)]
     end_position_ticks: Option<i64>,
     /// Optional. Whether to copy (preserve) the original timestamps.
-    #[serde(default, alias = "CopyTimestamps")]
+    #[serde(default)]
     copy_timestamps: bool,
     /// Optional. Whether to prepend a WebVTT `X-TIMESTAMP-MAP` header.
-    #[serde(default, alias = "AddVttTimeMap")]
+    #[serde(default)]
     add_vtt_time_map: bool,
-    /// The start position of the subtitle in ticks.
-    #[serde(default, alias = "StartPositionTicks")]
-    start_position_ticks: i64,
+    /// The start position of the subtitle in ticks. Nullable: upstream's
+    /// route-ticks action takes `long? startPositionTicks` (an empty value is
+    /// unset there), the other `long startPositionTicks = 0`.
+    #[serde(default)]
+    start_position_ticks: Option<i64>,
 }
 
 /// Serves an encoded subtitle: converts the stream, then wraps the bytes with the
@@ -329,7 +341,7 @@ async fn encode_subtitle_response(
             media_source_id,
             index,
             format,
-            query.start_position_ticks,
+            query.start_position_ticks.unwrap_or(0),
             query.end_position_ticks.unwrap_or(0),
             query.copy_timestamps,
         )
@@ -420,12 +432,11 @@ async fn get_subtitle_with_ticks(
     )>,
     Query(mut query): Query<SubtitleStreamQuery>,
 ) -> Result<Response, ApiError> {
-    // The route-supplied start position wins unless the query overrides it (the
-    // C# `startPositionTicks ?? routeStartPositionTicks`); serde defaults the
-    // query field to 0, so a 0 there yields the route value.
-    if query.start_position_ticks == 0 {
-        query.start_position_ticks = start_position_ticks;
-    }
+    // The route-supplied start position applies unless the query names one
+    // (the C# `startPositionTicks ?? routeStartPositionTicks`).
+    query
+        .start_position_ticks
+        .get_or_insert(start_position_ticks);
     let format = parse_subtitle_format(&route_format);
     encode_subtitle_response(&state, item_id, &media_source_id, index, &format, &query).await
 }
@@ -471,7 +482,7 @@ async fn get_subtitle_playlist(
     Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
 ) -> Result<Response, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
 
     let user = resolve_user_opt(&state, &auth, None).await?;
     let user_id = user
@@ -696,17 +707,48 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// Ports the OpenSubtitles plugin's login-check action: the posted
 /// `{ApiKey,Username,Password}` body is validated by attempting a real login via
 /// the provider. `200` means the credentials work; a rejected login is `401`, a
-/// missing key `400`.
+/// missing account and API key override `400`. The API key is optional when
+/// account credentials are provided (Jellyfin's shared key is used).
+///
+/// The body binds like every MVC body (member names ignoring case), then
+/// reaches the provider in its canonical PascalCase.
 async fn validate_open_subtitles_login(
     RequireAuth(_auth): RequireAuth,
     State(state): State<AppState>,
-    body: axum::body::Bytes,
+    JsonBody(body): JsonBody<LoginInfoBody>,
 ) -> Result<StatusCode, ApiError> {
+    let canonical =
+        serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
     state
         .subtitles
-        .validate_provider_login("opensubtitles", &body)
+        .validate_provider_login("opensubtitles", &canonical)
         .await?;
     Ok(StatusCode::OK)
+}
+
+/// The `ValidateLoginInfo` body: upstream's `LoginInfoInput`
+/// (`Username`/`Password`, bound by the MVC binder) plus Ferrofin's optional
+/// `ApiKey` override.
+///
+/// No `Debug`: it carries a plaintext password.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LoginInfoBody {
+    /// The optional API key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    /// The account username.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    /// The account password.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+}
+
+crate::query::query_parameters! {
+    RemoteSearchQuery {} => [("get", "/Items/{itemId}/RemoteSearch/Subtitles/{language}")];
+    SubtitleStreamQuery {} => [("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}"), ("get", "/Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}")];
+    SubtitlePlaylistQuery {} => [("get", "/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8")];
 }
 
 #[cfg(test)]

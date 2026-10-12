@@ -106,5 +106,18 @@
     "TaskExtractMediaSegmentsDescription": "แยกหรือดึงส่วนของสื่อจากปลั๊กอินที่เปิดใช้งาน MediaSegment",
     "TaskMoveTrickplayImages": "ย้ายตำแหน่งเก็บภาพตัวอย่าง Trickplay",
     "CleanupUserDataTask": "ส่วนงานล้างข้อมูลผู้ใช้",
-    "CleanupUserDataTaskDescription": "ล้างข้อมูลผู้ใช้ทั้งหมด (สถานะการรับชม สถานะรายการโปรด ฯลฯ) จากสื่อที่ไม่ได้ใช้งานแล้วอย่างน้อย 90 วัน"
+    "CleanupUserDataTaskDescription": "ล้างข้อมูลผู้ใช้ทั้งหมด (สถานะการรับชม สถานะรายการโปรด ฯลฯ) จากสื่อที่ไม่ได้ใช้งานแล้วอย่างน้อย 90 วัน",
+    "NameExtraBehindTheScenes": "เบื้องหลังการถ่ายทำ",
+    "NameExtraClip": "คลิปวิดีโอ",
+    "NameExtraDeletedScene": "ฉากที่ถูกตัดออก",
+    "NameExtraFeaturette": "คลิปสั้นพิเศษ",
+    "NameExtraInterview": "บทสัมภาษณ์",
+    "NameExtraNumbered": "{0} {1}",
+    "NameExtraSample": "ตัวอย่าง",
+    "NameExtraScene": "ฉาก",
+    "NameExtraShort": "ภาพยนตร์สั้น",
+    "NameExtraThemeSong": "เพลงประกอบ",
+    "NameExtraThemeVideo": "วิดีโอธีม",
+    "NameExtraTrailer": "ตัวอย่างภาพยนตร์",
+    "NameExtraUnknown": "เนื้อหาพิเศษ"
 }

@@ -151,6 +151,10 @@ pub fn filter_channel_rows(
         let want = match channel_type {
             ferrofin_model::live_tv::ChannelType::Radio => "Radio",
             ferrofin_model::live_tv::ChannelType::Tv => "Tv",
+            ferrofin_model::live_tv::ChannelType::Unrecognized(_) => {
+                rows.clear();
+                return;
+            }
         };
         rows.retain(|r| r.channel_type == want);
     }
@@ -226,7 +230,7 @@ pub fn sort_channel_rows(
             };
             let ordering = match direction {
                 SortOrder::Ascending => ordering,
-                SortOrder::Descending => ordering.reverse(),
+                SortOrder::Descending | SortOrder::Unrecognized(_) => ordering.reverse(),
             };
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;

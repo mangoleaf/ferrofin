@@ -270,7 +270,7 @@ async fn consolidate(
     let marks = placeholders(stale_ids.len());
     let reparent_sql =
         format!(r#"UPDATE "BaseItems" SET "ParentId" = ? WHERE "ParentId" IN ({marks})"#);
-    let mut reparent = sqlx::query(&reparent_sql).bind(&canonical_db);
+    let mut reparent = sqlx::query(sqlx::AssertSqlSafe(reparent_sql)).bind(&canonical_db);
     for id in &stale_ids {
         reparent = reparent.bind(id);
     }
@@ -282,7 +282,7 @@ async fn consolidate(
 
     let retop_sql =
         format!(r#"UPDATE "BaseItems" SET "TopParentId" = ? WHERE "TopParentId" IN ({marks})"#);
-    let mut retop = sqlx::query(&retop_sql).bind(&canonical_db);
+    let mut retop = sqlx::query(sqlx::AssertSqlSafe(retop_sql)).bind(&canonical_db);
     for id in &stale_ids {
         retop = retop.bind(id);
     }
@@ -292,10 +292,13 @@ async fn consolidate(
     move_user_settings(tx, canonical, source_id.as_deref(), &stale_ids).await?;
     move_remaining_references(tx, &canonical_db, &stale_ids).await?;
 
+    for id in &stale_ids {
+        crate::item_persistence_service::move_user_data(tx, id, &canonical_db).await?;
+    }
     // Nothing points at them any more, and BaseItems cascades on ParentId, so
     // this has to come last.
     let delete_sql = format!(r#"DELETE FROM "BaseItems" WHERE "Id" IN ({marks})"#);
-    let mut delete = sqlx::query(&delete_sql);
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
     for id in &stale_ids {
         delete = delete.bind(id);
     }
@@ -323,7 +326,7 @@ async fn move_remaining_references(
 ) -> Result<(), ServiceError> {
     let marks = placeholders(stale_ids.len());
     let reown_sql = format!(r#"UPDATE "BaseItems" SET "OwnerId" = ? WHERE "OwnerId" IN ({marks})"#);
-    let mut reown = sqlx::query(&reown_sql).bind(canonical_db);
+    let mut reown = sqlx::query(sqlx::AssertSqlSafe(reown_sql)).bind(canonical_db);
     for id in stale_ids {
         reown = reown.bind(id);
     }
@@ -331,7 +334,7 @@ async fn move_remaining_references(
     let unlink_sql = format!(
         r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({marks}) OR "ChildId" IN ({marks})"#
     );
-    let mut unlink = sqlx::query(&unlink_sql);
+    let mut unlink = sqlx::query(sqlx::AssertSqlSafe(unlink_sql));
     for id in stale_ids.iter().chain(stale_ids) {
         unlink = unlink.bind(id);
     }
@@ -352,7 +355,7 @@ async fn pick_source<'a>(
            WHERE "ParentId" IN ({}) GROUP BY "ParentId""#,
         placeholders(stale_ids.len())
     );
-    let mut count = sqlx::query_as::<_, (String, i64)>(&count_sql);
+    let mut count = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(count_sql));
     for id in stale_ids {
         count = count.bind(id);
     }
@@ -441,14 +444,14 @@ async fn move_ancestors(
     let marks = placeholders(stale_ids.len());
     let select_sql =
         format!(r#"SELECT DISTINCT "ItemId" FROM "AncestorIds" WHERE "ParentItemId" IN ({marks})"#);
-    let mut select = sqlx::query_scalar::<_, String>(&select_sql);
+    let mut select = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select_sql));
     for id in stale_ids {
         select = select.bind(id);
     }
     let items = select.fetch_all(&mut **tx).await.map_err(db_err)?;
 
     let delete_sql = format!(r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" IN ({marks})"#);
-    let mut delete = sqlx::query(&delete_sql);
+    let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
     for id in stale_ids {
         delete = delete.bind(id);
     }
@@ -510,9 +513,9 @@ async fn move_user_settings(
 
     if let Some(moved) = source_id {
         for table in DISPLAY_SETTING_TABLES {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"UPDATE "{table}" SET "ItemId" = ?1 WHERE "ItemId" = ?2"#
-            ))
+            )))
             .bind(&canonical_db)
             .bind(moved)
             .execute(&mut **tx)
@@ -525,7 +528,7 @@ async fn move_user_settings(
         let marks = placeholders(dropped.len());
         for table in DISPLAY_SETTING_TABLES {
             let delete_sql = format!(r#"DELETE FROM "{table}" WHERE "ItemId" IN ({marks})"#);
-            let mut delete = sqlx::query(&delete_sql);
+            let mut delete = sqlx::query(sqlx::AssertSqlSafe(delete_sql));
             for id in &dropped {
                 delete = delete.bind(id.as_str());
             }
@@ -606,6 +609,31 @@ pub fn rewrite_view_preference(value: &str, stale: &[Uuid], canonical: Uuid) -> 
         });
     }
     touched.then(|| rewritten.join(","))
+}
+
+/// Seeds the adopted token path and historical save date for the warm-view test.
+#[cfg(test)]
+pub(crate) async fn seed_adopted_folder_view(db: &Database, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await?;
+    Ok(())
+}
+
+/// Seeds an explicit stored sort key for named-view comparer regressions.
+#[cfg(test)]
+pub(crate) async fn seed_view_sort_name(
+    db: &Database,
+    id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(name)
+        .execute(db.writer())
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -754,9 +782,9 @@ mod tests {
     }
 
     async fn display_setting_item_ids(db: &Database, table: &str) -> Vec<String> {
-        sqlx::query_scalar(&format!(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             r#"SELECT "ItemId" FROM "{table}" ORDER BY "ItemId""#
-        ))
+        )))
         .fetch_all(db.pool())
         .await
         .expect("display setting rows")
@@ -802,6 +830,7 @@ mod tests {
         seed_child(&db, channel_b, BaseItemKind::LiveTvChannel, stale_id).await;
         seed_child(&db, program, BaseItemKind::LiveTvProgram, stale_id).await;
         seed_display_settings(&db, user, stale_id, "emby").await;
+        crate::test_support::seed_user_data(&db, user, stale_id, true, None).await;
         let movies = Uuid::from_u128(0x1111);
         let music = Uuid::from_u128(0x2222);
         seed_preference(
@@ -828,6 +857,18 @@ mod tests {
             .await
             .expect("consolidate");
         assert_eq!(dropped, 1);
+
+        let (history_item, history_key): (String, String) = sqlx::query_as(
+            r#"SELECT "ItemId", "CustomDataKey" FROM "UserData" WHERE "UserId" = ?1"#,
+        )
+        .bind(guid_to_db(user))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (history_item, history_key),
+            (guid_to_db(canonical), canonical.to_string())
+        );
 
         // The canonical view is a copy of the promoted source.
         let view = fetch_item_opt(&db, canonical)

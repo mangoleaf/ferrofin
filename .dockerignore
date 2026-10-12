@@ -1,10 +1,15 @@
 # Keep the docker build context small — the root Dockerfile builds from the repo root.
 # (suite/ stays ignored defensively: retired v2 data dirs may linger on old checkouts.)
-target/
-.git/
+**/target/
+**/.git
 suite/
+suite.*/
 data/
-.claude/
+**/.claude/
+**/.worktrees/
+.agents/
+.codex/
+.mcp.json
 # The RustCodeGraph index (2.4GB) made "load build context" take longer than
 # the compile; none of these feed the server build.
 .rcg/
@@ -12,3 +17,23 @@ brain/
 # benchmark test data and run output (bench/ code itself is tiny)
 bench/testdata/
 bench/runs/
+# Local databases and private adoption fixtures/reports (also in .gitignore).
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/jellyfin-10.*/
+**/jellyfin-12.*/
+**/media-mounts.sh
+**/smoke-jellyfin-*.txt
+adoption/oracle/
+adoption/work/
+adoption/fixtures/
+**/*.metadata.json
+**/*.metadata-after-*.log
+**/*.watch-history.json
+**/*.watch-history-after-*.log
+**/*.boot.log
+**/*.boot2.log
+**/*.server.log
+**/*.smoke.txt
+**/*.smoke2.txt

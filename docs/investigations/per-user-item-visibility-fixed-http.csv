@@ -1,0 +1,34 @@
+case,baseline_ferrofin,fixed_ferrofin,jellyfin_12_1,fixed_observation,reference_observation
+hidden image,not probed,404,404,{},{}
+hidden image HEAD,not probed,404,404,{},{}
+hidden conditional image,not probed,404,404,{},{}
+allowed image,not probed,200,200,{},{}
+restricted browse,200,200,200,"{""names"": [""Allowed""]}","{""names"": [""Allowed""]}"
+allowed detail,200,200,200,"{""media_sources"": 1}","{""media_sources"": 1}"
+hidden detail,200,404,404,{},{}
+hidden playback,200,404,404,{},{}
+hidden download,200,404,404,{},{}
+hidden ancestors,200,404,404,{},{}
+hidden extras,200,404,404,{},{}
+hidden similar,200,404,404,{},{}
+hidden favorite,200,404,404,{},{}
+hidden userdata,200,404,404,{},{}
+hidden played,200,404,404,{},{}
+admin detail,200,200,200,"{""media_sources"": 1}","{""media_sources"": 1}"
+admin targeting restricted user,200,404,404,{},{}
+blocked tag detail,200,404,404,{},{}
+unmatched allowed tag detail,200,404,404,{},{}
+parental limit detail,200,404,404,{},{}
+hidden explicit ids query,200,200,200,"{""names"": [""Hidden""]}","{""names"": [""Hidden""]}"
+hidden parent query,200,401,401,{},{}
+API key download,200,200,200,{},{}
+API key targeting restricted user,200,404,404,{},{}
+restricted admin detail,200,404,404,{},{}
+private playlist detail,200,404,404,{},{}
+private playlist delete,401,404,404,{},{}
+SyncPlay hidden group list,not probed,200,200,"{""groups"": 0}","{""groups"": 0}"
+SyncPlay hidden group detail,not probed,404,404,{},{}
+SyncPlay allowed group list,not probed,200,200,"{""groups"": 1}","{""groups"": 1}"
+hidden delete,204,404,404,{},{}
+admin detail after delete,404,200,200,"{""media_sources"": 1}","{""media_sources"": 1}"
+media exists after delete,true,true,true,"{""exists"": true}","{""exists"": true}"

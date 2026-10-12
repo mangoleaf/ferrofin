@@ -5,9 +5,13 @@
 # Built + pushed by the `runtime-image` CI job to $CI_REGISTRY_IMAGE/ci:runtime-trixie-ffmpeg8,
 # rebuilt only when this file changes (else on demand via REBUILD_RUNTIME_IMAGE).
 # Bump the tag (ci:runtime-<...>) when the ffmpeg major or the base distro moves.
+# Keep this runtime in sync with the root Dockerfile's runtime-build stage.
+# Jellyfin FFmpeg supplies chromaprint; libchromaprint-tools would add an unused
+# fpcalc fallback and Debian's separate FFmpeg libraries. curl and gnupg are
+# only needed to import the repository key and are purged in the same layer.
 FROM debian:trixie-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl gnupg libchromaprint-tools \
+ && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
  && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
       | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg \
  && echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian trixie main" \
@@ -16,4 +20,5 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends jellyfin-ffmpeg8 \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
+ && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false curl gnupg \
  && rm -rf /var/lib/apt/lists/*

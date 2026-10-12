@@ -39,6 +39,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the encoder protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub encoder_protocol: Option<MediaProtocol>,
 
     /// Gets or sets the type.
@@ -51,6 +52,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the size in bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub size: Option<i64>,
 
     /// Gets or sets the name.
@@ -67,6 +69,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the run time in ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
 
     /// Gets or sets a value indicating whether to read at the native framerate.
@@ -113,6 +116,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the buffer in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub buffer_ms: Option<i32>,
 
     /// Gets or sets a value indicating whether the source requires looping.
@@ -123,14 +127,17 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the video type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_type: Option<VideoType>,
 
     /// Gets or sets the ISO type.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub iso_type: Option<IsoType>,
 
     /// Gets or sets the 3D format.
     #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video3d_format: Option<Video3DFormat>,
 
     /// Gets or sets the media streams.
@@ -151,14 +158,17 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bitrate: Option<i32>,
 
     /// Gets or sets the fallback maximum streaming bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub fallback_max_streaming_bitrate: Option<i32>,
 
     /// Gets or sets the timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub timestamp: Option<TransportStreamTimestamp>,
 
     /// Gets or sets the required HTTP headers.
@@ -177,6 +187,7 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the analyze duration in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub analyze_duration_ms: Option<i32>,
 
     /// Gets or sets the transcode reasons. `[JsonIgnore]` upstream.
@@ -189,10 +200,12 @@ pub struct MediaSourceInfo {
 
     /// Gets or sets the index of the default audio stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub default_audio_stream_index: Option<i32>,
 
     /// Gets or sets the index of the default subtitle stream.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub default_subtitle_stream_index: Option<i32>,
 
     /// Gets or sets a value indicating whether the source has segments.

@@ -32,7 +32,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, RawQuery, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get};
@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
@@ -51,6 +52,84 @@ use crate::state::AppState;
 // still advertises `application/x-mpegURL` — that is the attribute, not the runtime.)
 const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 
+/// Binds only the CPU-limit query as ASP.NET's nullable `Int32` converter does.
+/// Empty/whitespace input is absent; nonempty input is trimmed before numeric
+/// conversion. `BaseNumberConverter` also accepts #, 0x and &h hexadecimal forms.
+fn optional_cpu_core_limit<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    let Some(value) = raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let hex = value.strip_prefix('#').or_else(|| {
+        value
+            .get(..2)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("0x") || prefix.eq_ignore_ascii_case("&h"))
+            .and_then(|_| value.get(2..))
+    });
+    if let Some(hex) = hex {
+        // Convert.ToInt32(base16) permits one plus before an optional 0x, and
+        // interprets the full unsigned bit pattern as a signed 32-bit value.
+        let digits = hex.strip_prefix('+').unwrap_or(hex);
+        let digits = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+            .unwrap_or(digits);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(serde::de::Error::custom("invalid CPU core limit"));
+        }
+        return u32::from_str_radix(digits, 16)
+            .map(|bits| Some(i32::from_be_bytes(bits.to_be_bytes())))
+            .map_err(serde::de::Error::custom);
+    }
+    // NumberStyles.Integer retains the framework's trailing-NUL compatibility.
+    value
+        .trim_end_matches('\0')
+        .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
+        .parse()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+/// Jellyfin's registered NullableEnumModelBinder uses EnumConverter, retaining
+/// undefined Int32 values and comma combinations; FormatException leaves null.
+fn optional_encoding_context<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ferrofin_model::dlna::EncodingContext>, D::Error> {
+    use ferrofin_model::dlna::EncodingContext;
+    use serde::Deserialize as _;
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bits = value.split(',').try_fold(0_i32, |bits, part| {
+        let named = part.trim();
+        let number = if named.eq_ignore_ascii_case("Streaming") {
+            0
+        } else if named.eq_ignore_ascii_case("Static") {
+            1
+        } else {
+            part.trim_start()
+                .trim_end_matches('\0')
+                .trim_end_matches(|character| matches!(character, ' ' | '\t'..='\r'))
+                .parse::<i32>()
+                .ok()?
+        };
+        Some(bits | number)
+    });
+    Ok(bits.map(|number| match number {
+        0 => EncodingContext::Streaming,
+        1 => EncodingContext::Static,
+        number => EncodingContext::Unrecognized(number),
+    }))
+}
+
 /// The `?static` / segment-shaping query parameters common to every HLS route.
 ///
 /// Only the fields the software transcode path consumes are captured; the full
@@ -58,124 +137,157 @@ const HLS_PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
 /// defaults inside the [`HlsStreamManager`] implementation. Unknown parameters are
 /// ignored here but preserved verbatim in the raw query string (see
 /// [`build_request`]).
-/// Every field carries a PascalCase `alias`: the PlaybackInfo-negotiated
-/// `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase parameters,
-/// while the regenerated playlist's segment URLs lowercase the first character
-/// — both spellings must parse or the master-playlist request silently drops
-/// the negotiated limits.
+///
+/// Keys bind ignoring case ([`crate::extract::Query`]): the PlaybackInfo-
+/// negotiated `TranscodingUrl` (built by `StreamInfo::to_url`) uses PascalCase
+/// parameters and the contract spells the caps `videoBitRate`/`audioBitRate`,
+/// and every spelling must reach its field or the master-playlist request
+/// silently drops the negotiated limits.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HlsQuery {
     /// The pinned media source id, if any.
-    #[serde(default, alias = "MediaSourceId")]
+    #[serde(default)]
     media_source_id: Option<String>,
     /// The open live stream to transcode, when the client opened one.
-    #[serde(default, alias = "LiveStreamId")]
+    #[serde(default)]
     live_stream_id: Option<String>,
     /// The playback-session id this stream belongs to.
-    #[serde(default, alias = "PlaySessionId")]
+    #[serde(default)]
     play_session_id: Option<String>,
     /// The requesting device id (kill/keep-alive scope).
-    #[serde(default, alias = "DeviceId")]
+    #[serde(default)]
     device_id: Option<String>,
     /// The desired segment container (`ts`/`mp4`).
-    #[serde(default, alias = "SegmentContainer")]
+    #[serde(default)]
     segment_container: Option<String>,
+    /// Progressive output container (stream.{container} or Container query).
+    #[serde(default)]
+    container: Option<String>,
+    /// Explicit streaming/static muxing context.
+    #[serde(default, deserialize_with = "optional_encoding_context")]
+    context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds.
-    #[serde(default, alias = "SegmentLength")]
+    #[serde(default)]
     segment_length: Option<i32>,
+    /// Segment position and duration supplied by the generated playlist URL.
+    #[serde(default)]
+    runtime_ticks: i64,
+    #[serde(default)]
+    actual_segment_length_ticks: i64,
     /// The resume offset in ticks; starts the fMP4 init transcode at the resume
     /// segment so the cached init matches the seek-offset segments (avoids the
     /// resume spinner). Baked into playlist init/segment URLs on a resume.
-    #[serde(default, alias = "StartTimeTicks")]
+    #[serde(default)]
     start_time_ticks: Option<i64>,
     /// The desired output audio codec.
-    #[serde(default, alias = "AudioCodec")]
+    #[serde(default)]
     audio_codec: Option<String>,
     /// The desired output video codec.
-    #[serde(default, alias = "VideoCodec")]
+    #[serde(default)]
     video_codec: Option<String>,
     /// The transcoding profile's max audio channels (drives the `-ac` downmix).
-    #[serde(default, alias = "TranscodingMaxAudioChannels")]
+    #[serde(default)]
     transcoding_max_audio_channels: Option<i32>,
+    /// The requested output audio channels (`audioChannels`).
+    #[serde(default)]
+    audio_channels: Option<i32>,
+    /// The maximum output audio channels (`maxAudioChannels`).
+    #[serde(default)]
+    max_audio_channels: Option<i32>,
+    /// The maximum output audio bit depth (`maxAudioBitDepth`).
+    #[serde(default)]
+    max_audio_bit_depth: Option<i32>,
+    /// The maximum reference-frame count (`maxRefFrames`).
+    #[serde(default)]
+    max_ref_frames: Option<i32>,
+    /// The maximum output video bit depth (`maxVideoBitDepth`).
+    #[serde(default)]
+    max_video_bit_depth: Option<i32>,
+    /// Whether the input is force-deinterlaced (`deInterlace`).
+    #[serde(default)]
+    de_interlace: Option<bool>,
+    /// The audio track to transcode (`audioStreamIndex`, a media-stream index).
+    #[serde(default)]
+    audio_stream_index: Option<i32>,
+    /// The video track to transcode (`videoStreamIndex`, a media-stream index).
+    #[serde(default)]
+    video_stream_index: Option<i32>,
+    /// The requested output audio sample rate (`audioSampleRate`).
+    #[serde(default)]
+    audio_sample_rate: Option<i32>,
     /// The negotiated video bitrate cap in bit/s (`-maxrate` + downscale).
     ///
     /// The contract (and every Jellyfin client) spells this `videoBitRate`
     /// (capital `R`, `DynamicHlsController`'s `int? videoBitRate`), while the
-    /// PlaybackInfo `TranscodingUrl` emits `VideoBitrate`. All four spellings
-    /// must parse: dropping the contract form silently lost the negotiated cap
-    /// (no `-maxrate`/`-bufsize`, and a source-bitrate BANDWIDTH in the master).
-    #[serde(
-        default,
-        alias = "VideoBitrate",
-        alias = "VideoBitRate",
-        alias = "videoBitRate"
-    )]
+    /// PlaybackInfo `TranscodingUrl` emits `VideoBitrate`; both reach this field
+    /// because keys bind ignoring case. Dropping the contract form once lost the
+    /// negotiated cap (no `-maxrate`/`-bufsize`, and a source-bitrate BANDWIDTH
+    /// in the master).
+    #[serde(default)]
     video_bitrate: Option<i32>,
     /// The negotiated audio bitrate cap in bit/s (`audioBitRate` in the
     /// contract; see [`Self::video_bitrate`] for the spellings).
-    #[serde(
-        default,
-        alias = "AudioBitrate",
-        alias = "AudioBitRate",
-        alias = "audioBitRate"
-    )]
+    #[serde(default)]
     audio_bitrate: Option<i32>,
+    /// The per-request encoding thread limit, overriding EncodingThreadCount.
+    #[serde(default, deserialize_with = "optional_cpu_core_limit")]
+    cpu_core_limit: Option<i32>,
     /// The maximum output width in pixels (bounds the scale filter).
-    #[serde(default, alias = "MaxWidth")]
+    #[serde(default)]
     max_width: Option<i32>,
     /// The maximum output height in pixels.
-    #[serde(default, alias = "MaxHeight")]
+    #[serde(default)]
     max_height: Option<i32>,
     /// The maximum output framerate.
-    #[serde(default, alias = "MaxFramerate")]
+    #[serde(default)]
     max_framerate: Option<f32>,
     /// Whether `-c:v copy` is permitted (PlaybackInfo appends `false` when the
     /// client forbade it).
-    #[serde(default, alias = "AllowVideoStreamCopy")]
+    #[serde(default)]
     allow_video_stream_copy: Option<bool>,
     /// Whether `-c:a copy` is permitted.
-    #[serde(default, alias = "AllowAudioStreamCopy")]
+    #[serde(default)]
     allow_audio_stream_copy: Option<bool>,
     /// Whether the client asked for a static (direct) stream.
-    #[serde(default, rename = "static", alias = "Static")]
+    #[serde(default, rename = "static")]
     is_static: Option<bool>,
     /// The requested video profile (the `CODECS` profile byte of a re-encode).
-    #[serde(default, alias = "Profile")]
+    #[serde(default)]
     profile: Option<String>,
     /// The requested video level (the `CODECS` level of a re-encode).
-    #[serde(default, alias = "Level")]
+    #[serde(default)]
     level: Option<String>,
     /// The requested output framerate.
-    #[serde(default, alias = "Framerate")]
+    #[serde(default)]
     framerate: Option<f32>,
     /// The requested fixed output width.
-    #[serde(default, alias = "Width")]
+    #[serde(default)]
     width: Option<i32>,
     /// The requested fixed output height.
-    #[serde(default, alias = "Height")]
+    #[serde(default)]
     height: Option<i32>,
     /// The minimum segment count a live playlist waits for before serving.
-    #[serde(default, alias = "MinSegments")]
+    #[serde(default)]
     min_segments: Option<i32>,
     /// The subtitle stream to deliver or burn in.
-    #[serde(default, alias = "SubtitleStreamIndex")]
+    #[serde(default)]
     subtitle_stream_index: Option<i32>,
     /// The negotiated subtitle delivery method name.
-    #[serde(default, alias = "SubtitleMethod")]
+    #[serde(default)]
     subtitle_method: Option<String>,
     /// The client's transcode reasons (forwarded into the master's variant URL).
-    #[serde(default, alias = "TranscodeReasons")]
+    #[serde(default)]
     transcode_reasons: Option<String>,
     /// Whether text subtitles are listed as a group in the master playlist
     /// (route-specific default: `false` for `master.m3u8`, `true` for `live.m3u8`).
-    #[serde(default, alias = "EnableSubtitlesInManifest")]
+    #[serde(default)]
     enable_subtitles_in_manifest: Option<bool>,
     /// Whether the master playlist adds two lower-bitrate variants (default `false`).
-    #[serde(default, alias = "EnableAdaptiveBitrateStreaming")]
+    #[serde(default)]
     enable_adaptive_bitrate_streaming: Option<bool>,
     /// Whether the master playlist lists trickplay image playlists (default `true`).
-    #[serde(default, alias = "EnableTrickplay")]
+    #[serde(default)]
     enable_trickplay: Option<bool>,
 }
 
@@ -189,6 +301,8 @@ struct HlsQuery {
 struct HlsRequestContext {
     /// The access token presented by the request, if any.
     api_key: Option<String>,
+    /// Trusted policy snapshot from authorization, including on segment requests.
+    playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
     /// The peer's IP from the connection; `None` when the server was not started
     /// with connect-info (tests) — treated as not local, the conservative answer.
     remote_ip: Option<std::net::IpAddr>,
@@ -207,6 +321,7 @@ impl HlsRequestContext {
     ) -> Self {
         Self {
             api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
+            playback_permissions: auth.user_policy.as_deref().map(Into::into),
             // Inserted by the server's `with_connect_info`; absent behind a
             // body-consuming extractor or in tests.
             remote_ip: parts
@@ -244,12 +359,26 @@ fn build_request(
         play_session_id: query.play_session_id,
         device_id: query.device_id,
         segment_container: query.segment_container,
+        output_container: query.container,
+        context: query.context,
         segment_length: query.segment_length,
+        current_runtime_ticks: query.runtime_ticks,
+        actual_segment_length_ticks: query.actual_segment_length_ticks,
         audio_codec: query.audio_codec,
         video_codec: query.video_codec,
         transcoding_max_audio_channels: query.transcoding_max_audio_channels,
+        audio_channels: query.audio_channels,
+        max_audio_channels: query.max_audio_channels,
+        max_audio_bit_depth: query.max_audio_bit_depth,
+        max_ref_frames: query.max_ref_frames,
+        max_video_bit_depth: query.max_video_bit_depth,
+        deinterlace: query.de_interlace.unwrap_or(false),
+        audio_stream_index: query.audio_stream_index,
+        video_stream_index: query.video_stream_index,
+        audio_sample_rate: query.audio_sample_rate,
         video_bitrate: query.video_bitrate,
         audio_bitrate: query.audio_bitrate,
+        cpu_core_limit: query.cpu_core_limit,
         max_width: query.max_width,
         max_height: query.max_height,
         max_framerate: query.max_framerate,
@@ -272,6 +401,7 @@ fn build_request(
         enable_adaptive_bitrate_streaming: query.enable_adaptive_bitrate_streaming.unwrap_or(false),
         enable_trickplay: query.enable_trickplay.unwrap_or(true),
         api_key: ctx.api_key,
+        playback_permissions: ctx.playback_permissions,
         is_in_local_network: ctx
             .remote_ip
             .is_some_and(crate::handlers::system::is_in_local_network),
@@ -279,6 +409,27 @@ fn build_request(
         // Fields this route does not read keep their DTO defaults.
         ..HlsStreamRequest::default()
     }
+}
+
+/// The ordinary stream controllers validate these query/route identifiers
+/// before dispatch, including Static=true requests.
+pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), ApiError> {
+    for value in [
+        &request.output_container,
+        &request.segment_container,
+        &request.video_codec,
+        &request.audio_codec,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !ferrofin_model::media_info::is_valid_stream_identifier(value) {
+            return Err(ApiError::BadRequest(
+                "invalid streaming container or codec".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Serves the transcode branch of a direct-play stream route.
@@ -303,8 +454,29 @@ pub(crate) async fn transcode_stream_fallback(
 ) -> Result<Response, ApiError> {
     let mut req = query;
     req.item_id = item_id;
+    validate_stream_request(&req)?;
+    req.requested_url = Some(request.uri().path().to_owned());
+    req.is_head_request = request.method() == axum::http::Method::HEAD;
     let file = state.hls.transcode_stream(&req, is_audio).await?;
-    served_file_response(file, request).await
+    let mut response = if req.is_head_request {
+        Response::new(Body::empty())
+    } else {
+        crate::handlers::streaming::serve_growing_transcode(&file.path, request, file.progress)
+            .await?
+    };
+    response.headers_mut().insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("none"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_str(&file.content_type).map_err(|error| {
+            ApiError::from(ferrofin_traits::error::ServiceError::backend(
+                error.to_string(),
+            ))
+        })?,
+    );
+    Ok(response)
 }
 
 /// Builds an [`HlsStreamRequest`] (public to `videos`/`audio` so their direct-play
@@ -313,10 +485,17 @@ pub(crate) fn request_from_query(
     item_id: Uuid,
     query: HlsQueryPub,
     raw_query: Option<String>,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
 ) -> HlsStreamRequest {
-    // The progressive-transcode fallback builds no master playlist, so the
-    // token/peer context is irrelevant there.
-    build_request(item_id, query.0, raw_query, HlsRequestContext::default())
+    build_request(
+        item_id,
+        query.0,
+        raw_query,
+        HlsRequestContext {
+            playback_permissions: auth.user_policy.as_deref().map(Into::into),
+            ..HlsRequestContext::default()
+        },
+    )
 }
 
 /// A public wrapper around the crate-private [`HlsQuery`] so `videos`/`audio` can
@@ -324,6 +503,23 @@ pub(crate) fn request_from_query(
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(transparent)]
 pub(crate) struct HlsQueryPub(HlsQuery);
+
+/// Universal audio declares Container as a collection, unlike ordinary streams.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct UniversalHlsQueryPub(HlsQuery);
+
+/// Retains the existing universal-audio fallback while binding its collections.
+/// Container negotiation is separate from the ordinary progressive request.
+pub(crate) fn request_from_universal_query(
+    item_id: Uuid,
+    mut query: UniversalHlsQueryPub,
+    raw_query: Option<String>,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> HlsStreamRequest {
+    query.0.container = None;
+    request_from_query(item_id, HlsQueryPub(query.0), raw_query, auth)
+}
 
 /// Serves a playlist string as an HLS `.m3u8` response.
 fn playlist_response(playlist: String) -> Response {
@@ -339,8 +535,30 @@ fn playlist_response(playlist: String) -> Response {
 /// Uses the shared [`serve_static_file`](crate::handlers::streaming::serve_static_file)
 /// helper (Range/`HEAD`/`404`), then overrides the `Content-Type` with the MIME
 /// type the seam resolved for the file (ffmpeg's segment/playlist extensions).
-async fn served_file_response(file: ServedFile, request: Request) -> Result<Response, ApiError> {
-    let mut response = crate::handlers::streaming::serve_static_file(&file.path, request).await?;
+async fn served_file_response(
+    mut file: ServedFile,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let observer = file.progress.take();
+    let mut response = if let Some(observer) = observer
+        .as_ref()
+        .filter(|observer| observer.is_progressive())
+    {
+        crate::handlers::streaming::serve_growing_transcode(
+            &file.path,
+            request,
+            Some(std::sync::Arc::clone(observer)),
+        )
+        .await?
+    } else {
+        let mut response =
+            crate::handlers::streaming::serve_static_file(&file.path, request).await?;
+        if let Some(observer) = observer {
+            let body = std::mem::replace(response.body_mut(), Body::empty());
+            *response.body_mut() = crate::handlers::streaming::track_transcode_body(body, observer);
+        }
+        response
+    };
     if let Ok(value) = header::HeaderValue::from_str(&file.content_type) {
         response.headers_mut().insert(header::CONTENT_TYPE, value);
     }
@@ -464,14 +682,17 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 /// cannot set an `Authorization` header on a segment URL authenticate.
 async fn get_video_hls_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw, HlsRequestContext::default());
+    let (parts, body) = request.into_parts();
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let request = Request::from_parts(parts, body);
+    let req = build_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, false).await?;
     served_file_response(file, request).await
 }
@@ -480,14 +701,17 @@ async fn get_video_hls_segment(
 /// segment. Authenticated for the same reason as its video sibling above.
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
     let index = parse_segment_index(&segment_id)?;
-    let req = build_request(item_id, query, raw, HlsRequestContext::default());
+    let (parts, body) = request.into_parts();
+    let ctx = HlsRequestContext::from_parts(&auth, &parts, false);
+    let request = Request::from_parts(parts, body);
+    let req = build_request(item_id, query, raw, ctx);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
 }
@@ -598,9 +822,16 @@ async fn stop_encoding_process(
 /// `application/octet-stream`). A missing item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
+    auth: Result<crate::auth::AuthenticatedIdentity, ApiError>,
     Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
 ) -> Result<Response, ApiError> {
-    if state.library.get_item_by_id(video_id).await?.is_none() {
+    let user = auth.ok().and_then(|auth| auth.0.user);
+    if state
+        .library
+        .get_item_by_id_for_user(video_id, user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("video {video_id}")));
     }
     let extracted = state
@@ -667,18 +898,110 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
+crate::query::query_parameters! {
+    HlsQuery {} => [("get", "/Videos/{itemId}/master.m3u8"), ("get", "/Audio/{itemId}/master.m3u8"), ("get", "/Videos/{itemId}/stream")];
+    StopEncodingQuery {} => [("delete", "/Videos/ActiveEncodings")];
+    HlsQueryPub {} => [("get", "/Videos/{itemId}/stream"), ("get", "/Audio/{itemId}/stream")];
+    UniversalHlsQueryPub {"container" => ','} => [("get", "/Audio/{itemId}/universal")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn ordinary_container_is_scalar_and_universal_container_is_a_collection() {
+        let uri = "/?Container=mp3&container=flac".parse().unwrap();
+        let ordinary = Query::<HlsQueryPub>::try_from_uri(&uri).unwrap();
+        assert_eq!(ordinary.0.0.container.as_deref(), Some("mp3"));
+        let universal = Query::<UniversalHlsQueryPub>::try_from_uri(&uri).unwrap();
+        assert_eq!(universal.0.0.container.as_deref(), Some("mp3,flac"));
+        let request = request_from_universal_query(
+            Uuid::nil(),
+            universal.0,
+            None,
+            &ferrofin_traits::options::AuthorizationInfo::default(),
+        );
+        assert!(request.output_container.is_none());
+    }
+
+    /// Binds `query` the way the routes do, through the shared [`Query`]
+    /// extractor (keys matched ignoring case).
+    fn parse(query: &str) -> Result<HlsQuery, crate::extract::QueryRejection> {
+        let uri = format!("/Videos/x/master.m3u8?{query}")
+            .parse()
+            .expect("uri");
+        Query::try_from_uri(&uri).map(|Query(query)| query)
+    }
+
+    /// The nullable CPU override follows the source Int32 query binder.
+    #[test]
+    fn hls_cpu_core_limit_binds_all_cases_and_reaches_the_request() {
+        for spelling in ["CpuCoreLimit", "cpuCoreLimit", "CPUCORELIMIT"] {
+            for value in [-1, 0, 1, i32::MAX] {
+                let raw = format!("{spelling}={value}");
+                let query = parse(&raw).expect("integer limit");
+                let request =
+                    build_request(Uuid::nil(), query, Some(raw), HlsRequestContext::default());
+                assert_eq!(request.cpu_core_limit, Some(value));
+            }
+        }
+        assert_eq!(parse("").expect("absent").cpu_core_limit, None);
+        assert_eq!(
+            parse("CpuCoreLimit")
+                .expect("bare nullable integer")
+                .cpu_core_limit,
+            None
+        );
+        for blank in ["", "%20", "%09%0D%0A", "%C2%A0"] {
+            assert_eq!(
+                parse(&format!("CpuCoreLimit={blank}"))
+                    .expect("blank nullable query")
+                    .cpu_core_limit,
+                None
+            );
+        }
+        for (encoded, expected) in [
+            ("%20%2B2%20", 2),
+            ("%09-02%0A", -2),
+            ("0x2", 2),
+            ("0X7fffffff", i32::MAX),
+            ("0x80000000", i32::MIN),
+            ("0xffffffff", -1),
+            ("%23%2B0x2", 2),
+            ("%26H2", 2),
+            ("2%00%00", 2),
+            ("2%20%00", 2),
+        ] {
+            let query = parse(&format!("CpuCoreLimit={encoded}")).expect("native Int32 form");
+            let request = build_request(Uuid::nil(), query, None, HlsRequestContext::default());
+            assert_eq!(request.cpu_core_limit, Some(expected));
+        }
+
+        for value in [
+            "bad",
+            "2147483648",
+            "-2147483649",
+            "2.5",
+            "0x100000000",
+            "%23-1",
+            "%23%2B%2B2",
+            "%230x%2B2",
+            "1%002",
+            "2%C2%A0%00",
+        ] {
+            assert!(parse(&format!("CpuCoreLimit={value}")).is_err());
+        }
+    }
+
     /// The PlaybackInfo-negotiated `TranscodingUrl` uses PascalCase parameters
-    /// (`StreamInfo::to_url`); regenerated playlist URLs lowercase the first
-    /// character. Both spellings must reach the same request — dropping the
+    /// (`StreamInfo::to_url`), and clients may send camelCase. Every spelling
+    /// must reach the same request — dropping the
     /// PascalCase form silently loses the negotiated caps (the 2026-07-30
     /// benchmark's full-4K re-encode) and the psid (psid-scoped kills).
     #[test]
     fn hls_query_parses_pascal_and_camel_case() {
-        let pascal: HlsQuery = serde_urlencoded::from_str(
+        let pascal: HlsQuery = parse(
             "DeviceId=d1&PlaySessionId=p1&MediaSourceId=m1&VideoCodec=h264&\
              VideoBitrate=8000000&AudioBitrate=192000&MaxWidth=1920&MaxFramerate=30&\
              TranscodingMaxAudioChannels=2&SegmentContainer=mp4&Static=false",
@@ -692,7 +1015,7 @@ mod tests {
         assert_eq!(pascal.max_framerate, Some(30.0));
         assert_eq!(pascal.transcoding_max_audio_channels, Some(2));
 
-        let camel: HlsQuery = serde_urlencoded::from_str(
+        let camel: HlsQuery = parse(
             "deviceId=d1&playSessionId=p1&videoBitrate=8000000&maxWidth=1920&\
              allowVideoStreamCopy=false",
         )
@@ -706,17 +1029,68 @@ mod tests {
         // used to parse as `None`: no `-maxrate`, no `-b:a`, and the master
         // playlist fell back to the source bitrate.
         let contract: HlsQuery =
-            serde_urlencoded::from_str("videoBitRate=1000000&audioBitRate=128000")
-                .expect("contract query parses");
+            parse("videoBitRate=1000000&audioBitRate=128000").expect("contract query parses");
         assert_eq!(contract.video_bitrate, Some(1_000_000));
         assert_eq!(contract.audio_bitrate, Some(128_000));
-        let contract_pascal: HlsQuery =
-            serde_urlencoded::from_str("VideoBitRate=1000000&AudioBitRate=128000")
-                .expect("pascal contract query parses");
+        let contract_pascal: HlsQuery = parse("VideoBitRate=1000000&AudioBitRate=128000")
+            .expect("pascal contract query parses");
         assert_eq!(contract_pascal.video_bitrate, Some(1_000_000));
         assert_eq!(contract_pascal.audio_bitrate, Some(128_000));
-        let lower: HlsQuery = serde_urlencoded::from_str("audioBitrate=96000").expect("parses");
+        let lower: HlsQuery = parse("audioBitrate=96000").expect("parses");
         assert_eq!(lower.audio_bitrate, Some(96_000));
+    }
+
+    /// `DynamicHlsController`'s typed members bind in any casing and reach the
+    /// stream request (upstream reads them before any per-codec stream option).
+    #[test]
+    fn typed_encoding_members_reach_the_request_in_any_casing() {
+        for query in [
+            "AudioChannels=6&MaxAudioChannels=8&MaxAudioBitDepth=24&\
+             MaxRefFrames=4&MaxVideoBitDepth=10&DeInterlace=True&\
+             AudioStreamIndex=3&VideoStreamIndex=0&AudioSampleRate=44100",
+            "audioChannels=6&maxAudioChannels=8&maxAudioBitDepth=24&\
+             maxRefFrames=4&maxVideoBitDepth=10&deInterlace=true&\
+             audioStreamIndex=3&videoStreamIndex=0&audioSampleRate=44100",
+        ] {
+            let req = build_request(
+                uuid::Uuid::from_u128(7),
+                parse(query).expect(query),
+                None,
+                HlsRequestContext::default(),
+            );
+            assert_eq!(req.audio_channels, Some(6), "{query}");
+            assert_eq!(req.max_audio_channels, Some(8), "{query}");
+            assert_eq!(req.max_audio_bit_depth, Some(24), "{query}");
+            assert_eq!(req.max_ref_frames, Some(4), "{query}");
+            assert_eq!(req.max_video_bit_depth, Some(10), "{query}");
+            assert!(req.deinterlace, "{query}");
+            assert_eq!(req.audio_stream_index, Some(3), "{query}");
+            assert_eq!(req.video_stream_index, Some(0), "{query}");
+            assert_eq!(req.audio_sample_rate, Some(44_100), "{query}");
+        }
+        let req = build_request(
+            uuid::Uuid::from_u128(7),
+            parse("").expect("empty"),
+            None,
+            HlsRequestContext::default(),
+        );
+        assert!(!req.deinterlace);
+        assert_eq!(req.audio_channels, None);
+    }
+
+    /// ASP.NET's `bool.TryParse`: any case, surrounding whitespace, and an
+    /// empty value as unset. `StreamInfo::to_url` emits `True`/`False`.
+    #[test]
+    fn hls_bools_bind_like_bool_try_parse() {
+        let query =
+            parse("EnableSubtitlesInManifest=True&Static=FALSE&AllowVideoStreamCopy=%20true%20")
+                .expect("binds");
+        assert_eq!(query.enable_subtitles_in_manifest, Some(true));
+        assert_eq!(query.is_static, Some(false));
+        assert_eq!(query.allow_video_stream_copy, Some(true));
+        let query = parse("deInterlace=").expect("empty binds");
+        assert_eq!(query.de_interlace, None);
+        assert!(parse("deInterlace=yes").is_err());
     }
 
     #[test]
@@ -725,8 +1099,7 @@ mod tests {
         // stream it opened. Without this the planner would resolve the channel's
         // static source and dial the tuner a second time.
         let query: HlsQuery =
-            serde_urlencoded::from_str("LiveStreamId=prov_service_source&MediaSourceId=source")
-                .expect("parses");
+            parse("LiveStreamId=prov_service_source&MediaSourceId=source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -739,8 +1112,7 @@ mod tests {
         // The camelCase spelling parses too. It also looks like a
         // `ParseStreamOptions` key (lower-case initial), so assert it still
         // reaches the field rather than being swallowed as a stream option.
-        let query: HlsQuery =
-            serde_urlencoded::from_str("liveStreamId=prov_service_source").expect("parses");
+        let query: HlsQuery = parse("liveStreamId=prov_service_source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -750,7 +1122,7 @@ mod tests {
         assert_eq!(req.live_stream_id.as_deref(), Some("prov_service_source"));
 
         // An ordinary transcode names no live stream.
-        let query: HlsQuery = serde_urlencoded::from_str("MediaSourceId=source").expect("parses");
+        let query: HlsQuery = parse("MediaSourceId=source").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -762,8 +1134,7 @@ mod tests {
 
     #[test]
     fn build_request_maps_caps_and_defaults_allow_copy() {
-        let query: HlsQuery =
-            serde_urlencoded::from_str("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
+        let query: HlsQuery = parse("MaxWidth=1280&VideoBitrate=4000000").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -782,8 +1153,7 @@ mod tests {
         assert_eq!(req.api_key, None);
         assert!(!req.is_in_local_network, "unknown peer is not local");
 
-        let query: HlsQuery =
-            serde_urlencoded::from_str("AllowVideoStreamCopy=false").expect("parses");
+        let query: HlsQuery = parse("AllowVideoStreamCopy=false").expect("parses");
         let req = build_request(
             uuid::Uuid::from_u128(7),
             query,
@@ -798,7 +1168,7 @@ mod tests {
     /// the manifest flags, the session token and the peer's locality.
     #[test]
     fn build_request_carries_master_playlist_inputs() {
-        let query: HlsQuery = serde_urlencoded::from_str(
+        let query: HlsQuery = parse(
             "Profile=high&Level=41&Framerate=30&Width=1280&Height=720&MinSegments=2&\
              SubtitleStreamIndex=3&SubtitleMethod=Hls&TranscodeReasons=ContainerNotSupported&\
              EnableSubtitlesInManifest=true&EnableAdaptiveBitrateStreaming=true&\
@@ -807,6 +1177,7 @@ mod tests {
         .expect("parses");
         let ctx = HlsRequestContext {
             api_key: Some("tok".to_owned()),
+            playback_permissions: None,
             remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 192, 168, 1, 5,
             ))),
@@ -832,9 +1203,10 @@ mod tests {
 
         // The route default fills an omitted `EnableSubtitlesInManifest`
         // (`live.m3u8` defaults it to true); a public peer is not local.
-        let query: HlsQuery = serde_urlencoded::from_str("").expect("parses");
+        let query: HlsQuery = parse("").expect("parses");
         let ctx = HlsRequestContext {
             api_key: None,
+            playback_permissions: None,
             remote_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))),
             subtitles_in_manifest_default: true,
         };

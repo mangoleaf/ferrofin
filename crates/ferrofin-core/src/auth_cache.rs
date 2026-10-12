@@ -41,6 +41,13 @@ use std::time::{Duration, Instant};
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::UserDto;
+use ferrofin_model::users::UserPolicy;
+
+type TokenResolution = (
+    Arc<DeviceEntity>,
+    Option<UserEntity>,
+    Option<Arc<UserPolicy>>,
+);
 
 /// How long a cached token resolution may be served before the next request
 /// re-reads it from the database.
@@ -67,6 +74,7 @@ const AUTH_CACHE_MAX_ENTRIES: usize = 4096;
 struct CachedAuth {
     device: Arc<DeviceEntity>,
     user: Option<UserEntity>,
+    policy: Option<Arc<UserPolicy>>,
     cached_at: Instant,
 }
 
@@ -141,13 +149,17 @@ impl AuthCache {
     ///
     /// [`AuthorizationInfo`]: ferrofin_traits::options::AuthorizationInfo
     #[must_use]
-    pub fn get(&self, token: &str) -> Option<(Arc<DeviceEntity>, Option<UserEntity>)> {
+    pub fn get(&self, token: &str) -> Option<TokenResolution> {
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
         let hit = entries.get(token)?;
         if hit.cached_at.elapsed() > self.ttl {
             return None;
         }
-        Some((Arc::clone(&hit.device), hit.user.clone()))
+        Some((
+            Arc::clone(&hit.device),
+            hit.user.clone(),
+            hit.policy.clone(),
+        ))
     }
 
     /// Caches a successful token resolution, unless the cache was cleared since
@@ -158,6 +170,7 @@ impl AuthCache {
         token: &str,
         device: DeviceEntity,
         user: Option<UserEntity>,
+        policy: Option<Arc<UserPolicy>>,
     ) {
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
         if !self.is_current(generation) {
@@ -171,6 +184,7 @@ impl AuthCache {
             CachedAuth {
                 device: Arc::new(device),
                 user,
+                policy,
                 cached_at: Instant::now(),
             },
         );
@@ -274,7 +288,7 @@ mod tests {
     #[test]
     fn hit_within_ttl_miss_after_expiry() {
         let cache = AuthCache::new(Duration::from_millis(30));
-        cache.put(cache.generation(), "tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None, None);
         assert!(cache.get("tok").is_some(), "fresh entry hits");
         std::thread::sleep(Duration::from_millis(40));
         assert!(cache.get("tok").is_none(), "expired entry misses");
@@ -286,10 +300,10 @@ mod tests {
     #[test]
     fn hits_share_the_device_row_instead_of_deep_copying_it() {
         let cache = AuthCache::default();
-        cache.put(cache.generation(), "tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None, None);
 
-        let (first, _) = cache.get("tok").expect("first hit");
-        let (second, _) = cache.get("tok").expect("second hit");
+        let (first, _, _) = cache.get("tok").expect("first hit");
+        let (second, _, _) = cache.get("tok").expect("second hit");
         assert!(
             Arc::ptr_eq(&first, &second),
             "both hits point at the one cached device row"
@@ -306,7 +320,7 @@ mod tests {
     #[test]
     fn clear_revokes_immediately() {
         let cache = AuthCache::default();
-        cache.put(cache.generation(), "tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None, None);
         assert!(cache.get("tok").is_some());
         cache.clear();
         assert!(cache.get("tok").is_none(), "cleared entry never served");
@@ -326,7 +340,7 @@ mod tests {
         // …the revocation lands while that read is in flight…
         cache.clear();
         // …and the in-flight resolver stores what it read.
-        cache.put(generation, "tok", device("tok"), None);
+        cache.put(generation, "tok", device("tok"), None, None);
 
         assert!(
             cache.get("tok").is_none(),
@@ -360,7 +374,7 @@ mod tests {
     fn a_put_after_a_clear_is_kept() {
         let cache = AuthCache::default();
         cache.clear();
-        cache.put(cache.generation(), "tok", device("tok"), None);
+        cache.put(cache.generation(), "tok", device("tok"), None, None);
         assert!(
             cache.get("tok").is_some(),
             "a fresh resolution still caches"
@@ -371,10 +385,16 @@ mod tests {
     fn cap_drops_the_map_instead_of_growing() {
         let cache = AuthCache::default();
         for i in 0..AUTH_CACHE_MAX_ENTRIES {
-            cache.put(cache.generation(), &format!("t{i}"), device("t"), None);
+            cache.put(
+                cache.generation(),
+                &format!("t{i}"),
+                device("t"),
+                None,
+                None,
+            );
         }
         assert_eq!(cache.len(), AUTH_CACHE_MAX_ENTRIES);
-        cache.put(cache.generation(), "one-more", device("t"), None);
+        cache.put(cache.generation(), "one-more", device("t"), None, None);
         assert_eq!(
             cache.len(),
             1,

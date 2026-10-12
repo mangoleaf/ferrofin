@@ -34,7 +34,7 @@ fn hw_encoder_suffix(hw_type: HardwareAccelerationType) -> Option<&'static str> 
         HardwareAccelerationType::videotoolbox => Some("videotoolbox"),
         HardwareAccelerationType::v4l2m2m => Some("v4l2m2m"),
         HardwareAccelerationType::rkmpp => Some("rkmpp"),
-        HardwareAccelerationType::none => None,
+        HardwareAccelerationType::none | HardwareAccelerationType::Unrecognized(_) => None,
     }
 }
 
@@ -52,7 +52,8 @@ fn mjpeg_encoder_suffix(hw_type: HardwareAccelerationType) -> Option<&'static st
         HardwareAccelerationType::amf
         | HardwareAccelerationType::nvenc
         | HardwareAccelerationType::v4l2m2m
-        | HardwareAccelerationType::none => None,
+        | HardwareAccelerationType::none
+        | HardwareAccelerationType::Unrecognized(_) => None,
     }
 }
 

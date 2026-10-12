@@ -21,9 +21,21 @@ use crate::dlna::PlaybackErrorCode;
 use crate::dto::{BaseItemPerson, MediaSourceInfo};
 use crate::entities_media::{ChapterInfo, MediaStream};
 
+/// Validates a streaming container or codec name.
+/// Port of EncodingHelper.ContainerValidationRegexStr: ASCII letters/digits
+/// and `-._,|`, with at most 40 characters (including an empty value).
+#[must_use]
+pub fn is_valid_stream_identifier(value: &str) -> bool {
+    value.len() <= 40
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b',' | b'|')
+        })
+}
+
 /// Enum `MediaProtocol` — how a media source is delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum MediaProtocol {
     /// Local file.
     #[default]
@@ -40,11 +52,27 @@ pub enum MediaProtocol {
     Rtp = 5,
     /// FTP.
     Ftp = 6,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    MediaProtocol, None, {
+        File => ("File", 0),
+        Http => ("Http", 1),
+        Rtmp => ("Rtmp", 2),
+        Rtsp => ("Rtsp", 3),
+        Udp => ("Udp", 4),
+        Rtp => ("Rtp", 5),
+        Ftp => ("Ftp", 6),
+    }
 }
 
 /// The type of timestamps used in a transport stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum TransportStreamTimestamp {
     /// The stream contains no timestamps.
     None,
@@ -52,6 +80,17 @@ pub enum TransportStreamTimestamp {
     Zero,
     /// The stream contains valid timestamps.
     Valid,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    TransportStreamTimestamp, None, {
+        None => ("None", 0),
+        Zero => ("Zero", 1),
+        Valid => ("Valid", 2),
+    }
 }
 
 /// Subtitle format string constants (C# `SubtitleFormat` static class).
@@ -124,6 +163,7 @@ pub struct BlurayDiscInfo {
     pub media_streams: Vec<MediaStream>,
     /// The run time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub run_time_ticks: Option<i64>,
     /// The files.
     pub files: Vec<String>,
@@ -188,18 +228,23 @@ pub struct LiveStreamRequest {
     pub play_session_id: Option<String>,
     /// The maximum streaming bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_streaming_bitrate: Option<i32>,
     /// The start time ticks.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_time_ticks: Option<i64>,
     /// The audio stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_stream_index: Option<i32>,
     /// The subtitle stream index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub subtitle_stream_index: Option<i32>,
     /// The maximum audio channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_audio_channels: Option<i32>,
     /// The item id.
     #[schema(value_type = String, format = "uuid")]
@@ -277,6 +322,12 @@ pub struct MediaInfo {
     #[serde(flatten)]
     pub media_source: MediaSourceInfo,
 
+    /// Unsplit, lowercased-key embedded audio tags from the encoder. Kept
+    /// internally so the audio prober can apply live library options after
+    /// probing; this is never part of the HTTP DTO or its schema.
+    #[serde(skip)]
+    pub raw_audio_tags: Option<HashMap<String, String>>,
+
     /// Gets or sets the chapters.
     pub chapters: Vec<ChapterInfo>,
 
@@ -306,14 +357,17 @@ pub struct MediaInfo {
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
 
     /// Gets or sets the premiere date.
@@ -344,6 +398,23 @@ pub struct MediaInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_identifiers_preserve_native_boundary_and_reject_path_separators() {
+        for value in ["", "..", "-._,|", "hevc,h264", &"x".repeat(40)] {
+            assert!(is_valid_stream_identifier(value), "{value:?}");
+        }
+        for value in [
+            "ts/../../outside",
+            "ts\\outside",
+            "mkv mp4",
+            "mkv\n",
+            "mätroska",
+            &"x".repeat(41),
+        ] {
+            assert!(!is_valid_stream_identifier(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn media_protocol_default_and_round_trip() {
@@ -512,5 +583,21 @@ mod tests {
         assert!(json.get("Protocol").is_some());
         let back: MediaInfo = serde_json::from_value(json).unwrap();
         assert_eq!(info, back);
+    }
+    #[test]
+    fn raw_audio_tags_remain_internal_and_cannot_be_supplied_through_json() {
+        let info = MediaInfo {
+            raw_audio_tags: Some(HashMap::from([(
+                "artist".to_owned(),
+                "unsplit / artist".to_owned(),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(info.clone().raw_audio_tags, info.raw_audio_tags);
+        let mut json = serde_json::to_value(&info).unwrap();
+        assert!(json.get("RawAudioTags").is_none());
+        json["RawAudioTags"] = serde_json::json!({"artist":"untrusted"});
+        let decoded: MediaInfo = serde_json::from_value(json).unwrap();
+        assert!(decoded.raw_audio_tags.is_none());
     }
 }

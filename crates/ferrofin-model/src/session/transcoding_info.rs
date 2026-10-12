@@ -30,26 +30,32 @@ pub struct TranscodingInfo {
 
     /// Gets or sets the bitrate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bitrate: Option<i32>,
 
     /// Gets or sets the framerate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub framerate: Option<f32>,
 
     /// Gets or sets the completion percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub completion_percentage: Option<f64>,
 
     /// Gets or sets the video width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
 
     /// Gets or sets the video height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
 
     /// Gets or sets the audio channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_channels: Option<i32>,
 
     /// Gets or sets the hardware acceleration type.

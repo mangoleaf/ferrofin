@@ -11,7 +11,7 @@
 //! `AuthenticationManager` over `dbContext.ApiKeys` (distinct from device-session
 //! tokens issued by the session manager).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -20,6 +20,7 @@ use ferrofin_model::security::AuthenticationInfo;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Query parameters for `POST /Auth/Keys` — the app name for the new key.
@@ -98,4 +99,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Auth/Keys", get(get_keys).post(create_key))
         .route("/Auth/Keys/{key}", delete(revoke_key))
+}
+crate::query::query_parameters! {
+    CreateKeyQuery {} => [("post", "/Auth/Keys")];
 }

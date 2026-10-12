@@ -1,0 +1,332 @@
+{
+ "DELETE /Library/VirtualFolders": [
+  "name",
+  "refreshLibrary"
+ ],
+ "DELETE /Library/VirtualFolders/Paths": [
+  "name",
+  "path",
+  "refreshLibrary"
+ ],
+ "DELETE /Videos/ActiveEncodings": [
+  "deviceId",
+  "playSessionId"
+ ],
+ "GET /Artists": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Artists/AlbumArtists": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Artists/InstantMix": [
+  "id"
+ ],
+ "GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}": [
+  "actualSegmentLengthTicks",
+  "enableAudioVbrEncoding",
+  "runtimeTicks"
+ ],
+ "GET /Audio/{itemId}/main.m3u8": [
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Audio/{itemId}/master.m3u8": [
+  "enableAdaptiveBitrateStreaming",
+  "enableAudioVbrEncoding",
+  "mediaSourceId"
+ ],
+ "GET /Audio/{itemId}/stream": [
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Audio/{itemId}/stream.{container}": [
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Audio/{itemId}/universal": [
+  "enableAudioVbrEncoding",
+  "enableRedirection"
+ ],
+ "GET /Devices/Info": [
+  "id"
+ ],
+ "GET /Devices/Options": [
+  "id"
+ ],
+ "GET /DisplayPreferences/{displayPreferencesId}": [
+  "client"
+ ],
+ "GET /Environment/DirectoryContents": [
+  "includeDirectories",
+  "includeFiles",
+  "path"
+ ],
+ "GET /Environment/ParentPath": [
+  "path"
+ ],
+ "GET /Genres": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Items": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Items/Latest": [
+  "groupItems",
+  "limit"
+ ],
+ "GET /Items/Suggestions": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Items/{itemId}/RemoteImages": [
+  "includeAllLanguages"
+ ],
+ "GET /Items/{itemId}/ThemeMedia": [
+  "inheritFromParent"
+ ],
+ "GET /Items/{itemId}/ThemeSongs": [
+  "inheritFromParent"
+ ],
+ "GET /Items/{itemId}/ThemeVideos": [
+  "inheritFromParent"
+ ],
+ "GET /Libraries/AvailableOptions": [
+  "isNewLibrary"
+ ],
+ "GET /LiveTv/Channels": [
+  "addCurrentProgram",
+  "enableFavoriteSorting"
+ ],
+ "GET /LiveTv/Programs": [
+  "enableTotalRecordCount"
+ ],
+ "GET /LiveTv/Programs/Recommended": [
+  "enableTotalRecordCount"
+ ],
+ "GET /LiveTv/Recordings": [
+  "enableTotalRecordCount"
+ ],
+ "GET /LiveTv/Recordings/Series": [
+  "enableTotalRecordCount"
+ ],
+ "GET /LiveTv/Tuners/Discover": [
+  "newDevicesOnly"
+ ],
+ "GET /LiveTv/Tuners/Discvover": [
+  "newDevicesOnly"
+ ],
+ "GET /Movies/Recommendations": [
+  "categoryLimit",
+  "itemLimit"
+ ],
+ "GET /MusicGenres": [
+  "enableTotalRecordCount"
+ ],
+ "GET /MusicGenres/InstantMix": [
+  "id"
+ ],
+ "GET /Playback/BitrateTest": [
+  "size"
+ ],
+ "GET /QuickConnect/Connect": [
+  "secret"
+ ],
+ "GET /Search/Hints": [
+  "includeArtists",
+  "includeGenres",
+  "includeMedia",
+  "includePeople",
+  "includeStudios",
+  "searchTerm"
+ ],
+ "GET /Shows/NextUp": [
+  "enableResumable",
+  "enableRewatching",
+  "enableTotalRecordCount"
+ ],
+ "GET /Studios": [
+  "enableTotalRecordCount"
+ ],
+ "GET /System/Logs/Log": [
+  "name"
+ ],
+ "GET /Trailers": [
+  "enableTotalRecordCount"
+ ],
+ "GET /UserItems/Resume": [
+  "enableTotalRecordCount",
+  "excludeActiveSessions"
+ ],
+ "GET /UserViews": [
+  "includeHidden"
+ ],
+ "GET /Users/{userId}/Items": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Users/{userId}/Items/Latest": [
+  "groupItems",
+  "limit"
+ ],
+ "GET /Users/{userId}/Items/Resume": [
+  "enableTotalRecordCount",
+  "excludeActiveSessions"
+ ],
+ "GET /Users/{userId}/Suggestions": [
+  "enableTotalRecordCount"
+ ],
+ "GET /Users/{userId}/Views": [
+  "includeHidden"
+ ],
+ "GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}": [
+  "actualSegmentLengthTicks",
+  "alwaysBurnInSubtitleWhenTranscoding",
+  "enableAudioVbrEncoding",
+  "runtimeTicks"
+ ],
+ "GET /Videos/{itemId}/live.m3u8": [
+  "alwaysBurnInSubtitleWhenTranscoding",
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Videos/{itemId}/main.m3u8": [
+  "alwaysBurnInSubtitleWhenTranscoding",
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Videos/{itemId}/master.m3u8": [
+  "alwaysBurnInSubtitleWhenTranscoding",
+  "enableAdaptiveBitrateStreaming",
+  "enableAudioVbrEncoding",
+  "enableTrickplay",
+  "mediaSourceId"
+ ],
+ "GET /Videos/{itemId}/stream": [
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Videos/{itemId}/stream.{container}": [
+  "enableAudioVbrEncoding"
+ ],
+ "GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8": [
+  "segmentLength"
+ ],
+ "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}": [
+  "addVttTimeMap",
+  "copyTimestamps",
+  "startPositionTicks"
+ ],
+ "GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}": [
+  "addVttTimeMap",
+  "copyTimestamps"
+ ],
+ "GET /Years": [
+  "recursive"
+ ],
+ "HEAD /Audio/{itemId}/master.m3u8": [
+  "enableAdaptiveBitrateStreaming",
+  "enableAudioVbrEncoding",
+  "mediaSourceId"
+ ],
+ "HEAD /Audio/{itemId}/stream": [
+  "enableAudioVbrEncoding"
+ ],
+ "HEAD /Audio/{itemId}/stream.{container}": [
+  "enableAudioVbrEncoding"
+ ],
+ "HEAD /Audio/{itemId}/universal": [
+  "enableAudioVbrEncoding",
+  "enableRedirection"
+ ],
+ "HEAD /Videos/{itemId}/master.m3u8": [
+  "alwaysBurnInSubtitleWhenTranscoding",
+  "enableAdaptiveBitrateStreaming",
+  "enableAudioVbrEncoding",
+  "enableTrickplay",
+  "mediaSourceId"
+ ],
+ "HEAD /Videos/{itemId}/stream": [
+  "enableAudioVbrEncoding"
+ ],
+ "HEAD /Videos/{itemId}/stream.{container}": [
+  "enableAudioVbrEncoding"
+ ],
+ "POST /Audio/{itemId}/Lyrics": [
+  "fileName"
+ ],
+ "POST /Auth/Keys": [
+  "app"
+ ],
+ "POST /Collections": [
+  "isLocked"
+ ],
+ "POST /Devices/Options": [
+  "id"
+ ],
+ "POST /DisplayPreferences/{displayPreferencesId}": [
+  "client"
+ ],
+ "POST /Items/RemoteSearch/Apply/{itemId}": [
+  "replaceAllImages"
+ ],
+ "POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index": [
+  "newIndex"
+ ],
+ "POST /Items/{itemId}/Refresh": [
+  "imageRefreshMode",
+  "metadataRefreshMode",
+  "regenerateTrickplay",
+  "replaceAllImages",
+  "replaceAllMetadata"
+ ],
+ "POST /Items/{itemId}/RemoteImages/Download": [
+  "type"
+ ],
+ "POST /Library/VirtualFolders": [
+  "name",
+  "refreshLibrary"
+ ],
+ "POST /Library/VirtualFolders/Name": [
+  "refreshLibrary"
+ ],
+ "POST /Library/VirtualFolders/Paths": [
+  "refreshLibrary"
+ ],
+ "POST /LiveStreams/Close": [
+  "liveStreamId"
+ ],
+ "POST /LiveTv/ListingProviders": [
+  "validateListings",
+  "validateLogin"
+ ],
+ "POST /PlayingItems/{itemId}": [
+  "canSeek"
+ ],
+ "POST /PlayingItems/{itemId}/Progress": [
+  "isMuted",
+  "isPaused"
+ ],
+ "POST /QuickConnect/Authorize": [
+  "code"
+ ],
+ "POST /Sessions/Capabilities": [
+  "supportsMediaControl",
+  "supportsPersistentIdentifier"
+ ],
+ "POST /Sessions/Playing/Ping": [
+  "playSessionId"
+ ],
+ "POST /Sessions/Viewing": [
+  "itemId"
+ ],
+ "POST /Sessions/{sessionId}/Playing": [
+  "playCommand"
+ ],
+ "POST /Sessions/{sessionId}/Viewing": [
+  "itemId",
+  "itemName",
+  "itemType"
+ ],
+ "POST /Users/{userId}/Authenticate": [
+  "pw"
+ ],
+ "POST /Users/{userId}/PlayingItems/{itemId}": [
+  "canSeek"
+ ],
+ "POST /Users/{userId}/PlayingItems/{itemId}/Progress": [
+  "isMuted",
+  "isPaused"
+ ]
+}

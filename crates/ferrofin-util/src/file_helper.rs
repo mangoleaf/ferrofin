@@ -4,6 +4,90 @@
 use std::io;
 use std::path::Path;
 
+/// Replaces a file only after its complete new contents have reached disk.
+///
+/// The temporary file is private and lives beside the destination so rename
+/// is atomic. A failed write or rename leaves the previous file intact.
+/// Call from a blocking worker when used by an async service.
+///
+/// # Errors
+///
+/// Returns a filesystem error without truncating the destination.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    atomic_replace_with(path, |file| file.write_all(contents))
+}
+
+/// Replaces media-adjacent artwork atomically with ordinary file permissions.
+///
+/// New files honor the process umask. Existing files retain their permissions,
+/// clearing the read-only owner flag as ImageSaver does before replacement.
+///
+/// # Errors
+/// Returns a filesystem error without truncating the destination.
+pub fn atomic_write_media(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    atomic_replace_with_permissions(path, false, |file| file.write_all(contents))
+}
+
+fn atomic_replace_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    atomic_replace_with_permissions(path, true, write)
+}
+
+fn atomic_replace_with_permissions(
+    path: &Path,
+    private: bool,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".ferrofin-config-{}", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if private {
+            options.mode(0o600);
+        }
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| {
+        if !private
+            && let Ok(metadata) = std::fs::metadata(path)
+            && metadata.is_file()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                file.set_permissions(std::fs::Permissions::from_mode(
+                    metadata.permissions().mode() | 0o200,
+                ))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let mut permissions = metadata.permissions();
+                permissions.set_readonly(false);
+                file.set_permissions(permissions)?;
+            }
+        }
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 /// Creates, or truncates, a file at the specified path.
 ///
 /// # Errors
@@ -46,6 +130,51 @@ pub fn ensure_writable_dir<P: AsRef<Path>>(dir: P) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+
+    #[cfg(unix)]
+    #[test]
+    fn media_writes_honor_umask_and_preserve_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir().join(format!("ferrofin-media-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = dir.join("ordinary");
+        std::fs::write(&expected, b"ordinary").unwrap();
+        let path = dir.join("artwork");
+        atomic_write_media(&path, b"new artwork").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode(),
+            std::fs::metadata(&expected).unwrap().permissions().mode()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o440)).unwrap();
+        atomic_write_media(&path, b"replacement").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_preserves_previous_file_when_a_write_fails() {
+        use std::io::Write as _;
+        let dir = temp_dir().join(format!("ferrofin-atomic-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("settings.json");
+        atomic_write(&path, b"original").unwrap();
+        let result = atomic_replace_with(&path, |file| {
+            file.write_all(b"incomplete")?;
+            Err(io::Error::other("disk full"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        atomic_write(&path, b"replacement").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        // A rename failure also cleans up its temporary file.
+        assert!(atomic_write(&dir, b"cannot replace a directory").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn ensure_writable_dir_creates_and_probes() {

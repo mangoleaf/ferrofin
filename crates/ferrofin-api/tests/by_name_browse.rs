@@ -186,6 +186,21 @@ fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
 
 #[async_trait]
 impl LibraryManager for ByNameLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_genres(
         &self,
         _q: &InternalItemsQuery,

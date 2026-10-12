@@ -54,8 +54,8 @@ impl MediaAttachmentRepository for FerrofinMediaAttachmentRepository {
         }
         sql.push_str(r#" ORDER BY "Index""#);
 
-        let mut query =
-            sqlx::query_as::<_, AttachmentStreamInfoEntity>(&sql).bind(guid_to_db(filter.item_id));
+        let mut query = sqlx::query_as::<_, AttachmentStreamInfoEntity>(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(filter.item_id));
         if let Some(index) = filter.index {
             query = query.bind(i64::from(index));
         }
@@ -78,7 +78,8 @@ impl MediaAttachmentRepository for FerrofinMediaAttachmentRepository {
                 r#"SELECT * FROM "AttachmentStreamInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "Index""#,
             );
-            let mut query = sqlx::query_as::<_, AttachmentStreamInfoEntity>(&sql);
+            let mut query =
+                sqlx::query_as::<_, AttachmentStreamInfoEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }

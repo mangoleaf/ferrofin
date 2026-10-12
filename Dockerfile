@@ -38,9 +38,10 @@ COPY --from=web-source /web/dist /dist
 # jellyfin-ffmpeg over Debian's ffmpeg: SIMD single-pass tonemapping and a
 # current libx264 — the difference on 4K HDR transcode start times. It is also
 # built --enable-chromaprint, which is what the intro skipper fingerprints
-# with; trixie's libchromaprint-tools (fpcalc 1.5.1, a 2020 release) is
-# deliberately NOT installed — it aborts any window that decodes to
-# end-of-stream, which is every credits window.
+# with; libchromaprint-tools would add an unused fpcalc fallback and Debian's
+# separate FFmpeg libraries. Keep this runtime in sync with ci/runtime.Dockerfile.
+# curl and gnupg are only needed to import the repository key; purge them and
+# their unused dependencies in the installation layer.
 FROM debian:trixie-slim AS runtime-build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
@@ -52,6 +53,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends jellyfin-ffmpeg8 \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg \
  && ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
+ && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false curl gnupg \
  && rm -rf /var/lib/apt/lists/*
 
 # ── prebuilt-or-local indirection ───────────────────────────────────────
@@ -66,7 +68,8 @@ COPY . .
 # which ferrofin-health's build.rs treats as unset → crate version fallback).
 ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
-RUN cargo build --release -p ferrofin-server
+# Strip the container binary while leaving local profiling builds unchanged.
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}

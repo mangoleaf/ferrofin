@@ -110,6 +110,15 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
         "missing empty-label 404 series:\n{out}"
     );
 
+    // Every name the crate declares renders (the dashboard lint test trusts
+    // this list).
+    for name in ferrofin_metrics::METRIC_NAMES {
+        assert!(
+            out.lines().any(|l| l.starts_with(name)),
+            "declared metric `{name}` is absent from the exposition:\n{out}"
+        );
+    }
+
     // Parity name-set gate: every portable Jellyfin metric name renders here.
     // (dotnet_* / prometheus_net_* families are honest divergences — excluded.)
     for name in PORTABLE_JELLYFIN_METRICS {

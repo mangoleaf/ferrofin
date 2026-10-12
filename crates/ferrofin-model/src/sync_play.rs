@@ -12,19 +12,31 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// The mode for inserting items into a group queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum GroupQueueMode {
     /// Insert items at the end of the queue.
     #[default]
     Queue = 0,
     /// Insert items after the currently playing item.
     QueueNext = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    GroupQueueMode, None, {
+        Queue => ("Queue", 0),
+        QueueNext => ("QueueNext", 1),
+    }
 }
 
 /// The repeat mode of a group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum GroupRepeatMode {
     /// Repeat one item only.
     RepeatOne = 0,
@@ -33,17 +45,39 @@ pub enum GroupRepeatMode {
     /// Do not repeat.
     #[default]
     RepeatNone = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    GroupRepeatMode, None, {
+        RepeatOne => ("RepeatOne", 0),
+        RepeatAll => ("RepeatAll", 1),
+        RepeatNone => ("RepeatNone", 2),
+    }
 }
 
 /// The shuffle mode of a group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum GroupShuffleMode {
     /// Sorted playlist.
     #[default]
     Sorted = 0,
     /// Shuffled playlist.
     Shuffle = 1,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    GroupShuffleMode, None, {
+        Sorted => ("Sorted", 0),
+        Shuffle => ("Shuffle", 1),
+    }
 }
 
 /// The state of a group.
@@ -234,6 +268,7 @@ pub struct SendCommand {
 
     /// Gets the position ticks, for commands that require it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub position_ticks: Option<i64>,
 
     /// Gets the command.

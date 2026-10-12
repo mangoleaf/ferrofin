@@ -84,6 +84,55 @@ pub trait DtoService: Send + Sync {
         tagged_item_ids: Option<&[Uuid]>,
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError>;
+
+    /// Whether the item itself supports downloading (`BaseItem.CanDownload()`),
+    /// before the user's permission is applied. Must agree with a userless DTO.
+    /// Implementations may answer directly without building the entire DTO.
+    async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let options = DtoOptions {
+            fields: vec![ferrofin_model::querying::ItemFields::CanDownload],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        Ok(self
+            .get_base_item_dto(item, &options, None, None)
+            .await?
+            .can_download
+            .unwrap_or(false))
+    }
+
+    /// Whether `user` may delete `item` — C# `BaseItem.CanDelete(User)`, the
+    /// check `LibraryController.DeleteItem`/`DeleteItems` make before deleting.
+    ///
+    /// This is the **same value** the projection puts in the DTO's
+    /// `CanDelete` for that user, which is what jellyfin-web shows its
+    /// "Delete" menu entry by; the delete endpoints ask here so the two can
+    /// never disagree. The default reads it off
+    /// [`Self::get_base_item_dto`] with only the `CanDelete` field requested
+    /// (no `CanDelete` in the DTO reads as `false`); an implementation may
+    /// answer more cheaply, but must answer identically.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the projection's reads return.
+    async fn can_delete(
+        &self,
+        item: &BaseItemEntity,
+        user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        let options = DtoOptions {
+            fields: vec![ferrofin_model::querying::ItemFields::CanDelete],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        Ok(self
+            .get_base_item_dto(item, &options, Some(user), None)
+            .await?
+            .can_delete
+            .unwrap_or(false))
+    }
 }
 
 /// Compile-time assertion that [`DtoService`] is object-safe, so it can be

@@ -2,22 +2,26 @@
 //! `Movie.eng.forced.srt` and `Movie.fra.srt` beside it must leave two
 //! `IsExternal` subtitle rows in `MediaStreamInfos` — with the language and
 //! flags the filenames declare, numbered before the embedded streams as
-//! Jellyfin 10.11's `FFProbeVideoInfo.Fetch` numbers them — and a rescan must
-//! keep exactly those rows (no duplicates of a sidecar the subtitle manager
-//! had already recorded). The sidecar a read-only-library upload leaves in the
-//! item's internal metadata folder is found too.
+//! Jellyfin 10.11's `FFProbeVideoInfo.Fetch` numbers them. An unchanged
+//! rescan probes nothing and keeps those rows; a re-probe keeps exactly those
+//! rows too (no duplicates of a sidecar the subtitle manager had already
+//! recorded). The sidecar a read-only-library upload leaves in the item's
+//! internal metadata folder is a changed sidecar set: the next scan re-probes
+//! the movie (`ProbeProvider.HasChanged`) and indexes it.
 //!
 //! Port target: `SubtitleResolver`/`AudioResolver` as run from
-//! `FFProbeVideoInfo`, over the real scanner, repository and SQLite schema; the
-//! ffprobe seam is a fake that answers by file extension.
+//! `FFProbeVideoInfo`, over the real scanner (with the item repository, so a
+//! rescan reads the stored rows and decides per item), repository and SQLite
+//! schema; the ffprobe seam is a fake that answers by file extension.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_core::{
-    FerrofinChapterRepository, FerrofinItemPersistenceService, FerrofinMediaStreamRepository,
-    FerrofinVirtualFolderManager, LibraryScanner,
+    FerrofinChapterRepository, FerrofinItemPersistenceService, FerrofinItemRepository,
+    FerrofinMediaStreamRepository, FerrofinVirtualFolderManager, LibraryScanner,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
@@ -29,7 +33,7 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
-use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use uuid::Uuid;
 
 /// The extension of `path`, with its dot (`Path.GetExtension`).
@@ -58,6 +62,26 @@ impl ProbeByExtension {
 
     fn probed(&self) -> Vec<(String, bool)> {
         self.probed.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    /// The file names probed since the last call, sorted.
+    fn take_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .probed
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, _)| {
+                Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        names.sort_unstable();
+        names
     }
 }
 
@@ -144,6 +168,7 @@ impl MediaEncoder for ProbeByExtension {
 
 /// One movie with two subtitle sidecars, plus the neighbours the resolver
 /// must ignore: a poster, an NFO, and a sidecar belonging to another title.
+/// Returns the movie's folder.
 fn write_movie_library(media: &Path) -> std::path::PathBuf {
     let dir = media.join("Heat (1995)");
     std::fs::create_dir_all(&dir).expect("fixture dirs");
@@ -162,11 +187,13 @@ struct Harness {
     streams: Arc<FerrofinMediaStreamRepository>,
     probe: Arc<ProbeByExtension>,
     meta_root: std::path::PathBuf,
+    /// The movie file.
+    movie: std::path::PathBuf,
 }
 
 async fn harness(tmp: &Path) -> Harness {
     let media = tmp.join("movies");
-    write_movie_library(&media);
+    let movie = write_movie_library(&media).join("Heat (1995).mkv");
     let meta_root = tmp.join("metadata").join("library");
 
     let db = Database::connect_in_memory().await.expect("connect");
@@ -190,11 +217,16 @@ async fn harness(tmp: &Path) -> Harness {
 
     let streams = Arc::new(FerrofinMediaStreamRepository::new(db.clone()));
     let probe = ProbeByExtension::new();
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
     let scanner = LibraryScanner::new(
         vf,
         Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
         persistence,
     )
+    .with_items(items)
     .with_probe(
         Arc::clone(&probe) as Arc<dyn MediaEncoder>,
         Arc::clone(&streams) as Arc<dyn MediaStreamRepository>,
@@ -207,7 +239,19 @@ async fn harness(tmp: &Path) -> Harness {
         streams,
         probe,
         meta_root,
+        movie,
     }
+}
+
+/// Moves `path`'s mtime an hour ahead: a changed file, which the next scan
+/// re-probes (`ProbeProvider.HasChanged`).
+fn touch(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("set mtime");
 }
 
 async fn movie_id(db: &Database) -> Uuid {
@@ -244,6 +288,9 @@ fn file_name(row: &MediaStreamInfoEntity) -> &str {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+// One scan sequence (index, unchanged rescan, re-probe over a duplicate);
+// splitting it would only repeat the first scan's setup.
+#[allow(clippy::too_many_lines)]
 async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempotently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let h = harness(tmp.path()).await;
@@ -316,10 +363,18 @@ async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempote
         ]
     );
     assert!(probed.iter().all(|(_, is_audio)| !is_audio));
+    let _ = h.probe.take_names();
+
+    // An unchanged rescan: the file and its sidecar set are as stored, so
+    // nothing is probed and the rows stand as they are.
+    h.scanner.scan_all().await.expect("unchanged rescan");
+    assert!(h.probe.take_names().is_empty(), "nothing re-probed");
+    assert_eq!(streams_of(&h.streams, movie).await, rows);
 
     // A downloaded sidecar the subtitle manager appended before this scan
     // (same file the resolver finds) must not survive as a duplicate: the
-    // scan's stream save is a full replace.
+    // scan's stream save is a full replace. The movie file changed, so the
+    // scan re-probes it.
     let mut with_duplicate = rows.clone();
     with_duplicate.push(MediaStreamInfoEntity {
         item_id: guid_to_db(movie),
@@ -337,12 +392,22 @@ async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempote
         .expect("simulate a download");
     assert_eq!(streams_of(&h.streams, movie).await.len(), 5);
 
+    touch(&h.movie);
     h.scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        h.probe.take_names(),
+        [
+            "Heat (1995).eng.forced.srt",
+            "Heat (1995).fra.srt",
+            "Heat (1995).mkv"
+        ],
+        "the changed movie was re-probed"
+    );
     let again = streams_of(&h.streams, movie).await;
     assert_eq!(
         again.len(),
         4,
-        "a rescan keeps exactly the two sidecars: {again:?}"
+        "a re-probe keeps exactly the two sidecars: {again:?}"
     );
     assert_eq!(
         again
@@ -366,16 +431,25 @@ async fn scan_finds_sidecars_in_the_items_internal_metadata_folder() {
     h.scanner.scan_all().await.expect("scan");
     let movie = movie_id(&h.db).await;
     assert_eq!(streams_of(&h.streams, movie).await.len(), 4);
+    let _ = h.probe.take_names();
 
     // An upload against a read-only library lands in
     // `{metadata}/library/{id2}/{id}` (the subtitle manager's fallback); the
-    // next scan indexes it like a media-adjacent sidecar.
+    // next scan indexes it like a media-adjacent sidecar. The movie file is
+    // unchanged: the changed sidecar set alone makes the scan re-probe it.
     let dashless = movie.simple().to_string();
     let internal = h.meta_root.join(&dashless[..2]).join(&dashless);
     std::fs::create_dir_all(&internal).expect("internal metadata dir");
     std::fs::write(internal.join("Heat (1995).deu.srt"), b"1\n").expect("uploaded sidecar");
 
     h.scanner.scan_all().await.expect("rescan");
+    assert!(
+        h.probe
+            .take_names()
+            .iter()
+            .any(|name| name == "Heat (1995).mkv"),
+        "the sidecar change re-probed the movie"
+    );
     let rows = streams_of(&h.streams, movie).await;
     assert_eq!(rows.len(), 5, "{rows:?}");
     let deu = rows

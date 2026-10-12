@@ -336,3 +336,34 @@ fn test_multi_discs() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].files.len(), 2);
 }
+
+/// Upstream sorts the candidates with `OrderBy(i => i.FullName)`, the
+/// current culture's comparer (ICU root collation, see `stack_resolver`), not
+/// ordinally: case is only a tie-break, so `pt 1` stays ahead of `Pt 2` and
+/// the stack's first file is part 1. Stack names still group ordinally (the
+/// C# dictionary's default comparer), so `movie` and `Movie` never stack.
+#[rstest::rstest]
+#[case::mixed_case_part_type(
+    &["Movie Pt 2.mkv", "Movie pt 1.mkv"],
+    &[("Movie", &["Movie pt 1.mkv", "Movie Pt 2.mkv"][..])]
+)]
+#[case::mixed_case_part_word(
+    &["Movie Part2.mkv", "Movie part1.mkv"],
+    &[("Movie", &["Movie part1.mkv", "Movie Part2.mkv"][..])]
+)]
+#[case::mixed_case_stack_name(&["Movie Pt 2.mkv", "movie pt 1.mkv"], &[])]
+fn test_stack_order_is_culture_aware(#[case] files: &[&str], #[case] expected: &[(&str, &[&str])]) {
+    let options = NamingOptions::new();
+    let result = stack_resolver::resolve_files(&strs(files), &options);
+    let actual: Vec<(&str, Vec<&str>)> = result
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.files.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, Vec<&str>)> = expected.iter().map(|(n, f)| (*n, f.to_vec())).collect();
+    assert_eq!(actual, expected);
+}

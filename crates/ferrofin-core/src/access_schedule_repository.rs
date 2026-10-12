@@ -95,36 +95,14 @@ pub async fn replace_tx(
 /// Maps a stored `DayOfWeek` discriminant to its [`DynamicDayOfWeek`].
 #[must_use]
 pub fn day_from_i32(value: i32) -> DynamicDayOfWeek {
-    match value {
-        1 => DynamicDayOfWeek::Monday,
-        2 => DynamicDayOfWeek::Tuesday,
-        3 => DynamicDayOfWeek::Wednesday,
-        4 => DynamicDayOfWeek::Thursday,
-        5 => DynamicDayOfWeek::Friday,
-        6 => DynamicDayOfWeek::Saturday,
-        7 => DynamicDayOfWeek::Everyday,
-        8 => DynamicDayOfWeek::Weekday,
-        9 => DynamicDayOfWeek::Weekend,
-        _ => DynamicDayOfWeek::Sunday,
-    }
+    DynamicDayOfWeek::from_json_value(value)
 }
 
 /// The stored `DayOfWeek` discriminant of a [`DynamicDayOfWeek`] (the inverse
 /// of [`day_from_i32`]).
 #[must_use]
 pub fn day_to_i32(day: DynamicDayOfWeek) -> i32 {
-    match day {
-        DynamicDayOfWeek::Sunday => 0,
-        DynamicDayOfWeek::Monday => 1,
-        DynamicDayOfWeek::Tuesday => 2,
-        DynamicDayOfWeek::Wednesday => 3,
-        DynamicDayOfWeek::Thursday => 4,
-        DynamicDayOfWeek::Friday => 5,
-        DynamicDayOfWeek::Saturday => 6,
-        DynamicDayOfWeek::Everyday => 7,
-        DynamicDayOfWeek::Weekday => 8,
-        DynamicDayOfWeek::Weekend => 9,
-    }
+    day.json_value()
 }
 
 #[cfg(test)]

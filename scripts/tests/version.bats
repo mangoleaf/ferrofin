@@ -4,7 +4,8 @@
 
 setup() {
   SCRIPT="$BATS_TEST_DIRNAME/../version.sh"
-  REPO="$(mktemp -d)"
+  REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$REPO"
   cd "$REPO" || exit 1
   git init -q
   git config user.email t@t
@@ -12,11 +13,7 @@ setup() {
   git config commit.gpgsign false
   git commit -q --allow-empty -m "chore: init"
   # Neutralize CI/override env so tests are deterministic regardless of caller.
-  unset CI_COMMIT_TAG FORCE_VERSION
-}
-
-teardown() {
-  rm -rf "$REPO"
+  unset CI_COMMIT_TAG FORCE_VERSION CI_COMMIT_REF_SLUG CI_DEFAULT_BRANCH
 }
 
 # Commit touching a build-relevant path (bumps the `image` count).
@@ -91,7 +88,7 @@ build_commit() {
 
 @test "image: on a release tag -> the tag verbatim (keeps leading v)" {
   git tag v0.5.0
-  CI_COMMIT_TAG=v0.5.0 run "$SCRIPT" image
+  CI_COMMIT_TAG=v0.5.0 CI_COMMIT_REF_SLUG=release-v0-5-0 CI_DEFAULT_BRANCH=main run "$SCRIPT" image
   [ "$output" = "v0.5.0" ]
 }
 
@@ -103,12 +100,41 @@ build_commit() {
 @test "image: dev version = vbase-<build-relevant count>-<sha12>" {
   git tag v0.4.1
   build_commit "feat: code change"          # build-relevant
-  git commit -q --allow-empty -m "docs: not build-relevant"
+  echo "documentation only" > README.md
+  git add README.md
+  git commit -q -m "docs: not build-relevant"
   build_commit "fix: another code change"   # build-relevant
   run "$SCRIPT" image
   [ "$status" -eq 0 ]
   sha=$(git rev-parse --short=12 HEAD)
   [ "$output" = "v0.4.1-2-${sha}" ]         # count is 2 (docs commit excluded); keeps v
+}
+
+@test "image: a branch build includes its CI slug" {
+  git tag v0.4.1
+  build_commit "feat: code change"
+  CI_COMMIT_REF_SLUG=feat-player CI_DEFAULT_BRANCH=main run "$SCRIPT" image
+  [ "$status" -eq 0 ]
+  sha=$(git rev-parse --short=12 HEAD)
+  [ "$output" = "v0.4.1-feat-player-1-${sha}" ]
+}
+
+@test "image: a custom default branch omits its CI slug" {
+  git tag v0.4.1
+  build_commit "fix: code change"
+  CI_COMMIT_REF_SLUG=trunk CI_DEFAULT_BRANCH=trunk run "$SCRIPT" image
+  [ "$status" -eq 0 ]
+  sha=$(git rev-parse --short=12 HEAD)
+  [ "$output" = "v0.4.1-1-${sha}" ]
+}
+
+@test "image: main is the default when CI_DEFAULT_BRANCH is unset" {
+  git tag v0.4.1
+  build_commit "fix: code change"
+  CI_COMMIT_REF_SLUG=main run "$SCRIPT" image
+  [ "$status" -eq 0 ]
+  sha=$(git rev-parse --short=12 HEAD)
+  [ "$output" = "v0.4.1-1-${sha}" ]
 }
 
 @test "image: dev sha component is 12 hex chars" {

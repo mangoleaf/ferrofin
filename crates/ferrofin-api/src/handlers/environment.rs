@@ -15,7 +15,7 @@
 
 use std::path::Path as StdPath;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -24,7 +24,7 @@ use ferrofin_model::io::FileSystemEntryInfo;
 
 use crate::auth::FirstTimeSetupOrAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
 /// The leading marker of a UNC path (`\\server\share`).
@@ -253,4 +253,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Environment/DefaultDirectoryBrowser",
             get(get_default_directory_browser),
         )
+}
+crate::query::query_parameters! {
+    DirectoryContentsQuery {} => [("get", "/Environment/DirectoryContents")];
+    ParentPathQuery {} => [("get", "/Environment/NetworkShares")];
 }

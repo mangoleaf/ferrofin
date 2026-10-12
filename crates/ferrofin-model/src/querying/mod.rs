@@ -14,8 +14,9 @@ pub use filters::{QueryFilters, QueryFiltersLegacy};
 pub use query_result::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 
 /// Used to control the data that gets attached to `DtoBaseItems`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum ItemFields {
     /// The air time.
     AirTime,
@@ -116,6 +117,63 @@ pub enum ItemFields {
     IsHd,
     /// The special feature count.
     SpecialFeatureCount,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    ItemFields, None, {
+        AirTime => ("AirTime", 0),
+        CanDelete => ("CanDelete", 1),
+        CanDownload => ("CanDownload", 2),
+        ChannelInfo => ("ChannelInfo", 3),
+        Chapters => ("Chapters", 4),
+        Trickplay => ("Trickplay", 5),
+        ChildCount => ("ChildCount", 6),
+        CumulativeRunTimeTicks => ("CumulativeRunTimeTicks", 7),
+        CustomRating => ("CustomRating", 8),
+        DateCreated => ("DateCreated", 9),
+        DateLastMediaAdded => ("DateLastMediaAdded", 10),
+        DisplayPreferencesId => ("DisplayPreferencesId", 11),
+        Etag => ("Etag", 12),
+        ExternalUrls => ("ExternalUrls", 13),
+        Genres => ("Genres", 14),
+        ItemCounts => ("ItemCounts", 15),
+        MediaSourceCount => ("MediaSourceCount", 16),
+        MediaSources => ("MediaSources", 17),
+        OriginalTitle => ("OriginalTitle", 18),
+        Overview => ("Overview", 19),
+        ParentId => ("ParentId", 20),
+        Path => ("Path", 21),
+        People => ("People", 22),
+        PlayAccess => ("PlayAccess", 23),
+        ProductionLocations => ("ProductionLocations", 24),
+        ProviderIds => ("ProviderIds", 25),
+        PrimaryImageAspectRatio => ("PrimaryImageAspectRatio", 26),
+        RecursiveItemCount => ("RecursiveItemCount", 27),
+        Settings => ("Settings", 28),
+        SeriesStudio => ("SeriesStudio", 29),
+        SortName => ("SortName", 30),
+        SpecialEpisodeNumbers => ("SpecialEpisodeNumbers", 31),
+        Studios => ("Studios", 32),
+        Taglines => ("Taglines", 33),
+        Tags => ("Tags", 34),
+        RemoteTrailers => ("RemoteTrailers", 35),
+        MediaStreams => ("MediaStreams", 36),
+        SeasonUserData => ("SeasonUserData", 37),
+        DateLastRefreshed => ("DateLastRefreshed", 38),
+        DateLastSaved => ("DateLastSaved", 39),
+        RefreshState => ("RefreshState", 40),
+        ChannelImage => ("ChannelImage", 41),
+        EnableMediaSourceDisplay => ("EnableMediaSourceDisplay", 42),
+        Width => ("Width", 43),
+        Height => ("Height", 44),
+        ExtraIds => ("ExtraIds", 45),
+        LocalTrailerCount => ("LocalTrailerCount", 46),
+        IsHd => ("IsHD", 47),
+        SpecialFeatureCount => ("SpecialFeatureCount", 48),
+    }
 }
 
 /// Enum `ItemFilter`.

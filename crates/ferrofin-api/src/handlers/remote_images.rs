@@ -12,7 +12,7 @@
 //!
 //! [`ProviderManager`]: ferrofin_traits::providers::ProviderManager
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -20,11 +20,11 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::providers::{
     ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteImageResult,
 };
-use ferrofin_traits::providers::ItemUpdateType;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::state::AppState;
 
 /// Query parameters for `GET /Items/{itemId}/RemoteImages`.
@@ -32,8 +32,11 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 struct RemoteImagesQuery {
     /// Restrict candidates to this image type.
-    #[serde(default)]
-    #[serde(rename = "type")]
+    #[serde(
+        default,
+        rename = "type",
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
     image_type: Option<ImageType>,
     /// The first record to return (records before it are dropped).
     #[serde(default)]
@@ -67,11 +70,11 @@ struct RemoteImagesQuery {
 )]
 async fn get_remote_images(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<RemoteImagesQuery>,
 ) -> Result<Json<RemoteImageResult>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
 
     let image_query = RemoteImageQuery {
         provider_name: query.provider_name.clone().unwrap_or_default(),
@@ -126,10 +129,10 @@ async fn get_remote_images(
 )]
 async fn get_remote_image_providers(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<Json<Vec<ImageProviderInfo>>, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let providers = state
         .providers
         .get_remote_image_provider_info(item_id)
@@ -154,7 +157,7 @@ struct DownloadQuery {
 /// an item.
 ///
 /// Port of `RemoteImageController.DownloadRemoteImage`: stores the URL via the
-/// provider manager and records an [`ItemUpdateType::ImageUpdate`]. A missing
+/// provider manager, which performs the `ImageUpdate` repository save. A missing
 /// item is a `404`; a missing `type` is a `400`. On success `204`.
 #[utoipa::path(
     post,
@@ -169,11 +172,11 @@ struct DownloadQuery {
 )]
 async fn download_remote_image(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
     Query(query): Query<DownloadQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_item(&state, item_id).await?;
+    require_item(&state, item_id, &auth).await?;
     let image_type = query
         .image_type
         .ok_or_else(|| ApiError::BadRequest("type is required".to_owned()))?;
@@ -185,18 +188,18 @@ async fn download_remote_image(
         .providers
         .save_image_from_url(item_id, &url, image_type, None)
         .await?;
-    state
-        .providers
-        .save_metadata(item_id, ItemUpdateType::ImageUpdate)
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Resolves an item, returning a `404` when it does not exist.
-async fn require_item(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+async fn require_item(
+    state: &AppState,
+    item_id: Uuid,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<(), ApiError> {
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok(())
@@ -228,4 +231,8 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Items/{itemId}/RemoteImages/Download",
             post(download_remote_image),
         )
+}
+crate::query::query_parameters! {
+    RemoteImagesQuery {} => [("get", "/Items/{itemId}/RemoteImages")];
+    DownloadQuery {} => [("post", "/Items/{itemId}/RemoteImages/Download")];
 }

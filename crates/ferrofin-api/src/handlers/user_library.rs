@@ -29,7 +29,7 @@
 //! elsewhere; `GET /Items/Latest` is the full `GetLatestMedia` port (the
 //! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::dto::{BaseItemDto, UpdateUserItemDataDto, UserItemDataDto};
@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::session_ctx::notify_user_data_changed;
 use crate::state::AppState;
@@ -81,7 +81,11 @@ struct UserIdQuery {
 /// user root folder (C# `itemId.IsEmpty() ? GetUserRootFolder() : …`), any other
 /// id to the addressed item. A missing item is reported as `None` so the caller
 /// can map it to a `404`.
-async fn resolve_item_id(state: &AppState, item_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_item_id(
+    state: &AppState,
+    item_id: Uuid,
+    user: &ferrofin_db::entities::users::UserEntity,
+) -> Result<Option<Uuid>, ApiError> {
     if item_id.is_nil() {
         return Ok(state
             .library
@@ -91,7 +95,7 @@ async fn resolve_item_id(state: &AppState, item_id: Uuid) -> Result<Option<Uuid>
     }
     Ok(state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(user))
         .await?
         .and_then(|item| Uuid::parse_str(&item.id).ok()))
 }
@@ -105,10 +109,11 @@ async fn save_and_return(
     user_id: Uuid,
     item_id: Uuid,
     update: &UpdateUserItemDataDto,
+    reason: ferrofin_model::entities::UserDataSaveReason,
 ) -> Result<Json<UserItemDataDto>, ApiError> {
     state
         .user_data
-        .save_user_data(user_id, item_id, update)
+        .save_user_data_with_reason(user_id, item_id, update, reason)
         .await?;
     let dto = state
         .user_data
@@ -144,7 +149,7 @@ async fn resolve_user_and_item(
 ) -> Result<(Uuid, Uuid), ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
     let user_uuid = user_uuid(&user)?;
-    let resolved_item = resolve_item_id(state, item_id)
+    let resolved_item = resolve_item_id(state, item_id, &user)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     Ok((user_uuid, resolved_item))
@@ -251,7 +256,14 @@ async fn set_favorite(
         is_favorite: Some(is_favorite),
         ..UpdateUserItemDataDto::default()
     };
-    save_and_return(state, user_uuid, resolved_item, &update).await
+    save_and_return(
+        state,
+        user_uuid,
+        resolved_item,
+        &update,
+        ferrofin_model::entities::UserDataSaveReason::UpdateUserRating,
+    )
+    .await
 }
 
 /// Query parameters for `POST /UserItems/{itemId}/Rating`.
@@ -347,7 +359,7 @@ async fn get_item_user_data(
     // C# `GetItemById<BaseItem>` requires a real item (no empty-guid fallback).
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(&user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let dto = state
@@ -383,10 +395,17 @@ async fn update_item_user_data(
     let user_uuid = user_uuid(&user)?;
     state
         .library
-        .get_item_by_id(item_id)
+        .get_item_by_id_for_user(item_id, Some(&user))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
-    save_and_return(&state, user_uuid, item_id, &update).await
+    save_and_return(
+        &state,
+        user_uuid,
+        item_id,
+        &update,
+        ferrofin_model::entities::UserDataSaveReason::UpdateUserData,
+    )
+    .await
 }
 
 /// `GET /Items/Root` — the user root folder.
@@ -476,11 +495,21 @@ async fn get_extras(
     extra_types: &[ExtraType],
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user(state, auth, user_id).await?;
-    let owner = resolve_item_id(state, item_id)
+    let owner = resolve_item_id(state, item_id, &user)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    let owner_item = state
+        .library
+        .get_item_by_id(owner)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("item {owner}")))?;
+    let mut owner_groups = state
+        .library
+        .get_extra_owner_ids_batch(&[owner_item])
+        .await?;
     let query = InternalItemsQuery {
-        owner_ids: vec![owner],
+        user: Some(user.clone()),
+        owner_ids: owner_groups.remove(&owner).unwrap_or_else(|| vec![owner]),
         extra_types: extra_types.to_vec(),
         order_by: vec![(
             ferrofin_model::live_tv::ItemSortBy::SortName,
@@ -852,6 +881,16 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/SpecialFeatures", get(get_special_features))
         .route("/Items/{itemId}/Intros", get(get_intros))
         .route("/Items/{itemId}/CriticReviews", get(get_critic_reviews))
+}
+
+crate::query::query_parameters! {
+    UserIdQuery {} => [("post", "/UserFavoriteItems/{itemId}"), ("delete", "/UserFavoriteItems/{itemId}"), ("delete", "/UserItems/{itemId}/Rating"), ("get", "/UserItems/{itemId}/UserData"), ("post", "/UserItems/{itemId}/UserData"), ("get", "/Items/Root"), ("get", "/Items/{itemId}/LocalTrailers"), ("get", "/Items/{itemId}/SpecialFeatures"), ("get", "/Items/{itemId}/Intros")];
+    RatingQuery {} => [("post", "/UserItems/{itemId}/Rating")];
+    LatestQuery {
+        "fields" => ',',
+        "includeItemTypes" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Items/Latest")];
 }
 
 #[cfg(test)]

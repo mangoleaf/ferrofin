@@ -23,11 +23,11 @@ use chrono::{TimeZone, Utc};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    AuthedAuthService, FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger,
-    FakeCollections, FakeDevices, FakeDisplayPreferences, FakeDto, FakeLocalization, FakeLyrics,
-    FakeMediaSegments, FakeMusic, FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch,
-    FakeSessions, FakeSimilarItems, FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay,
-    FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers, minimal_base_item,
+    FakeActivity, FakeApiKeys, FakeAppHost, FakeClientEventLogger, FakeCollections, FakeDevices,
+    FakeDisplayPreferences, FakeDto, FakeLocalization, FakeLyrics, FakeMediaSegments, FakeMusic,
+    FakePlaylists, FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems,
+    FakeSubtitles, FakeSystem, FakeTasks, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews,
+    FakeUsers, minimal_base_item,
 };
 use ferrofin_api::test_support::{FakeAuthContext, FakeMediaSources};
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
@@ -60,6 +60,21 @@ struct OneItemLibrary;
 
 #[async_trait]
 impl LibraryManager for OneItemLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok((id == ITEM_ID).then(|| minimal_base_item(id, "The Item", "Movie")))
     }
@@ -277,9 +292,6 @@ impl MediaSourceManager for FixedSources {
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!("unused")
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }
@@ -327,9 +339,15 @@ impl SubtitleEncoder for StubEncoder {
     }
 }
 
-/// A [`SubtitleManager`] recording deletes and returning empty search results.
+/// The `(provider, config bytes)` of each `validate_provider_login` call.
+type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// A [`SubtitleManager`] recording deletes and provider-login validations, and
+/// returning empty search results.
+#[derive(Default)]
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+    logins: Logins,
 }
 
 #[async_trait]
@@ -367,6 +385,17 @@ impl SubtitleManager for CannedSubtitles {
     ) -> Result<Vec<ferrofin_model::providers::SubtitleProviderInfo>, ServiceError> {
         Ok(Vec::new())
     }
+    async fn validate_provider_login(
+        &self,
+        provider_name: &str,
+        config_json: &[u8],
+    ) -> Result<(), ServiceError> {
+        self.logins
+            .lock()
+            .unwrap()
+            .push((provider_name.to_owned(), config_json.to_vec()));
+        Ok(())
+    }
 }
 
 // ---- Harness ---------------------------------------------------------------
@@ -382,6 +411,34 @@ fn build_state(
     media_sources: Arc<dyn MediaSourceManager>,
     subtitles: Arc<dyn SubtitleManager>,
     subtitle_encoder: Arc<dyn SubtitleEncoder>,
+) -> AppState {
+    build_state_with_auth(
+        library,
+        config,
+        file_system,
+        media_sources,
+        subtitles,
+        subtitle_encoder,
+        Arc::new(PolicyAuth(ferrofin_traits::options::AuthorizationInfo {
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_subtitle_management: true,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
+        })),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_state_with_auth(
+    library: Arc<dyn LibraryManager>,
+    config: Arc<dyn ServerConfigurationManager>,
+    file_system: Arc<dyn FileSystem>,
+    media_sources: Arc<dyn MediaSourceManager>,
+    subtitles: Arc<dyn SubtitleManager>,
+    subtitle_encoder: Arc<dyn SubtitleEncoder>,
+    auth: Arc<dyn ferrofin_traits::net::AuthService>,
 ) -> AppState {
     AppState::new(
         library,
@@ -399,7 +456,7 @@ fn build_state(
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
         Arc::new(FakeAuthContext),
-        Arc::new(AuthedAuthService),
+        auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -653,14 +710,52 @@ async fn subtitle_playlist_unknown_source_is_not_found() {
 
 #[tokio::test]
 async fn subtitle_remote_search_is_empty_list() {
-    let app = remote_search_state(Arc::new(CannedSubtitles {
-        deleted: Arc::new(Mutex::new(Vec::new())),
-    }));
+    let app = remote_search_state(Arc::new(CannedSubtitles::default()));
     let (status, body, _) =
         call(app, &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng")).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v.as_array().unwrap().is_empty());
+}
+
+// ---- OpenSubtitles login validation ----------------------------------------
+
+/// Upstream binds `[FromBody] LoginInfoInput` through the MVC binder, so member
+/// names bind ignoring case; the provider receives the canonical PascalCase
+/// shape it deserializes (`OpenSubtitlesConfig`).
+#[tokio::test]
+async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let app = remote_search_state(subtitles.clone());
+    let post = |content_type: Option<&'static str>, body: &'static str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo");
+        if let Some(content_type) = content_type {
+            request = request.header("Content-Type", content_type);
+        }
+        create_router(app.clone()).oneshot(request.body(Body::from(body)).unwrap())
+    };
+    let response = post(
+        Some("application/json"),
+        r#"{"username":"u","PASSWORD":"p","apiKey":"k"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let logins = subtitles.logins.lock().unwrap().clone();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].0, "opensubtitles");
+    let forwarded: serde_json::Value = serde_json::from_slice(&logins[0].1).unwrap();
+    assert_eq!(
+        forwarded,
+        serde_json::json!({"ApiKey": "k", "Username": "u", "Password": "p"})
+    );
+
+    // `[ApiController]`: no JSON content type is 415, before any login.
+    let response = post(None, r#"{"Username":"u"}"#).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(subtitles.logins.lock().unwrap().len(), 1);
 }
 
 // ---- FallbackFont ----------------------------------------------------------
@@ -764,4 +859,115 @@ async fn fallback_font_missing_named_file_is_ok_empty() {
     let (status, body, _) = call(app, "/FallbackFont/Fonts/absent.ttf").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.is_empty());
+}
+
+/// Mirrors a production token-cache snapshot; FakeUsers must never be queried.
+struct PolicyAuth(ferrofin_traits::options::AuthorizationInfo);
+
+#[async_trait]
+impl ferrofin_traits::net::AuthService for PolicyAuth {
+    async fn authenticate(
+        &self,
+        _request: &ferrofin_traits::net::RequestContext,
+    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn subtitle_management_gates_every_operation_but_deletion_requires_admin() {
+    use ferrofin_api::test_support::sample_user;
+    use ferrofin_model::users::UserPolicy;
+    use ferrofin_traits::options::AuthorizationInfo;
+    for (admin, enabled, api_key) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (false, false, true),
+    ] {
+        let deleted = Arc::new(Mutex::new(Vec::new()));
+        let info = AuthorizationInfo {
+            is_authenticated: true,
+            is_api_key: api_key,
+            user: (!api_key).then(sample_user),
+            user_policy: Some(Arc::new(UserPolicy {
+                is_administrator: admin,
+                enable_subtitle_management: enabled,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let app = build_state_with_auth(
+            Arc::new(OneItemLibrary),
+            Arc::new(FontConfig(EncodingOptions::default())),
+            Arc::new(FontFs {
+                files: Vec::new(),
+                bytes: Vec::new(),
+            }),
+            Arc::new(FakeMediaSources),
+            Arc::new(CannedSubtitles {
+                deleted: deleted.clone(),
+                ..CannedSubtitles::default()
+            }),
+            Arc::new(StubEncoder(Ok(Vec::new()))),
+            Arc::new(PolicyAuth(info)),
+        );
+        for (method, uri, body, allowed) in [
+            (
+                "POST",
+                format!("/Videos/{ITEM_ID}/Subtitles"),
+                r#"{"Language":"eng","Format":"srt","Data":"aGk="}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng"),
+                "",
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/missing"),
+                "",
+                StatusCode::NO_CONTENT,
+            ),
+            (
+                "GET",
+                "/Providers/Subtitles/Subtitles/missing".to_owned(),
+                "",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "DELETE",
+                format!("/Videos/{ITEM_ID}/Subtitles/1"),
+                "",
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let permitted = admin || api_key || (enabled && method != "DELETE");
+            let response = create_router(app.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("X-Emby-Token", "tok")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if permitted {
+                    allowed
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+                "{admin} {enabled} {api_key} {method} {uri}"
+            );
+        }
+        assert_eq!(deleted.lock().unwrap().len(), usize::from(admin || api_key));
+    }
 }

@@ -38,6 +38,7 @@ fn transcode_seek_info_name(v: TranscodeSeekInfo) -> &'static str {
     match v {
         TranscodeSeekInfo::Auto => "Auto",
         TranscodeSeekInfo::Bytes => "Bytes",
+        TranscodeSeekInfo::Unrecognized(_) => unreachable!("fixture uses a declared value"),
     }
 }
 
@@ -48,6 +49,7 @@ fn subtitle_delivery_method_name(v: SubtitleDeliveryMethod) -> &'static str {
         SubtitleDeliveryMethod::External => "External",
         SubtitleDeliveryMethod::Hls => "Hls",
         SubtitleDeliveryMethod::Drop => "Drop",
+        SubtitleDeliveryMethod::Unrecognized(_) => unreachable!("fixture uses a declared value"),
     }
 }
 

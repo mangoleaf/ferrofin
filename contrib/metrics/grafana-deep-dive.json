@@ -3,6 +3,9 @@
   "__requires": [],
   "title": "Ferrofin \u2014 Deep Dive",
   "uid": "ferrofin-deep-dive",
+  "tags": [
+    "ferrofin"
+  ],
   "editable": true,
   "schemaVersion": 39,
   "version": 1,
@@ -12,6 +15,18 @@
     "from": "now-1h",
     "to": "now"
   },
+  "links": [
+    {
+      "title": "Ferrofin",
+      "type": "dashboards",
+      "tags": [
+        "ferrofin"
+      ],
+      "asDropdown": true,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
   "templating": {
     "list": [
       {
@@ -24,6 +39,27 @@
         "current": {}
       },
       {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(http_requests_received_total, job)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "ferrofin",
+          "value": "ferrofin"
+        },
+        "sort": 1
+      },
+      {
         "name": "controller",
         "label": "Controller",
         "type": "query",
@@ -32,7 +68,7 @@
           "uid": "${datasource}"
         },
         "query": {
-          "query": "label_values(http_requests_received_total, controller)",
+          "query": "label_values(http_requests_received_total{job=~\"$job\"}, controller)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -93,7 +129,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(http_request_duration_seconds_bucket{controller=~\"$controller\"}[$__rate_interval])) by (le)",
+          "expr": "sum(rate(http_request_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])) by (le)",
           "legendFormat": "{{le}}",
           "format": "heatmap"
         }
@@ -148,7 +184,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (code) (rate(http_requests_received_total{controller=~\"$controller\"}[$__rate_interval]))",
+          "expr": "sum by (code) (rate(http_requests_received_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))",
           "legendFormat": "{{code}}"
         }
       ]
@@ -202,7 +238,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(15, sum by (endpoint) (rate(http_requests_received_total{controller=~\"$controller\"}[$__rate_interval])))",
+          "expr": "topk(15, sum by (endpoint) (rate(http_requests_received_total{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval])))",
           "legendFormat": "{{endpoint}}",
           "instant": true,
           "range": false,
@@ -259,7 +295,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(15, histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket{controller=~\"$controller\"}[$__rate_interval]))))",
+          "expr": "topk(15, histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket{job=~\"$job\", controller=~\"$controller\"}[$__rate_interval]))))",
           "legendFormat": "{{endpoint}}",
           "instant": true,
           "range": false,
@@ -316,7 +352,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (controller) (http_requests_in_progress{controller=~\"$controller\"})",
+          "expr": "sum by (controller) (http_requests_in_progress{job=~\"$job\", controller=~\"$controller\"})",
           "legendFormat": "{{controller}}"
         }
       ]
@@ -367,7 +403,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (controller) (rate(http_requests_received_total{controller=~\"$controller\",code=~\"[45]..\"}[$__rate_interval]))",
+          "expr": "sum by (controller) (rate(http_requests_received_total{job=~\"$job\", controller=~\"$controller\",code=~\"[45]..\"}[$__rate_interval]))",
           "legendFormat": "{{controller}}"
         }
       ]
@@ -430,7 +466,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_db_pool_connections",
+          "expr": "ferrofin_db_pool_connections{job=~\"$job\"}",
           "legendFormat": "{{pool}} total"
         },
         {
@@ -439,7 +475,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_idle_connections{job=~\"$job\"}",
           "legendFormat": "{{pool}} idle"
         },
         {
@@ -448,7 +484,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections",
+          "expr": "ferrofin_db_pool_connections{job=~\"$job\"} - ferrofin_db_pool_idle_connections{job=~\"$job\"}",
           "legendFormat": "{{pool}} in-use"
         }
       ]
@@ -499,7 +535,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "100 * (ferrofin_db_pool_connections - ferrofin_db_pool_idle_connections) / clamp_min(ferrofin_db_pool_connections, 1)",
+          "expr": "100 * (ferrofin_db_pool_connections{job=~\"$job\"} - ferrofin_db_pool_idle_connections{job=~\"$job\"}) / clamp_min(ferrofin_db_pool_connections{job=~\"$job\"}, 1)",
           "legendFormat": "{{pool}}"
         }
       ]
@@ -542,7 +578,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_library_items",
+          "expr": "ferrofin_library_items{job=~\"$job\"}",
           "legendFormat": "{{type}}",
           "instant": true,
           "range": false
@@ -607,7 +643,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(process_cpu_seconds_total[$__rate_interval])",
+          "expr": "rate(process_cpu_seconds_total{job=~\"$job\"}[$__rate_interval])",
           "legendFormat": "cores used"
         },
         {
@@ -616,7 +652,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_cpu_count",
+          "expr": "process_cpu_count{job=~\"$job\"}",
           "legendFormat": "cores available"
         }
       ]
@@ -667,7 +703,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_working_set_bytes",
+          "expr": "process_working_set_bytes{job=~\"$job\"}",
           "legendFormat": "working set"
         },
         {
@@ -676,7 +712,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_private_memory_bytes",
+          "expr": "process_private_memory_bytes{job=~\"$job\"}",
           "legendFormat": "private"
         },
         {
@@ -685,7 +721,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_virtual_memory_bytes",
+          "expr": "process_virtual_memory_bytes{job=~\"$job\"}",
           "legendFormat": "virtual"
         }
       ]
@@ -736,7 +772,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_num_threads",
+          "expr": "process_num_threads{job=~\"$job\"}",
           "legendFormat": "os threads"
         },
         {
@@ -745,7 +781,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_open_handles",
+          "expr": "process_open_handles{job=~\"$job\"}",
           "legendFormat": "open fds"
         },
         {
@@ -754,7 +790,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_tokio_alive_tasks",
+          "expr": "ferrofin_tokio_alive_tasks{job=~\"$job\"}",
           "legendFormat": "tokio alive tasks"
         },
         {
@@ -763,7 +799,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_tokio_workers",
+          "expr": "ferrofin_tokio_workers{job=~\"$job\"}",
           "legendFormat": "tokio workers"
         }
       ]
@@ -807,7 +843,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_uptime_seconds",
+          "expr": "ferrofin_uptime_seconds{job=~\"$job\"}",
           "legendFormat": "uptime"
         }
       ]
@@ -851,7 +887,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_start_time_seconds * 1000",
+          "expr": "process_start_time_seconds{job=~\"$job\"} * 1000",
           "legendFormat": "started"
         }
       ]
@@ -907,7 +943,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_sessions_active",
+          "expr": "ferrofin_sessions_active{job=~\"$job\"}",
           "legendFormat": "sessions"
         }
       ]
@@ -951,7 +987,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_playback_streams_active",
+          "expr": "ferrofin_playback_streams_active{job=~\"$job\"}",
           "legendFormat": "streams"
         }
       ]
@@ -995,7 +1031,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_transcode_jobs_active",
+          "expr": "ferrofin_transcode_jobs_active{job=~\"$job\"}",
           "legendFormat": "transcodes"
         }
       ]
@@ -1039,7 +1075,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_uptime_seconds / 3600",
+          "expr": "ferrofin_uptime_seconds{job=~\"$job\"} / 3600",
           "legendFormat": "hours"
         }
       ]
@@ -1093,7 +1129,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "ferrofin_playback_streams",
+          "expr": "ferrofin_playback_streams{job=~\"$job\"}",
           "legendFormat": "{{method}}"
         }
       ]

@@ -124,13 +124,39 @@ enumerable at review time:
 ## 8. Placement — the architecture seam
 
 - Instruments live in `crates/ferrofin-metrics` (HTTP + process families) or the
-  composition root `apps/ferrofin-server` (sampler-fed gauges). That is the default
-  and covers everything shipped so far.
+  composition root `apps/ferrofin-server` (sampler-fed gauges). That is the default.
 - `ferrofin-api` handlers and library crates must **not** depend on
   `ferrofin-metrics` — same DI principle as `ferrofin-traits` (handlers see traits,
-  not impls). A subsystem that later genuinely needs deep-internal recording uses
+  not impls). A subsystem that genuinely needs deep-internal recording uses
   `opentelemetry::global::meter("ferrofin")` directly; that dep is `opentelemetry`
-  only, and the noop-when-disabled guarantee (rule 6) still holds.
+  only, and the noop-when-disabled guarantee (rule 6) still holds. The shipped
+  cases are the library scan (`ferrofin_core::scan_metrics`) and the metadata
+  providers (`ferrofin_providers::metrics`); follow their shape:
+  - the instruments live in one struct in a `static OnceLock`, created by a
+    `pub fn install(..)` that the composition root calls right after
+    `ferrofin_metrics::init` (`metrics_wiring::install_subsystem_instruments`),
+    passing any bootstrap settings they take (the scan histograms' bucket list,
+    `FERROFIN_METRICS_SCAN_DURATION_BUCKETS`). Never create them lazily on first
+    use: an instrument taken from the global meter *before* the provider is
+    installed stays a noop forever. A bad setting is refused there with a
+    warning and the default used — never a startup failure;
+  - every recording function starts with `OnceLock::get()` and returns when it is
+    unset — metrics disabled costs one atomic load, and no label set is built;
+  - record per unit of work (a scan pass, an ffprobe run, a provider request),
+    never per scanned item, with `&'static str` label values;
+  - seed every counter's bounded label combinations at 0 in `install`, so a
+    series exists before its first event and the first event after a restart
+    shows up in `increase()` (a series born at its final value does not);
+  - a label says why or how something ran, never changes *what* runs (rule 6):
+    requests that coalesce run as one unit of work and are counted once, under
+    the label of the request that unit runs as (the scan `trigger` is "the
+    request that started the scan": the queued request later ones joined, or a
+    queued full scan that took over the pending requests it covers);
+  - a guard whose `Drop` undoes a gauge increment counts only if the instruments
+    were installed when it was taken, so a startup race cannot drive a gauge
+    negative;
+  - export a `pub const METRIC_NAMES` list; the module's tests assert it equals
+    what it exports, and the dashboard lint test checks the dashboards against it.
 - Do not confuse this system with the `PlaybackMetrics` trait
   (`ferrofin-traits/src/metrics.rs`) — that is the DB-backed playback-decision log,
   a different track entirely. They stay separate.
@@ -138,8 +164,11 @@ enumerable at review time:
 ## 9. Every metric is registered, documented, tested
 
 - New metric ⇒ a row in the table in `contrib/metrics/README.md`, marked
-  **parity** or **ferrofin-specific**; consider whether the Grafana dashboard
-  (`contrib/metrics/grafana-dashboard.json`) needs a panel.
+  **parity** or **ferrofin-specific**; consider whether a Grafana dashboard
+  (`contrib/metrics/grafana-*.json`) needs a panel. A dashboard may chart only names
+  in some module's `METRIC_NAMES` (`apps/ferrofin-server/tests/dashboards.rs`), and
+  the chart ships byte-equal copies (`charts/ferrofin/dashboards/`) — copy an edited
+  dashboard over or that test fails.
 - New metric ⇒ a test asserting its name renders in the exposition output.
   Tests that touch the global meter provider or the instruments `OnceLock` go in
   their own integration binary (process-globals are set-once); everything else

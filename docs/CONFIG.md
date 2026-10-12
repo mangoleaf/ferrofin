@@ -59,7 +59,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
 | `FERROFIN_PLAYBACK_METRICS_QUEUE` | `1024` | Depth of the playback-metrics write queue, in events. Each PlaybackInfo decision and playstate start/stop is handed to this queue and written by one background task, so a SQLite WAL checkpoint can never stall a playback request. A full queue drops the event with a warning rather than blocking — raise it if `playback-metrics queue full` appears in the log under a load spike. |
-| `FERROFIN_SCAN_PROBE_CONCURRENCY` | `4` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
+| `FERROFIN_SCAN_PROBE_CONCURRENCY` | `8` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
 
 ## Observability
 
@@ -67,23 +67,39 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 |---|---|---|
 | `FERROFIN_ENABLE_METRICS` | `false` | Serve Prometheus `/metrics`. Off → the route is absent. |
 | `FERROFIN_METRICS_SAMPLE_INTERVAL` | built-in | Seconds between process-metric samples. |
+| `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` | 1–2.5–5 per decade, `0.001` … `5000` | Bucket boundaries, in seconds, of the library-scan duration histograms (`ferrofin_library_scan_duration_seconds`, `ferrofin_library_scan_pass_duration_seconds`). The env var is comma-separated (`0.01,0.1,1,10,60,300,1800,7200`); the `config.toml` key `metrics_scan_duration_buckets` is an array (`[0.01, 0.1, 1, 10]`). A list that is empty, non-numeric, non-finite, not above zero or not strictly increasing is refused with a warning at startup and the default is used. |
 | `FERROFIN_SHUTDOWN_TIMEOUT_SECS` | `30` | Seconds a graceful shutdown or in-process restart (`POST /System/Restart`, backup restore) waits for in-flight requests before aborting the remaining connections — ASP.NET's `ShutdownTimeout` default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Enable OTLP trace export to this endpoint (off by default). |
+
+## Provider request limits
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | `20` | Default per-attempt HTTP timeout, clamped to 10–60 seconds. Explicit request timeouts take precedence. |
+| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | `60` | Maximum pending pacing/quota wait before skipping a lookup, clamped to 30–300 seconds. Open circuits skip immediately until a probe is permitted. |
+
+These are read when provider limiters are constructed; restart to apply changes.
+See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown policy.
 
 ## Remote metadata provider keys
 
 Every remote provider is compiled in and enabled per library through the fetcher
-checkboxes, as in Jellyfin. The keyed ones below additionally need their key: without one
-the provider returns empty results rather than failing the scan. Never send user PII to
-these services.
+checkboxes, as in Jellyfin. TMDB, OMDb, TVDB, fanart.tv and TheAudioDB ship with
+Jellyfin's shared keys. The settings below are optional overrides or additions.
 
 | Variable | Purpose |
 |---|---|
-| `FERROFIN_OMDB_KEY` | OMDb API key (Rotten Tomatoes ratings). |
-| `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | TheTVDB API key + subscriber PIN. |
-| `FERROFIN_FANART_KEY` | fanart.tv personal API key. |
+| `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. |
+| `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | Optional TheTVDB API key override and subscriber PIN. |
+| `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
+| `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. |
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |
+
+TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
+Jellyfin's shared application key with the username/password configured in its
+plugin settings; its `ApiKey` field is an optional override. The shared key does
+not replace the account needed for subtitle downloads.
 
 ## WASM plugins (Tier 1b)
 

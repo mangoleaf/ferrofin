@@ -10,9 +10,9 @@
 //! And the splashscreen asset routes (`ImageController` in Jellyfin):
 //! - `GET /Branding/Splashscreen` — serves the splashscreen image file (the
 //!   configured `SplashscreenLocation`, else `<data>/splashscreen.png`); `404`
-//!   when splashscreen is disabled or no file exists. Under original-file serving
-//!   the `tag`/`format` query parameters are accepted but do not transform the
-//!   bytes (as in [`super::images`]).
+//!   when splashscreen is disabled (an administrator may still preview it) or no
+//!   file exists. `format` converts the image and `tag` earns the immutable
+//!   caching contract, through the same tail as [`super::images`].
 //! - `POST /Branding/Splashscreen` — upload a custom splashscreen: base64 body +
 //!   image `Content-Type`, written to `<data>/splashscreen-upload{ext}`, path
 //!   recorded on the branding options.
@@ -21,19 +21,19 @@
 
 use std::path::Path;
 
-use axum::body::Body;
-use axum::extract::{Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::branding::BrandingOptionsDto;
-use tower::ServiceExt;
-use tower_http::services::ServeFile;
+use ferrofin_traits::options::ItemImageInfo;
 
-use crate::auth::RequireAdmin;
+use crate::auth::{AuthenticatedIdentity, RequireAdmin, is_administrator_identity};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::image_upload::{decode_base64, image_extension_from_content_type};
+use crate::handlers::images::{ImageQuery, serve_image_file};
 use crate::state::AppState;
 
 /// `GET /Branding/Configuration` — the branding configuration DTO.
@@ -81,18 +81,13 @@ async fn get_branding_css(State(state): State<AppState>) -> Result<Response, Api
 }
 
 /// The query parameters accepted by `GET /Branding/Splashscreen`.
-///
-/// `tag`/`format` mirror the C# signature; under original-file serving they are
-/// accepted (so a client sending them still gets a `200`) but do not transform
-/// the bytes — hence unread, like the sibling image routes' `ImageQuery` fields.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct SplashscreenQuery {
-    /// Optional cache tag (accepted, not used under original-file serving).
+    /// Optional cache tag: its presence makes the response immutable-cacheable.
     #[serde(default)]
     tag: Option<String>,
-    /// Optional output format (accepted, not used under original-file serving).
+    /// Optional output format the image is converted to.
     #[serde(default)]
     format: Option<String>,
 }
@@ -117,9 +112,9 @@ fn resolve_splashscreen_path(location: Option<&str>, data_path: &str) -> Option<
 
 /// `GET /Branding/Splashscreen` — serve the splashscreen image.
 ///
-/// Port of `ImageController.GetSplashscreen`: `404` when splashscreen is disabled,
-/// or when no splashscreen file exists; otherwise the stored file is served (the
-/// image processor is not ported, so the original bytes are returned).
+/// Port of `ImageController.GetSplashscreen`: `404` when splashscreen is disabled
+/// (unless the caller is an administrator) or when no splashscreen file exists;
+/// otherwise the stored file is served through the image processor.
 #[utoipa::path(
     get,
     path = "/Branding/Splashscreen",
@@ -135,23 +130,52 @@ fn resolve_splashscreen_path(location: Option<&str>, data_path: &str) -> Option<
 )]
 async fn get_splashscreen(
     State(state): State<AppState>,
-    Query(_query): Query<SplashscreenQuery>,
+    auth: Result<AuthenticatedIdentity, ApiError>,
+    Query(query): Query<SplashscreenQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let branding = state.config.get_branding().await?;
-    // The C# admin bypass of the disabled flag needs the elevation policy (not
-    // wired at this seam); the disabled case is the not-found outcome.
+    // `!SplashscreenEnabled && !User.IsInRole(Administrator)`: an administrator
+    // may preview a disabled splashscreen (the dashboard's upload page does).
     if !branding.splashscreen_enabled {
-        return Err(ApiError::NotFound("splashscreen is disabled".to_owned()));
+        let is_admin = match &auth {
+            Ok(identity) => is_administrator_identity(&state, &identity.0).await?,
+            Err(_) => false,
+        };
+        if !is_admin {
+            return Err(ApiError::NotFound("splashscreen is disabled".to_owned()));
+        }
     }
     let data_path = state.config.application_paths().data_path();
     let path = resolve_splashscreen_path(branding.splashscreen_location.as_deref(), &data_path)
         .ok_or_else(|| ApiError::NotFound("no splashscreen file".to_owned()))?;
-    let response = ServeFile::new(&path)
-        .oneshot(request)
+    // The same tail as every image route: the processor converts to the
+    // requested `format`, and a `tag` earns the year-long immutable caching
+    // (`GetImageResult` with a 365-day cache duration).
+    let modified = tokio::fs::metadata(&path)
         .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
-    Ok(response.map(Body::new))
+        .and_then(|meta| meta.modified())
+        .map_or_else(
+            |_| chrono::Utc::now(),
+            chrono::DateTime::<chrono::Utc>::from,
+        );
+    let image = ItemImageInfo {
+        path,
+        image_type: ferrofin_model::entities::ImageType::Primary,
+        date_modified: modified,
+        width: 0,
+        height: 0,
+        blur_hash: None,
+    };
+    serve_image_file(
+        &state,
+        uuid::Uuid::nil(),
+        &image,
+        0,
+        &ImageQuery::tagged(query.tag, query.format),
+        request,
+    )
+    .await
 }
 
 /// `POST /Branding/Splashscreen` — upload a custom splashscreen.
@@ -184,6 +208,13 @@ async fn upload_splashscreen(
         .ok_or_else(|| ApiError::BadRequest("splashscreen data is not valid base64".to_owned()))?;
 
     let data_path = state.config.application_paths().data_path();
+    // Jellyfin's data path exists from startup; a fresh Ferrofin data directory
+    // has no such folder until something writes to it.
+    tokio::fs::create_dir_all(&data_path).await.map_err(|e| {
+        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+            "create data directory: {e}"
+        )))
+    })?;
     let file_path = Path::new(&data_path).join(format!("splashscreen-upload{extension}"));
     tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
         ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
@@ -240,4 +271,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(upload_splashscreen)
                 .delete(delete_splashscreen),
         )
+}
+crate::query::query_parameters! {
+    SplashscreenQuery {} => [("get", "/Branding/Css")];
 }

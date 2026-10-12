@@ -216,13 +216,19 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extracts a query-string parameter value by exact key (no percent-decoding —
-/// access tokens are URL-safe hex).
+/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
+/// Raw authentication reads join nonempty StringValues; scalar model binding's
+/// first-value rule does not apply. Decode each key and value exactly once.
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key && !v.is_empty()).then(|| v.to_owned())
-    })
+    let mut values = form_urlencoded::parse(query?.as_bytes())
+        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
+        .map(|(_, value)| value);
+    let mut value = values.next()?.into_owned();
+    for next in values {
+        value.push(',');
+        value.push_str(&next);
+    }
+    Some(value)
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -273,17 +279,33 @@ fn action_for(frame: Option<Result<Message, axum::Error>>) -> Action {
 
 /// Parses a text frame as an inbound protocol message, or `None` for anything
 /// unrecognized (matching the C# socket, which ignores unknown message types).
+///
+/// Upstream deserializes the frame with `JsonDefaults.Options`
+/// (`WebSocketConnection.cs:60,262`): member names (`MessageType`, `Data`) match
+/// exactly, as there is no MVC binder to fold them, but `MessageType` is a
+/// `SessionMessageType` read by `JsonStringEnumConverter`, so its VALUE matches
+/// ignoring case. Numeric message types retain their actual C# discriminants.
 fn parse_inbound(text: &str) -> Option<Inbound> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let period = || subscription_period(value.get("Data").and_then(|d| d.as_str()));
-    match value.get("MessageType")?.as_str()? {
-        "KeepAlive" => Some(Inbound::KeepAlive),
-        "SessionsStart" => Some(Inbound::SessionsStart(period())),
-        "SessionsStop" => Some(Inbound::SessionsStop),
-        "ScheduledTasksInfoStart" => Some(Inbound::TasksStart(period())),
-        "ScheduledTasksInfoStop" => Some(Inbound::TasksStop),
-        "ActivityLogEntryStart" => Some(Inbound::ActivityStart(period())),
-        "ActivityLogEntryStop" => Some(Inbound::ActivityStop),
+    use ferrofin_model::session::SessionMessageType as Kind;
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Envelope {
+        message_type: Kind,
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+    }
+    let value: Envelope = crate::extract::deserialize_defaults(text).ok()?;
+    // C# forwards JsonElement.ToString(). Only a string can carry the
+    // comma-separated subscription period; other token kinds use the fallback.
+    let period = || subscription_period(value.data.as_ref().and_then(serde_json::Value::as_str));
+    match value.message_type {
+        Kind::KeepAlive => Some(Inbound::KeepAlive),
+        Kind::SessionsStart => Some(Inbound::SessionsStart(period())),
+        Kind::SessionsStop => Some(Inbound::SessionsStop),
+        Kind::ScheduledTasksInfoStart => Some(Inbound::TasksStart(period())),
+        Kind::ScheduledTasksInfoStop => Some(Inbound::TasksStop),
+        Kind::ActivityLogEntryStart => Some(Inbound::ActivityStart(period())),
+        Kind::ActivityLogEntryStop => Some(Inbound::ActivityStop),
         _ => None,
     }
 }
@@ -500,6 +522,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only an authenticated socket may
     // subscribe — the streams answer as the socket's user.
     let mut streams = Streams::default();
+    let mut task_updates = None;
 
     if open {
         loop {
@@ -523,7 +546,12 @@ async fn handle_socket(
                         }
                     }
                     Action::Inbound(inbound) => {
+                        log_task_subscription(inbound, caller.is_some());
                         if caller.is_some() {
+                            let message = update_task_subscription(&state, inbound, &mut task_updates).await;
+                            if !send_optional(&mut socket, message, &overflowed).await {
+                                break;
+                            }
                             streams.apply(inbound);
                         }
                     }
@@ -557,17 +585,21 @@ async fn handle_socket(
                         break;
                     }
                 }
+                update = next_task_update(&mut task_updates) => {
+                    let msg = task_transition_message(&state, update, &mut task_updates).await;
+                    if !send_optional(&mut socket, msg, &overflowed).await {
+                        break;
+                    }
+                }
                 () = tick(&mut streams.tasks) => {
-                    if let Some(msg) = tasks_message(&state).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = periodic_tasks_message(&state, task_updates.as_ref()).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
                 () = tick(&mut streams.activity) => {
-                    if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = activity_message(&state, &mut streams.activity_since).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
@@ -575,17 +607,44 @@ async fn handle_socket(
         }
     }
 
+    unregister_socket(&state, registration).await;
+    drop(tx);
+    tracing::info!(
+        elapsed_s = started.elapsed().as_secs(),
+        "websocket disconnected"
+    );
+}
+
+/// Debug diagnostics for accepted and ignored task subscriptions.
+fn log_task_subscription(inbound: Inbound, authenticated: bool) {
+    if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
+        tracing::debug!(
+            authenticated,
+            subscribing = matches!(inbound, Inbound::TasksStart(_)),
+            "dashboard task subscription requested"
+        );
+    }
+}
+
+async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
             state.sessions.report_session_ended(&sid)
         })
         .await;
     }
-    drop(tx);
-    tracing::info!(
-        elapsed_s = started.elapsed().as_secs(),
-        "websocket disconnected"
-    );
+}
+
+/// Send a stream update when it contains a payload.
+async fn send_optional(
+    socket: &mut WebSocket,
+    message: Option<String>,
+    overflowed: &tokio::sync::Notify,
+) -> bool {
+    match message {
+        Some(message) => send_frame(socket, Message::Text(message.into()), overflowed).await,
+        None => true,
+    }
 }
 
 /// The one `websocket connected` line, which says whether the socket carries a
@@ -772,11 +831,93 @@ async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<Strin
 /// .Where(i => !i.IsHidden)` — name-ordered (which `get_tasks` already is) and
 /// with hidden tasks dropped, unlike the `GET /ScheduledTasks` listing.
 async fn tasks_message(state: &AppState) -> Option<String> {
-    let tasks = visible_tasks(state.tasks.get_tasks().await.ok()?);
+    task_snapshot_message(state.tasks.get_tasks().await.ok()?)
+}
+
+fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<String> {
+    // The dashboard's task feed is distinct from per-library RefreshProgress.
+    // Keep these snapshots available for debugging subscription delivery.
+    for task in &tasks {
+        if task.key.as_deref() == Some("RefreshLibrary")
+            && task.state != ferrofin_model::tasks::TaskState::Idle
+        {
+            tracing::debug!(
+                task = "RefreshLibrary",
+                state = ?task.state,
+                progress = ?task.current_progress_percentage,
+                "dashboard scan task snapshot"
+            );
+        }
+    }
     Some(envelope(
         "ScheduledTasksInfo",
-        &serde_json::to_value(tasks).ok()?,
+        &serde_json::to_value(visible_tasks(tasks)).ok()?,
     ))
+}
+
+type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
+
+/// An initial snapshot and its subscription are acquired atomically by the registry.
+async fn update_task_subscription(
+    state: &AppState,
+    inbound: Inbound,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match inbound {
+        Inbound::TasksStart(_) => match state.tasks.subscribe_task_updates() {
+            Some(subscription) => {
+                *receiver = Some(subscription.updates);
+                task_snapshot_message(subscription.snapshot)
+            }
+            None => tasks_message(state).await,
+        },
+        Inbound::TasksStop => {
+            *receiver = None;
+            None
+        }
+        _ => None,
+    }
+}
+
+async fn task_transition_message(
+    state: &AppState,
+    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match update {
+        Ok(tasks) => task_snapshot_message(tasks),
+        // Resubscribe atomically after lag, dropping obsolete queued snapshots.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            update_task_subscription(state, Inbound::TasksStart(Duration::ZERO), receiver).await
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            *receiver = None;
+            None
+        }
+    }
+}
+
+async fn periodic_tasks_message(
+    state: &AppState,
+    receiver: Option<&TaskUpdateReceiver>,
+) -> Option<String> {
+    let message = tasks_message(state).await;
+    // A transition may race the read. Drain captured transitions before sending
+    // any newer periodic snapshot, otherwise a short run can appear out of order.
+    if receiver.is_some_and(|updates| !updates.is_empty()) {
+        None
+    } else {
+        message
+    }
+}
+
+async fn next_task_update(
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The listener's `.Where(i => !i.IsHidden)` clause.
@@ -849,6 +990,41 @@ mod tests {
     use axum::http::HeaderMap;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
+        use crate::test_support::{
+            FakeLibrary, RecordingTasks, elevated_state_with_library_monitor_and_tasks,
+        };
+        use std::sync::Arc;
+        let state = elevated_state_with_library_monitor_and_tasks(
+            Arc::new(FakeLibrary),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+            Arc::new(RecordingTasks::default()),
+        );
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        let mut receiver = Some(receiver);
+        sender.send(Vec::new()).unwrap();
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_none()
+        );
+        let update = super::next_task_update(&mut receiver).await;
+        assert!(
+            super::task_transition_message(&state, update, &mut receiver)
+                .await
+                .is_some()
+        );
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_some()
+        );
+        super::update_task_subscription(&state, Inbound::TasksStop, &mut receiver).await;
+        assert!(receiver.is_none());
+        assert_eq!(sender.receiver_count(), 0);
+    }
+
     /// A client that stops reading must not make the server buffer without
     /// bound: the sink accepts exactly `PUSH_QUEUE_DEPTH` messages, then drops
     /// the rest and raises the overflow signal that closes the socket.
@@ -907,13 +1083,46 @@ mod tests {
     }
 
     #[test]
-    fn query_param_extracts_by_exact_key() {
+    fn query_param_accepts_jellyfin_and_host_normalized_token_keys() {
         let q = Some("deviceId=dev1&api_key=abc123&x=1");
         assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
         assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
-        assert_eq!(query_param(q, "ApiKey"), None); // case-sensitive
+        assert_eq!(query_param(q, "ApiKey"), None); // underscore is significant
+        for key in ["ApiKey", "apiKey", "apikey", "APIKEY"] {
+            let query = format!("deviceId=dev1&{key}=aBc123&x=1");
+            assert_eq!(
+                query_param(Some(&query), "ApiKey").as_deref(),
+                Some("aBc123")
+            );
+        }
+        assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
+        assert_eq!(
+            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
+            Some("first,second")
+        );
+        assert_eq!(
+            query_param(Some("api_key=&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            query_param(Some("api_key&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
+        assert_eq!(query_param(Some("api_key=&api_key"), "api_key"), None);
+        assert_eq!(
+            query_param(
+                Some("%61pi_key=first%2526&API_KEY=second%2Bvalue"),
+                "api_key"
+            )
+            .as_deref(),
+            Some("first%26,second+value")
+        );
+        assert_eq!(
+            query_param(Some("%2561pi_key=ignored&api_key=second"), "api_key").as_deref(),
+            Some("second")
+        );
     }
 
     #[test]
@@ -1002,6 +1211,21 @@ mod tests {
             Some(Inbound::SessionsStart(Duration::from_millis(
                 DEFAULT_STREAM_MILLIS
             )))
+        );
+    }
+
+    #[test]
+    fn inbound_member_names_are_exact_but_the_message_type_value_is_not() {
+        // `JsonDefaults.Options`: no member-name fold…
+        assert_eq!(parse_inbound(r#"{"messageType":"KeepAlive"}"#), None);
+        // …but `JsonStringEnumConverter` reads the enum value ignoring case.
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"keepalive"}"#),
+            Some(Inbound::KeepAlive)
+        );
+        assert_eq!(
+            parse_inbound(r#"{"MessageType":"SESSIONSSTOP"}"#),
+            Some(Inbound::SessionsStop)
         );
     }
 
@@ -1157,5 +1381,35 @@ mod tests {
         assert_eq!(KEEPALIVE_SECS, 60);
         assert!((KEEPALIVE_FORCE_AFTER_SECS - 60.0 * 0.75).abs() < f64::EPSILON);
         assert!((KEEPALIVE_LOST_SECS - 60.0).abs() < f64::EPSILON);
+    }
+    #[test]
+    fn inbound_enum_numbers_use_csharp_values_and_exact_property_names() {
+        use ferrofin_model::session::SessionMessageType as Kind;
+        for value in [
+            Kind::KeepAlive.json_value().to_string(),
+            format!("\" {} \"", Kind::KeepAlive.json_value()),
+        ] {
+            let text = format!(r#"{{"MessageType":{value}}}"#);
+            assert_eq!(parse_inbound(&text), Some(Inbound::KeepAlive));
+        }
+        let message = format!(
+            r#"{{"MessageType":{},"Data":"0,2345"}}"#,
+            Kind::SessionsStart.json_value()
+        );
+        assert_eq!(
+            parse_inbound(&message),
+            Some(Inbound::SessionsStart(std::time::Duration::from_millis(
+                2345
+            )))
+        );
+        for text in [
+            r#"{"MessageType":28.0}"#,
+            r#"{"MessageType":"28.0"}"#,
+            r#"{"MessageType":999}"#,
+            r#"{"messageType":28}"#,
+            r#"{"MessageType":true}"#,
+        ] {
+            assert_eq!(parse_inbound(text), None, "{text}");
+        }
     }
 }

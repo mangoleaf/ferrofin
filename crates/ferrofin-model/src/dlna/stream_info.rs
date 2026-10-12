@@ -607,7 +607,7 @@ impl StreamInfo {
             }
             if self.transcode_seek_info != TranscodeSeekInfo::Auto {
                 sb.push_str("&TranscodeSeekInfo=");
-                sb.push_str(transcode_seek_info_name(self.transcode_seek_info));
+                sb.push_str(&self.transcode_seek_info.json_name());
             }
             if self.copy_timestamps {
                 sb.push_str("&CopyTimestamps=");
@@ -629,7 +629,7 @@ impl StreamInfo {
             && self.subtitle_delivery_method != SubtitleDeliveryMethod::External
         {
             sb.push_str("&SubtitleMethod=");
-            sb.push_str(subtitle_delivery_method_name(self.subtitle_delivery_method));
+            sb.push_str(&self.subtitle_delivery_method.json_name());
         }
 
         if self.subtitle_stream_index.is_some()
@@ -861,23 +861,6 @@ fn bool_lower(v: bool) -> String {
         "true".to_owned()
     } else {
         "false".to_owned()
-    }
-}
-
-fn transcode_seek_info_name(v: TranscodeSeekInfo) -> &'static str {
-    match v {
-        TranscodeSeekInfo::Auto => "Auto",
-        TranscodeSeekInfo::Bytes => "Bytes",
-    }
-}
-
-fn subtitle_delivery_method_name(v: SubtitleDeliveryMethod) -> &'static str {
-    match v {
-        SubtitleDeliveryMethod::Encode => "Encode",
-        SubtitleDeliveryMethod::Embed => "Embed",
-        SubtitleDeliveryMethod::External => "External",
-        SubtitleDeliveryMethod::Hls => "Hls",
-        SubtitleDeliveryMethod::Drop => "Drop",
     }
 }
 

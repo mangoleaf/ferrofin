@@ -107,7 +107,8 @@ impl Guest for HelloPlugin {
     fn provider_info() -> Option<ProviderDescriptor> {
         // The reference plugin IS a (tiny) named provider: its
         // metadata_lookup recognizes one demo title, and this name is what
-        // the dashboard's library-options fetcher list shows.
+        // the dashboard's library-options fetcher list shows and what the
+        // admin ranks among the built-in providers there.
         Some(ProviderDescriptor {
             name: "HelloDb".to_owned(),
             supported_kinds: vec!["Movie".to_owned()],
@@ -228,8 +229,10 @@ impl Guest for HelloPlugin {
                 community_rating: Some(7.9),
                 genres: vec!["Animation".to_owned(), "Short".to_owned()],
                 provider_ids: vec![("HelloDb".to_owned(), "bbb-1".to_owned())],
-                // The 0.5.0 supplement fields — demo a tagline; the rest
-                // pass through empty (supplement-only either way).
+                // The 0.5.0 additions — demo a tagline and a studio; the
+                // rest stay empty. The scan folds this answer at HelloDb's
+                // rank in the library's fetcher order: ranked first it wins
+                // these fields, ranked after TheMovieDb it fills its gaps.
                 tagline: Some("A big bunny, three bullies.".to_owned()),
                 studios: vec!["Blender Foundation".to_owned()],
                 tags: vec![],

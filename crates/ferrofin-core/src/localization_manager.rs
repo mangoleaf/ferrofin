@@ -1,39 +1,10 @@
 //! [`LocalizationManager`] — a concrete culture/country/parental-rating service.
 //!
-//! Port of `Emby.Server.Implementations.Localization.LocalizationManager`, cut
-//! down to the culture-data surface that the rest of Ferrofin needs today.
-//!
-//! **Flagged for `ferrofin-traits`:** the C# `ILocalizationManager` interface was
-//! deliberately *not* ported into `ferrofin-traits` (its module doc says the
-//! service is "not part of the wire contract, so it is dropped"). Consumers of
-//! this data (the DTO layer's language display names, the metadata provider's
-//! rating scores) will need a trait to inject it. This unit ships a **concrete
-//! struct**; a follow-up should add an `ILocalizationManager` trait to
-//! `ferrofin-traits` and have this type implement it. The public methods here are
-//! named to match that future trait so the change is mechanical.
-//!
-//! Dataset scope (a *minimal* embedded dataset, not the full Jellyfin resource
-//! bundle):
-//! - **Cultures** — a compact ISO 639 table (`(t, b, two-letter, display)`)
-//!   covering the common media languages, parsed the same way C# parses
-//!   `iso6392.txt` (building the ISO 639-2/B → /T map as a side effect).
-//! - **Countries** — a short [`CountryInfo`] list for the common metadata
-//!   regions.
-//! - **Parental ratings** — the US rating system (the primary source of ratings
-//!   in metadata providers), with the same "common ratings" back-fill and score
-//!   ordering the C# `GetParentalRatings` performs.
-//!
-//! The localized-*string* machinery (`GetLocalizedString`, the per-culture JSON
-//! resource dictionaries) is out of scope for this minimal port and is omitted;
-//! the runtime translation catalog is a `ferrofin-server` asset concern.
-//!
-//! All the vendored tables (cultures, countries, ratings, UI-language options) are
-//! parsed **once** into process-wide [`LazyLock`] statics rather than being rebuilt on
-//! every call: the source data is `include_str!`-embedded and immutable, so nothing
-//! about it can vary at runtime. The only per-instance state left is the configured
-//! default country code and the parental-rating list derived from it.
+//! Ports Jellyfin's cultures, country tables, parental ratings and core strings.
+//! Immutable embedded tables are parsed once. Server UI culture and metadata
+//! country are read from live configuration when resolving a value.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use ferrofin_model::entities_media::{ParentalRating, ParentalRatingScore};
@@ -63,9 +34,8 @@ const ISO6392: &str = include_str!("data/iso6392.txt");
 /// `Emby.Server.Implementations/Localization/countries.json` (v10.11.8, 139 ISO-3166 entries).
 const COUNTRIES_JSON: &str = include_str!("data/countries.json");
 
-/// Jellyfin's bundled US parental-rating system, vendored verbatim from
-/// `Emby.Server.Implementations/Localization/Ratings/us.json` (v10.11.8).
-const RATINGS_US_JSON: &str = include_str!("data/ratings-us.json");
+#[path = "data/parental_ratings.rs"]
+mod parental_ratings;
 
 #[path = "data/core_dictionaries.rs"]
 mod core_dictionaries;
@@ -126,81 +96,9 @@ fn core_dictionary(culture: &str) -> Option<&'static HashMap<String, String>> {
         .map(|(_, dict)| dict)
 }
 
-/// The fixed UI-language option list, ported verbatim from Jellyfin's
-/// `LocalizationManager.GetLocalizationOptions` (v10.11.8). `(name, value)`.
-const LOCALIZATION_OPTIONS: &[(&str, &str)] = &[
-    ("Afrikaans", "af"),
-    ("العربية", "ar"),
-    ("Беларуская", "be"),
-    ("Български", "bg-BG"),
-    ("বাংলা (বাংলাদেশ)", "bn"),
-    ("Català", "ca"),
-    ("Čeština", "cs"),
-    ("Cymraeg", "cy"),
-    ("Dansk", "da"),
-    ("Deutsch", "de"),
-    ("English (United Kingdom)", "en-GB"),
-    ("English", "en-US"),
-    ("Ελληνικά", "el"),
-    ("Esperanto", "eo"),
-    ("Español", "es"),
-    ("Español americano", "es_419"),
-    ("Español (Argentina)", "es-AR"),
-    ("Español (Dominicana)", "es_DO"),
-    ("Español (México)", "es-MX"),
-    ("Eesti", "et"),
-    ("Basque", "eu"),
-    ("فارسی", "fa"),
-    ("Suomi", "fi"),
-    ("Filipino", "fil"),
-    ("Français", "fr"),
-    ("Français (Canada)", "fr-CA"),
-    ("Galego", "gl"),
-    ("Schwiizerdütsch", "gsw"),
-    ("עִבְרִית", "he"),
-    ("हिन्दी", "hi"),
-    ("Hrvatski", "hr"),
-    ("Magyar", "hu"),
-    ("Bahasa Indonesia", "id"),
-    ("Íslenska", "is"),
-    ("Italiano", "it"),
-    ("日本語", "ja"),
-    ("Qazaqşa", "kk"),
-    ("한국어", "ko"),
-    ("Lietuvių", "lt"),
-    ("Latviešu", "lv"),
-    ("Македонски", "mk"),
-    ("മലയാളം", "ml"),
-    ("मराठी", "mr"),
-    ("Bahasa Melayu", "ms"),
-    ("Norsk bokmål", "nb"),
-    ("नेपाली", "ne"),
-    ("Nederlands", "nl"),
-    ("Norsk nynorsk", "nn"),
-    ("ਪੰਜਾਬੀ", "pa"),
-    ("Polski", "pl"),
-    ("Pirate", "pr"),
-    ("Português", "pt"),
-    ("Português (Brasil)", "pt-BR"),
-    ("Português (Portugal)", "pt-PT"),
-    ("Românește", "ro"),
-    ("Русский", "ru"),
-    ("Slovenčina", "sk"),
-    ("Slovenščina", "sl-SI"),
-    ("Shqip", "sq"),
-    ("Српски", "sr"),
-    ("Svenska", "sv"),
-    ("தமிழ்", "ta"),
-    ("తెలుగు", "te"),
-    ("ภาษาไทย", "th"),
-    ("Türkçe", "tr"),
-    ("Українська", "uk"),
-    ("اُردُو", "ur_PK"),
-    ("Tiếng Việt", "vi"),
-    ("汉语 (简体字)", "zh-CN"),
-    ("漢語 (繁體字)", "zh-TW"),
-    ("廣東話 (香港)", "zh-HK"),
-];
+/// Native labels captured from .NET 10 `CultureInfo.NativeName` for the pinned
+/// core-resource catalog, including the explicit English label for `en-US`.
+const LOCALIZATION_OPTIONS_JSON: &str = include_str!("data/localization_options.json");
 
 /// One country row as stored in `countries.json` (PascalCase keys).
 #[derive(serde::Deserialize)]
@@ -230,25 +128,43 @@ static COUNTRIES: LazyLock<Vec<CountryInfo>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The UI-language option list, materialized once from [`LOCALIZATION_OPTIONS`].
+/// The dropdown follows the shipped resources, with .NET native labels and
+/// ordinal-ignore-case label ordering (`BuildLocalizationData`).
 static LOCALIZATION_OPTION_LIST: LazyLock<Vec<LocalizationOption>> = LazyLock::new(|| {
-    LOCALIZATION_OPTIONS
+    let labels: Vec<LocalizationOption> = serde_json::from_str(LOCALIZATION_OPTIONS_JSON)
+        .expect("embedded localization labels are valid JSON");
+    let mut options: Vec<_> = core_dictionaries::CORE_DICTIONARIES
         .iter()
-        .map(|(name, value)| LocalizationOption {
-            name: (*name).to_owned(),
-            value: (*value).to_owned(),
+        .filter(|(code, _)| !code.eq_ignore_ascii_case(DEFAULT_CULTURE))
+        .map(|(code, _)| LocalizationOption {
+            name: labels
+                .iter()
+                .find(|option| option.value == *code)
+                .map_or_else(|| (*code).to_owned(), |option| option.name.clone()),
+            value: (*code).to_owned(),
         })
-        .collect()
+        .collect();
+    options.push(LocalizationOption {
+        name: "English".to_owned(),
+        value: DEFAULT_CULTURE.to_owned(),
+    });
+    options.sort_by_cached_key(|option| {
+        ferrofin_util::string_extensions::upper_invariant(&option.name)
+            .encode_utf16()
+            .collect::<Vec<_>>()
+    });
+    options
 });
 
 /// The parsed ISO 639-2 dataset, built once.
 static CULTURE_DATA: LazyLock<CultureData> = LazyLock::new(load_culture_data);
 
 /// Every known rating system, keyed by upper-case country code, parsed once.
-static PARENTAL_RATINGS: LazyLock<HashMap<String, RatingTable>> = LazyLock::new(|| {
-    let mut systems = HashMap::new();
-    systems.insert("US".to_owned(), load_rating_table(RATINGS_US_JSON));
-    systems
+static PARENTAL_RATINGS: LazyLock<BTreeMap<String, RatingTable>> = LazyLock::new(|| {
+    parental_ratings::TABLES
+        .iter()
+        .map(|(country, json)| ((*country).to_owned(), load_rating_table(json)))
+        .collect()
 });
 
 /// A parental-rating system as stored in `Ratings/*.json` (C# `ParentalRatingSystem`).
@@ -295,23 +211,15 @@ struct RatingTable {
     by_name: HashMap<String, ParentalRatingScore>,
 }
 
-/// A concrete culture/country/parental-rating service over a minimal dataset.
-///
-/// See the module docs: this stands in for the (unported) C#
-/// `ILocalizationManager` and should be fronted by a `ferrofin-traits` trait in a
-/// follow-up.
+/// Culture, country and parental-rating services over the embedded resources.
 #[derive(Clone)]
 pub struct LocalizationManager {
     /// The server default country code for rating fallback.
-    metadata_country_code: String,
+    metadata_country_code: Arc<dyn Fn() -> String + Send + Sync>,
     /// `ServerConfiguration.UICulture` — the culture `GetLocalizedString`
     /// resolves phrases in (en-US fallback), read live so an admin change
     /// applies without a restart, as the C# config fallback does.
     ui_culture: Arc<dyn Fn() -> String + Send + Sync>,
-    /// The default country's parental-rating list, built once at construction. It
-    /// depends on `metadata_country_code`, so unlike the tables above it cannot be a
-    /// process-wide static — but it is still immutable for the manager's lifetime.
-    parental_ratings: Vec<ParentalRating>,
 }
 
 impl Default for LocalizationManager {
@@ -323,7 +231,7 @@ impl Default for LocalizationManager {
 impl std::fmt::Debug for LocalizationManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalizationManager")
-            .field("metadata_country_code", &self.metadata_country_code)
+            .field("metadata_country_code", &(self.metadata_country_code)())
             .field("ui_culture", &(self.ui_culture)())
             .finish_non_exhaustive()
     }
@@ -335,12 +243,20 @@ impl LocalizationManager {
     #[must_use]
     pub fn new(metadata_country_code: &str) -> Self {
         let metadata_country_code = metadata_country_code.to_ascii_uppercase();
-        let parental_ratings = build_parental_ratings(&metadata_country_code);
         Self {
-            metadata_country_code,
+            metadata_country_code: Arc::new(move || metadata_country_code.clone()),
             ui_culture: Arc::new(|| DEFAULT_CULTURE.to_owned()),
-            parental_ratings,
         }
+    }
+
+    /// Reads the current metadata country when resolving default ratings.
+    #[must_use]
+    pub fn with_metadata_country_source(
+        mut self,
+        source: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_country_code = Arc::new(source);
+        self
     }
 
     /// Sets a fixed server UI culture (`ServerConfiguration.UICulture`) phrases
@@ -367,11 +283,22 @@ impl LocalizationManager {
         self
     }
 
-    /// Port of `GetLocalizedString(phrase)` / `GetServerLocalizedString`: the
-    /// phrase in the server's UI culture, falling back to `en-US`, then to the
-    /// phrase key itself.
+    /// Port of `GetLocalizedString(phrase)`: the phrase in the *ambient* UI
+    /// culture (`CultureInfo.CurrentUICulture` — the request's, or that of the
+    /// work a request started), falling back to `en-US`, then to the phrase key
+    /// itself. Outside any request there is no ambient culture, and the lookup
+    /// uses the configured server culture like an empty `CurrentUICulture.Name`.
     #[must_use]
     pub fn get_localized_string(&self, phrase: &str) -> String {
+        let ambient = ferrofin_util::current_culture::ambient_ui_culture().unwrap_or_default();
+        self.get_localized_string_for(phrase, &ambient)
+    }
+
+    /// Port of `GetServerLocalizedString(phrase)`: the phrase in the configured
+    /// server UI culture, whatever culture the calling request or worker runs
+    /// under (library view, collection and extra names).
+    #[must_use]
+    pub fn get_server_localized_string(&self, phrase: &str) -> String {
         self.get_localized_string_for(phrase, &(self.ui_culture)())
     }
 
@@ -420,17 +347,10 @@ impl LocalizationManager {
         COUNTRIES.clone()
     }
 
-    /// The available UI-language localization options (C# `GetLocalizationOptions`).
-    ///
-    /// Jellyfin derives this from the embedded translation-catalog resource files;
-    /// that catalog is a `ferrofin-server` asset that this minimal port omits, so
-    /// the list is built from the embedded culture dataset's display names
-    /// (truncated at the first delimiter), always including the base `en-US`
-    /// entry the C# adds explicitly.
+    /// The available UI-language options, derived from bundled core resources
+    /// with native labels and .NET ordinal-ignore-case label ordering.
     #[must_use]
     pub fn get_localization_options(&self) -> Vec<LocalizationOption> {
-        // Port of C# GetLocalizationOptions: a fixed list of UI-language options (the translation
-        // catalogs Jellyfin ships), not derived from the culture dataset.
         LOCALIZATION_OPTION_LIST.clone()
     }
 
@@ -483,10 +403,10 @@ impl LocalizationManager {
     /// The parental-rating list for the server default country, back-filled with
     /// the common ratings and ordered by score (C# `GetParentalRatings`).
     ///
-    /// Built once in [`LocalizationManager::new`]; this is a clone of that list.
+    /// Resolves the live server country against the immutable parsed tables.
     #[must_use]
     pub fn get_parental_ratings(&self) -> Vec<ParentalRating> {
-        self.parental_ratings.clone()
+        build_parental_ratings(&(self.metadata_country_code)())
     }
 
     /// Resolves a rating string to a score (C# `GetRatingScore`, Jellyfin 12.1
@@ -569,7 +489,7 @@ impl LocalizationManager {
                     return Some(*score);
                 }
             }
-        } else if let Some(table) = parental_ratings_for(&self.metadata_country_code)
+        } else if let Some(table) = parental_ratings_for(&(self.metadata_country_code)())
             && let Some(score) = table.by_name.get(&rating_key(cleaned))
         {
             // Fall back to the server default language for the ratings check.
@@ -763,7 +683,9 @@ fn load_rating_table(json: &str) -> RatingTable {
                     // providers are not consistent (`VM18` vs `vm18`).
                     if by_name.insert(rating_key(&rating), score).is_none() {
                         ordered.push((rating, score));
-                    } else if let Some(slot) = ordered.iter_mut().find(|(name, _)| name == &rating)
+                    } else if let Some(slot) = ordered
+                        .iter_mut()
+                        .find(|(name, _)| rating_key(name) == rating_key(&rating))
                     {
                         slot.1 = score;
                     }
@@ -847,6 +769,37 @@ fn build_parental_ratings_from(table: Option<&RatingTable>) -> Vec<ParentalRatin
     ratings
 }
 
+/// An item's parental rating score — `BaseItem.GetParentalRatingScore`
+/// (`BaseItem.cs:1916-1931`) over the item's OWN ratings: its custom rating
+/// when it has one, else its official rating, scored by the localization
+/// tables against the server's metadata country; `None` when it has neither
+/// or the rating is unknown.
+///
+/// TODO(parity, open work item): upstream reads `CustomRatingForComparison`
+/// and `OfficialRatingForComparison`, which fall back to the item's
+/// `DisplayParent` (an episode or season with no rating of its own takes its
+/// series'), and scores against `GetPreferredMetadataCountryCode()` (the
+/// item's, else its library's, else the server's country). Here only the
+/// item's own ratings count and the server's country is used. Un-defer path:
+/// pass the display parent's ratings (one batched read of the series per
+/// scan pass, as the series-key read) and the library's preferred country
+/// into this function, and apply it in the scan, the owned-video copy and
+/// the boot repair (`repair_rating_levels`) together, so no writer disagrees
+/// with another.
+#[must_use]
+pub fn parental_rating_score(
+    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) -> Option<ParentalRatingScore> {
+    let rating = item
+        .custom_rating
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .or_else(|| item.official_rating.as_deref().filter(|r| !r.is_empty()))?;
+    // `GetRatingScore(rating, GetPreferredMetadataCountryCode())`.
+    localization.get_rating_score(rating, item.preferred_metadata_country_code.as_deref())
+}
+
 impl ferrofin_traits::localization::LocalizationManager for LocalizationManager {
     fn get_cultures(&self) -> Vec<CultureDto> {
         CULTURE_DATA.cultures.clone()
@@ -864,8 +817,21 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
         LocalizationManager::get_localization_options(self)
     }
 
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // Pinned BuildLocalizationData scans all embedded Core resources, not
+        // the historical fixed dropdown. Request options validate the names.
+        core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, _)| code.replace('_', "-"))
+            .collect()
+    }
+
     fn get_localized_string(&self, phrase: &str) -> String {
         LocalizationManager::get_localized_string(self, phrase)
+    }
+
+    fn get_server_localized_string(&self, phrase: &str) -> String {
+        LocalizationManager::get_server_localized_string(self, phrase)
     }
 
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String {
@@ -902,6 +868,37 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    /// `GetLocalizedString(phrase)` reads the ambient `CurrentUICulture`;
+    /// `GetServerLocalizedString` the configured `UICulture`. A request in French
+    /// on a German-configured server sees French stream labels but German
+    /// library-view names, work it spawns keeps both, and outside any request
+    /// the ambient lookup is the configured culture.
+    #[tokio::test]
+    async fn ambient_and_server_localized_strings_use_their_own_cultures() {
+        use ferrofin_util::current_culture::{scope, scope_with_ui};
+        let server = LocalizationManager::default().with_ui_culture("de");
+        assert_eq!(server.get_localized_string("Default"), "Standard");
+        let request = scope_with_ui("fr".into(), Some("fr".into()), async {
+            let spawned = scope(ferrofin_util::current_culture::capture(), async {
+                (
+                    server.get_localized_string("Default"),
+                    server.get_server_localized_string("Default"),
+                )
+            })
+            .await;
+            (
+                server.get_localized_string("Default"),
+                server.get_server_localized_string("Default"),
+                spawned,
+            )
+        })
+        .await;
+        assert_eq!(request.0, "Par défaut");
+        assert_eq!(request.1, "Standard");
+        assert_eq!(request.2, ("Par défaut".to_owned(), "Standard".to_owned()));
+        assert_eq!(server.get_localized_string("Default"), "Standard");
+    }
 
     /// `GetLocalizedString`: the server UI culture, BCP-47 → resource mapping,
     /// case-insensitive phrase keys, en-US fallback, then the phrase itself.
@@ -1033,8 +1030,14 @@ mod tests {
         assert_eq!(m.get_rating_score("Unrated", None), None);
         // Multi-value: first resolvable wins.
         assert_eq!(
-            m.get_rating_score("n/a / PG", None).map(|s| s.score),
+            m.get_rating_score("Unrated / PG", None).map(|s| s.score),
             Some(10)
+        );
+        // With all tables loaded, upstream's slash split resolves the `a`
+        // fragment via BG's A=0. Only a whole `n/a` is an unrated marker.
+        assert_eq!(
+            m.get_rating_score("n/a / PG", None).map(|s| s.score),
+            Some(0)
         );
         // Country-prefixed.
         assert_eq!(m.get_rating_score("US:R", None).map(|s| s.score), Some(17));
@@ -1129,9 +1132,9 @@ mod tests {
         assert_eq!(nc17.rating_score.map(|s| s.score), Some(17));
         assert_eq!(nc17.rating_score.and_then(|s| s.sub_score), Some(1));
 
-        // Localization options: the fixed 71-entry UI-language list, incl. es_419.
+        // Localization options cover every bundled translation, including es_419.
         let options = m.get_localization_options();
-        assert_eq!(options.len(), 71);
+        assert_eq!(options.len(), 105);
         assert!(options.iter().any(|o| o.value == "es_419"));
         assert!(
             options
@@ -1278,11 +1281,10 @@ mod tests {
         assert!(parental_ratings_for("zz").is_none());
     }
 
-    /// A non-US default country has no vendored table, so only the back-fill remains —
-    /// which is why the rating list cannot be a process-wide static.
+    /// An unknown country exposes only the common backfill.
     #[test]
     fn parental_ratings_depend_on_the_configured_country() {
-        let names: Vec<String> = shipped("DE")
+        let names: Vec<String> = shipped("ZZ")
             .get_parental_ratings()
             .into_iter()
             .map(|r| r.name)
@@ -1295,19 +1297,36 @@ mod tests {
         );
     }
 
-    /// The UI-language list keeps its declared order (clients render it as given).
+    /// No bundled language disappears from the dropdown; native labels and
+    /// order match the pinned .NET catalog rather than the old web labels.
     #[test]
-    fn localization_options_preserve_declared_order() {
-        let m = shipped(DEFAULT_METADATA_COUNTRY_CODE);
-        let options = m.get_localization_options();
-        assert_eq!(options.len(), LOCALIZATION_OPTIONS.len());
-        let head: Vec<&str> = options.iter().take(4).map(|o| o.value.as_str()).collect();
-        assert_eq!(head, ["af", "ar", "be", "bg-BG"]);
-        assert_eq!(options.last().map(|o| o.value.as_str()), Some("zh-HK"));
-        for (option, (name, value)) in options.iter().zip(LOCALIZATION_OPTIONS) {
-            assert_eq!(option.name, *name);
-            assert_eq!(option.value, *value);
+    fn localization_options_cover_resources_and_native_order() {
+        let options = shipped(DEFAULT_METADATA_COUNTRY_CODE).get_localization_options();
+        let expected: Vec<LocalizationOption> =
+            serde_json::from_str(LOCALIZATION_OPTIONS_JSON).unwrap();
+        assert_eq!(
+            options, expected,
+            "complete .NET catalog and label ordering"
+        );
+        let mut values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        let mut resources: Vec<_> = core_dictionaries::CORE_DICTIONARIES
+            .iter()
+            .map(|(code, _)| *code)
+            .collect();
+        resources.sort_unstable();
+        assert_eq!(values, resources, "exactly one option for each resource");
+        for (code, name) in [
+            ("lt-LT", "lietuvių (Lietuva)"),
+            ("pr", "pr"),
+            ("es_419", "español (Latinoamérica)"),
+            ("ar_SA", "العربية (المملكة العربية السعودية)"),
+        ] {
+            assert_eq!(options.iter().find(|o| o.value == code).unwrap().name, name);
         }
+        assert!(!values.contains(&"lt"));
+        assert_eq!(options.first().unwrap().value, "ab");
+        assert_eq!(options.last().unwrap().value, "ko");
     }
 
     /// Cultures come from the shared static but are still the full list, in file order.
@@ -1413,5 +1432,86 @@ mod tests {
             .expect("ZZ-DUP listed");
         assert_eq!(listed.rating_score, Some(dup));
         assert_eq!(listed.value, Some(18));
+    }
+    /// Cases ported from upstream LocalizationManagerTests at 4910aafa1a.
+    #[rstest]
+    #[case("CA-R", "CA", 18, Some(1))]
+    #[case("FSK-16", "DE", 16, None)]
+    #[case("FSK-18", "DE", 18, None)]
+    #[case("FSK-18", "US", 18, None)]
+    #[case("TV-MA", "US", 17, Some(1))]
+    #[case("XXX", "asdf", 1000, None)]
+    #[case("Germany: FSK-18", "DE", 18, None)]
+    #[case("Rated : R", "US", 17, Some(0))]
+    #[case("Rated: R", "US", 17, Some(0))]
+    #[case("Rated R", "US", 17, Some(0))]
+    #[case(" PG-13 ", "US", 13, Some(0))]
+    #[case("TV-MA", "DE", 17, Some(1))]
+    #[case("PG-13", "FR", 13, Some(0))]
+    #[case("R", "JP", 17, Some(0))]
+    #[case("us:R", "DE", 17, Some(0))]
+    #[case("US:PG-13", "DE", 13, Some(0))]
+    #[case("ca:R", "US", 18, Some(1))]
+    fn international_rating_oracles(
+        #[case] rating: &str,
+        #[case] country: &str,
+        #[case] score: i32,
+        #[case] subscore: Option<i32>,
+    ) {
+        assert_eq!(
+            LocalizationManager::new(country).get_rating_score(rating, None),
+            Some(ParentalRatingScore::new(score, subscore))
+        );
+    }
+
+    #[test]
+    fn live_country_changes_rating_choices_and_ambiguous_scores() {
+        let country = Arc::new(std::sync::RwLock::new("US".to_owned()));
+        let read = Arc::clone(&country);
+        let manager = LocalizationManager::default()
+            .with_metadata_country_source(move || read.read().unwrap().clone());
+        assert_eq!(manager.get_parental_ratings().len(), 56);
+        assert_eq!(manager.get_rating_score("PG", None).unwrap().score, 10);
+        *country.write().unwrap() = "DE".into();
+        let ratings = manager.get_parental_ratings();
+        assert_eq!(ratings.len(), 24);
+        assert_eq!(
+            ratings.iter().find(|r| r.name == "FSK-12").unwrap().value,
+            Some(12)
+        );
+        *country.write().unwrap() = "CA".into();
+        assert_eq!(manager.get_rating_score("PG", None).unwrap().score, 8);
+        assert_eq!(
+            manager.get_rating_score("PG", Some("US")).unwrap().score,
+            10
+        );
+        // Both gb.json and uk.json declare GB, as in upstream LoadAll.
+        assert_eq!(parental_ratings::TABLES.len(), 45);
+        assert_eq!(PARENTAL_RATINGS.len(), 44);
+        // Cross-country fallback order must prefer the 0-prefer resource.
+        assert_eq!(
+            LocalizationManager::new("ZZ")
+                .get_rating_score("M", None)
+                .unwrap()
+                .score,
+            18
+        );
+    }
+
+    #[test]
+    fn startup_supported_ui_cultures_follow_all_embedded_resources() {
+        let manager = LocalizationManager::default();
+        let names =
+            ferrofin_traits::localization::LocalizationManager::get_supported_ui_cultures(&manager);
+        assert_eq!(names.len(), 105, "pinned embedded resource set");
+        for name in [
+            "en-US", "ar-SA", "lt-LT", "he-IL", "ur", "sv", "uz", "ka", "km",
+        ] {
+            assert!(
+                names.iter().any(|actual| actual == name),
+                "missing startup culture {name}"
+            );
+        }
+        assert!(!names.iter().any(|name| name.contains('_')));
     }
 }

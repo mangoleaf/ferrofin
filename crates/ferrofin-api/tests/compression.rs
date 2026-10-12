@@ -265,3 +265,10 @@ async fn encodings_jellyfin_does_not_offer_are_served_uncompressed() {
             .unwrap_or_else(|e| panic!("{offered} body must be plain JSON: {e}"));
     }
 }
+
+#[tokio::test]
+async fn rejecting_every_encoding_returns_not_acceptable() {
+    let (status, encoding, _) = get(JSON_ROUTE, Some("identity;q=0, *;q=0")).await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(encoding, None);
+}

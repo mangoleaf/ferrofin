@@ -24,7 +24,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::entities::ExtraType;
+use ferrofin_model::entities::{ExtraType, ImageType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::dto::DtoService;
@@ -303,6 +303,10 @@ impl UserManager for OkUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
+            policy: Some(ferrofin_model::users::UserPolicy {
+                enable_content_deletion: true,
+                ..Default::default()
+            }),
             ..ferrofin_model::dto::UserDto::default()
         })
     }
@@ -325,6 +329,8 @@ impl UserManager for OkUsers {
     }
 }
 
+const SEASON_VIEW_ID: Uuid = Uuid::from_u128(0x5EA0_0001);
+const SEASON_BROWSE_ID: Uuid = Uuid::from_u128(0x5EA0_0002);
 /// The physical library-root `Folder` an item scanned by Jellyfin parents to.
 const PHYSICAL_FOLDER_ID: Uuid = Uuid::from_u128(0xF01);
 /// The `AggregateFolder` (`{data}/root`) that physical folder parents to.
@@ -352,11 +358,60 @@ const PHYSICAL_PATH: &str = "/media/movies-real";
 struct OkLibrary {
     item_id: Uuid,
     adopted_tree: bool,
+    /// The last query `query_items` received.
+    last_query: Arc<std::sync::Mutex<Option<InternalItemsQuery>>>,
+    /// Every `delete_item` call: the id and whether its files were asked to go
+    /// (`DeleteOptions::delete_file_location`).
+    deleted: Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>,
+    /// When set, `delete_item` signals it has started and waits to be
+    /// released before it records the delete.
+    gate: Option<Arc<DeleteGate>>,
+}
+
+/// Holds a fake delete half way, so a test can drop the request meanwhile.
+#[derive(Default)]
+struct DeleteGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == SEASON_VIEW_ID {
+            let mut view = item_entity(SEASON_VIEW_ID, "Season view", BaseItemKind::UserView);
+            view.data = Some(serde_json::json!({"DisplayParentId":SEASON_BROWSE_ID}).to_string());
+            return Ok(Some(view));
+        }
+        if id == SEASON_BROWSE_ID {
+            return Ok(Some(item_entity(
+                SEASON_BROWSE_ID,
+                "Season 1",
+                BaseItemKind::Season,
+            )));
+        }
+        if id == PLAYLIST_ID {
+            return Ok(Some(item_entity(
+                PLAYLIST_ID,
+                "Playlist",
+                BaseItemKind::Playlist,
+            )));
+        }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
             return Ok(Some(item_entity(
                 COLLECTION_FOLDER_ID,
@@ -364,7 +419,11 @@ impl LibraryManager for OkLibrary {
                 BaseItemKind::CollectionFolder,
             )));
         }
-        Ok((id == self.item_id).then(|| base_item_entity(self.item_id)))
+        Ok((id == self.item_id).then(|| {
+            let mut item = base_item_entity(self.item_id);
+            item.path = Some("/synthetic/movie.mkv".to_owned());
+            item
+        }))
     }
     async fn get_ancestors(
         &self,
@@ -409,8 +468,9 @@ impl LibraryManager for OkLibrary {
     }
     async fn query_items(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        *self.last_query.lock().unwrap() = Some(query.clone());
         Ok(QueryResult::new(
             Some(0),
             Some(1),
@@ -447,7 +507,15 @@ impl LibraryManager for OkLibrary {
     ) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn delete_item(&self, _id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
+    async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
+        self.deleted
+            .lock()
+            .expect("lock")
+            .push((id, options.delete_file_location));
         Ok(())
     }
     async fn get_people(
@@ -605,6 +673,13 @@ impl DtoService for OkDto {
     ) -> Result<BaseItemDto, ServiceError> {
         Ok(entity_to_dto(item))
     }
+    async fn can_delete(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
 }
 
 /// A [`VirtualFolderManager`] listing one library whose locations include
@@ -658,6 +733,9 @@ fn ok_state(item_id: Uuid) -> AppState {
     ok_state_with(OkLibrary {
         item_id,
         adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
 }
 
@@ -668,6 +746,25 @@ fn ok_state_with(library: OkLibrary) -> AppState {
 
 /// [`ok_state_with`] over a caller-chosen [`UserManager`] (a policy, say).
 fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppState {
+    ok_state_full(
+        library,
+        users,
+        Arc::new(OkDto),
+        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+    )
+}
+
+/// The request authentication a test state resolves callers with.
+type Auth = (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>);
+
+/// [`ok_state_with_users`] over a caller-chosen DTO service and
+/// authentication.
+fn ok_state_full(
+    library: OkLibrary,
+    users: Arc<dyn UserManager>,
+    dto: Arc<dyn DtoService>,
+    (auth_context, auth_service): Auth,
+) -> AppState {
     let item_id = library.item_id;
     AppState::new(
         Arc::new(library),
@@ -683,9 +780,9 @@ fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppSt
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(OkDto),
-        Arc::new(OkAuthContext),
-        Arc::new(OkAuthService),
+        dto,
+        auth_context,
+        auth_service,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -753,6 +850,21 @@ struct StubLibrary;
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         if id == ITEM_ID {
             let mut item = item_entity(ITEM_ID, "Movie", BaseItemKind::Movie);
@@ -1103,6 +1215,9 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
     let library = || OkLibrary {
         item_id,
         adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     };
     let get = |state: AppState, uri: &'static str| async move {
         let response = create_router(state)
@@ -1172,6 +1287,34 @@ async fn item_by_id_returns_base_item_dto() {
     assert_eq!(json["Name"], "Test Item");
 }
 
+/// An empty query value is `null` (`ConvertEmptyStringToNull`), which
+/// `CheckModel` rejects only for a member whose C# type is non-nullable —
+/// `GetItems`' `bool enableTotalRecordCount = true` — and accepts for a
+/// nullable one (`bool? isFavorite`). Measured on a live Jellyfin 12.2.
+#[tokio::test]
+async fn an_empty_value_is_rejected_only_for_a_non_nullable_member() {
+    let item_id = Uuid::from_u128(0xABCD);
+    for (query, expected) in [
+        ("enableTotalRecordCount=", StatusCode::BAD_REQUEST),
+        ("ENABLETOTALRECORDCOUNT=%20", StatusCode::BAD_REQUEST),
+        ("enableTotalRecordCount=False", StatusCode::OK),
+        ("isFavorite=", StatusCode::OK),
+        ("limit=&recursive=", StatusCode::OK),
+    ] {
+        let response = create_router(ok_state(item_id))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{query}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{query}");
+    }
+}
+
 #[tokio::test]
 async fn item_by_id_missing_is_404() {
     // The library knows only `item_id`; a different id resolves to `None` → 404.
@@ -1213,6 +1356,134 @@ async fn get_items_with_filters_returns_query_result() {
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
+}
+
+/// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
+/// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
+/// This), through both the query- and the path-scoped route. Each id set
+/// must reach the repository query: a dropped one answers the Albums section
+/// with every album in the library.
+#[tokio::test]
+async fn get_items_forwards_the_artist_id_filters() {
+    let (album_artist, featured, excluded) = (
+        Uuid::from_u128(0xA1),
+        Uuid::from_u128(0xA2),
+        Uuid::from_u128(0xA3),
+    );
+    let filters = format!(
+        "includeItemTypes=MusicAlbum&recursive=true&albumArtistIds={album_artist}\
+         &contributingArtistIds={featured},{excluded}&excludeArtistIds={excluded}"
+    );
+    for uri in [
+        format!("/Items?{filters}"),
+        format!("/Users/{USER_ID}/Items?{filters}"),
+    ] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let query = seen.lock().unwrap().take().expect("query_items ran");
+        assert_eq!(query.album_artist_ids, [album_artist], "{uri}");
+        assert_eq!(query.contributing_artist_ids, [featured, excluded], "{uri}");
+        assert_eq!(query.exclude_artist_ids, [excluded], "{uri}");
+        assert!(query.artist_ids.is_empty(), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes() {
+    use ferrofin_model::data::BaseItemKind;
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{path}?includeItemTypes=Movie&INCLUDEITEMTYPES=Series\
+                &genres=News%2CSport&GENRES=Drama&tags=one&TAGS=two\
+                &limit=7&LIMIT=bad&recursive=true&Recursive=false\
+                &searchTerm=a%2Cb&SEARCHTERM=ignored&userId={USER_ID}&USERID=bad\
+                &genreIds={USER_ID}&GENREIDS={USER_ID}"
+                    ))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let query = seen.lock().unwrap().take().expect("query_items ran");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Movie, BaseItemKind::Series]
+        );
+        assert_eq!(query.genres, ["News,Sport", "Drama"]);
+        assert_eq!(query.tags, ["one", "two"]);
+        assert_eq!(query.genre_ids, [USER_ID, USER_ID]);
+        assert_eq!(query.limit, Some(7));
+        assert!(query.recursive);
+        assert_eq!(query.search_term.as_deref(), Some("a,b"));
+    }
+}
+
+/// Wholphin's genre grid asks each genre for one random item that has a
+/// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
+/// an item without a backdrop yields a null URL that crashes the whole grid
+/// (`ConcurrentHashMap.put(genreId, null)`). The image type set must reach the
+/// repository query; unknown tokens drop like the binder's.
+#[tokio::test]
+async fn get_items_forwards_the_image_types_filter() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5C),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let seen = Arc::clone(&library.last_query);
+    // Wholphin's request, verbatim apart from the ids.
+    let uri = format!(
+        "/Items?userId={USER_ID}&limit=1&recursive=true&parentId={}&fields=Genres\
+         &includeItemTypes=MusicAlbum&imageTypes=Backdrop,Nonsense&sortBy=Random\
+         &imageTypeLimit=1&genreIds={}&enableTotalRecordCount=false&enableImages=true",
+        Uuid::from_u128(0x5C).simple(),
+        Uuid::from_u128(0x5D).simple(),
+    );
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.image_types, [ImageType::Backdrop]);
 }
 
 /// A `GET /Items` with an unknown enum token is a `400`.
@@ -1287,6 +1558,9 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
     let state = ok_state_with(OkLibrary {
         item_id,
         adopted_tree: true,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1341,6 +1615,9 @@ async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
     let state = ok_state_with(OkLibrary {
         item_id: Uuid::from_u128(0x56),
         adopted_tree: true,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1582,4 +1859,756 @@ async fn file_missing_item_is_404() {
     let missing = Uuid::from_u128(0x9999_9999_9999_9999_9999_9999_9999_9999);
     let (status, _) = send("GET", &format!("/Items/{missing}/File"), Body::empty()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A [`DtoService`] that projects like [`OkDto`] but whose `CanDelete`
+/// refuses the listed items — the per-user answer the delete endpoints ask
+/// for (`BaseItem.CanDelete(user)`).
+struct DenyingDto(Vec<Uuid>);
+
+#[async_trait]
+impl DtoService for DenyingDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items.iter().map(entity_to_dto).collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn can_delete(
+        &self,
+        item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(!self
+            .0
+            .contains(&Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil())))
+    }
+}
+
+/// A [`DtoService`] whose projected `CanDelete` is fixed and which does NOT
+/// override `can_delete`, so the trait's default — the DTO's own field —
+/// answers the delete endpoints.
+struct DtoSays(Option<bool>);
+
+#[async_trait]
+impl DtoService for DtoSays {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        let mut dto = entity_to_dto(item);
+        if options.contains_field(ferrofin_model::querying::ItemFields::CanDelete) {
+            dto.can_delete = self.0;
+        }
+        Ok(dto)
+    }
+    async fn get_base_item_dtos(
+        &self,
+        _items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// An [`AuthService`] whose token is authenticated but names no user and is
+/// not an API key — a token whose user has gone.
+struct UserlessAuthService;
+
+#[async_trait]
+impl AuthService for UserlessAuthService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
+/// Sends `DELETE uri` through a router over `state`.
+async fn delete(state: AppState, uri: &str) -> StatusCode {
+    create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The authenticated user every other test runs as.
+fn alice() -> Auth {
+    (Arc::new(OkAuthContext), Arc::new(OkAuthService))
+}
+
+/// The delete log a [`two_item_state`] library keeps.
+type DeleteLog = Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>;
+
+/// A state over the adopted tree, so both `item_id` and
+/// [`COLLECTION_FOLDER_ID`] resolve, with the given DTO service and
+/// authentication — plus the library's delete log.
+fn two_item_state(item_id: Uuid, dto: Arc<dyn DtoService>, auth: Auth) -> (AppState, DeleteLog) {
+    let library = OkLibrary {
+        item_id,
+        adopted_tree: true,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let deleted = Arc::clone(&library.deleted);
+    (
+        ok_state_full(library, Arc::new(OkUsers), dto, auth),
+        deleted,
+    )
+}
+
+/// `LibraryController.DeleteItem`: `!item.CanDelete(user)` is `401
+/// Unauthorized access` and nothing is deleted; allowed, the item is deleted
+/// **with its files** (`DeleteOptions { DeleteFileLocation = true }`).
+#[tokio::test]
+async fn delete_item_asks_can_delete_and_deletes_the_files() {
+    let item_id = Uuid::from_u128(0xAB51);
+    let (state, deleted) = two_item_state(item_id, Arc::new(OkDto), alice());
+    assert_eq!(
+        delete(state, &format!("/Items/{item_id}")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+
+    let (state, deleted) = two_item_state(item_id, Arc::new(DenyingDto(vec![item_id])), alice());
+    assert_eq!(
+        delete(state, &format!("/Items/{item_id}")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(deleted.lock().unwrap().is_empty(), "nothing deleted");
+}
+
+/// With no `can_delete` override, the endpoints follow the DTO's own
+/// `CanDelete` — the field jellyfin-web shows its "Delete" entry by — and an
+/// absent one refuses.
+#[tokio::test]
+async fn the_default_can_delete_is_the_dtos_field() {
+    let item_id = Uuid::from_u128(0xAB52);
+    for (says, expected) in [
+        (Some(true), StatusCode::NO_CONTENT),
+        (Some(false), StatusCode::UNAUTHORIZED),
+        (None, StatusCode::UNAUTHORIZED),
+    ] {
+        let (state, _) = two_item_state(item_id, Arc::new(DtoSays(says)), alice());
+        assert_eq!(
+            delete(state, &format!("/Items/{item_id}")).await,
+            expected,
+            "{says:?}"
+        );
+    }
+}
+
+/// `LibraryController.DeleteItems` is per item, in order: the ids before a
+/// refused one are already deleted when the request answers `401`, and the
+/// ids after it are never reached.
+#[tokio::test]
+async fn delete_items_stops_at_the_first_refused_id() {
+    let item_id = Uuid::from_u128(0xAB53);
+    let forbidden = COLLECTION_FOLDER_ID;
+    let denying = || -> Arc<dyn DtoService> { Arc::new(DenyingDto(vec![forbidden])) };
+    let (state, deleted) = two_item_state(item_id, denying(), alice());
+    assert_eq!(
+        delete(
+            state,
+            &format!("/Items?ids={item_id},{forbidden},{item_id}")
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+
+    let (state, deleted) = two_item_state(item_id, denying(), alice());
+    assert_eq!(
+        delete(state, &format!("/Items?ids={forbidden},{item_id}")).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(deleted.lock().unwrap().is_empty());
+
+    // A missing id stops the batch the same way, with a `404`.
+    let (state, deleted) = two_item_state(item_id, Arc::new(OkDto), alice());
+    let missing = Uuid::from_u128(0xBEEF);
+    assert_eq!(
+        delete(state, &format!("/Items?ids={item_id},{missing},{item_id}")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+}
+
+/// An API key has no user, so `CanDelete(user)` is not asked (upstream's
+/// `user is not null && …`); a token with no user identity is refused by the
+/// default policy before either delete handler can run.
+#[tokio::test]
+async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
+    let item_id = Uuid::from_u128(0xAB54);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let (state, deleted) = two_item_state(
+            item_id,
+            Arc::new(DenyingDto(vec![item_id])),
+            (
+                Arc::new(ferrofin_api::test_support::FakeAuthContext),
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+            ),
+        );
+        assert_eq!(delete(state, &uri).await, StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+    }
+    for (uri, expected) in [
+        (format!("/Items/{item_id}"), StatusCode::FORBIDDEN),
+        (format!("/Items?ids={item_id}"), StatusCode::FORBIDDEN),
+    ] {
+        let (state, deleted) = two_item_state(
+            item_id,
+            Arc::new(OkDto),
+            (
+                Arc::new(ferrofin_api::test_support::FakeAuthContext),
+                Arc::new(UserlessAuthService),
+            ),
+        );
+        assert_eq!(delete(state, &uri).await, expected, "{uri}");
+        assert!(deleted.lock().unwrap().is_empty());
+    }
+}
+
+/// A client that goes away mid-delete does not stop the delete: the work
+/// runs on its own task (upstream's controller ignores `RequestAborted`), so
+/// the item is deleted even though the request future was dropped while the
+/// library was deleting.
+#[tokio::test]
+async fn a_dropped_request_still_finishes_its_delete() {
+    let item_id = Uuid::from_u128(0xAB55);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let gate = Arc::new(DeleteGate::default());
+        let library = OkLibrary {
+            item_id,
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: Some(Arc::clone(&gate)),
+        };
+        let deleted = Arc::clone(&library.deleted);
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
+        let request = tokio::spawn(async move { delete(state, &uri).await });
+        gate.started.notified().await;
+        request.abort();
+        assert!(
+            request.await.is_err_and(|e| e.is_cancelled()),
+            "the request was dropped"
+        );
+        gate.release.notify_one();
+        for _ in 0..200 {
+            if !deleted.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(*deleted.lock().unwrap(), vec![(item_id, true)]);
+    }
+}
+
+#[tokio::test]
+async fn default_season_view_preserves_actual_parent_for_live_aired_selection_and_ids_bypass_it() {
+    for recursive in [false, true] {
+        for explicit in [false, true] {
+            let library = OkLibrary {
+                item_id: ITEM_ID,
+                adopted_tree: false,
+                last_query: Arc::default(),
+                deleted: Arc::default(),
+                gate: None,
+            };
+            let seen = library.last_query.clone();
+            let router = create_router(ok_state_with(library));
+            let path = format!(
+                "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}{}",
+                if explicit {
+                    format!("&ids={ITEM_ID}")
+                } else {
+                    String::new()
+                }
+            );
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("X-Emby-Token", "valid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let query = seen.lock().unwrap().clone().expect("repository query");
+            assert_eq!(
+                query.parent_id,
+                if explicit {
+                    Uuid::nil()
+                } else {
+                    SEASON_BROWSE_ID
+                }
+            );
+            assert_eq!(
+                query.parent_type,
+                if explicit {
+                    None
+                } else {
+                    Some(BaseItemKind::Season)
+                }
+            );
+            assert_eq!(query.apply_folder_display_options, !explicit);
+            assert!(
+                !query.folder_query_recursive,
+                "default delegation keeps the Season override instead of invoking Folder.QueryRecursive"
+            );
+        }
+    }
+}
+
+/// Plain nullable string query parameters use ASP.NET ConvertEmptyStringToNull.
+/// This is an HTTP boundary, not permission to trim nonblank internal filters.
+#[tokio::test]
+async fn items_http_name_boundaries_bind_blank_to_null_and_preserve_nonblank() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            ("", None),
+            ("%20", None),
+            ("%09%0A%0D", None),
+            ("%C2%A0%E2%80%83", None),
+            ("%20A%20", Some(" A ")),
+            ("%25", Some("%")),
+            ("_", Some("_")),
+        ] {
+            let library = OkLibrary {
+                item_id: Uuid::from_u128(0x5A),
+                adopted_tree: false,
+                last_query: Arc::default(),
+                deleted: Arc::default(),
+                gate: None,
+            };
+            let seen = Arc::clone(&library.last_query);
+            let uri = format!(
+                "{path}?recursive=true&nameStartsWith={encoded}&nameStartsWithOrGreater={encoded}&nameLessThan={encoded}"
+            );
+            let response = create_router(ok_state_with(library))
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header("X-Emby-Token", "valid")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let query = seen.lock().unwrap().take().expect("query_items ran");
+            assert_eq!(query.name_starts_with.as_deref(), expected, "{uri}");
+            assert_eq!(
+                query.name_starts_with_or_greater.as_deref(),
+                expected,
+                "{uri}"
+            );
+            assert_eq!(query.name_less_than.as_deref(), expected, "{uri}");
+        }
+    }
+}
+
+async fn capture_items_filter_query(uri: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let captured = seen.lock().unwrap().take();
+    (response.status(), captured)
+}
+
+/// Both controller routes forward every exposed GetResult presence flag,
+/// including nullable boolean binding rather than silently discarding it.
+#[tokio::test]
+async fn items_get_result_presence_flags_reach_both_routes() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            ("true", Some(true)),
+            ("false", Some(false)),
+            ("%20TrUe%20", Some(true)),
+            ("%09FaLsE%0A", Some(false)),
+            ("", None),
+            ("%20", None),
+            ("%C2%A0%E2%80%83", None),
+        ] {
+            let uri = format!(
+                "{path}?recursive=true&hasOverview={encoded}&hasImdbId={encoded}&hasTmdbId={encoded}&hasTvdbId={encoded}&hasParentalRating={encoded}"
+            );
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let query = query.expect("query_items ran");
+            assert_eq!(query.has_overview, expected, "{uri}");
+            assert_eq!(query.has_imdb_id, expected, "{uri}");
+            assert_eq!(query.has_tmdb_id, expected, "{uri}");
+            assert_eq!(query.has_tvdb_id, expected, "{uri}");
+            assert_eq!(query.has_parental_rating, expected, "{uri}");
+        }
+    }
+}
+
+/// Inclusive premiere dates are normalized to UTC without dropping 100ns
+/// precision; empty dates and empty adjacency remain absent on both routes.
+#[tokio::test]
+async fn items_get_result_dates_and_adjacency_reach_both_routes() {
+    let adjacent = Uuid::from_u128(0x5678);
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for (encoded, expected) in [
+            (
+                "2026-01-02T03:04:05.0000001%2B02:00",
+                Some("2026-01-02T01:04:05.0000001Z"),
+            ),
+            (
+                "2026-01-02T03:04:05.0000001Z",
+                Some("2026-01-02T03:04:05.0000001Z"),
+            ),
+            ("", None),
+            ("%20", None),
+        ] {
+            let uri = format!(
+                "{path}?recursive=true&minPremiereDate={encoded}&maxPremiereDate={encoded}&adjacentTo={adjacent}"
+            );
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            let query = query.expect("query_items ran");
+            let expected =
+                expected.map(|raw| raw.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+            assert_eq!(query.min_premiere_date, expected, "{uri}");
+            assert_eq!(query.max_premiere_date, expected, "{uri}");
+            assert_eq!(query.adjacent_to, Some(adjacent), "{uri}");
+        }
+        for (encoded, expected) in [
+            ("", None),
+            ("%20", None),
+            ("00000000-0000-0000-0000-000000000000", Some(Uuid::nil())),
+        ] {
+            let uri = format!("{path}?recursive=true&adjacentTo={encoded}");
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                query.expect("query_items ran").adjacent_to,
+                expected,
+                "{uri}"
+            );
+        }
+    }
+}
+
+/// Invalid exposed filters fail at binding instead of returning unfiltered data.
+#[tokio::test]
+async fn items_get_result_invalid_filters_fail_before_querying() {
+    for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+        for parameter in [
+            "hasOverview=1",
+            "hasImdbId=yes",
+            "hasTmdbId=null",
+            "hasTvdbId=no",
+            "hasParentalRating=maybe",
+            "minPremiereDate=invalid",
+            "maxPremiereDate=2026-02-30",
+            "adjacentTo=not-a-guid",
+        ] {
+            let uri = format!("{path}?recursive=true&{parameter}");
+            let (status, query) = capture_items_filter_query(&uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert!(query.is_none(), "{uri} must fail before querying");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(serde::Deserialize)]
+struct ItemsDateOracleRow {
+    timezone: String,
+    raw: String,
+    utc: Option<String>,
+}
+
+/// The UTC instant `row` binds to on this host. Dublin's spring gap and
+/// autumn fold resolve through the zone's standard offset (.NET's
+/// `NoThrowOnInvalidTime`; Ferrofin's `mktime` with `tm_isdst = 0`), and the
+/// host's tzdata decides which offset that is: the main format makes Irish
+/// Standard Time (+01:00) standard with a negative winter DST, the rearguard
+/// format (Ubuntu's, so GitHub's runners) makes GMT standard. The oracle ran
+/// on main-format data; on a rearguard host .NET reads the same TZif as
+/// Ferrofin and answers an hour later.
+#[cfg(unix)]
+fn host_utc(row: &ItemsDateOracleRow) -> Option<chrono::DateTime<chrono::Utc>> {
+    let utc = row.utc.as_deref()?.parse().unwrap();
+    let transition = row.timezone == "Europe/Dublin"
+        && ["2026-03-29T01:30:00", "2026-10-25T01:30:00"]
+            .iter()
+            .any(|wall| row.raw.starts_with(wall));
+    if transition && winter_is_standard_time() {
+        return Some(utc + chrono::Duration::hours(1));
+    }
+    Some(utc)
+}
+
+/// Whether the process's zone (`TZ`) reports mid-January as standard time:
+/// false for a main-format Europe/Dublin, whose winter GMT is the DST.
+#[cfg(unix)]
+fn winter_is_standard_time() -> bool {
+    let january: libc::time_t = 1_768_478_400; // 2026-01-15T12:00:00Z
+    // SAFETY: localtime_r reads the zone the child process started with
+    // (`TZ`), writes one zero-initialized tm and returns null only when the
+    // time is unrepresentable.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        assert!(!libc::localtime_r(&raw const january, &raw mut tm).is_null());
+        tm.tm_isdst == 0
+    }
+}
+
+#[cfg(unix)]
+fn items_date_oracle_rows() -> Vec<ItemsDateOracleRow> {
+    if let Ok(path) = std::env::var("FERROFIN_ITEMS_DATE_ORACLE") {
+        return serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    }
+    // Actual BCL10 oracle results, with stable named-zone transition dates.
+    // A root-only validation may supply the full measured160+row JSON using
+    // FERROFIN_ITEMS_DATE_ORACLE; neither path mutates the test process TZ.
+    let cases = [
+        ("UTC", "2026-01-02", "2026-01-02T00:00:00Z"),
+        ("UTC", "1969-12-31T23:59:59", "1969-12-31T23:59:59Z"),
+        (
+            "America/New_York",
+            "2026-01-02T03:04:05.0000001",
+            "2026-01-02T08:04:05.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "2026-07-02T03:04:05.0000001",
+            "2026-07-02T07:04:05.0000001Z",
+        ),
+        ("America/New_York", "2026-01-02", "2026-01-02T05:00:00Z"),
+        (
+            "America/New_York",
+            "2026-03-08T02:30:00.0000001",
+            "2026-03-08T07:30:00.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "2026-11-01T01:30:00.0000001",
+            "2026-11-01T06:30:00.0000001Z",
+        ),
+        (
+            "America/New_York",
+            "0001-01-01T00:00:00",
+            "0001-01-01T04:57:00Z",
+        ),
+        (
+            "America/New_York",
+            "9999-12-31T23:59:59.9999999",
+            "9999-12-31T23:59:59.9999999Z",
+        ),
+        (
+            "Europe/Dublin",
+            "2026-03-29T01:30:00.0000001",
+            "2026-03-29T00:30:00.0000001Z",
+        ),
+        (
+            "Europe/Dublin",
+            "2026-10-25T01:30:00.0000001",
+            "2026-10-25T00:30:00.0000001Z",
+        ),
+        (
+            "Europe/Dublin",
+            "0001-01-01T00:00:00",
+            "0001-01-01T00:25:00Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "2026-04-05T01:45:00.0000001",
+            "2026-04-04T15:15:00.0000001Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "2026-10-04T02:15:00.0000001",
+            "2026-10-03T15:45:00.0000001Z",
+        ),
+        (
+            "Australia/Lord_Howe",
+            "0001-01-01T00:00:00",
+            "0001-01-01T00:00:00Z",
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(zone, raw, utc)| ItemsDateOracleRow {
+            timezone: zone.to_owned(),
+            raw: raw.to_owned(),
+            utc: Some(utc.to_owned()),
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+async fn capture_items_date_socket_query(uri: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+    };
+    let seen = Arc::clone(&library.last_query);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = create_router(ok_state_with(library));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket.write_all(format!("GET {uri} HTTP/1.1\r\nHost: {address}\r\nX-Emby-Token: valid\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.read_to_end(&mut bytes),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    read.expect("owned HTTP server responds").unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    let code = response
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let captured = seen.lock().unwrap().take();
+    (StatusCode::from_u16(code).unwrap(), captured)
+}
+
+/// The actual modern and legacy Items routes bind local dates in owned child
+/// processes so concurrent tests never change their environment or timezone.
+#[cfg(unix)]
+#[tokio::test]
+async fn items_get_result_local_dates_match_dotnet_child_process() {
+    let rows = items_date_oracle_rows();
+    let Ok(zone) = std::env::var("FERROFIN_ITEMS_DATE_TEST_ZONE") else {
+        let zones = rows
+            .iter()
+            .map(|row| &row.timezone)
+            .collect::<std::collections::BTreeSet<_>>();
+        for zone in zones {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "items_get_result_local_dates_match_dotnet_child_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("TZ", zone)
+                .env("FERROFIN_ITEMS_DATE_TEST_ZONE", zone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{zone}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    for row in rows.iter().filter(|row| row.timezone == zone) {
+        let encoded = form_urlencoded::byte_serialize(row.raw.as_bytes()).collect::<String>();
+        for path in ["/Items".to_owned(), format!("/Users/{USER_ID}/Items")] {
+            let uri = format!(
+                "{path}?recursive=true&minPremiereDate={encoded}&maxPremiereDate={encoded}"
+            );
+            let (status, query) = capture_items_date_socket_query(&uri).await;
+            if let Some(expected) = host_utc(row) {
+                assert_eq!(status, StatusCode::OK, "{zone}: {uri}");
+                let query = query.expect("query_items ran");
+                let expected = Some(expected);
+                assert_eq!(query.min_premiere_date, expected, "min {zone}: {uri}");
+                assert_eq!(query.max_premiere_date, expected, "max {zone}: {uri}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{zone}: {uri}");
+                assert!(query.is_none(), "{zone}: {uri} must fail before querying");
+            }
+        }
+    }
 }

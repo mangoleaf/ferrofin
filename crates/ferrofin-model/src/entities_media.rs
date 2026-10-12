@@ -23,8 +23,9 @@ use crate::media_info::audio_codec;
 ///
 /// Upstream this lives in `Jellyfin.Data.Enums`, but it is pulled in here
 /// because [`MediaStream`] derives it from the codec profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum AudioSpatialFormat {
     /// None audio spatial format.
     #[default]
@@ -34,6 +35,17 @@ pub enum AudioSpatialFormat {
     /// DTS:X audio spatial format.
     #[serde(rename = "DTSX")]
     Dtsx,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    AudioSpatialFormat, None, {
+        None => ("None", 0),
+        DolbyAtmos => ("DolbyAtmos", 1),
+        Dtsx => ("DTSX", 2),
+    }
 }
 
 /// Enum `MetadataProvider` — well-known external metadata sources.
@@ -197,6 +209,7 @@ pub struct ParentalRatingScore {
     pub score: i32,
     /// The sub score.
     #[serde(rename = "subScore", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sub_score: Option<i32>,
 }
 
@@ -243,6 +256,7 @@ pub struct ParentalRating {
     ///
     /// Deprecated: mirrors the score for backwards compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub value: Option<i32>,
     /// The rating score.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,10 +360,98 @@ pub struct VirtualFolderInfo {
     pub primary_image_item_id: Option<String>,
     /// The refresh progress.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub refresh_progress: Option<f64>,
     /// The refresh status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_status: Option<String>,
+}
+
+impl VirtualFolderInfo {
+    /// Whether one of this library's locations holds `path` — the location
+    /// itself or anything under it, compared as upstream compares physical
+    /// locations (`OrdinalIgnoreCase`).
+    #[must_use]
+    pub fn holds_path(&self, path: &str) -> bool {
+        self.location_holding(path).is_some()
+    }
+
+    /// The longest of this library's locations that holds `path`.
+    fn location_holding(&self, path: &str) -> Option<&str> {
+        let path = trim_separators(path);
+        self.locations
+            .iter()
+            .map(|location| trim_separators(location))
+            .filter(|location| {
+                path.len() >= location.len()
+                    && path.is_char_boundary(location.len())
+                    && path[..location.len()].eq_ignore_ascii_case(location)
+                    && (path.len() == location.len()
+                        || location.ends_with(['/', '\\'])
+                        || path[location.len()..].starts_with(['/', '\\']))
+            })
+            .max_by_key(|location| location.len())
+    }
+
+    /// Whether `top_parent_id` (a stored `TopParentId`, any GUID form) is
+    /// this library's collection folder.
+    fn is_collection_folder(&self, top_parent_id: &str) -> bool {
+        match (
+            self.item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+            uuid::Uuid::parse_str(top_parent_id).ok(),
+        ) {
+            (Some(own), Some(top)) => own == top,
+            _ => false,
+        }
+    }
+}
+
+/// A location without its trailing separators (the root stays itself).
+fn trim_separators(path: &str) -> &str {
+    match path.trim_end_matches(['/', '\\']) {
+        "" if !path.is_empty() => &path[..1],
+        trimmed => trimmed,
+    }
+}
+
+/// Every configured library one of whose locations holds `path` —
+/// `LibraryManager.GetCollectionFolders(item)`, which walks to the item's
+/// top-level physical folder and returns each collection folder whose
+/// physical locations contain it, so a folder two libraries share is in both.
+#[must_use]
+pub fn libraries_holding<'a>(
+    folders: &'a [VirtualFolderInfo],
+    path: &str,
+) -> Vec<&'a VirtualFolderInfo> {
+    folders.iter().filter(|f| f.holds_path(path)).collect()
+}
+
+/// The configured library that owns an item stored with `top_parent_id` at
+/// `path` (its own path, or for a path-less item its nearest ancestor's):
+/// the library whose collection folder is the `TopParentId` (a row an older
+/// Ferrofin scan wrote), else the one a location of which holds the path —
+/// the innermost, where locations nest. Upstream reads library options and
+/// collection folders through the item's location the same way
+/// (`LibraryManager.GetLibraryOptions` → `GetCollectionFolders`).
+#[must_use]
+pub fn owning_library<'a>(
+    folders: &'a [VirtualFolderInfo],
+    top_parent_id: Option<&str>,
+    path: Option<&str>,
+) -> Option<&'a VirtualFolderInfo> {
+    if let Some(top) = top_parent_id
+        && let Some(folder) = folders.iter().find(|f| f.is_collection_folder(top))
+    {
+        return Some(folder);
+    }
+    let path = path?;
+    folders
+        .iter()
+        .filter_map(|f| f.location_holding(path).map(|location| (location.len(), f)))
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, f)| f)
 }
 
 /// Since `BaseItem` and `DTOBaseItem` both have provider ids, this trait helps
@@ -400,30 +502,39 @@ pub struct MediaStream {
     pub color_primaries: Option<String>,
     /// The Dolby Vision version major.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_version_major: Option<i32>,
     /// The Dolby Vision version minor.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_version_minor: Option<i32>,
     /// The Dolby Vision profile.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_profile: Option<i32>,
     /// The Dolby Vision level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_level: Option<i32>,
     /// The Dolby Vision rpu present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rpu_present_flag: Option<i32>,
     /// The Dolby Vision el present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub el_present_flag: Option<i32>,
     /// The Dolby Vision bl present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bl_present_flag: Option<i32>,
     /// The Dolby Vision bl signal compatibility id.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub dv_bl_signal_compatibility_id: Option<i32>,
     /// The rotation in degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub rotation: Option<i32>,
     /// The comment.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -445,6 +556,7 @@ pub struct MediaStream {
     pub display_title: Option<String>,
     /// The HDR10+ present flag.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub hdr10_plus_present_flag: Option<bool>,
     /// The localized "undefined" label.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,27 +594,34 @@ pub struct MediaStream {
     pub is_interlaced: bool,
     /// A value indicating whether this instance is AVC.
     #[serde(rename = "IsAVC", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_avc: Option<bool>,
     /// The channel layout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_layout: Option<String>,
     /// The bit rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bit_rate: Option<i32>,
     /// The bit depth.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub bit_depth: Option<i32>,
     /// The reference frames.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub ref_frames: Option<i32>,
     /// The length of the packet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub packet_length: Option<i32>,
     /// The channels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub channels: Option<i32>,
     /// The sample rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub sample_rate: Option<i32>,
     /// A value indicating whether this instance is default.
     pub is_default: bool,
@@ -518,21 +637,25 @@ pub struct MediaStream {
     pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub height: Option<i32>,
     /// The width.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub width: Option<i32>,
     /// The average frame rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub average_frame_rate: Option<f32>,
     /// The real frame rate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub real_frame_rate: Option<f32>,
     /// The profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// The type.
-    #[serde(rename = "Type", deserialize_with = "deserialize_media_stream_type")]
+    #[serde(rename = "Type")]
     pub stream_type: MediaStreamType,
     /// The aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -541,17 +664,20 @@ pub struct MediaStream {
     pub index: i32,
     /// The score.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub score: Option<i32>,
     /// A value indicating whether this instance is external.
     pub is_external: bool,
     /// The delivery method.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub delivery_method: Option<SubtitleDeliveryMethod>,
     /// The delivery URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_url: Option<String>,
     /// A value indicating whether this instance is an external URL.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_external_url: Option<bool>,
     /// A value indicating whether external streams are supported.
     pub supports_external_stream: bool,
@@ -563,30 +689,37 @@ pub struct MediaStream {
     pub pixel_format: Option<String>,
     /// The level.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub level: Option<f64>,
     /// A value indicating whether this instance is anamorphic.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_anamorphic: Option<bool>,
     /// The video color range (SDR/HDR), derived from the color / Dolby-Vision
     /// metadata by [`video_range`](Self::video_range). Populated when the wire DTO
     /// is built (Jellyfin serializes it as a computed property).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_range: Option<VideoRange>,
     /// The specific video range type (HDR10/HLG/DOVI/…), from
     /// [`video_range_type`](Self::video_range_type). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub video_range_type: Option<VideoRangeType>,
     /// The spatial audio format (Dolby Atmos / DTS:X), from
     /// [`audio_spatial_format`](Self::audio_spatial_format). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub audio_spatial_format: Option<AudioSpatialFormat>,
     /// Whether this is a text-based subtitle stream (from the codec), from
     /// [`is_text_subtitle_stream`](Self::is_text_subtitle_stream). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_text_subtitle_stream: Option<bool>,
     /// The reference frame rate (average, or real when average is missing/unrealistic),
     /// from [`reference_frame_rate`](Self::reference_frame_rate). Populated when the DTO is built.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub reference_frame_rate: Option<f32>,
 }
 
@@ -738,7 +871,7 @@ impl MediaStream {
                 } else {
                     let video_range = self.video_range();
                     if video_range != VideoRange::Unknown {
-                        attributes.push(video_range_to_string(video_range).to_owned());
+                        attributes.push(video_range_to_string(video_range));
                     }
                 }
 
@@ -1016,12 +1149,8 @@ fn it(interlaced: bool, base: &str) -> String {
 }
 
 /// The `ToString()` of a [`VideoRange`], matching the C# enum member names.
-fn video_range_to_string(range: VideoRange) -> &'static str {
-    match range {
-        VideoRange::Unknown => "Unknown",
-        VideoRange::Sdr => "SDR",
-        VideoRange::Hdr => "HDR",
-    }
+fn video_range_to_string(range: VideoRange) -> String {
+    range.json_name().into_owned()
 }
 
 /// Joins `attributes` with `separator`; if a `title` is present, appends only
@@ -1200,50 +1329,163 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     remove_provider_id(instance, provider.as_name());
 }
 
-/// Deserializes a [`MediaStreamType`] from either its PascalCase string name or
-/// its integer discriminant.
-///
-/// Jellyfin's `System.Text.Json` enum converter accepts both forms on read; the
-/// checked-in test fixtures encode `MediaStream.Type` as an integer.
-fn deserialize_media_stream_type<'de, D>(deserializer: D) -> Result<MediaStreamType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrString {
-        Int(u8),
-        Str(String),
+/// Numeric/date snapshot used to sort normal episodes and positioned specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiredEpisodeOrder {
+    /// Physical parent season number.
+    pub season: Option<i64>,
+    /// Episode number within its parent season.
+    pub episode: Option<i64>,
+    /// Known premiere date, used to break regular episode ties.
+    pub premiere: Option<chrono::DateTime<chrono::Utc>>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Episode before which a special airs.
+    pub airs_before_episode: Option<i64>,
+}
+
+impl AiredEpisodeOrder {
+    /// Whether this snapshot represents season zero.
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.season.unwrap_or(-1) == 0
     }
 
-    match IntOrString::deserialize(deserializer)? {
-        IntOrString::Int(n) => match n {
-            0 => Ok(MediaStreamType::Audio),
-            1 => Ok(MediaStreamType::Video),
-            2 => Ok(MediaStreamType::Subtitle),
-            3 => Ok(MediaStreamType::EmbeddedImage),
-            4 => Ok(MediaStreamType::Data),
-            5 => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType discriminant: {other}"
-            ))),
-        },
-        IntOrString::Str(s) => match s.as_str() {
-            "Audio" => Ok(MediaStreamType::Audio),
-            "Video" => Ok(MediaStreamType::Video),
-            "Subtitle" => Ok(MediaStreamType::Subtitle),
-            "EmbeddedImage" => Ok(MediaStreamType::EmbeddedImage),
-            "Data" => Ok(MediaStreamType::Data),
-            "Lyric" => Ok(MediaStreamType::Lyric),
-            other => Err(serde::de::Error::custom(format!(
-                "invalid MediaStreamType: {other}"
-            ))),
-        },
+    /// Compare aired positions exactly as Jellyfin's `AiredEpisodeOrderComparer`.
+    #[must_use]
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_special(), other.is_special()) {
+            (true, true) => self.special_value().cmp(&other.special_value()),
+            (false, false) => self.compare_episodes(other),
+            (false, true) => self.compare_episode_to_special(other),
+            (true, false) => other.compare_episode_to_special(self).reverse(),
+        }
+    }
+
+    /// `CompareEpisodeToSpecial(x = self, y = special)`.
+    fn compare_episode_to_special(&self, special: &Self) -> std::cmp::Ordering {
+        let x_season = self.season.unwrap_or(-1);
+        let y_season = special
+            .airs_after_season
+            .or(special.airs_before_season)
+            .unwrap_or(-1);
+        if x_season != y_season {
+            return x_season.cmp(&y_season);
+        }
+        // Special comes after the episode's season.
+        if special.airs_after_season.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        // Special comes before the season.
+        let Some(y_episode) = special.airs_before_episode else {
+            return std::cmp::Ordering::Greater;
+        };
+        // Can't really compare if this happens.
+        let Some(x_episode) = self.episode else {
+            return std::cmp::Ordering::Equal;
+        };
+        // Special comes before the episode it names.
+        if x_episode == y_episode {
+            return std::cmp::Ordering::Greater;
+        }
+        x_episode.cmp(&y_episode)
+    }
+
+    /// `GetSpecialCompareValue`: season, then airs-after, then the episode
+    /// it airs before, then the special's own number.
+    fn special_value(&self) -> i64 {
+        let mut value = self
+            .airs_after_season
+            .or(self.airs_before_season)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000);
+        if self.airs_after_season.is_some() {
+            value = value.saturating_add(1_000_000);
+        }
+        value = value.saturating_add(self.airs_before_episode.unwrap_or(0).saturating_mul(1_000));
+        value.saturating_add(self.episode.unwrap_or(0))
+    }
+
+    /// `CompareEpisodes`: `(season ?? -1) * 1000 + (episode ?? -1)`, then the
+    /// premiere dates when both are known.
+    fn compare_episodes(&self, other: &Self) -> std::cmp::Ordering {
+        let value = |o: &Self| {
+            o.season
+                .unwrap_or(-1)
+                .saturating_mul(1_000)
+                .saturating_add(o.episode.unwrap_or(-1))
+        };
+        let by_number = value(self).cmp(&value(other));
+        if by_number != std::cmp::Ordering::Equal {
+            return by_number;
+        }
+        match (self.premiere, other.premiere) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
+        let library = |id: &str, locations: &[&str]| super::VirtualFolderInfo {
+            item_id: Some(id.to_owned()),
+            locations: locations.iter().map(|l| (*l).to_owned()).collect(),
+            ..super::VirtualFolderInfo::default()
+        };
+        let movies = library("11111111-1111-1111-1111-111111111111", &["/media/Movies/"]);
+        let kids = library(
+            "22222222-2222-2222-2222-222222222222",
+            &["/media/movies/Kids"],
+        );
+        let all = [movies, kids];
+        let name = |f: Option<&super::VirtualFolderInfo>| f.and_then(|f| f.item_id.clone());
+        // An older row's collection folder, in the database's GUID form.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some(
+                    "11111111-1111-1111-1111-111111111111"
+                        .to_uppercase()
+                        .as_str()
+                ),
+                None
+            )),
+            all[0].item_id
+        );
+        // By path: case-insensitive, the innermost location wins.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some("not-a-library"),
+                Some("/media/MOVIES/Heat/Heat.mkv")
+            )),
+            all[0].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                None,
+                Some("/media/movies/Kids/Up/Up.mkv")
+            )),
+            all[1].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(&all, None, Some("/media/movies"))),
+            all[0].item_id
+        );
+        // A sibling that only shares a prefix is no location's.
+        assert!(super::owning_library(&all, None, Some("/media/Movies2/x.mkv")).is_none());
+        assert_eq!(
+            super::libraries_holding(&all, "/media/movies/Kids/Up").len(),
+            2
+        );
+    }
     use super::*;
 
     #[test]
@@ -1837,8 +2079,23 @@ mod tests {
                 serde_json::from_value(serde_json::json!({ "Type": str_wire })).unwrap();
             assert_eq!(from_str.stream_type, expected);
         }
+        // A name matches ignoring case, as `JsonStringEnumConverter` reads it.
+        for (wire, expected) in [
+            ("audio", MediaStreamType::Audio),
+            ("SUBTITLE", MediaStreamType::Subtitle),
+            ("embeddedImage", MediaStreamType::EmbeddedImage),
+        ] {
+            let stream: MediaStream =
+                serde_json::from_value(serde_json::json!({ "Type": wire })).unwrap();
+            assert_eq!(stream.stream_type, expected, "{wire}");
+        }
         // Out-of-range int and unknown string both error.
-        assert!(serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 })).is_err());
+        assert_eq!(
+            serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": 99 }))
+                .unwrap()
+                .stream_type,
+            MediaStreamType::Unrecognized(99)
+        );
         assert!(
             serde_json::from_value::<MediaStream>(serde_json::json!({ "Type": "Nope" })).is_err()
         );
@@ -1855,5 +2112,139 @@ mod tests {
         assert!(json.get("LibraryOptions").is_some());
         let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, info);
+    }
+}
+
+#[cfg(test)]
+mod aired_episode_order_tests {
+    use super::AiredEpisodeOrder;
+    use rstest::rstest;
+    use std::cmp::Ordering;
+    fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+        value.parse().unwrap()
+    }
+    /// A comparer operand: `(season, episode, before_season, after_season,
+    /// before_episode, premiere)`.
+    fn order(
+        season: Option<i64>,
+        episode: Option<i64>,
+        before_season: Option<i64>,
+        after_season: Option<i64>,
+        before_episode: Option<i64>,
+        premiere: Option<&str>,
+    ) -> AiredEpisodeOrder {
+        AiredEpisodeOrder {
+            season,
+            episode,
+            premiere: premiere.map(ts),
+            airs_before_season: before_season,
+            airs_after_season: after_season,
+            airs_before_episode: before_episode,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        order(None, None, None, None, None, None),
+        order(None, None, None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(2), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(0), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(2), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, Some(1), None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), None, None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(3), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Less
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        Ordering::Greater
+    )]
+    fn aired_episode_order_compare(
+        #[case] x: AiredEpisodeOrder,
+        #[case] y: AiredEpisodeOrder,
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(x.compare(&y), expected);
+        assert_eq!(y.compare(&x), expected.reverse());
     }
 }

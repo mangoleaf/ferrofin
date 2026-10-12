@@ -103,7 +103,8 @@ pub async fn backfill_by_name_presentation_keys(writer: &sqlx::SqlitePool) -> Re
             WHERE ("PresentationUniqueKey" IS NULL OR "PresentationUniqueKey" = '')
               AND "Type" IN ({placeholders})"#
     );
-    let mut query = sqlx::query_as::<_, (String, String, Option<String>)>(&select);
+    let mut query =
+        sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(select));
     for (type_name, _) in BY_NAME_PREFIXES {
         query = query.bind(type_name);
     }

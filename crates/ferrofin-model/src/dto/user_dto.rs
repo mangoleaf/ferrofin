@@ -40,20 +40,24 @@ pub struct UserDto {
 
     /// Gets or sets a value indicating whether this instance has password.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_password: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance has configured password.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_configured_password: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance has configured easy password.
     ///
     /// Deprecated: easy password has been replaced with Quick Connect.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_configured_easy_password: Option<bool>,
 
     /// Gets or sets whether auto login is enabled or not.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_auto_login: Option<bool>,
 
     /// Gets or sets the last login date.
@@ -78,6 +82,7 @@ pub struct UserDto {
 
     /// Gets or sets the primary image aspect ratio.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub primary_image_aspect_ratio: Option<f64>,
 }
 

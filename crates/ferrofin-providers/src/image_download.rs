@@ -11,6 +11,42 @@
 //! an extensionless URL is stored as a PNG, and a URL that answers JSON is
 //! refused instead of being written into the library as artwork.
 
+use crate::rate_limit::CountedBody as _;
+use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Image/CDN quotas are independent of metadata API quotas. Share a gate by
+/// origin across download callers, never one gate across unrelated hosts.
+///
+/// `label` is only the provider the caller's downloads are counted under
+/// (`ferrofin_metadata_provider_requests_total{provider}`): `image` for
+/// artwork, `opensubtitles` for a subtitle file. It never picks the gate:
+/// every caller of one origin shares its pacing and cooldowns whatever it is
+/// counted as (METRICS.md rule 6).
+pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
+    static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
+    let origin = reqwest::Url::parse(url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
+    LIMITERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(origin)
+        .or_insert_with_key(|origin| RateLimiter::new(origin.clone()))
+        .counted_as(label)
+}
+
+pub(crate) async fn send(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<reqwest::Response, RequestError> {
+    http.get(url)
+        .send_limited(&limiter_for(url, crate::metrics::IMAGE))
+        .await
+}
+
 use ferrofin_model::net::mime_types;
 
 /// GETs `url` and returns its bytes plus the media type resolved the way the
@@ -27,7 +63,7 @@ use ferrofin_model::net::mime_types;
 /// turns that into its own error. The media type is NOT validated here; see
 /// [`reject_non_image`].
 pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<(Vec<u8>, String)> {
-    let resp = http.get(url).send().await.ok()?;
+    let resp = send(http, url).await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -38,7 +74,7 @@ pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     let content_type = resolve_content_type(declared.as_deref(), url);
-    let bytes = resp.bytes().await.ok()?.to_vec();
+    let bytes = resp.counted_bytes().await.ok()?;
     Some((bytes, content_type))
 }
 
@@ -68,6 +104,20 @@ pub(crate) fn non_image_reason(content_type: &str) -> Option<String> {
 mod tests {
     use super::{non_image_reason, resolve_content_type};
     use rstest::rstest;
+
+    /// The label never picks the gate: an artwork download and a subtitle
+    /// download from one origin share its pacing and cooldowns, each counted
+    /// under its own provider; another origin has a gate of its own.
+    #[test]
+    fn two_labels_on_one_origin_share_one_gate() {
+        let artwork = super::limiter_for("https://cdn.example/poster.jpg", crate::metrics::IMAGE);
+        let subtitle = super::limiter_for("https://cdn.example/file.srt", "opensubtitles");
+        let other = super::limiter_for("https://elsewhere.example/poster.jpg", "image");
+        assert!(artwork.shares_gate_with(&subtitle));
+        assert!(!artwork.shares_gate_with(&other));
+        assert_eq!(artwork.metric_label(), "image");
+        assert_eq!(subtitle.metric_label(), "opensubtitles");
+    }
 
     #[rstest]
     // The response's own type wins, parameters stripped by the caller.
@@ -102,4 +152,110 @@ mod tests {
         // item's artwork and served back as `image/jpeg`.
         assert!(non_image_reason("text/html").is_some());
     }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    use crate::mock_http::MockServer;
+
+    #[tokio::test]
+    async fn downloads_share_origin_cooldowns_but_not_other_hosts() {
+        let blocked = MockServer::with_headers(
+            vec![("/", "image".to_owned())],
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
+        )
+        .await;
+        let other = MockServer::always("image").await;
+        let http = reqwest::Client::new();
+        assert!(send(&http, &blocked.base_url).await.is_ok());
+        assert!(matches!(
+            send(&http, &format!("{}/another-cover", blocked.base_url)).await,
+            Err(RequestError::Cooldown)
+        ));
+        assert!(send(&http, &other.base_url).await.is_ok());
+    }
+}
+
+/// Recognizes JPEG, PNG, GIF and WebP magic before persisting plugin artwork.
+/// This identifies the file format; image processing validates its dimensions.
+#[must_use]
+pub fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Successful automatic image download, with enough information to avoid
+/// duplicates and preserve the response's actual image format.
+#[derive(Debug)]
+pub struct ArtworkDownload {
+    /// Complete response body.
+    pub bytes: Vec<u8>,
+    /// Resolved image media type.
+    pub content_type: String,
+    /// Reported body length, for Jellyfin's backdrop duplicate check.
+    pub content_length: Option<u64>,
+}
+
+/// How automatic acquisition handles a failed candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkDownloadFailure {
+    /// A stale/forbidden URL: try the next candidate from this provider.
+    Skip,
+    /// Transport or another HTTP error: stop this provider's image-type pass.
+    Stop,
+}
+
+pub(crate) async fn download_artwork(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
+    let response = send(http, url)
+        .await
+        .map_err(|_| ArtworkDownloadFailure::Stop)?;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => {
+            return Err(ArtworkDownloadFailure::Skip);
+        }
+        status if !status.is_success() => return Err(ArtworkDownloadFailure::Stop),
+        _ => {}
+    }
+    let declared = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|header| header.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|value| !value.is_empty());
+    let content_type = resolve_content_type(declared.as_deref(), url);
+    if let Some(reason) = non_image_reason(&content_type) {
+        crate::rate_limit::note_request_failure();
+        tracing::warn!(%reason, "artwork provider returned a non-image response");
+        return Err(ArtworkDownloadFailure::Stop);
+    }
+    let content_length = response.content_length();
+    let bytes = response
+        .counted_bytes()
+        .await
+        .map_err(|_| ArtworkDownloadFailure::Stop)?;
+    Ok(ArtworkDownload {
+        bytes,
+        content_type,
+        content_length,
+    })
 }

@@ -63,7 +63,7 @@ pub(crate) fn build_provider() -> Result<(Registry, SdkMeterProvider), MetricsEr
         // so disable every form of auto-suffixing / decoration.
         .without_units()
         .without_counter_suffixes()
-        .without_scope_info()
+        .scope_info_enabled(false)
         .without_target_info()
         .build()
         .map_err(|e| MetricsError::Exporter(e.to_string()))?;
@@ -151,6 +151,10 @@ mod tests {
         );
         // No auto-suffixing: the name is verbatim, not `test_widget_total_total`.
         assert!(!out.contains("test_widget_total_total"));
+        assert!(
+            !out.contains("otel_scope_"),
+            "unexpected scope labels: {out}"
+        );
     }
 
     #[test]

@@ -5,18 +5,12 @@
 //! `BaseNfoSaver` and the per-kind savers (`MovieNfoSaver`, `EpisodeNfoSaver`,
 //! `SeriesNfoSaver`, `SeasonNfoSaver`, `AlbumNfoSaver`, `ArtistNfoSaver`).
 //!
-//! Only the pure serialization is ported here: the C# `SaveAsync` /
-//! `SaveToFileAsync` filesystem pipeline (byte-for-byte compare, hidden-attribute
-//! handling, atomic replace), the media-stream (`AddMediaInfo`) block — which
-//! needs `IHasMediaSources`, absent from [`NfoBaseItem`] — the image-path block
-//! (`SaveImagePathsInNfo`, off by default in First-Light), the user-data block
-//! (needs a user store), and the `AddCustomTags` merge of an existing file are
-//! deferred. What remains is the round-trip oracle: [`save_movie`] et al. produce
-//! the same tags [`super::fetch_movie`] et al. read back.
-//!
-//! The album/artist savers write child tracks/albums; [`NfoBaseItem`] carries no
-//! child collection, so those savers emit only the parent tags (the child loops
-//! become no-ops), which is faithful for a childless item.
+//! Pure item serialization is shared with the automatic sidecar writer in
+//! [`crate::nfo_save`]. Its runtime supplement adds streams, artwork, selected
+//! user data and custom tags from an existing document.
+
+mod runtime;
+pub(crate) use runtime::{DocumentExtras, complete_document};
 
 use std::fmt::Write as _;
 
@@ -28,6 +22,68 @@ use crate::container_types::{MetadataResult, PersonInfo};
 
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
+
+/// `Comparer<string>.Default` — the actual `CurrentCulture` collation — which
+/// every `OrderBy(string)` in `BaseNfoSaver` uses. Rust's `str::cmp` orders
+/// UTF-8 bytes and disagrees with it for non-ASCII text and for case (`ä`
+/// sorts after `z` byte-wise, before it in English).
+///
+/// The comparer for the culture in force is built once per culture and thread
+/// (the collation data is not `Send`) and shared; an unusable culture falls
+/// back to byte order rather than failing a save. Serialization is
+/// synchronous, so a `Collation` never crosses an `.await`.
+#[derive(Clone)]
+pub(crate) struct Collation(Option<std::rc::Rc<ferrofin_util::current_culture::CultureComparer>>);
+
+impl Collation {
+    /// The collation of the current culture.
+    pub(crate) fn current() -> Self {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        type Comparers =
+            HashMap<String, Option<Rc<ferrofin_util::current_culture::CultureComparer>>>;
+        thread_local! {
+            static COMPARERS: RefCell<Comparers> = RefCell::default();
+        }
+        let culture = ferrofin_util::current_culture::capture();
+        COMPARERS.with(|comparers| {
+            Self(
+                comparers
+                    .borrow_mut()
+                    .entry(culture.clone())
+                    .or_insert_with(|| {
+                        ferrofin_util::current_culture::comparer(&culture)
+                            .ok()
+                            .map(Rc::new)
+                    })
+                    .clone(),
+            )
+        })
+    }
+
+    /// Orders two strings as the current culture does.
+    pub(crate) fn compare(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        self.0
+            .as_ref()
+            .map_or_else(|| left.cmp(right), |comparer| comparer.compare(left, right))
+    }
+}
+
+/// `StringComparer.OrdinalIgnoreCase.Equals`: equal after each character's
+/// simple (one-to-one) invariant upper-casing. Unlike `eq_ignore_ascii_case`
+/// it folds non-ASCII letters (`é`/`É`, `ж`/`Ж`), and unlike Rust's full case
+/// mapping it does not expand (`ß` stays `ß`, as .NET's `ToUpperInvariant`).
+pub(crate) fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
+    fn fold(c: char) -> char {
+        let mut upper = c.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(single), None) => single,
+            _ => c,
+        }
+    }
+    left.chars().map(fold).eq(right.chars().map(fold))
+}
 
 /// The `dateadded` timestamp format (`BaseNfoSaver.DateAddedFormat`).
 const DATE_ADDED_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -154,19 +210,34 @@ fn strip_html(text: &str) -> String {
     out.trim().replace("&quot;", "'")
 }
 
-/// Formats a `DateTime` with a chrono `strftime` string (invariant culture).
+/// `DateTime.ToString(format, CultureInfo.InvariantCulture)` with the NFO
+/// `ReleaseDateFormat`.
+///
+/// A malformed pattern throws `FormatException` upstream, aborting the save;
+/// the Ferrofin save path rejects it first ([`release_date_format_error`]), so
+/// the ISO fallback only serves direct callers that skipped that check.
 fn format_date(date: DateTime<Utc>, fmt: &str) -> String {
-    date.format(fmt).to_string()
+    super::dotnet_date::format_date_time(date, fmt)
+        .unwrap_or_else(|| date.format("%Y-%m-%d").to_string())
 }
 
-/// Converts the .NET release-date format to a chrono `strftime` string.
-///
-/// The NFO configuration only ever carries `"yyyy-MM-dd"` (see
-/// [`super::config::NfoConfiguration::release_date_format`]), which the parser
-/// reads back with `try_read_date_time_exact`'s `yyyy-MM-dd` path; the single
-/// mapped format is therefore the only one the round trip needs.
-fn release_date_strftime(_format: &str) -> &'static str {
-    "%Y-%m-%d"
+/// Why `config`'s release-date format cannot be used to write `item`'s dates,
+/// when it cannot: upstream's `FormatException`, raised only when a date is
+/// actually written (`premiered`/`releasedate`/`formed`/`enddate`/`aired`/
+/// `disbanded`).
+#[must_use]
+pub fn release_date_format_error(item: &NfoBaseItem, config: &NfoConfiguration) -> Option<String> {
+    let writes_date = if item.kind == NfoItemKind::Episode {
+        item.premiere_date.is_some()
+    } else {
+        item.premiere_date.is_some() || item.end_date.is_some()
+    };
+    (writes_date && !super::dotnet_date::is_valid_format(&config.release_date_format)).then(|| {
+        format!(
+            "ReleaseDateFormat {:?} is not a valid date format",
+            config.release_date_format
+        )
+    })
 }
 
 /// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`).
@@ -183,8 +254,22 @@ fn output_trailer_url(url: &str) -> String {
 }
 
 /// The lowercase `<key>id` tag `BaseNfoSaver.GetTagForProviderKey` derives.
+///
+/// `providerKey.ToLowerInvariant() + "id"`: every character is lower-cased one
+/// to one, non-ASCII letters included (a full Unicode mapping that expands a
+/// character is not .NET's).
 fn tag_for_provider_key(key: &str) -> String {
-    format!("{}id", key.to_ascii_lowercase())
+    let lower: String = key
+        .chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(single), None) => single,
+                _ => c,
+            }
+        })
+        .collect();
+    format!("{lower}id")
 }
 
 /// Whether `item` derives from `Video` for the `is not Video` outline guard.
@@ -239,9 +324,9 @@ fn add_common_nodes(
         writer.element("lockedfields", &joined);
     }
 
-    let date_added = item
-        .date_created
-        .map_or_else(default_date_added, |d| format_date(d, DATE_ADDED_FORMAT));
+    let date_added = item.date_created.map_or_else(default_date_added, |d| {
+        d.format(DATE_ADDED_FORMAT).to_string()
+    });
     writer.element("dateadded", &date_added);
 
     writer.element("title", item.name.as_deref().unwrap_or_default());
@@ -259,10 +344,11 @@ fn add_common_nodes(
 
     // Directors, then writers, then credits (writers again), each distinct
     // (case-insensitive) and sorted ascending.
-    for name in distinct_sorted_people(people, PersonKind::Director) {
+    let collation = Collation::current();
+    for name in distinct_sorted_people(people, PersonKind::Director, &collation) {
         writer.element("director", &name);
     }
-    let writers = distinct_sorted_people(people, PersonKind::Writer);
+    let writers = distinct_sorted_people(people, PersonKind::Writer, &collation);
     for name in &writers {
         writer.element("writer", name);
     }
@@ -272,7 +358,7 @@ fn add_common_nodes(
 
     // Trailers, ordered by trimmed URL.
     let mut trailers: Vec<&String> = item.remote_trailers.iter().collect();
-    trailers.sort_by(|a, b| a.trim().cmp(b.trim()));
+    trailers.sort_by(|a, b| collation.compare(a.trim(), b.trim()));
     for trailer in trailers {
         writer.element("trailer", &output_trailer_url(trailer));
     }
@@ -355,7 +441,7 @@ fn add_common_nodes(
         writer.element("countrycode", cc);
     }
 
-    let date_fmt = release_date_strftime(&config.release_date_format);
+    let date_fmt = config.release_date_format.as_str();
     if let Some(premiere) = item
         .premiere_date
         .filter(|_| item.kind != NfoItemKind::Episode)
@@ -393,18 +479,18 @@ fn add_common_nodes(
         writer.element("tagline", tagline);
     }
 
-    for country in sorted_trimmed(&item.production_locations) {
+    for country in sorted_trimmed(&item.production_locations, &collation) {
         writer.element("country", &country);
     }
-    for genre in sorted_trimmed(&item.genres) {
+    for genre in sorted_trimmed(&item.genres, &collation) {
         writer.element("genre", &genre);
     }
-    for studio in sorted_trimmed(&item.studios) {
+    for studio in sorted_trimmed(&item.studios, &collation) {
         writer.element("studio", &studio);
     }
     // Both music kinds write their tags as `<style>`.
     let tag_element = if is_music(item.kind) { "style" } else { "tag" };
-    for tag in sorted_trimmed(&item.tags) {
+    for tag in sorted_trimmed(&item.tags, &collation) {
         writer.element(tag_element, &tag);
     }
 
@@ -477,7 +563,7 @@ fn add_common_nodes(
                     .any(|w| w.eq_ignore_ascii_case(key))
         })
         .collect();
-    remaining.sort_by(|a, b| a.0.cmp(b.0));
+    remaining.sort_by(|a, b| collation.compare(a.0, b.0));
     for (key, value) in remaining {
         let tag = tag_for_provider_key(key);
         if is_valid_xml_name(&tag) {
@@ -485,13 +571,12 @@ fn add_common_nodes(
         }
     }
 
-    // Image paths (SaveImagePathsInNfo) and user data are deferred (off in
-    // First-Light); the parser has no target for either.
+    // The runtime supplement appends artwork and the selected user data.
 
     // C# `if (item is not MusicAlbum && item is not MusicArtist)` — the music
     // kinds get their credits from their own savers, not `<actor>` blocks.
     if !is_music(item.kind) {
-        add_actors(writer, people);
+        add_actors(writer, people, &collation);
     }
 }
 
@@ -528,13 +613,13 @@ fn write_fixed_provider(
 ///
 /// Directors and writers are excluded (they went to `<director>`/`<writer>`).
 /// Ordered by sort order then trimmed name.
-fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo]) {
+fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo], collation: &Collation) {
     let mut sorted: Vec<&PersonInfo> = people.iter().collect();
     sorted.sort_by(|a, b| {
         a.sort_order
             .unwrap_or(0)
             .cmp(&b.sort_order.unwrap_or(0))
-            .then_with(|| a.name.trim().cmp(b.name.trim()))
+            .then_with(|| collation.compare(a.name.trim(), b.name.trim()))
     });
 
     for person in sorted {
@@ -556,7 +641,9 @@ fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo]) {
         if let Some(order) = person.sort_order {
             writer.element("sortorder", &order.to_string());
         }
-        // Image path (saveImagePath) is deferred.
+        if let Some(path) = person.image_url.as_deref().filter(|path| !path.is_empty()) {
+            writer.element("thumb", path);
+        }
 
         writer.end_element("actor");
     }
@@ -564,26 +651,30 @@ fn add_actors(writer: &mut NfoWriter, people: &[PersonInfo]) {
 
 /// Returns the distinct (case-insensitive), ascending-sorted names of the people
 /// of `kind` (`BaseNfoSaver` director/writer projection).
-fn distinct_sorted_people(people: &[PersonInfo], kind: PersonKind) -> Vec<String> {
+fn distinct_sorted_people(
+    people: &[PersonInfo],
+    kind: PersonKind,
+    collation: &Collation,
+) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for person in people.iter().filter(|p| p.is_type(kind)) {
         let name = person.name.trim().to_owned();
-        if !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+        if !names.iter().any(|n| equals_ordinal_ignore_case(n, &name)) {
             names.push(name);
         }
     }
-    names.sort();
+    names.sort_by(|a, b| collation.compare(a, b));
     names
 }
 
 /// Trims each string, drops empties, and sorts ascending (`.Trimmed().OrderBy`).
-fn sorted_trimmed(values: &[String]) -> Vec<String> {
+fn sorted_trimmed(values: &[String], collation: &Collation) -> Vec<String> {
     let mut out: Vec<String> = values
         .iter()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
         .collect();
-    out.sort();
+    out.sort_by(|a, b| collation.compare(a, b));
     out
 }
 
@@ -642,7 +733,7 @@ pub fn save_movie(result: &MetadataResult<NfoBaseItem>, config: &NfoConfiguratio
     }
 
     if item.kind == NfoItemKind::MusicVideo {
-        for artist in sorted_trimmed(&item.artists) {
+        for artist in sorted_trimmed(&item.artists, &Collation::current()) {
             writer.element("artist", &artist);
         }
         if let Some(album) = item.album.as_deref().filter(|s| !s.is_empty()) {
@@ -682,7 +773,7 @@ pub fn save_episode(result: &MetadataResult<NfoBaseItem>, config: &NfoConfigurat
         writer.element("season", &season.to_string());
     }
     if let Some(premiere) = item.premiere_date {
-        let fmt = release_date_strftime(&config.release_date_format);
+        let fmt = config.release_date_format.as_str();
         writer.element("aired", &format_date(premiere, fmt));
     }
 
@@ -807,10 +898,11 @@ pub fn save_album(
     writer.start_element("album");
     add_common_nodes(&mut writer, item, people_slice(result), config);
 
-    for artist in sorted_trimmed(&item.artists) {
+    let collation = Collation::current();
+    for artist in sorted_trimmed(&item.artists, &collation) {
         writer.element("artist", &artist);
     }
-    for artist in sorted_trimmed(&item.album_artists) {
+    for artist in sorted_trimmed(&item.album_artists, &collation) {
         writer.element("albumartist", &artist);
     }
 
@@ -866,7 +958,7 @@ pub fn save_artist(
     add_common_nodes(&mut writer, item, people_slice(result), config);
 
     if let Some(end) = item.end_date {
-        let fmt = release_date_strftime(&config.release_date_format);
+        let fmt = config.release_date_format.as_str();
         writer.element("disbanded", &format_date(end, fmt));
     }
 
@@ -960,10 +1052,133 @@ mod tests {
         assert_eq!(invariant_f32(8.5), "8.5");
     }
 
+    /// `OrderBy(string)` in `BaseNfoSaver` uses the actual current culture, so
+    /// the same names serialize in a different order under a culture that sorts
+    /// `ä` after `z` (Swedish) than under one that sorts it beside `a`
+    /// (English). Rust's byte order is neither.
+    #[tokio::test]
+    async fn generic_name_ordering_follows_the_current_culture() {
+        let mut item = NfoBaseItem::new(NfoItemKind::Movie);
+        item.name = Some("Film".to_owned());
+        item.genres = vec!["Zebra".into(), " \u{c4}rlig ".into(), "Apa".into()];
+        item.studios = vec!["Zeta".into(), "\u{c4}ngel".into()];
+        item.tags = vec!["z-tag".into(), "\u{e4}-tag".into()];
+        item.production_locations = vec!["Zimbabwe".into(), "\u{d6}sterrike".into()];
+        item.remote_trailers = vec![
+            "https://example.com/z".into(),
+            "https://example.com/\u{e4}".into(),
+        ];
+        item.provider_ids = [("Zeta", "1"), ("\u{c4}pple", "2")]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let person = |name: &str, kind| PersonInfo {
+            name: name.to_owned(),
+            type_: kind,
+            ..PersonInfo::default()
+        };
+        let people = vec![
+            person("Zed", PersonKind::Actor),
+            person("\u{c4}sa", PersonKind::Actor),
+            person("Zed Director", PersonKind::Director),
+            person("\u{c4}ke Director", PersonKind::Director),
+        ];
+        let result = MetadataResult {
+            people: Some(people),
+            ..MetadataResult::new(item)
+        };
+        // Position of `later` after `earlier` in each culture's document.
+        for (culture, ae_first) in [("en-US", true), ("sv", false)] {
+            let xml = ferrofin_util::current_culture::scope(culture.into(), async {
+                tokio::task::yield_now().await;
+                save_movie(&result, &NfoConfiguration::default())
+            })
+            .await;
+            let at = |needle: &str| {
+                xml.find(needle)
+                    .unwrap_or_else(|| panic!("`{needle}` missing from {xml}"))
+            };
+            let before = |first: &str, second: &str| at(first) < at(second);
+            assert_eq!(
+                before("<genre>\u{c4}rlig</genre>", "<genre>Zebra</genre>"),
+                ae_first,
+                "{culture} genres"
+            );
+            assert_eq!(
+                before("<studio>\u{c4}ngel</studio>", "<studio>Zeta</studio>"),
+                ae_first,
+                "{culture} studios"
+            );
+            assert_eq!(
+                before("<tag>\u{e4}-tag</tag>", "<tag>z-tag</tag>"),
+                ae_first,
+                "{culture} tags"
+            );
+            assert_eq!(
+                before(
+                    "<country>\u{d6}sterrike</country>",
+                    "<country>Zimbabwe</country>"
+                ),
+                ae_first,
+                "{culture} countries"
+            );
+            assert_eq!(
+                before(
+                    "<director>\u{c4}ke Director</director>",
+                    "<director>Zed Director</director>"
+                ),
+                ae_first,
+                "{culture} directors"
+            );
+            assert_eq!(
+                before("example.com/\u{e4}", "example.com/z"),
+                ae_first,
+                "{culture} trailers"
+            );
+            assert_eq!(
+                before("<\u{e4}pple", "<zeta"),
+                ae_first,
+                "{culture} provider keys"
+            );
+            assert_eq!(
+                before("<name>\u{c4}sa</name>", "<name>Zed</name>"),
+                ae_first,
+                "{culture} actors"
+            );
+        }
+    }
+
+    /// Director/writer duplicates are dropped by `OrdinalIgnoreCase`, which
+    /// folds non-ASCII letters (`é`/`É`) that an ASCII-only comparison keeps
+    /// apart, and keeps `ß` and `SS` distinct as .NET's one-to-one upper-casing.
+    #[test]
+    fn distinct_people_use_ordinal_ignore_case() {
+        assert!(equals_ordinal_ignore_case("\u{c9}mile", "\u{e9}mile"));
+        assert!(equals_ordinal_ignore_case("\u{416}", "\u{436}"));
+        assert!(!equals_ordinal_ignore_case("Stra\u{df}e", "STRASSE"));
+        assert!(!equals_ordinal_ignore_case("e\u{301}", "\u{e9}"));
+        let person = |name: &str| PersonInfo {
+            name: name.to_owned(),
+            type_: PersonKind::Director,
+            ..PersonInfo::default()
+        };
+        let people = [
+            person("\u{c9}mile"),
+            person("\u{e9}mile"),
+            person("  \u{c9}MILE "),
+        ];
+        assert_eq!(
+            distinct_sorted_people(&people, PersonKind::Director, &Collation(None)),
+            ["\u{c9}mile"],
+            "the first spelling survives"
+        );
+    }
+
     #[test]
     fn tag_for_provider_key_lowercases_and_suffixes() {
         assert_eq!(tag_for_provider_key("MyCustom"), "mycustomid");
         assert_eq!(tag_for_provider_key("Imdb"), "imdbid");
+        assert_eq!(tag_for_provider_key("\u{c4}pple"), "\u{e4}ppleid");
     }
 
     #[test]

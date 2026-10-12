@@ -15,6 +15,7 @@ pub struct RemoteImageQuery {
 
     /// Gets or sets the image type.
     #[serde(rename = "ImageType", skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_type: Option<ImageType>,
 
     /// Gets or sets a value indicating whether to include disabled providers.

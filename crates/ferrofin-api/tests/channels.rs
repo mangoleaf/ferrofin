@@ -42,7 +42,7 @@ impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -55,7 +55,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -70,7 +70,7 @@ impl AuthService for UserAuth {
         Ok(AuthorizationInfo {
             user: Some(fake_user_entity(self.0, "caller")),
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -84,7 +84,7 @@ impl AuthorizationContext for UserAuth {
         Ok(AuthorizationInfo {
             user: Some(fake_user_entity(self.0, "caller")),
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }

@@ -25,21 +25,78 @@ use crate::state::AppState;
 /// RefreshPriority.High)` call the subtitle/lyric upload+download handlers make
 /// after mutating an item's sidecar files, so the freshly added stream is picked
 /// up. Uses [`MetadataRefreshOptions::default`] (the C# constructor with only a
-/// directory service is a no-op-mode refresh).
+/// directory service: `Default` modes, nothing replaced). A file item refreshes
+/// through the library scan of its path, whose probe re-runs because its
+/// sidecar set changed (`ProbeProvider.HasChanged`); an item with no file of
+/// its own through the provider manager.
 pub(crate) async fn queue_high_priority_refresh(
     state: &AppState,
     item_id: Uuid,
 ) -> Result<(), ApiError> {
+    use ferrofin_traits::library::ScanTarget;
     use ferrofin_traits::providers::{MetadataRefreshOptions, RefreshPriority};
+    let options = MetadataRefreshOptions::default();
+    let item = state.library.get_item_by_id(item_id).await?;
+    if let Some(path) = item.as_ref().and_then(refresh_scan_path) {
+        state
+            .library
+            .queue_refresh_scan(ScanTarget::Items(vec![path]), &options)
+            .await?;
+        return Ok(());
+    }
     state
         .providers
-        .queue_refresh(
-            item_id,
-            &MetadataRefreshOptions::default(),
-            RefreshPriority::High,
-        )
+        .queue_refresh(item_id, &options, RefreshPriority::High)
         .await?;
     Ok(())
+}
+
+/// Whether the library scan can reach `target`: every path of it lies under
+/// a location of a configured library (the scan plans nothing anywhere
+/// else). A library or the root always can.
+pub(crate) async fn scan_reaches(
+    state: &AppState,
+    target: &ferrofin_traits::library::ScanTarget,
+) -> Result<bool, ApiError> {
+    use ferrofin_traits::library::ScanTarget;
+    let (ScanTarget::Paths(paths) | ScanTarget::Items(paths)) = target else {
+        return Ok(true);
+    };
+    let folders = state.virtual_folders.get_virtual_folders().await?;
+    Ok(paths.iter().all(|path| {
+        folders.iter().any(|folder| {
+            folder
+                .locations
+                .iter()
+                .any(|location| path_is_under(path, location))
+        })
+    }))
+}
+
+/// Whether `path` is `root` or lies under it, component-wise.
+fn path_is_under(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The path an item refreshes through the library scan by: its own
+/// filesystem path, when it has one inside a library. `None` for an item
+/// with no file of its own — a person, a genre or studio, a channel or
+/// live-TV item streamed from a URL, a row outside every library — which the
+/// provider manager refreshes.
+pub(crate) fn refresh_scan_path(
+    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+) -> Option<String> {
+    let in_library = item
+        .top_parent_id
+        .as_deref()
+        .is_some_and(|top| !top.is_empty());
+    item.path
+        .clone()
+        .filter(|path| in_library && !path.is_empty() && !path.contains("://"))
 }
 
 pub mod activity_log;
@@ -64,6 +121,7 @@ pub(crate) mod image_upload;
 pub mod images;
 pub mod instant_mix;
 pub mod intro_skipper;
+mod item_dates;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
@@ -475,10 +533,11 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/ExternalIdInfos"),
     // Batch 4 — remote metadata search + apply (`ItemLookupController`). Each
     // typed search route collapses its `RemoteSearchQuery<XInfo>` into the
-    // object-safe `ProviderManager::remote_search` seam; the remote fetchers
-    // (TMDb/TVDb/MusicBrainz) are deferred, so with none registered the search
-    // faithfully returns `[]`. Apply resolves the item then drives the real
-    // `refresh_full_item` seam (the refresh pipeline is the deferred piece).
+    // object-safe `ProviderManager::remote_search` seam, which fans out over
+    // the registered fetchers (TMDB/TVDB/OMDb/MusicBrainz/TheAudioDb). Apply
+    // replaces the item's ids with the chosen result's and refreshes it: a
+    // file item or folder through the library scan of its path, anything
+    // else through `refresh_full_item`.
     ("post", "/Items/RemoteSearch/Movie"),
     ("post", "/Items/RemoteSearch/Trailer"),
     ("post", "/Items/RemoteSearch/MusicVideo"),
@@ -773,7 +832,7 @@ pub struct Verified {
     /// Date of the comparison, `YYYY-MM-DD`.
     pub date: &'static str,
     /// Accepted divergences, one sentence each. Owner-scope items (native .NET
-    /// plugin loading, SSDP, OMDb without a key) and Jellyfin bugs deliberately
+    /// plugin loading, SSDP) and Jellyfin bugs deliberately
     /// not ported belong here; anything else is a gap to fix before the row is
     /// written. An entry with divergences still counts as verified — the text
     /// is the published statement of what is *not* done.
@@ -808,13 +867,9 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
-         the primary episode row. Un-defer path: port v12's Video.GetMediaSourceName \
-         common-prefix naming in media_source_manager, then swap by name in \
-         tv_series_manager (see the TODO there).",
-            "Video.GetAllVersions also spans file-based local alternates \
-         (LinkedChildType.LocalAlternateVersion); Ferrofin's version model links alternates \
-         through PrimaryVersionId only, so the resumable check and the last-played date span \
-         that group.",
+         the primary episode row. Un-defer path: v12's Video.GetMediaSourceName \
+         common-prefix naming is ported (video_versions::media_source_name); swap by that \
+         name in tv_series_manager (see the TODO there).",
             "parentId naming a non-view item: v12 routes it to AncestorIds, which the keys \
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
@@ -972,10 +1027,12 @@ const GENRES_DIVERGENCES: &[&str] = &[
 /// does differently from v12's `ItemsController.GetResumeItems` +
 /// `TranslateQuery`'s `IsResumable` block.
 const RESUME_DIVERGENCES: &[&str] = &[
-    "Video.GetAllVersions also spans file-based local alternates \
-     (LinkedChildType.LocalAlternateVersion); Ferrofin links alternates through \
-     PrimaryVersionId only, so the per-version resumable test, the most-recently-played \
-     dedupe and the DatePlayed order span that group.",
+    "Video.GetAllVersions spans the local alternates of every version in the group; \
+     Ferrofin groups by COALESCE(PrimaryVersionId, Id), which covers a primary's local and \
+     merged versions but not the local versions of a version MERGED onto another primary \
+     (they point at the merged version), so the per-version resumable test, the \
+     most-recently-played dedupe and the DatePlayed order miss those. Un-defer path: group \
+     by the primary of the version's primary (one more level) in translate_query.",
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",

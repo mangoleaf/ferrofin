@@ -276,9 +276,6 @@ impl MediaSourceManager for StreamSources {
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
     }
@@ -289,6 +286,21 @@ struct StreamLibrary;
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         if id == MOVIE_ID {
             // A real item that is NOT an `Audio`: every lyric route must 404 on
@@ -569,7 +581,10 @@ async fn audio_stream_by_container_serves_file() {
     let router = create_router(app);
     // `/Audio/{itemId}/stream.mp3` normalizes to `/Audio/{itemId}/{container}`.
     let resp = router
-        .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/stream.mp3")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Audio/{ITEM_ID}/stream.mp3?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);

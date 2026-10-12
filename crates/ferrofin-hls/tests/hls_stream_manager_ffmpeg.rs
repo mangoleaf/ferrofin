@@ -133,8 +133,13 @@ impl ServerApplicationPaths for TempPaths {
     fn cache_path(&self) -> String {
         String::new()
     }
+    // The test's temp dir: ffmpeg's `FFmpeg.Transcode-*.log` goes there,
+    // never into the working directory (the crate).
     fn log_directory_path(&self) -> String {
-        String::new()
+        Path::new(&self.transcode)
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
     fn transcode_path(&self) -> String {
         self.transcode.clone()

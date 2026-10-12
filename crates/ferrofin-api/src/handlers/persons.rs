@@ -9,7 +9,7 @@
 //! to its by-name `Person` item, mirroring `ILibraryManager.GetPeopleItems`. The
 //! per-name image routes are Batch 9.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::BaseItemKind;
@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::by_name::{ByNameItemQuery, additional_dto_options, project_item_rows};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
@@ -202,4 +203,13 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Persons", get(get_persons))
         .route("/Persons/{name}", get(get_person))
+}
+crate::query::query_parameters! {
+    PersonsQuery {
+        "filters" => ',',
+        "personTypes" => ',',
+        "excludePersonTypes" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Persons")];
 }

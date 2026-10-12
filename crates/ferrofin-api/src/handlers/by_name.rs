@@ -474,6 +474,26 @@ pub(crate) async fn project_query_result(
     Ok(QueryResult::new(start_index, total, dtos))
 }
 
+crate::query::query_parameters! {
+    ByNameListQuery {
+        "includeItemTypes" => ',',
+        "excludeItemTypes" => ',',
+        "mediaTypes" => ',',
+        "sortBy" => ',',
+        "sortOrder" => ',',
+        "filters" => ',',
+        "fields" => ',',
+        "enableImageTypes" => ',',
+        "genres" => '|',
+        "genreIds" => ',',
+        "officialRatings" => '|',
+        "tags" => '|',
+        "years" => ',',
+        "studioIds" => ',',
+    } => [("get", "/Genres"), ("get", "/MusicGenres"), ("get", "/Studios"), ("get", "/Artists"), ("get", "/Artists/AlbumArtists")];
+    ByNameItemQuery {} => [("get", "/Genres/{genreName}"), ("get", "/MusicGenres/{genreName}"), ("get", "/Persons/{name}"), ("get", "/Studios/{name}"), ("get", "/Artists/{name}")];
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ByNameListQuery, additional_dto_options};

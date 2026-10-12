@@ -88,7 +88,7 @@ pub async fn channel_rows_by_ids(
     // can name thousands of items and a channel only has to be one of them for
     // this lookup to run.
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
             r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
            FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
@@ -143,7 +143,7 @@ pub async fn program_rows_by_ids(
 ) -> Result<std::collections::HashMap<Uuid, ProgramRow>, ServiceError> {
     let mut out = std::collections::HashMap::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
         qb.push(r#" WHERE p."Id" IN ("#);
         let mut separated = qb.separated(", ");
         for id in chunk {
@@ -361,7 +361,7 @@ async fn delete_by_id(
     ids: &[String],
 ) -> Result<(), ServiceError> {
     for chunk in ids.chunks(500) {
-        let mut qb: sqlx::QueryBuilder<'_, sqlx::Sqlite> =
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
             sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
         let mut separated = qb.separated(", ");
         for id in chunk {
@@ -397,7 +397,7 @@ pub async fn existing_config_id(
 ) -> Result<Option<String>, ServiceError> {
     // `table` is one of the two crate constants above, never caller input.
     let sql = format!(r#"SELECT "Id" FROM "{table}" WHERE "Id" = ?1 COLLATE NOCASE"#);
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .bind(wanted)
         .fetch_optional(db.pool())
         .await

@@ -13,7 +13,7 @@ if [ "$1" = "configure" ]; then
             --gecos "Ferrofin media server" ferrofin
     fi
     # 0750: the database inside is nobody else's business.
-    install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
+    install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin
 
     # The conffile may contain the bootstrap admin password. Apply this on
     # upgrades too, after the service group exists, without changing contents.

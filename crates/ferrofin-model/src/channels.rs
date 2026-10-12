@@ -104,10 +104,12 @@ pub struct ChannelFeatures {
     /// Gets or sets the maximum number of records the channel allows retrieving
     /// at a time.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_page_size: Option<i32>,
 
     /// Gets or sets the automatic refresh levels.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub auto_refresh_levels: Option<i32>,
 
     /// Gets or sets the default sort orders.
@@ -139,10 +141,12 @@ pub struct ChannelQuery {
 
     /// Gets or sets a value indicating whether images are enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub enable_images: Option<bool>,
 
     /// Gets or sets the image type limit.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub image_type_limit: Option<i32>,
 
     /// Gets or sets the enabled image types.
@@ -156,26 +160,32 @@ pub struct ChannelQuery {
 
     /// Gets or sets the start index. Use for paging.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub start_index: Option<i32>,
 
     /// Gets or sets the maximum number of items to return.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub limit: Option<i32>,
 
     /// Gets or sets a value indicating whether latest items are supported.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub supports_latest_items: Option<bool>,
 
     /// Gets or sets a value indicating whether media deletion is supported.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub supports_media_deletion: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance is favorite.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_favorite: Option<bool>,
 
     /// Gets or sets a value indicating whether this is the recordings folder.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub is_recordings_folder: Option<bool>,
 
     /// Gets or sets a value indicating whether to refresh latest channel items.

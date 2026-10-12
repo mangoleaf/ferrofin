@@ -51,9 +51,9 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// The caller is authenticated but not permitted to perform the operation
-    /// → `403`. Ported from the controllers' `StatusCode(403, …)` returns (e.g.
-    /// updating another user without elevation, disabling the last admin).
+    /// Account policy or permissions forbid the operation → `403`. Covers
+    /// disabled-account logins and the controllers' `StatusCode(403, …)` returns
+    /// (e.g. updating another user without elevation, disabling the last admin).
     #[error("forbidden: {0}")]
     Forbidden(String),
 
@@ -165,7 +165,7 @@ impl ApiError {
                 StatusCode::BAD_REQUEST
             }
             Self::Service(ServiceError::Conflict(_)) | Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Service(ServiceError::Forbidden(_)) | Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::Problem(p) => p.status(),
@@ -257,6 +257,10 @@ mod tests {
         );
         assert_eq!(
             ApiError::Forbidden("nope".into()).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ApiError::from(ServiceError::Forbidden("disabled".into())).status(),
             StatusCode::FORBIDDEN
         );
         assert_eq!(

@@ -311,7 +311,7 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 pub struct LiveTvPaths {
     /// Where a shared live stream's `{uniqueId}.ts` buffer is written
     /// (C# `GetTranscodePath()`).
-    pub transcode_dir: PathBuf,
+    pub transcode_dir: ferrofin_util::directory_path::DirectoryPath,
     /// The server data directory, under which `livetv/recordings` is the
     /// default DVR target (C# `CommonApplicationPaths.DataPath`).
     pub data_dir: PathBuf,
@@ -623,7 +623,7 @@ impl FerrofinLiveTvManager {
         db: Database,
         fetcher: Arc<dyn SourceFetcher>,
         server_id: String,
-        cache_dir: impl Into<PathBuf>,
+        cache_dir: impl Into<ferrofin_util::directory_path::DirectoryPath>,
     ) -> Self {
         let schedules_direct = SchedulesDirect::new(Arc::clone(&fetcher), cache_dir);
         // The same two hosts, in the same order, that
@@ -1042,7 +1042,7 @@ impl FerrofinLiveTvManager {
         // 14 columns per row; chunked multi-row insert instead of one round-trip
         // per channel.
         for (chunk_index, chunk) in channels.chunks(SQLITE_BIND_LIMIT / 14).enumerate() {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvChannels"
                    ("Id","TunerHostId","TvgId","Name","Number","ImageUrl","ChannelType","StreamUrl","SortIndex","DateCreated","ExternalId","IsHd","VideoCodec","AudioCodec") "#,
             );
@@ -1193,7 +1193,7 @@ impl FerrofinLiveTvManager {
     ) -> Result<HashMap<String, Option<String>>, ServiceError> {
         let mut existing: HashMap<String, Option<String>> = HashMap::new();
         for chunk in channel_ids.chunks(SQLITE_BIND_LIMIT) {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"SELECT "Id","DateCreated" FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#,
             );
             let mut sep = qb.separated(",");
@@ -1205,7 +1205,7 @@ impl FerrofinLiveTvManager {
                 existing.insert(row.get("Id"), row.get("DateCreated"));
             }
 
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new(r#"DELETE FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" IN ("#);
             let mut sep = qb.separated(",");
             for id in chunk {
@@ -1405,7 +1405,7 @@ impl FerrofinLiveTvManager {
         let existing_dates = Self::clean_programs(&mut tx, touched).await?;
 
         for chunk in rows.chunks(SQLITE_BIND_LIMIT / 27) {
-            let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
                     "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
@@ -1970,7 +1970,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // paging actually truncated the result.
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
-            let mut cb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
+            let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
             push_program_filters(&mut cb, query, now);
             let count: i64 = cb
                 .build_query_scalar()
@@ -2927,6 +2927,12 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
 
+    async fn get_recording_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        Ok(crate::dvr_repository::recording_row(&self.db, id)
+            .await?
+            .map(|row| crate::projection::recording_entity(&row, parse_dt)))
+    }
+
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
         let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
             return Ok(None);
@@ -2959,6 +2965,30 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .active_recordings_lock()
             .get(timer_id)
             .map(|recording| recording.path.display().to_string()))
+    }
+
+    async fn active_recording_paths(&self) -> Result<Vec<String>, ServiceError> {
+        // `RecordingsManager.GetActiveRecordingInfo`: a capture told to stop,
+        // or whose timer is no longer `InProgress`, is not an active recording.
+        let live: Vec<(String, String)> = self
+            .active_recordings_lock()
+            .values()
+            .filter(|recording| !recording.is_cancelled())
+            .map(|recording| {
+                (
+                    recording.timer_id.clone(),
+                    recording.path.display().to_string(),
+                )
+            })
+            .collect();
+        let mut paths = Vec::with_capacity(live.len());
+        for (timer_id, path) in live {
+            let timer = self.get_timer(&timer_id).await?;
+            if timer.is_some_and(|timer| timer.status == RecordingStatus::InProgress) {
+                paths.push(path);
+            }
+        }
+        Ok(paths)
     }
 
     async fn live_tv_media_type(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
@@ -3127,7 +3157,7 @@ impl FerrofinLiveTvManager {
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
         let start_index = query.start_index.unwrap_or(0);
-        let mut qb: QueryBuilder<'_, Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
         push_program_filters(&mut qb, query, now);
         push_program_order(&mut qb, &query.order_by);
         push_program_paging(&mut qb, query.limit, start_index);
@@ -3260,7 +3290,7 @@ impl FerrofinLiveTvManager {
             RecordingStatus::Cancelled | RecordingStatus::Error
         ) {
             dto.timer_id.clone_from(&timer.base.id);
-            dto.status = Some(recording_status_name(timer.status).to_owned());
+            dto.status = Some(recording_status_name(timer.status));
         }
         if let Some(series_timer_id) = timer.series_timer_id.as_deref().filter(|s| !s.is_empty()) {
             dto.series_timer_id = Some(series_timer_id.to_owned());
@@ -4345,12 +4375,19 @@ impl FerrofinLiveTvManager {
 
     /// The directory a shared live stream's buffer is written to.
     fn transcode_dir(&self) -> Result<PathBuf, ServiceError> {
-        if self.paths.transcode_dir.as_os_str().is_empty() {
+        let path = self.paths.transcode_dir.resolve();
+        if path.as_os_str().is_empty() {
             return Err(ServiceError::Backend(
                 "live tv transcode path not wired".to_owned(),
             ));
         }
-        Ok(self.paths.transcode_dir.clone())
+        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
+            ServiceError::backend(format!(
+                "prepare transcode directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
     }
 
     /// The API base URL a live stream's buffered file is served from.
@@ -4362,7 +4399,10 @@ impl FerrofinLiveTvManager {
     }
 
     /// Reads a JSON `Data` column across all rows of `sql`, deserializing each.
-    async fn json_list<T: DeserializeOwned>(&self, sql: &str) -> Result<Vec<T>, ServiceError> {
+    async fn json_list<T: DeserializeOwned>(
+        &self,
+        sql: &'static str,
+    ) -> Result<Vec<T>, ServiceError> {
         let rows = sqlx::query(sql)
             .fetch_all(self.db.pool())
             .await
@@ -4376,7 +4416,7 @@ impl FerrofinLiveTvManager {
     /// Reads and deserializes a single JSON `Data` column by id.
     async fn json_get<T: DeserializeOwned>(
         &self,
-        sql: &str,
+        sql: &'static str,
         id: &str,
     ) -> Result<Option<T>, ServiceError> {
         let data: Option<String> = sqlx::query_scalar(sql)
@@ -4388,7 +4428,7 @@ impl FerrofinLiveTvManager {
     }
 
     /// Runs a `DELETE … WHERE "Id" = ?1` statement.
-    async fn delete_by_id(&self, sql: &str, id: &str) -> Result<(), ServiceError> {
+    async fn delete_by_id(&self, sql: &'static str, id: &str) -> Result<(), ServiceError> {
         sqlx::query(sql)
             .bind(id)
             .execute(self.db.writer())
@@ -4400,7 +4440,7 @@ impl FerrofinLiveTvManager {
 
 /// Emits `WHERE` for the first predicate of a query and `AND` for each one
 /// after it.
-fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
+fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
     qb.push(if *first { " WHERE " } else { " AND " });
     *first = false;
 }
@@ -4420,7 +4460,7 @@ fn push_separator(qb: &mut QueryBuilder<'_, Sqlite>, first: &mut bool) {
 /// `get_programs` answers it with the empty result upstream returns when the
 /// series-timer scope cannot be built.
 fn push_program_filters(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
 ) {
@@ -4558,7 +4598,7 @@ fn program_sort_column(sort: ItemSortBy) -> Option<&'static str> {
 /// order C# `LiveTvManager.GetPrograms` relies on ("order by start date to take
 /// advantage of a specialized index"). The id tiebreaker makes paging stable
 /// across requests.
-fn push_program_order(qb: &mut QueryBuilder<'_, Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
+fn push_program_order(qb: &mut QueryBuilder<Sqlite>, order_by: &[(ItemSortBy, SortOrder)]) {
     let mut wrote = false;
     for (column, order) in order_by {
         let Some(sql) = program_sort_column(*column) else {
@@ -4580,7 +4620,7 @@ fn push_program_order(qb: &mut QueryBuilder<'_, Sqlite>, order_by: &[(ItemSortBy
 }
 
 /// Pushes `LIMIT`/`OFFSET` for the requested page.
-fn push_program_paging(qb: &mut QueryBuilder<'_, Sqlite>, limit: Option<i32>, start_index: i32) {
+fn push_program_paging(qb: &mut QueryBuilder<Sqlite>, limit: Option<i32>, start_index: i32) {
     if let Some(limit) = limit {
         qb.push(" LIMIT ").push_bind(i64::from(limit.max(0)));
     } else if start_index > 0 {
@@ -4593,16 +4633,8 @@ fn push_program_paging(qb: &mut QueryBuilder<'_, Sqlite>, limit: Option<i32>, st
 }
 
 /// The stored `Status` string for a [`RecordingStatus`].
-fn recording_status_name(status: RecordingStatus) -> &'static str {
-    match status {
-        RecordingStatus::New => "New",
-        RecordingStatus::InProgress => "InProgress",
-        RecordingStatus::Completed => "Completed",
-        RecordingStatus::Cancelled => "Cancelled",
-        RecordingStatus::ConflictedOk => "ConflictedOk",
-        RecordingStatus::ConflictedNotOk => "ConflictedNotOk",
-        RecordingStatus::Error => "Error",
-    }
+fn recording_status_name(status: RecordingStatus) -> String {
+    status.json_name().into_owned()
 }
 
 /// Parses a timestamp stored in the guide cache: the canonical storage format
@@ -6706,7 +6738,7 @@ mod tests {
             .await
             .with_tuner_source(Arc::new(tuner))
             .with_paths(LiveTvPaths {
-                transcode_dir: transcode_dir.to_path_buf(),
+                transcode_dir: transcode_dir.to_path_buf().into(),
                 ..LiveTvPaths::default()
             });
         mgr.set_local_api_url("http://127.0.0.1:8096");
@@ -6997,7 +7029,7 @@ mod tests {
             .await
             .with_tuner_source(Arc::new(tuner))
             .with_paths(LiveTvPaths {
-                transcode_dir: root.join("transcodes"),
+                transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: root.join("named").join("livetv.json"),
             });
@@ -7029,7 +7061,7 @@ mod tests {
         manager_with(FakeFetcher(HashMap::new()))
             .await
             .with_paths(LiveTvPaths {
-                transcode_dir: root.join("transcodes"),
+                transcode_dir: root.join("transcodes").into(),
                 data_dir: root.join("data"),
                 options_file: named.join("livetv.json"),
             })
@@ -7252,6 +7284,45 @@ mod tests {
         }
     }
 
+    /// Port of `GetActiveRecordingInfo`'s two exclusions: a capture whose
+    /// cancel flag is set, and one whose timer is not `InProgress` (or is
+    /// gone), are not active recordings.
+    #[tokio::test]
+    async fn only_a_live_capture_of_an_in_progress_timer_is_an_active_recording() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        for (id, status) in [
+            ("recording", RecordingStatus::InProgress),
+            ("stopping", RecordingStatus::InProgress),
+            ("finished", RecordingStatus::Completed),
+        ] {
+            let timer = TimerInfoDto {
+                base: BaseTimerInfoDto {
+                    id: Some(id.to_owned()),
+                    start_date: Utc::now() + chrono::Duration::minutes(600),
+                    end_date: Utc::now() + chrono::Duration::minutes(660),
+                    ..BaseTimerInfoDto::default()
+                },
+                status,
+                ..TimerInfoDto::default()
+            };
+            mgr.persist_timer(&timer).await.expect("plant");
+        }
+        for id in ["recording", "stopping", "finished", "no-timer-row"] {
+            let path = dir.path().join(format!("{id}.ts"));
+            mgr.active_recordings_lock().insert(
+                id.to_owned(),
+                crate::dvr::ActiveRecording::new(id.to_owned(), Uuid::new_v4(), path),
+            );
+        }
+        mgr.cancel_recording("stopping");
+
+        let expected = dir.path().join("recording.ts").display().to_string();
+        assert_eq!(
+            mgr.active_recording_paths().await.expect("paths"),
+            vec![expected]
+        );
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_timer_mid_capture_releases_it_on_a_real_runtime() {
         // On a multi-thread runtime the firing task and the cancel really do
@@ -7278,6 +7349,14 @@ mod tests {
         })
         .await
         .expect("the capture must start");
+        // `Video.IsActiveRecording`'s source: the file being written, once
+        // the timer row says `InProgress`.
+        let active = wait_for(|| async {
+            let paths = mgr.active_recording_paths().await.expect("paths");
+            (!paths.is_empty()).then_some(paths)
+        })
+        .await;
+        assert_eq!(active, Some(vec![path.clone()]));
         mgr.cancel_timer(&timer_id).await.expect("cancel");
 
         let released = wait_for(|| async {
@@ -7292,9 +7371,17 @@ mod tests {
             released.is_some(),
             "the capture must be released, not orphaned"
         );
-        // The recording settled rather than being stuck mid-flight.
-        let in_progress = mgr
-            .get_recordings_matching(
+        assert!(
+            mgr.active_recording_paths()
+                .await
+                .expect("paths")
+                .is_empty()
+        );
+        // `finish_capture` releases the active entry before `settle_timer`
+        // finishes the async database writes. Wait for that second phase too:
+        // seeing no active path does not yet mean the recording row has settled.
+        let settled = wait_for(|| async {
+            mgr.get_recordings_matching(
                 &ferrofin_model::live_tv::RecordingQuery {
                     is_in_progress: Some(true),
                     ..ferrofin_model::live_tv::RecordingQuery::default()
@@ -7303,9 +7390,14 @@ mod tests {
                 &DtoOptions::default(),
             )
             .await
-            .expect("recordings");
+            .expect("recordings")
+            .items
+            .is_empty()
+            .then_some(())
+        })
+        .await;
         assert!(
-            in_progress.items.is_empty(),
+            settled.is_some(),
             "nothing may still report itself as recording"
         );
         let _ = tokio::fs::remove_file(path).await;

@@ -84,6 +84,8 @@ pub struct BaseEncodingJobOptions {
     pub transcoding_max_audio_channels: Option<i32>,
     /// Whether this is a static (direct) stream (`Static`).
     pub is_static: bool,
+    /// Seek offset reported by the running encoder (StartTimeTicks).
+    pub start_time_ticks: Option<i64>,
     /// The requested video profile (`Profile`).
     pub profile: Option<String>,
     /// The requested video range type (`VideoRangeType`).
@@ -151,6 +153,7 @@ impl Default for BaseEncodingJobOptions {
             max_audio_channels: None,
             transcoding_max_audio_channels: None,
             is_static: false,
+            start_time_ticks: None,
             profile: None,
             video_range_type: None,
             level: None,
@@ -556,6 +559,18 @@ impl EncodingJobInfo {
                 .and_then(|v| v.parse::<i32>().ok());
         }
         None
+    }
+
+    /// The output audio sample rate. Port of `EncodingJobInfo.OutputAudioSampleRate`:
+    /// the source's own rate for a static or copied stream, else the requested
+    /// `AudioSampleRate`, else none (the encoder keeps the source rate).
+    #[must_use]
+    pub fn output_audio_sample_rate(&self) -> Option<i32> {
+        if self.base_request.is_static || Self::is_copy_codec(self.output_audio_codec.as_deref()) {
+            self.audio_stream.as_ref().and_then(|a| a.sample_rate)
+        } else {
+            self.base_request.audio_sample_rate
+        }
     }
 
     /// The client-requested audio channel count for `codec`. Port of

@@ -5,17 +5,20 @@
 //! provider framework, the ffprobe-backed media-info provider, and local NFO
 //! metadata. The remote providers (TMDB/TVDB/OMDb/fanart/MusicBrainz/AudioDb/
 //! Studio Images) are compiled in unconditionally and gated at runtime by the
-//! per-library fetcher checkboxes — OMDb additionally needs an API key before
-//! it does anything.
+//! per-library fetcher checkboxes, using shared keys where required.
 
 pub mod audiodb;
 pub mod books;
 pub mod builtin_plugins;
+pub mod chapter_names;
 pub mod container_types;
+pub mod episode;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;
 mod image_download;
+pub mod image_policy;
+pub mod image_save;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
@@ -23,15 +26,21 @@ pub mod local_xml;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
+pub mod metadata_merge;
+pub mod metrics;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;
+pub mod nfo_save;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
 pub mod playlist_file;
 pub mod plugin_config;
 pub mod provider_manager;
+pub mod rate_limit;
+pub mod refresh_plan;
+pub mod season;
 pub mod similarity;
 pub mod studios;
 pub mod tmdb;
@@ -55,10 +64,11 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
+pub use image_download::{ArtworkDownload, ArtworkDownloadFailure, sniff_image_ext};
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
-    AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate, ReleaseArtistCredit,
-    ReleaseDetails, ReleaseHit,
+    AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,
+    ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
 pub use similarity::{
@@ -66,13 +76,12 @@ pub use similarity::{
 };
 pub use studios::StudiosClient;
 pub use tmdb::{
-    EpisodeDetails, RemoteImage, SeasonDetails, SeriesMatch, TmdbClient, TmdbCollection,
-    TmdbCollectionHit, TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbPersonHit, TmdbSearchHit,
-    TmdbTrailer,
+    EpisodeDetails, RemoteImage, SeasonDetails, TmdbClient, TmdbCollection, TmdbCollectionHit,
+    TmdbDetails, TmdbImage, TmdbKind, TmdbPerson, TmdbPersonHit, TmdbSearchHit, TmdbTrailer,
 };
 pub use tvdb::{
     TvdbClient, TvdbEpisodeDetails, TvdbPerson, TvdbPersonDetails, TvdbSearchHit,
-    TvdbSeasonDetails, TvdbSeriesDetails,
+    TvdbSeasonDetails, TvdbSeriesDetails, TvdbTranslation,
 };
 
 pub use container_types::{

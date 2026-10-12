@@ -1,0 +1,16 @@
+{
+  "jellyfin_version": "12.2.0.0",
+  "upstream_tag": "v12.2",
+  "upstream_commit": "ca0f16eb7c195f720a1493ed469a27c4657db0c6",
+  "method": "JsonSerializer.Deserialize(input, type, JsonDefaults.Options), using the official portable Jellyfin.Extensions.dll",
+  "case_count": 2398,
+  "corrections": [
+    "Quoted NaN, Infinity and -Infinity are accepted for float/double with AllowReadingFromString.",
+    "Overflow to infinity is accepted for bare float/double numbers but rejected for quoted numbers.",
+    "Numeric strings reject whitespace. Enum strings trim whitespace and accept comma-separated names even for non-flags enums.",
+    "Only the exact empty string is null for nullable structs; whitespace is rejected.",
+    "Nullable Guid uses its dedicated converter and rejects the empty string.",
+    "String members preserve raw numeric lexemes, keep null, and reject objects/arrays.",
+    "The flags converter throws NotImplementedException; MediaSourceInfo marks its two flags fields JsonIgnore."
+  ]
+}

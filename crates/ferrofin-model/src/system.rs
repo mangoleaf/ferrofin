@@ -74,6 +74,7 @@ pub struct PublicSystemInfo {
 
     /// Gets or sets a value indicating whether the startup wizard is completed.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub startup_wizard_completed: Option<bool>,
 }
 
@@ -112,6 +113,7 @@ pub struct SystemInfo {
 
     /// Gets or sets a value indicating whether the startup wizard is completed.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub startup_wizard_completed: Option<bool>,
 
     // --- SystemInfo-specific fields ---

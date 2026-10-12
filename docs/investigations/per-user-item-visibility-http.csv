@@ -1,0 +1,27 @@
+case,method,path,ferrofin,jellyfin_12_1,ferrofin_detail,jellyfin_detail
+restricted browse,GET,/Items,200,200,"{""names"": [""Allowed""]}","{""names"": [""Allowed""]}"
+allowed detail,GET,/Items/{itemId},200,200,"{""media_sources"": 1}","{""media_sources"": 1}"
+hidden detail,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+hidden playback,POST,/Items/{itemId}/PlaybackInfo,200,404,"{""media_sources"": 1}",{}
+hidden download,GET,/Items/{itemId}/Download,200,404,{},{}
+hidden ancestors,GET,/Items/{itemId}/Ancestors,200,404,{},{}
+hidden extras,GET,/Items/{itemId}/SpecialFeatures,200,404,{},{}
+hidden similar,GET,/Items/{itemId}/Similar,200,404,"{""names"": []}",{}
+hidden favorite,POST,/UserFavoriteItems/{itemId},200,404,{},{}
+hidden userdata,GET,/UserItems/{itemId}/UserData,200,404,{},{}
+hidden played,POST,/UserPlayedItems/{itemId},200,404,{},{}
+admin detail,GET,/Items/{itemId},200,200,"{""media_sources"": 1}","{""media_sources"": 1}"
+admin targeting restricted user,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+blocked tag detail,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+unmatched allowed tag detail,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+parental limit detail,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+hidden explicit ids query,GET,/Items,200,200,"{""names"": [""Hidden""]}","{""names"": [""Hidden""]}"
+hidden parent query,GET,/Items,200,401,"{""names"": [""Hidden""]}",{}
+API key download,GET,/Items/{itemId}/Download,200,200,{},{}
+API key targeting restricted user,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+restricted admin detail,GET,/Items/{itemId},200,404,"{""media_sources"": 1}",{}
+private playlist detail,GET,/Items/{itemId},200,404,{},{}
+private playlist delete,DELETE,/Items/{itemId},401,404,{},{}
+hidden delete,DELETE,/Items/{itemId},204,404,{},{}
+admin detail after delete,GET,/Items/{itemId},404,200,{},"{""media_sources"": 1}"
+media exists after delete,,,,,"{""exists"": true}","{""exists"": true}"

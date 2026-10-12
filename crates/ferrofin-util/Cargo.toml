@@ -16,6 +16,13 @@ rand = "0.8"
 unicode-normalization = "0.1"
 regex.workspace = true
 icu_casemap.workspace = true
+icu_collator.workspace = true
+icu_locale_core.workspace = true
+icu_collections.workspace = true
+icu_locale_fallback.workspace = true
+icu_normalizer.workspace = true
+icu_provider.workspace = true
+zerovec.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

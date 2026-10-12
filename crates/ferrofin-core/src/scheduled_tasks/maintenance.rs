@@ -412,7 +412,7 @@ impl ScheduledTask for DeleteTranscodeFileTask {
             tracing::info!("skipping transcode-directory sweep: playback is active");
             return Ok(());
         }
-        let dir = PathBuf::from(self.paths.transcode_path());
+        let dir = PathBuf::from(self.paths.prepare_transcode_path()?);
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let cutoff = SystemTime::now() - std::time::Duration::from_hours(24);
@@ -677,17 +677,11 @@ impl ScheduledTask for CleanupUserDataTask {
         tracing::info!(detached, "detached user-data entries");
 
         let cutoff = Utc::now() - chrono::Duration::days(USER_DATA_RETENTION_DAYS);
-        let result = sqlx::query(
-            r#"DELETE FROM "UserData"
-               WHERE "ItemId" = ?1 AND "RetentionDate" IS NOT NULL AND "RetentionDate" < ?2"#,
-        )
-        .bind(PLACEHOLDER_ID)
-        .bind(datetime_to_db(cutoff))
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        let removed =
+            crate::user_data_retention_repository::purge_expired(&self.db, &datetime_to_db(cutoff))
+                .await?;
         tracing::info!(
-            removed = result.rows_affected(),
+            removed,
             days = USER_DATA_RETENTION_DAYS,
             "removed expired detached user-data entries"
         );
@@ -747,7 +741,11 @@ impl ScheduledTask for MoveTrickplayImagesTask {
                 .collect();
             seen.dedup();
             for item_id in seen {
-                if let Err(e) = self.trickplay.move_generated_trickplay_data(item_id).await {
+                if let Err(e) = self
+                    .trickplay
+                    .move_generated_library_trickplay_data(item_id)
+                    .await
+                {
                     tracing::warn!(item = %item_id, error = %e, "error moving trickplay files");
                 } else {
                     moved += 1;
@@ -1428,8 +1426,8 @@ mod tests {
         let live_item = Uuid::from_u128(0x11);
         seed_item(&db, live_item, BaseItemKind::Movie).await;
 
-        // Three rows: attached (kept), detached-and-expired (removed),
-        // detached-but-recent (kept).
+        // Attached history never expires, even with a legacy timestamp.
+        // Detached rows expire only with an old, non-null retention date.
         let insert = |item_id: String, key: &str, retention: Option<String>| {
             let db = db.clone();
             let user_id = user.id.clone();
@@ -1450,7 +1448,13 @@ mod tests {
                 .expect("insert userdata");
             }
         };
-        insert(guid_to_db(live_item), "live", None).await;
+        insert(
+            guid_to_db(live_item),
+            "live",
+            Some(datetime_to_db(Utc::now() - chrono::Duration::days(120))),
+        )
+        .await;
+        insert(PLACEHOLDER_ID.to_owned(), "undated", None).await;
         insert(
             PLACEHOLDER_ID.to_owned(),
             "expired",
@@ -1474,6 +1478,9 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .expect("query");
-        assert_eq!(remaining, vec!["live".to_owned(), "recent".to_owned()]);
+        assert_eq!(
+            remaining,
+            vec!["live".to_owned(), "recent".to_owned(), "undated".to_owned()]
+        );
     }
 }

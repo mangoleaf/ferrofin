@@ -17,9 +17,8 @@
 
 use std::time::Duration;
 
+use crate::rate_limit::RateLimiter;
 use serde::Deserialize;
-use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 /// The default MusicBrainz web-service base.
 pub const DEFAULT_BASE_URL: &str = "https://musicbrainz.org";
@@ -44,6 +43,21 @@ impl AlbumIds {
     #[must_use]
     pub fn is_some(&self) -> bool {
         self.release_id.is_some() || self.release_group_id.is_some()
+    }
+
+    /// Both ids as the lookups send them ([`lookup_id`]): canonical, a
+    /// malformed one dropped.
+    fn for_lookup(self) -> Self {
+        Self {
+            release_id: self
+                .release_id
+                .as_deref()
+                .and_then(|id| lookup_id(id, "release")),
+            release_group_id: self
+                .release_group_id
+                .as_deref()
+                .and_then(|id| lookup_id(id, "release group")),
+        }
     }
 }
 
@@ -81,6 +95,44 @@ struct Release {
     date: Option<String>,
     #[serde(rename = "artist-credit", default)]
     artist_credit: Vec<ArtistCreditWire>,
+    /// `inc=labels`.
+    #[serde(rename = "label-info", default)]
+    label_info: Vec<LabelInfoWire>,
+    /// `inc=genres`; `None` when not included.
+    #[serde(default)]
+    genres: Option<Vec<VotedWire>>,
+    /// `inc=tags`; `None` when not included.
+    #[serde(default)]
+    tags: Option<Vec<VotedWire>>,
+}
+
+/// One `label-info` entry on a release (`inc=labels`).
+#[derive(Debug, Deserialize)]
+struct LabelInfoWire {
+    #[serde(default)]
+    label: Option<LabelWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelWire {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A genre or tag with its vote count (`inc=genres` / `inc=tags`).
+#[derive(Debug, Deserialize)]
+struct VotedWire {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    count: i64,
+}
+
+/// An artist's area (`area.name`).
+#[derive(Debug, Deserialize)]
+struct AreaWire {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// One `artist-credit` entry on a release: the credited name plus the artist
@@ -109,6 +161,16 @@ struct ArtistLookup {
     name: Option<String>,
     #[serde(rename = "life-span", default)]
     span: Option<LifeSpan>,
+    #[serde(default)]
+    area: Option<AreaWire>,
+    #[serde(default)]
+    country: Option<String>,
+    /// `inc=genres`; `None` when not included.
+    #[serde(default)]
+    genres: Option<Vec<VotedWire>>,
+    /// `inc=tags`; `None` when not included.
+    #[serde(default)]
+    tags: Option<Vec<VotedWire>>,
 }
 
 /// `/ws/2/artist?query=` with the full per-hit shape (id + name + life-span).
@@ -130,6 +192,29 @@ struct LifeSpan {
 struct ReleaseGroupLookup {
     #[serde(default)]
     releases: Vec<Entity>,
+    /// The group's first release date: the original album's.
+    #[serde(rename = "first-release-date", default)]
+    first_release_date: Option<String>,
+    /// `inc=artists`.
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCreditWire>,
+    /// `inc=genres`; `None` when not included.
+    #[serde(default)]
+    genres: Option<Vec<VotedWire>>,
+    /// `inc=tags`; `None` when not included.
+    #[serde(default)]
+    tags: Option<Vec<VotedWire>>,
+}
+
+/// The names of `voted`, most votes first (`OrderByDescending(VoteCount)`,
+/// stable), blank ones dropped.
+fn by_votes(voted: &[VotedWire]) -> Vec<String> {
+    let mut ordered: Vec<&VotedWire> = voted.iter().collect();
+    ordered.sort_by_key(|v| std::cmp::Reverse(v.count));
+    ordered
+        .into_iter()
+        .filter_map(|v| non_empty(v.name.clone()))
+        .collect()
 }
 
 /// A MusicBrainz date, which may specify only a year or a year and month.
@@ -153,15 +238,29 @@ impl PartialDate {
     }
 }
 
-/// One release's metadata beyond its ids.
+/// What `MusicBrainzAlbumProvider.GetMetadata` answers for an album: the
+/// ids it settled on and what `Populate` (`MusicBrainzAlbumProvider.cs:
+/// 268-320`) reads off the looked-up release and release group.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReleaseDetails {
-    /// The release title.
-    pub name: Option<String>,
-    /// The release date.
+pub struct AlbumDetails {
+    /// The `MusicBrainzAlbum` (release) id.
+    pub release_id: Option<String>,
+    /// The `MusicBrainzReleaseGroup` id — the given one, else the looked-up
+    /// release's.
+    pub release_group_id: Option<String>,
+    /// `releaseGroup?.FirstReleaseDate ?? release?.Date`.
     pub premiere_date: Option<PartialDate>,
-    /// The release year.
+    /// That date's year.
     pub production_year: Option<i32>,
+    /// The credited artist names (`release?.ArtistCredit ??
+    /// releaseGroup?.ArtistCredit`): the album artists.
+    pub album_artists: Vec<String>,
+    /// `releaseGroup?.Genres ?? release?.Genres`, most votes first.
+    pub genres: Vec<String>,
+    /// `releaseGroup?.Tags ?? release?.Tags`, most votes first.
+    pub tags: Vec<String>,
+    /// The release's label names, distinct ignoring case: its studios.
+    pub studios: Vec<String>,
 }
 
 /// One artist credit on a release — the "Identify" result's `Artists` entry.
@@ -229,7 +328,9 @@ impl From<Release> for ReleaseHit {
     }
 }
 
-/// One artist's metadata beyond its id.
+/// One artist's metadata beyond its id — what `MusicBrainzArtistProvider.
+/// GetMetadata` (`MusicBrainzArtistProvider.cs:112-175`) reads off the
+/// looked-up artist.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArtistDetails {
     /// The artist name as MusicBrainz spells it.
@@ -239,6 +340,12 @@ pub struct ArtistDetails {
     /// The life-span end date (a band's break-up), which the artist NFO saver
     /// writes as `<disbanded>`.
     pub end_date: Option<PartialDate>,
+    /// Its area's name, else its country: its production location.
+    pub location: Option<String>,
+    /// Its genres, most votes first.
+    pub genres: Vec<String>,
+    /// Its tags, most votes first.
+    pub tags: Vec<String>,
 }
 
 /// The `DateTime.MinValue` a component-less MetaBrainz `PartialDate` reports
@@ -335,8 +442,8 @@ pub struct MusicBrainzClient {
     /// `ReplaceArtistName`).
     plugin: crate::plugin_config::ConfigSource,
     user_agent: String,
-    /// Timestamp of the last request, for the rate limit.
-    last_request: Mutex<Option<Instant>>,
+    /// Request pacing and server-directed cooldown, shared by all callers.
+    limiter: RateLimiter,
 }
 
 impl std::fmt::Debug for MusicBrainzClient {
@@ -359,8 +466,8 @@ impl MusicBrainzClient {
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
-            user_agent: format!("Ferrofin/{version} ( https://github.com/ )"),
-            last_request: Mutex::new(None),
+            user_agent: format!("Ferrofin/{version} ( https://github.com/mangoleaf/ferrofin )"),
+            limiter: RateLimiter::new("musicbrainz"),
         }
     }
 
@@ -393,19 +500,6 @@ impl MusicBrainzClient {
         cfg.normalized()
     }
 
-    /// Blocks until at least `interval` has elapsed since the previous request,
-    /// then records now — the ≤1 req/sec throttle, whose period is the
-    /// plugin's `RateLimit` (seconds between requests).
-    async fn throttle(&self, interval: std::time::Duration) {
-        let mut last = self.last_request.lock().await;
-        if let Some(prev) = *last
-            && let Some(wait) = interval.checked_sub(prev.elapsed())
-        {
-            tokio::time::sleep(wait).await;
-        }
-        *last = Some(Instant::now());
-    }
-
     /// `RateLimit` seconds as a `Duration`.
     ///
     /// A negative or non-finite value (only reachable by hand-editing
@@ -414,58 +508,44 @@ impl MusicBrainzClient {
     /// published MusicBrainz policy floor. Falling back to *zero* there would
     /// turn a typo into an unthrottled crawl of a public service.
     fn interval(rate_limit: f64) -> Duration {
-        if rate_limit.is_finite() && rate_limit > 0.0 {
-            Duration::from_secs_f64(rate_limit)
+        if rate_limit > 0.0 {
+            Duration::try_from_secs_f64(rate_limit)
+                .unwrap_or(MIN_INTERVAL)
+                .min(Duration::from_secs(u64::from(u32::MAX)))
         } else {
             MIN_INTERVAL
         }
     }
 
-    /// GETs `path?{query}&fmt=json` as an authenticated (User-Agent) MB call,
-    /// returning the parsed body or `None` on any failure. Throttled.
-    ///
-    /// Every failure is LOGGED before it is swallowed. musicbrainz.org
-    /// rate-limits at roughly one request per second per IP and answers `503`
-    /// when it is exceeded; returning a silent `None` makes that
-    /// indistinguishable from "no such release" in the Identify dialog. C#
-    /// surfaces the same failures — `ProviderManager` catches the MetaBrainz
-    /// `HttpError` and logs `Provider {ProviderName} failed to retrieve search
-    /// results` (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs`).
+    fn request_interval(server: &str, rate_limit: f64) -> Duration {
+        let interval = Self::interval(rate_limit);
+        let official = reqwest::Url::parse(server).is_ok_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
+        });
+        if official {
+            interval.max(MIN_INTERVAL)
+        } else {
+            interval
+        }
+    }
+
+    /// Resolves metadata through the shared provider limiter.
     async fn get<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         query: &[(&str, String)],
     ) -> Option<T> {
         let cfg = self.settings().await;
-        self.throttle(Self::interval(cfg.rate_limit)).await;
-        let mut q: Vec<(&str, String)> = vec![("fmt", "json".to_owned())];
-        q.extend(query.iter().cloned());
-        let resp = match self
+        let request = self
             .http
             .get(format!("{}{path}", cfg.server))
             .header(reqwest::header::USER_AGENT, &self.user_agent)
-            .query(&q)
-            .send()
+            .query(&[("fmt", "json")])
+            .query(query);
+        self.limiter
+            .get_json(request, Self::request_interval(&cfg.server, cfg.rate_limit))
             .await
-        {
-            Ok(resp) => resp,
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz request failed");
-                return None;
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            tracing::warn!(%path, %status, "MusicBrainz request rejected");
-            return None;
-        }
-        match resp.json().await {
-            Ok(body) => Some(body),
-            Err(error) => {
-                tracing::warn!(%path, %error, "MusicBrainz response could not be parsed");
-                None
-            }
-        }
     }
 
     /// Resolves an artist's `MusicBrainzArtist` id by name, or `None`. Port of
@@ -500,14 +580,18 @@ impl MusicBrainzClient {
 
     /// Resolves an album's ids from its name + the album artist (by MB id when
     /// known, else by name). Port of the `MusicBrainzAlbumProvider` search:
-    /// `"album" AND arid:{artist}` / `AND artist:"{name}"`.
+    /// `"album" AND arid:{artist}` / `AND artist:"{name}"`. With neither
+    /// there is no search and no match (`MusicBrainzAlbumProvider.cs:
+    /// 196-212` searches only in those two branches).
     pub async fn search_release(
         &self,
         album: &str,
         artist_mbid: Option<&str>,
         artist_name: Option<&str>,
     ) -> AlbumIds {
-        let query = release_query(album, artist_mbid, artist_name);
+        let Some(query) = release_query(album, artist_mbid, artist_name) else {
+            return AlbumIds::default();
+        };
         let Some(result): Option<ReleaseSearch> =
             self.get("/ws/2/release", &[("query", query)]).await
         else {
@@ -541,6 +625,7 @@ impl MusicBrainzClient {
     /// (`inc=artists+release-groups`) — port of `Query.LookupReleaseAsync(id,
     /// Include.Artists | Include.ReleaseGroups)`. `None` on any failure.
     pub async fn lookup_release(&self, release_id: &str) -> Option<ReleaseHit> {
+        let release_id = lookup_id(release_id, "release")?;
         let release: Release = self
             .get(
                 &format!("/ws/2/release/{release_id}"),
@@ -555,6 +640,9 @@ impl MusicBrainzClient {
     /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. Empty when
     /// the group is unknown.
     pub async fn release_group_releases(&self, release_group_id: &str) -> Vec<ReleaseHit> {
+        let Some(release_group_id) = lookup_id(release_group_id, "release group") else {
+            return Vec::new();
+        };
         let Some(group): Option<ReleaseGroupLookup> = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
@@ -599,27 +687,18 @@ impl MusicBrainzClient {
     /// Looks up one artist by id — port of `Query.LookupArtistAsync` as the
     /// "Identify" flow uses it. `None` on any failure.
     pub async fn lookup_artist(&self, artist_id: &str) -> Option<ArtistHit> {
+        let artist_id = lookup_id(artist_id, "artist")?;
         let artist: ArtistLookup = self.get(&format!("/ws/2/artist/{artist_id}"), &[]).await?;
         Some(ArtistHit {
-            id: non_empty(artist.id).unwrap_or_else(|| artist_id.to_owned()),
+            id: non_empty(artist.id).unwrap_or(artist_id),
             name: non_empty(artist.name),
             begin: MbDate::parse(artist.span.and_then(|s| s.begin).as_deref()),
         })
     }
 
-    /// Looks up a release to get its release-group id (`inc=release-groups`).
-    pub async fn release_group_of(&self, release_id: &str) -> Option<String> {
-        let result: Release = self
-            .get(
-                &format!("/ws/2/release/{release_id}"),
-                &[("inc", "release-groups".to_owned())],
-            )
-            .await?;
-        result.group.map(|g| g.id)
-    }
-
     /// Looks up a release group to get its first release id (`inc=releases`).
     pub async fn first_release_of(&self, release_group_id: &str) -> Option<String> {
+        let release_group_id = lookup_id(release_group_id, "release group")?;
         let result: ReleaseGroupLookup = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
@@ -629,63 +708,192 @@ impl MusicBrainzClient {
         result.releases.into_iter().next().map(|r| r.id)
     }
 
-    /// One release's own metadata — port of the fields
-    /// `MusicBrainzAlbumProvider` writes onto a `MusicAlbum` beyond its ids.
-    ///
-    /// MusicBrainz dates may be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`; the missing
-    /// parts default to January 1st, as C#'s partial-date handling does.
-    pub async fn release_details(&self, release_id: &str) -> Option<ReleaseDetails> {
-        let release: Release = self
-            .get(&format!("/ws/2/release/{release_id}"), &[])
-            .await?;
-        let date = release.date.as_deref().and_then(parse_partial_date);
-        Some(ReleaseDetails {
-            name: non_empty(release.title),
+    /// The tail of `MusicBrainzAlbumProvider.GetMetadata` over resolved
+    /// `ids` (`MusicBrainzAlbumProvider.cs:220-265`): the release looked up
+    /// with its artists, release group, labels, genres and tags — whose
+    /// group is the album's when none was known — then the release group
+    /// with its artists, genres and tags, and `Populate` over both. `None`
+    /// when neither id is known or neither lookup finds anything.
+    pub async fn album_details(&self, ids: AlbumIds) -> Option<AlbumDetails> {
+        let ids = ids.for_lookup();
+        let release: Option<Release> = match ids.release_id.as_deref() {
+            Some(id) => {
+                self.get(
+                    &format!("/ws/2/release/{id}"),
+                    &[(
+                        "inc",
+                        "artists+release-groups+labels+genres+tags".to_owned(),
+                    )],
+                )
+                .await
+            }
+            None => None,
+        };
+        let release_group_id = ids.release_group_id.or_else(|| {
+            release
+                .as_ref()
+                .and_then(|r| r.group.as_ref().map(|g| g.id.clone()))
+        });
+        let group: Option<ReleaseGroupLookup> = match release_group_id.as_deref() {
+            Some(id) => {
+                self.get(
+                    &format!("/ws/2/release-group/{id}"),
+                    &[("inc", "artists+genres+tags".to_owned())],
+                )
+                .await
+            }
+            None => None,
+        };
+        if release.is_none() && group.is_none() {
+            return None;
+        }
+        // `Populate`: "Prefer the release group (album-level) data, falling
+        // back to the specific release".
+        //
+        // ACCEPTED DIVERGENCE (the owner's rule: Jellyfin's bugs are not
+        // ported): a group whose first-release date is blank (`""`) falls
+        // back to the release's date. Upstream's `??` takes the blank date,
+        // which MetaBrainz still builds into a `PartialDate`, and stores
+        // `PremiereDate` 0001-01-01 with no year
+        // (`MusicBrainzAlbumProvider.cs:282-287`).
+        let date = group
+            .as_ref()
+            .and_then(|g| g.first_release_date.as_deref())
+            .and_then(parse_partial_date)
+            .or_else(|| {
+                release
+                    .as_ref()
+                    .and_then(|r| r.date.as_deref())
+                    .and_then(parse_partial_date)
+            });
+        let credit = match (&release, &group) {
+            (Some(release), _) => &release.artist_credit,
+            (None, Some(group)) => &group.artist_credit,
+            (None, None) => return None,
+        };
+        let voted = |of_group: Option<&Vec<VotedWire>>, of_release: Option<&Vec<VotedWire>>| {
+            of_group
+                .or(of_release)
+                .map(|v| by_votes(v))
+                .unwrap_or_default()
+        };
+        // `.Distinct(StringComparer.OrdinalIgnoreCase)`: folded as .NET's
+        // invariant upper case, non-ASCII letters included.
+        let mut studios: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for label in release.iter().flat_map(|r| &r.label_info) {
+            if let Some(name) = non_empty(label.label.as_ref().and_then(|l| l.name.clone()))
+                && seen.insert(ferrofin_util::string_extensions::upper_invariant(&name))
+            {
+                studios.push(name);
+            }
+        }
+        Some(AlbumDetails {
+            release_id: ids.release_id,
+            release_group_id,
             premiere_date: date,
             production_year: date.map(|d| d.year),
+            album_artists: credit
+                .iter()
+                .filter_map(|c| non_empty(c.name.clone()))
+                .collect(),
+            genres: voted(
+                group.as_ref().and_then(|g| g.genres.as_ref()),
+                release.as_ref().and_then(|r| r.genres.as_ref()),
+            ),
+            tags: voted(
+                group.as_ref().and_then(|g| g.tags.as_ref()),
+                release.as_ref().and_then(|r| r.tags.as_ref()),
+            ),
+            studios,
         })
     }
 
     /// One artist's own metadata — port of the fields
-    /// `MusicBrainzArtistProvider` writes onto a `MusicArtist`.
+    /// `MusicBrainzArtistProvider.GetMetadata` writes onto a `MusicArtist`
+    /// from `LookupArtistOrNullAsync(id, Include.Genres | Include.Tags)`.
     pub async fn artist_details(&self, artist_id: &str) -> Option<ArtistDetails> {
-        let artist: ArtistLookup = self.get(&format!("/ws/2/artist/{artist_id}"), &[]).await?;
+        let artist_id = lookup_id(artist_id, "artist")?;
+        let artist: ArtistLookup = self
+            .get(
+                &format!("/ws/2/artist/{artist_id}"),
+                &[("inc", "genres+tags".to_owned())],
+            )
+            .await?;
         let life_span = artist.span.unwrap_or_default();
         Some(ArtistDetails {
             name: non_empty(artist.name),
+            // ACCEPTED DIVERGENCE (the owner's rule: Jellyfin's bugs are
+            // not ported): a blank `life-span.begin` gives no date. Upstream
+            // takes it (`artist.LifeSpan?.Begin is not null`) and stores
+            // `PremiereDate` 0001-01-01 with no year
+            // (`MusicBrainzArtistProvider.cs:147-151`).
             premiere_date: life_span.begin.as_deref().and_then(parse_partial_date),
             end_date: life_span.end.as_deref().and_then(parse_partial_date),
+            // `string.IsNullOrWhiteSpace(artist.Area?.Name) ? artist.Country
+            // : artist.Area!.Name`.
+            location: non_empty(artist.area.and_then(|a| a.name))
+                .or_else(|| non_empty(artist.country)),
+            genres: artist.genres.as_deref().map(by_votes).unwrap_or_default(),
+            tags: artist.tags.as_deref().map(by_votes).unwrap_or_default(),
         })
     }
 
-    /// The full album-id resolution with the faithful precedence: fill the
-    /// missing half of a known pair via a lookup, else search by name. Returns
-    /// whatever it could resolve (possibly the input unchanged).
+    /// The album-id resolution of `MusicBrainzAlbumProvider.GetMetadata`
+    /// (`MusicBrainzAlbumProvider.cs:176-215`): a known release group with
+    /// no release takes the group's first release; still no release → a
+    /// search by name and artist (only with an artist id or name), whose hit
+    /// gives the release and, when it carries one, the release group.
+    /// Returns whatever it could resolve (possibly the input unchanged); a
+    /// release still missing its group gets it from
+    /// [`album_details`](Self::album_details)' release lookup.
     pub async fn resolve_album(
         &self,
         album: &str,
-        mut ids: AlbumIds,
+        ids: AlbumIds,
         artist_mbid: Option<&str>,
         artist_name: Option<&str>,
     ) -> AlbumIds {
+        // `ParseMusicBrainzId` on both ids first: a malformed one is no id.
+        let mut ids = ids.for_lookup();
         // release-group known, release missing → first release of the group.
         if ids.release_id.is_none()
             && let Some(rg) = ids.release_group_id.as_deref()
         {
             ids.release_id = self.first_release_of(rg).await;
         }
-        // Neither known → search by name.
-        if ids.release_id.is_none() && ids.release_group_id.is_none() {
-            ids = self.search_release(album, artist_mbid, artist_name).await;
-        }
-        // release known, group missing → look it up.
-        if ids.release_group_id.is_none()
-            && let Some(rel) = ids.release_id.as_deref()
-        {
-            ids.release_group_id = self.release_group_of(rel).await;
+        // Still no release (none known, or a group without releases) →
+        // search; the hit's group replaces a known one.
+        if ids.release_id.is_none() {
+            let hit = self.search_release(album, artist_mbid, artist_name).await;
+            if let Some(release) = hit.release_id {
+                ids.release_id = Some(release);
+                if hit.release_group_id.is_some() {
+                    ids.release_group_id = hit.release_group_id;
+                }
+            }
         }
         ids
     }
+}
+
+/// `MusicBrainzQueryExtensions.ParseMusicBrainzId`
+/// (`MusicBrainzQueryExtensions.cs:35-49`): the id a by-id lookup sends —
+/// the GUID `id` names in any form `Guid.TryParse` reads
+/// ([`parse_guid`](crate::metadata_merge::parse_guid)), written as
+/// `Guid.ToString()` writes it (the lowercase `D` form). A braced or
+/// `X`-form id in a URL path is a 400 from MusicBrainz — a failed request,
+/// which would keep the item from ever being stamped as refreshed. `None`
+/// for a blank or malformed id, which upstream ignores rather than sends.
+fn lookup_id(id: &str, entity: &'static str) -> Option<String> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    let parsed = crate::metadata_merge::parse_guid(id);
+    if parsed.is_none() {
+        tracing::debug!(entity, id, "ignoring malformed MusicBrainz id");
+    }
+    parsed.map(|guid| guid.hyphenated().to_string())
 }
 
 /// The lucene query for an artist search. Diacritics route through
@@ -700,17 +908,23 @@ fn artist_query(name: &str) -> String {
 }
 
 /// The lucene query for a release search: `"album" AND arid:{mbid}` when the
-/// artist id is known, else `"album" AND artist:"{name}"`, else just `"album"`.
-fn release_query(album: &str, artist_mbid: Option<&str>, artist_name: Option<&str>) -> String {
-    use std::fmt::Write as _;
-    let mut q = format!("\"{}\"", lucene_escape(album));
+/// artist id is known, else `"album" AND artist:"{name}"`; `None` with
+/// neither — upstream searches by album name alone never
+/// (`MusicBrainzAlbumProvider.cs:196-212`).
+fn release_query(
+    album: &str,
+    artist_mbid: Option<&str>,
+    artist_name: Option<&str>,
+) -> Option<String> {
+    let album = lucene_escape(album);
     if let Some(arid) = artist_mbid.filter(|s| !s.is_empty()) {
         // arid is a raw MBID (UUID) — not lucene-escaped.
-        let _ = write!(q, " AND arid:{arid}");
-    } else if let Some(name) = artist_name.filter(|s| !s.is_empty()) {
-        let _ = write!(q, " AND artist:\"{}\"", lucene_escape(name));
+        Some(format!("\"{album}\" AND arid:{arid}"))
+    } else {
+        artist_name
+            .filter(|s| !s.is_empty())
+            .map(|name| format!("\"{album}\" AND artist:\"{}\"", lucene_escape(name)))
     }
-    q
 }
 
 /// Escapes the lucene special characters MB's query parser reserves.
@@ -731,7 +945,7 @@ fn lucene_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
     #[test]
     fn partial_dates_default_the_missing_parts_to_the_first() {
         assert_eq!(
@@ -776,7 +990,23 @@ mod tests {
             Some("1997-06-16T00:00:00+00:00".to_owned())
         );
     }
-    use super::*;
+
+    #[test]
+    fn official_host_interval_floor() {
+        assert_eq!(MusicBrainzClient::interval(f64::MAX), MIN_INTERVAL);
+        assert_eq!(MusicBrainzClient::interval(f64::NAN), MIN_INTERVAL);
+        for url in [
+            "https://musicbrainz.org",
+            "http://MUSICBRAINZ.ORG:80/",
+            "https://www.musicbrainz.org",
+        ] {
+            assert_eq!(MusicBrainzClient::request_interval(url, 0.01), MIN_INTERVAL);
+        }
+        assert_eq!(
+            MusicBrainzClient::request_interval("http://localhost", 0.1),
+            Duration::from_millis(100)
+        );
+    }
 
     #[test]
     fn artist_query_uses_accent_field_for_non_ascii() {
@@ -787,19 +1017,17 @@ mod tests {
     #[test]
     fn release_query_prefers_arid_then_artist_name() {
         assert_eq!(
-            release_query("Kind of Blue", Some("mbid-123"), Some("Miles Davis")),
-            "\"Kind of Blue\" AND arid:mbid-123"
+            release_query("Kind of Blue", Some("mbid-123"), Some("Miles Davis")).as_deref(),
+            Some("\"Kind of Blue\" AND arid:mbid-123")
         );
         assert_eq!(
-            release_query("Kind of Blue", None, Some("Miles Davis")),
-            "\"Kind of Blue\" AND artist:\"Miles Davis\""
+            release_query("Kind of Blue", None, Some("Miles Davis")).as_deref(),
+            Some("\"Kind of Blue\" AND artist:\"Miles Davis\"")
         );
-        assert_eq!(
-            release_query("Kind of Blue", None, None),
-            "\"Kind of Blue\""
-        );
+        // Neither: no query — upstream never searches by album name alone.
+        assert_eq!(release_query("Kind of Blue", None, None), None);
         // Blank ids/names are ignored.
-        assert_eq!(release_query("X", Some(""), Some("")), "\"X\"");
+        assert_eq!(release_query("X", Some(""), Some("")), None);
     }
 
     #[test]
@@ -846,6 +1074,212 @@ mod tests {
                 ..AlbumIds::default()
             }
             .is_some()
+        );
+    }
+
+    /// Lookup ids: the lookups send only what `Guid.TryParse` reads.
+    const REL: &str = "b1f1a1b0-0000-4000-8000-000000000001";
+    const RG: &str = "b1f1a1b0-0000-4000-8000-000000000002";
+    const ARTIST: &str = "b1f1a1b0-0000-4000-8000-000000000003";
+    const RG_X: &str = "b1f1a1b0-0000-4000-8000-000000000004";
+    const REL_Y: &str = "b1f1a1b0-0000-4000-8000-000000000005";
+    const RG_EMPTY: &str = "b1f1a1b0-0000-4000-8000-000000000006";
+
+    /// `ParseMusicBrainzId` before every by-id lookup
+    /// (`MusicBrainzQueryExtensions.cs:35-49`): a braced, parenthesised,
+    /// upper-case or `X`-form id is sent as the canonical lowercase `D` form
+    /// (a raw one is a 400, a failed request forever), and a malformed one
+    /// is not sent at all.
+    #[rstest::rstest]
+    #[case::braced("{B1F1A1B0-0000-4000-8000-000000000001}")]
+    #[case::parenthesised("(b1f1a1b0-0000-4000-8000-000000000001)")]
+    #[case::n_form("B1F1A1B0000040008000000000000001")]
+    #[case::x_form("{0xb1f1a1b0,0x0,0x4000,{0x80,0x0,0x0,0x0,0x0,0x0,0x0,0x1}}")]
+    #[case::d_form(" b1f1a1b0-0000-4000-8000-000000000001 ")]
+    #[tokio::test]
+    async fn a_lookup_sends_the_canonical_mbid(#[case] id: &str) {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/release/b1f1a1b0-0000-4000-8000-000000000001?",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","title":"Kind of Blue"}"#
+                    .to_owned(),
+            ),
+            (
+                "/ws/2/release-group/b1f1a1b0-0000-4000-8000-000000000001?",
+                r#"{"releases":[{"id":"b1f1a1b0-0000-4000-8000-000000000009"}]}"#.to_owned(),
+            ),
+            (
+                "/ws/2/artist/b1f1a1b0-0000-4000-8000-000000000001",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","name":"Miles Davis"}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let hit = c.lookup_release(id).await.expect("release");
+        assert_eq!(hit.title.as_deref(), Some("Kind of Blue"));
+        assert_eq!(
+            c.first_release_of(id).await.as_deref(),
+            Some("b1f1a1b0-0000-4000-8000-000000000009")
+        );
+        let artist = c.lookup_artist(id).await.expect("artist");
+        assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
+        let details = c
+            .album_details(AlbumIds {
+                release_id: Some(id.to_owned()),
+                ..AlbumIds::default()
+            })
+            .await
+            .expect("album");
+        assert_eq!(
+            details.release_id.as_deref(),
+            Some("b1f1a1b0-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_mbid_is_never_looked_up() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::always(r#"{"id":"x","title":"Should not be asked"}"#).await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        assert!(c.lookup_release("not-an-mbid").await.is_none());
+        assert!(c.lookup_artist("{not-an-mbid}").await.is_none());
+        assert!(c.artist_details("rel-1").await.is_none());
+        assert!(c.first_release_of("").await.is_none());
+        assert!(c.release_group_releases("rg").await.is_empty());
+    }
+
+    /// `MusicBrainzAlbumProvider.Populate` (`:268-320`) over a release and
+    /// its group, both looked up with what it includes: the group's first
+    /// release date over the release's own, the release's artist credits,
+    /// the group's genres and tags by votes (the release's only without a
+    /// group), the release's labels as studios, distinct ignoring case.
+    #[tokio::test]
+    async fn an_album_is_populated_from_its_release_and_release_group() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/ws/2/release-group/",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000002","first-release-date":"1959-08-17",
+                    "artist-credit":[{"name":"Group Credit"}],
+                    "genres":[{"name":"modal jazz","count":2},{"name":"jazz","count":9},{"name":" ","count":20}],
+                    "tags":[{"name":"trumpet","count":1}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/ws/2/release/",
+                r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","date":"1997-03-25","release-group":{"id":"b1f1a1b0-0000-4000-8000-000000000002"},
+                    "artist-credit":[{"name":"Miles Davis","artist":{"id":"a"}},{"name":""}],
+                    "label-info":[{"label":{"name":"Columbia"}},{"label":{"name":"columbia"}},{"label":null},
+                                  {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}}],
+                    "genres":[{"name":"release genre","count":50}],
+                    "tags":[{"name":"release tag","count":50}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let details = c
+            .album_details(AlbumIds {
+                release_id: Some(REL.to_owned()),
+                ..AlbumIds::default()
+            })
+            .await
+            .expect("details");
+        assert_eq!(
+            details.release_group_id.as_deref(),
+            Some(RG),
+            "the release's group, when none was known"
+        );
+        assert_eq!(
+            details.production_year,
+            Some(1959),
+            "the group's first date"
+        );
+        assert_eq!(
+            details.premiere_date,
+            Some(super::PartialDate {
+                year: 1959,
+                month: 8,
+                day: 17
+            })
+        );
+        assert_eq!(
+            details.album_artists,
+            ["Miles Davis"],
+            "the release's credits"
+        );
+        assert_eq!(
+            details.genres,
+            ["jazz", "modal jazz"],
+            "the group's, by votes"
+        );
+        assert_eq!(details.tags, ["trumpet"]);
+        assert_eq!(
+            details.studios,
+            ["Columbia", "Éditions"],
+            "distinct ignoring case, non-ASCII too"
+        );
+
+        // No group: the release's own genres, tags, date and credits.
+        let server = MockServer::start(vec![(
+            "/ws/2/release/",
+            r#"{"id":"b1f1a1b0-0000-4000-8000-000000000001","date":"1997-03-25","artist-credit":[{"name":"Miles Davis"}],
+                "genres":[{"name":"jazz","count":1}],"tags":[{"name":"reissue","count":1}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let details = c
+            .album_details(AlbumIds {
+                release_id: Some(REL.to_owned()),
+                ..AlbumIds::default()
+            })
+            .await
+            .expect("details");
+        assert_eq!(details.release_group_id, None);
+        assert_eq!(details.production_year, Some(1997));
+        assert_eq!(details.genres, ["jazz"]);
+        assert_eq!(details.tags, ["reissue"]);
+        assert!(
+            c.album_details(AlbumIds::default()).await.is_none(),
+            "nothing to look up"
+        );
+    }
+
+    /// `MusicBrainzArtistProvider.GetMetadata`'s lookup: the life span, the
+    /// area's name else the country as the location, genres and tags by
+    /// votes.
+    #[tokio::test]
+    async fn an_artist_is_populated_from_its_lookup() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![(
+            "/ws/2/artist/",
+            r#"{"id":"a","name":"Miles Davis","country":"US","area":{"name":"United States"},
+                "life-span":{"begin":"1926-05-26","end":"1991-09-28"},
+                "genres":[{"name":"bebop","count":1},{"name":"jazz","count":7}],
+                "tags":[{"name":"trumpeter","count":3}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let details = c.artist_details(ARTIST).await.expect("details");
+        assert_eq!(details.location.as_deref(), Some("United States"));
+        assert_eq!(details.genres, ["jazz", "bebop"]);
+        assert_eq!(details.tags, ["trumpeter"]);
+        assert_eq!(details.premiere_date.map(|d| d.year), Some(1926));
+
+        let server = MockServer::start(vec![(
+            "/ws/2/artist/",
+            r#"{"id":"a","country":"GB","area":{"name":" "}}"#.to_owned(),
+        )])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+        let details = c.artist_details(ARTIST).await.expect("details");
+        assert_eq!(
+            details.location.as_deref(),
+            Some("GB"),
+            "the country, without an area"
         );
     }
 
@@ -896,7 +1330,7 @@ mod tests {
             .resolve_album(
                 "X",
                 AlbumIds {
-                    release_group_id: Some("rg-x".to_owned()),
+                    release_group_id: Some(RG_X.to_owned()),
                     ..AlbumIds::default()
                 },
                 None,
@@ -905,19 +1339,79 @@ mod tests {
             .await;
         assert_eq!(ids.release_id.as_deref(), Some("rel-from-rg"));
 
-        // Release known, group missing → release_group_of fills the group.
+        // Release known, group missing: resolution asks nothing more — the
+        // album lookup's release (`inc=release-groups`) gives the group.
+        let known = AlbumIds {
+            release_id: Some(REL_Y.to_owned()),
+            ..AlbumIds::default()
+        };
+        let ids = c.resolve_album("X", known.clone(), None, None).await;
+        assert_eq!(ids, known);
+        let details = c.album_details(ids).await.expect("details");
+        assert_eq!(details.release_group_id.as_deref(), Some("rg-looked-up"));
+    }
+
+    /// `MusicBrainzAlbumProvider.GetMetadata`'s search rules
+    /// (`MusicBrainzAlbumProvider.cs:186-215`): with neither an artist id
+    /// nor an album artist there is no search at all — the album alone is
+    /// never searched; a known release group without releases is still
+    /// searched, and the hit's group replaces it.
+    #[tokio::test]
+    async fn an_album_is_searched_only_by_its_artist_and_whenever_it_has_no_release() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            ("/ws/2/release-group/", r#"{"releases":[]}"#.to_owned()),
+            (
+                "/ws/2/release/",
+                r#"{"id":"rel-searched","release-group":{"id":"rg-searched"}}"#.to_owned(),
+            ),
+            (
+                "/ws/2/release?",
+                r#"{"releases":[{"id":"rel-searched","release-group":{"id":"rg-searched"}}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = MusicBrainzClient::new(&server.base_url, "test");
+
+        // No artist to search by: no search, so no match (a search would
+        // have answered `rel-searched`).
+        let ids = c
+            .resolve_album("Kind of Blue", AlbumIds::default(), None, None)
+            .await;
+        assert_eq!(ids, AlbumIds::default(), "no search by album name alone");
+
+        // A release group with no releases, and an artist to search by: the
+        // search runs, and its hit's group replaces the known one.
+        let empty_group = AlbumIds {
+            release_group_id: Some(RG_EMPTY.to_owned()),
+            ..AlbumIds::default()
+        };
         let ids = c
             .resolve_album(
-                "X",
-                AlbumIds {
-                    release_id: Some("rel-y".to_owned()),
-                    ..AlbumIds::default()
-                },
-                None,
+                "Kind of Blue",
+                empty_group.clone(),
+                Some("artist-mbid"),
                 None,
             )
             .await;
-        assert_eq!(ids.release_group_id.as_deref(), Some("rg-looked-up"));
+        assert_eq!(ids.release_id.as_deref(), Some("rel-searched"));
+        assert_eq!(ids.release_group_id.as_deref(), Some("rg-searched"));
+        let ids = c
+            .resolve_album(
+                "Kind of Blue",
+                empty_group.clone(),
+                None,
+                Some("Miles Davis"),
+            )
+            .await;
+        assert_eq!(ids.release_id.as_deref(), Some("rel-searched"));
+
+        // The same group with nothing to search by keeps the group alone.
+        let ids = c
+            .resolve_album("Kind of Blue", empty_group.clone(), None, None)
+            .await;
+        assert_eq!(ids, empty_group);
     }
 
     #[tokio::test]
@@ -1010,7 +1504,7 @@ mod tests {
             Some((1926, 5, 26))
         );
 
-        let artist = c.lookup_artist("artist-mbid").await.expect("lookup");
+        let artist = c.lookup_artist(ARTIST).await.expect("lookup");
         assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
         assert_eq!(artist.begin.year(), Some(1926));
     }

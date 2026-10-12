@@ -269,8 +269,11 @@ where
         return Ok(true);
     }
 
-    let hour =
-        f64::from(now.hour()) + f64::from(now.minute()) / 60.0 + f64::from(now.second()) / 3600.0;
+    // TimeOfDay.TotalHours includes subsecond time: the first fraction of a
+    // second after EndHour must not remain inside the allowed window.
+    let hour = (f64::from(now.num_seconds_from_midnight())
+        + f64::from(now.nanosecond()) / 1_000_000_000.0)
+        / 3600.0;
     let weekday = now.date_naive().weekday();
 
     Ok(schedules
@@ -492,6 +495,46 @@ mod tests {
             !has_permission(db.pool(), &guid_to_db(id), PermissionKind::EnableAllDevices)
                 .await
                 .expect("read")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(9, 29, 59, 999_999_900, false)]
+    #[case(9, 30, 0, 0, true)]
+    #[case(10, 30, 0, 0, true)]
+    #[case(10, 30, 0, 100, false)]
+    #[case(10, 30, 0, 500_000_000, false)]
+    #[tokio::test]
+    async fn stored_schedule_preserves_fractional_second_boundaries(
+        #[case] hour: u32,
+        #[case] minute: u32,
+        #[case] second: u32,
+        #[case] nanos: u32,
+        #[case] expected: bool,
+    ) {
+        use chrono::TimeZone as _;
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_user(&db, id).await;
+        let schedule = ferrofin_model::users::AccessSchedule {
+            day_of_week: ferrofin_model::users::DynamicDayOfWeek::Everyday,
+            start_hour: 9.5,
+            end_hour: 10.5,
+            ..Default::default()
+        };
+        crate::access_schedule_repository::replace(db.writer(), &guid_to_db(id), &[schedule])
+            .await
+            .unwrap();
+        let local = chrono::NaiveDate::from_ymd_opt(2026, 10, 5)
+            .unwrap()
+            .and_hms_nano_opt(hour, minute, second, nanos)
+            .unwrap();
+        let now = chrono::Local.from_local_datetime(&local).single().unwrap();
+        assert_eq!(
+            is_parental_schedule_allowed(db.pool(), &guid_to_db(id), now)
+                .await
+                .unwrap(),
+            expected
         );
     }
 

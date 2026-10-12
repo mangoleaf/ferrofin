@@ -407,10 +407,11 @@ fn parse(xml: &str) -> Result<Node, ServiceError> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    reader.config_mut().trim_text(false);
 
     let mut stack: Vec<Node> = Vec::new();
     let mut root: Option<Node> = None;
+    let mut text = String::new();
 
     loop {
         let event = reader.read_event().map_err(|e| {
@@ -419,6 +420,14 @@ fn parse(xml: &str) -> Result<Node, ServiceError> {
                 reader.buffer_position()
             ))
         })?;
+        // Entity references are separate events. Trim only after joining a
+        // complete text run, retaining spaces on either side of an entity.
+        if !matches!(&event, Event::Text(_) | Event::GeneralRef(_)) {
+            if let Some(top) = stack.last_mut() {
+                top.text.push_str(text.trim());
+            }
+            text.clear();
+        }
         match event {
             Event::Start(e) => {
                 if stack.len() >= MAX_DEPTH {
@@ -432,17 +441,18 @@ fn parse(xml: &str) -> Result<Node, ServiceError> {
                 let node = new_node(&e);
                 close(&mut stack, &mut root, node);
             }
-            Event::Text(e) => {
-                if let Some(top) = stack.last_mut() {
-                    let text = e
-                        .unescape()
+            Event::Text(e) => text.push_str(e.as_ref()),
+            Event::GeneralRef(e) => {
+                if !stack.is_empty() {
+                    let reference = format!("&{};", e.as_ref());
+                    let value = quick_xml::escape::unescape(&reference)
                         .map_err(|err| ServiceError::Backend(format!("bad XML text: {err}")))?;
-                    top.text.push_str(text.as_ref());
+                    text.push_str(&value);
                 }
             }
             Event::CData(e) => {
                 if let Some(top) = stack.last_mut() {
-                    top.text.push_str(&String::from_utf8_lossy(e.as_ref()));
+                    top.text.push_str(e.as_ref());
                 }
             }
             Event::End(_) => {
@@ -462,10 +472,10 @@ fn parse(xml: &str) -> Result<Node, ServiceError> {
 /// Builds an empty node from a start tag, recording `xsi:nil="true"`.
 fn new_node(tag: &quick_xml::events::BytesStart<'_>) -> Node {
     let nil = tag.attributes().flatten().any(|a| {
-        a.key.local_name().as_ref() == b"nil" && a.value.as_ref().eq_ignore_ascii_case(b"true")
+        a.key.local_name().as_ref() == "nil" && a.value.as_ref().eq_ignore_ascii_case("true")
     });
     Node {
-        name: String::from_utf8_lossy(tag.local_name().as_ref()).into_owned(),
+        name: tag.local_name().as_ref().to_owned(),
         text: String::new(),
         nil,
         children: Vec::new(),
@@ -488,6 +498,15 @@ fn backend(action: &str, err: &serde_json::Error) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn entity_text_is_joined_before_trimming() {
+        let node = super::parse("<Name>  Fish &amp; Chips &#33;  </Name>").expect("valid XML");
+        assert_eq!(node.text, "Fish & Chips !");
+        let node = super::parse("<Name><![CDATA[  keep spaces  ]]></Name>").expect("CDATA");
+        assert_eq!(node.text, "  keep spaces  ");
+        assert!(super::parse("<Name>&missing;</Name>").is_err());
+    }
+
     #[test]
     fn single_class_typed_entry_is_read_as_a_list() {
         // A library with one path: `<PathInfos>` has exactly one

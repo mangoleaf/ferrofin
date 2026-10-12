@@ -211,13 +211,20 @@ struct OkAuth {
 impl AuthService for OkAuth {
     async fn authenticate(
         &self,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
+        if !request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ServiceError::unauthorized("no credentials"));
+        }
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -226,13 +233,20 @@ impl AuthService for OkAuth {
 impl AuthorizationContext for OkAuth {
     async fn get_authorization_info(
         &self,
-        _request: &RequestContext,
+        request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
+        if !request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ServiceError::unauthorized("no credentials"));
+        }
         Ok(AuthorizationInfo {
             user: Some(user_entity(USER_ID, "alice")),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -262,6 +276,21 @@ impl StubLibrary {
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         *self.item_reads.lock().expect("lock") += 1;
         Ok(match id {
@@ -319,7 +348,7 @@ impl LibraryManager for StubLibrary {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // Mirror the real manager's 400 guard so the "wrong type" test exercises
         // it, then record the accepted swap.
         if !matches!(image_type, ImageType::Backdrop | ImageType::Chapter) {
@@ -329,7 +358,8 @@ impl LibraryManager for StubLibrary {
             .lock()
             .expect("lock")
             .push((item_id, image_type, index1, index2));
-        Ok(())
+        // Index 99 stands for a slot that does not exist: upstream does nothing.
+        Ok(index2 != 99)
     }
 
     async fn get_named_item(
@@ -590,11 +620,15 @@ impl UserManager for StubUsers {
     }
 }
 
+type SavedImage = (Uuid, String, ImageType, Option<i32>);
+
 /// A [`ProviderManager`] recording `save_image`/`delete_image` and returning a
 /// canned remote image + provider.
 struct StubProviders {
-    saved: Arc<Mutex<Vec<(Uuid, String)>>>,
+    saved: Arc<Mutex<Vec<SavedImage>>>,
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
+    /// The `ImageUpdate` repository saves requested through `update_to_repository`.
+    updates: Arc<Mutex<Vec<Uuid>>>,
 }
 
 #[async_trait]
@@ -635,13 +669,15 @@ impl ProviderManager for StubProviders {
         item_id: Uuid,
         _content: &[u8],
         mime_type: &str,
-        _image_type: ImageType,
-        _image_index: Option<i32>,
+        image_type: ImageType,
+        image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        self.saved
-            .lock()
-            .expect("lock")
-            .push((item_id, mime_type.to_owned()));
+        self.saved.lock().expect("lock").push((
+            item_id,
+            mime_type.to_owned(),
+            image_type,
+            image_index,
+        ));
         Ok(())
     }
     async fn delete_image(
@@ -682,6 +718,14 @@ impl ProviderManager for StubProviders {
         _item_id: Uuid,
         _update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn update_to_repository(
+        &self,
+        item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        self.updates.lock().expect("lock").push(item_id);
         Ok(())
     }
     async fn get_external_id_infos(
@@ -731,6 +775,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
         providers: Arc::new(StubProviders {
             saved: Arc::new(Mutex::new(Vec::new())),
             deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
         }),
         elevated: false,
     }
@@ -934,18 +979,20 @@ async fn item_image_wrong_type_is_404() {
 }
 
 #[tokio::test]
-async fn serving_an_item_image_reads_no_item_row() {
-    // The hot path: the image row the handler found already proves the item
-    // exists (`BaseItemImageInfos.ItemId` is a cascading foreign key), so the
-    // served request must not also read `BaseItems`. Restoring the eager
-    // existence check makes this one, not zero.
+async fn authenticated_image_aliases_resolve_the_item_before_serving() {
+    // An existing image row proves existence, but does not establish visibility.
+    // Every authenticated alias must resolve the item before serving bytes.
     let img = TempImage::new(b"IMAGEBYTES");
     let s = stubs(img.path(), String::new());
 
     let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images/Primary"), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"IMAGEBYTES");
-    assert_eq!(s.library.item_reads(), 0, "served image read an item row");
+    assert_eq!(
+        s.library.item_reads(),
+        1,
+        "served image must check visibility"
+    );
 
     // Same for the indexed and fully-parametrized aliases.
     let (status, _) = send(
@@ -964,20 +1011,22 @@ async fn serving_an_item_image_reads_no_item_row() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(s.library.item_reads(), 0, "alias route read an item row");
+    assert_eq!(
+        s.library.item_reads(),
+        3,
+        "each alias must check visibility"
+    );
 }
 
 #[tokio::test]
 async fn item_image_404_still_tells_missing_item_from_missing_image() {
-    // The item read moved onto the miss path — it did not disappear. A request
-    // for an item that does not exist still says so, and one for an item that
-    // exists but has no image of that type still names the image.
+    // Missing items and missing images retain their respective responses.
     let img = TempImage::new(b"X");
     let s = stubs(img.path(), String::new());
 
     let missing = Uuid::from_u128(0xDEAD);
 
-    // All THREE route shapes that pass `ItemResolved::No` must keep the
+    // All three item-image route shapes must keep the
     // distinction — the bare route, the indexed alias, and the fully
     // parametrized alias. Flipping either alias to `ItemResolved::Yes` changes
     // its missing-item body from "item {id}" to "item {id} has no Primary image
@@ -1177,21 +1226,49 @@ async fn set_item_image_saves_and_returns_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let saved = s.providers.saved.lock().expect("lock");
-    assert_eq!(saved.as_slice(), [(ITEM_ID, "image/png".to_owned())]);
+    assert_eq!(
+        saved.as_slice(),
+        [(ITEM_ID, "image/png".to_owned(), ImageType::Primary, None)]
+    );
 }
 
 #[tokio::test]
-async fn set_item_image_by_index_saves() {
+async fn indexed_upload_ignores_every_bound_index_for_single_and_multiple_images() {
     let s = elevated_stubs(String::new(), String::new());
-    let (status, _) = send(
-        &s,
-        "POST",
-        &format!("/Items/{ITEM_ID}/Images/Backdrop/2"),
-        Some(("image/jpeg", "aGk=")),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(s.providers.saved.lock().expect("lock").len(), 1);
+    let mut expected = Vec::new();
+    for (kind, image_type) in [
+        ("Backdrop", ImageType::Backdrop),
+        ("Primary", ImageType::Primary),
+    ] {
+        for index in [i32::MIN, -1, 0, 1, 2, i32::MAX] {
+            let (status, _) = send(
+                &s,
+                "POST",
+                &format!("/Items/{ITEM_ID}/Images/{kind}/{index}"),
+                Some(("image/png", "aGk=")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{kind}/{index}");
+            expected.push((ITEM_ID, "image/png".to_owned(), image_type, None));
+        }
+    }
+    assert_eq!(*s.providers.saved.lock().expect("lock"), expected);
+}
+
+#[tokio::test]
+async fn indexed_upload_rejects_unbound_indices_without_saving() {
+    let s = elevated_stubs(String::new(), String::new());
+    for index in ["2147483648", "-2147483649", "invalid"] {
+        let (status, _) = send(
+            &s,
+            "POST",
+            &format!("/Items/{ITEM_ID}/Images/Backdrop/{index}"),
+            Some(("image/png", "aGk=")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(s.providers.saved.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]
@@ -1285,6 +1362,26 @@ async fn update_item_image_index_swaps_and_returns_204() {
         s.library.swaps.lock().expect("lock").as_slice(),
         [(ITEM_ID, ImageType::Backdrop, 1, 3)]
     );
+}
+
+#[tokio::test]
+async fn update_item_image_index_saves_the_item_only_after_a_real_swap() {
+    let s = elevated_stubs(String::new(), String::new());
+    for (new_index, expected_saves) in [(3, 1), (99, 1)] {
+        let (status, _) = send(
+            &s,
+            "POST",
+            &format!("/Items/{ITEM_ID}/Images/Backdrop/1/Index?newIndex={new_index}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            s.providers.updates.lock().expect("lock").len(),
+            expected_saves
+        );
+    }
+    assert_eq!(*s.providers.updates.lock().expect("lock"), [ITEM_ID]);
 }
 
 #[tokio::test]
@@ -1460,6 +1557,24 @@ async fn untagged_image_is_public_and_client_no_cache_is_mirrored() {
     );
 }
 
+#[tokio::test]
+async fn file_metadata_validators_do_not_override_image_tags() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let path = format!("/Items/{ITEM_ID}/Images/Primary?tag=abc123");
+    for condition in ["If-Match", "If-None-Match"] {
+        let (status, headers, body) = send_with_headers(
+            &s,
+            &path,
+            &[("Cache-Control", "no-cache"), (condition, "*")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"PNGDATA");
+        assert!(headers.get("etag").is_none());
+    }
+}
+
 // The legacy `/Users/{userId}/Images/{imageType}[/{index}]` forms (upstream
 // [Obsolete] + hidden from OpenAPI; jellyfin-web's apiclient still requests
 // avatars this way) forward to the /UserImage handlers — the path's image
@@ -1530,4 +1645,57 @@ async fn legacy_user_image_upload_and_delete_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn profile_images_are_public_on_all_read_routes() {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    for method in ["GET", "HEAD"] {
+        for path in [
+            format!("/UserImage?userId={USER_ID}"),
+            format!("/Users/{USER_ID}/Images/Primary"),
+            format!("/Users/{USER_ID}/Images/Primary/0"),
+        ] {
+            let app = state(&s);
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                body.as_ref(),
+                if method == "HEAD" {
+                    b"".as_slice()
+                } else {
+                    b"PROFILE".as_slice()
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn anonymous_profile_image_requires_a_nonempty_user_id() {
+    let s = stubs(String::new(), String::new());
+    for path in [
+        "/UserImage".to_owned(),
+        format!("/UserImage?userId={}", Uuid::nil()),
+    ] {
+        let app = state(&s);
+        let response = create_router(app)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

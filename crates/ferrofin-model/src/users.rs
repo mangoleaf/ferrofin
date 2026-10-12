@@ -26,8 +26,9 @@ pub enum ForgotPasswordAction {
 
 /// Access level to `SyncPlay` features (mirrors
 /// `Jellyfin.Database.Implementations.Enums.SyncPlayUserAccessType`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum SyncPlayUserAccessType {
     /// The user can create and join groups.
     #[default]
@@ -36,6 +37,17 @@ pub enum SyncPlayUserAccessType {
     JoinGroups = 1,
     /// The user has no access to `SyncPlay`.
     None = 2,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    SyncPlayUserAccessType, None, {
+        CreateAndJoinGroups => ("CreateAndJoinGroups", 0),
+        JoinGroups => ("JoinGroups", 1),
+        None => ("None", 2),
+    }
 }
 
 impl SyncPlayUserAccessType {
@@ -48,11 +60,7 @@ impl SyncPlayUserAccessType {
     /// must not silently grant full access.
     #[must_use]
     pub fn from_stored(value: i32) -> Self {
-        match value {
-            0 => Self::CreateAndJoinGroups,
-            1 => Self::JoinGroups,
-            _ => Self::None,
-        }
+        Self::from_json_value(value)
     }
 
     /// Whether this level permits joining an existing group.
@@ -70,8 +78,9 @@ impl SyncPlayUserAccessType {
 
 /// The day of the week, or a group of days, an access schedule applies to
 /// (mirrors `Jellyfin.Data.Enums.DynamicDayOfWeek`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum DynamicDayOfWeek {
     /// Sunday.
     #[default]
@@ -94,6 +103,24 @@ pub enum DynamicDayOfWeek {
     Weekday,
     /// Any weekend day.
     Weekend,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+crate::json::enums::wire_enum! {
+    DynamicDayOfWeek, None, {
+        Sunday => ("Sunday", 0),
+        Monday => ("Monday", 1),
+        Tuesday => ("Tuesday", 2),
+        Wednesday => ("Wednesday", 3),
+        Thursday => ("Thursday", 4),
+        Friday => ("Friday", 5),
+        Saturday => ("Saturday", 6),
+        Everyday => ("Everyday", 7),
+        Weekday => ("Weekday", 8),
+        Weekend => ("Weekend", 9),
+    }
 }
 
 /// An access schedule constraining when a user may access the server.
@@ -101,8 +128,8 @@ pub enum DynamicDayOfWeek {
 /// Forward reference: upstream this is
 /// `Jellyfin.Database.Implementations.Entities.AccessSchedule`. Embedded in
 /// [`UserPolicy`]; move when that entity is ported.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default, rename_all = "PascalCase")]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct AccessSchedule {
     /// Gets the id of this instance.
@@ -179,10 +206,12 @@ pub struct UserPolicy {
 
     /// Gets or sets the max parental rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_parental_rating: Option<i32>,
 
     /// Gets or sets the max parental sub rating.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub max_parental_sub_rating: Option<i32>,
 
     /// Gets or sets the blocked tags.
@@ -322,8 +351,8 @@ mod sync_play_access_tests {
         assert_eq!(Access::from_stored(2), Access::None);
         // Out of range denies: the value backs an authorization check, and an
         // out-of-range C# cast matches no permitted variant either.
-        assert_eq!(Access::from_stored(99), Access::None);
-        assert_eq!(Access::from_stored(-1), Access::None);
+        assert_eq!(Access::from_stored(99), Access::Unrecognized(99));
+        assert_eq!(Access::from_stored(-1), Access::Unrecognized(-1));
         assert!(!Access::from_stored(99).can_join_groups());
         assert!(!Access::from_stored(99).can_create_groups());
     }
@@ -338,5 +367,20 @@ mod sync_play_access_tests {
 
         assert!(!Access::None.can_create_groups());
         assert!(!Access::None.can_join_groups());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn access_schedule_accepts_a_new_row_without_database_identity() {
+        let schedule: super::AccessSchedule = serde_json::from_value(serde_json::json!({
+            "DayOfWeek": "Weekday", "StartHour": 9.5, "EndHour": 17.25
+        }))
+        .unwrap();
+        assert_eq!(schedule.id, 0);
+        assert!(schedule.user_id.is_nil());
+        assert_eq!(schedule.day_of_week, super::DynamicDayOfWeek::Weekday);
+        assert_eq!((schedule.start_hour, schedule.end_hour), (9.5, 17.25));
     }
 }

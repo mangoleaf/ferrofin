@@ -33,3 +33,22 @@ pub use gauges::{GaugeCell, GaugeMap};
 pub use http::track_http;
 pub use init::{MetricsHandle, init};
 pub use labels::RouteLabels;
+
+/// Every metric name this crate's own instruments expose (the `http_*` and
+/// `process_*` parity families plus `ferrofin_tokio_*`), for the dashboard
+/// lint test. The integration test asserts each one renders.
+pub const METRIC_NAMES: &[&str] = &[
+    "http_requests_received_total",
+    "http_requests_in_progress",
+    "http_request_duration_seconds",
+    "process_cpu_seconds_total",
+    "process_start_time_seconds",
+    "process_open_handles",
+    "process_working_set_bytes",
+    "process_virtual_memory_bytes",
+    "process_private_memory_bytes",
+    "process_num_threads",
+    "process_cpu_count",
+    "ferrofin_tokio_workers",
+    "ferrofin_tokio_alive_tasks",
+];

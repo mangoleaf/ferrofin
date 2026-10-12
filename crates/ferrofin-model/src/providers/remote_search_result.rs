@@ -23,18 +23,22 @@ pub struct RemoteSearchResult {
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub production_year: Option<i32>,
 
     /// Gets or sets the index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number: Option<i32>,
 
     /// Gets or sets the end index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub index_number_end: Option<i32>,
 
     /// Gets or sets the parent index number.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub parent_index_number: Option<i32>,
 
     /// Gets or sets the premiere date.

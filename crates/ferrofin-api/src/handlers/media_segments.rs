@@ -4,11 +4,10 @@
 //! - `GET /MediaSegments/{itemId}` — the intro/outro/recap/commercial/preview
 //!   segments stored for an item, optionally filtered by type.
 //!
-//! The plugin-owned `SegmentEditor` routes (`/MediaSegmentsApi/*`, tagged
-//! `SegmentEditor` in the contract) belong to a dynamic plugin host and stay on
-//! the `501` stub.
+//! The plugin-owned `SegmentEditor` routes (`/MediaSegmentsApi/*`) are implemented
+//! by the Intro Skipper handlers and retain their management view of stored rows.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -16,8 +15,9 @@ use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_model::querying::QueryResult;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
+use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
@@ -43,8 +43,8 @@ fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
 /// Port of `MediaSegmentsController.GetItemSegments`: resolves the item (`404`
 /// when absent), then returns its stored segments narrowed to the requested
 /// [`MediaSegmentType`]s (all types when the filter is empty), wrapped in a
-/// [`QueryResult`]. The C# per-library provider filtering is a documented
-/// deferral in the manager (all stored segments are returned).
+/// [`QueryResult`]. Rows are limited to registered providers enabled on the
+/// owning library, matching Jellyfin's default provider filter.
 #[utoipa::path(
     get,
     path = "/MediaSegments/{itemId}",
@@ -60,11 +60,16 @@ fn include_segment_types(pairs: &[(String, String)]) -> Option<String> {
 )]
 async fn get_item_segments(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
-    if state.library.get_item_by_id(item_id).await?.is_none() {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
 
@@ -76,10 +81,16 @@ async fn get_item_segments(
         Some(types.as_slice())
     };
 
-    let segments = state
+    let mut segments = state
         .media_segments
-        .get_segments(item_id, type_filter, false)
+        .get_segments(item_id, type_filter, true)
         .await?;
+    // The Intro Skipper's `MediaSegmentsFirstEpisodeFilter` (`SkipFirstEpisode`).
+    if segments.iter().any(|s| s.type_ == MediaSegmentType::Intro)
+        && state.intro_skipper_analysis.hides_intros(item_id).await
+    {
+        segments.retain(|s| s.type_ != MediaSegmentType::Intro);
+    }
     let count = i32::try_from(segments.len()).unwrap_or(i32::MAX);
     Ok(Json(QueryResult::new(Some(0), Some(count), segments)))
 }
@@ -93,11 +104,17 @@ struct ProviderEraseQuery {
 }
 
 /// `DELETE /MediaSegments/Provider/{providerId}` — erases every segment a provider
-/// wrote, optionally limited to one type. Backs a provider's bulk "erase
-/// timestamps" tool (e.g. Intro Skipper). Not a Jellyfin contract route; additive.
+/// wrote, optionally limited to one type. Not a Jellyfin contract route;
+/// additive. (Intro Skipper's erase goes through its own tier, `POST
+/// /Intros/EraseTimestamps`; rows removed here would be republished from it.)
+///
+/// Elevated: a server-wide erase, as every bulk segment erase upstream is
+/// (`SkipIntroController.ResetIntroTimestamps`, `EraseSeasonAsync` are
+/// `RequiresElevation`). It took a bare `RequireAuth`, so any account could
+/// wipe every provider's segments.
 async fn erase_provider_segments(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAdmin(_auth): RequireAdmin,
     Path(provider_id): Path<String>,
     Query(query): Query<ProviderEraseQuery>,
 ) -> Result<StatusCode, ApiError> {
@@ -112,7 +129,7 @@ async fn erase_provider_segments(
     };
     state
         .media_segments
-        .delete_all_provider_segments(&provider_id, type_filter)
+        .delete_all_producer_segments(&provider_id, type_filter)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -125,4 +142,27 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/MediaSegments/Provider/{providerId}",
             delete(erase_provider_segments),
         )
+}
+
+crate::query::query_parameters! {
+    ProviderEraseQuery {} => [];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::include_segment_types;
+
+    #[test]
+    fn include_segment_types_matches_the_key_ignoring_case() {
+        let pairs = [
+            ("IncludeSegmentTypes".to_owned(), "Intro".to_owned()),
+            ("includesegmenttypes".to_owned(), "Outro".to_owned()),
+            ("other".to_owned(), "x".to_owned()),
+        ];
+        assert_eq!(
+            include_segment_types(&pairs).as_deref(),
+            Some("Intro,Outro")
+        );
+        assert_eq!(include_segment_types(&[]), None);
+    }
 }

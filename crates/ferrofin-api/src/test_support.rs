@@ -400,10 +400,22 @@ impl AuthService for AuthedAuthService {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
+        Ok(authenticated_user_info())
+    }
+}
+
+/// A valid ordinary test user with a cached policy. Handler-only fakes use this
+/// instead of an authenticated context with neither a user nor an API key.
+#[must_use]
+pub fn authenticated_user_info() -> AuthorizationInfo {
+    AuthorizationInfo {
+        is_authenticated: true,
+        user: Some(sample_user()),
+        user_policy: Some(Arc::new(UserPolicy {
+            enable_remote_access: true,
+            ..UserPolicy::default()
+        })),
+        ..AuthorizationInfo::default()
     }
 }
 
@@ -432,6 +444,21 @@ pub struct FakeLibrary;
 
 #[async_trait]
 impl LibraryManager for FakeLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
@@ -1096,9 +1123,6 @@ impl MediaSourceManager for FakeMediaSources {
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
 }
 
 /// The deterministic access token [`FakeSessions`] mints on authentication, so
@@ -1419,7 +1443,7 @@ impl ServerApplicationPaths for FakePaths {
         // A process-unique temp root so path-backed handlers (e.g. Backup) have a
         // real, writable directory to operate in during tests.
         std::env::temp_dir()
-            .join("ferrofin-api-test-data")
+            .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()
             .into_owned()
     }
@@ -1629,7 +1653,8 @@ impl SearchManager for FakeSearch {
     }
 }
 
-/// A fake [`DtoService`]; every method is unused by INFRA-level tests.
+/// A fake [`DtoService`]; every projection is unused by INFRA-level tests, and
+/// its `CanDelete(user)` never grants a delete.
 pub struct FakeDto;
 
 #[async_trait]
@@ -1667,6 +1692,13 @@ impl DtoService for FakeDto {
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
         unimplemented!("fake")
+    }
+    async fn can_delete(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        Ok(false)
     }
 }
 
@@ -2133,7 +2165,15 @@ impl LocalizationManager for FakeLocalization {
     fn get_localization_options(&self) -> Vec<LocalizationOption> {
         unimplemented!("fake")
     }
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        // AppState snapshots this at construction; INFRA fixtures only need
+        // the built-in startup culture, without invoking unused API handlers.
+        vec!["en-US".to_owned()]
+    }
     fn get_localized_string(&self, phrase: &str) -> String {
+        phrase.to_owned()
+    }
+    fn get_server_localized_string(&self, phrase: &str) -> String {
         phrase.to_owned()
     }
     fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
@@ -2978,4 +3018,43 @@ pub fn elevated_state_with_library_and_providers(
         Arc::new(FakeFileSystem),
         Arc::new(FakeTasks),
     )
+}
+
+/// `name=value` pairs for every query member upstream requires on `method`
+/// `path` (any template spelling), except `except`. The value suits the
+/// member's OpenAPI `schema` type when `operation` gives one, so a probe
+/// request is not refused for a missing required member first.
+#[must_use]
+pub fn required_query(
+    method: &str,
+    path: &str,
+    operation: &serde_json::Value,
+    except: &str,
+) -> String {
+    let method = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+        .unwrap_or(axum::http::Method::GET);
+    crate::query::required_members(&method, path)
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(except))
+        .map(|name| {
+            let schema = operation["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                })
+                .map(|p| &p["schema"]);
+            let value = match schema.map(|s| (s["type"].as_str(), s["format"].as_str())) {
+                Some((_, Some("uuid"))) => "00000000000000000000000000000001",
+                Some((Some("integer" | "number"), _)) => "1",
+                Some((Some("boolean"), _)) => "true",
+                _ => "x",
+            };
+            format!("{name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }

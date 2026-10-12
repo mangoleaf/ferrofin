@@ -4,7 +4,7 @@
 #   /usr/bin/ferrofin-server                the binary (the .deb puts it here; a tarball
 #                                           install overrides ExecStart= with a drop-in)
 #   /etc/ferrofin/config.toml               configuration (docs/CONFIG.md)
-#   /var/lib/ferrofin/data                  data dir: jellyfin.db, cache/, log/, plugins/
+#   /var/lib/ferrofin                       data dir: jellyfin.db, cache/, log/, plugins/
 #   /usr/lib/jellyfin-ffmpeg/               jellyfin-ffmpeg from the Jellyfin apt repository
 #   /usr/share/jellyfin/web                 the jellyfin-web package's built client
 #
@@ -16,13 +16,13 @@ Description=Ferrofin media server
 Documentation=https://github.com/mangoleaf/ferrofin
 Wants=network-online.target
 After=network-online.target remote-fs.target
-RequiresMountsFor=/var/lib/ferrofin/data
+RequiresMountsFor=/var/lib/ferrofin
 
 [Service]
 Type=simple
 User=ferrofin
 Group=ferrofin
-WorkingDirectory=/var/lib/ferrofin/data
+WorkingDirectory=/var/lib/ferrofin
 
 # Fail fast, with a clear journal line, when a runtime dependency is missing.
 ExecStartPre=/usr/bin/test -x /usr/lib/jellyfin-ffmpeg/ffmpeg
@@ -42,19 +42,8 @@ RestartSec=5
 # In-flight transcodes are killed on stop; the DB checkpoint is quick.
 TimeoutStopSec=45
 
-# Hardening. ProtectSystem=strict makes the whole filesystem read-only except
-# the paths listed; media libraries are read through the read-only view, which
-# is all a scan and a transcode need. Add a ReadWritePaths= entry for any
-# library where you enable deletion or metadata/image saving from the UI.
-UMask=0027
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectHome=yes
-ProtectSystem=strict
-ReadWritePaths=/var/lib/ferrofin/data
-# Hardware transcoding needs the render node; uncomment for VAAPI/QSV.
-#DeviceAllow=/dev/dri/renderD128 rw
-#SupplementaryGroups=render video
+# VAAPI/QSV transcoding opens /dev/dri/renderD*, owned by the render group.
+SupplementaryGroups=render
 
 [Install]
 WantedBy=multi-user.target

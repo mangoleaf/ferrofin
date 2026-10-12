@@ -16,6 +16,18 @@ pub trait SourceFetcher: Send + Sync {
     /// Fetches `url` and returns its body as text.
     async fn fetch(&self, url: &str) -> Result<String, ServiceError>;
 
+    /// Fetches `url` presenting `user_agent` when one is given
+    /// (`M3uParser.GetListingsStream`: `requestMessage.Headers.UserAgent.
+    /// TryParseAdd(info.UserAgent)` for a non-empty configured value, so a
+    /// playlist host that only serves a particular client still answers).
+    ///
+    /// The default ignores the agent and delegates to [`fetch`](Self::fetch),
+    /// so a text-only fake keeps working; the real fetcher sets the header.
+    async fn fetch_as(&self, url: &str, user_agent: Option<&str>) -> Result<String, ServiceError> {
+        let _ = user_agent;
+        self.fetch(url).await
+    }
+
     /// Fetches `url` and returns its body as raw bytes — for documents the
     /// server passes through untouched (the Schedules Direct country list).
     ///
@@ -78,9 +90,23 @@ impl ReqwestFetcher {
 
     /// Performs the `GET`, failing on transport errors and non-success statuses.
     async fn get(&self, url: &str) -> Result<reqwest::Response, ServiceError> {
-        let resp = self
-            .client
-            .get(url)
+        self.get_as(url, None).await
+    }
+
+    /// [`get`](Self::get) with a per-request `User-Agent`, when it is a valid
+    /// header value; an invalid one is dropped, as `TryParseAdd` drops it.
+    async fn get_as(
+        &self,
+        url: &str,
+        user_agent: Option<&str>,
+    ) -> Result<reqwest::Response, ServiceError> {
+        let mut request = self.client.get(url);
+        if let Some(agent) = user_agent.map(str::trim).filter(|agent| !agent.is_empty())
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(agent)
+        {
+            request = request.header(reqwest::header::USER_AGENT, value);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
@@ -109,6 +135,18 @@ impl SourceFetcher for ReqwestFetcher {
             tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
+        }
+    }
+
+    async fn fetch_as(&self, url: &str, user_agent: Option<&str>) -> Result<String, ServiceError> {
+        if is_http(url) {
+            self.get_as(url, user_agent)
+                .await?
+                .text()
+                .await
+                .map_err(|e| LiveTvError::http(format!("read {url}"), e).into())
+        } else {
+            self.fetch(url).await
         }
     }
 
@@ -219,6 +257,79 @@ mod tests {
         }
         let bytes = TextOnly.fetch_bytes("x").await.expect("fetch_bytes");
         assert_eq!(bytes, b"body of x");
+    }
+
+    /// One-shot HTTP server that answers with `200 #EXTM3U` and reports the
+    /// `User-Agent` header it received.
+    fn serve_once() -> (String, std::sync::mpsc::Receiver<Option<String>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/list.m3u", listener.local_addr().expect("addr"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let agent = request.lines().find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                        .map(|(_, value)| value.trim().to_owned())
+                });
+                let _ = sender.send(agent);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n#EXTM3U",
+                );
+            }
+        });
+        (url, receiver)
+    }
+
+    /// `M3uParser.GetListingsStream` sends the tuner's configured user agent;
+    /// without one (or with a blank one) the client's own product agent goes.
+    #[tokio::test]
+    async fn a_configured_user_agent_is_sent_with_the_playlist_request() {
+        for (configured, expected) in [
+            (Some(" VLC/3.0 "), Some("VLC/3.0".to_owned())),
+            (None, Some(super::USER_AGENT.to_owned())),
+            (Some("   "), Some(super::USER_AGENT.to_owned())),
+            // Not a valid header value: dropped, like `TryParseAdd`.
+            (Some("bad\nagent"), Some(super::USER_AGENT.to_owned())),
+        ] {
+            let (url, received) = serve_once();
+            let body = ReqwestFetcher::new()
+                .fetch_as(&url, configured)
+                .await
+                .expect("fetch");
+            assert_eq!(body, "#EXTM3U");
+            assert_eq!(received.recv().expect("agent"), expected, "{configured:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_default_fetch_as_ignores_the_agent_and_a_file_needs_none() {
+        struct TextOnly;
+        #[async_trait::async_trait]
+        impl SourceFetcher for TextOnly {
+            async fn fetch(
+                &self,
+                url: &str,
+            ) -> Result<String, ferrofin_traits::error::ServiceError> {
+                Ok(format!("body of {url}"))
+            }
+        }
+        assert_eq!(
+            TextOnly.fetch_as("x", Some("agent")).await.expect("fetch"),
+            "body of x"
+        );
+        let path = std::env::temp_dir().join("ferrofin_livetv_fetch_as_test.m3u");
+        tokio::fs::write(&path, "#EXTM3U\n").await.expect("write");
+        let body = ReqwestFetcher::new()
+            .fetch_as(path.to_str().unwrap(), Some("agent"))
+            .await
+            .expect("fetch");
+        assert_eq!(body, "#EXTM3U\n");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

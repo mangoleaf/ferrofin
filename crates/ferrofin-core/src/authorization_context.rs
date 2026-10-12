@@ -184,10 +184,11 @@ impl FerrofinAuthorizationContext {
         // The row-refresh bookkeeping below is deliberately skipped on a hit —
         // it re-runs on the next TTL expiry, the same cadence Jellyfin's
         // in-memory device map effectively gives it.
-        if let Some((device, user)) = self.auth_cache.get(token) {
+        if let Some((device, user, policy)) = self.auth_cache.get(token) {
             info.is_authenticated = true;
             fill_blank_client_fields(info, &device);
             info.user = user;
+            info.user_policy = policy;
             return Ok(true);
         }
 
@@ -249,14 +250,29 @@ impl FerrofinAuthorizationContext {
             Err(_) => None,
         };
 
+        if let Some(user) = &info.user {
+            info.user_policy = Some(Arc::new(
+                self.user_manager
+                    .get_user_dto(user, None)
+                    .await?
+                    .policy
+                    .ok_or_else(|| ServiceError::unauthorized("User policy is unavailable."))?,
+            ));
+        }
+
         if update {
             device.date_modified = Utc::now();
             self.update_device(&device).await?;
         }
         // Cache the row exactly as it now exists (post-refresh), so a hit
         // serves what a re-read would.
-        self.auth_cache
-            .put(generation, token, device, info.user.clone());
+        self.auth_cache.put(
+            generation,
+            token,
+            device,
+            info.user.clone(),
+            info.user_policy.clone(),
+        );
         Ok(true)
     }
 
@@ -357,6 +373,7 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
             token: None,
             is_api_key: false,
             user: None,
+            user_policy: None,
             is_authenticated: false,
             // C# reads `HttpContext.GetNormalizedRemoteIP()` ambiently; the
             // portable seam carries it on the request context, so it rides
@@ -375,6 +392,16 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
         if !self.resolve_device_token(&mut info, token.expose()).await? {
             self.resolve_api_key_token(&mut info, token.expose())
                 .await?;
+        }
+        // The HTTP middleware consumes this context directly, so the disabled
+        // check must run here as well as through AuthService. Existing device
+        // rows cannot keep a locked-out account authenticated.
+        if info
+            .user_policy
+            .as_ref()
+            .is_some_and(|policy| policy.is_disabled)
+        {
+            info.is_authenticated = false;
         }
         Ok(info)
     }
@@ -445,17 +472,23 @@ fn fill_blank_client_fields(
     }
 }
 
-/// Reads the first value of a query-string parameter, case-insensitively on the
-/// key. The `RequestContext` carries the raw query string (no leading `?`).
+/// Reads a query-string parameter, case-insensitively on the decoded key.
+/// `AuthorizationContext.cs` assigns `IQueryCollection`'s `StringValues` to a
+/// string, joining nonempty values instead of taking `FirstValue`. Preserve
+/// that behavior now that the router leaves raw URIs intact.
 fn query_value<'r>(request: &'r RequestContext, key: &str) -> Option<Cow<'r, str>> {
     let query = request.query_string.as_deref()?;
-    for pair in query.split('&') {
+    let mut values = query.split('&').filter_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        if k.eq_ignore_ascii_case(key) {
-            return Some(url_decode(v));
-        }
+        (url_decode(k).eq_ignore_ascii_case(key) && !v.is_empty()).then(|| url_decode(v))
+    });
+    let mut value = values.next()?;
+    for next in values {
+        let joined = value.to_mut();
+        joined.push(',');
+        joined.push_str(&next);
     }
-    None
+    Some(value)
 }
 
 /// The five authorization-header fields Ferrofin consumes (C# reads exactly
@@ -1279,6 +1312,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_credentials_use_string_values_semantics_not_scalar_binding() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x22);
+        crate::test_support::seed_user(&db, uid).await;
+        seed_device(&db, uid).await;
+        let ctx = context(db);
+
+        for (query, token, authenticated) in [
+            ("ApiKey=dev-tok&ApiKey=bad", Some("dev-tok,bad"), false),
+            ("apikey=bad&APIKEY=dev-tok", Some("bad,dev-tok"), false),
+            ("%41piKey=dev%2Dtok&ApiKey=bad", Some("dev-tok,bad"), false),
+            (
+                "ApiKey=dev-tok&ApiKey=dev-tok",
+                Some("dev-tok,dev-tok"),
+                false,
+            ),
+            ("ApiKey=&APIKEY=dev-tok", Some("dev-tok"), true),
+            ("ApiKey&APIKEY=dev-tok&ApiKey=", Some("dev-tok"), true),
+            ("%41piKey=dev%2Dtok", Some("dev-tok"), true),
+            ("%2541piKey=ignored&ApiKey=dev-tok", Some("dev-tok"), true),
+            ("ApiKey=&APIKEY", None, false),
+        ] {
+            let info = ctx
+                .get_authorization_info(&query_request(query))
+                .await
+                .unwrap();
+            assert_eq!(
+                info.token
+                    .as_ref()
+                    .map(ferrofin_model::secret::Secret::expose),
+                token,
+                "{query}"
+            );
+            assert_eq!(info.is_authenticated, authenticated, "{query}");
+        }
+
+        let legacy = query_request("API_KEY=first&%61pi_key=second");
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, None, false),
+            None
+        );
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, None, true).as_deref(),
+            Some("first,second")
+        );
+        assert_eq!(
+            FerrofinAuthorizationContext::resolve_token(&legacy, Some("header".to_owned()), true)
+                .as_deref(),
+            Some("header")
+        );
+    }
+
+    #[tokio::test]
     async fn cached_token_is_served_without_the_database_until_cleared() {
         let db = crate::test_support::test_db().await;
         let uid = Uuid::from_u128(8);
@@ -1388,7 +1474,7 @@ mod tests {
             .unwrap();
 
         // Now the in-flight request finishes and caches what it read.
-        cache.put(generation, "dev-tok", device, None);
+        cache.put(generation, "dev-tok", device, None, None);
 
         let info = ctx.get_authorization_info(&token_request()).await.unwrap();
         assert!(
@@ -1418,6 +1504,76 @@ mod tests {
             cache.is_empty(),
             "password change dropped every cached resolution"
         );
+    }
+
+    #[tokio::test]
+    async fn saved_disable_and_lockout_reject_existing_cached_tokens() {
+        use ferrofin_model::users::UserPolicy;
+        let db = crate::test_support::test_db().await;
+        let cache = Arc::new(AuthCache::default());
+        let users = Arc::new(FerrofinUserManager::new(db.clone()).with_auth_cache(cache.clone()));
+        let user = users.create_user("policy-user").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        users.change_password(uid, "password").await.unwrap();
+        seed_device(&db, uid).await;
+        let mut ctx = context(db).with_auth_cache(cache);
+        ctx.user_manager = users.clone();
+        let request = token_request();
+        let before = ctx.get_authorization_info(&request).await.unwrap();
+        let hit = ctx.get_authorization_info(&request).await.unwrap();
+        assert!(Arc::ptr_eq(
+            before.user_policy.as_ref().unwrap(),
+            hit.user_policy.as_ref().unwrap()
+        ));
+        let mut policy = UserPolicy {
+            is_disabled: true,
+            ..UserPolicy::default()
+        };
+        users.update_policy(uid, &policy).await.unwrap();
+        for _ in 0..2 {
+            assert!(
+                !ctx.get_authorization_info(&request)
+                    .await
+                    .unwrap()
+                    .is_authenticated
+            );
+            assert!(matches!(
+                AuthService::authenticate(&ctx, &request).await,
+                Err(ServiceError::Unauthorized(_))
+            ));
+        }
+        policy.is_disabled = false;
+        policy.is_hidden = true;
+        policy.login_attempts_before_lockout = 2;
+        users.update_policy(uid, &policy).await.unwrap();
+        assert!(
+            ctx.get_authorization_info(&request)
+                .await
+                .unwrap()
+                .is_authenticated
+        );
+        assert!(
+            users
+                .authenticate_user("policy-user", "password", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some(),
+            "hidden users can log in by name"
+        );
+        for _ in 0..2 {
+            assert!(
+                users
+                    .authenticate_user("policy-user", "wrong", "127.0.0.1", true)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for _ in 0..2 {
+            let locked = ctx.get_authorization_info(&request).await.unwrap();
+            assert!(!locked.is_authenticated);
+            assert!(locked.user_policy.unwrap().is_disabled);
+        }
     }
 
     #[tokio::test]

@@ -485,7 +485,9 @@ pub fn hardware_video_decoder(ctx: &DecodeContext<'_>) -> Option<String> {
         HardwareAccelerationType::nvenc => nvdec_decoder(ctx, stream, bit_depth),
         HardwareAccelerationType::videotoolbox => videotoolbox_decoder(ctx, stream, bit_depth),
         HardwareAccelerationType::rkmpp => rkmpp_decoder(ctx, stream, bit_depth),
-        HardwareAccelerationType::v4l2m2m | HardwareAccelerationType::none => None,
+        HardwareAccelerationType::v4l2m2m
+        | HardwareAccelerationType::none
+        | HardwareAccelerationType::Unrecognized(_) => None,
     };
 
     decoder.filter(|d| !d.is_empty())

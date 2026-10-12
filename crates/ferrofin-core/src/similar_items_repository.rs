@@ -113,7 +113,7 @@ impl SimilarItemsRepository {
         sql.push_str(r#" ORDER BY s.score DESC, bi."SortName" ASC, bi."Id" ASC LIMIT ?"#);
         sql.push_str(&next.to_string());
 
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql).bind(&seed);
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(&seed);
         for type_name in candidate_types {
             query = query.bind((*type_name).to_owned());
         }
@@ -173,7 +173,8 @@ impl SimilarItemsRepository {
                    WHERE "ProviderId" = ?1
                      AND "ProviderValue" COLLATE NOCASE IN ({placeholders})"#,
             );
-            let mut query = sqlx::query_as::<_, (String, String)>(&sql).bind(provider_key);
+            let mut query =
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql)).bind(provider_key);
             for value in chunk {
                 query = query.bind(value);
             }
@@ -273,7 +274,7 @@ impl SimilarItemsRepository {
         }
         sql.push(')');
 
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
         for id in item_ids {
             query = query.bind(guid_to_db(*id));
         }

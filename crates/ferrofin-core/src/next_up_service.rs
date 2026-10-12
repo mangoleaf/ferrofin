@@ -56,7 +56,7 @@ use ferrofin_traits::persistence::{
 };
 
 use crate::db_error::db_err;
-use crate::item_repository::physical_folders_by_view;
+use crate::item_repository::library_top_parents_by_view;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::PLACEHOLDER_ID;
 
@@ -98,7 +98,7 @@ impl FerrofinNextUpService {
         let mut sql = String::from(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
         push_key_placeholders(&mut sql, ids.len());
         sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
         for id in ids {
             query = query.bind(guid_to_db(*id));
         }
@@ -114,9 +114,11 @@ impl FerrofinNextUpService {
     /// The `TopParentId` values a set of scope parents stands for — C#
     /// `LibraryManager.GetNextUpSeriesKeys`'s `SetTopParentIdsOrAncestors`
     /// step, per parent (`GetTopParentIdsForQuery`): a collection folder
-    /// contributes its `PhysicalFolderIds`, anything else — a Live TV or
-    /// playlists view, a physical folder, or any id on a Ferrofin-written
-    /// database where the view IS the top parent — contributes itself.
+    /// contributes its `PhysicalFolderIds` and itself (what the rows a
+    /// Ferrofin scan saved carry, `library_top_parents_by_view`), anything
+    /// else — a Live TV or playlists view, a physical folder, or any id on a
+    /// Ferrofin-written database where the view IS the top parent —
+    /// contributes itself.
     ///
     /// The manager hands over the user's library folders (3–7 ids), and this
     /// list must stay that small: the keys statement's `TopParentId IN (…)`
@@ -125,7 +127,7 @@ impl FerrofinNextUpService {
     /// against the retired `CROSS JOIN` shape, which walked it once per
     /// `UserData` row, is what made the statement 10 M index probes and 1.4 s.
     async fn top_parent_ids(&self, parents: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
-        let by_view = physical_folders_by_view(&self.db, parents).await?;
+        let by_view = library_top_parents_by_view(&self.db, parents).await?;
         let mut out = Vec::with_capacity(parents.len());
         for id in parents {
             match by_view.get(id) {
@@ -187,9 +189,12 @@ type ProjectionRow = (
 struct ProjectedEpisode {
     key: String,
     pos: EpisodePos,
-    /// The id every version of this episode shares: its `PrimaryVersionId`
-    /// when it is an alternate, else its own id (C# `GetAllVersions` groups
-    /// a primary with the alternates linked onto it).
+    /// The id every version of this episode shares: its primary's — the
+    /// primary of its `PrimaryVersionId` when that is itself a version — else
+    /// its own id. C# `GetAllVersions` (`Video.GetAllItemsForMediaSources`,
+    /// `Video.cs:845-884`) groups a primary with the versions linked onto it
+    /// AND the local versions of each, which point at the version they sit
+    /// beside, further down ([`version_groups`]).
     version_group: Uuid,
     /// Whether the row may be picked at all — C# `ApplyAccessFiltering`'s
     /// `PrimaryVersionId == null && (OwnerId == null || ExtraType != null)`:
@@ -229,7 +234,7 @@ impl NextUpService for FerrofinNextUpService {
         // Series (by presentation key) whose most-recently-played episode within
         // the requested libraries is at/after the cutoff, newest first.
         let sql = next_up_series_keys_sql(top_parents.len(), filter.limit.is_some());
-        let mut query = sqlx::query_scalar::<_, String>(&sql)
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
             .bind(&user.id)
             .bind(episode_type)
             .bind(PLACEHOLDER_ID);
@@ -383,7 +388,7 @@ impl FerrofinNextUpService {
         );
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql)
+        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql))
             .bind(episode_type)
             .bind(guid_to_db(Uuid::nil()));
         for key in series_keys {
@@ -425,7 +430,7 @@ impl FerrofinNextUpService {
         push_key_placeholders(&mut sql, series_keys.len());
         sql.push(')');
 
-        let mut query = sqlx::query_as::<_, ProjectionRow>(&sql)
+        let mut query = sqlx::query_as::<_, ProjectionRow>(sqlx::AssertSqlSafe(sql))
             .bind(user_id)
             .bind(episode_type);
         for key in series_keys {
@@ -486,8 +491,47 @@ impl FerrofinNextUpService {
                 user_data,
             });
         }
+        version_groups(&mut out);
         Ok(out)
     }
+}
+
+/// Moves each projected version up to its group's primary — the root of its
+/// `PrimaryVersionId` chain. A local version of a version merged onto
+/// another primary points at the merged version (`ItemPersistenceService`'s
+/// local-version save), and a merge onto a version a scan later grouped
+/// under another primary sits one level further down; the candidate the
+/// batch picks — the root — reaches them through its versions' own local
+/// and linked versions (`GetAllItemsForMediaSources`, `Video.cs:845-884`).
+/// A chain that loops has no root: every row reaching the loop groups at
+/// its lowest id, so they still group together.
+fn version_groups(projected: &mut [ProjectedEpisode]) {
+    let primary_of: HashMap<Uuid, Uuid> = projected
+        .iter()
+        .filter(|ep| ep.version_group != ep.pos.id)
+        .map(|ep| (ep.pos.id, ep.version_group))
+        .collect();
+    if primary_of.is_empty() {
+        return;
+    }
+    for ep in projected {
+        ep.version_group = chain_root(ep.pos.id, &primary_of);
+    }
+}
+
+/// The root of `id`'s `PrimaryVersionId` chain in `primary_of`; for a chain
+/// that loops, the lowest id of the loop.
+fn chain_root(id: Uuid, primary_of: &HashMap<Uuid, Uuid>) -> Uuid {
+    let mut path = vec![id];
+    let mut current = id;
+    while let Some(&next) = primary_of.get(&current) {
+        if let Some(at) = path.iter().position(|seen| *seen == next) {
+            return path[at..].iter().copied().min().unwrap_or(next);
+        }
+        path.push(next);
+        current = next;
+    }
+    current
 }
 
 /// Whether an `OwnerId` means "no owner". C# treats `Guid.Empty` as unowned,
@@ -743,7 +787,7 @@ mod tests {
 
     /// Runs one fixture statement with string binds (SQLite's column affinity
     /// turns a numeric string into the integer the column holds).
-    async fn exec(db: &Database, sql: &str, binds: &[&str]) {
+    async fn exec(db: &Database, sql: &'static str, binds: &[&str]) {
         let mut query = sqlx::query(sql);
         for bind in binds {
             query = query.bind((*bind).to_owned());
@@ -941,6 +985,120 @@ mod tests {
         let next = series.user_data.get(&next_id).expect("next up facts");
         assert_eq!(next.playback_position_ticks, 5_000);
         assert!(!next.played);
+    }
+
+    /// `GetAllVersions` reaches the local versions of a version merged onto
+    /// the primary (they point at the merged version): progress on one is
+    /// the primary's too.
+    #[tokio::test]
+    async fn resume_position_on_a_merged_versions_local_version_reaches_the_primary() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let (e1, e2, merged, local) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for id in [e2, merged, local] {
+            seed_episode(&db, id, "series-a", 1, 2, false, Some(top)).await;
+        }
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        set_primary_version(&db, merged, e2).await;
+        set_primary_version(&db, local, merged).await;
+        exec(
+            &db,
+            r#"UPDATE "BaseItems" SET "OwnerId" = ?1 WHERE "Id" = ?2"#,
+            &[&guid_to_db(merged), &guid_to_db(local)],
+        )
+        .await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, local, false, Some(ts("2021-01-02T00:00:00Z"))).await;
+        set_resume_position(&db, user_id, local, 7_000).await;
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = svc
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        let next_id = series
+            .next_up
+            .as_ref()
+            .map(|e| e.id.clone())
+            .expect("next up");
+        assert_eq!(next_id, guid_to_db(e2));
+        let next = series.user_data.get(&next_id).expect("next up facts");
+        assert_eq!(next.playback_position_ticks, 7_000);
+        assert_eq!(next.last_played_date, Some(ts("2021-01-02T00:00:00Z")));
+    }
+
+    /// Three levels deep — a copy merged onto a version a scan later grouped
+    /// as the primary's local version — the copy's progress still reaches
+    /// the primary, the root of its chain.
+    #[tokio::test]
+    async fn resume_position_three_levels_down_reaches_the_root() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (e1, root, local, copy) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        for id in [root, local, copy] {
+            seed_episode(&db, id, "series-a", 1, 2, false, Some(top)).await;
+        }
+        set_primary_version(&db, local, root).await;
+        set_primary_version(&db, copy, local).await;
+        exec(
+            &db,
+            r#"UPDATE "BaseItems" SET "OwnerId" = ?1 WHERE "Id" = ?2"#,
+            &[&guid_to_db(root), &guid_to_db(local)],
+        )
+        .await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, copy, false, Some(ts("2021-01-02T00:00:00Z"))).await;
+        set_resume_position(&db, user_id, copy, 9_000).await;
+
+        let batch = FerrofinNextUpService::new(db)
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        let next_id = series.next_up.as_ref().map(|e| e.id.clone());
+        assert_eq!(next_id, Some(guid_to_db(root)));
+        let next = series.user_data.get(&guid_to_db(root)).expect("facts");
+        assert_eq!(next.playback_position_ticks, 9_000);
+    }
+
+    /// A pointer chain that loops has no root: its rows group at the loop's
+    /// lowest id, from wherever they start.
+    #[test]
+    fn a_looping_chain_groups_at_its_lowest_id() {
+        let (a, b, c) = (Uuid::from_u128(3), Uuid::from_u128(1), Uuid::from_u128(2));
+        let primary_of = std::collections::HashMap::from([(a, b), (b, c), (c, b)]);
+        for id in [a, b, c] {
+            assert_eq!(super::chain_root(id, &primary_of), b);
+        }
+        let straight = std::collections::HashMap::from([(a, b), (b, c)]);
+        assert_eq!(super::chain_root(a, &straight), c);
     }
 
     /// `ApplyAccessFiltering` keeps the batch rows to primaries (and owned

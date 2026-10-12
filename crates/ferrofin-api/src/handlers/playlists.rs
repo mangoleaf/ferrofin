@@ -28,7 +28,7 @@
 //! `404` (the C# `GetPlaylistForUser` null). Playlists predating owner tracking
 //! grant owner-equivalent access to every caller (back-compat).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
@@ -695,4 +695,19 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
                 .post(update_playlist_user)
                 .delete(remove_user_from_playlist),
         )
+}
+crate::query::query_parameters! {
+    CreatePlaylistQuery {
+        "ids" => ',',
+    } => [("post", "/Playlists")];
+    GetPlaylistItemsQuery {
+        "fields" => ',',
+        "enableImageTypes" => ',',
+    } => [("get", "/Playlists/{playlistId}/Items")];
+    AddItemsQuery {
+        "ids" => ',',
+    } => [("post", "/Playlists/{playlistId}/Items")];
+    RemoveItemsQuery {
+        "entryIds" => ',',
+    } => [("delete", "/Playlists/{playlistId}/Items")];
 }

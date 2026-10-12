@@ -112,6 +112,11 @@ struct FileConfig {
     studios_repo_url: Option<String>,
     tvdb_api_key: Option<String>,
     tvdb_subscriber_pin: Option<String>,
+    /// Read as text whatever its TOML type (`6`, `1.5`, `"6h"`, `true`): the
+    /// `config` crate would coerce a number into an integer field (`1.5` →
+    /// 2) and fail the whole file on a string, so every value goes through
+    /// [`Config::tvdb_cache_duration`]'s check and warning instead.
+    tvdb_cache_hours: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
@@ -125,6 +130,7 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
+    metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
@@ -153,6 +159,39 @@ enum DbPoolFileValue {
     Count(u32),
     /// A sizing mode by name — only `"auto"` is valid (`db_pool = "auto"`).
     Mode(String),
+}
+
+/// API roots that replace the public hosts of the remote providers a library
+/// scan reaches ([`Config::provider_endpoints`], a test seam). `None` keeps
+/// the provider's public host.
+///
+/// Not here, and why:
+/// - MusicBrainz and the studio artwork repository: each has a real setting
+///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
+/// - LrcLib: the scheduled lyric-download test uses `lrclib`; scans never
+///   download lyrics. ListenBrainz is only called for similar artists on request.
+/// - Image CDNs other than TMDb's: their URLs come from the provider answers
+///   (fanart.tv, TheTVDB, TheAudioDB), which a mock serves.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderEndpoints {
+    /// Replaces `https://api.themoviedb.org/3`.
+    pub tmdb: Option<String>,
+    /// Replaces TMDb's image CDN root, `https://image.tmdb.org/t/p` (the
+    /// artwork URLs TMDb's answers are relative to).
+    pub tmdb_images: Option<String>,
+    /// Replaces `https://www.omdbapi.com/`.
+    pub omdb: Option<String>,
+    /// OpenSubtitles REST endpoint override for integration tests.
+    pub opensubtitles: Option<String>,
+    /// Replaces `https://api4.thetvdb.com/v4`.
+    pub tvdb: Option<String>,
+    /// Replaces `https://webservice.fanart.tv/v3.2`.
+    pub fanart: Option<String>,
+    /// Replaces TheAudioDB's API root (`…/api/v1/json/{key}`).
+    pub audiodb: Option<String>,
+    /// Replaces `https://lrclib.net` for scheduled-lyrics integration tests.
+    pub lrclib: Option<String>,
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -187,10 +226,22 @@ pub struct Config {
     /// Address the HTTP listener binds to. Parsed from `bind_addr`.
     pub bind_addr: IpAddr,
 
+    /// Whether the operator chose `bind_addr` (flag, `FERROFIN_BIND_ADDR` or
+    /// `config.toml`). When they did, that one address is the listener; when
+    /// they did not, the dashboard's network settings (`LocalNetworkAddresses`,
+    /// `EnableIPv4`/`EnableIPv6`) decide, as Jellyfin's `GetAllBindInterfaces`.
+    pub bind_addr_explicit: bool,
+
     /// Internal discovery transport seam: production uses UDP 7359; test fixtures
     /// disable it or select an isolated loopback endpoint. Not a file/env setting.
     #[doc(hidden)]
     pub discovery_bind_addr: Option<std::net::SocketAddr>,
+
+    /// Internal provider transport seam: production calls each built-in
+    /// remote provider's public API; the end-to-end scan test points them at
+    /// an in-process mock server. Not a file/env setting.
+    #[doc(hidden)]
+    pub provider_endpoints: ProviderEndpoints,
 
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
@@ -206,8 +257,8 @@ pub struct Config {
     /// (`HostNetworkInfo.base_url`). Empty string = root.
     pub base_url: String,
 
-    /// OMDb (omdbapi.com) API key, enabling the Rotten Tomatoes critic rating.
-    /// Empty = disabled (RT ratings stay unpopulated). From `FERROFIN_OMDB_KEY` or
+    /// OMDb (omdbapi.com) API key override. Empty uses Jellyfin's built-in key.
+    /// From `FERROFIN_OMDB_KEY` or
     /// `config.toml`.
     pub omdb_api_key: String,
 
@@ -223,6 +274,16 @@ pub struct Config {
     /// TheTVDB subscriber PIN (for a user's paid subscription tier). Empty =
     /// non-subscriber. From `FERROFIN_TVDB_PIN` or `config.toml`.
     pub tvdb_subscriber_pin: String,
+
+    /// How long TheTVDB lookups are reused, in whole hours, as written: the
+    /// TVDB plugin's `CacheDurationInHours` (default 1). It covers the
+    /// episode ids the TVDB episode provider resolves and the season list of
+    /// each series the season provider reads a season's id from. Resolved
+    /// `FERROFIN_TVDB_CACHE_HOURS` env > `tvdb_cache_hours` in `config.toml` >
+    /// unset; validated by [`tvdb_cache_duration`](Self::tvdb_cache_duration)
+    /// where the client is built, so a bad value warns (tracing is up by
+    /// then) and the default applies — it never stops the server.
+    pub tvdb_cache_hours: Option<String>,
 
     /// fanart.tv personal API key (`client_key`), raising rate limits and
     /// unlocking fresher artwork. Empty = the built-in key only. From
@@ -297,6 +358,20 @@ pub struct Config {
     /// out of the API `ServerConfiguration` so `/System/Configuration` stays
     /// byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
+
+    /// Bucket boundaries (seconds, ascending) of the library-scan duration
+    /// histograms (`ferrofin_library_scan_duration_seconds`,
+    /// `ferrofin_library_scan_pass_duration_seconds`). `None` = the default,
+    /// 1–2.5–5 per decade from 0.001 s to 5000 s
+    /// ([`ferrofin_core::scan_metrics::DEFAULT_DURATION_BUCKETS`]). Resolved
+    /// `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` env (comma-separated, e.g.
+    /// `0.01,0.1,1,10,100,1000`) > `metrics_scan_duration_buckets` in
+    /// `config.toml` (an array of numbers) > default. Only consulted when
+    /// `EnableMetrics` is set. Like the sampler interval, a bad value never
+    /// stops the server: the metrics install refuses a list that is empty,
+    /// non-finite, not above zero or not strictly increasing, warns, and uses
+    /// the default. A bootstrap knob only, never a `ServerConfiguration` field.
+    pub metrics_scan_duration_buckets: Option<Vec<f64>>,
 
     /// How long a graceful shutdown/restart waits for in-flight requests before
     /// the remaining connections are aborted, in seconds. Default 30 — ASP.NET's
@@ -458,11 +533,12 @@ impl Config {
             .or(file.web_dir)
             .unwrap_or_else(|| data_dir.join("web"));
 
-        let bind_addr_str = cli
+        let chosen_bind = cli
             .bind_addr
             .or_else(|| env.var("FERROFIN_BIND_ADDR"))
-            .or(file.bind_addr)
-            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
+            .or(file.bind_addr);
+        let bind_addr_explicit = chosen_bind.is_some();
+        let bind_addr_str = chosen_bind.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned());
         let bind_addr: IpAddr = bind_addr_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid FERROFIN_BIND_ADDR `{bind_addr_str}`: {e}"))?;
@@ -508,6 +584,11 @@ impl Config {
             .var("FERROFIN_TVDB_PIN")
             .or(file.tvdb_subscriber_pin)
             .unwrap_or_default();
+
+        let tvdb_cache_hours = env
+            .var("FERROFIN_TVDB_CACHE_HOURS")
+            .filter(|raw| !raw.trim().is_empty())
+            .or(file.tvdb_cache_hours);
 
         let fanart_personal_api_key = env
             .var("FERROFIN_FANART_KEY")
@@ -563,7 +644,9 @@ impl Config {
             cache_dir,
             web_dir,
             bind_addr,
+            bind_addr_explicit,
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
+            provider_endpoints: ProviderEndpoints::default(),
             port,
             https_port,
             published_url,
@@ -572,6 +655,7 @@ impl Config {
             studios_repo_url,
             tvdb_api_key,
             tvdb_subscriber_pin,
+            tvdb_cache_hours,
             fanart_personal_api_key,
             musicbrainz_base_url,
             ffmpeg_path,
@@ -587,6 +671,11 @@ impl Config {
                 .or(file.disable_extensions)
                 .unwrap_or(false),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
+            metrics_scan_duration_buckets: env
+                .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| parse_bucket_list(&raw))
+                .or(file.metrics_scan_duration_buckets),
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
@@ -647,6 +736,31 @@ impl Config {
         ferrofin
     }
 
+    /// TheTVDB's cache duration ([`tvdb_cache_hours`](Self::tvdb_cache_hours)):
+    /// the configured whole hours, or the plugin's default of one hour
+    /// ([`ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION`]) when unset. A
+    /// value that is not a whole number of hours above zero is refused with
+    /// a warning and the default is used, as the sibling settings do; call
+    /// it once tracing is installed.
+    #[must_use]
+    pub fn tvdb_cache_duration(&self) -> std::time::Duration {
+        let default = ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION;
+        let Some(raw) = self.tvdb_cache_hours.as_deref() else {
+            return default;
+        };
+        match raw.trim().parse::<u32>() {
+            Ok(hours) if hours > 0 => std::time::Duration::from_hours(u64::from(hours)),
+            _ => {
+                tracing::warn!(
+                    value = raw,
+                    default_hours = default.as_secs() / 3600,
+                    "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours above zero; using the default"
+                );
+                default
+            }
+        }
+    }
+
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
     /// `ferrofin_db::Database::connect`.
     #[must_use]
@@ -672,7 +786,9 @@ impl Config {
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
+            bind_addr_explicit: true,
             discovery_bind_addr: None,
+            provider_endpoints: ProviderEndpoints::default(),
             port: 0,
             https_port: 0,
             published_url: None,
@@ -681,6 +797,7 @@ impl Config {
             studios_repo_url: String::new(),
             tvdb_api_key: String::new(),
             tvdb_subscriber_pin: String::new(),
+            tvdb_cache_hours: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: String::new(),
             ffmpeg_path: None,
@@ -694,6 +811,7 @@ impl Config {
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
+            metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
@@ -721,6 +839,15 @@ fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
     parse_var(env, "FERROFIN_METRICS_SAMPLE_INTERVAL")
         .or(file)
         .filter(|&s| s > 0)
+}
+
+/// Parses a comma-separated list of bucket boundaries (seconds). An entry
+/// that is not a number becomes `NaN`, so the metrics install refuses the
+/// whole list with a warning instead of silently installing a shorter one.
+fn parse_bucket_list(raw: &str) -> Vec<f64> {
+    raw.split(',')
+        .map(|entry| entry.trim().parse().unwrap_or(f64::NAN))
+        .collect()
 }
 
 /// Resolves the SQLite pool-size override: `FERROFIN_DB_POOL` env (integer or
@@ -1117,6 +1244,123 @@ mod tests {
             Config::load_from(cli(), &env).unwrap().enable_metrics,
             Some(false)
         );
+    }
+
+    /// `FERROFIN_TVDB_CACHE_HOURS` beats `tvdb_cache_hours` in `config.toml`,
+    /// and unset is the plugin's one hour.
+    #[test]
+    fn tvdb_cache_hours_env_beats_file() {
+        let hours = |config: &Config| config.tvdb_cache_duration().as_secs() / 3600;
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.tvdb_cache_hours, None);
+        assert_eq!(hours(&unset), 1, "the plugin's CacheDurationInHours");
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "tvdb_cache_hours = 6\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            hours(&Config::load_from(cli(), &FakeEnv::new()).unwrap()),
+            6,
+            "the file's"
+        );
+        let env = FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", " 12 ");
+        assert_eq!(
+            hours(&Config::load_from(cli(), &env).unwrap()),
+            12,
+            "the env beats the file"
+        );
+        let blank = FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", "  ");
+        assert_eq!(
+            hours(&Config::load_from(cli(), &blank).unwrap()),
+            6,
+            "a blank env var is unset"
+        );
+    }
+
+    /// A value that is not a whole number of hours above zero — from the
+    /// env or the file — warns and falls back to the default, never stops
+    /// the server.
+    #[test]
+    fn a_bad_tvdb_cache_hours_falls_back_to_the_default() {
+        let cases: [(Option<&str>, &str); 9] = [
+            (Some("0"), ""),
+            (Some("-3"), ""),
+            (Some("1.5"), ""),
+            (Some("6h"), ""),
+            (None, "tvdb_cache_hours = 0\n"),
+            (None, "tvdb_cache_hours = -2\n"),
+            (None, "tvdb_cache_hours = 1.5\n"),
+            (None, "tvdb_cache_hours = \"6h\"\n"),
+            (None, "tvdb_cache_hours = true\n"),
+        ];
+        for (env_value, file) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let toml = dir.path().join("config.toml");
+            std::fs::write(&toml, file).unwrap();
+            let cli = Cli {
+                config_file: Some(toml),
+                ..Cli::default()
+            };
+            let env = match env_value {
+                Some(value) => FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", value),
+                None => FakeEnv::new(),
+            };
+            let config = Config::load_from(cli, &env).unwrap();
+            assert!(
+                config.tvdb_cache_hours.is_some(),
+                "kept as written: {env_value:?} {file:?}"
+            );
+            assert_eq!(
+                config.tvdb_cache_duration(),
+                ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION,
+                "{env_value:?} {file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_duration_buckets_env_beats_file_and_defers_when_unset() {
+        assert_eq!(
+            Config::load_from(Cli::default(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            None,
+            "unset: the default buckets"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        // Integers and floats mix in the TOML array.
+        std::fs::write(&toml, "metrics_scan_duration_buckets = [0.5, 30, 3600]\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.5, 30.0, 3600.0])
+        );
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", " 0.1, 1 ,10");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.1, 1.0, 10.0])
+        );
+        // A typo is kept as NaN for the install to refuse (with a warning),
+        // never dropped into a silently shorter list.
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", "0.1,1s,10");
+        let buckets = Config::load_from(cli(), &env)
+            .unwrap()
+            .metrics_scan_duration_buckets
+            .expect("set");
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets[1].is_nan());
+        assert!(ferrofin_core::scan_metrics::validate_duration_buckets(&buckets).is_err());
     }
 
     #[test]

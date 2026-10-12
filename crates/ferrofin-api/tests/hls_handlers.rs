@@ -37,6 +37,8 @@ struct Recorded {
     last: Mutex<Option<HlsStreamRequest>>,
     stopped: Mutex<Vec<(Option<String>, Option<String>)>>,
     resolved: Mutex<Vec<(String, bool)>>,
+    stream_bytes: std::sync::atomic::AtomicUsize,
+    stream_completed: std::sync::atomic::AtomicUsize,
 }
 
 /// A fake [`HlsStreamManager`] that returns canned playlists and serves a real
@@ -57,6 +59,7 @@ impl FakeHls {
         Ok(ServedFile {
             path: self.served_path.clone(),
             content_type: ct.to_owned(),
+            progress: Some(Arc::new(RecordingStream(Arc::clone(&self.rec)))),
         })
     }
     fn playlist(&self, body: &str) -> Result<String, ServiceError> {
@@ -73,6 +76,26 @@ fn clone_err(e: &ServiceError) -> ServiceError {
         ServiceError::NotFound(m) => ServiceError::NotFound(m.clone()),
         ServiceError::InvalidInput(m) => ServiceError::InvalidInput(m.clone()),
         other => ServiceError::NotFound(format!("{other:?}")),
+    }
+}
+
+struct RecordingStream(Arc<Recorded>);
+impl ferrofin_traits::media_encoding::TranscodeStreamProgress for RecordingStream {
+    fn add_bytes(&self, bytes: usize) {
+        self.0
+            .stream_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn complete(&self) {
+        self.0
+            .stream_completed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn has_exited(&self) -> bool {
+        true
+    }
+    fn is_progressive(&self) -> bool {
+        false
     }
 }
 
@@ -219,8 +242,14 @@ impl AuthorizationContext for OkAuth {
 fn ok_auth_info() -> AuthorizationInfo {
     AuthorizationInfo {
         token: Some(ferrofin_model::secret::Secret::new("token")),
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            enable_video_playback_transcoding: false,
+            enable_audio_playback_transcoding: false,
+            enable_playback_remuxing: false,
+            ..ferrofin_model::users::UserPolicy::default()
+        })),
         is_authenticated: true,
-        ..AuthorizationInfo::default()
+        ..ferrofin_api::test_support::authenticated_user_info()
     }
 }
 
@@ -242,6 +271,21 @@ struct ItemLibrary {
 
 #[async_trait]
 impl LibraryManager for ItemLibrary {
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+    async fn is_item_visible(
+        &self,
+        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<bool, ferrofin_traits::error::ServiceError> {
+        Ok(true)
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(self.present.then(|| minimal_base_item(id, "clip", "Movie")))
     }
@@ -425,9 +469,6 @@ impl ferrofin_traits::library::MediaSourceManager for NoStaticSources {
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
         unimplemented!("unused")
     }
-    async fn refresh_media_streams(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-        Ok(())
-    }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }
@@ -445,6 +486,13 @@ fn router_with(
 /// Like [`router_with`] but with a media-source manager that yields no static
 /// sources, so the direct-play stream routes fall through to transcode.
 fn router_no_static(hls: Arc<dyn HlsStreamManager>) -> axum::Router {
+    router_no_static_with_auth(hls, Arc::new(OkAuth))
+}
+
+fn router_no_static_with_auth(
+    hls: Arc<dyn HlsStreamManager>,
+    auth: Arc<impl AuthService + AuthorizationContext + 'static>,
+) -> axum::Router {
     use ferrofin_api::test_support as t;
     let app = AppState::new(
         Arc::new(ItemLibrary { present: true }),
@@ -461,8 +509,8 @@ fn router_no_static(hls: Arc<dyn HlsStreamManager>) -> axum::Router {
         Arc::new(t::FakeSimilarItems),
         Arc::new(t::FakeSearch),
         Arc::new(t::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        auth.clone(),
+        auth,
         Arc::new(t::FakeQuickConnect),
         Arc::new(t::FakePlaylists),
         Arc::new(t::FakeCollections),
@@ -633,6 +681,80 @@ async fn body_string(resp: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn every_planning_route_carries_trusted_playback_permissions() {
+    use ferrofin_traits::library::PlaybackPermissions;
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let rec = Arc::new(Recorded::default());
+    let router = router_no_static(ok_hls(temp.path().to_str().unwrap(), rec.clone()));
+    for route in [
+        "Videos/ITEM/master.m3u8",
+        "Videos/ITEM/main.m3u8",
+        "Videos/ITEM/live.m3u8",
+        "Audio/ITEM/master.m3u8",
+        "Audio/ITEM/main.m3u8",
+        "Videos/ITEM/hls1/main/0.ts",
+        "Audio/ITEM/hls1/main/0.ts",
+        "Videos/ITEM/stream.ts",
+        "Audio/ITEM/stream.aac",
+        "Audio/ITEM/universal",
+    ] {
+        // Each route's `[Required]` members (`CheckModel` refuses without).
+        let required = if route.ends_with("master.m3u8") {
+            "&MediaSourceId=source"
+        } else if route.contains("/hls1/") {
+            "&RuntimeTicks=0&ActualSegmentLengthTicks=0"
+        } else {
+            ""
+        };
+        let uri = format!(
+            "/{}?EnableVideoPlaybackTranscoding=true&EnableAudioPlaybackTranscoding=true&EnablePlaybackRemuxing=true{required}",
+            route.replace("ITEM", &ITEM_ID.to_string())
+        );
+        let response = router.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let request = rec.last.lock().unwrap().clone().unwrap();
+        // Query parameters cannot replace the saved policy. The restricted
+        // test user's policy is still carried on every route, including segments.
+        assert_eq!(
+            request.playback_permissions,
+            Some(PlaybackPermissions {
+                video_transcoding: false,
+                audio_transcoding: false,
+                remuxing: false,
+            }),
+            "{uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hls_binds_first_scalars_and_forwards_the_original_query() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let raw = "DEVICEID=first&deviceId=second&MaxWidth=1280&maxwidth=bad&VideoBitRate=1000000&videobitrate=bad&mediaSourceId=src";
+    let response = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?{raw}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = rec.last.lock().unwrap().clone().unwrap();
+    assert_eq!(request.device_id.as_deref(), Some("first"));
+    assert_eq!(request.max_width, Some(1280));
+    assert_eq!(request.video_bitrate, Some(1_000_000));
+    assert_eq!(request.query_string, format!("?{raw}"));
+}
+
+#[tokio::test]
 async fn video_master_playlist_returns_m3u8() {
     let rec = Arc::new(Recorded::default());
     let router = router_with(
@@ -694,7 +816,7 @@ async fn video_master_playlist_parses_contract_spellings() {
         .oneshot(authed(
             "GET",
             &format!(
-                "/Videos/{ITEM_ID}/master.m3u8?videoBitRate=1000000&audioBitRate=128000&\
+                "/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src&videoBitRate=1000000&audioBitRate=128000&\
                  enableAdaptiveBitrateStreaming=true&enableTrickplay=false&\
                  enableSubtitlesInManifest=true&subtitleStreamIndex=3&subtitleMethod=Hls&\
                  profile=high&level=41&framerate=30&width=640&height=360&minSegments=2&\
@@ -735,7 +857,10 @@ async fn video_master_head_is_ok() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("HEAD", &format!("/Videos/{ITEM_ID}/master.m3u8")))
+        .oneshot(authed(
+            "HEAD",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -759,7 +884,10 @@ async fn video_main_and_live_and_audio_playlists() {
     for (uri, marker) in [
         (format!("/Videos/{ITEM_ID}/main.m3u8"), "#VARIANT"),
         (format!("/Videos/{ITEM_ID}/live.m3u8"), "#LIVE"),
-        (format!("/Audio/{ITEM_ID}/master.m3u8"), "#MASTER"),
+        (
+            format!("/Audio/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+            "#MASTER",
+        ),
         (format!("/Audio/{ITEM_ID}/main.m3u8"), "#VARIANT"),
     ] {
         let router = router_with(
@@ -800,7 +928,7 @@ async fn dynamic_video_segment_serves_file_with_seam_content_type() {
     let resp = router
         .oneshot(authed(
             "GET",
-            &format!("/Videos/{ITEM_ID}/hls1/main/3.ts?runtimeTicks=0"),
+            &format!("/Videos/{ITEM_ID}/hls1/main/3.ts?runtimeTicks=0&actualSegmentLengthTicks=0"),
         ))
         .await
         .unwrap();
@@ -822,7 +950,10 @@ async fn dynamic_audio_segment_serves_file() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("GET", &format!("/Audio/{ITEM_ID}/hls1/main/0.aac")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Audio/{ITEM_ID}/hls1/main/0.aac?runtimeTicks=0&actualSegmentLengthTicks=0"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -1019,7 +1150,10 @@ async fn playlist_seam_error_maps_to_status() {
         Arc::new(ItemLibrary { present: true }),
     );
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/master.m3u8")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/master.m3u8?mediaSourceId=src"),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1091,4 +1225,318 @@ async fn hls1_segments_require_auth_but_legacy_segments_stay_open() {
         StatusCode::UNAUTHORIZED,
         "legacy hls segments are anonymous upstream — gating them breaks parity"
     );
+}
+
+#[tokio::test]
+async fn dynamic_segment_download_query_and_body_completion_are_observed_separately() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("segment.ts");
+    std::fs::write(&file, b"actual segment bytes").unwrap();
+    let rec = Arc::new(Recorded::default());
+    let app = router_with(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let response=app.oneshot(authed("GET",&format!("/Videos/{ITEM_ID}/hls1/main/4.ts?RuntimeTicks=123456789&ACTUALSEGMENTLENGTHTICKS=45678901"))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let captured = rec.last.lock().unwrap().clone().unwrap();
+    assert_eq!(captured.current_runtime_ticks, 123_456_789);
+    assert_eq!(captured.actual_segment_length_ticks, 45_678_901);
+    assert_eq!(
+        rec.stream_completed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"actual segment bytes");
+    assert_eq!(
+        rec.stream_bytes.load(std::sync::atomic::Ordering::SeqCst),
+        20
+    );
+    assert_eq!(
+        rec.stream_completed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dynamic_segment_disconnect_and_failed_file_run_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("segment.ts");
+    std::fs::write(&file, b"segment").unwrap();
+    let rec = Arc::new(Recorded::default());
+    let app = router_with(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let response = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/hls1/main/0.ts?runtimeTicks=0&actualSegmentLengthTicks=0"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        rec.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .current_runtime_ticks,
+        0
+    );
+    assert_eq!(
+        rec.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .actual_segment_length_ticks,
+        0
+    );
+    drop(response);
+    assert_eq!(
+        rec.stream_completed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    std::fs::remove_file(file).unwrap();
+    let response = app
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/hls1/main/0.ts?runtimeTicks=9&actualSegmentLengthTicks=9"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        rec.stream_completed
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn ordinary_stream_default_and_head_forward_progressive_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("output.mp4");
+    std::fs::write(&file, b"progressive bytes").unwrap();
+    let rec = Arc::new(Recorded::default());
+    let app = router_with(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let response = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream.mp4?videoCodec=h264&startTimeTicks=300000000"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "none");
+    assert!(!response.headers().contains_key("content-length"));
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"progressive bytes"
+    );
+    let captured = rec.last.lock().unwrap().clone().unwrap();
+    assert!(!captured.is_static);
+    assert_eq!(captured.context, None);
+    assert_eq!(captured.output_container.as_deref(), Some("mp4"));
+    assert_eq!(captured.start_time_ticks, Some(300_000_000));
+    std::fs::remove_file(&file).unwrap();
+    let response = app
+        .oneshot(authed(
+            "HEAD",
+            &format!("/Videos/{ITEM_ID}/stream?Container=mp4&Context=Static"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("accept-ranges").unwrap(), "none");
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(rec.last.lock().unwrap().as_ref().unwrap().is_head_request);
+    assert_eq!(
+        rec.last.lock().unwrap().as_ref().unwrap().context,
+        Some(ferrofin_model::dlna::EncodingContext::Static)
+    );
+}
+
+#[tokio::test]
+async fn invalid_progressive_containers_are_rejected_before_dispatch() {
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    for path in [
+        format!("/Videos/{ITEM_ID}/stream?Container=ts%2F..%2F..%2Foutside"),
+        format!("/Audio/{ITEM_ID}/stream?Container=a%3Bb"),
+        format!("/Videos/{ITEM_ID}/stream?static=true&Container=ts%2Fbad"),
+        format!("/Videos/{ITEM_ID}/stream.bad%3Bname"),
+    ] {
+        let response = app.clone().oneshot(authed("GET", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn ordinary_static_and_progressive_head_allow_anonymous_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("missing.mp4");
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static_with_auth(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(DenyAuth),
+    );
+    let request = axum::http::Request::builder()
+        .method("HEAD")
+        .uri(format!("/Videos/{ITEM_ID}/stream.mp4"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        rec.last
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .playback_permissions
+            .is_none()
+    );
+    let request = axum::http::Request::builder()
+        .method("HEAD")
+        .uri(format!("/Audio/{ITEM_ID}/stream?static=true"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "anonymous static requests reach source resolution"
+    );
+}
+
+#[tokio::test]
+async fn progressive_context_query_uses_jellyfin_nullable_enum_binding() {
+    use ferrofin_model::dlna::EncodingContext;
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    for (query, expected) in [
+        ("", None),
+        ("Context=", None),
+        ("Context=%20%09", None),
+        ("Context", None),
+        ("CONTEXT=streamING", Some(EncodingContext::Streaming)),
+        ("context=STATIC", Some(EncodingContext::Static)),
+        ("Context=0", Some(EncodingContext::Streaming)),
+        ("Context=1", Some(EncodingContext::Static)),
+        ("Context=%20Static%20", Some(EncodingContext::Static)),
+        (
+            "Context=Streaming&context=Static",
+            Some(EncodingContext::Streaming),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "HEAD",
+                &format!("/Videos/{ITEM_ID}/stream.mkv?{query}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        assert_eq!(
+            rec.last.lock().unwrap().as_ref().unwrap().context,
+            expected,
+            "{query}"
+        );
+    }
+    for query in ["Context=other", "Context=1.0", "Context=2147483648"] {
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "HEAD",
+                &format!("/Videos/{ITEM_ID}/stream.mkv?{query}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        assert!(rec.last.lock().unwrap().as_ref().unwrap().context.is_none());
+    }
+}
+
+#[tokio::test]
+async fn progressive_context_matches_actual_nullable_enum_converter() {
+    use ferrofin_model::dlna::EncodingContext;
+    #[derive(serde::Deserialize)]
+    struct Case {
+        value: String,
+        result: Option<i32>,
+    }
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("data/t06-nullable-context.json")).unwrap();
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    for route in ["Videos", "Audio"] {
+        for case in &cases {
+            let query = form_urlencoded::Serializer::new(String::new())
+                .append_pair("Context", &case.value)
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(authed(
+                    "HEAD",
+                    &format!("/{route}/{ITEM_ID}/stream.mkv?{query}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{route}: {:?}",
+                case.value
+            );
+            let expected = case.result.map(|number| match number {
+                0 => EncodingContext::Streaming,
+                1 => EncodingContext::Static,
+                number => EncodingContext::Unrecognized(number),
+            });
+            assert_eq!(
+                rec.last.lock().unwrap().as_ref().unwrap().context,
+                expected,
+                "{route}: {:?}",
+                case.value
+            );
+        }
+    }
 }

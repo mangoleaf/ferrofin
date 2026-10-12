@@ -88,6 +88,15 @@ fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
+    /// Serializes named saves through validation, persistence and live updates.
+    pub configuration_write_lock: tokio::sync::Mutex<()>,
+    /// Serializes issuing and consuming recovery files through password updates.
+    pub password_reset_lock: tokio::sync::Mutex<()>,
+    /// Store validators registered by the composition root, keyed case-insensitively.
+    pub configuration_validators: std::collections::HashMap<
+        String,
+        Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
+    >,
     /// The network policy — which peers count as local, and which remote ones
     /// may reach the server at all (`RemoteIPFilter`).
     ///
@@ -192,6 +201,16 @@ pub struct Inner {
     /// composition root injects the watcher-backed `FerrofinLibraryMonitor` via
     /// [`AppState::with_library_monitor`].
     pub library_monitor: Arc<dyn LibraryMonitor>,
+    /// The Intro Skipper's per-season analyzer actions
+    /// (`/Intros/AnalyzerActions/*`). Defaults to a process-local store; the
+    /// composition root injects the database-backed one via
+    /// [`AppState::with_intro_skipper_store`].
+    pub intro_skipper: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    /// The Intro Skipper's analysis runtime (season rescans, the scan latch,
+    /// the detection cache). Defaults to a detached handle; the composition
+    /// root injects the extension's via
+    /// [`AppState::with_intro_skipper_analysis`].
+    pub intro_skipper_analysis: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperAnalysis>,
 
     /// The Tier-1 (compile-time) plugin manager backing `/Plugins/*`,
     /// `/Packages/*` and `/Repositories`. Defaults to the disabled stub (no
@@ -248,15 +267,48 @@ pub struct Inner {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
+    request_culture: Arc<crate::request_culture::RequestCultureOptions>,
 }
 
 impl AppState {
     /// Wraps an already-assembled [`Inner`] set of managers.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if the built-in English request culture cannot be parsed.
     pub fn from_inner(inner: Inner) -> Self {
+        let request_culture = crate::request_culture::RequestCultureOptions::new(
+            "en-US",
+            inner.localization.get_supported_ui_cultures(),
+        )
+        .expect("built-in request culture is valid");
         Self {
             inner: Arc::new(inner),
+            request_culture: Arc::new(request_culture),
         }
+    }
+
+    /// Snapshots Startup's request-localization culture and supported UI list.
+    /// Later UICulture saves only affect UI localization, as in the source.
+    ///
+    /// # Errors
+    /// Returns an error if the startup culture is invalid.
+    pub fn with_request_culture(
+        mut self,
+        culture: &str,
+    ) -> Result<Self, ferrofin_traits::error::ServiceError> {
+        self.request_culture = Arc::new(
+            crate::request_culture::RequestCultureOptions::new(
+                culture,
+                self.inner.localization.get_supported_ui_cultures(),
+            )
+            .map_err(|error| ferrofin_traits::error::ServiceError::backend(error.to_string()))?,
+        );
+        Ok(self)
+    }
+
+    pub(crate) fn request_culture(&self) -> Arc<crate::request_culture::RequestCultureOptions> {
+        Arc::clone(&self.request_culture)
     }
 
     /// Builds an [`AppState`] from each manager trait object.
@@ -301,6 +353,9 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
+            configuration_write_lock: tokio::sync::Mutex::new(()),
+            password_reset_lock: tokio::sync::Mutex::new(()),
+            configuration_validators: std::collections::HashMap::new(),
             // Wired by the composition root via `with_network`.
             network: None,
             library,
@@ -354,6 +409,12 @@ impl AppState {
             // Default to the no-op library monitor; the composition root overrides
             // it via `with_library_monitor` once the filesystem watcher is wired.
             library_monitor: Arc::new(NoopLibraryMonitor),
+            intro_skipper: Arc::new(
+                ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
+            ),
+            intro_skipper_analysis: Arc::new(
+                ferrofin_traits::intro_skipper::DetachedIntroSkipperAnalysis,
+            ),
             // Default to the disabled plugin manager; the composition root injects
             // the registry-backed `FerrofinPluginManager` via `with_plugins`.
             plugins: Arc::new(DisabledPluginManager),
@@ -422,6 +483,42 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_virtual_folders must be called before the state is shared");
         inner.virtual_folders = virtual_folders;
+        self
+    }
+
+    /// Replaces the Intro Skipper's analyzer-action store with the
+    /// database-backed one ([`new`](Self::new) installs a process-local store
+    /// so every test constructor keeps compiling).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_intro_skipper_store(
+        mut self,
+        store: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperStore>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_intro_skipper_store must be called before the state is shared");
+        inner.intro_skipper = store;
+        self
+    }
+
+    /// Replaces the Intro Skipper's analysis runtime with the extension's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_intro_skipper_analysis(
+        mut self,
+        analysis: Arc<dyn ferrofin_traits::intro_skipper::IntroSkipperAnalysis>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_intro_skipper_analysis must be called before the state is shared");
+        inner.intro_skipper_analysis = analysis;
         self
     }
 
@@ -515,6 +612,24 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_live_tv must be called before the state is shared");
         inner.live_tv = Some(live_tv);
+        self
+    }
+
+    /// Registers a named store's validation before the state is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been cloned.
+    #[must_use]
+    pub fn with_configuration_validator(
+        mut self,
+        key: &str,
+        validator: Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_configuration_validator must precede sharing")
+            .configuration_validators
+            .insert(key.to_ascii_lowercase(), validator);
         self
     }
 

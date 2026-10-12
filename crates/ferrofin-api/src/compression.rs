@@ -113,7 +113,7 @@ impl JellyfinCompressible {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            size: SizeAbove::new(MIN_COMPRESSIBLE_BYTES),
+            size: SizeAbove::new(u64::from(MIN_COMPRESSIBLE_BYTES)),
         }
     }
 }
