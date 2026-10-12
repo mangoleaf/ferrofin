@@ -33,11 +33,13 @@ major is `0`; use `force_version` for that.
 
 ## Cutting an app release `vX.Y.Z`
 
-1. **Ensure `main` is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
+1. **Ensure the branch is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
    must have succeeded on the commit you are releasing; the workflow refuses otherwise.
-2. **Actions → Release → Run workflow** on `main`. Leave `force_version` empty to accept
+2. **Actions → Release → Run workflow** on `main`, or on a `release/vX.Y.Z` branch when the
+   release's scope is frozen while `main` moves on. Leave `force_version` empty to accept
    the derived version, or set it to `vX.Y.Z`. The job pushes the annotated tag; it does
-   **not** commit to `main`.
+   **not** commit to the branch. A release branch merges back into `main` with a merge
+   commit (never squash or rebase), so the release tag stays reachable from `main`.
 3. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
    Watch it finish, then verify (below).
 
