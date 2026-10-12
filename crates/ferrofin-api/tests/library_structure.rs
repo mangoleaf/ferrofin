@@ -710,6 +710,9 @@ async fn backend_failure_maps_to_500() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
+/// The complete Jellyfin Web library editor payload (`library` in
+/// `fixtures/dashboard-settings.json`, whose provenance `tests/config.rs`
+/// records), through creation and ID-based update.
 #[tokio::test]
 async fn current_web_library_options_survive_creation_and_update() {
     let fixture: serde_json::Value =

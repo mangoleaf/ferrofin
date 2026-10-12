@@ -1,15 +1,17 @@
 # Vendored icu_collator 2.3.1
 
-This is the crates.io `icu_collator` 2.3.1 package with one change, and without
-its `tests/` and `benches/`. The root `Cargo.toml` patches it in through
-`[patch.crates-io]`.
+This is the crates.io `icu_collator` 2.3.1 package with one change. Only its
+`src/`, `Cargo.toml` and `LICENSE` are vendored; its README, `tests/`,
+`benches/` and packaging metadata are not. The root `Cargo.toml` patches it
+in through `[patch.crates-io]`.
 
 ## The change
 
 `src/elements.rs` uses the shared root Jamo shortcut only for an untailored
 Jamo. A tailoring's own CE32 (Korean search collation) keeps its expansions
-and prefixes. See "Save image paths in NFO" in
-`docs/reviews/dashboard-settings.md`.
+and prefixes. Korean `search` collation needs it: genrb drops 67 modern Jamo
+entries from that tailoring, and without the fix the root shortcut overrides
+the ones restored in the generated data.
 
 ## Upstream tests
 

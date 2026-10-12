@@ -1463,6 +1463,33 @@ async fn only_successful_named_saves_notify_configuration_observers() {
     assert_eq!(manager.updates.lock().unwrap().len(), 1);
 }
 
+/// `fixtures/dashboard-settings.json` holds the payloads Jellyfin Web
+/// `1e507c588f353482a00333f84e36ddb7c8fc8221` sends when its dashboard saves:
+/// hand-chosen form values with the member names, nesting and value types
+/// those save actions emit, not Ferrofin DTO defaults. Each key comes from
+/// these Web sources (under `src/`):
+///
+/// - `server`: `apps/dashboard/routes/settings/index.tsx`,
+///   `libraries/display.tsx`, `libraries/metadata.tsx`, `playback/resume.tsx`,
+///   `playback/streaming.tsx`, `playback/trickplay.tsx`, `logs/index.tsx`
+/// - `branding`: `apps/dashboard/routes/branding/index.tsx`
+/// - `network`: `apps/dashboard/routes/networking/index.tsx`
+/// - `encoding`: `apps/dashboard/routes/playback/transcoding.tsx` (without the
+///   read-only `EncoderAppPathDisplay`)
+/// - `metadata`: `apps/dashboard/routes/libraries/display.tsx`
+/// - `xbmcmetadata`: `apps/dashboard/routes/libraries/nfo.tsx`
+/// - `livetv`: `apps/dashboard/routes/livetv/recordings.tsx`
+/// - `library`: `components/libraryoptionseditor/libraryoptionseditor.js`,
+///   `components/imageOptionsEditor/imageOptionsEditor.js`
+///
+/// Web fetches the full server document before assigning these fields; this
+/// test posts them through the real binder and reads them back. Web still
+/// emits `EnableArchiveMediaFiles: false`, which has no control and is absent
+/// from Jellyfin v12.0-rc7's `LibraryOptions`: Ferrofin discards it as that
+/// server does. These tests prove transport fidelity, not that each setting
+/// has a runtime consumer. When the Web pin moves, recheck the action
+/// objects, input names, provider-list helpers and nested payloads before
+/// updating the fixture.
 #[tokio::test]
 async fn current_web_configuration_payloads_survive_save_and_readback() {
     let fixture: serde_json::Value =
