@@ -1,19 +1,33 @@
-"""Build meaningful adoption state through Jellyfin's own API."""
+"""Build meaningful adoption state through Jellyfin's own API, plus the few states no API
+can produce, written into the stopped 10.11.8 fixture (seed_database)."""
 
 import base64
+from contextlib import closing
 from io import BytesIO
 import json
 import re
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from PIL import Image
 
 from metadata import Api as MetadataApi, CheckError
 
 
+EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
+# Ratings found only in other countries' tables (the library is US). Jellyfin 12.2 changed
+# two: "-12" scored -12 before it and 12 since, and "SAM 13" is new in its ar.json.
+SEEDED_RATINGS = (("allowed_movie", "SAM 13"), ("rated_movie", "FSK 16"), ("locked_movie", "-12"),
+                  ("versions_movie", "MA15+"), ("private_movie", "12A"))
+# The rows of upstream's HarmonizeConflictingUserDataTests, on the locked movie's two
+# provider keys: (provider, LastPlayedDate, PlayCount, PlaybackPositionTicks, Played).
+CONFLICT = (("Tmdb", "2023-08-14 00:00:00", 9, 0, 1), ("Imdb", "2021-12-31 00:00:00", 7, 490, 0))
+# The play state on the second item of the dangling parent chain.
+ORPHAN_PLAY = {"LastPlayedDate": "2025-05-05 00:00:00", "PlayCount": 3, "PlaybackPositionTicks": 0, "Played": 1}
 PASSWORD = "Synthetic-adoption-only-123!"
 USERS = ("synthetic-admin", "synthetic-adult", "synthetic-child")
 LIBRARIES = (("Synthetic Movies", "movies", "movies"),
@@ -137,14 +151,16 @@ def seed(base):
     libraries = {row["Name"]: row for row in api.get("/Library/VirtualFolders")}
     child = users[USERS[2]]
     ratings = api.get("/Localization/ParentalRatings")
-    pg = next(row["Value"] for row in ratings if row["Name"] == "PG")
+    # PG-13 (13): the seeded "SAM 13" is exactly at the child's limit, so the allowed
+    # movie stays visible while Jellyfin 12.2 scores it 13 (seed_database).
+    limit = next(row["Value"] for row in ratings if row["Name"] == "PG-13")
     for name in USERS[1:]:
         user = users[name]
         policy = user["Policy"]
         policy.update({"EnableContentDownloading": False, "EnableContentDeletion": False,
                        "EnableRemoteControlOfOtherUsers": False, "EnableAllFolders": name != USERS[2]})
         if name == USERS[2]:
-            policy.update({"MaxParentalRating": pg, "EnabledFolders": [
+            policy.update({"MaxParentalRating": limit, "EnabledFolders": [
                 libraries[name]["ItemId"] for name, _, folder in LIBRARIES if folder != "private"]})
         api.post(f"/Users/{user['Id']}/Policy", policy)
         configuration = user["Configuration"]
@@ -206,3 +222,93 @@ def seed(base):
     from user_accounts import seed as seed_accounts
     seed_accounts(api, manifest)
     return manifest
+
+
+def seed_id(name):
+    """A fixed id for a seeded row, so a rerun writes the same rows again."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, "ferrofin:adoption:synthetic:" + name)
+
+
+def seed_database(db, manifest):
+    """Write the adoption seeds into a STOPPED 10.11.8 fixture database, before any later
+    release boots a copy of it; returns the manifest entry describing them. Rerunning it
+    leaves the same state.
+
+    1. Non-US ratings on the five movies (SEEDED_RATINGS). Only OfficialRating changes;
+       each release scores it its own way, and Jellyfin 12.2's scores are the oracle.
+    2. Conflicting user data: the locked movie's adult rows become exactly two, one per
+       provider key, that disagree (CONFLICT). Jellyfin 12.2 and Ferrofin harmonize them.
+    3. A dangling parent chain: two copies of an episode, the first under a parent that
+       does not exist, the second under the first, with play state on the second. Jellyfin
+       (12.1+ from 10.11, or its post-scan clean-up) and Ferrofin's migration 0042 delete
+       them and keep the play state on the placeholder item. They carry no series, season
+       or top parent and no real path, so no browse list treats them as library content.
+    """
+    adult = uuid.UUID(manifest["users"][USERS[1]])
+    with closing(sqlite3.connect(db)) as conn:
+        # The chain's first item names a parent that does not exist, which only a
+        # connection without foreign-key enforcement can write. It must be set outside
+        # a transaction, so before the first statement.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        with conn:
+            def stored(table, wanted):
+                row = conn.execute(f'SELECT "Id" FROM "{table}" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                                   (wanted.hex,)).fetchone()
+                if row is None:
+                    raise CheckError(f"synthetic seed: no {table} row for a manifest id")
+                return row[0]
+
+            def spelled(like, value):
+                text = str(value) if "-" in like else value.hex
+                return text.upper() if like == like.upper() else text
+
+            ratings = {}
+            for key, rating in SEEDED_RATINGS:
+                movie = uuid.UUID(manifest[key])
+                conn.execute('UPDATE "BaseItems" SET "OfficialRating" = ? WHERE "Id" = ?',
+                             (rating, stored("BaseItems", movie)))
+                ratings[movie.hex] = rating
+
+            locked = uuid.UUID(manifest["locked_movie"])
+            item, user = stored("BaseItems", locked), stored("Users", adult)
+            providers = dict(conn.execute(
+                'SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders" WHERE "ItemId" = ?', (item,)))
+            keys = [providers.get(provider) for provider, *_ in CONFLICT]
+            if not all(keys):
+                raise CheckError("synthetic seed: the locked movie lacks its Tmdb and Imdb ids")
+            conn.execute('DELETE FROM "UserData" WHERE "ItemId" = ? AND "UserId" = ?', (item, user))
+            for key, (_, date, plays, ticks, played) in zip(keys, CONFLICT):
+                conn.execute('INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", '
+                             '"LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played") '
+                             'VALUES (?, ?, ?, 0, ?, ?, ?, ?)', (item, user, key, date, plays, ticks, played))
+
+            source = conn.execute('SELECT "Id" FROM "BaseItems" WHERE "Type" = ? ORDER BY "Id" LIMIT 1',
+                                  (EPISODE_TYPE,)).fetchone()
+            if source is None:
+                raise CheckError("synthetic seed: no episode to copy")
+            columns = {row[1] for row in conn.execute('PRAGMA table_info("BaseItems")')}
+            first, second, missing = (seed_id(name) for name in ("orphan", "orphan-child", "missing-parent"))
+            for number, (orphan, parent) in enumerate(((first, missing), (second, first)), 1):
+                changes = {"Id": spelled(source[0], orphan), "ParentId": spelled(source[0], parent),
+                           "Name": f"Synthetic orphan {number}", "PresentationUniqueKey": orphan.hex,
+                           "Path": f"/media/shows/Synthetic orphans/{number}.mkv", "TopParentId": None,
+                           "SeriesId": None, "SeasonId": None, "SeriesName": None, "SeasonName": None,
+                           "SeriesPresentationUniqueKey": None}
+                changes = {column: value for column, value in changes.items() if column in columns}
+                conn.execute('DROP TABLE IF EXISTS temp."SeedOrphan"')
+                conn.execute('CREATE TEMP TABLE "SeedOrphan" AS SELECT * FROM "BaseItems" WHERE "Id" = ?', source)
+                conn.execute('UPDATE temp."SeedOrphan" SET ' + ", ".join(f'"{column}" = ?' for column in changes),
+                             tuple(changes.values()))
+                conn.execute('INSERT OR IGNORE INTO "BaseItems" SELECT * FROM temp."SeedOrphan"')
+                conn.execute('DROP TABLE temp."SeedOrphan"')
+            # Jellyfin's own key for an item's history: its id, dashed and lower-case.
+            history = str(second)
+            conn.execute('INSERT OR REPLACE INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", '
+                         '"LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played") '
+                         'VALUES (?, ?, ?, 0, ?, ?, ?, ?)',
+                         (spelled(source[0], second), user, history, *ORPHAN_PLAY.values()))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return {"ratings": ratings,
+            "conflict": {"item": locked.hex, "user": adult.hex, "keys": keys},
+            "orphans": [first.hex, second.hex],
+            "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY}}

@@ -3,6 +3,9 @@
 
 All media and accounts are invented. Jellyfin creates the source state through its
 API; each supported release supplies its own expected responses before adoption.
+A few states no API produces (non-US ratings, conflicting user data, a dangling parent
+chain) are written into the stopped 10.11.8 fixture and inherited by every later one;
+for those, Jellyfin 12.2's own result is the expectation on every path.
 """
 
 import argparse
@@ -16,7 +19,7 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import Api, USERS, seed
+from synthetic_fixture import Api, USERS, seed, seed_database
 from synthetic_media import generate
 
 
@@ -28,6 +31,9 @@ VERSIONS = (
     ("jellyfin-12.0", "12.0", "jellyfin-10.11.8"),
     ("jellyfin-12.1-from-10", "12.1", "jellyfin-10.11.8"),
     ("jellyfin-12.1-from-12", "12.1", "jellyfin-12.0"),
+    ("jellyfin-12.2-from-10", "12.2", "jellyfin-10.11.8"),
+    ("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0"),
+    ("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12"),
 )
 
 
@@ -103,6 +109,18 @@ def build(root, only, port):
             baseline = snapshot(api, manifest)
             validate(baseline, manifest)
             save(config / "preservation.json", baseline)
+        if not parent:
+            # States no API produces, written with the server stopped. The 10.11.8
+            # baseline above predates them; every later fixture inherits them.
+            manifest["seeds"] = seed_database(config / "data/jellyfin.db", manifest)
+            save(config / "synthetic.json", manifest)
+        # What this release left of the seeds: its own boot and scan act on them first.
+        from preservation import seed_state, validate_oracle, validate_seed_state
+        state = seed_state(config / "data/jellyfin.db", manifest["seeds"])
+        validate_seed_state(state, manifest["seeds"], version)
+        if version == "12.2":
+            validate_oracle(config / "data/jellyfin.db", manifest)
+        save(config / "seeds.json", state)
         save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
         print(name + " built and validated", flush=True)
 

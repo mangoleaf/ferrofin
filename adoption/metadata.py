@@ -34,6 +34,23 @@ IMAGE_TYPES = (
     "Screenshot", "Menu", "Chapter", "BoxRear", "Profile",
 )
 
+# Migration 0042's orphan set, verbatim: items whose ParentId names no item, everything
+# under them, and (Ferrofin's addition) every extra they own.
+ORPHANS_BY_PARENT = '''
+    SELECT Child."Id"
+    FROM "BaseItems" AS Child
+    WHERE Child."ParentId" IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM "BaseItems" AS Parent WHERE Parent."Id" = Child."ParentId")
+    UNION
+    SELECT Descendant."Id"
+    FROM "BaseItems" AS Descendant
+    INNER JOIN Orphan ON Descendant."ParentId" = Orphan."Id"'''
+ORPHANS_BY_OWNER = '''
+    UNION
+    SELECT Owned."Id"
+    FROM "BaseItems" AS Owned
+    INNER JOIN Orphan ON Owned."OwnerId" = Orphan."Id"'''
+
 
 class CheckError(Exception):
     """An actionable failure whose message contains no library content."""
@@ -68,17 +85,31 @@ def decodable_image(body):
         return False
 
 
-def snapshot(db):
-    """Read all relevant rows in one SQLite snapshot, including a live WAL."""
+def orphaned_items(conn):
+    """The items migration 0042 deletes, as normalized ids. Empty for a table without
+    ParentId (a canned test schema)."""
+    columns = {row[1] for row in conn.execute('PRAGMA table_info("BaseItems")')}
+    if "ParentId" not in columns:
+        return set()
+    owned = ORPHANS_BY_OWNER if "OwnerId" in columns else ""
+    query = f'WITH RECURSIVE Orphan ("Id") AS ({ORPHANS_BY_PARENT}{owned}\n)\nSELECT "Id" FROM Orphan'
+    return {item_id(row[0]) for row in conn.execute(query)}
+
+
+def snapshot(db, expected=False):
+    """Read all relevant rows in one SQLite snapshot, including a live WAL. A baseline
+    (expected=True) leaves out the orphaned items migration 0042 deletes on adoption;
+    their play state is checked on the placeholder item instead (watch_history)."""
     with closing(connect(db)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
+        orphans = orphaned_items(conn) if expected else set()
         rows = conn.execute('SELECT "Id", "Type", ' + ", ".join(
             f'b."{field}"' for field in FIELDS) + ' FROM "BaseItems" b')
         items = {}
         for row in rows:
             kind = row["Type"].rsplit(".", 1)[-1]
-            if kind in KINDS:
+            if kind in KINDS and item_id(row["Id"]) not in orphans:
                 items[item_id(row["Id"])] = {
                     "kind": kind,
                     "fields": [field for field in FIELDS if present(row[field])
@@ -271,7 +302,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.mode == "snapshot":
-            data = snapshot(args.db)
+            data = snapshot(args.db, expected=True)
             validate_baseline(data)
             fd = os.open(args.baseline, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as output:

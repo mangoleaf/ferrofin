@@ -1,5 +1,6 @@
 """Compare the synthetic library's behavior with its source Jellyfin release."""
 
+from contextlib import closing
 from io import BytesIO
 import json
 import copy
@@ -11,7 +12,7 @@ import uuid
 
 from PIL import Image, ImageStat
 
-from metadata import CheckError
+from metadata import CheckError, connect
 from synthetic_fixture import USERS
 
 
@@ -157,6 +158,149 @@ def same_artwork(expected, actual):
             and all(abs(a - b) <= 3 for a, b in zip(expected["rgb"], actual["rgb"])))
 
 
+# The fixture whose Jellyfin 12.2 handling of the seeds is the expectation on every path
+# (built 10.11.8 -> 12.0 -> 12.1 -> 12.2, the fullest upgrade route).
+ORACLE = "jellyfin-12.2-from-121"
+MOVIE_TYPE = "MediaBrowser.Controller.Entities.Movies.Movie"
+PLACEHOLDER = "00000000000000000000000000000001"
+# The generation each release's database adopts as: the id SET the gate matches
+# (10.11.9 adds no migration; 10.11.10 adds 10.11.11's three).
+GENERATIONS = {"10.11.8": "10.11.8", "10.11.9": "10.11.8", "10.11.10": "10.11.11",
+               "10.11.11": "10.11.11", "12.0": "12.0.0", "12.1": "12.1.0", "12.2": "12.2.0"}
+
+
+def scrub(value, ids):
+    """value without the given (normalized) ids, as dict keys or list members."""
+    if isinstance(value, dict):
+        return {key: scrub(val, ids) for key, val in value.items() if key not in ids}
+    if isinstance(value, list):
+        return [scrub(val, ids) for val in value if not (isinstance(val, str) and val in ids)]
+    return value
+
+
+def comparable(data, seeds, orphans):
+    """A snapshot as the per-release comparison sees it. Orphaned items leave every list
+    on adoption. Whether a seeded movie is visible follows Jellyfin 12.2's scores, and
+    whether the conflicting movie is resumable follows 12.2's harmonize; seed_failures
+    compares those against the 12.2 oracle instead of the source release."""
+    data = scrub(data, orphans)
+    if "visibility" in data:
+        data["visibility"] = scrub(data["visibility"], set(seeds["ratings"]))
+    if "views" in data:
+        data["views"] = scrub(data["views"], {seeds["conflict"]["item"]})
+    return data
+
+
+def rating_triples(conn):
+    """Every movie's (OfficialRating, InheritedParentalRatingValue, InheritedParentalRatingSubValue)."""
+    return {normalize(row[0]): list(row[1:]) for row in conn.execute(
+        'SELECT "Id", "OfficialRating", "InheritedParentalRatingValue", "InheritedParentalRatingSubValue" '
+        'FROM "BaseItems" WHERE "Type" = ?', (MOVIE_TYPE,))}
+
+
+def user_data_state(conn, item, user):
+    """The rows of one (item, user) by CustomDataKey: the nine columns the harmonize repair
+    copies, dates as exact instants, booleans as booleans."""
+    from watch_history import BOOLEANS, HARMONIZED, instant
+    cursor = conn.cursor()
+    cursor.row_factory = sqlite3.Row
+    rows = {}
+    for record in cursor.execute(
+            'SELECT * FROM "UserData" WHERE lower(replace("ItemId", \'-\', \'\')) = ? '
+            'AND lower(replace("UserId", \'-\', \'\')) = ?', (item, user)):
+        row = {column: record[column] for column in HARMONIZED if column in record.keys()}
+        row["LastPlayedDate"] = instant(row.get("LastPlayedDate"))
+        for column in BOOLEANS:
+            if row.get(column) is not None:
+                row[column] = bool(row[column])
+        rows[record["CustomDataKey"]] = row
+    return rows
+
+
+def orphan_history(conn, seeds):
+    """Where the dangling chain's play state is: "placeholder" (detached, with a
+    RetentionDate), "item" (still on an orphaned item), or None (lost or malformed)."""
+    history = seeds["orphan_history"]
+    row = conn.execute(
+        'SELECT lower(replace("ItemId", \'-\', \'\')), "Played", "PlayCount", "RetentionDate" FROM "UserData" '
+        'WHERE lower(replace("UserId", \'-\', \'\')) = ? AND "CustomDataKey" = ?',
+        (history["user"], history["key"])).fetchone()
+    if row is None or (row[1], row[2]) != (history["Played"], history["PlayCount"]):
+        return None
+    if row[0] == PLACEHOLDER:
+        return "placeholder" if row[3] is not None else None
+    return "item" if row[0] in seeds["orphans"] else None
+
+
+def seed_state(db, seeds):
+    """What of the seeds a built fixture still holds, recorded beside it (seeds.json):
+    each release handles them on its own boot and scan before Ferrofin ever sees them.
+    Jellyfin's post-scan clean-up (CleanDatabaseScheduledTask, HasDeadParentId) deletes
+    dead-parent items, so the chain itself may already be gone."""
+    with closing(connect(db)) as conn:
+        triples = rating_triples(conn)
+        survivors = conn.execute('SELECT lower(replace("Id", \'-\', \'\')) FROM "BaseItems"').fetchall()
+        conflict = seeds["conflict"]
+        return {"ratings": {movie: triples.get(movie, [None])[0] for movie in seeds["ratings"]},
+                "conflict": user_data_state(conn, conflict["item"], conflict["user"]),
+                "orphans": sorted({row[0] for row in survivors} & set(seeds["orphans"])),
+                "history": orphan_history(conn, seeds)}
+
+
+def validate_seed_state(state, seeds, version):
+    """A fixture whose seeds did not survive its release cannot test Ferrofin with them."""
+    if state["ratings"] != seeds["ratings"]:
+        raise CheckError(f"Jellyfin {version} did not keep the seeded ratings")
+    rows = list(state["conflict"].values())
+    if sorted(state["conflict"]) != sorted(seeds["conflict"]["keys"]):
+        raise CheckError(f"Jellyfin {version} did not keep the seeded conflicting user data")
+    agree = all(row == rows[0] for row in rows)
+    if version == "12.2" and not agree:
+        raise CheckError("Jellyfin 12.2 did not harmonize the seeded conflicting user data")
+    if version != "12.2" and agree:
+        raise CheckError(f"Jellyfin {version} changed the seeded conflicting user data")
+
+
+def validate_oracle(db, manifest):
+    """A Jellyfin 12.2 fixture can serve as the seeds' oracle only if 12.2 scored every
+    seeded rating (each scores above zero; 10.11.8's tables score none of them)."""
+    seeds = manifest.get("seeds")
+    if not seeds:
+        raise CheckError("synthetic fixture lacks the database seeds")
+    with closing(connect(db)) as conn:
+        triples = rating_triples(conn)
+    if any(triples.get(movie, [None, None])[1] in (None, 0) for movie in seeds["ratings"]):
+        raise CheckError("Jellyfin 12.2 left a seeded rating unscored")
+
+
+def seed_failures(conn, actual, seeds, state, oracle_conn, oracle):
+    """How the adopted database (conn) and API snapshot (actual) differ from Jellyfin 12.2's
+    handling of the seeds (oracle_conn, oracle: the oracle fixture's database and baseline).
+    state is what the source fixture still held (seed_state): the dangling chain's history
+    is checked only where the source still had it."""
+    failures = []
+    if rating_triples(conn) != rating_triples(oracle_conn):
+        failures.append("seeded ratings differ from Jellyfin 12.2")
+    if any((movie in actual["visibility"].get(name, [])) != (movie in oracle["visibility"].get(name, []))
+           for movie in seeds["ratings"] for name in USERS[1:]):
+        failures.append("seeded rating visibility differs from Jellyfin 12.2")
+    seeded = [*seeds["ratings"], seeds["conflict"]["item"]]
+    if any((movie in actual["views"][name]["resume"]) != (movie in oracle["views"][name]["resume"])
+           for movie in seeded for name in USERS[1:]):
+        failures.append("seeded movie resume differs from Jellyfin 12.2")
+    conflict = seeds["conflict"]
+    if (user_data_state(conn, conflict["item"], conflict["user"])
+            != user_data_state(oracle_conn, conflict["item"], conflict["user"])):
+        failures.append("seeded conflicting user data differs from Jellyfin 12.2")
+    survivors = conn.execute('SELECT COUNT(*) FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) IN ({})'.format(
+        ",".join("?" * len(seeds["orphans"]))), seeds["orphans"]).fetchone()[0]
+    if survivors:
+        failures.append("seeded orphaned items survive")
+    if state["history"] is not None and orphan_history(conn, seeds) != "placeholder":
+        failures.append("seeded orphaned history is not on the placeholder item")
+    return failures
+
+
 def library_settings(value):
     result = copy.deepcopy(value)
     for library in result.values():
@@ -193,18 +337,17 @@ def container_log():
 
 
 def verify_database(db):
-    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+    with closing(connect(db)) as conn:
         if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
             raise CheckError("synthetic database integrity check failed")
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise CheckError("synthetic database has foreign-key violations")
 
 
-def verify_boot(work, name, stage, previous_logs):
+def verify_boot(work, version, stage, previous_logs):
     log = work / (stage + ".boot.log")
     log.write_text("\n".join(container_log().splitlines()[previous_logs:]))
-    generation = ("12.1.0" if "12.1" in name else "12.0.0" if "12.0" in name
-                  else "10.11.8" if name.endswith((".8", ".9")) else "10.11.11")
+    generation = GENERATIONS[version]
     function = "adoption_check_boot_log" if stage == "adoption" else "adoption_second_boot_repairs"
     result = subprocess.run(["bash", "-c", 'source "$1"; "$2" "$3" "$4"', "_",
         str(Path(__file__).with_name("lib.sh")), function, str(log), generation],
@@ -219,7 +362,12 @@ def run_matrix(root, image, only, port):
     import watch_history
     import user_accounts
     failures = []
-    for name, _, _ in VERSIONS:
+    oracle_dir = root / ORACLE
+    oracle_ready = oracle_dir / "synthetic-ready.json"
+    if not oracle_ready.exists() or json.loads(oracle_ready.read_text()).get("recipe") != recipe():
+        raise CheckError("synthetic Jellyfin 12.2 oracle missing; build " + ORACLE + " first")
+    oracle = json.loads((oracle_dir / "preservation.json").read_text())
+    for name, version, _ in VERSIONS:
         if only and only != name:
             continue
         source = root / name
@@ -230,15 +378,21 @@ def run_matrix(root, image, only, port):
             raise CheckError("synthetic recipe changed; rebuild the fixture before testing")
         manifest = json.loads((source / "synthetic.json").read_text())
         expected = json.loads((source / "preservation.json").read_text())
+        seeds = manifest.get("seeds")
+        if not seeds or not (source / "seeds.json").exists():
+            raise CheckError("synthetic fixture lacks the database seeds; rebuild it")
+        state = json.loads((source / "seeds.json").read_text())
         work = root / "work" / name
         if work.exists():
             raise CheckError("previous synthetic run remains; inspect it before rerunning")
         work.parent.mkdir(exist_ok=True)
         shutil.copytree(source, work)
         db = work / "data/jellyfin.db"
-        history = watch_history.snapshot(db)
+        with closing(metadata.connect(db)) as conn:
+            orphans = watch_history.orphaned_items(conn) | set(seeds["orphans"])
+        history = watch_history.snapshot(db, expected=True)
         accounts_before = user_accounts.database_snapshot(db)
-        metadata_before = metadata.snapshot(db)
+        metadata_before = metadata.snapshot(db, expected=True)
         with server(image, work, root / "media", "synthetic-adoption", port, ferrofin=True) as api:
             api = api.login(USERS[0])
             api.idle()
@@ -260,9 +414,12 @@ def run_matrix(root, image, only, port):
                     api.scan(300, interval=1)
                 verify_database(db)
                 if stage in ("adoption", "restart"):
-                    verify_boot(work, name, stage, previous_logs)
+                    verify_boot(work, version, stage, previous_logs)
                 actual = snapshot(api, manifest)
-                changed = compare(expected, actual)
+                changed = compare(comparable(expected, seeds, orphans), comparable(actual, seeds, orphans))
+                with closing(metadata.connect(db)) as conn, \
+                        closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
+                    changed += seed_failures(conn, actual, seeds, state, oracle_conn, oracle)
                 changed += user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db))
                 changed += list(watch_history.compare_db(history, watch_history.snapshot(db)))
                 changed += list(watch_history.compare_api(history, metadata.Api(api.base, db)))
