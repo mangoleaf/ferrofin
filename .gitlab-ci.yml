@@ -24,9 +24,8 @@
 #   chart-vA.B.C  → chart only @ A.B.C
 #   main commit   → dev image v{M.m.p}-{N}-{sha12} when build-relevant paths change
 #   merge request → dev image v{M.m.p}-{branch-slug}-{N}-{sha12}, MANUAL (play
-#                   docker-image in the MR pipeline) — for homelab testing before merge
-#   release/* push → dev image v{M.m.p}-{branch-slug}-{N}-{sha12}, MANUAL (play
-#                   docker-image in the branch pipeline) — homelab testing of a release branch
+#                   docker-image in the MR pipeline) — for homelab testing before merge;
+#                   a release/* MR always offers it (see image-version)
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
@@ -415,9 +414,9 @@ image-version:
       dotenv: image.env
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
-    # A release branch carries all of main's code, so it is always build-worthy:
-    # no `changes:` filter (its own diff may be only docs and CI).
-    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+    # A release/* MR is always build-worthy: its diff against main may be only
+    # docs and CI, but the branch carries all of main's code. No `changes:`.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^release\//'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - crates/**/*
@@ -500,6 +499,10 @@ docker-image:
         - Cargo.toml
         - Cargo.lock
         - Dockerfile
+    # A release/* MR: always offer the button (no `changes:`, as in image-version).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^release\//'
+      when: manual
+      allow_failure: true
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - crates/**/*
@@ -509,11 +512,6 @@ docker-image:
         - Dockerfile
       when: manual
       allow_failure: true   # a non-clicked button must not leave the MR pipeline "blocked"
-    # Release branch: a Play button on every push, for homelab testing of the
-    # release before an rc tag is cut (no `changes:` filter, as in image-version).
-    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
-      when: manual
-      allow_failure: true
 
 # ---------------------------------------------------------------------------
 # release — GitLab Release with git-cliff notes (final versions only)
