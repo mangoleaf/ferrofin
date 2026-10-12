@@ -59,6 +59,11 @@ release changes what a refresh does once it runs:
   Each is an ffmpeg process with its own memory and, with hardware acceleration, its own
   GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). `FERROFIN_TRICKPLAY_CONCURRENCY` caps it (a new setting, default `auto`; `1`
   matches Jellyfin; see [`CONFIG.md`](CONFIG.md)).
+- Sonarr's and Radarr's notifications now start a scan. They send camelCase keys
+  (`{"updates":[{"path":…}]}`), which 1.3.x answered with `204` and ignored; request bodies
+  now bind in any letter case, as Jellyfin's do. The reported path is scanned once
+  `LibraryMonitorDelay` has passed, so a library on a network share that the disk watcher
+  cannot see no longer waits for the next scheduled scan.
 
 Apart from scans, deleting an item now deletes its files, and who may delete one follows
 Jellyfin's rules:
@@ -79,10 +84,6 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
-  (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
-  shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
-  updated by the disk watcher (where it can see the change) and by scheduled scans.
 - The first scan of an adopted Jellyfin database still rewrites three kinds of item: music
   albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
   album's `folder.jpg`; music artists, whose running time Ferrofin sums from their tracks

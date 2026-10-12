@@ -248,7 +248,8 @@ library's folders and processes a change once they have been quiet for
 `LibraryMonitorDelay` seconds. That is a server setting, 60 by default, with no field in
 jellyfin-web: it is set through `POST /System/Configuration`. The `*arr` webhooks
 (`POST /Library/Media/Updated`, `/Library/Series/Updated`, `/Library/Movies/Updated`) wait
-for the same delay, with or without real time monitoring (but see the Sonarr limit below).
+for the same delay, with or without real time monitoring. Sonarr and Radarr send camelCase
+keys (`{"updates":[{"path":…}]}`); request bodies bind in any letter case, as Jellyfin's do.
 Either way, as Jellyfin's `FileRefresher` does, the scan starts at the nearest item already
 in the library and runs **Scan for new and updated files** on it. For a new episode that is
 its season: the episode is added, the season (whose folder changed) is refreshed, the
@@ -262,12 +263,6 @@ the season's folder change asks the season providers.
 
 ### Known limits
 
-- **Sonarr's notification is not read yet.** Sonarr sends camelCase keys
-  (`{"updates":[{"path":…}]}`), and Ferrofin binds only the PascalCase keys of Jellyfin's
-  API schema (`Updates`, `Path`). It answers `204` and scans nothing; Jellyfin binds the
-  keys in any letter case. Radarr shares Sonarr's code and is expected to send the same.
-  Until this is fixed, a library whose changes the watcher cannot see (a network share
-  written to by another host) is updated by scheduled scans only.
 - **A file that disappears takes its item's user data with it.** A deleted, renamed or moved
   file's item is removed with its watched state, resume position and favourite, and a
   renamed or moved file comes back as a new item. Jellyfin keeps that data for when the
