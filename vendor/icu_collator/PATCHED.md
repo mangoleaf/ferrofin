@@ -8,7 +8,8 @@ its `tests/` and `benches/`. The root `Cargo.toml` patches it in through
 
 `src/elements.rs` uses the shared root Jamo shortcut only for an untailored
 Jamo. A tailoring's own CE32 (Korean search collation) keeps its expansions
-and prefixes. See `docs/reviews/dashboard-settings-n02.md`.
+and prefixes. See "Save image paths in NFO" in
+`docs/reviews/dashboard-settings.md`.
 
 ## Upstream tests
 
