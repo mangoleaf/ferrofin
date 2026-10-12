@@ -267,20 +267,46 @@ mod tests {
         // so appending to a shared file interleaves them.
         let argv_dir = dir.join("argv");
         std::fs::create_dir_all(&argv_dir).unwrap();
-        std::fs::write(
+        stub_script(
             &path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}/$$\ncat >&2 <<'EOF'\n{text}\nEOF\n",
+            &format!(
+                "printf '%s\\n' \"$@\" > {}/$$\ncat >&2 <<'EOF'\n{text}\nEOF\n",
                 argv_dir.display()
             ),
+        );
+        path
+    }
+
+    /// Writes an executable `#!/bin/sh` stub at `path` running `body`, and
+    /// returns once it can be executed. A test thread that forks while the
+    /// file is open for writing hands the child that write handle until the
+    /// child execs, and exec'ing the stub meanwhile fails `ETXTBSY`. One
+    /// successful run (`--ready`, which exits before `body`) proves no handle
+    /// is left, and none can appear once this process has closed its own.
+    fn stub_script(path: &Path, body: &str) {
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n[ \"$1\" = --ready ] && exit 0\n{body}"),
         )
         .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        path
+        for _ in 0..200 {
+            match std::process::Command::new(path).arg("--ready").status() {
+                Ok(status) => {
+                    assert!(status.success(), "{}: {status}", path.display());
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{}: {error}", path.display()),
+            }
+        }
+        panic!("{} stayed busy", path.display());
     }
 
     /// The argument vectors the stub was invoked with, one per spawn.
@@ -498,19 +524,13 @@ mod tests {
         // Appends a marker per run, so the file's length counts the spawns.
         let counter = dir.path().join("runs");
         let ffmpeg = dir.path().join("counting-ffmpeg");
-        std::fs::write(
+        stub_script(
             &ffmpeg,
-            format!(
-                "#!/bin/sh\necho x >> {}\necho 'VAAPI driver: Intel iHD driver' >&2\n",
+            &format!(
+                "echo x >> {}\necho 'VAAPI driver: Intel iHD driver' >&2\n",
                 counter.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let runs = || std::fs::read_to_string(&counter).map_or(0, |s| s.lines().count());
 
         let prober = VaapiProber::new(ffmpeg, linux_vaapi_caps());

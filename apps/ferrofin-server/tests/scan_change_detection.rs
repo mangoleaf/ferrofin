@@ -1778,8 +1778,35 @@ fn assert_provider_counts_agree(seen: &Seen, row: &str) {
     );
 }
 
+/// Whether this test should run here: the server's log subscriber is
+/// process-wide (`init_tracing`'s `try_init`), so a second server booted in
+/// the same process logs into the first one's directory and never sees its
+/// own watcher start. Under `cargo test`, which runs this file's tests on
+/// threads of one process, each re-runs itself alone in a child process and
+/// reports its result; nextest already gives every test a process of its own.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("FERROFIN_SCAN_MATRIX_CHILD").is_some()
+    {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("FERROFIN_SCAN_MATRIX_CHILD", "1")
+        .status()
+        .expect("run the test in its own process");
+    assert!(
+        status.success(),
+        "{name} failed in its own process: {status}"
+    );
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scan_reprocesses_only_what_changed() {
+    if !in_own_process("a_scan_reprocesses_only_what_changed") {
+        return;
+    }
     let h = Harness::boot().await;
     let started = Instant::now();
     rows(&h).await;
@@ -1794,6 +1821,9 @@ async fn a_scan_reprocesses_only_what_changed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subtitle_downloads_survive_rescans_and_probe_failure() {
+    if !in_own_process("subtitle_downloads_survive_rescans_and_probe_failure") {
+        return;
+    }
     let h = Harness::boot().await;
     subtitles_are_downloaded_during_scan(&h).await;
     std::fs::remove_file(&h.stubs.ffprobe).expect("make ffprobe unavailable");

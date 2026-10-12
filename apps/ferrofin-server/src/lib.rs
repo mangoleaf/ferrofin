@@ -1101,10 +1101,19 @@ mod tests {
             drop(socket);
         });
         super::stop_background_tasks(vec![task]).await;
-        let rebound = tokio::net::UdpSocket::bind(address)
-            .await
-            .expect("released before return");
-        drop(rebound);
+        // A child another test forks at this moment holds a copy of every
+        // open socket until it execs, so the port may stay taken for a few
+        // milliseconds after this process closed it; one never released
+        // stays taken.
+        let mut rebound = tokio::net::UdpSocket::bind(address).await;
+        for _ in 0..100 {
+            if rebound.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            rebound = tokio::net::UdpSocket::bind(address).await;
+        }
+        drop(rebound.expect("released before return"));
     }
 
     /// An upper-casing test transformer.
