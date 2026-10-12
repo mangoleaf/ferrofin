@@ -901,10 +901,10 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
-    // One-shot (Jellyfin 12.0 `MigrateRatingLevels`): recompute every row's
-    // inherited parental-rating columns from its OWN `OfficialRating` through
-    // `GetRatingScore`, so a rating string a 10.11/11.x build scored
-    // differently (or not at all) reads back under 12.0's tables.
+    // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
+    // every row's inherited parental-rating columns from its OWN
+    // `OfficialRating` through `GetRatingScore`, so a rating string an older
+    // build scored differently (or not at all) reads back under 12.2's tables.
     match item_persistence_impl
         .repair_rating_levels(localization.as_ref())
         .await

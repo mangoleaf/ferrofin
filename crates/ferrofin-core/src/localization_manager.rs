@@ -409,16 +409,26 @@ impl LocalizationManager {
         build_parental_ratings(&(self.metadata_country_code)())
     }
 
-    /// Resolves a rating string to a score (C# `GetRatingScore`, Jellyfin 12.1
-    /// `LocalizationManager.cs`).
+    /// Resolves a rating string to a score (C# `GetRatingScore`, Jellyfin 12.2
+    /// `LocalizationManager.cs:374-430`).
     ///
     /// An unrated marker is checked on the whole value first (some contain a
     /// `/` themselves: `n/a`), then the whole value is looked up before any
     /// splitting, because several systems keep a `/` inside one rating
     /// (`M/12`, `U/A 13+`, `7/i/fig`). Only a value with more than one
-    /// `/`-part falls back to the per-part lookup, where an unrated part is
-    /// skipped rather than ending the search and the first part that
-    /// resolves wins.
+    /// non-empty `/`-part falls back to the per-part lookup, where an unrated
+    /// part is skipped rather than ending the search and the first part that
+    /// resolves wins (`FR:16 / US:12` → 16). Accepted divergence: a value
+    /// whose only non-empty part is not the whole value (`PG/`, ` / PG`) has
+    /// that part looked up — upstream (since 12.1) answers unrated, which
+    /// would loosen parental filtering; a bare unrated marker part (`NR/`) stays
+    /// unrated (a `Rated `-prefixed one, `Rated NR/`, scores as the whole
+    /// value `Rated NR` does).
+    ///
+    /// The per-part lookups stay silent; when none of them resolves, one
+    /// message names the whole list. Upstream logs it at warning, but it fires
+    /// once per scanned item carrying such a value, so it is `debug` here
+    /// (`docs/conventions/LOGGING.md`).
     #[must_use]
     pub fn get_rating_score(
         &self,
@@ -428,31 +438,62 @@ impl LocalizationManager {
         if rating.is_empty() || is_unrated(rating) {
             return None;
         }
-        if let Some(score) = self.single_rating_score(rating, country_code) {
+        if let Some(score) = self.single_rating_score(rating, country_code, true) {
             return Some(score);
         }
-        let parts: Vec<&str> = rating.split('/').collect();
-        if parts.len() == 1 {
-            return None;
-        }
-        parts
-            .into_iter()
+        // `Split('/', RemoveEmptyEntries | TrimEntries)`.
+        let parts: Vec<&str> = rating
+            .split('/')
             .map(str::trim)
-            .filter(|part| !part.is_empty() && !is_unrated(part))
-            .find_map(|part| self.single_rating_score(part, country_code))
+            .filter(|part| !part.is_empty())
+            .collect();
+        // Upstream returns null whenever one part survives the split. Its
+        // intent is "the value is that single part, already looked up", which
+        // only holds when nothing was dropped. For `PG/`, ` / PG` or `US:PG/`,
+        // dropping an empty entry leaves a part that was never looked up, so
+        // 12.1 and 12.2 rate them unrated (rc7, and Ferrofin before, gave
+        // `PG` = 10).
+        // Accepted divergence, "don't port Jellyfin bugs": an unrated score
+        // loosens parental filtering, so the surviving part is looked up.
+        if let [only] = parts.as_slice() {
+            // An unrated marker stays unrated, as in the list loop below.
+            if *only == rating.trim() || is_unrated(only) {
+                return None;
+            }
+            return self.single_rating_score(only, country_code, true);
+        }
+        let mut has_unknown_rating = false;
+        for part in parts {
+            // One entry of such a list may be unrated while a later one still resolves.
+            if is_unrated(part) {
+                continue;
+            }
+            // An unknown entry is not worth a message of its own as long as
+            // another entry still resolves.
+            if let Some(score) = self.single_rating_score(part, country_code, false) {
+                return Some(score);
+            }
+            has_unknown_rating = true;
+        }
+        if has_unknown_rating {
+            tracing::debug!(
+                rating,
+                "none of the ratings in the list are in a known rating system; treating as unrated"
+            );
+        }
+        None
     }
 
-    /// Resolves a single (already split) rating value — C#
-    /// `GetSingleRatingScore` (`LocalizationManager.cs:396-465`).
+    /// Resolves a single rating value — C# `GetSingleRatingScore`
+    /// (`LocalizationManager.cs:441-507`). `log_unknown` is upstream's
+    /// `logUnknownRating`: `false` for one entry of a `/`-list, whose caller
+    /// reports the list as a whole instead.
     fn single_rating_score(
         &self,
         rating: &str,
         country_code: Option<&str>,
+        log_unknown: bool,
     ) -> Option<ParentalRatingScore> {
-        // Handle unrated content.
-        if is_unrated(rating) {
-            return None;
-        }
         // Convert ints directly. This may override some of the locale
         // specific age ratings (but those always map to the same age).
         if let Some(age) = parse_rating_as_score(rating) {
@@ -508,11 +549,18 @@ impl LocalizationManager {
             }
         }
 
+        // A '/' marks a list of ratings, which this would split into the first
+        // entry's country and the last entry's rating (upstream 12.2,
+        // `LocalizationManager.cs:497-504`); `get_rating_score` splits it first.
+        if cleaned.contains('/') {
+            return None;
+        }
+
         // Try splitting by a country prefix separator to handle "US:PG-13",
         // "Germany: FSK-18", "DE-FSK-18".
         for separator in [':', '-'] {
             if let SeparatorLookup::Resolved(score) =
-                self.rating_score_by_separator(cleaned, separator)
+                self.rating_score_by_separator(cleaned, separator, log_unknown)
             {
                 return score;
             }
@@ -520,12 +568,29 @@ impl LocalizationManager {
         None
     }
 
-    /// C# `TryGetRatingScoreBySeparator`: [`SeparatorLookup::NotApplicable`]
-    /// when the separator does not apply (no separator, or nothing after it),
-    /// otherwise the resolved score — `Resolved(None)` when the country was
-    /// identified but its table knows neither the rating nor a number, which
-    /// upstream logs and treats as unrated.
-    fn rating_score_by_separator(&self, rating: &str, separator: char) -> SeparatorLookup {
+    /// C# `TryGetRatingScoreBySeparator` (`LocalizationManager.cs:509-577`):
+    /// [`SeparatorLookup::NotApplicable`] when the separator does not apply
+    /// (no separator, or nothing after it), otherwise the resolved score —
+    /// `Resolved(None)` when the country was identified but its table knows
+    /// neither the rating nor a number, which is logged (when `log_unknown`)
+    /// and treated as unrated. An explicitly unrated part (`IT-NR`) is
+    /// unrated without a message.
+    ///
+    /// **Accepted divergence (owner decision D4: "don't port Jellyfin bugs").**
+    /// This splits at the *first* separator on both sides. Upstream takes the
+    /// country before the first separator but the rating after the **last**
+    /// one (`LeftPart`/`RightPart`, `StringExtensions.cs:89,106` — `RightPart`
+    /// uses `LastIndexOf`), so it misreads every rating that itself contains
+    /// the separator: `CA-TV-MA` is unrated upstream (`MA` is not a Canadian
+    /// rating) but 18/1 here, and `US-PG-13` resolves only by its number
+    /// upstream (13/none) but as 13/0 here. Where the two differ, this answer
+    /// is the country table's own entry for the rating.
+    fn rating_score_by_separator(
+        &self,
+        rating: &str,
+        separator: char,
+        log_unknown: bool,
+    ) -> SeparatorLookup {
         let Some((country_part, rating_part)) = rating.split_once(separator) else {
             return SeparatorLookup::NotApplicable;
         };
@@ -549,13 +614,17 @@ impl LocalizationManager {
             if let Some(age) = parse_rating_as_score(rating_part) {
                 return SeparatorLookup::Resolved(Some(ParentalRatingScore::new(age, None)));
             }
-            // Upstream logs this at warning; it fires once per rating lookup
-            // (every scanned item), so it stays at debug here (LOGGING.md).
-            tracing::debug!(
-                rating,
-                country_code = cc,
-                "rating not found in the country's rating system; treating as unrated"
-            );
+            // Explicitly unrated content (`IT-NR`) is unrated by definition,
+            // not a lookup failure.
+            if log_unknown && !is_unrated(rating_part) {
+                // Upstream logs this at warning; it fires once per rating lookup
+                // (every scanned item), so it stays at debug here (LOGGING.md).
+                tracing::debug!(
+                    rating,
+                    country_code = cc,
+                    "rating not found in the country's rating system; treating as unrated"
+                );
+            }
             return SeparatorLookup::Resolved(None);
         }
         // Country not identified or no rating data available: recursive lookup.
@@ -599,9 +668,24 @@ fn remove_ignore_ascii_case(haystack: &str, needle: &str) -> String {
     out
 }
 
-/// Parses a rating as a number, allowing a trailing `+` (C# `TryParseRatingAsScore`).
+/// Parses a rating as a number, allowing a trailing `+` (`16+`) or a leading
+/// `-` (C# `TryParseRatingAsScore`, Jellyfin 12.2 `LocalizationManager.cs:586-591`).
+///
+/// A leading `-` marks a minimum age — the French CNC's `-12` is "not for
+/// under 12s" — never a negative score, which would sort the item below every
+/// user's parental limit. Surrounding whitespace is allowed on both sides of
+/// the stripped `-`/`+`. Accepted divergence from C#, which strips on the
+/// untrimmed value and then lets `int.TryParse` read a sign: there ` -12` is
+/// −12 (a negative score that passes every limit) and `12+ ` does not parse;
+/// here they are 12 and 12.
 fn parse_rating_as_score(rating: &str) -> Option<i32> {
-    rating.trim_end_matches('+').parse::<i32>().ok()
+    rating
+        .trim()
+        .trim_start_matches('-')
+        .trim_end_matches('+')
+        .trim()
+        .parse::<i32>()
+        .ok()
 }
 
 /// The rating table for a country code (case-insensitive).
@@ -1433,7 +1517,16 @@ mod tests {
         assert_eq!(listed.rating_score, Some(dup));
         assert_eq!(listed.value, Some(18));
     }
-    /// Cases ported from upstream LocalizationManagerTests at 4910aafa1a.
+    /// `GetRatingScore(value)` on a server whose `MetadataCountryCode` is
+    /// `country` — the shape of every upstream rating `[Theory]`.
+    fn score_on_server(rating: &str, country: &str) -> Option<(i32, Option<i32>)> {
+        LocalizationManager::new(country)
+            .get_rating_score(rating, None)
+            .map(|s| (s.score, s.sub_score))
+    }
+
+    /// Upstream `GetRatingLevel_GivenValidString_Success` (v12.2
+    /// `LocalizationManagerTests.cs:191-255`), every `[InlineData]`.
     #[rstest]
     #[case("CA-R", "CA", 18, Some(1))]
     #[case("FSK-16", "DE", 16, None)]
@@ -1446,21 +1539,454 @@ mod tests {
     #[case("Rated: R", "US", 17, Some(0))]
     #[case("Rated R", "US", 17, Some(0))]
     #[case(" PG-13 ", "US", 13, Some(0))]
-    #[case("TV-MA", "DE", 17, Some(1))]
-    #[case("PG-13", "FR", 13, Some(0))]
-    #[case("R", "JP", 17, Some(0))]
-    #[case("us:R", "DE", 17, Some(0))]
-    #[case("US:PG-13", "DE", 13, Some(0))]
-    #[case("ca:R", "US", 18, Some(1))]
-    fn international_rating_oracles(
+    #[case("T", "IT", 0, None)]
+    #[case("VM6", "IT", 6, None)]
+    #[case("VM12", "IT", 12, None)]
+    #[case("VM14", "IT", 14, None)]
+    #[case("VM18", "IT", 18, None)]
+    #[case("IT-VM14", "IT", 14, None)] // TMDB style country prefix
+    #[case("IT-VM18", "IT", 18, None)]
+    #[case("it-vm18", "IT", 18, None)] // Rating strings are case insensitive
+    #[case("VM 18", "IT", 18, None)]
+    #[case("Vietato ai minori di 18 anni", "IT", 18, None)]
+    #[case("ATP", "AR", 0, None)]
+    #[case("SAM 13", "AR", 13, None)]
+    #[case("SAM 16", "AR", 16, None)]
+    #[case("SAM 18", "AR", 18, None)]
+    #[case("SAM13", "AR", 13, None)] // Written without a space
+    #[case("AR-SAM 16", "AR", 16, None)] // Country prefix stripped against the configured country
+    #[case("AR-SAM 13", "US", 13, None)] // Country prefix resolved via the separator fallback
+    #[case("AR-SAM 18", "US", 18, None)]
+    #[case("AR-SAM13", "US", 13, None)]
+    #[case("SAM 18 C", "AR", 1001, None)] // Condicionada, same as "C"
+    #[case("Interdit aux moins de 12 ans", "FR", 12, None)]
+    #[case("Interdit aux moins de 18 ans", "FR", 18, None)]
+    #[case("X 18+", "AU", 1000, Some(0))] // Official spelling of the Australian X rating
+    #[case("X18+", "AU", 1000, Some(0))]
+    #[case("FSK18", "DE", 18, None)] // Written without a space
+    #[case("ab 18", "DE", 18, None)] // Written as the minimum age
+    #[case("DE:ab 6", "DE", 6, None)]
+    #[case("\u{2013}12", "FR", 12, None)] // The CNC writes its minimum ages with an en dash
+    #[case("\u{2013}16", "FR", 16, None)]
+    #[case("\u{2013}18", "FR", 18, None)]
+    #[case("SU", "ID", 0, None)] // Indonesian broadcast classifications (KPI)
+    #[case("P", "ID", 2, None)]
+    #[case("A", "ID", 7, None)]
+    #[case("R", "ID", 13, None)]
+    #[case("D", "ID", 18, None)]
+    #[case("D18+", "ID", 18, None)] // Written with the minimum age, as broadcast since 2016
+    #[case("R-BO", "ID", 13, None)] // Parental guidance does not change the age group
+    #[case("Dewasa", "ID", 18, None)]
+    #[case("ID-D", "ID", 18, None)] // TMDB style country prefix
+    #[case("ID-D", "US", 18, None)] // Country prefix resolved via the separator fallback
+    #[case("P", "US", 1000, None)] // Ambiguous outside Indonesia, preferred as the Portuguese "Pornográfico"
+    fn get_rating_level_given_valid_string(
         #[case] rating: &str,
         #[case] country: &str,
         #[case] score: i32,
-        #[case] subscore: Option<i32>,
+        #[case] sub_score: Option<i32>,
     ) {
+        assert_eq!(score_on_server(rating, country), Some((score, sub_score)));
+    }
+
+    /// Upstream `GetRatingScore_IsCaseInsensitive_Success` (`:257-279`).
+    #[rstest]
+    #[case("btl", "se", 0, None)] // Direct lookup, lowercase of "Btl"
+    #[case("BARNTILLÅTEN", "se", 0, None)] // Direct lookup, uppercase incl. diacritics
+    #[case("SE-BTL", "se", 0, None)] // Country prefix stripped against the configured country
+    #[case("SE-BTL", "us", 0, None)] // Country prefix resolved via the separator fallback
+    #[case("Från 7 År", "se", 7, None)] // Diacritic casing (json has "Från 7 år")
+    #[case("SE-Från 7 År", "us", 7, None)] // Same, via the separator fallback
+    #[case("fsk-16", "de", 16, None)] // Not Sweden specific: lowercase of "FSK-16"
+    fn get_rating_score_is_case_insensitive(
+        #[case] rating: &str,
+        #[case] country: &str,
+        #[case] score: i32,
+        #[case] sub_score: Option<i32>,
+    ) {
+        assert_eq!(score_on_server(rating, country), Some((score, sub_score)));
+    }
+
+    /// Upstream `GetRatingLevel_GivenValidAge_Success` (`:281-302`): a bare
+    /// age is its own score, and the French CNC's leading `-` ("not for under
+    /// 12s") is a minimum age — read as −12 it would sort below every
+    /// `MaxParentalRatingScore` and bypass parental control entirely.
+    #[rstest]
+    #[case("0", 0)]
+    #[case("1", 1)]
+    #[case("6", 6)]
+    #[case("12", 12)]
+    #[case("42", 42)]
+    #[case("9999", 9999)]
+    #[case("-10", 10)]
+    #[case("-12", 12)]
+    #[case("-16", 16)]
+    #[case("-18", 18)]
+    fn get_rating_level_given_valid_age(#[case] rating: &str, #[case] score: i32) {
+        assert_eq!(score_on_server(rating, "nl"), Some((score, None)));
+    }
+
+    /// `TryParseRatingAsScore` strips one or more leading `-` and trailing
+    /// `+`, plus surrounding whitespace. The ` -12` and `12+ ` cases are
+    /// Ferrofin's values, not a C# oracle: upstream reads ` -12` as −12 and
+    /// fails `12+ ` (accepted divergence, see `parse_rating_as_score`).
+    #[rstest]
+    #[case("-12", Some(12))]
+    #[case("--12", Some(12))]
+    #[case("18+", Some(18))]
+    #[case("-16+", Some(16))]
+    #[case(" 12 ", Some(12))]
+    #[case(" -12", Some(12))]
+    #[case("- 12", Some(12))]
+    #[case("12 +", Some(12))]
+    #[case("12+ ", Some(12))]
+    #[case("+12", Some(12))]
+    #[case("-", None)]
+    #[case("PG-13", None)]
+    #[case("", None)]
+    fn parse_rating_as_score_reads_minimum_ages(#[case] rating: &str, #[case] age: Option<i32>) {
+        assert_eq!(parse_rating_as_score(rating), age);
+    }
+
+    /// Upstream `GetRatingLevel_GivenUnratedString_Success` (`:304-318`).
+    #[rstest]
+    #[case("NR")]
+    #[case("unrated")]
+    #[case("Not Rated")]
+    #[case("n/a")]
+    #[case("N/A")]
+    #[case(" n/a ")]
+    fn get_rating_level_given_unrated_string(#[case] rating: &str) {
+        assert_eq!(score_on_server(rating, DEFAULT_METADATA_COUNTRY_CODE), None);
+    }
+
+    /// Upstream `GetRatingLevel_SkipsUnratedListEntries_Success` (`:320-335`):
+    /// `NR`/`UR` are rating strings of some systems, so they must stay unrated
+    /// when listed alongside others.
+    #[rstest]
+    #[case("NR / R", 17, Some(0))]
+    #[case("unrated / R", 17, Some(0))]
+    #[case("R / NR", 17, Some(0))]
+    fn get_rating_level_skips_unrated_list_entries(
+        #[case] rating: &str,
+        #[case] score: i32,
+        #[case] sub_score: Option<i32>,
+    ) {
+        assert_eq!(score_on_server(rating, "us"), Some((score, sub_score)));
+    }
+
+    /// Upstream `GetRatingScore_RatingContainingSlash_IsNotSplit` (`:337-361`).
+    #[rstest]
+    #[case("M/3", "pt", 3, None)]
+    #[case("M/12", "pt", 12, None)]
+    #[case("M/18", "pt", 18, None)]
+    #[case("PT-M/12", "pt", 12, None)] // TMDB style country prefix
+    #[case("M/12", "us", 12, None)] // Resolved through the all-systems fallback
+    #[case("U/A 13+", "in", 13, None)]
+    #[case("7/i", "es", 11, None)]
+    #[case("7/i/fig", "es", 11, None)]
+    #[case("18/fig", "es", 18, None)]
+    fn get_rating_score_rating_containing_slash_is_not_split(
+        #[case] rating: &str,
+        #[case] country: &str,
+        #[case] score: i32,
+        #[case] sub_score: Option<i32>,
+    ) {
+        assert_eq!(score_on_server(rating, country), Some((score, sub_score)));
+    }
+
+    /// Upstream `GetRatingScore_CountryPrefixedList_UsesFirstResolvingEntry`
+    /// (`:363-379`): a list of country-prefixed spellings is split by `/`
+    /// first — the separator split of the whole value would pair the first
+    /// entry's country with the last entry's rating.
+    #[rstest]
+    #[case("DE:FSK 18 / DE:FSK-18 / DE:FSK18 / DE:18 / DE:ab 18", 18, None)]
+    #[case("SE:15 / SE:15+ / SE:Från 15 år", 15, None)]
+    #[case("FR:16 / US:12", 16, None)] // The first entry that resolves wins
+    fn get_rating_score_country_prefixed_list_uses_first_resolving_entry(
+        #[case] rating: &str,
+        #[case] score: i32,
+        #[case] sub_score: Option<i32>,
+    ) {
+        assert_eq!(score_on_server(rating, "de"), Some((score, sub_score)));
+    }
+
+    /// Counts this module's log events: those at `DEBUG`, and those above it.
+    #[derive(Clone, Default)]
+    struct CountRatingLogs {
+        /// Events at `DEBUG`.
+        debug: Arc<std::sync::atomic::AtomicUsize>,
+        /// Events at `INFO`, `WARN` or `ERROR`.
+        above_debug: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountRatingLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            if metadata.target() != "ferrofin_core::localization_manager" {
+                return;
+            }
+            let counter = match *metadata.level() {
+                tracing::Level::DEBUG => &self.debug,
+                tracing::Level::TRACE => return,
+                _ => &self.above_debug,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Resolves `rating` on a `de` server under a counting subscriber,
+    /// returning the score and the `(debug, above debug)` event counts.
+    fn score_with_log_counts(rating: &str) -> (Option<ParentalRatingScore>, (usize, usize)) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let counts = CountRatingLogs::default();
+        let score = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(counts.clone()),
+            || LocalizationManager::new("de").get_rating_score(rating, None),
+        );
+        let load = |n: &std::sync::atomic::AtomicUsize| n.load(std::sync::atomic::Ordering::SeqCst);
+        (score, (load(&counts.debug), load(&counts.above_debug)))
+    }
+
+    /// Upstream `GetRatingScore_ResolvedCountryPrefixedList_DoesNotWarn`
+    /// (`:381-398`): an entry of a list that resolves leaves no message, even
+    /// though the whole value went through the lookups first.
+    #[test]
+    fn get_rating_score_resolved_country_prefixed_list_does_not_log() {
+        let (score, counts) =
+            score_with_log_counts("DE:FSK 18 / DE:FSK-18 / DE:FSK18 / DE:18 / DE:ab 18");
+        assert!(score.is_some());
+        assert_eq!(counts, (0, 0));
+    }
+
+    /// Upstream `GetRatingScore_ListWithoutKnownRating_WarnsOnce`
+    /// (`:400-417`): a list none of whose entries resolves logs once for the
+    /// whole list, not once per entry — at `debug` here (upstream: warning),
+    /// because it fires per scanned item.
+    #[test]
+    fn get_rating_score_list_without_known_rating_logs_once_at_debug() {
+        let (score, counts) = score_with_log_counts("DE:Unbekannt / DE:Unsinn");
+        assert_eq!(score, None);
+        assert_eq!(counts, (1, 0), "one debug event, nothing above debug");
+        // A single unknown country-prefixed value is reported by the separator
+        // lookup (once), and an explicitly unrated one not at all.
+        assert_eq!(score_with_log_counts("DE:Unbekannt"), (None, (1, 0)));
+        assert_eq!(score_with_log_counts("IT-NR"), (None, (0, 0)));
+    }
+
+    /// Upstream `GetRatingLevel_Split_Success` (`:419-431`).
+    #[rstest]
+    #[case("-NO RATING SHOWN-")]
+    #[case(":NO RATING SHOWN:")]
+    fn get_rating_level_split(#[case] rating: &str) {
+        assert_eq!(score_on_server(rating, DEFAULT_METADATA_COUNTRY_CODE), None);
+    }
+
+    /// Upstream `GetRatingScore_FallbackPrioritizesUS_Success` (`:433-450`)
+    /// and `GetRatingScore_ValidRatingWithCountrySeparator_ReturnsScore`
+    /// (`:468-484`).
+    #[rstest]
+    #[case("TV-MA", "DE", 17, Some(1))] // US-only rating, DE country code
+    #[case("PG-13", "FR", 13, Some(0))] // US-only rating, FR country code
+    #[case("R", "JP", 17, Some(0))] // US-only rating, JP country code
+    #[case("us:R", "DE", 17, Some(0))] // Colon separator, explicit US country, valid US rating
+    #[case("US:PG-13", "DE", 13, Some(0))] // Colon separator, explicit US country, valid US rating
+    #[case("ca:R", "US", 18, Some(1))] // Colon separator, Canada country code, valid CA rating
+    fn get_rating_score_us_fallback_and_country_separator(
+        #[case] rating: &str,
+        #[case] country: &str,
+        #[case] score: i32,
+        #[case] sub_score: Option<i32>,
+    ) {
+        assert_eq!(score_on_server(rating, country), Some((score, sub_score)));
+    }
+
+    /// Upstream `GetRatingScore_UnknownRatingWithKnownCountry_ReturnsNull`
+    /// (`:452-466`).
+    #[rstest]
+    #[case("US:INVALID")] // Colon separator, known country code, unknown rating
+    #[case("us:INVALID")] // Colon separator, lowercase country code
+    #[case("DE-INVALID")] // Hyphen separator, known language prefix, unknown rating
+    #[case("ca:INVALID")] // Colon separator, known country code (Canada)
+    fn get_rating_score_unknown_rating_with_known_country(#[case] rating: &str) {
+        assert_eq!(score_on_server(rating, "US"), None);
+    }
+
+    /// D4 (owner decision, accepted divergence): Ferrofin splits a
+    /// country-prefixed rating at the FIRST separator on both sides; upstream
+    /// reads the rating after the LAST one. These values are Ferrofin's, not
+    /// Jellyfin 12.2's.
+    #[rstest]
+    // D4: upstream null — it looks up `MA` in the Canadian table.
+    #[case("CA-TV-MA", Some((18, Some(1))))]
+    // D4: upstream 13/none — it parses `13` as a bare number.
+    #[case("US-PG-13", Some((13, Some(0))))]
+    fn d4_country_prefix_splits_at_the_first_separator(
+        #[case] rating: &str,
+        #[case] expected: Option<(i32, Option<i32>)>,
+    ) {
+        assert_eq!(score_on_server(rating, "ZZ"), expected);
+    }
+
+    /// Accepted divergence (a 12.1 regression, still in 12.2; rc7 and Ferrofin
+    /// before both rated these): a `/`-list whose only non-empty part is not
+    /// the whole value looks that part up instead of answering unrated, which
+    /// would loosen parental filtering. Upstream 12.2 returns null for all of
+    /// them. A surviving bare unrated marker stays unrated (`NR` would otherwise
+    /// hit Slovakia's `NR` = 0 and turn an unrated item all-ages).
+    #[rstest]
+    #[case("PG/", Some((10, Some(0))))]
+    #[case(" / PG", Some((10, Some(0))))]
+    #[case("PG / ", Some((10, Some(0))))]
+    #[case("US:PG/", Some((10, Some(0))))]
+    #[case("NR/", None)]
+    #[case(" / NR", None)]
+    #[case("unrated / ", None)]
+    fn a_list_with_one_surviving_part_looks_that_part_up(
+        #[case] rating: &str,
+        #[case] expected: Option<(i32, Option<i32>)>,
+    ) {
+        assert_eq!(score_on_server(rating, "US"), expected);
+    }
+
+    /// Upstream `GetParentalRatings_Default_Success` and
+    /// `GetParentalRatings_ConfiguredCountryCode_Success` (`:157-189`).
+    #[rstest]
+    #[case("US", 56, "TV-MA", 17)]
+    #[case("DE", 34, "FSK-12", 12)]
+    fn get_parental_ratings_for_the_configured_country(
+        #[case] country: &str,
+        #[case] count: usize,
+        #[case] name: &str,
+        #[case] score: i32,
+    ) {
+        let ratings = shipped(country).get_parental_ratings();
+        assert_eq!(ratings.len(), count);
+        let rating = ratings
+            .iter()
+            .find(|r| r.name == name)
+            .expect("rating listed");
+        assert_eq!(rating.rating_score.map(|s| s.score), Some(score));
+    }
+
+    /// The vendored rating resources are Jellyfin v12.2's (`ca0f16eb7c`): 45
+    /// files, 44 systems (`gb.json` and `uk.json` both declare `GB`), none
+    /// empty, `0-PREFER` first in the fallback walk. The files are
+    /// byte-compared against `v12.2` when re-vendored; the entries below exist
+    /// only in the 12.2 (or 12.1) versions of their files.
+    #[test]
+    fn every_vendored_rating_table_matches_jellyfin_12_2() {
+        assert_eq!(parental_ratings::TABLES.len(), 45);
+        assert_eq!(PARENTAL_RATINGS.len(), 44);
         assert_eq!(
-            LocalizationManager::new(country).get_rating_score(rating, None),
-            Some(ParentalRatingScore::new(score, subscore))
+            PARENTAL_RATINGS.keys().next().map(String::as_str),
+            Some("0-PREFER")
+        );
+        for (country, json) in parental_ratings::TABLES {
+            let table = load_rating_table(json);
+            assert!(!table.ordered.is_empty(), "{country} parses with ratings");
+            assert_eq!(
+                PARENTAL_RATINGS[*country].by_name.len(),
+                table.by_name.len(),
+                "{country}"
+            );
+        }
+        for (country, rating, score) in [
+            ("AR", "SAM 13", 13),
+            ("AU", "X 18+", 1000),
+            ("DE", "ab 18", 18),
+            ("FR", "\u{2013}12", 12),
+            ("ID", "D18+", 18),
+            ("IT", "VM14", 14),
+        ] {
+            assert_eq!(
+                parental_ratings_for(country)
+                    .and_then(|t| t.by_name.get(&rating_key(rating)))
+                    .map(|s| s.score),
+                Some(score),
+                "{country} {rating}"
+            );
+        }
+    }
+
+    /// Upstream `GetLocalizedString_*` (`:486-566`): en-US keys, an unknown
+    /// key, an unknown culture's en-US fallback, and BCP-47 spellings of
+    /// underscore resources (`es-419`, `he-IL`).
+    #[rstest]
+    #[case("Default", "", "Default")]
+    #[case("HeaderLiveTV", "", "Live TV")]
+    #[case(
+        "SuperInvalidTranslationKeyThatWillNeverBeAdded",
+        "",
+        "SuperInvalidTranslationKeyThatWillNeverBeAdded"
+    )]
+    #[case("Artists", "zz", "Artists")]
+    #[case("Books", "he-IL", "ספרים")]
+    fn get_localized_string_cases(
+        #[case] phrase: &str,
+        #[case] culture: &str,
+        #[case] expected: &str,
+    ) {
+        let manager = LocalizationManager::default().with_ui_culture("en-US");
+        assert_eq!(manager.get_localized_string_for(phrase, culture), expected);
+        assert_ne!(
+            manager.get_localized_string_for("Default", "es-419"),
+            "Default"
+        );
+    }
+
+    /// Upstream `FindLanguageInfo_Valid_Success` (`:81-102`),
+    /// `TryGetISO6392TFromB_Success` (`:57-79`) and the language display-name
+    /// theories (`:123-155`).
+    #[rstest]
+    #[case("de")]
+    #[case("deu")]
+    #[case("ger")]
+    #[case("german")]
+    fn find_language_info_valid(#[case] identifier: &str) {
+        let m = LocalizationManager::default();
+        let german = m.find_language_info(identifier).expect("German");
+        assert_eq!(
+            german.three_letter_iso_language_name.as_deref(),
+            Some("deu")
+        );
+        assert_eq!(german.display_name, "German");
+        assert_eq!(german.name, "German");
+        assert!(
+            german
+                .three_letter_iso_language_names
+                .iter()
+                .any(|n| n == "deu")
+        );
+        assert!(
+            german
+                .three_letter_iso_language_names
+                .iter()
+                .any(|n| n == "ger")
+        );
+        assert_eq!(m.try_get_iso6392_t_from_b("ger").as_deref(), Some("deu"));
+        assert_eq!(m.try_get_iso6392_t_from_b("chi").as_deref(), Some("zho"));
+        assert_eq!(m.try_get_iso6392_t_from_b("eng"), None);
+    }
+
+    #[rstest]
+    #[case("ell", Some("Greek"))] // Comma truncation
+    #[case("nld", Some("Dutch"))] // Semicolon truncation
+    #[case("ron", Some("Romanian"))] // Semicolon truncation, multiple
+    #[case("eng", Some("English"))] // No truncation
+    #[case("zh-CN", Some("Chinese (Simplified)"))] // No truncation, with parentheses
+    #[case("", None)]
+    #[case("xyz", None)]
+    fn get_language_display_name_cases(#[case] language: &str, #[case] expected: Option<&str>) {
+        assert_eq!(
+            LocalizationManager::default()
+                .get_language_display_name(language)
+                .as_deref(),
+            expected
         );
     }
 
@@ -1474,7 +2000,7 @@ mod tests {
         assert_eq!(manager.get_rating_score("PG", None).unwrap().score, 10);
         *country.write().unwrap() = "DE".into();
         let ratings = manager.get_parental_ratings();
-        assert_eq!(ratings.len(), 24);
+        assert_eq!(ratings.len(), 34);
         assert_eq!(
             ratings.iter().find(|r| r.name == "FSK-12").unwrap().value,
             Some(12)
