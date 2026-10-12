@@ -77,6 +77,11 @@ pub struct FerrofinTrickplayManager {
     image_encoder: Arc<dyn ImageEncoder>,
     live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
     virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
+    /// Bounds how many item widths extract and tile at once, across scans and
+    /// the scheduled task.
+    /// Upstream holds a lock of 1 (`TrickplayManager._resourcePool`); Ferrofin
+    /// sizes it from `FERROFIN_TRICKPLAY_CONCURRENCY` instead.
+    generation_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -179,7 +184,18 @@ impl FerrofinTrickplayManager {
             image_encoder,
             live_tv: None,
             virtual_folders: Arc::new(std::sync::OnceLock::new()),
+            generation_slots: Arc::new(tokio::sync::Semaphore::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )),
         }
+    }
+
+    /// Caps how many trickplay generations (one item width each) run at once.
+    /// Unset, only the frame extractor's shared image-encoding pool bounds them.
+    #[must_use]
+    pub fn with_generation_concurrency(mut self, slots: usize) -> Self {
+        self.generation_slots = Arc::new(tokio::sync::Semaphore::new(slots.max(1)));
+        self
     }
 
     /// Connects the live library-options reader before the server starts.
@@ -377,6 +393,11 @@ impl FerrofinTrickplayManager {
         }
 
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
+        let _slot = self
+            .generation_slots
+            .acquire()
+            .await
+            .map_err(ServiceError::backend_source)?;
         tracing::info!(
             width = actual_width,
             path = ctx.media_path,
@@ -2598,6 +2619,45 @@ mod tests {
             Some((10_000, 200)),
             "no fresh probe still carries persisted stream dimensions"
         );
+    }
+
+    #[tokio::test]
+    async fn generation_concurrency_holds_a_second_item_until_a_slot_frees() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(2, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        seed_video(&db, &r, first, Some(HOUR_TICKS), None).await;
+        seed_video(&db, &r, second, Some(HOUR_TICKS), None).await;
+        let manager = r.mgr.clone().with_generation_concurrency(1);
+        let refresh = |item| {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .refresh_trickplay_data(item, false, &extraction_on())
+                    .await
+            })
+        };
+        let (a, b) = (refresh(first), refresh(second));
+
+        entered.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered.notified())
+                .await
+                .is_err(),
+            "the second extraction waits for the single slot"
+        );
+        assert_eq!(r.extractor.calls(), 1);
+
+        release.notify_one();
+        entered.notified().await;
+        release.notify_one();
+        a.await.unwrap().expect("first refresh");
+        b.await.unwrap().expect("second refresh");
+        assert_eq!(r.extractor.calls(), 2);
     }
 
     #[tokio::test]

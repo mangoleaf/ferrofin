@@ -53,6 +53,12 @@ release changes what a refresh does once it runs:
 - WASM plugins that supply metadata run at their place in the library's order, and an
   `album.nfo` or `artist.nfo` now wins over every remote provider:
   [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
+- In a library with **Extract trickplay images during the library scan** checked, a scan
+  generates trickplay images several at a time, up to the image-encoding limit (one per
+  CPU unless **Parallel image encoding limit** is set). Jellyfin generates one at a time.
+  Each is an ffmpeg process with its own memory and, with hardware acceleration, its own
+  GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). `FERROFIN_TRICKPLAY_CONCURRENCY` caps it (a new setting, default `auto`; `1`
+  matches Jellyfin; see [`CONFIG.md`](CONFIG.md)).
 
 Apart from scans, deleting an item now deletes its files, and who may delete one follows
 Jellyfin's rules:

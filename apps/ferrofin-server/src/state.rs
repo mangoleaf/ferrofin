@@ -856,7 +856,11 @@ pub async fn build_app_state(
             ),
             Arc::new(ImageCrateEncoder::new()),
         )
-        .with_live_tv(&live_tv),
+        .with_live_tv(&live_tv)
+        .with_generation_concurrency(trickplay_concurrency(
+            config.trickplay_concurrency,
+            image_encoding_limit,
+        )),
     );
     let trickplay: Arc<dyn ferrofin_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
 
@@ -2580,6 +2584,24 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     }
 }
 
+/// `FERROFIN_TRICKPLAY_CONCURRENCY` against its auto value, the image-encoding
+/// pool size that already bounds trickplay's ffmpeg processes: unset (auto, or
+/// zero/negative) and anything above it resolve to it.
+fn trickplay_concurrency(configured: Option<u32>, auto: usize) -> usize {
+    match configured.and_then(|n| usize::try_from(n).ok()) {
+        Some(n) if n <= auto => n,
+        Some(n) => {
+            tracing::warn!(
+                configured = n,
+                auto,
+                "trickplay concurrency is above the image-encoding limit; using auto"
+            );
+            auto
+        }
+        None => auto,
+    }
+}
+
 /// C# ImageProcessor / MediaEncoder constructor rule: nonpositive means CPU count.
 fn parallel_image_encoding_limit(setting: i32, processors: u32) -> usize {
     usize::try_from(setting)
@@ -2802,6 +2824,18 @@ mod tests {
         for (setting, cores, expected) in [(-1, 8, 8), (0, 4, 4), (0, 1, 1), (1, 8, 1), (20, 2, 20)]
         {
             assert_eq!(parallel_image_encoding_limit(setting, cores), expected);
+        }
+    }
+
+    #[test]
+    fn trickplay_concurrency_falls_back_to_the_image_encoding_limit() {
+        for (configured, auto, expected) in [
+            (None, 8, 8),
+            (Some(1), 8, 1),
+            (Some(8), 8, 8),
+            (Some(20), 8, 8),
+        ] {
+            assert_eq!(trickplay_concurrency(configured, auto), expected);
         }
     }
 

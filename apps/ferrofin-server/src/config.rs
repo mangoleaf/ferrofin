@@ -134,6 +134,7 @@ struct FileConfig {
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
+    trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
@@ -158,6 +159,18 @@ enum DbPoolFileValue {
     /// An explicit connection count (`db_pool = 16`).
     Count(u32),
     /// A sizing mode by name — only `"auto"` is valid (`db_pool = "auto"`).
+    Mode(String),
+}
+
+/// A `config.toml` value that is an integer or the literal string `"auto"`.
+/// Unlike [`DbPoolFileValue`] the integer is signed: zero and negative values
+/// are accepted and mean `auto`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CountOrAuto {
+    /// An explicit count (`trickplay_concurrency = 2`).
+    Count(i64),
+    /// A mode by name — only `"auto"` is valid (`trickplay_concurrency = "auto"`).
     Mode(String),
 }
 
@@ -399,6 +412,16 @@ pub struct Config {
     /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
     /// `config.toml` > default.
     pub scan_probe_concurrency: Option<u32>,
+
+    /// How many trickplay generations (one item width each, an ffmpeg frame
+    /// extraction plus tile packing) run at once. A library scan runs several;
+    /// the scheduled task runs one but shares the cap. `None` = `auto`: as many as the shared image-encoding
+    /// pool allows (`ParallelImageEncodingLimit`, else the usable cores).
+    /// Jellyfin runs one at a time; `1` restores that. Zero, negative, and
+    /// values above the auto value also mean auto (applied in `state.rs`).
+    /// Resolved `FERROFIN_TRICKPLAY_CONCURRENCY` env (integer or `auto`) >
+    /// `trickplay_concurrency` in `config.toml` (integer or `"auto"`) > auto.
+    pub trickplay_concurrency: Option<u32>,
 
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
@@ -683,6 +706,7 @@ impl Config {
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
                 .or(file.scan_probe_concurrency),
+            trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
             wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
@@ -815,6 +839,7 @@ impl Config {
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
+            trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
@@ -881,6 +906,40 @@ fn resolve_db_pool(env: &dyn Env, file: Option<DbPoolFileValue>) -> anyhow::Resu
         Some(DbPoolFileValue::Mode(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
         Some(DbPoolFileValue::Mode(s)) => Err(anyhow::anyhow!(
             "invalid db_pool `{s}` in config.toml: expected an integer or \"auto\""
+        )),
+    }
+}
+
+/// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
+/// (integer or `auto`) > `trickplay_concurrency` in `config.toml` (integer or
+/// `"auto"`) > `None` (auto). Zero and negative integers are `auto`; anything
+/// that is neither an integer nor `auto` is an error, so a typo is noticed.
+fn resolve_trickplay_concurrency(
+    env: &dyn Env,
+    file: Option<CountOrAuto>,
+) -> anyhow::Result<Option<u32>> {
+    // Huge values saturate; state.rs caps every value at the auto value anyway.
+    let positive = |n: i64| (n > 0).then(|| u32::try_from(n).unwrap_or(u32::MAX));
+    if let Some(raw) = env
+        .var("FERROFIN_TRICKPLAY_CONCURRENCY")
+        .filter(|s| !s.is_empty())
+    {
+        if raw.eq_ignore_ascii_case("auto") {
+            return Ok(None);
+        }
+        let n: i64 = raw.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid FERROFIN_TRICKPLAY_CONCURRENCY `{raw}`: expected an integer or `auto`"
+            )
+        })?;
+        return Ok(positive(n));
+    }
+    match file {
+        None => Ok(None),
+        Some(CountOrAuto::Count(n)) => Ok(positive(n)),
+        Some(CountOrAuto::Mode(s)) if s.eq_ignore_ascii_case("auto") => Ok(None),
+        Some(CountOrAuto::Mode(s)) => Err(anyhow::anyhow!(
+            "invalid trickplay_concurrency `{s}` in config.toml: expected an integer or \"auto\""
         )),
     }
 }
@@ -1420,6 +1479,51 @@ mod tests {
         };
         let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
         assert!(err.to_string().contains("at least one connection"));
+    }
+
+    #[test]
+    fn trickplay_concurrency_resolves_integers_auto_and_garbage() {
+        let resolve =
+            |env: FakeEnv| Config::load_from(Cli::default(), &env).map(|c| c.trickplay_concurrency);
+        let env = |v: &str| FakeEnv::new().with("FERROFIN_TRICKPLAY_CONCURRENCY", v);
+        assert_eq!(resolve(FakeEnv::new()).unwrap(), None, "unset is auto");
+        assert_eq!(resolve(env("auto")).unwrap(), None);
+        assert_eq!(resolve(env("AUTO")).unwrap(), None);
+        assert_eq!(resolve(env("")).unwrap(), None, "empty is unset");
+        assert_eq!(resolve(env("0")).unwrap(), None, "zero is auto");
+        assert_eq!(resolve(env("-3")).unwrap(), None, "negative is auto");
+        assert_eq!(resolve(env("2")).unwrap(), Some(2));
+        let err = resolve(env("lots")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid FERROFIN_TRICKPLAY_CONCURRENCY")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let file = |body: &str| {
+            std::fs::write(&toml, body).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            Config::load_from(cli, &FakeEnv::new()).map(|c| c.trickplay_concurrency)
+        };
+        assert_eq!(file("trickplay_concurrency = 3\n").unwrap(), Some(3));
+        assert_eq!(file("trickplay_concurrency = \"auto\"\n").unwrap(), None);
+        assert_eq!(file("trickplay_concurrency = 0\n").unwrap(), None);
+        assert_eq!(file("trickplay_concurrency = -1\n").unwrap(), None);
+        let err = file("trickplay_concurrency = \"many\"\n").unwrap_err();
+        assert!(err.to_string().contains("invalid trickplay_concurrency"));
+
+        // Env beats the file.
+        std::fs::write(&toml, "trickplay_concurrency = 3\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env("auto")).unwrap();
+        assert_eq!(cfg.trickplay_concurrency, None);
     }
 
     #[test]

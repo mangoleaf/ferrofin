@@ -160,6 +160,10 @@ ferrofin:
     # How many ffprobe processes a library scan runs at once (default: 8, capped
     # at the core count). Lower it for libraries on NFS or spinning disks.
     # FERROFIN_SCAN_PROBE_CONCURRENCY: "4"
+    # How many trickplay images are generated at once (default: auto, up to the
+    # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
+    # hardware acceleration holds GPU memory; "1" matches Jellyfin.
+    # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
     # How long TheTVDB lookups (episode ids, a series' season list) are reused,
     # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
     # FERROFIN_TVDB_CACHE_HOURS: "1"
