@@ -26,10 +26,11 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 ## Why Ferrofin
 
-- **Faster, and a fraction of the memory.** On the same machine and library, Ferrofin
-  renders the home screen **3.4× faster** than Jellyfin 12.0-rc7, cold-starts **15.8×
-  faster**, and sits at **61 MiB idle against 409 MiB** (6.7× lighter), with peak memory
-  under load 3.8× lower. Numbers, method and caveats are in [Benchmarks](#benchmarks).
+- **Faster movie browsing, lower memory.** Across three runs on the same machine and
+  fixture, Ferrofin's movie-screen HTTP workload had **13 ms median latency against
+  37 ms** for Jellyfin 12.0.0, and steady idle memory was **152 MiB against 423 MiB**.
+  Other screen comparisons remain withheld where response validation differs.
+  Results, ranges and limitations are in [Benchmarks](#benchmarks).
 - **One binary, no runtime.** A single `ferrofin-server` executable plus ffmpeg. No .NET
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
@@ -68,35 +69,47 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 ## Benchmarks
 
 <!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
-     python3 bench/report.py --readme README.md bench/runs/v1.0.0 bench/runs/v1.0.0-run2 bench/runs/v1.0.0-run3 -->
-Ferrofin `v1.0.0` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
+     python3 bench/report.py --readme README.md bench/runs/quiet-cpu-comparison-current bench/runs/quiet-cpu-comparison-run2 bench/runs/quiet-cpu-comparison-run3 -->
+Ferrofin `quiet-cpu-comparison-current` against **Jellyfin 12.0.0** and **Jellyfin 10.11.8**, measured 2026-09-17 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 logical CPUs with an 8 GiB limit, over a fixture of 3001 movies, 250 series and 7490 episodes. Published figures are medians across 3 selected runs; incomplete or non-comparable cells are withheld.
+No measured request failed in the recorded load windows (unloaded, loaded, stress).
 
-The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that screen, replayed at 5 screens per second (the "loaded" level). Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0-rc7.
+The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, replayed at 5 screens per second (the "loaded" level). They include API and poster requests, not browser rendering. Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0.0.
 
-| | Jellyfin 12.0-rc7 | Jellyfin 10.11.8 | **Ferrofin** | Ferrofin vs 12.0-rc7 |
+| | Jellyfin 12.0.0 | Jellyfin 10.11.8 | **Ferrofin** | Ferrofin vs 12.0.0 |
 |---|---|---|---|---|
-| **home** screen | 44 / 51 / 57 | 64 / 73 / 77 | **13 / 16 / 19** | **3.4× faster** |
-| **movies** screen | 38 / 43 / 47 | 24 / 28 / 31 | **25 / 30 / 32** | **1.5× faster** |
-| **detail** screen | 98 / 161 / 165 | 20 / 29 / 33 | **9 / 12 / 13** | **10.9× faster** ⚠[1] |
-| **series** screen | 97 / 101 / 224 | 18 / 21 / 27 | **8 / 10 / 11** | **12.1× faster** |
-| **search** screen | 70 / 234 / 255 | 98 / 121 / 184 | **26 / 36 / 42** | **2.7× faster** |
-| **playback** screen | 31 / 37 / 55 | 5 / 20 / 33 | **10 / 13 / 45** | **3.1× faster** ⚠[2] |
-| cold start (restart → home screen) | 2746 ms | 2162 ms | **174 ms** | **15.8× faster** |
-| direct-play TTFB (1 MiB range) | 4.61 ms | 1.01 ms | **0.48 ms** | **9.6× faster** |
-| peak under load memory | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
-| steady idle memory | 409 MiB | 356 MiB | **61.4 MiB** | **6.7× lighter** |
+| **home** screen | 45 / 48 / 52 | — ⚠[1] | **— ⚠[2]** | **—** |
+| **movies** screen | 37 / 41 / 44 | 23 / 27 / 29 | **13 / 16 / 17** | **2.8× faster** |
+| **detail** screen | 39 / 42 / 44 | — ⚠[3] | **— ⚠[4]** | **—** |
+| **series** screen | 30 / 32 / 34 | — ⚠[5] | **— ⚠[6]** | **—** |
+| **search** screen | 58 / 65 / 82 | — ⚠[7] | **— ⚠[7]** | **—** |
+| **playback** screen | 31 / 34 / 45 | — ⚠[8] | **— ⚠[8]** | **—** |
+| cold start (restart → authenticated views; host caches retained) | 2143 ms | 2079 ms | **244 ms** | **8.8× faster** |
+| direct-play TTFB (1 MiB range) | 4.31 ms | 1.07 ms | **0.52 ms** | **8.3× faster** |
+| peak under load memory | 571 MiB | 672 MiB | **202 MiB** | **2.8× lighter** |
+| steady idle memory | 423 MiB | 481 MiB | **152 MiB** | **2.8× lighter** |
 
-Per endpoint, same level and runs, Ferrofin is faster than Jellyfin 12.0-rc7 on all 28 compared requests, from 1.1× (`movies:items`) to 20.7× (`home:resume-book`); the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Among 22 comparable endpoint measurements at this level, Ferrofin is faster on 22, about the same on 0, and slower on 0 against Jellyfin 12.0.0. Flagged or missing endpoints are excluded from these counts. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather than a like-for-like result:
+⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. Raw diagnostic numbers remain in the full report.
 
-1. detail: detail:item: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal, MediaStreams[].IsOriginal (+1 more)
-2. playback: playback:playbackinfo: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal
+1. Jellyfin 10.11.8: home: home:latest-music: ids differs for a request pick
+2. Ferrofin: home: home:latest-shows: ids differs for a request pick
+3. Jellyfin 10.11.8: detail: detail:image: request picks differ; measured request selections differ from validated slot
+4. Ferrofin: detail: detail:image: request picks differ
+5. Jellyfin 10.11.8: series: series:episodes: per-item fields/types differ for a request pick
+6. Ferrofin: series: series:similar: ids differs for a request pick
+7. Jellyfin 10.11.8: search, Ferrofin: search: search:artists: ids differs for a request pick
+8. Jellyfin 10.11.8: playback, Ferrofin: playback: playback:playbackinfo: per-item fields/types differ for a request pick
 
-Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.
-
-How steady are these numbers? Across the 3 runs, 3 of the 102 medians in the loaded-level tables moved by more than 15 % of their value, against 68 of the 204 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
+How steady are these numbers? Across the 3 runs, 5 of the 117 medians in the loaded-level tables moved by more than 15 % of their value, against 85 of the 234 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
 <!-- END GENERATED BENCHMARKS -->
+
+The measured server source is commit `9c17abad`; the run name above identifies the
+local result set, not a release. CPU observations and the retained cold-start range
+(240–1087 ms across Ferrofin's run medians) are in [the full results](docs/BENCHMARKS.md).
+Whole-workload CPU savings claims remain withheld while response/work differences are
+unresolved. The host passed the normal idle checks, but sampled interference remained.
+
 
 ## Quickstart
 

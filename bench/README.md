@@ -246,7 +246,7 @@ uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes oc
 
 The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
 retain sub-millisecond precision so catch-up observations do not collide through rounding.
-Reports compare CPU-seconds side by side for each server and repetition. A separate
+Reports compare CPU-seconds, average cores busy, percentage of allocated CPU capacity busy, and CPU milliseconds per completed mixed screen side by side for each server and repetition. Average cores busy is CPU-seconds divided by observed wall seconds; capacity busy divides that by the allocated logical CPU count. CPU per screen includes failed screens and window overhead, so savings claims require matching completed work and passing validation. CPU measurements render as tables, including the runner log, rather than JSON dumps. A separate
 coverage table shows observed duration, UTC boundaries, sample count, largest gap and
 CPU evidence validity; missing historical counters remain unavailable. CPU seconds use the two bracketing
 raw counters; they are not reconstructed from rounded utilization for archived runs.

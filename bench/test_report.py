@@ -88,6 +88,28 @@ class ReportTests(unittest.TestCase):
     def row(self, text, label='home'):
         return next(line for line in text.splitlines() if line.startswith(f'| **{label}**'))
 
+    def test_report_evidence_is_tabular_and_preserves_failures_and_missing_values(self):
+        model = self.build(self.a, self.b)
+        for server, _ in model['servers']:
+            model['phases'][server] = [
+                {'loaded': {'status': 'failed', 'reason': '<timeout>|retry', 'start': 1000, 'end': 1002}}, None]
+            model['coverage'][server] = [
+                {'slots': 600, 'requests': 8732, 'distinct_requests': 2913,
+                 'elapsed_s': 32.75, 'distinct_picks': {'detail:item': 120}},
+                {'unavailable': 'legacy workload'}]
+            model['levels']['loaded']['image_bytes'][server] = [0, None]
+        for rendered in (report.render_md(model), report.render_html(model)):
+            for expected in ('Phase outcomes', 'Shape coverage', 'Distinct requests',
+                             'detail:item: 120', 'legacy workload', 'no phase evidence',
+                             '2.000', 'Image response bytes', 'unavailable'):
+                self.assertIn(expected, rendered)
+            for serialized_key in ('"distinct_picks"', '"status"', '"elapsed_s"', "{'movies':"):
+                self.assertNotIn(serialized_key, rendered)
+            self.assertNotIn('<pre>', rendered)
+        self.assertIn('&lt;timeout&gt;|retry', report.render_html(model))
+        self.assertIn('<timeout>\\|retry', report.render_md(model))
+        self.assertIn('| 1 | Ferrofin | 0 |', report.image_table(model, 'loaded'))
+
     def test_cpu_tables_compare_servers_and_preserve_every_repetition(self):
         model = self.build(self.a, self.b)
         for n, (server, _) in enumerate(model['servers']):
@@ -106,6 +128,29 @@ class ReportTests(unittest.TestCase):
                 self.assertIn(expected, section)
             self.assertNotIn('cpu_seconds', section)
             self.assertNotIn('<pre>', section)
+
+    def test_cpu_utilization_and_completed_screen_cost(self):
+        model = self.build()
+        model['meta']['server_cpus'] = '8-15'
+        for server, _ in model['servers']:
+            model['resources'][server] = [{'loaded': {'cpu_seconds': 24,
+                'observed_start': 1000, 'observed_end': 1120, 'samples': 1202}}]
+            path = Path(model['runs'][0]) / server / 'k6-loaded.json'
+            summary = json.loads(path.read_text())
+            summary['iterations'] = 600
+            self.write(path, summary)
+        tables = {title: dict(rows) for title, rows in report.cpu_tables(model)}
+        for server, _ in model['servers']:
+            self.assertEqual(tables['Average CPU cores busy']['loaded · run 1'][server], '0.200')
+            self.assertEqual(tables['Allocated CPU capacity busy (%)']['loaded · run 1'][server], '2.50%')
+            self.assertEqual(tables['CPU milliseconds per completed screen']['loaded · run 1'][server], '40.000')
+        model['resources']['ferrofin'][0]['loaded']['cpu_seconds'] = 12
+        rows = dict(dict(report.cpu_tables(model))['CPU per screen comparison (validated workloads only)'])
+        key = next(k for k in rows if 'vs Jellyfin 12' in k)
+        self.assertEqual(rows[key]['ferrofin'], '50.0% less CPU per screen')
+        model['levels']['loaded']['screens'][0][1]['ferrofin'].flag = 'different work'
+        rows = dict(dict(report.cpu_tables(model))['CPU per screen comparison (validated workloads only)'])
+        self.assertEqual(rows[key]['ferrofin'], 'withheld — validation flags')
 
     def test_cpu_table_retains_failed_sampler_and_escapes_reason(self):
         model = self.build()

@@ -859,14 +859,14 @@ def build(runs):
 
 def cpu_tables(m):
     """Keep each repetition and its resource validity visible, including missing data."""
-    cpu, coverage = [], []
+    cpu, busy, capacity, per_screen, comparison, coverage = [], [], [], [], [], []
     for i, _ in enumerate(m["runs"]):
         for window in (*LOAD_LEVELS, "steady"):
             records = {k: m["resources"][k][i].get(window, {}) for k, _ in m["servers"]}
             if not any(records.values()):
                 continue
             label = f"{window} · run {i + 1}"
-            values, details = {}, {}
+            values, details, cores, shares, costs, numeric_costs, validity = {}, {}, {}, {}, {}, {}, {}
             for k, _ in m["servers"]:
                 r = records[k]
                 phases = m["phases"][k][i] or {}
@@ -877,6 +877,24 @@ def cpu_tables(m):
                 seconds = r.get("cpu_seconds")
                 values[k] = (f"{seconds:.3f}" if number(seconds) else "unavailable") + (" ⚠" if problem else "")
                 start, end = r.get("observed_start"), r.get("observed_end")
+                duration = end - start if number(start) and number(end) and end > start else None
+                mean = seconds / duration if number(seconds) and duration else None
+                cpuset = str(m["meta"].get("server_cpus", ""))
+                try:
+                    count = len({cpu for part in cpuset.split(",") for cpu in range(int(part.split("-")[0]), int(part.split("-")[-1]) + 1)})
+                except ValueError:
+                    count = 0
+                suffix = " ⚠" if problem else ""
+                cores[k] = f"{mean:.3f}" + suffix if mean is not None else "unavailable"
+                shares[k] = f"{100 * mean / count:.2f}%" + suffix if mean is not None and count else "unavailable"
+                summary = load(os.path.join(m["runs"][i], k, f"k6-{window}.json")) or {}
+                completed = summary.get("iterations")
+                work_flags = [cell[k].flag for _, cell in m.get("levels", {}).get(window, {}).get("screens", []) if k in cell and cell[k].flag]
+                validity[k] = reasons(problem, *work_flags)
+                numeric_costs[k] = seconds / completed if number(seconds) and number(completed) and completed > 0 else None
+                costs[k] = f"{seconds * 1000 / completed:.3f}" + suffix if number(seconds) and number(completed) and completed > 0 else "unavailable"
+                if work_flags:
+                    costs[k] += " ⚠ workload validation failed"
                 stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
                 details[k] = {
                     "Observed duration (s)": f"{end-start:.3f}" if number(start) and number(end) else "unavailable",
@@ -887,9 +905,87 @@ def cpu_tables(m):
                     "CPU evidence": "⚠ " + problem if problem else ("available" if number(seconds) else "unavailable — no cumulative CPU counters"),
                 }
             cpu.append((label, values))
+            busy.append((label, cores))
+            capacity.append((label, shares))
+            if window != "steady":
+                per_screen.append((label, costs))
+                for reference, reference_label in m["servers"]:
+                    if reference == "ferrofin":
+                        continue
+                    base = numeric_costs.get(reference)
+                    ratios = {}
+                    for k, _ in m["servers"]:
+                        value = numeric_costs.get(k)
+                        if k == reference:
+                            ratios[k] = "reference"
+                        elif validity.get(k) or validity.get(reference):
+                            ratios[k] = "withheld — validation flags"
+                        elif value is None or base is None or base <= 0:
+                            ratios[k] = "unavailable"
+                        else:
+                            difference = 100 * (value / base - 1)
+                            ratios[k] = f"{abs(difference):.1f}% {'less' if difference < 0 else 'more'} CPU per screen"
+                    comparison.append((f"{label} · vs {reference_label}", ratios))
             for metric in next(iter(details.values())):
                 coverage.append((f"{label} · {metric}", {k: d[metric] for k, d in details.items()}))
-    return [("CPU consumption (CPU-seconds)", cpu), ("CPU sample coverage", coverage)]
+    return [("CPU consumption (CPU-seconds)", cpu),
+            ("Average CPU cores busy", busy),
+            ("Allocated CPU capacity busy (%)", capacity),
+            ("CPU milliseconds per completed screen", per_screen),
+            ("CPU per screen comparison (validated workloads only)", comparison),
+            ("CPU sample coverage", coverage)]
+
+
+def diagnostic_table(title, headers, rows, as_html=False):
+    """Render evidence as labelled cells, never as serialized Python/JSON objects."""
+    if as_html:
+        head = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
+        body = "".join("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in row) + "</tr>" for row in rows)
+        table = f"<div class='scroll'><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+        return f"<h2>{html.escape(title)}</h2><details><summary>Show evidence</summary>{table}</details>"
+    escape = lambda v: str(v).replace("|", "\\|").replace("\n", " ")
+    lines = [f"### {title}\n", "| " + " | ".join(map(escape, headers)) + " |",
+             "|" + "---|" * len(headers)]
+    lines += ["| " + " | ".join(map(escape, row)) + " |" for row in rows]
+    return "\n".join(lines) + "\n"
+
+
+def image_table(m, level, as_html=False):
+    rows = [[i + 1, label, values[i] if i < len(values) and values[i] is not None else "unavailable"]
+            for i in range(len(m["runs"])) for k, label in m["servers"]
+            for values in [m["levels"][level]["image_bytes"][k]]]
+    return diagnostic_table(f"Image response bytes — {level} (diagnostic)",
+                            ["Run", "Server", "Bytes"], rows, as_html)
+
+
+def coverage_table(m, as_html=False):
+    rows = []
+    for i in range(len(m["runs"])):
+        for k, label in m["servers"]:
+            r = m["coverage"][k][i] or {}
+            picks = "; ".join(f"{name}: {count}" for name, count in sorted(r.get("distinct_picks", {}).items()))
+            rows.append([i + 1, label, *(r.get(key, "unavailable") for key in
+                         ("slots", "requests", "distinct_requests", "elapsed_s")),
+                         picks or "unavailable", r.get("unavailable") or "available"])
+    return diagnostic_table("Shape coverage", ["Run", "Server", "Slots", "Requests",
+                            "Distinct requests", "Duration (s)", "Distinct picks", "Evidence"], rows, as_html)
+
+
+def phase_table(m, as_html=False):
+    rows = []
+    stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
+    for i in range(len(m["runs"])):
+        for k, label in m["servers"]:
+            phases = m["phases"][k][i] or {}
+            if not phases:
+                rows.append([i + 1, label, "unavailable", "unavailable", "unavailable", "unavailable", "unavailable", "no phase evidence"])
+            for name, r in phases.items():
+                start, end = r.get("start"), r.get("end")
+                duration = f"{end-start:.3f}" if number(start) and number(end) and end >= start else "unavailable"
+                rows.append([i + 1, label, name, r.get("status", "unavailable"), duration,
+                             stamp(start), stamp(end), r.get("reason") or "—"])
+    return diagnostic_table("Phase outcomes", ["Run", "Server", "Phase", "Status", "Duration (s)",
+                            "Start (UTC)", "End (UTC)", "Reason"], rows, as_html)
 
 
 # ── markdown (the README tables) ────────────────────────────────────────────
@@ -900,7 +996,7 @@ def render_md(m):
     p = out.append
     p(f"## Ferrofin vs Jellyfin — {len(m['runs'])} run(s), commit {meta.get('sha', '?')}, {meta.get('date', '')[:10]}")
     p(f"Host {meta.get('cpu', '?')} · server on cpus {meta.get('server_cpus', '?')} · {meta.get('memory_limit', '?')} limit · "
-      f"test data {meta.get('testdata_counts', {})} · windows {meta.get('window_s', '?')} s · "
+      f"test data {', '.join(f'{count} {name}' for name, count in meta.get('testdata_counts', {}).items())} · windows {meta.get('window_s', '?')} s · "
       + " · ".join(f"{lvl} {m['levels'][lvl]['rate']} screens/s" for lvl in LOAD_LEVELS if lvl in m["levels"]))
     p("Cells are the median across runs"
       + ("; where the runs disagreed, the range they spanned follows in brackets" if len(m["runs"]) > 1 else "")
@@ -924,12 +1020,11 @@ def render_md(m):
                 md_cell(cells[k], notes, f"{lbl} · {name} ({level} endpoints)",
                         cells.get(ORACLE) if k != ORACLE else None) for k, lbl in servers) + " |")
         p("")
-        p("Image response bytes (diagnostic, per run): " + "; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers) + "\n")
-    for k, coverage in m["coverage"].items():
-        p(f"Shape coverage — {dict(servers)[k]}: `{json.dumps(coverage)}`\n")
+        p(image_table(m, level))
+    p(coverage_table(m))
     p("### CPU and sample coverage — invocation and idle windows\n")
     p("CPU seconds use cumulative counters at the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable.\n")
-    p("Each row retains its individual run; these are diagnostic observations, not speedup claims. See the latency/work flags for differences in executed work.\n")
+    p("Average cores busy is CPU-seconds divided by observed wall seconds; 1.0 means one core fully occupied. Capacity busy divides that by the allocated logical CPU count. CPU milliseconds per completed screen divides total window CPU by completed mixed-screen iterations, including failed screens; it is not per-endpoint attribution. Lower values mean less CPU work only when completed work and validation agree. Each row retains its individual run; flagged workloads cannot support CPU savings claims. See the latency/work flags for differences in executed work.\n")
     for title, rows in cpu_tables(m):
         p(f"#### {title}\n")
         p("| Window / metric | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
@@ -937,9 +1032,7 @@ def render_md(m):
             escape = lambda value: str(value).replace("|", "\\|").replace("\n", " ")
             p("| " + escape(label) + " | " + " | ".join(escape(cells[k]) for k, _ in servers) + " |")
         p("")
-    p("### Phase outcomes\n")
-    for k, phases in m["phases"].items():
-        p(f"**{dict(servers)[k]}**: `{json.dumps(phases)}`\n")
+    p(phase_table(m))
     p("### Time to first screen\n")
     p("| | " + " | ".join(label for _, label in servers) + " |\n|" + "---|" * (len(servers) + 1))
     for name, cells in m["ttfs"]:
@@ -1425,20 +1518,20 @@ def render_html(m, base=None, picker=""):
         bl = base_l.get(level, {})
         parts.append(table_html("screen", lv["screens"], servers, dict(bl.get("screens", [])), notes, f"{level} screens"))
         parts.append(f"<details><summary>Per endpoint, {level}</summary>{table_html('endpoint', lv['endpoints'], servers, dict(bl.get('endpoints', [])), notes, f'{level} endpoints')}</details>")
-        parts.append("<p>Image response bytes (diagnostic, per run): " + e("; ".join(f"{label}: {lv['image_bytes'][k]}" for k, label in servers)) + "</p>")
-    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable. Each row retains its individual run; these are diagnostic observations, not speedup claims. See latency/work flags for differences in executed work.</p>")
+        parts.append(image_table(m, level, True))
+    parts.append("<h2>CPU and sample coverage — invocation and idle windows</h2><p>Cumulative counter differences use the reported bracketing samples; load includes setup/teardown and harness overhead, and steady is post-load idle. Missing historical counters remain unavailable. Average cores busy is CPU-seconds divided by observed wall seconds; 1.0 means one core fully occupied. Capacity busy divides that by the allocated logical CPU count. CPU milliseconds per completed screen divides total window CPU by completed mixed-screen iterations, including failed screens; it is not per-endpoint attribution. Lower values mean less CPU work only when completed work and validation agree. Each row retains its individual run; flagged workloads cannot support CPU savings claims. See latency/work flags for differences in executed work.</p>")
     for title, rows in cpu_tables(m):
         head = "".join(f"<th>{e(label)}</th>" for _, label in servers)
         body = "".join("<tr><th>" + e(label) + "</th>" + "".join(
             f"<td class='num{' flagged' if '⚠' in cells[k] else ''}'>{e(cells[k])}</td>" for k, _ in servers) + "</tr>" for label, cells in rows)
         parts.append(f"<h3>{e(title)}</h3><div class='scroll'><table><thead><tr><th>Window / metric</th>{head}</tr></thead><tbody>{body}</tbody></table></div>")
-    parts.append("<h2>Phase outcomes</h2><pre>" + e(json.dumps(m["phases"], indent=2)) + "</pre>")
+    parts.append(phase_table(m, True))
     parts.append("<h2>Time to first screen</h2>" + table_html("", m["ttfs"], servers, base_ttfs, notes, "time to first screen"))
     mem_note = "" if comparable_levels(m, base) else (
         "<p class='lede'>The baseline ran different load levels, so no change is shown on the "
         "memory rows: <em>peak under load</em> spans a different set of windows and "
         "<em>steady idle</em> follows a different one, which would read as a regression.</p>")
-    parts.append("<p>Shape coverage: " + e(json.dumps(m["coverage"])) + "</p>")
+    parts.append(coverage_table(m, True))
     parts.append(f"<h2>Memory — anon, cache excluded, {e(str(m['sample_ms']))} ms samples</h2>"
                  + mem_note + table_html("", m["memory"], servers, base_mem, notes, "memory"))
     if m["work"]:
@@ -1534,7 +1627,11 @@ def main():
     if args and args[0] == "--resource-check":
         d = args[1]
         windows = resource_windows(d, load(os.path.join(os.path.dirname(d), "run.json")) or {})
-        print("  resources: " + json.dumps(windows))
+        print("  Window       CPU-seconds   Samples   Evidence")
+        for name, row in windows.items():
+            seconds = row.get("cpu_seconds")
+            value = f"{seconds:.3f}" if number(seconds) else "unavailable"
+            print(f"  {name:<12} {value:>11} {row.get('samples', 0):>9}   {row.get('error') or 'valid'}")
         if not windows or any(r.get("error") for r in windows.values()):
             raise ValueError("resource coverage incomplete")
         return
@@ -1549,7 +1646,11 @@ def main():
         problem, _, coverage = shape_evidence(d, meta, load_shape(d))
         if problem:
             raise ValueError(problem)
-        print("  coverage: " + json.dumps(coverage))
+        for key, label in (("slots", "slots"), ("requests", "requests"),
+                           ("distinct_requests", "distinct requests"), ("elapsed_s", "seconds")):
+            print(f"  {label}: {coverage.get(key, 'unavailable')}")
+        for name, count in coverage.get("distinct_picks", {}).items():
+            print(f"    {name}: {count} distinct picks")
         shape = load_shape(d)
         if problem := oracle_failed(shape, list(shape or {}), os.path.basename(os.path.normpath(d))):
             raise ValueError(problem)
