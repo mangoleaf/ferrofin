@@ -1471,6 +1471,77 @@ async fn backup_before_rebuild(
     Ok(())
 }
 
+/// What a database file records about the migrations applied to it, as read
+/// by [`inspect_migration_history`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationHistory {
+    /// The file does not exist.
+    Missing,
+    /// The file has neither Ferrofin's `_sqlx_migrations` nor Jellyfin's
+    /// `__EFMigrationsHistory` table — an empty (0-byte) file included.
+    NoHistory,
+    /// A history table exists but records no migration.
+    Empty,
+    /// At least one applied migration is recorded.
+    Recorded,
+}
+
+/// Reads the migration history of the database file at `path` without
+/// creating, adopting or migrating it.
+///
+/// The existence check comes first because opening a missing SQLite database
+/// creates an empty file. A file that exists is opened without creating or
+/// migrating it and without changing its journal mode, and only queried — but
+/// SQLite may still checkpoint a WAL database's `-wal` file into it on close.
+/// Either history table counts: `_sqlx_migrations` for a database Ferrofin
+/// has opened, `__EFMigrationsHistory` for a Jellyfin database not yet adopted.
+///
+/// # Errors
+///
+/// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the existence check
+/// fails or the file cannot be opened or read as a SQLite database.
+pub async fn inspect_migration_history(path: &std::path::Path) -> Result<MigrationHistory> {
+    use sqlx::ConnectOptions as _;
+    if !path.try_exists().map_err(sqlx::Error::Io)? {
+        return Ok(MigrationHistory::Missing);
+    }
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .connect()
+        .await?;
+    let history = read_migration_history(&mut conn).await;
+    sqlx::Connection::close(conn).await?;
+    history
+}
+
+/// [`inspect_migration_history`] over an open connection.
+async fn read_migration_history(conn: &mut sqlx::SqliteConnection) -> Result<MigrationHistory> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('_sqlx_migrations', '__EFMigrationsHistory')",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if tables.is_empty() {
+        return Ok(MigrationHistory::NoHistory);
+    }
+    for table in &tables {
+        let count_query = if table == "_sqlx_migrations" {
+            r#"SELECT COUNT(*) FROM "_sqlx_migrations""#
+        } else {
+            r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#
+        };
+        let applied: i64 = sqlx::query_scalar(count_query)
+            .fetch_one(&mut *conn)
+            .await?;
+        if applied > 0 {
+            return Ok(MigrationHistory::Recorded);
+        }
+    }
+    Ok(MigrationHistory::Empty)
+}
+
 /// How many migrations `_sqlx_migrations` records as applied (`0` when the
 /// table does not exist yet — a fresh or Jellyfin-native database).
 #[cfg(test)]
@@ -1709,6 +1780,112 @@ mod tests {
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
         );
+    }
+
+    /// Runs `sql` against a database file created at `path`.
+    async fn create_with(path: &std::path::Path, sql: &'static str) {
+        use sqlx::ConnectOptions as _;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("create");
+        sqlx::raw_sql(sql).execute(&mut conn).await.expect("sql");
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_missing_database_is_reported_and_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::Missing
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("list").count(),
+            0,
+            "inspecting must not create the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_has_no_migration_history_and_stays_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        std::fs::write(&path, []).expect("empty file");
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::NoHistory
+        );
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::unrelated_tables("CREATE TABLE Users (Id TEXT);", super::MigrationHistory::NoHistory)]
+    #[case::empty_ef_history(
+        r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);"#,
+        super::MigrationHistory::Empty
+    )]
+    #[case::empty_sqlx_history(
+        "CREATE TABLE _sqlx_migrations (version BIGINT);",
+        super::MigrationHistory::Empty
+    )]
+    #[case::recorded_ef_history(
+        r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);
+           INSERT INTO "__EFMigrationsHistory" VALUES ('20250000000000_Initial', '9.0.0');"#,
+        super::MigrationHistory::Recorded
+    )]
+    #[case::empty_sqlx_beside_recorded_ef(
+        r#"CREATE TABLE _sqlx_migrations (version BIGINT);
+           CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);
+           INSERT INTO "__EFMigrationsHistory" VALUES ('20250000000000_Initial', '9.0.0');"#,
+        super::MigrationHistory::Recorded
+    )]
+    #[tokio::test]
+    async fn migration_history_is_read_from_either_table(
+        #[case] sql: &'static str,
+        #[case] expected: super::MigrationHistory,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        create_with(&path, sql).await;
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn a_migrated_database_has_recorded_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        db.close().await;
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_a_database_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        std::fs::write(&path, b"this is not a sqlite database file at all").expect("write");
+        assert!(super::inspect_migration_history(&path).await.is_err());
     }
 
     #[tokio::test]

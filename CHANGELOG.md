@@ -114,6 +114,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   earlier version (on its first boot of this one). Existing items otherwise keep their
   stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
+### Security
+- A server whose setup was completed no longer starts when its database is missing, empty or
+  has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
+  a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
+  could reach the server signed in as an administrator with an empty password (a lost mount, a
+  wrong data directory or a deleted file was enough). The refusal names three ways out: restore
+  the database, set `IsStartupWizardCompleted` to false in `system.json` to start over, or
+  start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
+
 ### Bug Fixes
 - A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
   first scan, and media deleted from disk is removed from it again. Jellyfin files a
