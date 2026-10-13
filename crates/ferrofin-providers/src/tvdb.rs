@@ -811,10 +811,10 @@ impl TvdbClient {
         env.data
     }
 
-    /// Searches TVDB for a series by name. Port of `TvdbSeriesProvider.FindSeries`
-    /// + `FindSeriesInternal`'s query, ranking and filter (each hit carries its
-    /// Tvdb id only: upstream also reads every hit's extended record for its
-    /// IMDb, Zap2It and TMDb ids, which this does not):
+    /// Searches TVDB for a series by name. Port of the query, ranking and
+    /// filter of `TvdbSeriesProvider.FindSeries` and `FindSeriesInternal`;
+    /// each hit carries its Tvdb id only (upstream also reads every hit's
+    /// extended record for its IMDb, Zap2It and TMDb ids, which this does not):
     ///
     /// - the query is `name` parsed (`ParseName`: no trailing year, no release
     ///   clutter) in its comparable form ([`comparable_name`]), five results,
