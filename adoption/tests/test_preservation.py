@@ -18,7 +18,7 @@ from preservation import (GENERATIONS, ORACLE, comparable, compare, normalize, r
                           seed_state, validate, validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS
 import synthetic_fixture
-from synthetic_fixture import USERS, seed_database
+from synthetic_fixture import USERS, drop_dangling_chain, seed_database
 from watch_history import orphaned_items
 from unchanged_scan import TABLES, audit, assert_unchanged, check
 from test_user_accounts import fixture as account_fixture
@@ -330,6 +330,37 @@ class SeededAdoptionTest(unittest.TestCase):
 
     def test_an_adoption_that_matches_jellyfin_12_2_passes(self):
         self.assertEqual(self.failures(), [])
+
+    def test_the_12_0_lineage_drops_the_chain_and_keeps_the_other_seeds(self):
+        # Jellyfin 12.0 cannot migrate a database holding the chain, so its copy drops it.
+        with closing(sqlite3.connect(self.source)) as conn:
+            before = conn.execute('SELECT COUNT(*) FROM BaseItems').fetchone()[0]
+        drop_dangling_chain(self.source, self.seeds)
+        with closing(sqlite3.connect(self.source)) as conn:
+            self.assertEqual(orphaned_items(conn), set())
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM BaseItems').fetchone()[0], before - 2)
+        state = seed_state(self.source, self.seeds)
+        self.assertEqual((state['orphans'], state['history']), ([], None))
+        self.assertEqual(state['ratings'], self.seeds['ratings'])
+        self.assertEqual(sorted(state['conflict']), sorted(self.seeds['conflict']['keys']))
+        drop_dangling_chain(self.source, self.seeds)  # idempotent
+        self.assertEqual(seed_state(self.source, self.seeds), state)
+
+    def test_a_12_0_lineage_adoption_is_checked_only_for_survivors(self):
+        with_chain = self.dir / 'with-chain.db'
+        shutil.copyfile(self.source, with_chain)
+        drop_dangling_chain(self.source, self.seeds)
+        self.state = seed_state(self.source, self.seeds)
+        # Adopted from the chain-free source: no placeholder history exists, and none is demanded.
+        shutil.copyfile(self.source, self.adopted)
+        jellyfin_12_2(self.adopted, self.seeds)
+        self.assertEqual(self.failures(), [])
+        # A chain item that survives is still caught.
+        orphan = str(uuid.UUID(self.seeds['orphans'][0])).upper()
+        with closing(sqlite3.connect(self.adopted)) as conn, conn:
+            conn.execute('ATTACH ? AS chain', (str(with_chain),))
+            conn.execute('INSERT INTO BaseItems SELECT * FROM chain.BaseItems WHERE Id = ?', (orphan,))
+        self.assertEqual(self.failures(), ['seeded orphaned items survive'])
 
     def test_a_score_from_older_tables_fails(self):
         # Jellyfin 12.1 scored "-12" as -12; "SAM 13" was unrated before 12.2.

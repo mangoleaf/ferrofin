@@ -243,6 +243,8 @@ def seed_database(db, manifest):
        (12.1+ from 10.11, or its post-scan clean-up) and Ferrofin's migration 0042 delete
        them and keep the play state on the placeholder item. They carry no series, season
        or top parent and no real path, so no browse list treats them as library content.
+       Jellyfin 12.0 cannot migrate the chain, so its lineage drops it first
+       (drop_dangling_chain); only 10.11.x, 12.1-from-10 and 12.2-from-10 carry it.
     """
     adult = uuid.UUID(manifest["users"][USERS[1]])
     with closing(sqlite3.connect(db)) as conn:
@@ -312,3 +314,22 @@ def seed_database(db, manifest):
             "conflict": {"item": locked.hex, "user": adult.hex, "keys": keys},
             "orphans": [first.hex, second.hex],
             "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY}}
+
+
+def drop_dangling_chain(db, seeds):
+    """Remove the seeded dangling chain (and its play state) from a STOPPED fixture copy.
+
+    Jellyfin 12.0's ChangeOwnerIdToGuid rebuilds BaseItems with foreign keys enforced and,
+    unlike 12.1's version of it, deletes no orphans first, so 12.0 cannot start on a
+    database that holds the chain ("FOREIGN KEY constraint failed"). No real database
+    carrying one reaches 12.0, so the 12.0 lineage starts without it; seed_state then
+    records no chain and seed_failures checks only that none survives.
+    """
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        with conn:
+            for item in seeds["orphans"]:
+                for table, column in (("UserData", "ItemId"), ("BaseItems", "Id")):
+                    conn.execute(f'DELETE FROM "{table}" WHERE lower(replace("{column}", \'-\', \'\')) = ?',
+                                 (item,))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

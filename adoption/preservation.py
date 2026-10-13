@@ -159,7 +159,11 @@ def same_artwork(expected, actual):
 
 
 # The fixture whose Jellyfin 12.2 handling of the seeds is the expectation on every path
-# (built 10.11.8 -> 12.0 -> 12.1 -> 12.2, the fullest upgrade route).
+# (built 10.11.8 -> 12.0 -> 12.1 -> 12.2, the fullest upgrade route). It never holds the
+# dangling chain (12.0 cannot migrate it; synthetic.NO_ORPHAN_CLEANUP), so the chain's
+# expectation is not read from it: seed_failures requires that no chain item survives and,
+# where the source still held the history, that it sits on the placeholder. Only
+# jellyfin-12.2-from-10's seeds.json records what real Jellyfin 12.2 did with the chain.
 ORACLE = "jellyfin-12.2-from-121"
 MOVIE_TYPE = "MediaBrowser.Controller.Entities.Movies.Movie"
 PLACEHOLDER = "00000000000000000000000000000001"
