@@ -355,14 +355,11 @@ impl FerrofinTrickplayManager {
         // row's `Width` is 0 for a probe that found no dimensions, which is
         // "unknown", not a zero-pixel video.
         let mut actual_width = 2 * (width / 2);
-        if let Some(video_width) = video_stream.width.map(i64::from)
-            && video_width < i64::from(width)
-        {
-            tracing::warn!(
-                video_width,
-                trickplay_width = width,
-                "video width is smaller than trickplay setting, using video width for thumbnails"
-            );
+        let narrower = video_stream
+            .width
+            .map(i64::from)
+            .filter(|video_width| *video_width < i64::from(width));
+        if let Some(video_width) = narrower {
             actual_width = i32::try_from(2 * (video_width / 2)).unwrap_or(actual_width);
         }
         if actual_width <= 0 {
@@ -398,8 +395,15 @@ impl FerrofinTrickplayManager {
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
+        // Upstream warns "video width is smaller than trickplay setting"
+        // before its existing-tiles check, so once per pass over every narrow
+        // video. Using the video's width is the intended outcome, so it is a
+        // field of the one line a generation logs (`video_width` present
+        // when the setting was narrowed).
         tracing::info!(
             width = actual_width,
+            trickplay_width = width,
+            video_width = narrower,
             path = ctx.media_path,
             item = %ctx.item_id,
             "creating trickplay files"
