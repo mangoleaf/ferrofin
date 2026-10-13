@@ -165,6 +165,12 @@ def same_artwork(expected, actual):
 # where the source still held the history, that it sits on the placeholder. Only
 # jellyfin-12.2-from-10's seeds.json records what real Jellyfin 12.2 did with the chain.
 ORACLE = "jellyfin-12.2-from-121"
+# Snapshot keys whose expectation is what Jellyfin 12.2 serves rather than what the source
+# release served. Every 12.x deletes a 10.11 local alternate version stored as a Video
+# (MigrateLinkedChildren.CleanupWrongTypeAlternateVersions) and its scan re-creates it under
+# the id its primary's type derives (LibraryManager.ResolveAlternateVersion), so a version
+# group's MediaSource ids change on every path from 10.11 and on none from 12.x.
+FROM_ORACLE = ("versions",)
 MOVIE_TYPE = "MediaBrowser.Controller.Entities.Movies.Movie"
 PLACEHOLDER = "00000000000000000000000000000001"
 # The generation each release's database adopts as: the id SET the gate matches
@@ -180,6 +186,26 @@ def scrub(value, ids):
     if isinstance(value, list):
         return [scrub(val, ids) for val in value if not (isinstance(val, str) and val in ids)]
     return value
+
+
+# The real 10.11.8 -> 12.2 upgrade: the direct evidence for what 12.2 serves from a 10.11 source.
+UPGRADED_FROM_10 = "jellyfin-12.2-from-10"
+
+
+def expectation(version, baseline, oracle, upgraded):
+    """What Ferrofin must serve after adopting a source of `version` whose own release served
+    `baseline`. A 10.11 source takes the FROM_ORACLE keys from the 12.2 oracle (`oracle`),
+    provided the real 10.11 -> 12.2 upgrade (`upgraded`) serves the same; a 12.x source keeps
+    its own release's baseline. Every stage is held to these post-scan values, including the
+    pre-scan ones: Ferrofin's boot repair re-keys the version in place, where 12.x serves the
+    primary alone until its scan re-creates the version."""
+    if not version.startswith("10.11"):
+        return baseline
+    differ = [key for key in FROM_ORACLE if oracle[key] != upgraded[key]]
+    if differ:
+        raise CheckError(f"{UPGRADED_FROM_10} and {ORACLE} serve different {', '.join(differ)}; "
+                         "rebuild the fixtures before trusting either as the expectation")
+    return {**baseline, **{key: oracle[key] for key in FROM_ORACLE}}
 
 
 def comparable(data, seeds, orphans):
@@ -371,6 +397,10 @@ def run_matrix(root, image, only, port):
     if not oracle_ready.exists() or json.loads(oracle_ready.read_text()).get("recipe") != recipe():
         raise CheckError("synthetic Jellyfin 12.2 oracle missing; build " + ORACLE + " first")
     oracle = json.loads((oracle_dir / "preservation.json").read_text())
+    upgraded_ready = root / UPGRADED_FROM_10 / "synthetic-ready.json"
+    if not upgraded_ready.exists() or json.loads(upgraded_ready.read_text()).get("recipe") != recipe():
+        raise CheckError("synthetic Jellyfin 12.2 upgrade from 10.11 missing; build " + UPGRADED_FROM_10 + " first")
+    upgraded = json.loads((root / UPGRADED_FROM_10 / "preservation.json").read_text())
     for name, version, _ in VERSIONS:
         if only and only != name:
             continue
@@ -381,7 +411,7 @@ def run_matrix(root, image, only, port):
         if json.loads(ready.read_text()).get("recipe") != recipe():
             raise CheckError("synthetic recipe changed; rebuild the fixture before testing")
         manifest = json.loads((source / "synthetic.json").read_text())
-        expected = json.loads((source / "preservation.json").read_text())
+        expected = expectation(version, json.loads((source / "preservation.json").read_text()), oracle, upgraded)
         seeds = manifest.get("seeds")
         if not seeds or not (source / "seeds.json").exists():
             raise CheckError("synthetic fixture lacks the database seeds; rebuild it")

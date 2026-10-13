@@ -14,8 +14,9 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (GENERATIONS, ORACLE, comparable, compare, normalize, run_matrix, seed_failures,
-                          seed_state, validate, validate_oracle, validate_seed_state, same_artwork, verify_database)
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, comparable, compare, expectation, normalize, run_matrix,
+                          seed_failures, seed_state, validate, validate_oracle, validate_seed_state, same_artwork,
+                          verify_database)
 from synthetic import VERSIONS
 import synthetic_fixture
 from synthetic_fixture import USERS, drop_dangling_chain, seed_database
@@ -267,6 +268,41 @@ def jellyfin_12_2(path, seeds):
         conn.execute('DELETE FROM BaseItems WHERE Id IN (?, ?)', orphans)
 
 
+class OracleExpectationTest(unittest.TestCase):
+    # The synthetic fixture's "Twin Horizon" group: 10.11 serves its alternate under the
+    # Video-derived id, every 12.x under the Movie-derived one.
+    PRIMARY, AS_VIDEO, AS_MOVIE = ('711d7b0f6790b40fbca3fd771dbb96d3', 'e24bb924be539d0746ec205b0b9536e6',
+                                   'ad1cd20859f6c42cfdfd85714b08748d')
+
+    def setUp(self):
+        self.baseline = {'versions': [self.PRIMARY, self.AS_VIDEO], 'extras': ['extra']}
+        self.oracle = {'versions': [self.PRIMARY, self.AS_MOVIE], 'extras': ['oracle-only']}
+
+    def test_a_10_11_path_expects_the_version_ids_jellyfin_12_2_serves(self):
+        expected = expectation('10.11.9', self.baseline, self.oracle, self.oracle)
+        self.assertEqual(compare(expected, {'versions': [self.PRIMARY, self.AS_MOVIE], 'extras': ['extra']}), [])
+        # Keeping the 10.11 id is not what 12.2 does.
+        self.assertEqual(compare(expected, {'versions': [self.PRIMARY, self.AS_VIDEO], 'extras': ['extra']}),
+                         ['versions'])
+
+    def test_only_the_oracle_keys_leave_the_source_baseline(self):
+        self.assertEqual(FROM_ORACLE, ('versions',))
+        expected = expectation('10.11.8', self.baseline, self.oracle, self.oracle)
+        self.assertEqual(expected['extras'], ['extra'])
+        self.assertEqual(self.baseline['versions'], [self.PRIMARY, self.AS_VIDEO], 'the baseline is not modified')
+
+    def test_a_12_x_path_keeps_its_own_release_baseline(self):
+        own = {'versions': ['own-12.1-ids'], 'extras': ['extra']}
+        disagreeing = {'versions': [self.PRIMARY, self.AS_VIDEO]}
+        # A 12.x source never consults the 10.11 upgrade, even when it disagrees.
+        self.assertIs(expectation('12.1', own, self.oracle, disagreeing), own)
+
+    def test_the_oracle_must_agree_with_the_real_10_11_upgrade(self):
+        upgraded = {'versions': [self.PRIMARY, self.AS_VIDEO]}
+        with self.assertRaisesRegex(CheckError, 'serve different versions'):
+            expectation('10.11.8', self.baseline, self.oracle, upgraded)
+
+
 class SeededAdoptionTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -503,6 +539,16 @@ class SeededAdoptionTest(unittest.TestCase):
     def test_the_matrix_refuses_to_run_without_the_12_2_oracle(self):
         # Checked before any container starts or any fixture is copied.
         with self.assertRaisesRegex(CheckError, 'oracle missing; build ' + ORACLE):
+            run_matrix(self.dir, 'unused-image', None, 0)
+        self.assertFalse((self.dir / 'work').exists())
+
+    def test_the_matrix_refuses_to_run_without_the_real_10_11_upgrade(self):
+        from synthetic import recipe
+        oracle = self.dir / ORACLE
+        oracle.mkdir()
+        (oracle / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+        (oracle / 'preservation.json').write_text('{}')
+        with self.assertRaisesRegex(CheckError, 'build jellyfin-12.2-from-10 first'):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
