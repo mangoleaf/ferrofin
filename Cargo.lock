@@ -1233,6 +1233,7 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "reqwest",
+ "rstest",
  "serde",
  "serde_json",
  "serde_path_to_error",

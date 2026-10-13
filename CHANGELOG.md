@@ -40,6 +40,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   collections the user can see that include the item, sorted and paged as upstream.
   jellyfin-web's item page calls it and hid its Collections section on the old `404`.
   `contract_superset` now probes every 12.1 operation the 10.11.8 contract lacks
+- Honour Jellyfin 12.1's `audioLanguages` and `subtitleLanguages` filters on `GET /Items`
+  and `GET /Trailers`: an item matches when its own streams or an alternate version's
+  carry a listed language (exact, case-sensitive codes; `und` also matches a stream with
+  no language), and a folder or collection matches when such an item sits below it. As
+  upstream, every media-stream filter (these two, `hasSubtitles`, `isHd`, `is4K`, `is3D`,
+  `videoTypes`) now keeps alternate versions in the query, and the legacy
+  `GET /Users/{userId}/Items` ignores both lists
+- `hasSubtitles`, `isHd`, `is4K` and `minWidth`/`minHeight`/`maxWidth`/`maxHeight` judge a
+  merged item by its whole version group, as Jellyfin 12 does: a movie whose subtitles or
+  4K file live only on its second version matches, listed under the primary, and an SD
+  primary with a better version no longer counts as SD. `hasSubtitles`, `isHd` and `is4K`
+  also match a series, library or collection by the items below it
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
   relationships, version links, `GetCleanValue`, forced sort names, localized user-view
   consolidation

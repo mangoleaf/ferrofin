@@ -146,6 +146,30 @@ pub(crate) fn parse_pipe_strings(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Splits a comma-delimited value into owned strings — Jellyfin's
+/// `CommaDelimitedCollectionModelBinder` bound to a `string[]` (v12
+/// CommaDelimitedCollectionModelBinder.cs:44-46, 58-87).
+///
+/// The binder splits with `StringSplitOptions.RemoveEmptyEntries` and only
+/// then `Trim()`s each piece, so a whitespace-only piece survives as `""`
+/// (`" ,ger"` binds `["", "ger"]`). A string never fails conversion, and no
+/// piece is case-folded. Absent ⇒ empty.
+///
+/// This ports the binder's single-value arm only. A key repeated in the query
+/// reaches here already joined with `,` by the shared `query::Query` extractor, so
+/// `a=eng,ger&a=fre` binds `["eng", "ger", "fre"]` — a deliberate leniency over
+/// upstream, whose multi-value arm (`CommaDelimitedCollectionModelBinder.cs:34-38`)
+/// only trims each raw value and binds `["eng,ger", "fre"]`.
+pub(crate) fn parse_csv_strings(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect()
+}
+
 /// Deserializes a **comma**-delimited JSON collection field.
 ///
 /// Port of `JsonDelimitedCollectionConverter<T>.Read` (v10.11.8
@@ -325,10 +349,34 @@ pub(crate) fn apply_location_types(
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_as_none_uuid, parse_csv_uuids, parse_pipe_strings};
+    use super::{empty_as_none_uuid, parse_csv_strings, parse_csv_uuids, parse_pipe_strings};
 
     use ferrofin_model::data::BaseItemKind;
+    use rstest::rstest;
     use uuid::Uuid;
+
+    /// `CommaDelimitedCollectionModelBinder` over `string[]`.
+    /// `"lol,xd"` is upstream's
+    /// `BindModelAsync_CorrectlyBindsValidCommaDelimitedStringArrayQuery`; the
+    /// double comma mirrors `…EnumArrayQueryWithDoubleCommas`; the rest pin the
+    /// binder's own order (`RemoveEmptyEntries` before `Trim`) and its lack of
+    /// case folding.
+    #[rstest]
+    #[case(None, &[])]
+    #[case(Some(""), &[])]
+    #[case(Some("lol,xd"), &["lol", "xd"])]
+    #[case(Some("eng"), &["eng"])]
+    #[case(Some("eng,ger"), &["eng", "ger"])]
+    #[case(Some("eng,,ger"), &["eng", "ger"])]
+    #[case(Some(" eng , ger "), &["eng", "ger"])]
+    #[case(Some(" ,ger"), &["", "ger"])]
+    #[case(Some("ENG"), &["ENG"])]
+    fn csv_strings_bind_like_the_comma_delimited_binder(
+        #[case] raw: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(parse_csv_strings(raw), expected);
+    }
 
     #[test]
     fn nullable_enums_bind_like_the_nullable_enum_model_binder() {
