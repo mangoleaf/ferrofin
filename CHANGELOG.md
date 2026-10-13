@@ -33,6 +33,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 36 shell tests passed.
 
 ### Parity
+- Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
+  Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
+  the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
+  embedded VobSub subtitles render again
 - Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
   and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
   12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
