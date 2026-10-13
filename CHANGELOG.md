@@ -124,6 +124,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   are listed as separate movies once the library is browsable again, and a plain
   subfolder of a movie library shows as an empty folder. See
   [docs/UPGRADING.md](docs/UPGRADING.md)
+- A movie's alternate version on a database adopted from Jellyfin 10.11 takes its primary's
+  official rating (scored), overview, community rating, genres, year, images and provider ids
+  when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
+  copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
+  before that copy makes it on the next boot
 
 ## [1.0.0] - 2026-09-05
 

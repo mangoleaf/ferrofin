@@ -909,21 +909,37 @@ struct GroupRow {
 /// and its stacked parts, and the scan that then re-creates them
 /// (`LibraryManager.ResolveAlternateVersion`, `LibraryManager.cs:865-922`;
 /// `Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`). Ferrofin keeps
-/// the rows — their user data, images, streams and provider ids — and gives
-/// them the shape the scan would store, so an adopted database's first scan
-/// writes nothing for them (owner decision D9c):
+/// the rows — their user data and streams, and their images and provider
+/// ids through the move (a local version then takes its primary's, below) —
+/// and gives them the shape the scan would store, so an adopted database's
+/// first scan writes nothing for them (owner decision D9c):
 ///
 /// - a local version — a row at a path in a movie's, music video's,
 ///   video's or episode's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
 ///   the primary's folder — of another type moves to the id the primary's
 ///   type derives for its path (the scan's re-key, with what is keyed by its
-///   id and its folders; a 10.11 `Video` keeps its refresh stamp and
-///   provider ids — it is the same title, [`RekeyKind::Represented`]); then
+///   id and its folders; a 10.11 `Video` keeps its refresh stamp, and its
+///   provider ids until its primary's copy replaces them — it is the same
+///   title, [`RekeyKind::Represented`]); then
 ///   it takes the primary as `OwnerId` and `PrimaryVersionId`, the
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
 ///   as a local version (`ChildType` 2). Its name stands: the scan never
 ///   renames an owned version (`settle_extra_name`).
+///
+///   Upstream's scan then finds the primary's version links short of its
+///   `LocalAlternateVersions` — the deleted row took its link along — and
+///   saves the primary (`Video.RefreshedOwnedItems`, `Video.cs:560-575`),
+///   whose save gives every local version its images, overview, year,
+///   premiere date, community and official rating, genres and provider ids
+///   (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`). So each primary
+///   whose version this repair moved, or had to link, gives its versions
+///   that copy here ([`ItemPersistenceService::copy_metadata_to_owned_videos`]
+///   on `persistence`, which scores the ratings it copies), as the scan
+///   does for a version it moves. The moves and links commit before the
+///   copy, so the primaries owed one are recorded (`FerrofinMeta`, before a
+///   move and with a link) until it is made: a copy that fails, or a boot
+///   that stops before it, is made by the next boot.
 /// - a stacked part — a row at a path in a video's `AdditionalParts` — of
 ///   another type moves to its `Video` id as the scan's re-key does
 ///   ([`RekeyKind::Changed`]); then it takes the video as `OwnerId`, and the
@@ -944,7 +960,8 @@ struct GroupRow {
 /// 12.x shape are left alone. Runs once per database (`FerrofinMeta`),
 /// after [`run_all`] — it needs the item-id derivation and the folder roots
 /// the composition root resolves (`art_root` is the item art root,
-/// `{metadata}/library`).
+/// `{metadata}/library`), and the persistence service the server saves
+/// items through (`persistence`, with its localization attached).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -953,16 +970,27 @@ pub async fn rehome_local_versions(
     derivation: &IdDerivation,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
+    persistence: &dyn ItemPersistenceService,
 ) -> Result<RehomedVersions, ServiceError> {
     const KEY: &str = "rehome_local_versions_v12";
     if !once(db, KEY).await? {
         return Ok(RehomedVersions::default());
     }
+    // Primaries an earlier boot moved or linked versions of without copying
+    // to them: the copy is still owed.
+    let mut copies = pending_copies(db).await?;
     let versions = version_pairs(db).await?;
     let parts = part_pairs(db).await?;
     if !needs_work(db, derivation, &versions, None).await?
         && !needs_work(db, derivation, &parts, Some(BaseItemKind::Video)).await?
     {
+        if !copies.is_empty() {
+            copy_to_versions(db, persistence, &copies).await?;
+            tracing::info!(
+                owners = copies.len(),
+                "copied primaries' metadata to the local versions an earlier boot re-homed"
+            );
+        }
         done(db, KEY).await?;
         return Ok(RehomedVersions::default());
     }
@@ -983,22 +1011,116 @@ pub async fn rehome_local_versions(
         path_manager,
     };
     let mut out = RehomedVersions::default();
+    // The primaries whose saves upstream's scan makes. One whose version is
+    // about to move is owed its copy from before the move commits, so a
+    // boot that stops between the move and the copy makes it on the next.
+    let owed = copies.len();
+    for pair in &versions {
+        if rekey_target(derivation, pair, None).is_some() {
+            copies.insert(uuid_of(&pair.owner.id)?);
+        }
+    }
+    if copies.len() != owed {
+        db.meta_set(COPY_KEY, &encode_copies(&copies))
+            .await
+            .map_err(meta_err)?;
+    }
     // Local versions first: a version's own stack is owned by its new id.
     let (versions, rekeyed, versions_moved) =
         rekey_to_owner_kind(db, derivation, &folders, versions, None).await?;
     out.rekeyed += rekeyed;
-    out.versions = place_owned(db, &versions, true).await?;
+    out.versions = place_owned(db, &versions, Some(&mut copies)).await?;
+    copy_to_versions(db, persistence, &copies).await?;
     let parts = part_pairs(db).await?;
     let (parts, rekeyed, parts_moved) =
         rekey_to_owner_kind(db, derivation, &folders, parts, Some(BaseItemKind::Video)).await?;
     out.rekeyed += rekeyed;
-    out.parts = place_owned(db, &parts, false).await?;
+    out.parts = place_owned(db, &parts, None).await?;
     // A failed move leaves its row for the scan; the repair runs again on
     // the next boot.
     if versions_moved && parts_moved {
         done(db, KEY).await?;
     }
     Ok(out)
+}
+
+/// The `FerrofinMeta` key holding the primaries [`rehome_local_versions`]
+/// owes a copy to their local versions (comma-separated ids). The moves and
+/// links the copy follows commit before it, so it stays until the copy is
+/// made.
+const COPY_KEY: &str = "rehome_local_versions_v12_copies";
+
+/// The primaries an earlier [`rehome_local_versions`] still owes a copy
+/// ([`COPY_KEY`]).
+async fn pending_copies(db: &Database) -> Result<BTreeSet<Uuid>, ServiceError> {
+    let Some(value) = db.meta_get(COPY_KEY).await.map_err(meta_err)? else {
+        return Ok(BTreeSet::new());
+    };
+    value
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            Uuid::parse_str(id).map_err(|err| {
+                ServiceError::Backend(format!("FerrofinMeta {COPY_KEY} holds {id:?}: {err}"))
+            })
+        })
+        .collect()
+}
+
+/// `owners` as [`COPY_KEY`] stores them.
+fn encode_copies(owners: &BTreeSet<Uuid>) -> String {
+    owners
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Writes `owners` as [`COPY_KEY`] on `conn`, inside its caller's
+/// transaction.
+async fn store_copies(
+    conn: &mut sqlx::SqliteConnection,
+    owners: &BTreeSet<Uuid>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, ?2)
+           ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value""#,
+    )
+    .bind(COPY_KEY)
+    .bind(encode_copies(owners))
+    .execute(conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Gives the local versions of each of `owners` what its save copies to
+/// them ([`ItemPersistenceService::copy_metadata_to_owned_videos`]), then
+/// clears [`COPY_KEY`]. A copy that fails leaves the key, so the next boot
+/// makes it.
+async fn copy_to_versions(
+    db: &Database,
+    persistence: &dyn ItemPersistenceService,
+    owners: &BTreeSet<Uuid>,
+) -> Result<(), ServiceError> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = owners.iter().copied().collect();
+    persistence
+        .copy_metadata_to_owned_videos(&ids, true, false)
+        .await?;
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(COPY_KEY)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// A stored id, parsed.
+fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(id).map_err(|err| ServiceError::Backend(err.to_string()))
 }
 
 /// [`rehome_local_versions`] and its log line, for the composition root.
@@ -1010,8 +1132,10 @@ pub async fn run_rehome_local_versions(
     derivation: &IdDerivation,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
+    persistence: &dyn ItemPersistenceService,
 ) -> Result<(), ServiceError> {
-    let rehomed = rehome_local_versions(db, derivation, art_root, path_manager).await?;
+    let rehomed =
+        rehome_local_versions(db, derivation, art_root, path_manager, persistence).await?;
     if rehomed != RehomedVersions::default() {
         tracing::info!(
             rekeyed = rehomed.rekeyed,
@@ -1610,16 +1734,20 @@ fn simple_key(id: &str) -> Result<String, ServiceError> {
 }
 
 /// Gives each pair's child its owner's shape ([`place_differs`]), in one
-/// transaction; a local version (`versions`) is linked under its owner (a
-/// linked one re-typed, as local beats linked). Returns the number of
-/// children changed.
+/// transaction. Local versions come with `copies`, the primaries owed a
+/// copy to their versions: each version is linked under its owner (a linked
+/// one re-typed, as local beats linked), and an owner a link is written
+/// under joins `copies`, stored ([`COPY_KEY`]) in the same transaction —
+/// upstream's scan saves it. Returns the number of children changed.
 async fn place_owned(
     db: &Database,
     pairs: &[OwnedPair],
-    versions: bool,
+    mut copies: Option<&mut BTreeSet<Uuid>>,
 ) -> Result<usize, ServiceError> {
+    let versions = copies.is_some();
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     let mut changed = 0usize;
+    let mut owed = false;
     for pair in pairs {
         if !place_differs(&mut tx, pair, versions).await? {
             continue;
@@ -1668,10 +1796,17 @@ async fn place_owned(
             .await
             .map_err(db_err)?;
         }
-        if versions {
-            link_local_version(&mut tx, &owner.id, &child.id).await?;
+        if let Some(copies) = copies.as_deref_mut()
+            && link_local_version(&mut tx, &owner.id, &child.id).await?
+        {
+            owed |= copies.insert(uuid_of(&owner.id)?);
         }
         changed += 1;
+    }
+    if let Some(copies) = copies
+        && owed
+    {
+        store_copies(&mut tx, copies).await?;
     }
     tx.commit().await.map_err(db_err)?;
     Ok(changed)
@@ -2426,6 +2561,11 @@ mod tests {
         program_data_path: None,
     };
 
+    /// The persistence service [`rehome_local_versions`] copies through.
+    fn store(db: &Database) -> FerrofinItemPersistenceService {
+        FerrofinItemPersistenceService::new(db.clone())
+    }
+
     /// A movies library's group and a home-video stack, both stored as a
     /// group's primary and its owned rows, under one library folder.
     struct Group {
@@ -2484,9 +2624,13 @@ mod tests {
         }
     }
 
+    /// The Tmdb id of [`seed_10_11_rows`]'s primary.
+    const PRIMARY_TMDB: &str = "101332";
+
     /// The bench's 10.11 rows of [`seed_group`]'s groups: the local version
-    /// (played, with a provider id), the part, and an older scan's `Movie`
-    /// part. Returns their ids.
+    /// (played, with the provider id 10.11 last copied from its primary,
+    /// which the primary has since changed), the part, and an older scan's
+    /// `Movie` part. Returns their ids.
     async fn seed_10_11_rows(db: &Database, g: &Group) -> [Uuid; 3] {
         let adopted = derive_item_id_with(&DERIVATION, BaseItemKind::Video, ALTERNATE).unwrap();
         let part = derive_item_id_with(&DERIVATION, BaseItemKind::Video, PART).unwrap();
@@ -2508,7 +2652,8 @@ mod tests {
             .await;
         }
         link(db, g.primary, adopted, LOCAL_ALTERNATE_VERSION, 0).await;
-        seed_provider_id(db, adopted, "Tmdb", "101332").await;
+        seed_provider_id(db, g.primary, "Tmdb", PRIMARY_TMDB).await;
+        seed_provider_id(db, adopted, "Tmdb", "75780").await;
         let user = Uuid::from_u128(0x99);
         seed_user(db, user).await;
         seed_user_data(db, user, adopted, true, None).await;
@@ -2521,17 +2666,18 @@ mod tests {
     /// own id — linked under it as `MigrateLinkedChildren` imports it; a
     /// stack's part is a `Video` it owns with no parent and its own folder
     /// state, and an older scan's part a `Movie` of its own. The repair
-    /// moves the version to its `Movie` id with its user data, provider ids
-    /// and refresh stamp, the older part to its `Video` id as the scan's
-    /// re-key does (refresh stamp cleared), gives all their owner's place,
-    /// and leaves the result alone on a second run, even with its once-key
-    /// cleared.
+    /// moves the version to its `Movie` id with its user data and refresh
+    /// stamp — its stale provider id replaced by its primary's, as the
+    /// primary's save copies — the older part to its `Video` id as the
+    /// scan's re-key does (refresh stamp cleared), gives all their owner's
+    /// place, and leaves the result alone on a second run, even with its
+    /// once-key cleared.
     #[tokio::test]
     async fn local_versions_and_parts_take_their_owners_shape() {
         let db = test_db().await;
         let g = seed_group(&db).await;
         let [adopted, part, older] = seed_10_11_rows(&db, &g).await;
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -2562,17 +2708,22 @@ mod tests {
             ancestors(&db, &guid_to_db(alternate)).await,
             vec![guid_to_db(g.library)]
         );
-        let kept: (i64, i64) = sqlx::query_as(
-            r#"SELECT (SELECT COUNT(*) FROM "BaseItemProviders" WHERE "ItemId" = ?1),
-                      (SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1
-                         AND "CustomDataKey" = ?2)"#,
+        let played: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1
+                 AND "CustomDataKey" = ?2"#,
         )
         .bind(guid_to_db(alternate))
         .bind(alternate.to_string())
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(kept, (1, 1), "provider ids and user data stay with it");
+        assert_eq!(played, 1, "its user data moves with it");
+        assert_eq!(
+            provider_ids(&db, alternate).await,
+            vec![("Tmdb".to_owned(), PRIMARY_TMDB.to_owned())],
+            "its provider ids are its primary's, copied by the primary's save"
+        );
+        assert_eq!(pending_copies(&db).await.unwrap(), BTreeSet::new());
         assert_eq!(
             links(&db).await,
             vec![(primary.clone(), guid_to_db(alternate), 2, 0)]
@@ -2605,7 +2756,7 @@ mod tests {
         }
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -2615,11 +2766,307 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default(),
             "the repaired shape is the 12.x one"
+        );
+    }
+
+    /// `OfficialRating`, `InheritedParentalRatingValue`/`SubValue`, `Name`,
+    /// `Overview`, `CommunityRating`, `Genres` and `ProductionYear` of `id`.
+    type Copied = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        Option<i64>,
+    );
+
+    async fn copied(db: &Database, id: Uuid) -> Copied {
+        sqlx::query_as(
+            r#"SELECT "OfficialRating", "InheritedParentalRatingValue",
+                      "InheritedParentalRatingSubValue", "Name", "Overview",
+                      "CommunityRating", "Genres", "ProductionYear"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("copied columns")
+    }
+
+    async fn provider_ids(db: &Database, id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as(
+            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ItemId" = ?1 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_all(db.pool())
+        .await
+        .expect("provider ids")
+    }
+
+    /// The synthetic fixture's Jellyfin 10.11.8 group: two version files,
+    /// the alternate a `Video` under its own id with its own name and an
+    /// older rating than the primary's (`G`, where the primary was since
+    /// rated `MA15+`), pointing at nothing. Jellyfin 12.x deletes that row
+    /// and its scan re-creates it under the `Movie` id and saves the primary,
+    /// whose save copies its metadata to it (`Video.cs:560-575,704-726`):
+    /// so the repair that moves it instead gives it the primary's rating
+    /// (scored), overview, community rating, genres, year and provider ids.
+    /// Its name is its own, as the version's.
+    #[tokio::test]
+    async fn a_moved_version_takes_what_its_primarys_save_copies() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let [adopted, ..] = seed_10_11_rows(&db, &g).await;
+        set_columns(
+            &db,
+            g.primary,
+            r#""OfficialRating" = ?2, "Overview" = ?3, "CommunityRating" = 7.5,
+               "Genres" = 'Adventure', "ProductionYear" = 2014"#,
+            &[
+                Some("MA15+".to_owned()),
+                Some("An invented adoption fixture.".to_owned()),
+            ],
+        )
+        .await;
+        set_columns(
+            &db,
+            adopted,
+            r#""Name" = ?2, "OfficialRating" = 'G'"#,
+            &[Some("Bridge (2014) - 1080p".to_owned())],
+        )
+        .await;
+        seed_provider_id(&db, g.primary, "Tmdb", "990000005").await;
+        let store = store(&db);
+        store.set_localization(std::sync::Arc::new(
+            crate::localization_manager::LocalizationManager::new("US"),
+        ));
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store)
+            .await
+            .unwrap();
+
+        assert_eq!((rehomed.rekeyed, rehomed.versions), (2, 1));
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        assert_eq!(
+            copied(&db, alternate).await,
+            (
+                Some("MA15+".to_owned()),
+                Some(15),
+                Some(3),
+                Some("Bridge (2014) - 1080p".to_owned()),
+                Some("An invented adoption fixture.".to_owned()),
+                Some(7.5),
+                Some("Adventure".to_owned()),
+                Some(2014),
+            )
+        );
+        assert_eq!(
+            provider_ids(&db, alternate).await,
+            vec![("Tmdb".to_owned(), "990000005".to_owned())]
+        );
+    }
+
+    /// A version stored under its `Movie` id but not linked under its
+    /// primary: upstream's scan finds the primary's version links short and
+    /// saves it, copying to its versions — so the repair that links it
+    /// copies. One already linked (the 12.x shape) is left as it is, its own
+    /// rating kept: upstream saves no primary for it.
+    #[rstest::rstest]
+    #[case::unlinked(false, "PG-13")]
+    #[case::linked(true, "G")]
+    #[tokio::test]
+    async fn a_version_linked_by_the_repair_takes_its_primarys_rating(
+        #[case] already_linked: bool,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let alternate = seed_placed_version(&db, &g).await;
+        if already_linked {
+            link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
+        }
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+
+        assert_eq!(rehomed.versions, usize::from(!already_linked));
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some(expected));
+    }
+
+    /// [`seed_group`]'s local version stored under its `Movie` id in its
+    /// primary's place but not linked under it, rated `G` where the primary
+    /// is rated `PG-13`. Returns its id.
+    async fn seed_placed_version(db: &Database, g: &Group) -> Uuid {
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        seed_item(db, alternate, BaseItemKind::Movie).await;
+        set_path(db, alternate, ALTERNATE).await;
+        set_columns(
+            db,
+            alternate,
+            r#""OwnerId" = ?2, "PrimaryVersionId" = ?2, "PresentationUniqueKey" = ?3,
+               "ParentId" = ?4, "TopParentId" = ?4, "IsInMixedFolder" = 0,
+               "OfficialRating" = 'G'"#,
+            &[
+                Some(guid_to_db(g.primary)),
+                Some(g.primary.as_simple().to_string()),
+                Some(guid_to_db(g.library)),
+            ],
+        )
+        .await;
+        add_ancestor(db, alternate, g.library).await;
+        set_columns(db, g.primary, r#""OfficialRating" = 'PG-13'"#, &[]).await;
+        alternate
+    }
+
+    /// A persistence service whose copy fails, as a storage failure would;
+    /// nothing else of it is used.
+    struct FailingCopy;
+
+    fn unused<T>() -> Result<T, ServiceError> {
+        Err(ServiceError::Backend("not used by the repair".to_owned()))
+    }
+
+    #[async_trait::async_trait]
+    impl ItemPersistenceService for FailingCopy {
+        async fn delete_items(&self, _: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            unused()
+        }
+        async fn deletion_closure(
+            &self,
+            _: &[Uuid],
+        ) -> Result<Vec<ferrofin_db::entities::base_items::BaseItemEntity>, ServiceError> {
+            unused()
+        }
+        async fn save_items(
+            &self,
+            _: &[ferrofin_db::entities::base_items::BaseItemEntity],
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn set_primary_version_id(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn copy_metadata_to_owned_videos(
+            &self,
+            _: &[Uuid],
+            _: bool,
+            _: bool,
+        ) -> Result<usize, ServiceError> {
+            Err(ServiceError::Backend("disk I/O error".to_owned()))
+        }
+        async fn set_parent_id(&self, _: Uuid, _: Uuid) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn set_collection_type(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn save_item_values(&self, _: Uuid, _: &[(i32, String)]) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn item_exists(&self, _: Uuid) -> Result<bool, ServiceError> {
+            unused()
+        }
+        async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn save_images(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn reattach_user_data(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn update_inherited_values(&self) -> Result<(), ServiceError> {
+            unused()
+        }
+    }
+
+    /// The moves and links commit before the copy: when the copy fails the
+    /// boot stops with the version moved but not yet given its primary's
+    /// rating, the primary still owed its copy and the repair not marked
+    /// done. The next boot, finding the version in place, makes the copy,
+    /// then clears what was owed and marks the repair done.
+    #[tokio::test]
+    async fn a_failed_copy_is_made_on_the_next_boot() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let [adopted, ..] = seed_10_11_rows(&db, &g).await;
+        set_columns(&db, g.primary, r#""OfficialRating" = 'PG-13'"#, &[]).await;
+        set_columns(&db, adopted, r#""OfficialRating" = 'G'"#, &[]).await;
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+
+        assert!(
+            rehome_local_versions(&db, &DERIVATION, None, None, &FailingCopy)
+                .await
+                .is_err()
+        );
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("G"));
+        assert_eq!(
+            pending_copies(&db).await.unwrap(),
+            BTreeSet::from([g.primary])
+        );
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
+        assert_eq!(pending_copies(&db).await.unwrap(), BTreeSet::new());
+        assert!(db.meta_get(COPY_KEY).await.unwrap().is_none());
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A boot that stopped after a version's link committed but before its
+    /// primary's copy leaves nothing to move or link — only the copy owed.
+    /// The next boot makes it before marking the repair done.
+    #[tokio::test]
+    async fn a_copy_owed_by_a_stopped_boot_is_made_with_nothing_left_to_move() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let alternate = seed_placed_version(&db, &g).await;
+        link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
+        db.meta_set(COPY_KEY, &g.primary.to_string()).await.unwrap();
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+
+        assert_eq!(rehomed, RehomedVersions::default());
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
+        assert!(db.meta_get(COPY_KEY).await.unwrap().is_none());
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -2674,7 +3121,7 @@ mod tests {
         )
         .await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -2780,7 +3227,7 @@ mod tests {
         }
         fail_moves(&db).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
             .await
             .unwrap();
         assert_eq!(rehomed.rekeyed, 0);
@@ -2798,7 +3245,7 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
             .await
             .unwrap();
         // The version and the older scan's `Movie` part.
@@ -2839,7 +3286,7 @@ mod tests {
         seed_user(&db, user).await;
         seed_user_data(&db, user, target, true, None).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!((rehomed.rekeyed, rehomed.versions), (1, 1));
@@ -2913,7 +3360,7 @@ mod tests {
         .await;
         link(&db, primary, as_movie, LINKED_ALTERNATE_VERSION, 0).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -2957,7 +3404,7 @@ mod tests {
             }
         };
         let quiet = open("quiet.db").await;
-        rehome_local_versions(&quiet, &DERIVATION, None, None)
+        rehome_local_versions(&quiet, &DERIVATION, None, None, &store(&quiet))
             .await
             .unwrap();
         assert!(!tmp.path().join("quiet.db.pre-rehome").exists());
@@ -2965,7 +3412,7 @@ mod tests {
         let db = open("jellyfin.db").await;
         let g = seed_group(&db).await;
         seed_10_11_rows(&db, &g).await;
-        rehome_local_versions(&db, &DERIVATION, None, None)
+        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert!(tmp.path().join("jellyfin.db.pre-rehome").is_file());
@@ -3024,7 +3471,7 @@ mod tests {
         );
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()

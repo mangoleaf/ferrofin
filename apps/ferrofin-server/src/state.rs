@@ -683,15 +683,17 @@ pub async fn build_app_state(
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
     // or stacked part takes the shape 12.x's scanner stores, so the first
-    // scan writes nothing for it. It needs the id derivation and the folders
-    // named after an item, so it runs here rather than with the others in
-    // `open_database`; nothing has scanned yet.
+    // scan writes nothing for it. It needs the id derivation, the folders
+    // named after an item and the localization that scores the ratings a
+    // primary copies to its versions, so it runs here rather than with the
+    // others in `open_database`; nothing has scanned yet.
     let metadata_library_now = metadata_library.resolve();
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
         &id_derivation,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
+        item_persistence_service.as_ref(),
     )
     .await
     .context("failed to re-home local alternate versions")?;
