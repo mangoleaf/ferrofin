@@ -93,6 +93,9 @@ struct ArtworkCache {
         HashMap<Uuid, Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>>,
     /// Final season names for episode `BeforeSaveInternal`, read once per pass.
     season_names: HashMap<String, Option<String>>,
+    /// Final series names for season and episode `BeforeSaveInternal`, read
+    /// once per pass.
+    series_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
     /// Lookup locales already resolved by this pass's metadata providers.
@@ -6021,6 +6024,7 @@ impl LibraryScanner {
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
         cache.season_names.retain(|id, _| !keys.contains(id));
+        cache.series_names.retain(|id, _| !keys.contains(id));
         cache.locale_parents.retain(|id, _| !keys.contains(id));
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         let albums: Vec<Uuid> = touched
@@ -6586,6 +6590,7 @@ impl LibraryScanner {
         if embedded_title.is_none() {
             settle_extra_name(&mut entity, &item.entity, locked_fields);
         }
+        self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
@@ -9291,9 +9296,43 @@ impl LibraryScanner {
         fold.result
     }
 
+    /// `Episode/SeasonMetadataService.BeforeSaveInternal`: `SeriesName =
+    /// FindSeriesName()` — the finalized parent series' name (including locked
+    /// edits and preserved case) when the series exists, else the child's
+    /// own. A series' rename reaches the children this scan does not refresh
+    /// through the save (`push_name_to_children` in the persistence service).
+    async fn sync_series_name(
+        &self,
+        row: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Result<(), ServiceError> {
+        match item_type_lookup::kind_from_type_name(&row.type_) {
+            Some(BaseItemKind::Series) => {
+                cache.series_names.insert(row.id.clone(), row.name.clone());
+            }
+            Some(BaseItemKind::Season | BaseItemKind::Episode) => {
+                if let Some(key) = row.series_id.as_ref() {
+                    if !cache.series_names.contains_key(key)
+                        && let Some(items) = &self.item_repository
+                        && let Some(id) = parse_id(key)
+                        && let Some(series) = items.retrieve_item(id).await?
+                    {
+                        cache.series_names.insert(key.clone(), series.name);
+                    }
+                    if let Some(name) = cache.series_names.get(key) {
+                        row.series_name.clone_from(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// `EpisodeMetadataService.BeforeSaveInternal` takes the finalized parent
-    /// season's name, including locked edits and preserved case. A season-only
-    /// refresh does not rewrite its episodes until they are refreshed as well.
+    /// season's name, including locked edits and preserved case. A season's
+    /// rename reaches the episodes this scan does not refresh through the
+    /// save (`push_name_to_children` in the persistence service).
     async fn sync_season_name(
         &self,
         row: &mut BaseItemEntity,
@@ -10020,7 +10059,13 @@ impl LibraryScanner {
                     // id is not one it resolves by.
                     let name = lookup.name(row)?;
                     let year = lookup.year(row);
-                    pick_series_hit(tvdb.search(&name, year).await, year)?.tvdb_id
+                    let language = lookup.metadata_language(FetcherPolicy::default());
+                    let names = self.three_letter_language_names(&language);
+                    tvdb.search(&name, year, &language, &names)
+                        .await
+                        .into_iter()
+                        .next()?
+                        .tvdb_id
                 };
                 let country =
                     self.three_letter_country(&lookup.metadata_country(FetcherPolicy::default()));
@@ -15504,20 +15549,6 @@ fn album_name_consensus(tracks: &[BaseItemEntity]) -> Option<String> {
     names.all(|n| n == first).then_some(first)
 }
 
-/// Picks the TVDB series candidate for a folder-derived `year`.
-///
-/// TVDB's `year` query parameter only biases the ranking — it does not filter —
-/// so a same-titled remake can outrank the year the folder actually names
-/// ("Doctor Who (1963)" matching the 2005 series). An exact year match wins;
-/// otherwise the API's own ordering stands.
-fn pick_series_hit(
-    hits: Vec<ferrofin_providers::TvdbSearchHit>,
-    year: Option<i32>,
-) -> Option<ferrofin_providers::TvdbSearchHit> {
-    year.and_then(|y| hits.iter().find(|h| h.year == Some(y)).cloned())
-        .or_else(|| hits.into_iter().next())
-}
-
 /// The item kinds a library's tile collage samples — port of
 /// `DtoExtensions.GetBaseItemKindsForCollectionType`, which
 /// `CollectionFolderImageProvider` uses to pick the rows whose Primary images
@@ -17447,6 +17478,8 @@ impl ResolverGuesses {
         replace_all_metadata: bool,
     ) -> Self {
         entity.sort_name = None;
+        let is_series =
+            item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Series);
         let name = entity.name.take();
         let production_year = entity.production_year.take();
         let index_number = entity.index_number.take();
@@ -17460,12 +17493,27 @@ impl ResolverGuesses {
                 stored.or(path)
             }
         };
+        let name = stored
+            .and_then(|s| s.name.clone())
+            .filter(|n| !n.is_empty())
+            .or(name);
+        // `Series.BeforeMetadataRefresh` runs before the lookup info is read,
+        // on the first refresh too: a series without a year takes the one in
+        // its name ("Show 2026", from a `Show.2026` folder), so the fetchers
+        // search with it and a new row is saved with it.
+        let production_year = stored
+            .and_then(|s| s.production_year)
+            .or(production_year)
+            .or_else(|| {
+                is_series
+                    .then_some(name.as_deref())
+                    .flatten()
+                    .and_then(|name| video_resolver::clean_date_time(name, &PATH_NAMING).year)
+                    .map(i64::from)
+            });
         Self {
-            name: stored
-                .and_then(|s| s.name.clone())
-                .filter(|n| !n.is_empty())
-                .or(name),
-            production_year: stored.and_then(|s| s.production_year).or(production_year),
+            name,
+            production_year,
             index_number: number(stored.and_then(|s| s.index_number), index_number),
             parent_index_number: number(
                 stored.and_then(|s| s.parent_index_number),
@@ -26588,6 +26636,33 @@ mod tests {
         }
     }
 
+    /// A series' lookup year comes from its name before any fetcher runs,
+    /// new or stored, unless it already has one.
+    #[rstest::rstest]
+    #[case::new_series(false, None, Some("Show 2026"), None, Some(2026))]
+    #[case::stored_without_year(true, None, Some("Show 2026"), None, Some(2026))]
+    #[case::stored_year_kept(true, Some(2020), Some("Show 2026"), None, Some(2020))]
+    #[case::resolver_year_kept(false, None, Some("Show 2026"), Some(2024), Some(2024))]
+    #[case::no_year_in_name(false, None, Some("Show"), None, None)]
+    fn a_series_looks_up_with_the_year_in_its_name(
+        #[case] is_stored: bool,
+        #[case] stored_year: Option<i64>,
+        #[case] name: Option<&str>,
+        #[case] resolver_year: Option<i64>,
+        #[case] expected: Option<i64>,
+    ) {
+        let stored = is_stored.then(|| stored_row("TV.Series", "/tv/Show.2026", name, stored_year));
+        let mut scanned = stored_row("TV.Series", "/tv/Show.2026", name, resolver_year);
+        let guesses = super::ResolverGuesses::take(&mut scanned, stored.as_ref(), false);
+        assert_eq!(
+            guesses.year(&scanned),
+            expected.and_then(|y| i32::try_from(y).ok())
+        );
+        let mut new_row = BaseItemEntity::default();
+        guesses.fill(&mut new_row);
+        assert_eq!(new_row.production_year, expected);
+    }
+
     /// `BeforeMetadataRefresh`'s name and year rules, kind by kind: an
     /// empty name is the file name without its extension (a folder's too,
     /// dots and all); a movie, trailer or music video takes the year in its
@@ -34627,36 +34702,6 @@ mod tests {
         assert!(data_of("Avatar (2009)").contains(r#""VideoType":"BluRay""#));
         assert!(data_of("Alien (1979)").contains(r#""VideoType":"Dvd""#));
         assert!(data_of("Heat (1995)").contains(r#""VideoType":"VideoFile""#));
-    }
-
-    #[test]
-    fn series_match_prefers_the_folder_year() {
-        use ferrofin_providers::TvdbSearchHit;
-        let hit = |name: &str, year: i32| TvdbSearchHit {
-            tvdb_id: i64::from(year),
-            name: name.to_owned(),
-            year: Some(year),
-            image_url: None,
-            overview: None,
-        };
-        // TVDB ranks the 2005 revival first; the folder says 1963.
-        let hits = vec![hit("Doctor Who", 2005), hit("Doctor Who", 1963)];
-        assert_eq!(
-            super::pick_series_hit(hits.clone(), Some(1963))
-                .unwrap()
-                .year,
-            Some(1963)
-        );
-        // No year, or no candidate matching it → the API's own ordering stands.
-        assert_eq!(
-            super::pick_series_hit(hits.clone(), None).unwrap().year,
-            Some(2005)
-        );
-        assert_eq!(
-            super::pick_series_hit(hits, Some(1999)).unwrap().year,
-            Some(2005)
-        );
-        assert!(super::pick_series_hit(Vec::new(), Some(1963)).is_none());
     }
 
     /// `Set3DFormat` (`BaseVideoResolver.cs:201-250`) maps the 3D format

@@ -569,53 +569,6 @@ pub async fn build_app_state(
         Some(base) => fanart_client.with_base_url(base),
         None => fanart_client,
     });
-    let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
-        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
-            Arc::clone(&tmdb_client),
-            ferrofin_providers::TmdbKind::Movie,
-        )),
-        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
-            Arc::clone(&tmdb_client),
-            ferrofin_providers::TmdbKind::Series,
-        )),
-        Arc::new(ferrofin_providers::TvdbSearchProvider::new(Arc::clone(
-            &the_tvdb,
-        ))),
-        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
-            Arc::clone(&omdb_client),
-            ferrofin_providers::OmdbKind::Movie,
-        )),
-        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
-            Arc::clone(&omdb_client),
-            ferrofin_providers::OmdbKind::Series,
-        )),
-        // Box sets identify against TMDB's collections, a separate endpoint.
-        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
-            Arc::clone(&tmdb_client),
-        )),
-        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
-        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
-            Arc::clone(&omdb_client),
-        )),
-        // People identify against TMDB's person search.
-        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
-            Arc::clone(&tmdb_client),
-        )),
-        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
-        // (selectable by name) but, as in Jellyfin, has no name search.
-        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
-            Arc::clone(&musicbrainz_client),
-        )),
-        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
-            Arc::clone(&musicbrainz_client),
-        )),
-        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
-            ferrofin_model::data::BaseItemKind::MusicAlbum,
-        )),
-        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
-            ferrofin_model::data::BaseItemKind::MusicArtist,
-        )),
-    ];
     // Studio logos from the artwork repository (name-matched, keyless). The repo
     // URL is overridable; empty falls back to the built-in emby-artwork tree.
     let studios_client = Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
@@ -676,6 +629,54 @@ pub async fn build_app_state(
     );
     let localization: Arc<dyn ferrofin_traits::localization::LocalizationManager> =
         localization_impl.clone();
+    let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
+        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::TmdbSearchProvider::new(
+            Arc::clone(&tmdb_client),
+            ferrofin_providers::TmdbKind::Series,
+        )),
+        Arc::new(
+            ferrofin_providers::TvdbSearchProvider::new(Arc::clone(&the_tvdb))
+                .with_localization(Arc::clone(&localization)),
+        ),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Movie,
+        )),
+        Arc::new(ferrofin_providers::OmdbSearchProvider::new(
+            Arc::clone(&omdb_client),
+            ferrofin_providers::OmdbKind::Series,
+        )),
+        // Box sets identify against TMDB's collections, a separate endpoint.
+        Arc::new(ferrofin_providers::TmdbBoxSetSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Trailers: OMDb's `IRemoteMetadataProvider<Trailer, TrailerInfo>`.
+        Arc::new(ferrofin_providers::OmdbSearchProvider::for_trailers(
+            Arc::clone(&omdb_client),
+        )),
+        // People identify against TMDB's person search.
+        Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
+            Arc::clone(&tmdb_client),
+        )),
+        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
+        // (selectable by name) but, as in Jellyfin, has no name search.
+        Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::MusicBrainzArtistSearchProvider::new(
+            Arc::clone(&musicbrainz_client),
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicAlbum,
+        )),
+        Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
+            ferrofin_model::data::BaseItemKind::MusicArtist,
+        )),
+    ];
     // An owned video's parental score follows the ratings its owner gives it.
     item_persistence_impl.set_localization(Arc::clone(&localization));
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =

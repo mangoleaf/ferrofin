@@ -64,6 +64,23 @@ release changes what a refresh does once it runs:
   now bind in any letter case, as Jellyfin's do. The reported path is scanned once
   `LibraryMonitorDelay` has passed, so a library on a network share that the disk watcher
   cannot see no longer waits for the next scheduled scan.
+- A series identified by name on TheTVDB is searched and chosen as the TVDB plugin does:
+  the search is the name without a trailing year or release tags (a `Show.2026` folder
+  searches "show", not "show 2026"); results whose title (in the metadata language, or an
+  alias) equals or contains the name rank first; and a known year drops every result more
+  than a year away. 1.3.x searched with the year left in the name and took TheTVDB's first
+  result unless one had exactly the item's year, so a folder whose name ends in a year
+  could match an unrelated show.
+  An already-matched series keeps its match: the ids that match stored (TheTVDB's, and the
+  IMDb and TheMovieDb ids that came with it) win over a new search. To re-match one, use
+  **Identify**, which replaces them; or clear its TheTVDB, IMDb and TheMovieDb ids in the
+  metadata editor, then choose **Refresh metadata → Replace all metadata**.
+- A season's and an episode's series name, and an episode's season name, are now those of
+  its series and season, as in Jellyfin. 1.3.x kept the series name the folder gave
+  ("Show 2026") on every season and episode, even after a provider named the series. The
+  first start after upgrading corrects the rows saved before, once, and logs how many (on
+  one test library, 3,223 seasons and episodes across 53 series); each changed row gets a
+  new `Etag`, so clients refetch it once.
 
 Apart from scans, deleting an item now deletes its files, and who may delete one follows
 Jellyfin's rules:

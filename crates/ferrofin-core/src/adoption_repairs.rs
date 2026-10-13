@@ -105,7 +105,55 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
             "re-typed merged version links as linked alternate versions"
         );
     }
+    let renamed = sync_child_parent_names(db).await?;
+    if renamed > 0 {
+        tracing::info!(
+            items = renamed,
+            "synced seasons' and episodes' series and season names with their parents"
+        );
+    }
     Ok(())
+}
+
+/// Ferrofin before 1.4.0 saved an episode or season with the series name its
+/// folder gave (`Show.2026` → "Show 2026") and never updated it when a
+/// provider renamed the series; upstream's `BeforeSaveInternal` keeps a
+/// child's `SeriesName` (an episode's `SeasonName`) equal to its parent's
+/// `Name`, and scan saves now do too. This brings the rows saved before into
+/// line, stamping `DateLastSaved` so clients refetch them. Runs once per
+/// database; an adopted Jellyfin database is already in line and changes
+/// nothing.
+///
+/// Returns the number of rows changed.
+///
+/// # Errors
+/// Returns [`ServiceError`] if an update fails.
+pub async fn sync_child_parent_names(db: &Database) -> Result<u64, ServiceError> {
+    const KEY: &str = "child_parent_names_synced_v140";
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    let now = ferrofin_db::store::datetime_to_db(chrono::Utc::now());
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut changed = 0;
+    for (name, parent) in [("SeriesName", "SeriesId"), ("SeasonName", "SeasonId")] {
+        let sql = format!(
+            r#"UPDATE "BaseItems" SET "{name}" = parent."Name", "DateLastSaved" = ?1
+               FROM "BaseItems" AS parent
+               WHERE parent."Id" = "BaseItems"."{parent}"
+                 AND nullif(parent."Name", '') IS NOT NULL
+                 AND "BaseItems"."{name}" IS NOT parent."Name""#
+        );
+        changed += sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+    }
+    tx.commit().await.map_err(db_err)?;
+    done(db, KEY).await?;
+    Ok(changed)
 }
 
 /// A `ferrofin-db` error on the bookkeeping tables, as a service error.
@@ -1997,6 +2045,65 @@ mod tests {
         seed_folder_item, seed_item, seed_named_item, seed_provider_id, seed_user, seed_user_data,
         test_db,
     };
+
+    #[tokio::test]
+    async fn child_parent_names_are_synced_once() {
+        let db = test_db().await;
+        let (series, season, episode) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_named_item(&db, season, BaseItemKind::Season, "Season 1").await;
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        for (id, series_name, season_id, season_name) in [
+            (season, "Show 2026", None, None),
+            (
+                episode,
+                "Show 2026",
+                Some(guid_to_db(season)),
+                Some("Season One"),
+            ),
+        ] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "SeriesName" = ?3,
+                       "SeasonId" = ?4, "SeasonName" = ?5 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(series))
+            .bind(series_name)
+            .bind(season_id)
+            .bind(season_name)
+            .execute(db.writer())
+            .await
+            .expect("child");
+        }
+        let names = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    r#"SELECT "SeriesName", "SeasonName", "DateLastSaved" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+            }
+        };
+
+        assert_eq!(sync_child_parent_names(&db).await.expect("sync"), 3);
+        let (series_name, season_name, saved) = names(episode).await;
+        assert_eq!(series_name.as_deref(), Some("Show"));
+        assert_eq!(season_name.as_deref(), Some("Season 1"));
+        assert!(saved.is_some(), "a synced row is re-stamped");
+        assert_eq!(names(season).await.0.as_deref(), Some("Show"));
+        assert_eq!(names(series).await.0, None, "a series has no SeriesName");
+
+        // Once per database.
+        sqlx::query(r#"UPDATE "BaseItems" SET "SeriesName" = 'Stale' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(episode))
+            .execute(db.writer())
+            .await
+            .expect("stale again");
+        assert_eq!(sync_child_parent_names(&db).await.expect("again"), 0);
+    }
 
     async fn set_path(db: &Database, id: Uuid, path: &str) {
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)

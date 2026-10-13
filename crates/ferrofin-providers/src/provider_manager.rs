@@ -246,13 +246,29 @@ impl TmdbSearchProvider {
 /// series. Returns candidates carrying their `Tvdb` provider id.
 pub struct TvdbSearchProvider {
     tvdb: Arc<crate::tvdb::TvdbClient>,
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl TvdbSearchProvider {
     /// A TVDB series search provider.
     #[must_use]
     pub fn new(tvdb: Arc<crate::tvdb::TvdbClient>) -> Self {
-        Self { tvdb }
+        Self {
+            tvdb,
+            localization: None,
+        }
+    }
+
+    /// The culture table that maps the lookup's metadata language onto
+    /// TheTVDB's ISO 639-2 translation keys, so results rank by their name in
+    /// that language. Without it they rank by their own name.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
     }
 }
 
@@ -331,9 +347,13 @@ impl RemoteSearchProvider for TvdbSearchProvider {
         let Some(name) = search_info.name.as_deref().filter(|n| !n.is_empty()) else {
             return Ok(Vec::new());
         };
+        let language = search_info.metadata_language.clone().unwrap_or_default();
+        let names = self.localization.as_ref().map_or_else(Vec::new, |l| {
+            crate::tvdb::three_letter_language_names(&l.get_cultures(), &language)
+        });
         Ok(self
             .tvdb
-            .search(name, search_info.year)
+            .search(name, search_info.year, &language, &names)
             .await
             .into_iter()
             .map(|hit| RemoteSearchResult {
@@ -599,7 +619,7 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 ///
 /// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
 /// built once for the process rather than per search request.
-fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
+pub(crate) fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
     static OPTIONS: std::sync::OnceLock<ferrofin_naming::common::NamingOptions> =
         std::sync::OnceLock::new();
     OPTIONS.get_or_init(ferrofin_naming::common::NamingOptions::new)

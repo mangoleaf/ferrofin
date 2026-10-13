@@ -1211,9 +1211,54 @@ impl FerrofinItemPersistenceService {
             query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
         query.execute(self.db.writer()).await.map_err(db_err)?;
+        if scan {
+            self.push_name_to_children(item).await?;
+        }
+        Ok(())
+    }
+
+    /// `BeforeSaveInternal` names an episode or a season after its parents
+    /// (`FindSeriesName()`, `FindSeasonName()`), and upstream's library scan
+    /// saves every child, so a renamed series' children take its name on the
+    /// next scan. A Ferrofin scan leaves unchanged children alone (the scan
+    /// names the ones it refreshes, `sync_series_name`/`sync_season_name`),
+    /// so a saved series (season) writes its STORED name — a locked one's
+    /// included — onto its seasons and episodes (episodes) here, stamping
+    /// `DateLastSaved` so clients see the change. Like upstream's
+    /// `BeforeSaveInternal`, a child's own lock does not keep a custom
+    /// series (season) name.
+    async fn push_name_to_children(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+        let sql = match crate::item_type_lookup::kind_from_type_name(&item.type_) {
+            Some(BaseItemKind::Series) => CHILD_SERIES_NAME_SQL,
+            Some(BaseItemKind::Season) => CHILD_SEASON_NAME_SQL,
+            _ => return Ok(()),
+        };
+        sqlx::query(sql)
+            .bind(datetime_to_db(chrono::Utc::now()))
+            .bind(&item.id)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 }
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a series:
+/// its seasons and episodes (the only rows with a `SeriesId`), through
+/// `IX_BaseItems_SeriesId`.
+const CHILD_SERIES_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeriesName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeriesId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeriesName" IS NOT parent."Name""#;
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a season:
+/// its episodes, through `IX_BaseItems_SeasonId`.
+const CHILD_SEASON_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeasonName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeasonId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeasonName" IS NOT parent."Name""#;
 
 /// One `BaseItems` column value as [`FerrofinItemPersistenceService`] binds
 /// it: dates already in [`datetime_to_db`]'s text form, so two values compare
@@ -8947,6 +8992,95 @@ mod tests {
             !links.contains_key(&bare),
             "an item with no rows reads as no entry"
         );
+    }
+
+    /// A saved series (season) pushes its stored name onto children the scan
+    /// does not save; a locked parent's stored name wins over the incoming
+    /// one. Editor saves push nothing (the editor has its own cascade).
+    #[tokio::test]
+    async fn a_saved_parent_pushes_its_stored_name_to_its_children() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_db::store::guid_to_db;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (series, season, episode) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let row = |id: Uuid, kind: &str, name: &str| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: format!("MediaBrowser.Controller.Entities.TV.{kind}"),
+            name: Some(name.to_owned()),
+            series_id: (kind != "Series").then(|| guid_to_db(series)),
+            season_id: (kind == "Episode").then(|| guid_to_db(season)),
+            series_name: (kind != "Series").then(|| "Show 2026".to_owned()),
+            season_name: (kind == "Episode").then(|| "Season 1".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        svc.save_items(&[
+            row(series, "Series", "Show 2026"),
+            row(season, "Season", "Season 1"),
+            row(episode, "Episode", "Pilot"),
+        ])
+        .await
+        .expect("seed");
+        let names = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    r#"SELECT "SeriesName", "SeasonName", "DateLastSaved" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+            }
+        };
+        let saved_before = names(episode).await.2;
+
+        // An editor save of the series pushes nothing.
+        svc.save_items(&[row(series, "Series", "Edited")])
+            .await
+            .expect("editor save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show 2026"));
+
+        // A provider renames the series: its season and episode follow.
+        svc.save_scanned_items(&[row(series, "Series", "Show")])
+            .await
+            .expect("rename");
+        assert_eq!(names(season).await.0.as_deref(), Some("Show"));
+        let (series_name, _, saved) = names(episode).await;
+        assert_eq!(series_name.as_deref(), Some("Show"));
+        assert_ne!(
+            saved, saved_before,
+            "the pushed rename stamps DateLastSaved"
+        );
+
+        // A renamed season pushes onto its episodes.
+        svc.save_scanned_items(&[row(season, "Season", "Specials")])
+            .await
+            .expect("season rename");
+        assert_eq!(names(episode).await.1.as_deref(), Some("Specials"));
+
+        // A locked series keeps its stored name, and pushes that one.
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(series))
+            .execute(db.writer())
+            .await
+            .expect("lock");
+        svc.save_scanned_items(&[row(series, "Series", "Incoming")])
+            .await
+            .expect("locked save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show"));
+
+        // Both pushes stay on their parent-id index.
+        for (sql, index) in [
+            (super::CHILD_SERIES_NAME_SQL, "IX_BaseItems_SeriesId"),
+            (super::CHILD_SEASON_NAME_SQL, "IX_BaseItems_SeasonId"),
+        ] {
+            let plan = query_plan(&db, sql, 2).await;
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{sql}: {plan:?}"
+            );
+        }
     }
 
     // One test for the whole scan statement: its guards are derived from one

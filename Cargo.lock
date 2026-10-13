@@ -1555,6 +1555,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
+ "regex",
  "reqwest",
  "rstest",
  "secrecy",
@@ -1565,6 +1566,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
  "zip 8.6.0",
 ]

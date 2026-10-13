@@ -424,9 +424,12 @@ struct SearchItem {
     #[serde(alias = "tvdb_id")]
     tvdb_id: Option<String>,
     name: Option<String>,
-    year: Option<String>,
+    first_air_time: Option<String>,
     overview: Option<String>,
     image_url: Option<String>,
+    aliases: Option<Vec<String>>,
+    /// Language (ISO 639-2) → name.
+    translations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,30 +811,98 @@ impl TvdbClient {
         env.data
     }
 
-    /// Searches TVDB for a series by name (optionally narrowed by year),
-    /// returning ranked candidates. Port of `FindSeries`.
-    pub async fn search(&self, name: &str, year: Option<i32>) -> Vec<TvdbSearchHit> {
-        let mut query = vec![
-            ("query", name.to_owned()),
+    /// Searches TVDB for a series by name. Port of `TvdbSeriesProvider.FindSeries`
+    /// + `FindSeriesInternal`'s query, ranking and filter (each hit carries its
+    /// Tvdb id only: upstream also reads every hit's extended record for its
+    /// IMDb, Zap2It and TMDb ids, which this does not):
+    ///
+    /// - the query is `name` parsed (`ParseName`: no trailing year, no release
+    ///   clutter) in its comparable form ([`comparable_name`]), five results,
+    ///   no year in the request — a `Show.2026` folder searches `show`;
+    /// - each hit's titles are its name in `language` (else its name) and its
+    ///   aliases, and its year is its first air date's;
+    /// - the hits are ranked: a title equal to `name`, then a title containing
+    ///   the parsed name, then the year parsed from `name`, then a title
+    ///   containing the comparable name, then TVDB's order;
+    /// - a known `year` drops every hit dated more than a year from it (a hit
+    ///   without a date is kept).
+    ///
+    /// `three_letter_names` are `language`'s ISO 639-2 codes
+    /// ([`three_letter_language_names`]), which the translations are keyed by.
+    pub async fn search(
+        &self,
+        name: &str,
+        year: Option<i32>,
+        language: &str,
+        three_letter_names: &[String],
+    ) -> Vec<TvdbSearchHit> {
+        let options = crate::provider_manager::naming_options();
+        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
+        let parsed_year = parsed.year;
+        let parsed_name =
+            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
+                .unwrap_or(parsed.name);
+        let comparable = comparable_name(&parsed_name);
+        let query = vec![
+            ("query", comparable.clone()),
             ("type", "series".to_owned()),
-            ("limit", "10".to_owned()),
+            ("limit", "5".to_owned()),
         ];
-        if let Some(y) = year {
-            query.push(("year", y.to_string()));
-        }
         let items: Vec<SearchItem> = self.get("/search", &query).await.unwrap_or_default();
-        items
+        let mut ranked: Vec<(Vec<String>, TvdbSearchHit)> = items
             .into_iter()
             .filter_map(|it| {
                 let tvdb_id = it.tvdb_id.as_deref()?.parse::<i64>().ok()?;
-                let name = it.name?;
-                Some(TvdbSearchHit {
-                    tvdb_id,
-                    name,
-                    year: it.year.as_deref().and_then(|y| y.parse::<i32>().ok()),
-                    image_url: it.image_url,
-                    overview: it.overview,
-                })
+                let title = it
+                    .translations
+                    .as_ref()
+                    .and_then(|translations| {
+                        translations.iter().find_map(|(lang, title)| {
+                            translation_matches(lang, language, three_letter_names)
+                                .then(|| title.clone())
+                        })
+                    })
+                    .or(it.name)?;
+                let mut titles = vec![title.clone()];
+                titles.extend(it.aliases.unwrap_or_default());
+                // `DateTime.TryParse(First_air_time)`; never the `year` field.
+                let year = it.first_air_time.as_deref().and_then(year_of);
+                Some((
+                    titles,
+                    TvdbSearchHit {
+                        tvdb_id,
+                        name: title,
+                        year,
+                        image_url: it.image_url,
+                        overview: it.overview,
+                    },
+                ))
+            })
+            .collect();
+        let contains = |titles: &[String], needle: &str| {
+            let needle = needle.to_lowercase();
+            titles
+                .iter()
+                .any(|title| title.to_lowercase().contains(&needle))
+        };
+        // `OrderBy` … `ThenBy(list.IndexOf)`: a stable sort keeps TVDB's order.
+        ranked.sort_by_key(|(titles, hit)| {
+            (
+                !titles
+                    .iter()
+                    .any(|title| title.to_lowercase() == name.to_lowercase()),
+                !contains(titles, &parsed_name),
+                !(hit.year.is_some() && hit.year == parsed_year),
+                !contains(titles, &comparable),
+            )
+        });
+        ranked
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .filter(|hit| match (year, hit.year) {
+                // "Allow one year tolerance".
+                (Some(year), Some(hit_year)) => (year - hit_year).abs() <= 1,
+                _ => true,
             })
             .collect()
     }
@@ -1172,6 +1243,32 @@ impl TvdbClient {
         let resp = crate::image_download::send(&self.http, url).await.ok()?;
         resp.counted_bytes().await.ok()
     }
+}
+
+/// `TvdbUtils.GetComparableName`: lower-cased (NFC), `", the"` and `"the "`
+/// removed, `&` spelled "and", modifier letters and non-spacing marks
+/// removed, and every run of non-word characters (and `_`) one space.
+///
+/// ACCEPTED DIVERGENCE (don't-port-bugs): upstream removes `"the "` inside a
+/// word too, so "Breathe Easy" searches as "brea easy"; here it must start a
+/// word.
+#[must_use]
+pub fn comparable_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    static THE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bthe ").expect("valid regex"));
+    static MARKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\p{Lm}\p{Mn}]").expect("valid regex"));
+    static SEPARATORS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\W\p{Pc}]+").expect("valid regex"));
+    let name = name
+        .to_lowercase()
+        .nfc()
+        .collect::<String>()
+        .replace(", the", "");
+    let name = THE.replace_all(&name, " ").replace('&', " and ");
+    let name = MARKS.replace_all(&name, "");
+    SEPARATORS.replace_all(&name, " ").trim().to_owned()
 }
 
 /// The four-digit year in a `YYYY-MM-DD` (or `YYYY…`) date string.
@@ -1598,7 +1695,7 @@ mod tests {
         // name is dropped.
         let items: Vec<SearchItem> = serde_json::from_str(
             r#"[
-              { "tvdb_id": "121361", "name": "Game of Thrones", "year": "2011", "image_url": "/p.jpg" },
+              { "tvdb_id": "121361", "name": "Game of Thrones", "first_air_time": "2011-04-17", "image_url": "/p.jpg" },
               { "name": "No Id" },
               { "tvdb_id": "abc", "name": "Bad Id" }
             ]"#,
@@ -1611,7 +1708,7 @@ mod tests {
                 Some(TvdbSearchHit {
                     tvdb_id,
                     name: it.name?,
-                    year: it.year.as_deref().and_then(|y| y.parse().ok()),
+                    year: it.first_air_time.as_deref().and_then(year_of),
                     image_url: it.image_url,
                     overview: it.overview,
                 })
@@ -1620,6 +1717,74 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tvdb_id, 121_361);
         assert_eq!(hits[0].year, Some(2011));
+    }
+
+    #[rstest::rstest]
+    #[case::lower_cased("Show", "show")]
+    #[case::trailing_article(", The Show", "show")]
+    #[case::leading_article("The Show", "show")]
+    #[case::inner_article("Back to the Future", "back to future")]
+    #[case::article_inside_a_word_kept("Breathe Easy", "breathe easy")]
+    #[case::article_before_punctuation_kept("The-Show", "the show")]
+    #[case::trailing_article_kept("Kill the", "kill the")]
+    #[case::lone_article_kept("The", "the")]
+    #[case::ampersand("Law & Order", "law and order")]
+    #[case::punctuation_runs("Star Trek: The Next Generation", "star trek next generation")]
+    #[case::underscore("Mr_Robot", "mr robot")]
+    #[case::combining_mark("Cafe\u{301}", "café")]
+    fn comparable_name_follows_get_comparable_name(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(comparable_name(name), expected);
+    }
+
+    #[tokio::test]
+    async fn search_queries_the_bare_name_ranks_like_find_series_and_keeps_hits_within_a_year() {
+        use crate::mock_http::MockServer;
+        // Only the request FindSeriesInternal sends is answered: the year and
+        // the release clutter are parsed off the name and never sent.
+        let server = MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            (
+                "/search?query=show&type=series&limit=5",
+                r#"{"data":[
+                  {"tvdb_id":"1","name":"Unrelated","first_air_time":"2020-01-01"},
+                  {"tvdb_id":"2","name":"Show","first_air_time":"2025-12-31"},
+                  {"tvdb_id":"3","name":"Show Again"},
+                  {"tvdb_id":"4","name":"Show Later","year":"2028"},
+                  {"tvdb_id":"5","name":"Serie","translations":{"deu":"Serie","eng":"Show"}}
+                ]}"#
+                .to_owned(),
+            ),
+        ])
+        .await;
+        let c = TvdbClient::new().with_base_url(&server.base_url);
+        let english = vec!["eng".to_owned()];
+        let ids = |hits: Vec<TvdbSearchHit>| hits.iter().map(|h| h.tvdb_id).collect::<Vec<_>>();
+
+        // OrderBy: a title equal to the name (5's English name too), then a
+        // title containing it, then TVDB's order.
+        assert_eq!(
+            ids(c.search("Show", None, "en", &english).await),
+            [2, 5, 3, 4, 1]
+        );
+        // Without the language, 5 ranks by its own name.
+        assert_eq!(ids(c.search("Show", None, "", &[]).await), [2, 3, 4, 1, 5]);
+        // A year in the name is parsed off the query. No title equals the
+        // raw name, so the titles containing "Show" keep TVDB's order; the
+        // known year keeps the hits first aired within a year of it, and
+        // those with no first air date (4 has only TVDB's `year`).
+        assert_eq!(
+            ids(c
+                .search("Show.2026.1080p", Some(2026), "en", &english)
+                .await),
+            [2, 3, 4, 5]
+        );
+        let first = c.search("Show", None, "en", &english).await;
+        assert_eq!(first[1].name, "Show", "the hit carries its translated name");
+        assert_eq!(
+            first[0].year,
+            Some(2025),
+            "the year is the first air date's"
+        );
     }
 
     #[tokio::test]
@@ -1662,7 +1827,7 @@ mod tests {
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
 
-        let hits = c.search("Game of Thrones", Some(2011)).await;
+        let hits = c.search("Game of Thrones", Some(2011), "en", &[]).await;
         assert_eq!(hits.first().map(|h| h.tvdb_id), Some(121_361));
 
         let d = c.series_details(121_361, "usa").await.expect("series");
@@ -1699,7 +1864,7 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None).await.is_empty());
+        assert!(c.search("x", None, "en", &[]).await.is_empty());
         assert!(c.series_details(1, "usa").await.is_none());
     }
 
@@ -1707,7 +1872,7 @@ mod tests {
     #[ignore = "hits the live TVDB API; run with --ignored"]
     async fn live_search_and_details_smoke() {
         let c = TvdbClient::new();
-        let hits = c.search("Game of Thrones", None).await;
+        let hits = c.search("Game of Thrones", None, "en", &[]).await;
         assert!(
             hits.iter().any(|h| h.tvdb_id == 121_361),
             "expected GoT (121361) in {hits:?}"
