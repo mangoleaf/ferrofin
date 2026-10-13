@@ -705,11 +705,18 @@ fn load_culture_data() -> CultureData {
         let iso639_2b = cols.next().unwrap_or("");
         let iso639_1 = cols.next().unwrap_or("");
         let display_name = cols.next().unwrap_or("");
-        // C# skips a row when the two-letter code or the English name is empty — which is
-        // why only the ~200 languages that have an ISO 639-1 code appear in the list.
-        if iso639_1.is_empty() || display_name.is_empty() {
+        // C# skips a row only when the English name is blank. Since Jellyfin 12
+        // (upstream 553f38a237) a row with no ISO 639-1 code is kept with an empty
+        // two-letter code, so ISO 639-2-only languages (`und`, `mul`, `zxx`, …)
+        // resolve too: all 496 rows of the vendored table.
+        if display_name.trim().is_empty() {
             continue;
         }
+        let iso639_1 = if iso639_1.trim().is_empty() {
+            ""
+        } else {
+            iso639_1
+        };
         // Name = the two-letter code when it is a region tag (contains '-'), else the
         // English display name (C# `twoCharName.Contains('-') ? twoCharName : displayName`).
         let name = if iso639_1.contains('-') {
@@ -922,6 +929,10 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
         LocalizationManager::get_localized_string_for(self, phrase, culture)
     }
 
+    fn find_language_info(&self, language: &str) -> Option<CultureDto> {
+        LocalizationManager::find_language_info(self, language).cloned()
+    }
+
     fn get_language_display_name(&self, language: &str) -> Option<String> {
         LocalizationManager::get_language_display_name(self, language)
     }
@@ -1050,7 +1061,7 @@ mod tests {
         assert!(m.find_language_info("zzz").is_none());
     }
 
-    // The full iso6392.txt list is served (Jellyfin's ~200 ISO-639-1 languages), each with
+    // The full iso6392.txt list is served (every row, ISO 639-1 code or not), each with
     // Name = the English display name — regression for the compact 21-language subset.
     #[test]
     fn cultures_cover_the_full_iso6392_list() {
@@ -1422,19 +1433,30 @@ mod tests {
     fn cultures_preserve_file_order() {
         let m = shipped(DEFAULT_METADATA_COUNTRY_CODE);
         let cultures = m.get_cultures();
-        assert_eq!(cultures.len(), 194);
-        let head: Vec<&str> = cultures
+        // Upstream `GetCultures_All_Success` (v12.2 `LocalizationManagerTests.cs:46`).
+        assert_eq!(cultures.len(), 496);
+        let head: Vec<(&str, &str)> = cultures
             .iter()
-            .take(6)
-            .map(|c| c.two_letter_iso_language_name.as_str())
+            .take(4)
+            .map(|c| {
+                (
+                    c.three_letter_iso_language_name
+                        .as_deref()
+                        .unwrap_or_default(),
+                    c.two_letter_iso_language_name.as_str(),
+                )
+            })
             .collect();
-        // File order (ISO 639-2/T), which is *not* two-letter-code order: "af" precedes "ak"
-        // and "am", but "ar" trails them.
-        assert_eq!(head, ["aa", "ab", "af", "ak", "am", "ar"]);
+        // File order (ISO 639-2/T); a row with no ISO 639-1 code keeps an empty
+        // two-letter code (Jellyfin 12 `LoadCultures`).
+        assert_eq!(
+            head,
+            [("aar", "aa"), ("abk", "ab"), ("ace", ""), ("ach", "")]
+        );
         assert_eq!(cultures[0].display_name, "Afar");
         assert_eq!(
             cultures.last().map(|c| c.display_name.as_str()),
-            Some("Zulu")
+            Some("Zaza; Dimili; Dimli; Kirdki; Kirmanjki; Zazaki")
         );
         // Region tags keep the two-letter column as their Name (C# behaviour).
         let hk = cultures
@@ -1971,6 +1993,37 @@ mod tests {
         assert_eq!(m.try_get_iso6392_t_from_b("ger").as_deref(), Some("deu"));
         assert_eq!(m.try_get_iso6392_t_from_b("chi").as_deref(), Some("zho"));
         assert_eq!(m.try_get_iso6392_t_from_b("eng"), None);
+    }
+
+    /// Upstream `FindLanguageInfo_ISO6392Only_Success` (v12.2
+    /// `LocalizationManagerTests.cs:104-121`): ISO 639-2-only codes resolve,
+    /// with the raw, untruncated English name.
+    #[rstest]
+    #[case("mul", "Multiple languages")]
+    #[case("und", "Undetermined")]
+    #[case("mis", "Uncoded languages")]
+    #[case("zxx", "No linguistic content; Not applicable")]
+    fn find_language_info_iso6392_only(#[case] code: &str, #[case] expected_display_name: &str) {
+        let m = LocalizationManager::default();
+        let culture = m.find_language_info(code).expect("ISO 639-2-only culture");
+        assert_eq!(culture.display_name, expected_display_name);
+        assert_eq!(
+            culture.three_letter_iso_language_name.as_deref(),
+            Some(code)
+        );
+        assert_eq!(culture.two_letter_iso_language_name, "");
+    }
+
+    /// The trait seam's `find_language_info` is the inherent lookup, cloned.
+    #[test]
+    fn trait_find_language_info_matches_the_inherent_lookup() {
+        let m = LocalizationManager::default();
+        let via_trait: &dyn LocalizationManagerTrait = &m;
+        let german = via_trait.find_language_info("ger").expect("German");
+        assert_eq!(german.display_name, "German");
+        assert_eq!(Some(&german), m.find_language_info("ger"));
+        assert!(via_trait.find_language_info("").is_none());
+        assert!(via_trait.find_language_info("zzz").is_none());
     }
 
     #[rstest]

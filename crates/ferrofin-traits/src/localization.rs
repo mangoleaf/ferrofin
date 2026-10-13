@@ -53,6 +53,13 @@ pub trait LocalizationManager: Send + Sync {
     /// the same fallbacks (C# `GetLocalizedString(phrase, culture)`).
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String;
 
+    /// The culture matching a language token by display name, name, two-letter
+    /// code or any three-letter code, ignoring ASCII case; `None` for an empty
+    /// or unknown token (C# `FindLanguageInfo`). Unlike
+    /// [`Self::get_language_display_name`], the culture's `display_name` is the
+    /// raw `iso6392.txt` English name, never truncated at `;`/`,`.
+    fn find_language_info(&self, language: &str) -> Option<CultureDto>;
+
     /// The display name of a language code (`"eng"` → `"English"`), `None`
     /// when unknown (C# `GetLanguageDisplayName`).
     fn get_language_display_name(&self, language: &str) -> Option<String>;

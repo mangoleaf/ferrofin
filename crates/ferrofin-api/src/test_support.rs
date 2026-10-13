@@ -2179,6 +2179,9 @@ impl LocalizationManager for FakeLocalization {
     fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
         phrase.to_owned()
     }
+    fn find_language_info(&self, _language: &str) -> Option<CultureDto> {
+        None
+    }
     fn get_language_display_name(&self, _language: &str) -> Option<String> {
         None
     }

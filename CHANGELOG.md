@@ -47,6 +47,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   upstream, every media-stream filter (these two, `hasSubtitles`, `isHd`, `is4K`, `is3D`,
   `videoTypes`) now keeps alternate versions in the query, and the legacy
   `GET /Users/{userId}/Items` ignores both lists
+- Publish Jellyfin 12's `AudioLanguages` and `SubtitleLanguages` facets on
+  `GET /Items/Filters2` for movie and TV type sets: each distinct stream language as
+  `{Name: "English (eng)", Value: "eng"}`, alternate versions included, show and season
+  sets widened to their episodes, sorted by name in the request culture. ISO 639-2-only
+  codes (`und`, `mul`, `zxx`, …) now resolve as in Jellyfin 12, so `/Localization/Cultures`
+  and the metadata editor's language list carry all 496 languages (was 194). Clients see
+  this in subtitle menus: a subtitle track tagged `und` is now titled "Undetermined" (was
+  "Und"), and `mul`, `zxx` and `mis` tracks read "Multiple languages", "No linguistic
+  content" and "Uncoded languages". External subtitle files named with these codes
+  (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
+  `GET /Items/Filters` is unchanged
 - `hasSubtitles`, `isHd`, `is4K` and `minWidth`/`minHeight`/`maxWidth`/`maxHeight` judge a
   merged item by its whole version group, as Jellyfin 12 does: a movie whose subtitles or
   4K file live only on its second version matches, listed under the primary, and an SD

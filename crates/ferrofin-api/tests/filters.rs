@@ -20,7 +20,7 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, MediaType};
-use ferrofin_model::dto::{BaseItemDto, NameGuidPair, RecommendationType};
+use ferrofin_model::dto::{BaseItemDto, NameGuidPair, NameValuePair, RecommendationType};
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFilters, QueryFiltersLegacy, QueryResult};
 use ferrofin_model::search::{SearchHint, SearchQuery};
@@ -35,6 +35,7 @@ use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use ferrofin_traits::persistence::ItemWithCounts;
+use rstest::rstest;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -343,6 +344,11 @@ struct StubLibrary {
     /// `Id` is not a Guid (a corrupt/adopted row) — the case the handler must
     /// drop rather than publish as the nil GUID.
     malformed_genre_id: bool,
+    /// The last query passed to [`LibraryManager::get_media_stream_languages`]
+    /// (the handler's stream-language query).
+    last_stream_query: Mutex<Option<InternalItemsQuery>>,
+    /// Overrides the canned `(audio, subtitle)` language codes.
+    stream_languages: Option<(Vec<&'static str>, Vec<&'static str>)>,
 }
 
 #[async_trait]
@@ -422,13 +428,22 @@ impl LibraryManager for StubLibrary {
     async fn get_media_stream_languages(
         &self,
         stream_type: MediaStreamType,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<Vec<String>, ServiceError> {
+        *self.last_stream_query.lock().expect("stream query lock") = Some(query.clone());
+        // Deliberately not in `Name` order: the handler sorts.
+        let (audio, subtitle) = self
+            .stream_languages
+            .clone()
+            .unwrap_or_else(|| (vec!["deu", "eng"], vec!["fra"]));
         Ok(match stream_type {
-            MediaStreamType::Audio => vec!["eng".to_owned(), "deu".to_owned()],
-            MediaStreamType::Subtitle => vec!["fra".to_owned()],
+            MediaStreamType::Audio => audio,
+            MediaStreamType::Subtitle => subtitle,
             _ => Vec::new(),
-        })
+        }
+        .into_iter()
+        .map(str::to_owned)
+        .collect())
     }
     // Remaining methods are never reached by these tests.
     async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
@@ -628,6 +643,70 @@ impl SearchManager for StubSearch {
     }
 }
 
+/// A culture table for the language facets: `FindLanguageInfo` knows `eng`,
+/// `deu`, `fra`, `eus` and `zxx` (with upstream's raw, untruncated English
+/// names); every other code is unknown. Everything else is the INFRA fake.
+struct LanguageNames;
+
+impl ferrofin_traits::localization::LocalizationManager for LanguageNames {
+    fn get_cultures(&self) -> Vec<ferrofin_model::globalization::CultureDto> {
+        ferrofin_api::test_support::FakeLocalization.get_cultures()
+    }
+    fn get_countries(&self) -> Vec<ferrofin_model::globalization::CountryInfo> {
+        ferrofin_api::test_support::FakeLocalization.get_countries()
+    }
+    fn get_parental_ratings(&self) -> Vec<ferrofin_model::entities_media::ParentalRating> {
+        ferrofin_api::test_support::FakeLocalization.get_parental_ratings()
+    }
+    fn get_localization_options(&self) -> Vec<ferrofin_model::globalization::LocalizationOption> {
+        ferrofin_api::test_support::FakeLocalization.get_localization_options()
+    }
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        ferrofin_api::test_support::FakeLocalization.get_supported_ui_cultures()
+    }
+    fn get_localized_string(&self, phrase: &str) -> String {
+        phrase.to_owned()
+    }
+    fn get_server_localized_string(&self, phrase: &str) -> String {
+        phrase.to_owned()
+    }
+    fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
+        phrase.to_owned()
+    }
+    fn find_language_info(
+        &self,
+        language: &str,
+    ) -> Option<ferrofin_model::globalization::CultureDto> {
+        let display_name = match language {
+            "eng" => "English",
+            "deu" => "German",
+            "fra" => "French",
+            "eus" => "Basque",
+            "zxx" => "No linguistic content; Not applicable",
+            _ => return None,
+        };
+        Some(ferrofin_model::globalization::CultureDto {
+            name: display_name.to_owned(),
+            display_name: display_name.to_owned(),
+            two_letter_iso_language_name: String::new(),
+            three_letter_iso_language_name: Some(language.to_owned()),
+            three_letter_iso_language_names: vec![language.to_owned()],
+        })
+    }
+    fn get_language_display_name(&self, _language: &str) -> Option<String> {
+        // The facet names must come from `find_language_info`; this one
+        // truncates at `;`, so a handler reaching for it gets nothing.
+        None
+    }
+    fn get_rating_score(
+        &self,
+        rating: &str,
+        country_code: Option<&str>,
+    ) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+        ferrofin_api::test_support::FakeLocalization.get_rating_score(rating, country_code)
+    }
+}
+
 /// Builds an [`AppState`] wired with the filter stubs around `library`.
 fn state_with(library: Arc<StubLibrary>) -> AppState {
     AppState::new(
@@ -658,7 +737,7 @@ fn state_with(library: Arc<StubLibrary>) -> AppState {
         Arc::new(ferrofin_api::test_support::FakeDevices),
         Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
         Arc::new(ferrofin_api::test_support::FakeApiKeys),
-        Arc::new(ferrofin_api::test_support::FakeLocalization),
+        Arc::new(LanguageNames),
         Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
         Arc::new(ferrofin_api::test_support::FakeActivity),
         Arc::new(ferrofin_api::test_support::FakeFileSystem),
@@ -713,16 +792,202 @@ async fn items_filters2_returns_genre_facets() {
             id: Uuid::from_u128(0x21),
         }]
     );
-    // The response schema is exactly {Genres, Tags} (Jellyfin's QueryFilters):
-    // no fabricated audio/subtitle language facets leak into the body.
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let keys: Vec<&str> = value
+    // The response schema is exactly Jellyfin 12's QueryFilters, in class
+    // order: {Genres, Tags, AudioLanguages, SubtitleLanguages}.
+    assert_eq!(
+        body_keys(&body),
+        ["Genres", "Tags", "AudioLanguages", "SubtitleLanguages"]
+    );
+}
+
+/// The top-level keys of a JSON object body, in wire order.
+fn body_keys(body: &[u8]) -> Vec<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).expect("json");
+    let mut keys: Vec<(usize, String)> = value
         .as_object()
         .expect("object")
         .keys()
-        .map(String::as_str)
+        .map(|key| {
+            let needle = format!("\"{key}\":");
+            let text = std::str::from_utf8(body).expect("utf-8");
+            (text.find(&needle).expect("key in body"), key.clone())
+        })
         .collect();
-    assert_eq!(keys, vec!["Genres", "Tags"]);
+    keys.sort();
+    keys.into_iter().map(|(_, key)| key).collect()
+}
+
+/// `{Name, Value}` facet pairs, in order.
+fn pairs(pairs: &[(&str, &str)]) -> Vec<NameValuePair> {
+    pairs
+        .iter()
+        .map(|&(name, value)| NameValuePair::new(name, value))
+        .collect()
+}
+
+/// `GET /Items/Filters2` over `library`, decoded.
+async fn filters2(library: Arc<StubLibrary>, uri: &str) -> QueryFilters {
+    let (status, body) = get_with(library, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    serde_json::from_slice(&body).expect("filters")
+}
+
+#[tokio::test]
+async fn items_filters2_names_languages_and_sorts_them_by_name() {
+    // v12.2 `FilterController.cs:246-271`: `"{DisplayName} ({code})"`, then
+    // `OrderBy(l => l.Name)` — the stub hands back `deu` before `eng`.
+    let filters = filters2(
+        Arc::new(StubLibrary::default()),
+        "/Items/Filters2?includeItemTypes=Movie",
+    )
+    .await;
+    assert_eq!(
+        filters.audio_languages,
+        pairs(&[("English (eng)", "eng"), ("German (deu)", "deu")])
+    );
+    assert_eq!(
+        filters.subtitle_languages,
+        pairs(&[("French (fra)", "fra")])
+    );
+}
+
+#[tokio::test]
+async fn items_filters2_keeps_unknown_codes_bare_and_display_names_whole() {
+    // An unknown code names itself; a known one uses the raw iso6392.txt name
+    // — `FindLanguageInfo(...).DisplayName`, not the `;`-truncating
+    // `GetLanguageDisplayName`.
+    let library = Arc::new(StubLibrary {
+        stream_languages: Some((vec!["xyz", "zxx"], vec!["und"])),
+        ..StubLibrary::default()
+    });
+    let filters = filters2(library, "/Items/Filters2?includeItemTypes=Movie").await;
+    assert_eq!(
+        filters.audio_languages,
+        pairs(&[
+            ("No linguistic content; Not applicable (zxx)", "zxx"),
+            ("xyz", "xyz"),
+        ])
+    );
+    assert_eq!(filters.subtitle_languages, pairs(&[("und", "und")]));
+}
+
+#[tokio::test]
+async fn items_filters2_sorts_languages_linguistically_not_ordinally() {
+    // `Comparer<string>.Default` is the culture comparer: "abc" sorts before
+    // "Basque (eus)", where an ordinal sort puts 'B' (0x42) before 'a' (0x61).
+    let library = Arc::new(StubLibrary {
+        stream_languages: Some((vec!["eus", "abc"], Vec::new())),
+        ..StubLibrary::default()
+    });
+    let filters = filters2(library, "/Items/Filters2?includeItemTypes=Movie").await;
+    assert_eq!(
+        filters.audio_languages,
+        pairs(&[("abc", "abc"), ("Basque (eus)", "eus")])
+    );
+    assert!(filters.subtitle_languages.is_empty());
+}
+
+/// Which type sets get the language facets (v12.2 `FilterController.cs:242-245`)
+/// and which kinds the stream query then runs over (`:212-217`: a show or
+/// season set gains `Episode`, appended last). `None` = no stream query, and
+/// both facets stay `[]`.
+#[rstest]
+#[case("Movie", Some(vec![BaseItemKind::Movie]))]
+#[case("Series", Some(vec![BaseItemKind::Series, BaseItemKind::Episode]))]
+#[case("Season", Some(vec![BaseItemKind::Season, BaseItemKind::Episode]))]
+#[case("Series,Episode", Some(vec![BaseItemKind::Series, BaseItemKind::Episode]))]
+#[case("Episode", Some(vec![BaseItemKind::Episode]))]
+#[case(
+    "Movie,Season",
+    Some(vec![BaseItemKind::Movie, BaseItemKind::Season, BaseItemKind::Episode])
+)]
+#[case("Audio", None)]
+#[case("BoxSet", None)]
+#[case("", None)]
+#[tokio::test]
+async fn items_filters2_language_facets_gate_and_widen_by_type(
+    #[case] types: &str,
+    #[case] expected: Option<Vec<BaseItemKind>>,
+) {
+    let library = Arc::new(StubLibrary::default());
+    let uri = if types.is_empty() {
+        "/Items/Filters2".to_owned()
+    } else {
+        format!("/Items/Filters2?includeItemTypes={types}")
+    };
+    let filters = filters2(Arc::clone(&library), &uri).await;
+    let stream_query = library
+        .last_stream_query
+        .lock()
+        .expect("stream query lock")
+        .clone();
+    if let Some(kinds) = expected {
+        let query = stream_query.expect("stream languages queried");
+        assert_eq!(query.include_item_types, kinds);
+        assert!(query.include_owned_items, "owned items are included");
+        assert!(!filters.audio_languages.is_empty());
+    } else {
+        assert!(stream_query.is_none(), "no stream query for {types:?}");
+        assert!(filters.audio_languages.is_empty());
+        assert!(filters.subtitle_languages.is_empty());
+    }
+}
+
+#[rstest]
+#[case("true")]
+#[case("false")]
+#[tokio::test]
+async fn items_filters2_stream_query_shares_the_genre_query_scope(#[case] recursive: &str) {
+    // `:197-209`: one scoping branch sets the genre and the stream query alike,
+    // and both carry the user and the live-TV `Is*` flags (`:161-178`).
+    let library = Arc::new(StubLibrary::default());
+    let parent = Uuid::from_u128(0xF00D);
+    filters2(
+        Arc::clone(&library),
+        &format!(
+            "/Items/Filters2?userId={USER_ID}&includeItemTypes=Movie&parentId={parent}\
+             &isMovie=true&recursive={recursive}"
+        ),
+    )
+    .await;
+    let stream = library
+        .last_stream_query
+        .lock()
+        .expect("stream query lock")
+        .clone()
+        .expect("stream languages queried");
+    let genre = library
+        .last_genre_query
+        .lock()
+        .expect("genre query lock")
+        .clone()
+        .expect("get_genres called");
+    assert_eq!(stream.ancestor_ids, vec![parent]);
+    assert_eq!(stream.ancestor_ids, genre.ancestor_ids);
+    assert_eq!(stream.parent_id, genre.parent_id);
+    assert_eq!(stream.is_movie, Some(true));
+    assert_eq!(stream.user_id(), Some(USER_ID));
+    // Only the two upstream differences separate them.
+    assert!(!genre.include_owned_items);
+    assert_eq!(
+        InternalItemsQuery {
+            include_owned_items: false,
+            ..stream
+        },
+        genre
+    );
+}
+
+#[tokio::test]
+async fn items_filters_legacy_carries_no_language_facets() {
+    // The languages moved to QueryFilters in Jellyfin 12; the legacy set is
+    // still {Genres, Tags, OfficialRatings, Years}.
+    let (status, body) = get("/Items/Filters?includeItemTypes=Movie").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body_keys(&body),
+        ["Genres", "Tags", "OfficialRatings", "Years"]
+    );
 }
 
 #[tokio::test]
@@ -765,11 +1030,11 @@ async fn items_filters2_music_type_uses_music_genres() {
 
 #[tokio::test]
 async fn items_filters2_leaves_tags_empty() {
-    // Parity lock, not a gap: Jellyfin 10.11.8's `FilterController.GetQueryFilters`
-    // assigns only `filters.Genres`, so `Tags` stays at the `QueryFilters`
-    // constructor's `Array.Empty<string>()` and Filters2 always answers `"Tags": []`.
-    // Tags are the LEGACY `/Items/Filters` facet (asserted below). Populating them
-    // here would be a fabricated field, not a fix.
+    // Pins today's behaviour, which is Jellyfin 10.11/12.0's: `GetQueryFilters`
+    // assigned only `filters.Genres`, so `Tags` stayed at the `QueryFilters`
+    // constructor's `Array.Empty<string>()`. TODO(12.1 parity): v12.1+ fills it
+    // with `GetTagNames(tagQuery)` (v12.2 `FilterController.cs:240`); porting
+    // that replaces this test.
     let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
     assert_eq!(status, StatusCode::OK);
     let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
