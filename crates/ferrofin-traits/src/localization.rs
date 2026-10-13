@@ -81,3 +81,21 @@ pub trait LocalizationManager: Send + Sync {
 }
 
 fn _assert_object_safe_localization_manager(_: &dyn LocalizationManager) {}
+
+/// The `BaseItem.OriginalLanguage` setter (`BaseItem.cs:228-232`):
+/// `LocalizationManager?.FindLanguageInfo(value)?.TwoLetterISOLanguageName ??
+/// value`. A known token (`"English"`, `"fra"`) becomes the culture's
+/// two-letter code; an unknown token, or no manager (`None`, as C#'s `?.`),
+/// keeps the value as-is.
+#[must_use]
+pub fn normalize_original_language(
+    localization: Option<&dyn LocalizationManager>,
+    value: &str,
+) -> String {
+    localization
+        .and_then(|manager| manager.find_language_info(value))
+        .map_or_else(
+            || value.to_owned(),
+            |culture| culture.two_letter_iso_language_name,
+        )
+}

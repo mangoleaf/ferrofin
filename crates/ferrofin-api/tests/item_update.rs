@@ -128,7 +128,8 @@ fn base_item_entity(id: Uuid) -> BaseItemEntity {
         normalization_gain: None,
         official_rating: None,
         original_title: None,
-        original_language: None,
+        // Stored, so an edit that omits `OriginalLanguage` visibly clears it.
+        original_language: Some("ja".to_owned()),
         overview: None,
         owner_id: None,
         parent_id: None,
@@ -745,9 +746,16 @@ impl ferrofin_traits::localization::LocalizationManager for StubLocalization {
     }
     fn find_language_info(
         &self,
-        _language: &str,
+        language: &str,
     ) -> Option<ferrofin_model::globalization::CultureDto> {
-        None
+        self.get_cultures().into_iter().find(|culture| {
+            language.eq_ignore_ascii_case(&culture.display_name)
+                || language.eq_ignore_ascii_case(&culture.two_letter_iso_language_name)
+                || culture
+                    .three_letter_iso_language_names
+                    .iter()
+                    .any(|code| language.eq_ignore_ascii_case(code))
+        })
     }
     fn get_language_display_name(&self, _language: &str) -> Option<String> {
         None
@@ -935,6 +943,33 @@ async fn an_edit_without_lock_data_leaves_the_item_unlocked() {
     )
     .await;
     assert!(written.is_locked, "LockData=true locks");
+}
+
+/// `item.OriginalLanguage = string.IsNullOrWhiteSpace(request.OriginalLanguage)
+/// ? null : request.OriginalLanguage` (v12.2 `ItemUpdateController.cs:245`)
+/// through the `BaseItem.OriginalLanguage` setter: a known language is stored
+/// as its two-letter code, an unknown one untrimmed as sent, whitespace as
+/// null, and an absent member clears the stored `"ja"`.
+#[tokio::test]
+async fn an_edit_stores_original_language_through_the_setter() {
+    let item_id = Uuid::from_u128(0x59);
+    for (member, expected) in [
+        (r#","OriginalLanguage":"English""#, Some("en")),
+        (r#","OriginalLanguage":"eng""#, Some("en")),
+        (r#","OriginalLanguage":" ja ""#, Some(" ja ")),
+        (r#","OriginalLanguage":"  ""#, None),
+        (r#","OriginalLanguage":null"#, None),
+        ("", None),
+    ] {
+        let written = update_and_capture(
+            item_id,
+            format!(
+                r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"n"{member}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(written.original_language.as_deref(), expected, "{member}");
+    }
 }
 
 /// Posts `body` for the fixture item of `library` and returns the library,

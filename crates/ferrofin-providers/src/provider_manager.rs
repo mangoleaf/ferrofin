@@ -2095,7 +2095,7 @@ impl LocalProviderManager {
         let subtag = language
             .split_once('-')
             .map_or(language, |(subtag, _)| subtag);
-        Some(crate::episode::omdb_answer(
+        let mut answer = crate::episode::omdb_answer(
             &record,
             crate::episode::OmdbGates {
                 english: subtag.eq_ignore_ascii_case("en"),
@@ -2104,7 +2104,23 @@ impl LocalProviderManager {
             },
             season_number,
             episode_number,
-        ))
+        );
+        self.normalize_original_language(&mut answer.result.item);
+        Some(answer)
+    }
+
+    /// `item.OriginalLanguage = …` (`OmdbProvider.cs:428`) assigns through the
+    /// `BaseItem.OriginalLanguage` setter, so the provider's `"English"` is
+    /// stored as `"en"`; without a localization manager the value is kept, as
+    /// C#'s `LocalizationManager?.` does.
+    fn normalize_original_language(&self, item: &mut BaseItemEntity) {
+        if let Some(value) = item.original_language.as_deref() {
+            item.original_language =
+                Some(ferrofin_traits::localization::normalize_original_language(
+                    self.localization.as_deref(),
+                    value,
+                ));
+        }
     }
 
     /// `TvdbEpisodeProvider`'s answer: TheTVDB's record for the episode of the
@@ -4732,6 +4748,8 @@ mod tests {
         RefreshPriority, RemoteSearchRequest,
     };
     use uuid::Uuid;
+
+    use crate::test_localization::EnglishAndFrench;
 
     /// A synthetic remote-search provider for exercising the merge/dedup port.
     struct FakeProvider {
@@ -9591,66 +9609,6 @@ mod tests {
         }
     }
 
-    /// A culture table holding English (`eng`) and French (`fre`, `fra`).
-    struct EnglishAndFrench;
-
-    impl ferrofin_traits::localization::LocalizationManager for EnglishAndFrench {
-        fn get_cultures(&self) -> Vec<ferrofin_model::globalization::CultureDto> {
-            let culture = |two: &str, display: &str, three: &[&str]| {
-                ferrofin_model::globalization::CultureDto {
-                    name: two.to_owned(),
-                    display_name: display.to_owned(),
-                    two_letter_iso_language_name: two.to_owned(),
-                    three_letter_iso_language_name: three.first().map(|t| (*t).to_owned()),
-                    three_letter_iso_language_names: three
-                        .iter()
-                        .map(|t| (*t).to_owned())
-                        .collect(),
-                }
-            };
-            vec![
-                culture("en", "English", &["eng"]),
-                culture("fr", "French", &["fre", "fra"]),
-            ]
-        }
-        fn get_countries(&self) -> Vec<ferrofin_model::globalization::CountryInfo> {
-            unimplemented!()
-        }
-        fn get_parental_ratings(&self) -> Vec<ferrofin_model::entities_media::ParentalRating> {
-            unimplemented!()
-        }
-        fn get_localization_options(
-            &self,
-        ) -> Vec<ferrofin_model::globalization::LocalizationOption> {
-            unimplemented!()
-        }
-        fn get_localized_string(&self, _phrase: &str) -> String {
-            unimplemented!()
-        }
-        fn get_server_localized_string(&self, _phrase: &str) -> String {
-            unimplemented!()
-        }
-        fn get_localized_string_for(&self, _phrase: &str, _culture: &str) -> String {
-            unimplemented!()
-        }
-        fn find_language_info(
-            &self,
-            _language: &str,
-        ) -> Option<ferrofin_model::globalization::CultureDto> {
-            unimplemented!()
-        }
-        fn get_language_display_name(&self, _language: &str) -> Option<String> {
-            unimplemented!()
-        }
-        fn get_rating_score(
-            &self,
-            _rating: &str,
-            _country_code: Option<&str>,
-        ) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
-            unimplemented!()
-        }
-    }
-
     /// What a path-less season's refresh needs: the season (number 1, under a
     /// series whose stored ids are `series_ids`, in a library saved with
     /// `options`), the stores it writes to, and a manager over `base`.
@@ -10725,6 +10683,33 @@ mod tests {
     ) {
         let mgr = LocalProviderManager::default().with_localization(Arc::new(EnglishAndFrench));
         assert_eq!(mgr.tvdb_image_language(input).as_deref(), expected);
+    }
+
+    /// OMDb's episode answer assigns `OriginalLanguage` through the
+    /// `BaseItem` setter: a known name becomes its two-letter code, an
+    /// unknown one is kept, and without a localization manager (C#'s
+    /// `LocalizationManager?.`) nothing changes.
+    #[rstest::rstest]
+    #[case(Some("English"), Some("en"))]
+    #[case(Some("fra"), Some("fr"))]
+    #[case(Some("Klingon"), Some("Klingon"))]
+    #[case(None, None)]
+    fn omdb_original_language_runs_the_setter(
+        #[case] value: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let item = || BaseItemEntity {
+            original_language: value.map(str::to_owned),
+            ..BaseItemEntity::default()
+        };
+        let mgr = LocalProviderManager::default().with_localization(Arc::new(EnglishAndFrench));
+        let mut normalized = item();
+        mgr.normalize_original_language(&mut normalized);
+        assert_eq!(normalized.original_language.as_deref(), expected);
+
+        let mut kept = item();
+        LocalProviderManager::default().normalize_original_language(&mut kept);
+        assert_eq!(kept.original_language.as_deref(), value);
     }
 
     #[tokio::test]

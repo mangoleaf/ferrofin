@@ -985,7 +985,8 @@ pub async fn build_app_state(
             Arc::clone(&virtual_folders),
             Arc::clone(&config_trait),
         )
-        .with_users(Arc::clone(&users), Arc::clone(&user_data)),
+        .with_users(Arc::clone(&users), Arc::clone(&user_data))
+        .with_localization(Arc::clone(&localization)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;

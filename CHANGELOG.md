@@ -65,6 +65,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   video track with a title appends its tags with " - " (`Main - 1080p - H264 - SDR`, was
   `Main 1080p H264 SDR`), and Live TV channel, recording and opened live streams carry the same
   localized labels as library items, plus the `DisplayTitle` they previously lacked
+- Send Jellyfin 12's `BaseItemDto.OriginalLanguage` on every item that has one, with no
+  `Fields` request needed and no series inheritance, and accept it in the metadata editor
+  (`POST /Items/{itemId}`; blank clears it, as does an edit that omits it). As upstream, a
+  known language is stored and served as its two-letter code: OMDb's "English" becomes
+  `en`, an edited `fra` becomes `fr`, and rows already stored as "English" are sent as
+  `en`. The NFO `<originallanguage>` element now follows `<originaltitle>` and is skipped
+  when blank
 - `hasSubtitles`, `isHd`, `is4K` and `minWidth`/`minHeight`/`maxWidth`/`maxHeight` judge a
   merged item by its whole version group, as Jellyfin 12 does: a movie whose subtitles or
   4K file live only on its second version matches, listed under the primary, and an SD

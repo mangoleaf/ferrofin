@@ -86,7 +86,7 @@ pub(crate) async fn update_item(
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
     // so an unlocked edit survives a rescan that runs no provider.
-    apply_update(&mut item, &request);
+    apply_update(&mut item, &request, &*state.localization);
     state
         .library
         .update_items(std::slice::from_ref(&item), None)
@@ -174,6 +174,8 @@ pub(crate) struct UpdateItemRequest {
     forced_sort_name: Option<String>,
     #[serde(default)]
     original_title: Option<String>,
+    #[serde(default)]
+    original_language: Option<String>,
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     critic_rating: Option<f32>,
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -264,10 +266,25 @@ fn opt_metadata_fields<'de, D: serde::Deserializer<'de>>(
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and
 /// collection assignments of C# `ItemUpdateController.UpdateItem`; the
 /// series/season/album child cascades are [`cascade_to_children`].
-fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
+fn apply_update(
+    item: &mut BaseItemEntity,
+    request: &UpdateItemRequest,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
     item.original_title = non_empty(request.original_title.as_deref());
+    // `item.OriginalLanguage = string.IsNullOrWhiteSpace(request.OriginalLanguage)
+    // ? null : request.OriginalLanguage` (`ItemUpdateController.cs:245`): the
+    // value is NOT trimmed, an absent member clears it, and the assignment
+    // runs the `BaseItem.OriginalLanguage` setter (`"fra"` is stored `"fr"`).
+    item.original_language = request
+        .original_language
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            ferrofin_traits::localization::normalize_original_language(Some(localization), value)
+        });
     item.critic_rating = request.critic_rating.map(f64::from);
     item.community_rating = request.community_rating.map(f64::from);
     item.index_number = request.index_number.map(i64::from);

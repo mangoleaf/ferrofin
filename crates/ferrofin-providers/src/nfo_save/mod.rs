@@ -14,6 +14,7 @@ use ferrofin_model::configuration::XbmcMetadataOptions;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{UserDataManager, UserManager, VirtualFolderManager};
+use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{
     ItemPersistenceService, ItemRepository, MediaStreamRepository, PeopleRepository,
@@ -48,6 +49,7 @@ pub struct NfoSaver {
     folders: Arc<dyn VirtualFolderManager>,
     configuration: Arc<dyn ServerConfigurationManager>,
     users: Option<(Arc<dyn UserManager>, Arc<dyn UserDataManager>)>,
+    localization: Option<Arc<dyn LocalizationManager>>,
     locks: SaveLocks,
 }
 
@@ -70,6 +72,7 @@ impl NfoSaver {
             folders,
             configuration,
             users: None,
+            localization: None,
             locks: Mutex::default(),
         }
     }
@@ -82,6 +85,15 @@ impl NfoSaver {
         data: Arc<dyn UserDataManager>,
     ) -> Self {
         self.users = Some((users, data));
+        self
+    }
+
+    /// Attaches the culture table the `BaseItem.OriginalLanguage` setter
+    /// resolves through, so a stored `"English"` is written as `en` — the
+    /// value upstream's loaded item (and Ferrofin's DTO) carries.
+    #[must_use]
+    pub fn with_localization(mut self, localization: Arc<dyn LocalizationManager>) -> Self {
+        self.localization = Some(localization);
         self
     }
 
@@ -203,7 +215,6 @@ impl NfoSaver {
             xml,
             saver::DocumentExtras {
                 item: &result.item,
-                original_language: row.original_language.as_deref(),
                 images: &images,
                 image_substitutions: substitutions,
                 streams: &streams,
@@ -249,8 +260,8 @@ impl NfoSaver {
         row: &BaseItemEntity,
         save_images: bool,
     ) -> Result<MetadataResult<NfoBaseItem>, ServiceError> {
-        let mut item =
-            mapping::item(row).ok_or_else(|| ServiceError::backend("unsupported NFO kind"))?;
+        let mut item = mapping::item(row, self.localization.as_deref())
+            .ok_or_else(|| ServiceError::backend("unsupported NFO kind"))?;
         for (key, value) in self
             .persistence
             .provider_ids_for_items(&[id])

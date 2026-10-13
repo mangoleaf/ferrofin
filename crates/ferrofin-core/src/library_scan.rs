@@ -18525,8 +18525,13 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&d.original_title);
     }
+    // `movie.OriginalLanguage = movieResult.OriginalLanguage` runs the
+    // `BaseItem.OriginalLanguage` setter (`BaseItem.cs:228-232`).
     if entity.original_language.is_none() {
-        entity.original_language.clone_from(&d.original_language);
+        entity.original_language = d
+            .original_language
+            .as_deref()
+            .map(crate::localization_manager::normalize_original_language);
     }
     merge_multi_value(&mut entity.tags, &d.tags);
     merge_multi_value(&mut entity.production_locations, &d.production_locations);
@@ -18787,8 +18792,14 @@ fn apply_omdb(
     if english {
         apply_episode_title(entity, item.title.as_deref());
     }
+    // `item.OriginalLanguage = result.Language?.Split(',')…FirstOrDefault()`
+    // (`OmdbProvider.cs:428`) through the setter: OMDb's `"English"` is
+    // stored as `"en"`.
     if entity.original_language.is_none() {
-        entity.original_language = item.original_language();
+        entity.original_language = item
+            .original_language()
+            .as_deref()
+            .map(crate::localization_manager::normalize_original_language);
     }
     fill_provider_data(
         entity,
@@ -20220,7 +20231,11 @@ mod tests {
         let mut empty = BaseItemEntity::default();
         super::apply_omdb(&mut empty, &omdb, false, false);
         assert!(empty.name.is_none(), "OMDb titles are English-only");
-        assert_eq!(empty.original_language.as_deref(), Some("English"));
+        assert_eq!(
+            empty.original_language.as_deref(),
+            Some("en"),
+            "the setter normalises OMDb's English name"
+        );
         assert_eq!(
             crate::item_data::parse_data(empty.data.as_deref())["HomePageUrl"],
             "https://other.org"

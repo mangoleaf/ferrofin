@@ -159,6 +159,61 @@ static LOCALIZATION_OPTION_LIST: LazyLock<Vec<LocalizationOption>> = LazyLock::n
 /// The parsed ISO 639-2 dataset, built once.
 static CULTURE_DATA: LazyLock<CultureData> = LazyLock::new(load_culture_data);
 
+/// `FindLanguageInfo`'s lookup, indexed once: every non-empty display name,
+/// name, two-letter and three-letter code (ASCII-lowercased) → the index of
+/// the FIRST culture in file order carrying it, so a hit is exactly the
+/// culture the linear `FirstOrDefault` scan would return. Upstream memoises
+/// the same answer per token in `_cultureCache`; this keeps the per-item cost
+/// on the DTO path at one hash lookup.
+static LANGUAGE_INDEX: LazyLock<HashMap<String, usize>> = LazyLock::new(|| {
+    let mut index = HashMap::new();
+    for (i, culture) in CULTURE_DATA.cultures.iter().enumerate() {
+        let keys = [
+            culture.display_name.as_str(),
+            culture.name.as_str(),
+            culture.two_letter_iso_language_name.as_str(),
+        ]
+        .into_iter()
+        .chain(
+            culture
+                .three_letter_iso_language_names
+                .iter()
+                .map(String::as_str),
+        );
+        for key in keys.filter(|key| !key.is_empty()) {
+            index.entry(key.to_ascii_lowercase()).or_insert(i);
+        }
+    }
+    index
+});
+
+/// C# `FindLanguageInfo` over the static culture table: the first culture
+/// whose display name, name, two-letter or any three-letter code equals
+/// `language` ignoring ASCII case; `None` for an empty or unknown token.
+#[must_use]
+pub fn find_culture(language: &str) -> Option<&'static CultureDto> {
+    if language.is_empty() {
+        return None;
+    }
+    LANGUAGE_INDEX
+        .get(&language.to_ascii_lowercase())
+        .map(|&i| &CULTURE_DATA.cultures[i])
+}
+
+/// The `BaseItem.OriginalLanguage` setter (`BaseItem.cs:228-232`):
+/// `FindLanguageInfo(value)?.TwoLetterISOLanguageName ?? value`. A known
+/// token (`"English"`, `"eng"`, `"EN"`) becomes its two-letter code; an
+/// unknown one is kept as-is. An ISO 639-2-only culture (`"und"`, `"mul"`)
+/// has an empty two-letter code, which C#'s `??` does not fall back from, so
+/// it becomes `""` — upstream's behaviour since Jellyfin 12 kept those rows.
+#[must_use]
+pub fn normalize_original_language(value: &str) -> String {
+    find_culture(value).map_or_else(
+        || value.to_owned(),
+        |culture| culture.two_letter_iso_language_name.clone(),
+    )
+}
+
 /// Every known rating system, keyed by upper-case country code, parsed once.
 static PARENTAL_RATINGS: LazyLock<BTreeMap<String, RatingTable>> = LazyLock::new(|| {
     parental_ratings::TABLES
@@ -358,17 +413,7 @@ impl LocalizationManager {
     /// three-letter code, or two-letter code (C# `FindLanguageInfo`).
     #[must_use]
     pub fn find_language_info(&self, language: &str) -> Option<&CultureDto> {
-        if language.is_empty() {
-            return None;
-        }
-        CULTURE_DATA.cultures.iter().find(|c| {
-            language.eq_ignore_ascii_case(&c.display_name)
-                || language.eq_ignore_ascii_case(&c.name)
-                || language.eq_ignore_ascii_case(&c.two_letter_iso_language_name)
-                || c.three_letter_iso_language_names
-                    .iter()
-                    .any(|n| language.eq_ignore_ascii_case(n))
-        })
+        find_culture(language)
     }
 
     /// The display name for a language token, truncated at the first `;`/`,`
@@ -1236,6 +1281,20 @@ mod tests {
         assert_eq!(nc17.rating_score.map(|s| s.score), Some(17));
         assert_eq!(nc17.rating_score.and_then(|s| s.sub_score), Some(1));
 
+        // Cultures: v12.2's iso6392.txt, where the Portuguese variants carry `por`
+        // (upstream #15555 reverted the `pob`/`pop` codes).
+        let pt_br = m
+            .get_cultures()
+            .iter()
+            .find(|c| c.name == "pt-br")
+            .expect("pt-br");
+        assert_eq!(
+            pt_br.three_letter_iso_language_names,
+            vec!["por".to_owned()]
+        );
+        assert!(m.find_language_info("pob").is_none());
+        assert!(m.find_language_info("pop").is_none());
+
         // Localization options cover every bundled translation, including es_419.
         let options = m.get_localization_options();
         assert_eq!(options.len(), 105);
@@ -2033,6 +2092,77 @@ mod tests {
         assert_eq!(Some(&german), m.find_language_info("ger"));
         assert!(via_trait.find_language_info("").is_none());
         assert!(via_trait.find_language_info("zzz").is_none());
+    }
+
+    /// The indexed lookup is the C# `FirstOrDefault` scan: for every key of
+    /// every culture (and tokens that miss, or that several cultures share, as
+    /// `chi`/`zho` do across the seven Chinese rows) it returns the same
+    /// culture the linear four-way predicate finds first in file order.
+    #[test]
+    fn indexed_find_language_info_equals_the_linear_scan() {
+        let linear = |token: &str| {
+            if token.is_empty() {
+                return None;
+            }
+            CULTURE_DATA.cultures.iter().find(|c| {
+                token.eq_ignore_ascii_case(&c.display_name)
+                    || token.eq_ignore_ascii_case(&c.name)
+                    || token.eq_ignore_ascii_case(&c.two_letter_iso_language_name)
+                    || c.three_letter_iso_language_names
+                        .iter()
+                        .any(|n| token.eq_ignore_ascii_case(n))
+            })
+        };
+        let mut tokens: Vec<String> = [
+            "und", "xx", "cn", "zh-CN", "Chinese", "CHI", "N/A", "", " en",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for culture in &CULTURE_DATA.cultures {
+            tokens.push(culture.display_name.clone());
+            tokens.push(culture.name.to_ascii_uppercase());
+            tokens.push(culture.two_letter_iso_language_name.clone());
+            tokens.extend(culture.three_letter_iso_language_names.iter().cloned());
+        }
+        for token in &tokens {
+            assert_eq!(
+                find_culture(token).map(std::ptr::from_ref),
+                linear(token).map(std::ptr::from_ref),
+                "token {token:?}"
+            );
+        }
+    }
+
+    /// The `BaseItem.OriginalLanguage` setter: a known token becomes its
+    /// two-letter code, an unknown one (TMDB's `xx`/`cn`, OMDb's `N/A`) is
+    /// kept, and an ISO 639-2-only culture's empty code is NOT fallen back
+    /// from (`?? value` only catches null).
+    #[rstest]
+    #[case("English", "en")]
+    #[case("eng", "en")]
+    #[case("en", "en")]
+    #[case("EN", "en")]
+    #[case("ger", "de")]
+    #[case("German", "de")]
+    #[case("fra", "fr")]
+    #[case("Chinese", "zh")]
+    #[case("zh-CN", "zh-cn")]
+    #[case("ja", "ja")]
+    #[case("xx", "xx")]
+    #[case("cn", "cn")]
+    #[case("N/A", "N/A")]
+    #[case(" ja ", " ja ")]
+    #[case("und", "")]
+    #[case("", "")]
+    // v12.2's iso6392.txt gives the Portuguese variant rows `por`, not `pob`/`pop`
+    // (upstream #15555), so those tokens are unknown and kept.
+    #[case("por", "pt")]
+    #[case("pt-br", "pt-br")]
+    #[case("pob", "pob")]
+    #[case("pop", "pop")]
+    fn normalize_original_language_cases(#[case] value: &str, #[case] expected: &str) {
+        assert_eq!(normalize_original_language(value), expected);
     }
 
     /// The trait seam's `try_get_iso6392_t_from_b` is the inherent lookup

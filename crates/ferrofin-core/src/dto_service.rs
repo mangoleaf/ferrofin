@@ -2711,6 +2711,15 @@ impl FerrofinDtoService {
         if options.contains_field(ItemFields::OriginalTitle) {
             dto.original_title = item.original_title.clone();
         }
+        // `dto.OriginalLanguage = item.OriginalLanguage` (`DtoService.cs:1235`):
+        // no field gate, every kind, the item's own value (no series
+        // inheritance). The row reaches C# through `BaseItemMapper.cs:105`,
+        // whose assignment runs the `BaseItem.OriginalLanguage` setter, so a
+        // stored `"English"` is served as `"en"`.
+        dto.original_language = item
+            .original_language
+            .as_deref()
+            .map(crate::localization_manager::normalize_original_language);
         if options.contains_field(ItemFields::ParentId) {
             dto.parent_id = item
                 .parent_id
@@ -5218,6 +5227,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(narrow_dto.cumulative_run_time_ticks, None);
+    }
+
+    /// `OriginalLanguage` (v12.2 DtoService.cs:1235) is sent with no field
+    /// requested, on single and batch projections alike, normalised by the
+    /// `BaseItem.OriginalLanguage` setter the mapper runs on read
+    /// (`"English"` → `"en"`), and never inherited: an episode without its
+    /// own value sends none.
+    #[tokio::test]
+    async fn original_language_is_emitted_without_any_field_and_normalized() {
+        let db = test_db().await;
+        let movie_id = Uuid::new_v4();
+        seed_named_item(&db, movie_id, BaseItemKind::Movie, "A Movie").await;
+        let mut movie = fetch_item(&db, movie_id).await;
+        let episode_id = Uuid::new_v4();
+        seed_named_item(&db, episode_id, BaseItemKind::Episode, "An Episode").await;
+        let episode = fetch_item(&db, episode_id).await;
+        let svc = service(db);
+        let no_fields = DtoOptions {
+            fields: Vec::new(),
+            ..DtoOptions::default()
+        };
+
+        movie.original_language = Some("English".into());
+        let dto = svc
+            .get_base_item_dto(&movie, &no_fields, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.original_language.as_deref(), Some("en"));
+
+        let dto = svc
+            .get_base_item_dto(&episode, &no_fields, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.original_language, None);
+
+        movie.original_language = Some("ja".into());
+        let dtos = svc
+            .get_base_item_dtos(&[movie, episode], &no_fields, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].original_language.as_deref(), Some("ja"));
+        assert_eq!(dtos[1].original_language, None);
     }
 
     /// `DateLastMediaAdded` (v12 DtoService.cs:638-641) sits in the same
