@@ -23,12 +23,13 @@
 use std::cmp::min;
 use std::fmt::Write as _;
 
-use ferrofin_model::configuration::EncodingOptions;
+use ferrofin_model::configuration::{EncodingOptions, HlsAudioSeekStrategy};
 use ferrofin_model::data::VideoRangeType;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::entities::EncoderPreset;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::session::TranscodeReasons;
+use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use crate::encoder::FfmpegVersion;
 
@@ -1228,6 +1229,28 @@ pub fn requires_software_tonemap(video_stream: Option<&MediaStream>) -> bool {
     video_stream.is_some_and(|s| s.video_range() == ferrofin_model::data::VideoRange::Hdr)
 }
 
+/// Whether an HLS job must re-encode audio it could otherwise stream-copy.
+///
+/// Port of `preventHlsAudioCopy` in `EncodingHelper.TryStreamCopy`: when an
+/// HLS job (`TranscodingJobType.Hls`) re-encodes its video stream and the
+/// administrator chose [`HlsAudioSeekStrategy::TranscodeAudio`], copied audio
+/// is refused. A re-encoded video is trimmed to the exact seek point, but
+/// copied audio starts at the preceding keyframe, so the two drift apart after
+/// a seek; re-encoding the audio keeps the timestamps accurate at the cost of
+/// the audio encode. `state.output_video_codec` must already hold the video
+/// copy decision (`"copy"` when the video is remuxed), as it does upstream.
+///
+/// This only vetoes the compatibility-based copy: a user without the
+/// audio-transcoding permission is still forced to copy, exactly as upstream's
+/// `else` branch does.
+#[must_use]
+pub fn prevent_hls_audio_copy(state: &EncodingJobInfo, encoding_options: &EncodingOptions) -> bool {
+    state.transcoding_type == TranscodingJobType::Hls
+        && state.video_stream.is_some()
+        && !EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref())
+        && encoding_options.hls_audio_seek_strategy == HlsAudioSeekStrategy::TranscodeAudio
+}
+
 /// The `-af` audio filter value for a re-encoded audio stream, if any.
 ///
 /// Port of `GetAudioFilterParam`'s downmix branch: when downmixing a
@@ -2399,6 +2422,90 @@ mod tests {
             helper(vec![]).can_stream_copy_audio(&state, &stream, &["aac".to_owned()]);
         assert!(!ok);
         assert!(reasons.contains(TranscodeReasons::AUDIO_CHANNELS_NOT_SUPPORTED));
+    }
+
+    // ----- prevent_hls_audio_copy --------------------------------------------
+
+    /// Every arm of upstream's `preventHlsAudioCopy` conjunction: only an HLS
+    /// job with a video stream that is being re-encoded, under the
+    /// `TranscodeAudio` strategy, refuses copied audio.
+    #[rstest]
+    #[case::hls_video_transcode_transcode_audio(
+        TranscodingJobType::Hls,
+        true,
+        Some("libx264"),
+        HlsAudioSeekStrategy::TranscodeAudio,
+        true
+    )]
+    #[case::default_strategy_keeps_copy(
+        TranscodingJobType::Hls,
+        true,
+        Some("libx264"),
+        HlsAudioSeekStrategy::TrimCopiedAudio,
+        false
+    )]
+    #[case::video_remux_keeps_copy(
+        TranscodingJobType::Hls,
+        true,
+        Some("copy"),
+        HlsAudioSeekStrategy::TranscodeAudio,
+        false
+    )]
+    #[case::video_remux_any_case_keeps_copy(
+        TranscodingJobType::Hls,
+        true,
+        Some("COPY"),
+        HlsAudioSeekStrategy::TranscodeAudio,
+        false
+    )]
+    #[case::progressive_keeps_copy(
+        TranscodingJobType::Progressive,
+        true,
+        Some("libx264"),
+        HlsAudioSeekStrategy::TranscodeAudio,
+        false
+    )]
+    #[case::no_video_stream_keeps_copy(
+        TranscodingJobType::Hls,
+        false,
+        Some("libx264"),
+        HlsAudioSeekStrategy::TranscodeAudio,
+        false
+    )]
+    #[case::unset_video_codec_is_not_copy(
+        TranscodingJobType::Hls,
+        true,
+        None,
+        HlsAudioSeekStrategy::TranscodeAudio,
+        true
+    )]
+    #[case::unknown_strategy_keeps_copy(
+        TranscodingJobType::Hls,
+        true,
+        Some("libx264"),
+        HlsAudioSeekStrategy::Unrecognized(2),
+        false
+    )]
+    fn prevent_hls_audio_copy_matches_upstream_condition(
+        #[case] transcoding_type: TranscodingJobType,
+        #[case] has_video: bool,
+        #[case] output_video_codec: Option<&str>,
+        #[case] strategy: HlsAudioSeekStrategy,
+        #[case] expected: bool,
+    ) {
+        let streams = if has_video {
+            vec![video_stream("hevc", 0), audio_stream("aac", 1)]
+        } else {
+            vec![audio_stream("aac", 1)]
+        };
+        let mut state = job(&streams);
+        state.transcoding_type = transcoding_type;
+        state.output_video_codec = output_video_codec.map(str::to_owned);
+        let options = EncodingOptions {
+            hls_audio_seek_strategy: strategy,
+            ..EncodingOptions::default()
+        };
+        assert_eq!(prevent_hls_audio_copy(&state, &options), expected);
     }
 
     /// Builds a minimal [`EncodingOptions`] with the given thread count and

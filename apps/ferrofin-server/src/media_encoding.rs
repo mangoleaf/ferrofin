@@ -21,6 +21,7 @@ use ferrofin_hls::{DynamicHlsPlaylistGenerator, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
+    subtitle_extraction_timeout,
 };
 use ferrofin_mediaencoding::{
     AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
@@ -218,6 +219,7 @@ pub fn build_media_encoding(
     let sub_io = FfmpegSubtitleIo {
         path_manager: Arc::clone(&path_manager),
         ffmpeg_path: encoder.encoder_path(),
+        config: Arc::clone(&config),
     };
     let pure_encoder = Arc::new(PureSubtitleEncoder::new(SubtitleEditParser::new(), sub_io));
     let subtitles: Arc<dyn SubtitleEncoder> =
@@ -313,10 +315,12 @@ pub fn build_media_encoding(
 ///
 /// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
 /// file/HTTP reads use `tokio::fs`/`reqwest`, and extraction runs the injected
-/// ffmpeg binary through `tokio::process`.
+/// ffmpeg binary through `tokio::process`, bounded by the persisted
+/// `SubtitleExtractionTimeoutMinutes` read from `config` on every run.
 struct FfmpegSubtitleIo {
     path_manager: Arc<dyn PathManager>,
     ffmpeg_path: String,
+    config: Arc<dyn ServerConfigurationManager>,
 }
 
 #[async_trait]
@@ -370,15 +374,47 @@ impl SubtitleIo for FfmpegSubtitleIo {
                     .map_err(|e| format!("create {}: {e}", parent.display()))?;
             }
         }
+        // `RunSubtitleExtractionProcess` reads the timeout on every run.
+        let minutes = self
+            .config
+            .get_encoding_options()
+            .await
+            .unwrap_or_default()
+            .subtitle_extraction_timeout_minutes;
+        let Some(timeout) = subtitle_extraction_timeout(minutes) else {
+            return Err(format!(
+                "invalid SubtitleExtractionTimeoutMinutes {minutes}: negative or longer than \
+                 the longest supported wait"
+            ));
+        };
         let parts = split_ffmpeg_args(args);
-        let status = tokio::process::Command::new(&self.ffmpeg_path)
+        let child = tokio::process::Command::new(&self.ffmpeg_path)
             .args(&parts)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await
+            .kill_on_drop(true)
+            .spawn()
             .map_err(|e| format!("spawn ffmpeg {}: {e}", self.ffmpeg_path))?;
+        // From here until ffmpeg exits on its own, any way out — the timeout
+        // below, or the request future being dropped (a client disconnecting
+        // mid-seek) — kills ffmpeg and deletes its outputs.
+        let mut running = RunningExtraction {
+            child,
+            output_paths,
+            finished: false,
+        };
+        let Ok(waited) = tokio::time::timeout(timeout, running.child.wait()).await else {
+            tracing::warn!(
+                timeout_minutes = minutes,
+                "ffmpeg subtitle extraction timed out; killing it and deleting its outputs"
+            );
+            return Err(format!(
+                "ffmpeg subtitle extraction timed out after {minutes} minute(s)"
+            ));
+        };
+        let status = waited.map_err(|e| format!("wait for ffmpeg {}: {e}", self.ffmpeg_path))?;
+        running.finished = true;
         if !status.success() {
             return Err(format!(
                 "ffmpeg subtitle extraction exited with {}",
@@ -392,6 +428,43 @@ impl SubtitleIo for FfmpegSubtitleIo {
             }
         }
         Ok(())
+    }
+}
+
+/// A subtitle extraction ffmpeg that has not exited on its own yet.
+///
+/// Port of upstream's cancellation path: the request's cancellation token and
+/// the timeout share one linked token, and either one kills the process
+/// (`Kill(true)`, exit code `-1`) and deletes every output it was writing
+/// (`ExtractSubtitlesForFile`). Here both cases are a drop before
+/// `finished` is set — the timeout returns early, and a cancelled request drops
+/// the future awaiting it. Without the deletion, a file cut off mid-write would
+/// stay in the subtitle cache and be served on every later request, because
+/// extraction skips any output that already exists.
+struct RunningExtraction<'a> {
+    child: tokio::process::Child,
+    output_paths: &'a [String],
+    finished: bool,
+}
+
+impl Drop for RunningExtraction<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // Kill first, so ffmpeg can't keep writing once its outputs are gone.
+        if let Err(error) = self.child.start_kill() {
+            tracing::debug!(%error, "the interrupted subtitle extraction had already exited");
+        }
+        for path in self.output_paths {
+            match std::fs::remove_file(path) {
+                Ok(()) => tracing::debug!(path, "deleted an interrupted subtitle extraction"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::error!(%error, path, "deleting an interrupted subtitle extraction failed");
+                }
+            }
+        }
     }
 }
 
@@ -773,15 +846,20 @@ mod tests {
             "/cache",
             "/web",
         ));
-        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
+        let config: Arc<dyn ServerConfigurationManager> =
+            Arc::new(FakeConfig(Arc::clone(&paths), EncodingOptions::default()));
         (config, paths)
     }
 
-    /// A fake [`ServerConfigurationManager`] exposing only the paths.
-    struct FakeConfig(Arc<FerrofinServerApplicationPaths>);
+    /// A fake [`ServerConfigurationManager`] exposing the paths and fixed
+    /// encoding options.
+    struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
 
     #[async_trait]
     impl ServerConfigurationManager for FakeConfig {
+        async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+            Ok(self.1.clone())
+        }
         fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
             Arc::clone(&self.0) as Arc<_>
         }
@@ -1137,7 +1215,8 @@ mod tests {
             directory.path().join("cache"),
             directory.path().join("web"),
         ));
-        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig(Arc::clone(&paths)));
+        let config: Arc<dyn ServerConfigurationManager> =
+            Arc::new(FakeConfig(Arc::clone(&paths), EncodingOptions::default()));
         let path_manager: Arc<dyn PathManager> = Arc::new(FakePathManager {
             root: "/cache/att".to_owned(),
         });
@@ -1294,6 +1373,188 @@ mod tests {
         );
         assert_eq!(wrapped.get_time_parameter(10), "-ss 10");
         assert!(wrapped.convert_image("a", "b").await.is_ok());
+    }
+
+    /// A stand-in ffmpeg: an executable shell script running `body`.
+    #[cfg(unix)]
+    fn fake_ffmpeg(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("ffmpeg");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The real subtitle I/O over `ffmpeg_path`, with the given persisted
+    /// `SubtitleExtractionTimeoutMinutes`.
+    #[cfg(unix)]
+    fn subtitle_io(dir: &std::path::Path, ffmpeg_path: String, minutes: i32) -> FfmpegSubtitleIo {
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            dir.join("data"),
+            dir.join("log"),
+            dir.join("config"),
+            dir.join("cache"),
+            dir.join("web"),
+        ));
+        let options = EncodingOptions {
+            subtitle_extraction_timeout_minutes: minutes,
+            ..EncodingOptions::default()
+        };
+        FfmpegSubtitleIo {
+            path_manager: Arc::new(FakePathManager {
+                root: dir.to_string_lossy().into_owned(),
+            }),
+            ffmpeg_path,
+            config: Arc::new(FakeConfig(paths, options)),
+        }
+    }
+
+    /// A configured timeout of zero minutes expires at once: the still-running
+    /// ffmpeg is killed and its half-written output deleted, as upstream's
+    /// `RunSubtitleExtractionProcess` + `ExtractSubtitlesForFile` do.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subtitle_extraction_times_out_after_the_configured_minutes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "exec sleep infinity");
+        let output = tmp.path().join("cache/0.srt");
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, "partial").unwrap();
+        let output = output.to_string_lossy().into_owned();
+        let io = subtitle_io(tmp.path(), ffmpeg, 0);
+        let error = io
+            .extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out after 0 minute(s)"), "{error}");
+        assert!(!std::path::Path::new(&output).exists());
+    }
+
+    /// Within the configured timeout the extraction completes normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subtitle_extraction_within_the_timeout_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            "for arg; do out=\"$arg\"; done; printf 1 > \"$out\"",
+        );
+        let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
+        let io = subtitle_io(tmp.path(), ffmpeg, 1);
+        io.extract(
+            &format!("-y -i in.mkv \"{output}\""),
+            std::slice::from_ref(&output),
+        )
+        .await
+        .unwrap();
+        assert!(std::path::Path::new(&output).is_file());
+    }
+
+    /// A negative timeout, or one past the longest .NET timer delay, is refused
+    /// before ffmpeg starts, instead of upstream's `CancelAfter` throw that
+    /// leaves the started ffmpeg running.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::negative(-1)]
+    #[case::beyond_the_longest_wait(i32::MAX)]
+    #[tokio::test]
+    async fn invalid_subtitle_extraction_timeout_never_starts_ffmpeg(#[case] minutes: i32) {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("started");
+        let ffmpeg = fake_ffmpeg(tmp.path(), &format!(": > \"{}\"", marker.display()));
+        let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
+        let io = subtitle_io(tmp.path(), ffmpeg, minutes);
+        let error = io
+            .extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("invalid SubtitleExtractionTimeoutMinutes"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+    }
+
+    /// How often the cancellation test re-checks the stand-in ffmpeg.
+    #[cfg(target_os = "linux")]
+    const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// How many [`CANCEL_POLL`] intervals the cancellation test waits for the
+    /// stand-in ffmpeg to start, and then to die, before failing.
+    #[cfg(target_os = "linux")]
+    const CANCEL_POLL_ATTEMPTS: u32 = 500;
+
+    /// Whether `pid` is gone or a zombie awaiting its reaper (killed).
+    #[cfg(target_os = "linux")]
+    fn process_has_exited(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+            // The state follows the parenthesised command name.
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X'))
+        })
+    }
+
+    /// Dropping the request future mid-extraction — a client disconnecting
+    /// during a seek — kills ffmpeg and deletes its half-written output,
+    /// as upstream's cancellation token does, so the truncated file is never
+    /// served from the subtitle cache.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cancelled_subtitle_extraction_kills_ffmpeg_and_deletes_its_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            &format!(
+                "for arg; do out=\"$arg\"; done; printf partial > \"$out\"; \
+                 echo $$ > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; exec sleep infinity",
+                pid = pid_file.display()
+            ),
+        );
+        let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
+        let io = subtitle_io(tmp.path(), ffmpeg, 1);
+        let args = format!("-y -i in.mkv \"{output}\"");
+        // Boxed, not stack-pinned: `drop` must drop the future itself.
+        let mut extraction = Box::pin(io.extract(&args, std::slice::from_ref(&output)));
+
+        // Drive the extraction until ffmpeg has written part of its output.
+        let mut started = false;
+        for _ in 0..CANCEL_POLL_ATTEMPTS {
+            tokio::select! {
+                result = &mut extraction => panic!("the extraction ended early: {result:?}"),
+                () = tokio::time::sleep(CANCEL_POLL) => {}
+            }
+            if pid_file.is_file() {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "the stand-in ffmpeg never started");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(std::path::Path::new(&output).is_file());
+
+        // The request is cancelled.
+        drop(extraction);
+
+        assert!(!std::path::Path::new(&output).exists());
+        let mut killed = false;
+        for _ in 0..CANCEL_POLL_ATTEMPTS {
+            if process_has_exited(&pid) {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(CANCEL_POLL).await;
+        }
+        assert!(killed, "ffmpeg {pid} kept running after the cancellation");
     }
 
     #[tokio::test]

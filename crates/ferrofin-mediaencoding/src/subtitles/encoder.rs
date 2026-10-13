@@ -81,6 +81,31 @@ impl Writer {
     }
 }
 
+/// The longest delay, in milliseconds, .NET's `CancellationTokenSource.CancelAfter`
+/// accepts: `Timer.MaxSupportedTimeout`, documented as `UInt32.MaxValue - 1`.
+/// A longer delay makes it throw `ArgumentOutOfRangeException`.
+const DOTNET_MAX_TIMER_DELAY_MS: u32 = u32::MAX - 1;
+
+/// How long one subtitle extraction ffmpeg run may take before it is killed,
+/// from `EncodingOptions.SubtitleExtractionTimeoutMinutes`.
+///
+/// Port of `waitSource.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes))` in
+/// `SubtitleEncoder.RunSubtitleExtractionProcess`, which reads the setting on
+/// every run. Zero is a zero wait: upstream cancels at once, so ffmpeg is
+/// killed and the extraction fails.
+///
+/// Deliberate divergence: a negative value, or one longer than
+/// [`DOTNET_MAX_TIMER_DELAY_MS`] (71,582 minutes), makes upstream's
+/// `CancelAfter` throw after ffmpeg has already started, so the extraction
+/// fails and the orphaned ffmpeg keeps running. `None` here reports such a
+/// value as invalid, so the caller fails the extraction without starting
+/// ffmpeg.
+#[must_use]
+pub fn subtitle_extraction_timeout(minutes: i32) -> Option<std::time::Duration> {
+    let timeout = std::time::Duration::from_mins(u64::try_from(minutes).ok()?);
+    (timeout.as_millis() <= u128::from(DOTNET_MAX_TIMER_DELAY_MS)).then_some(timeout)
+}
+
 /// The un-mockable I/O the encoder depends on (files, HTTP, ffmpeg).
 ///
 /// Everything the pure `SubtitleEncoder` logic cannot do without touching the
@@ -848,4 +873,46 @@ fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
 /// Case-insensitive `str::starts_with`.
 fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
     haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rstest::rstest;
+
+    use super::{DOTNET_MAX_TIMER_DELAY_MS, subtitle_extraction_timeout};
+
+    /// `TimeSpan.FromMinutes(SubtitleExtractionTimeoutMinutes)`: the stock 30,
+    /// any other minute count, and zero (an immediate timeout) are durations;
+    /// a negative count, or one past the longest .NET timer delay, is rejected
+    /// rather than handed to the wait.
+    #[rstest]
+    #[case::stock_default(30, Some(Duration::from_mins(30)))]
+    #[case::one_minute(1, Some(Duration::from_mins(1)))]
+    #[case::zero_is_immediate(0, Some(Duration::ZERO))]
+    #[case::negative_is_invalid(-1, None)]
+    #[case::most_negative_is_invalid(i32::MIN, None)]
+    #[case::largest_is_invalid(i32::MAX, None)]
+    fn subtitle_extraction_timeout_is_whole_minutes(
+        #[case] minutes: i32,
+        #[case] expected: Option<Duration>,
+    ) {
+        assert_eq!(subtitle_extraction_timeout(minutes), expected);
+    }
+
+    /// The upper bound is the last whole minute within .NET's
+    /// `Timer.MaxSupportedTimeout` (`UInt32.MaxValue - 1` ms = 71,582 minutes);
+    /// one minute more is refused, as upstream's `CancelAfter` would throw.
+    #[test]
+    fn subtitle_extraction_timeout_stops_at_the_dotnet_timer_limit() {
+        let ms_per_minute = Duration::from_mins(1).as_millis();
+        let longest = i32::try_from(u128::from(DOTNET_MAX_TIMER_DELAY_MS) / ms_per_minute).unwrap();
+        assert_eq!(longest, 71_582);
+        assert_eq!(
+            subtitle_extraction_timeout(longest),
+            Some(Duration::from_mins(71_582))
+        );
+        assert_eq!(subtitle_extraction_timeout(longest + 1), None);
+    }
 }
