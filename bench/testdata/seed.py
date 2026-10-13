@@ -11,6 +11,7 @@ and the persisted bench token that run.sh, screens.js and ttfs.py use.
 """
 
 import json
+import os
 import random
 import sys
 import time
@@ -27,28 +28,31 @@ TICK = 10_000_000  # ticks per second
 
 
 class Api:
-    def __init__(self, url):
+    def __init__(self, url, timeout=600, attempts=120):
         self.url = url.rstrip("/")
         self.token = None
+        self.auth = AUTH
+        self.timeout = timeout
+        self.attempts = attempts
 
     def call(self, method, path, body=None, **q):
         q = {k: v for k, v in q.items() if v is not None}
         u = self.url + path + ("?" + urllib.parse.urlencode(q, doseq=True) if q else "")
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(u, data=data, method=method)
-        req.add_header("Authorization", AUTH + (f', Token="{self.token}"' if self.token else ""))
+        req.add_header("Authorization", self.auth + (f', Token="{self.token}"' if self.token else ""))
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        for attempt in range(120):
+        for attempt in range(self.attempts):
             try:
-                with urllib.request.urlopen(req, timeout=600) as r:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
                     raw = r.read()
                     return json.loads(raw) if raw.strip() else None
             except urllib.error.HTTPError as e:
-                if e.code != 503:  # 503 = still starting up
+                if e.code != 503 or attempt + 1 == self.attempts:  # 503 = still starting up
                     raise
                 time.sleep(1)
-        raise RuntimeError(f"{method} {path}: 503 for 120s")
+        raise RuntimeError(f"{method} {path}: 503 after {self.attempts} attempts")
 
     def get(self, path, **q):
         return self.call("GET", path, **q)
@@ -58,12 +62,16 @@ class Api:
 
 
 def wait_ready(api, secs=300):
-    for _ in range(secs * 2):
+    deadline = time.monotonic() + secs
+    while time.monotonic() < deadline:
         try:
-            api.get("/System/Info/Public")
-            return
+            # Jellyfin 12's temporary setup server also returns HTTP 200, but
+            # camelCase JSON; wait for the actual API's PascalCase response.
+            if api.get("/System/Info/Public").get("Version"):
+                return
         except (urllib.error.URLError, ConnectionError, OSError):
-            time.sleep(0.5)
+            pass
+        time.sleep(0.5)
     sys.exit("server never became ready")
 
 
@@ -74,13 +82,273 @@ def running_tasks(api):
 def drain(api, settle=30, label=""):
     """Every scheduled task idle, then a settle margin — the run.sh rule applied at build."""
     t0 = time.time()
+    deadline = time.monotonic() + int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
     while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("fixture tasks did not drain before deadline")
         busy = running_tasks(api)
         if not busy:
             break
         print(f"  {label}waiting for {busy} ({int(time.time() - t0)}s)", flush=True)
         time.sleep(10)
     time.sleep(settle)
+
+
+def refresh_and_wait(api, timeout):
+    """The refresh POST is asynchronous: Idle alone does not prove a scan ran."""
+    tasks = [t for t in api.get("/ScheduledTasks") if t.get("Key") == "RefreshLibrary"]
+    if len(tasks) != 1:
+        raise RuntimeError("expected one RefreshLibrary task")
+    task = tasks[0]
+    if task.get("State") != "Idle":
+        raise RuntimeError("library scan already active; drain before requesting a scan")
+    before = (task.get("LastExecutionResult") or {}).get("EndTimeUtc", "")
+    api.post("/Library/Refresh")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        task = api.get(f"/ScheduledTasks/{task['Id']}")
+        result = task.get("LastExecutionResult") or {}
+        if result.get("EndTimeUtc", "") > before:
+            if result.get("Status") != "Completed":
+                raise RuntimeError(f"library scan failed: {result.get('Status')}")
+            if task.get("State") == "Idle":
+                return result
+        time.sleep(2)
+    raise RuntimeError("library scan did not complete before its deadline")
+
+
+def prepare_jellyfin12(url, ids_path, summary_path, out):
+    """Verify one disposable upgraded config; build.sh stops it before marking ready."""
+    with open(ids_path) as f:
+        ids = json.load(f)
+    with open(summary_path) as f:
+        summary = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    wait_ready(api)
+    api.token = ids["token"]
+    info = api.get("/System/Info/Public")
+    if info.get("Version") != "12.0.0":
+        raise RuntimeError(f"expected Jellyfin 12.0.0, got {info.get('Version')}")
+    timeout = int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("startup tasks did not drain before preparation deadline")
+        time.sleep(2)
+    print("requesting post-upgrade library scan", flush=True)
+    scan = refresh_and_wait(api, timeout)
+    counts = {}
+    for key, item_type in (("movies", "Movie"), ("series", "Series"), ("episodes", "Episode"),
+                           ("albums", "MusicAlbum"), ("tracks", "Audio")):
+        counts[key] = api.get("/Items", userId=ids["user"], recursive="true",
+                              includeItemTypes=item_type, limit=0)["TotalRecordCount"]
+        if counts[key] != summary[key]:
+            raise RuntimeError(f"{key}: expected {summary[key]}, got {counts[key]} after scan")
+    movies = api.get("/Items", userId=ids["user"], recursive="true", includeItemTypes="Movie",
+                     fields="MediaSources", limit=100000)["Items"]
+    versions = sum(len(m.get("MediaSources", [])) > 1 for m in movies)
+    if versions != summary["case_multi_version"]:
+        raise RuntimeError(f"multi-version groups: expected {summary['case_multi_version']}, got {versions}")
+    for key in ("movie", "hdr_movie", "stream", "series", "season", "episode"):
+        item = api.get(f"/Users/{ids['user']}/Items/{ids[key]}")
+        if item.get("Id", "").replace("-", "") != ids[key].replace("-", ""):
+            raise RuntimeError(f"selected {key} no longer resolves to its fixture ID")
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("tasks did not drain after preparation")
+        time.sleep(2)
+    result = {"system_info": info, "scan": scan, "counts": counts, "multi_version_groups": versions}
+    with open(out, "w") as f:
+        json.dump(result, f, indent=2)
+    print(json.dumps({"version": info["Version"], "counts": counts, "multi_version_groups": versions}), flush=True)
+
+
+def normalized_id(value):
+    return str(value).replace('-', '').lower()
+
+
+def validate_user_roles(ids):
+    if not ids.get('user') or not ids.get('viewer') or normalized_id(ids['user']) == normalized_id(ids['viewer']):
+        raise RuntimeError('browse and playback users must be distinct')
+    for key in ('user_name', 'password', 'viewer_name', 'viewer_password'):
+        if not isinstance(ids.get(key), str) or not ids[key]:
+            raise RuntimeError(f'missing fixture credential: {key}')
+
+
+def export_viewer(api, ids):
+    """Identify the existing seeded viewer; never create a user on a measured server."""
+    user = api.get(f"/Users/{ids['viewer']}")
+    if normalized_id(user.get('Id')) != normalized_id(ids['viewer']) or user.get('Name') != 'viewer':
+        raise RuntimeError('source fixture viewer does not match the seeded account')
+    ids.update(viewer_name='viewer', viewer_password='viewer')
+    validate_user_roles(ids)
+
+
+def role_api(url, token, device):
+    api = Api(url, timeout=int(os.environ.get('HTTP_TIMEOUT_S', '10')), attempts=1)
+    api.auth = AUTH.replace('bench-seed', device)
+    api.token = token
+    return api
+
+
+def movie_user_state(api, user, movie_ids):
+    """Bounded read of personal playback fields; missing/duplicate IDs are failures."""
+    expected = {normalized_id(i) for i in movie_ids}
+    if not expected or len(expected) != len(movie_ids):
+        raise RuntimeError('invalid isolation movie pool')
+    result = {}
+    for offset in range(0, len(movie_ids), 100):
+        batch = movie_ids[offset:offset + 100]
+        rows = api.get(f'/Users/{user}/Items', Ids=','.join(batch), Limit=len(batch),
+                       EnableUserData='true', EnableImages='false')['Items']
+        batch_ids = [normalized_id(r.get('Id')) for r in rows]
+        if len(set(batch_ids)) != len(batch_ids) or set(batch_ids) != {normalized_id(i) for i in batch}:
+            raise RuntimeError('isolation item observations missing, duplicated or unexpected')
+        for row in rows:
+            data = row.get('UserData')
+            if not isinstance(data, dict) or 'PlayCount' not in data:
+                raise RuntimeError('isolation user data missing')
+            result[normalized_id(row['Id'])] = {k: data.get(k) for k in
+                ('PlaybackPositionTicks', 'Played', 'PlayCount', 'LastPlayedDate')}
+    return result
+
+
+def authenticate_roles(url, ids_path, out):
+    with open(ids_path) as f:
+        ids = json.load(f)
+    validate_user_roles(ids)
+    roles = {}
+    control = role_api(url, ids['token'], 'bench-state')
+    for role, user_key, name_key, password_key in (
+            ('browse', 'user', 'user_name', 'password'),
+            ('playback', 'viewer', 'viewer_name', 'viewer_password')):
+        api = role_api(url, None, 'bench-' + role)
+        reply = api.post('/Users/AuthenticateByName', {'Username': ids[name_key], 'Pw': ids[password_key]})
+        user = reply.get('User') or {}
+        if normalized_id(user.get('Id')) != normalized_id(ids[user_key]) or not reply.get('AccessToken'):
+            raise RuntimeError(f'{role} authentication returned the wrong identity or no token')
+        if user.get('Policy', {}).get('IsDisabled'):
+            raise RuntimeError(f'{role} user is disabled')
+        api.token = reply['AccessToken']
+        movie_user_state(api, ids[user_key], ids['pools']['movies'])
+        ids[role + '_token'] = api.token
+        roles[role] = {'user': ids[user_key], 'device': 'bench-' + role, 'policy': user.get('Policy', {})}
+    ids['user_isolation'] = 1
+    # Authentication tokens/fixture passwords must never enter logs or report metadata.
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(ids, f)
+    with open(os.path.join(os.path.dirname(out), 'user-roles.json'), 'w') as f:
+        json.dump(roles, f, indent=2)
+    check_role_sessions(control.get('/Sessions'), ids)
+
+
+def check_role_sessions(sessions, ids):
+    for role, key in (('browse', 'user'), ('playback', 'viewer')):
+        matches = [s for s in sessions if s.get('DeviceId') == 'bench-' + role and s.get('Client') == 'bench']
+        if len(matches) != 1 or normalized_id(matches[0].get('UserId')) != normalized_id(ids[key]):
+            raise RuntimeError(f'{role} session missing, duplicated or owned by wrong user')
+        if matches[0].get('AdditionalUsers'):
+            raise RuntimeError(f'{role} session has additional users')
+
+
+def state_snapshot(url, ids_path, out):
+    with open(ids_path) as f:
+        ids = json.load(f)
+    validate_user_roles(ids)
+    api = role_api(url, ids['token'], 'bench-state')
+    check_role_sessions(api.get('/Sessions'), ids)
+    states = movie_user_state(api, ids['user'], ids['pools']['movies'])
+    playback = movie_user_state(api, ids['viewer'], ids['pools']['movies'])
+    # Same home queries/selection order as screens.js; these untimed observations do
+    # not replace its per-iteration exact request-key validation.
+    user = ids['user']
+    card = dict(Fields='PrimaryImageAspectRatio', ImageTypeLimit=1,
+                EnableImageTypes='Primary,Backdrop,Thumb', EnableTotalRecordCount='false')
+    queries = [('views', f'/Users/{user}/Views', {})]
+    queries += [('resume-' + media.lower(), f'/Users/{user}/Items/Resume',
+                 dict(Limit=12, Recursive='true', MediaTypes=media, **card)) for media in ('Video', 'Audio', 'Book')]
+    queries += [('nextup', '/Shows/NextUp', dict(Limit=24, Fields='PrimaryImageAspectRatio,DateCreated,Path,MediaSourceCount',
+                 UserId=user, ImageTypeLimit=1, EnableImageTypes='Primary,Backdrop,Banner,Thumb',
+                 EnableTotalRecordCount='false', DisableFirstEpisode='false',
+                 NextUpDateCutoff=ids['pools']['nextUpCutoff'], EnableResumable='false', EnableRewatching='false'))]
+    queries += [('latest-' + name, f'/Users/{user}/Items/Latest', dict(Limit=16, Fields='PrimaryImageAspectRatio,Path',
+                 ImageTypeLimit=1, EnableImageTypes='Primary,Backdrop,Thumb', ParentId=ids[key]))
+                for name, key in (('movies', 'movies_view'), ('shows', 'shows_view'), ('music', 'music_view'))]
+    lists, images = {}, {}
+    for name, path, params in queries:
+        response = api.get(path, **params)
+        rows = response if isinstance(response, list) else response['Items']
+        lists[name] = [r['Id'] for r in rows]
+        images[name] = [r['Id'] for r in rows if r.get('ImageTags', {}).get('Primary')]
+    posters = [i for name in ('resume-video', 'nextup', 'latest-movies', 'latest-shows') for i in images[name]][:12]
+    with open(out, 'w') as f:
+        json.dump({'browse_user': ids['user'], 'playback_user': ids['viewer'], 'user_state': states,
+                   'home': lists, 'home_images': posters, 'playback_state': playback}, f, indent=2)
+
+
+def state_changes(before, after):
+    for field in ('browse_user', 'playback_user', 'user_state', 'home', 'home_images'):
+        if field not in before or field not in after:
+            raise RuntimeError('incomplete isolation observation')
+    if before['browse_user'] != after['browse_user'] or before['playback_user'] != after['playback_user']:
+        raise RuntimeError('isolation identities changed')
+    if not before['user_state'] or set(before['user_state']) != set(after['user_state']):
+        raise RuntimeError('isolation item coverage changed')
+    return {'changed_items': [k for k in before['user_state'] if before['user_state'][k] != after['user_state'][k]],
+            'home_changed': before['home'] != after['home'] or before['home_images'] != after['home_images']}
+
+
+def compare_states(before_path, after_path, out):
+    with open(before_path) as f:
+        before = json.load(f)
+    with open(after_path) as f:
+        after = json.load(f)
+    result = state_changes(before, after)
+    if 'playback_state' in before and 'playback_state' in after:
+        result['playback_changed_items'] = [k for k in before['playback_state'] if before['playback_state'][k] != after['playback_state'].get(k)]
+    result['ok'] = not result['changed_items'] and not result['home_changed']
+    with open(out, 'w') as f:
+        json.dump(result, f, indent=2)
+    if not result['ok']:
+        raise RuntimeError('browse playback state or home selections changed; see isolation observations')
+
+
+def export_pools(api, ids):
+    """Read the fixed source fixture once; never select pools from a measured server."""
+    query = dict(Recursive="true", SortBy="SortName", SortOrder="Ascending")
+    movies = api.get(f"/Users/{ids['user']}/Items", **query, IncludeItemTypes="Movie",
+                     Limit=500, ParentId=ids["movies_view"])
+    series = api.get(f"/Users/{ids['user']}/Items", **query, IncludeItemTypes="Series",
+                     Limit=100, ParentId=ids["shows_view"])
+    terms = sorted({w for m in movies["Items"] for w in m["Name"].split(" ")
+                    if len(w) > 3 and w != "The"})[:40]
+    pools = {"movies": [m["Id"] for m in movies["Items"]],
+             "series": [m["Id"] for m in series["Items"]], "terms": terms,
+             "movieCount": movies["TotalRecordCount"],
+             "nextUpCutoff": "2025-09-01T00:00:00.000Z"}
+    if not all(pools[k] for k in ("movies", "series", "terms", "movieCount")):
+        raise RuntimeError("source fixture returned empty pools")
+    return pools
+
+
+def export_existing_pools(url, ids_path):
+    with open(ids_path) as f:
+        ids = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    wait_ready(api)
+    api.token = ids["token"]
+    if api.get("/System/Info/Public").get("Version") != "10.11.8":
+        raise RuntimeError("pool export requires the source Jellyfin 10.11.8 fixture")
+    drain(api)
+    export_viewer(api, ids)
+    ids["pools"] = export_pools(api, ids)
+    # Atomic replacement leaves the old fixture IDs intact if export fails.
+    with open(ids_path + ".tmp", "w") as f:
+        json.dump(ids, f, indent=2)
+    os.replace(ids_path + ".tmp", ids_path)
+    print("exported source pools: " + json.dumps({k: len(ids["pools"][k]) for k in ("movies", "series", "terms")}))
 
 
 def main():
@@ -157,9 +425,22 @@ def main():
            "series": ser["Id"], "season": season["Id"], "episode": episode["Id"],
            "stream": stream["Id"], "stream_source": stream["MediaSources"][0]["Id"],
            "counts": {"movies": len(movies), "series": len(series), "episodes": len(episodes), "hdr": len(hdr)}}
+    export_viewer(api, ids)
+    ids["pools"] = export_pools(api, ids)
     json.dump(ids, open(out, "w"), indent=2)
     print(json.dumps(ids["counts"]))
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--isolation-auth":
+        authenticate_roles(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--state-snapshot":
+        state_snapshot(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--state-compare":
+        compare_states(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin12":
+        prepare_jellyfin12(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--export-pools":
+        export_existing_pools(*sys.argv[2:])
+    else:
+        main()
