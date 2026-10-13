@@ -519,7 +519,7 @@ impl CollectionManager for RecordingCollections {
     }
     async fn get_collections_containing_item(
         &self,
-        _user_id: Uuid,
+        _user: &ferrofin_db::entities::users::UserEntity,
         _item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()

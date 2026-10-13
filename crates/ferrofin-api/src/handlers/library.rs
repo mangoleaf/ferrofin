@@ -8,6 +8,8 @@
 //! - `GET /Items/{itemId}/ThemeMedia` — both of the above (plus an empty
 //!   soundtrack result, matching C#).
 //! - `GET /Items/{itemId}/File` — the item's original on-disk file.
+//! - `GET /Items/{itemId}/Collections` — the visible collections that include
+//!   the item (Jellyfin 12.1, outside the 10.11.8 contract).
 //! - `POST /Library/Refresh` — queues a full library scan.
 //! - `GET /Library/MediaFolders` — the server's media (collection) folders,
 //!   name-sorted, projected to [`BaseItemDto`](ferrofin_model::dto::BaseItemDto).
@@ -38,6 +40,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::LibraryOptionsResultDto;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
@@ -286,6 +289,115 @@ async fn get_theme_media(
         theme_videos_result,
         soundtrack_songs_result: ThemeMediaResult::default(),
     }))
+}
+
+/// Query parameters of `GET /Items/{itemId}/Collections`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemCollectionsQuery {
+    /// Optional. Filter by user id, and attach user data.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
+    user_id: Option<Uuid>,
+    /// Optional. The index of the first record in the output.
+    #[serde(default)]
+    start_index: Option<i32>,
+    /// Optional. The maximum number of records to return.
+    #[serde(default)]
+    limit: Option<i32>,
+    /// Optional. Comma-delimited extra fields to populate.
+    #[serde(default)]
+    fields: Option<String>,
+}
+
+/// `GET /Items/{itemId}/Collections` — the collections that include an item.
+///
+/// Port of `LibraryController.GetItemCollections` (Jellyfin 12.1; not in the
+/// 10.11.8 contract): no user is a `401`, an item the user cannot see a `404`;
+/// the visible box sets that manually link the item are sorted by `SortName`
+/// then `Name` (both `OrdinalIgnoreCase`) and paged, with the pre-paging count
+/// as the total. The projection is `new DtoOptions { Fields = fields }` — no
+/// client or image options.
+#[utoipa::path(
+    get,
+    path = "/Items/{itemId}/Collections",
+    params(
+        ("itemId" = String, Path, description = "The item id"),
+        ("userId" = Option<String>, Query, description = "Optional user id"),
+        ("startIndex" = Option<i32>, Query, description = "The index of the first record"),
+        ("limit" = Option<i32>, Query, description = "The maximum number of records"),
+        ("fields" = Option<String>, Query, description = "Comma-delimited extra fields")
+    ),
+    responses(
+        (status = 200, description = "Collections returned", body = QueryResult<BaseItemDto>),
+        (status = 401, description = "User context missing"),
+        (status = 404, description = "Item not found")
+    ),
+    tag = "ferrofin"
+)]
+async fn get_item_collections(
+    State(state): State<AppState>,
+    RequireAuth(auth): RequireAuth,
+    Path(item_id): Path<Uuid>,
+    Query(query): Query<ItemCollectionsQuery>,
+) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    use ferrofin_util::string_extensions::compare_ordinal_ignore_case;
+    let Some(user) = resolve_user_opt(&state, &auth, query.user_id).await? else {
+        return Err(ApiError::Unauthorized("user context missing".to_owned()));
+    };
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, Some(&user))
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    let mut collections = state
+        .collections
+        .get_collections_containing_item(&user, item_id)
+        .await?;
+    // C# `BaseItem.SortName` is never null: with none stored it derives from the
+    // name. `Name` can be, and `StringComparer.OrdinalIgnoreCase` orders null first.
+    let sort_name = |item: &BaseItemEntity| {
+        item.sort_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                item.name
+                    .as_deref()
+                    .map(ferrofin_util::sort_name::create_sort_name)
+            })
+            .unwrap_or_default()
+    };
+    collections.sort_by(|a, b| {
+        compare_ordinal_ignore_case(&sort_name(a), &sort_name(b)).then_with(|| {
+            match (a.name.as_deref(), b.name.as_deref()) {
+                (Some(a), Some(b)) => compare_ordinal_ignore_case(a, b),
+                (a, b) => a.is_some().cmp(&b.is_some()),
+            }
+        })
+    });
+    let total = i32::try_from(collections.len()).unwrap_or(i32::MAX);
+    // LINQ `Skip`/`Take`: a negative count skips nothing / takes nothing.
+    let skip = query
+        .start_index
+        .map_or(0, |n| usize::try_from(n).unwrap_or(0));
+    let take = query
+        .limit
+        .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(0));
+    let page: Vec<BaseItemEntity> = collections.into_iter().skip(skip).take(take).collect();
+    let options = DtoOptions {
+        fields: parse_csv_enums_lenient(query.fields.as_deref()),
+        ..DtoOptions::default()
+    };
+    let dtos = state
+        .dto
+        .get_base_item_dtos(&page, &options, Some(&user), None, true)
+        .await?;
+    Ok(Json(QueryResult::new(query.start_index, Some(total), dtos)))
 }
 
 /// `GET /Items/{itemId}/File` — the original file of an item.
@@ -770,6 +882,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/Items/{itemId}/ThemeVideos", get(get_theme_videos))
         .route("/Items/{itemId}/ThemeMedia", get(get_theme_media))
         .route("/Items/{itemId}/File", get(get_file))
+        // A Jellyfin 12.1 operation outside the 10.11.8 contract, so it has no
+        // `REAL_ROUTES` row; `contract_superset` probes it against the 12.1 spec.
+        .route("/Items/{itemId}/Collections", get(get_item_collections))
         .route("/Library/Refresh", post(refresh_library))
         .route("/Library/MediaFolders", get(get_media_folders))
         .route("/Library/PhysicalPaths", get(get_physical_paths))
@@ -785,6 +900,9 @@ crate::query::query_parameters! {
         "sortBy" => ',',
         "sortOrder" => ',',
     } => [("get", "/Items/{itemId}/ThemeSongs"), ("get", "/Items/{itemId}/ThemeVideos"), ("get", "/Items/{itemId}/ThemeMedia")];
+    ItemCollectionsQuery {
+        "fields" => ',',
+    } => [("get", "/Items/{itemId}/Collections")];
     MediaFoldersQuery {} => [("get", "/Library/MediaFolders")];
     AvailableOptionsQuery {} => [("get", "/Libraries/AvailableOptions")];
     SeriesUpdatedQuery {} => [("post", "/Library/Series/Updated")];

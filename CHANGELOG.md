@@ -36,6 +36,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
   and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
   12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
+- Serve `GET /Items/{itemId}/Collections` (Jellyfin 12.1's `GetItemCollections`): the
+  collections the user can see that include the item, sorted and paged as upstream.
+  jellyfin-web's item page calls it and hid its Collections section on the old `404`.
+  `contract_superset` now probes every 12.1 operation the 10.11.8 contract lacks
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
   relationships, version links, `GetCleanValue`, forced sort names, localized user-view
   consolidation

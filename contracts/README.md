@@ -26,10 +26,18 @@ one real clients (jellyfin-web, Swiftfin, Findroid, Wolphin, …) are built agai
   `https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json` (Jellyfin's own
   generated spec for the stable release; `info.version` is `12.1.0`).
 - **Captured:** 2026-10-03.
-- **Used by:** the `items_query_binds_every_contract_parameter` guard in
-  `crates/ferrofin-api/src/handlers/items.rs`, which checks `GET /Items` parameters
-  against the union of both contracts — 12.1.0 adds `audioLanguages` and
-  `subtitleLanguages` to 10.11.8's 86. It is not the route gate's pin (see below).
+- **Used by:**
+  - the `items_query_binds_every_contract_parameter` guard in
+    `crates/ferrofin-api/src/handlers/items.rs`, which checks `GET /Items` parameters
+    against the union of both contracts — 12.1.0 adds `audioLanguages` and
+    `subtitleLanguages` to 10.11.8's 86;
+  - the `query_parameters!` metadata check (`crates/ferrofin-api/src/query.rs`);
+  - `newer_contract_operations_never_404` in `crates/ferrofin-api/tests/contract_superset.rs`,
+    which probes every operation 12.1.0 has and 10.11.8 lacks (today only
+    `GET /Items/{itemId}/Collections`) on the live router.
+
+  It is not the route gate's pin (see below): 12.1-only operations are probed for
+  routing but have no `REAL_ROUTES`/`VERIFIED` rows, which must be 10.11.8 operations.
 
 ## Why 10.11.8 and not 12.0
 
