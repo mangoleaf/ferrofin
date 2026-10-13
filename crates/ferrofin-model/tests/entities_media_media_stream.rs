@@ -306,3 +306,196 @@ fn get_resolution_text_valid(
     };
     assert_eq!(s.get_resolution_text().as_deref(), expected);
 }
+
+// ---------------------------------------------------------------------------
+// Jellyfin 12.x `IsOriginal` / `LocalizedOriginal`. Upstream `MediaStreamTests`
+// has no `[InlineData]` for them, so these cases are derived from the v12.2
+// `DisplayTitle` getter (`MediaStream.cs:271-331`, audio; `:358-373`, video).
+// ---------------------------------------------------------------------------
+
+/// Builds an audio stream for the `IsOriginal` `DisplayTitle` cases.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn audio(
+    title: Option<&str>,
+    language: Option<&str>,
+    localized_language: Option<&str>,
+    codec: Option<&str>,
+    channel_layout: Option<&str>,
+    is_default: bool,
+    is_external: bool,
+    is_original: bool,
+    localized_original: Option<&str>,
+) -> MediaStream {
+    MediaStream {
+        stream_type: MediaStreamType::Audio,
+        title: title.map(ToOwned::to_owned),
+        language: language.map(ToOwned::to_owned),
+        localized_language: localized_language.map(ToOwned::to_owned),
+        codec: codec.map(ToOwned::to_owned),
+        channel_layout: channel_layout.map(ToOwned::to_owned),
+        is_default,
+        is_external,
+        is_original,
+        localized_original: localized_original.map(ToOwned::to_owned),
+        ..Default::default()
+    }
+}
+
+// MediaStream.cs:310-313: `Original` follows `External`, and an empty
+// `LocalizedOriginal` falls back to "Original" (`string.IsNullOrEmpty`).
+#[rstest]
+#[case(
+    audio(
+        None,
+        Some("eng"),
+        Some("English"),
+        Some("aac"),
+        Some("stereo"),
+        false,
+        false,
+        true,
+        None
+    ),
+    "English - AAC - Stereo - Original"
+)]
+#[case(
+    audio(Some("Title"), None, None, Some("AAC"), None, true, true, true, None),
+    "Title - AAC - Default - External - Original"
+)]
+#[case(
+    audio(
+        None,
+        Some("eng"),
+        Some("English"),
+        Some("aac"),
+        Some("stereo"),
+        false,
+        false,
+        true,
+        Some("Originál")
+    ),
+    "English - AAC - Stereo - Originál"
+)]
+#[case(
+    audio(
+        None,
+        Some("eng"),
+        Some("English"),
+        Some("aac"),
+        Some("stereo"),
+        false,
+        false,
+        true,
+        Some("")
+    ),
+    "English - AAC - Stereo - Original"
+)]
+#[case(
+    audio(
+        Some("Original Mix"),
+        None,
+        None,
+        Some("aac"),
+        None,
+        false,
+        false,
+        true,
+        None
+    ),
+    "Original Mix - AAC"
+)]
+#[case(
+    audio(
+        None,
+        Some("eng"),
+        Some("English"),
+        Some("aac"),
+        Some("stereo"),
+        false,
+        false,
+        false,
+        Some("Original")
+    ),
+    "English - AAC - Stereo"
+)]
+fn display_title_audio_is_original(#[case] stream: MediaStream, #[case] expected: &str) {
+    assert_eq!(stream.display_title().as_deref(), Some(expected));
+}
+
+// The subtitle arm (MediaStream.cs:376-431) never reads `IsOriginal`.
+#[test]
+fn display_title_subtitle_ignores_is_original() {
+    let mut s = subtitle(
+        None,
+        Some("eng"),
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some("ASS"),
+    );
+    s.is_original = true;
+    s.localized_original = Some("Original".to_owned());
+    assert_eq!(s.display_title().as_deref(), Some("Eng - ASS"));
+}
+
+// MediaStream.cs:358-373: with a Title the missing tags are appended with
+// " - " (:366); without one they are joined with a single space (:373).
+#[rstest]
+#[case(Some("Main"), "Main - 1080p - H264 - SDR")]
+#[case(None, "1080p H264 SDR")]
+#[case(Some("Main 1080p"), "Main 1080p - H264 - SDR")]
+fn display_title_video_separators(#[case] title: Option<&str>, #[case] expected: &str) {
+    let s = MediaStream {
+        stream_type: MediaStreamType::Video,
+        title: title.map(ToOwned::to_owned),
+        codec: Some("h264".to_owned()),
+        width: Some(1920),
+        height: Some(1080),
+        ..Default::default()
+    };
+    assert_eq!(s.display_title().as_deref(), Some(expected));
+}
+
+// JsonDefaults `WhenWritingNull`: the non-nullable `IsOriginal` is always
+// written; null `LocalizedLanguage`/`LocalizedOriginal` are omitted (12.1 spec:
+// `boolean` vs `string, nullable`).
+#[test]
+fn is_original_and_localized_labels_serialize_like_jellyfin_12() {
+    let audio = audio(
+        None,
+        Some("eng"),
+        Some("English"),
+        Some("aac"),
+        None,
+        false,
+        false,
+        true,
+        Some("Original"),
+    );
+    let v = serde_json::to_value(&audio).unwrap();
+    assert_eq!(v["IsOriginal"], serde_json::json!(true));
+    assert_eq!(v["LocalizedLanguage"], serde_json::json!("English"));
+    assert_eq!(v["LocalizedOriginal"], serde_json::json!("Original"));
+
+    let video = MediaStream {
+        stream_type: MediaStreamType::Video,
+        ..Default::default()
+    };
+    let v = serde_json::to_value(&video).unwrap();
+    assert_eq!(v["IsOriginal"], serde_json::json!(false));
+    assert!(v.get("LocalizedLanguage").is_none());
+    assert!(v.get("LocalizedOriginal").is_none());
+}
+
+#[test]
+fn is_original_and_localized_original_deserialize() {
+    let s: MediaStream = serde_json::from_str(
+        r#"{"Type":"Audio","IsOriginal":true,"LocalizedOriginal":"Original"}"#,
+    )
+    .unwrap();
+    assert!(s.is_original);
+    assert_eq!(s.localized_original.as_deref(), Some("Original"));
+    assert_eq!(s.stream_type, MediaStreamType::Audio);
+}

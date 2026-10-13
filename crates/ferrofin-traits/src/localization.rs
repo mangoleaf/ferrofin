@@ -64,6 +64,13 @@ pub trait LocalizationManager: Send + Sync {
     /// when unknown (C# `GetLanguageDisplayName`).
     fn get_language_display_name(&self, language: &str) -> Option<String>;
 
+    /// The ISO 639-2/T code for an ISO 639-2/B code (`"ger"` → `"deu"`),
+    /// `None` when the code has no distinct /T form (C# `TryGetISO6392TFromB`).
+    /// The default knows no mappings, for lightweight manager substitutes.
+    fn try_get_iso6392_t_from_b(&self, _iso_b: &str) -> Option<String> {
+        None
+    }
+
     /// Resolves a rating string to a score, honouring the given country code
     /// (C# `GetRatingScore`).
     fn get_rating_score(

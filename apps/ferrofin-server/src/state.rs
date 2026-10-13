@@ -729,6 +729,7 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        .with_localization(Arc::clone(&localization))
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
             move || config_mgr.snapshot_shared().chapter_image_resolution

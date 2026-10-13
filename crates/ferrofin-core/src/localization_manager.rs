@@ -393,11 +393,16 @@ impl LocalizationManager {
     /// (C# `TryGetISO6392TFromB`).
     #[must_use]
     pub fn try_get_iso6392_t_from_b(&self, iso_b: &str) -> Option<String> {
-        CULTURE_DATA
-            .iso6392_b_to_t
-            .get(&iso_b.to_ascii_lowercase())
-            .filter(|t| !t.is_empty())
-            .cloned()
+        // Keys are stored lower-cased (C#'s dictionary is case-insensitive).
+        // Stored languages are almost always lower-case already, so this runs
+        // on every stream of every DTO read without allocating for them.
+        let map = &CULTURE_DATA.iso6392_b_to_t;
+        let found = if iso_b.bytes().any(|b| b.is_ascii_uppercase()) {
+            map.get(&iso_b.to_ascii_lowercase())
+        } else {
+            map.get(iso_b)
+        };
+        found.filter(|t| !t.is_empty()).cloned()
     }
 
     /// The parental-rating list for the server default country, back-filled with
@@ -935,6 +940,10 @@ impl ferrofin_traits::localization::LocalizationManager for LocalizationManager 
 
     fn get_language_display_name(&self, language: &str) -> Option<String> {
         LocalizationManager::get_language_display_name(self, language)
+    }
+
+    fn try_get_iso6392_t_from_b(&self, iso_b: &str) -> Option<String> {
+        LocalizationManager::try_get_iso6392_t_from_b(self, iso_b)
     }
 
     fn get_rating_score(
@@ -2024,6 +2033,26 @@ mod tests {
         assert_eq!(Some(&german), m.find_language_info("ger"));
         assert!(via_trait.find_language_info("").is_none());
         assert!(via_trait.find_language_info("zzz").is_none());
+    }
+
+    /// The trait seam's `try_get_iso6392_t_from_b` is the inherent lookup
+    /// (`LocalizationManagerTests.TryGetISO6392TFromB_Success`).
+    #[rstest]
+    #[case("ger", Some("deu"))]
+    #[case("fre", Some("fra"))]
+    #[case("chi", Some("zho"))]
+    #[case("eng", None)]
+    // Case-insensitive, as C#'s `StringComparer.OrdinalIgnoreCase` dictionary.
+    #[case("GER", Some("deu"))]
+    #[case("Fre", Some("fra"))]
+    #[case("ENG", None)]
+    fn trait_try_get_iso6392_t_from_b(#[case] iso_b: &str, #[case] expected: Option<&str>) {
+        let m = LocalizationManager::default();
+        let via_trait: &dyn LocalizationManagerTrait = &m;
+        assert_eq!(
+            via_trait.try_get_iso6392_t_from_b(iso_b).as_deref(),
+            expected
+        );
     }
 
     #[rstest]

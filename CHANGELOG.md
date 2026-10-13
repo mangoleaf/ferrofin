@@ -58,6 +58,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   content" and "Uncoded languages". External subtitle files named with these codes
   (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
   `GET /Items/Filters` is unchanged
+- Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
+  written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
+  original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
+  stored ISO 639-2/B language is sent as its /T code (`ger` → `deu`, `fre` → `fra`), a
+  video track with a title appends its tags with " - " (`Main - 1080p - H264 - SDR`, was
+  `Main 1080p H264 SDR`), and Live TV channel, recording and opened live streams carry the same
+  localized labels as library items, plus the `DisplayTitle` they previously lacked
 - `hasSubtitles`, `isHd`, `is4K` and `minWidth`/`minHeight`/`maxWidth`/`maxHeight` judge a
   merged item by its whole version group, as Jellyfin 12 does: a movie whose subtitles or
   4K file live only on its second version matches, listed under the primary, and an SD
