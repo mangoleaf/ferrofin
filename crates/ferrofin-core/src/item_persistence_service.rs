@@ -2831,13 +2831,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 query = query.bind(guid_to_db(*parent));
             }
             let parse = |id: Option<String>| id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-            for (id, parent, owner, path, extra_type) in
+            for (id, parent, season, owner, path, extra_type) in
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 if let Ok(id) = Uuid::parse_str(&id) {
                     out.push(ItemChildLink {
                         id,
                         parent_id: parse(parent),
+                        season_id: parse(season),
                         owner_id: parse(owner),
                         extra_type,
                         path,
@@ -5623,10 +5624,11 @@ pub(crate) fn local_group_paths_sql(n: usize) -> String {
     )
 }
 
-/// One row of [`child_links_sql`]: `Id`, `ParentId`, `OwnerId`, `Path`,
-/// `ExtraType`.
+/// One row of [`child_links_sql`]: `Id`, `ParentId`, `SeasonId`,
+/// `OwnerId`, `Path`, `ExtraType`.
 type ChildLinkRow = (
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -5636,8 +5638,8 @@ type ChildLinkRow = (
 pub(crate) fn child_links_sql(n: usize) -> String {
     let ids = numbered_placeholders(n);
     format!(
-        r#"SELECT "Id", "ParentId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
-            WHERE "ParentId" IN ({ids}) OR "OwnerId" IN ({ids})"#
+        r#"SELECT "Id", "ParentId", "SeasonId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
+            WHERE "ParentId" IN ({ids}) OR "SeasonId" IN ({ids}) OR "OwnerId" IN ({ids})"#
     )
 }
 
@@ -11046,10 +11048,14 @@ mod tests {
                     .any(|s| s.contains("IX_BaseItems_ParentId") && s.contains("ParentId=?"))
                     && seeks
                         .iter()
+                        .any(|s| s.contains("IX_BaseItems_SeasonId") && s.contains("SeasonId=?"))
+                    && seeks
+                        .iter()
                         .any(|s| s.contains("IX_BaseItems_OwnerId") && s.contains("OwnerId=?"))
                     && seeks.iter().all(|s| s.contains("IX_BaseItems_ParentId")
+                        || s.contains("IX_BaseItems_SeasonId")
                         || s.contains("IX_BaseItems_OwnerId")),
-                "the children by ParentId and OwnerId (n={n}), got: {plan:?}"
+                "the children by ParentId, SeasonId and OwnerId (n={n}), got: {plan:?}"
             );
         }
     }

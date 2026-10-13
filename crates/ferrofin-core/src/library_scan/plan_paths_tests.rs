@@ -301,7 +301,8 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
     let parents: std::collections::HashSet<String> = full
         .iter()
         .filter(|p| by_path(p))
-        .filter_map(|p| p.entity.parent_id.clone())
+        .flat_map(|p| [p.entity.parent_id.clone(), p.entity.season_id.clone()])
+        .flatten()
         .collect();
     let owners: std::collections::HashMap<&str, &str> = full
         .iter()
@@ -513,9 +514,17 @@ async fn plan_paths_plans_a_loose_episodes_virtual_season() {
         .iter()
         .find(|p| p.entity.path.as_deref() == Some(loose.as_str()))
         .expect("the episode");
+    let series = scoped
+        .iter()
+        .find(|p| p.entity.type_.ends_with("TV.Series"))
+        .expect("the series");
     assert_eq!(
         episode.entity.parent_id.as_deref(),
-        Some(season.entity.id.as_str())
+        Some(series.entity.id.as_str()),
+    );
+    assert_eq!(
+        episode.entity.season_id.as_deref(),
+        Some(season.entity.id.as_str()),
     );
     assert!(episode.ancestors.contains(&season.id));
     assert_eq!(

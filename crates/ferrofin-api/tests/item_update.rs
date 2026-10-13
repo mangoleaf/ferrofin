@@ -408,7 +408,10 @@ impl LibraryManager for OkLibrary {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        if query.recursive && query.ancestor_ids == [self.item_id] {
+        if query.recursive
+            && query.ancestor_ids == [self.item_id]
+            && !self.tree.descendants.is_empty()
+        {
             return Ok(self.tree.descendants.clone());
         }
         // `RefreshArtist`'s query: the albums crediting the artist, which
@@ -427,6 +430,17 @@ impl LibraryManager for OkLibrary {
             .iter()
             .filter_map(|k| k.stored_type_name())
             .collect();
+        // The cascade queries a season's episodes by ancestor_ids.
+        if !query.ancestor_ids.is_empty() {
+            return Ok(query
+                .ancestor_ids
+                .iter()
+                .filter_map(|id| self.tree.children.get(id))
+                .flatten()
+                .filter(|c| kinds.is_empty() || kinds.contains(&c.type_.as_str()))
+                .cloned()
+                .collect());
+        }
         Ok(self
             .tree
             .children

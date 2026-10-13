@@ -101,15 +101,17 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- The first scan of an adopted Jellyfin database still rewrites three kinds of item: music
+- The first scan of an adopted Jellyfin database still rewrites two kinds of item: music
   albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
-  album's `folder.jpg`; music artists, whose running time Ferrofin sums from their tracks
-  where Jellyfin stored 0; and the episodes that are not in a season folder. The
-  seasons Jellyfin made for those episodes keep their ids (and their watch state,
-  images and dates), but Ferrofin files such an episode under its season where
-  Jellyfin files it under the series, so the scan saves each of those episodes once
-  (on a Jellyfin 12.1 test library, about 8,700 episodes under 591 seasons). See the
-  next entry.
+  album's `folder.jpg`; and music artists, whose running time Ferrofin sums from their
+  tracks where Jellyfin stored 0.
+- An episode that is not in a season folder is now filed under its series, as in
+  Jellyfin; the season made for it (a season with no folder of its own) links it as its
+  season, still lists it and still counts it, and clients still see that season as the
+  episode's parent. 1.3.x filed such an episode under that season, which made the first
+  scan of an adopted Jellyfin database save every one of them once (about 8,700 episodes
+  under 591 seasons on a Jellyfin 12.1 test library); it no longer does. On a database
+  1.3.x scanned, the first scan after upgrading saves each such episode once instead.
 - Seasons with no folder of their own now take the ids Jellyfin gives them (from the
   series, the season number and the season's name). On a database an earlier Ferrofin
   scanned, the first start after upgrading moves each such season to its new id, with

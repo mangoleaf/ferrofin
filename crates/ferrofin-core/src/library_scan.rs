@@ -2419,10 +2419,11 @@ fn collapse_roots(mut roots: Vec<String>) -> Vec<String> {
 /// Deleting a row takes its `ParentId` descendants with it (the foreign key
 /// cascades), so a stale row whose child is kept — planned, under a folder
 /// that failed to list or an unavailable location, or kept because its file
-/// is still on disk — must stay: a virtual season whose loose episodes sit
-/// in a folder that failed to list is not removed with them unknown, as
+/// is still on disk — must stay. A kept episode also holds its season
+/// (`SeasonId`): a virtual season's episodes are stored under the series, and
 /// upstream removes a virtual season only when it has no episode left
-/// (`SeriesMetadataService.cs:172-207`). An extra (`OwnerId`) holds its owner
+/// (`SeriesMetadataService.cs:172-207`), so one whose loose episodes sit in a
+/// folder that failed to list is not removed with them unknown. An extra (`OwnerId`) holds its owner
 /// only while this scan planned it (`live`: its stored row may still name the
 /// old owner — an undecodable one is rewritten by its file facts only) or it
 /// is unknown itself (under a folder that did not list): otherwise
@@ -2443,11 +2444,12 @@ fn hold_back_kept_children(
             .filter(|child| !stale.contains(&child.id))
             .flat_map(|child| {
                 let parent = child.parent_id.filter(|p| stale.contains(p));
+                let season = child.season_id.filter(|s| stale.contains(s));
                 let owner = child.owner_id.filter(|o| {
                     stale.contains(o)
                         && (live.contains(&child.id) || !listed(child.path.as_deref()))
                 });
-                parent.into_iter().chain(owner)
+                parent.into_iter().chain(season).chain(owner)
             })
             .collect();
         let before = held;
@@ -2962,7 +2964,7 @@ impl PlanCtx<'_> {
     /// virtual season, the one kind planned without a path — is kept as
     /// well: [`plan_loose_episodes`](LibraryScanner::plan_loose_episodes)
     /// groups only the loose episodes the scope keeps, so each virtual
-    /// season it emits is the parent of a kept episode, exactly as the full
+    /// season it emits is the season of a kept episode, exactly as the full
     /// plan emits it.
     fn emit(&self, out: &mut Vec<Planned>, item: Planned) {
         let kept = match (self.scope.roots, item.entity.path.as_deref()) {
@@ -14154,9 +14156,11 @@ impl LibraryScanner {
     }
 
     /// Groups season-folder-less episodes into **virtual** `Season`s by their
-    /// filename-detected season number, emitting one `Season` per distinct number
-    /// and each episode parented to it. A file with no detectable season number
-    /// falls into a single "Season Unknown" grouping.
+    /// filename-detected season number, emitting one `Season` per distinct number;
+    /// each episode stays parented to the series, the folder it is in, and names
+    /// its season by `SeasonId` and as an ancestor ([`EpisodeHome::parent`]). A
+    /// file with no detectable season number falls into a single "Season
+    /// Unknown" grouping.
     // The C# planner's parameter list, plus the scanner receiver.
     #[allow(clippy::too_many_arguments)]
     fn plan_loose_episodes(
@@ -14246,6 +14250,7 @@ impl LibraryScanner {
                 series_name,
                 series_key,
                 season_name: Some(&season_name),
+                virtual_season: true,
             };
             self.plan_episode_file(path, home, ctx, out);
         }
@@ -14305,6 +14310,7 @@ impl LibraryScanner {
                     series_name,
                     series_key,
                     season_name,
+                    virtual_season: false,
                 };
                 self.plan_episode_file(&entry.path, home, ctx, out);
             } else if !ctx.tv_library.get() {
@@ -16455,13 +16461,22 @@ struct EpisodeHome<'a> {
     series_key: &'a str,
     /// The season's name.
     season_name: Option<&'a str>,
+    /// Whether the season is virtual: grouped from files in the series folder
+    /// (`SeriesMetadataService.CreateSeasonsAsync`), not the folder they are in.
+    virtual_season: bool,
 }
 
 impl EpisodeHome<'_> {
-    /// What an episode here hangs off — its season, else the series — and its
-    /// ancestors.
+    /// What an episode here hangs off and its ancestors. Upstream's `ParentId`
+    /// is the folder the file was found in: a season folder, or the series
+    /// for an episode of a virtual season, which `CreateSeasonsAsync` only
+    /// links by `SeasonId`. Either way the season is an ancestor
+    /// (`Episode.GetAncestorIds()` adds `SeasonId`).
     fn parent(self) -> (Uuid, Vec<Uuid>) {
         match self.season {
+            Some((season_id, _)) if self.virtual_season => {
+                (self.series_id, vec![self.cf, self.series_id, season_id])
+            }
             Some((season_id, _)) => (season_id, vec![self.cf, self.series_id, season_id]),
             None => (self.series_id, vec![self.cf, self.series_id]),
         }
@@ -33586,20 +33601,28 @@ mod tests {
         let link = |n: u128, parent: Option<u128>, owner: Option<u128>, path: &str| ItemChildLink {
             id: id(n),
             parent_id: parent.map(id),
+            season_id: None,
             owner_id: owner.map(id),
             extra_type: owner.map(|_| 1),
             path: (!path.is_empty()).then(|| path.to_owned()),
         };
         let listed = |path: Option<&str>| path.is_none_or(|p| !p.starts_with("/unlisted"));
-        // Series 1 → virtual season 2 → episode 3 (kept); series 4 →
-        // virtual season 5 → episode 6 (stale); movie 7 with a stale extra
+        // Series 1 → virtual season 2, episode 3 (kept) under the series in
+        // season 2; series 4 → virtual season 5, episode 6 (stale) in it;
+        // movie 7 with a stale extra
         // 8, movie 9 with a kept extra 10 on disk, movie 11 with an extra 12
         // under a folder that did not list.
         let children = vec![
             link(2, Some(1), None, ""),
-            link(3, Some(2), None, "/tv/Flat/Batch2/e.mkv"),
+            ItemChildLink {
+                season_id: Some(id(2)),
+                ..link(3, Some(1), None, "/tv/Flat/Batch2/e.mkv")
+            },
             link(5, Some(4), None, ""),
-            link(6, Some(5), None, "/tv/Gone/e.mkv"),
+            ItemChildLink {
+                season_id: Some(id(5)),
+                ..link(6, Some(4), None, "/tv/Gone/e.mkv")
+            },
             link(8, None, Some(7), "/movies/A/trailers/t.mkv"),
             link(10, None, Some(9), "/movies/B/trailers/t.mkv"),
             link(12, None, Some(11), "/unlisted/C/trailers/t.mkv"),
@@ -34290,7 +34313,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(ep.0, season.0, "episode parents to the virtual season");
+        assert_eq!(ep.0, series_id, "episode parents to the series");
         assert_eq!(ep.1, Some(2));
         assert_eq!(ep.2.as_deref(), Some(season.0.as_str()), "SeasonId set");
         assert_eq!(ep.3.as_deref(), Some(series_id.as_str()), "SeriesId set");

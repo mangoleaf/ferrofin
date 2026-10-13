@@ -485,6 +485,27 @@ async fn children_of(
         .await?)
 }
 
+/// A season's episodes for the cascade. Upstream walks `season.Children`,
+/// its `ParentId` children, which misses the episodes of a virtual season:
+/// they are stored under the series (`CreateSeasonsAsync` links them by
+/// `SeasonId` only). ACCEPTED DIVERGENCE (don't-port-bugs): they are reached
+/// here by ancestry, so a season's rating and tag edits reach every episode
+/// it lists.
+async fn season_episodes_of(
+    state: &AppState,
+    season: Uuid,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    Ok(state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            ancestor_ids: vec![season],
+            include_item_types: vec![BaseItemKind::Episode],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        })
+        .await?)
+}
+
 /// The rating and tag half of the cascade on one child, skipping a field in
 /// the child's own `LockedFields` (`ItemUpdateController.cs:321-381`):
 /// `OfficialRating` unless locked, `CustomRating` always, the tag edit
@@ -538,16 +559,14 @@ async fn cascade_to_children(
         Some(BaseItemKind::Series) => {
             children_of(state, item_id, Some(BaseItemKind::Season)).await?
         }
-        Some(BaseItemKind::Season) => {
-            children_of(state, item_id, Some(BaseItemKind::Episode)).await?
-        }
+        Some(BaseItemKind::Season) => season_episodes_of(state, item_id).await?,
         _ => children_of(state, item_id, None).await?,
     };
     if kind == Some(BaseItemKind::Series) {
         let mut episodes = Vec::new();
         for season in &children {
             if let Ok(season_id) = Uuid::parse_str(&season.id) {
-                episodes.extend(children_of(state, season_id, Some(BaseItemKind::Episode)).await?);
+                episodes.extend(season_episodes_of(state, season_id).await?);
             }
         }
         children.extend(episodes);

@@ -708,8 +708,8 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(new_season.len(), 1);
     assert_eq!(
         after[&id(BaseItemKind::Episode, &episode)].2.as_deref(),
-        Some(new_season[0].as_str()),
-        "the episode's parent is its virtual season, stored"
+        Some(id(BaseItemKind::Series, &series).as_str()),
+        "the episode's parent is its series"
     );
     assert_eq!(
         new_season[0],
@@ -734,7 +734,7 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(seasons(&rows), seasons(&after));
     assert_eq!(
         rows[&id(BaseItemKind::Episode, &second)].2.as_deref(),
-        Some(new_season[0].as_str())
+        Some(id(BaseItemKind::Series, &series).as_str()),
     );
 }
 
