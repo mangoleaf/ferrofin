@@ -1438,6 +1438,22 @@ pub trait UserDataManager: Send + Sync {
         self.save_user_data(user_id, item_id, user_data).await
     }
 
+    /// Gets the remembered audio and subtitle stream indices for an item.
+    ///
+    /// Port of the `UserDataManager.GetUserData(user, item)` call inside
+    /// `SetDefaultAudioAndSubtitleStreamIndices`: only the stream-index fields
+    /// are needed, so this avoids constructing the full DTO.  Returns
+    /// `(audio_stream_index, subtitle_stream_index)`, both `None` when no
+    /// user-data row exists.
+    async fn get_stream_default_data(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Option<i32>, Option<i32>), ServiceError> {
+        let _ = (item_id, user_id);
+        Ok((None, None))
+    }
+
     /// Gets the presentation DTO of a user's data for an item, or `None`.
     async fn get_user_data_dto(
         &self,
