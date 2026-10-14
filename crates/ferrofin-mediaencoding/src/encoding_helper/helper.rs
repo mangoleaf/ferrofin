@@ -370,8 +370,9 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             }
 
             if let Some(b) = bitrate {
+                let compensated = bit_depth_compensated_bitrate(b, stream, 8);
                 let input_codec = stream.codec.as_deref().unwrap_or_default();
-                let mut scaled = scale_bitrate(b, input_codec, output_video_codec);
+                let mut scaled = scale_bitrate(compensated, input_codec, output_video_codec);
                 if let Some(req) = request.video_bit_rate {
                     scaled = min(scaled, req);
                 }
@@ -709,6 +710,26 @@ fn video_bitrate_scale_factor(codec: &str) -> f64 {
         return 0.5;
     }
     1.0
+}
+
+/// Compensates the bitrate when reducing bit depth from 10-bit to a lower target.
+///
+/// 10-bit encoded video is more efficient; reducing depth without compensation
+/// degrades quality at low bitrates. Port of `GetBitDepthCompensatedBitrate`.
+fn bit_depth_compensated_bitrate(bitrate: i32, stream: &MediaStream, target_bit_depth: i32) -> i32 {
+    if target_bit_depth >= 10 || stream.bit_depth.is_some_and(|d| d <= target_bit_depth) {
+        return bitrate;
+    }
+    let Some(source_bitrate) = stream.bit_rate else {
+        return bitrate;
+    };
+    let factor: f64 = match source_bitrate {
+        ..=4_000_000 => 1.5,
+        4_000_001..=8_000_000 => 1.2,
+        8_000_001..=12_000_000 => 1.1,
+        _ => 1.05,
+    };
+    f64_to_i32_round(f64::from(bitrate) * factor)
 }
 
 /// Scales a bitrate for a codec transition. Port of `ScaleBitrate` (public so
@@ -1808,6 +1829,112 @@ mod tests {
         // VideoStream present but index == -1 → "-sn".
         state.video_stream = Some(video_stream("h264", -1));
         assert_eq!(state.map_args_for_test(), "-sn");
+    }
+
+    // ----- bit_depth_compensated_bitrate ---------------------------------------
+
+    #[test]
+    fn bit_depth_compensation_at_low_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_mid_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(6_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(5_000_000, &stream, 8),
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(10_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(8_000_000, &stream, 8),
+            8_800_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_very_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(20_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(15_000_000, &stream, 8),
+            15_750_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_target_is_10() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 10),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_source_is_8bit() {
+        let stream = MediaStream {
+            bit_depth: Some(8),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_no_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: None,
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_applies_when_bit_depth_unknown() {
+        let stream = MediaStream {
+            bit_depth: None,
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
     }
 
     // ----- video_bitrate_param (software) ------------------------------------
