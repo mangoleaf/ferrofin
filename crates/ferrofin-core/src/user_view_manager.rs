@@ -669,25 +669,43 @@ impl FerrofinUserViewManager {
 
     /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
     /// the folder — or of its physical folders, for a `CollectionFolder` that
-    /// has some — is visible to `user`. One key lookup, ungrouped, stored
-    /// columns only: the item repository's direct-children read of a
+    /// has some — is visible to `user`. Ungrouped direct-children reads: the
+    /// item repository's direct-children read of a
     /// collection folder already takes its physical folders' children with
     /// its own (`parent_physical_folder_ids`), which covers an adopted
     /// library's rows whether they still hang off Jellyfin's physical folder
     /// or a Ferrofin scan saved them under the collection folder.
+    ///
+    /// `items.Any(item => item.IsVisible(user))`: SQL cannot see a playlist's
+    /// owner and shares, so a child only counts once the visibility rules
+    /// pass it. The first child usually answers alone; only when it is hidden
+    /// are the rest read and checked. Jellyfin 12.2 replaced this check with
+    /// `HasVisibleItem` over the user's top parents; porting that is issue #50.
     async fn has_visible_child(
         &self,
         folder: Uuid,
         user: &UserEntity,
     ) -> Result<bool, ServiceError> {
-        let query = InternalItemsQuery {
+        let mut query = InternalItemsQuery {
             parent_id: folder,
             user: Some(user.clone()),
             group_by_presentation_unique_key: false,
             limit: Some(1),
             ..Default::default()
         };
-        Ok(!self.items.get_item_list(&query).await?.is_empty())
+        let first = self.items.get_item_list(&query).await?;
+        let Some(visibility) = &self.visibility else {
+            return Ok(!first.is_empty());
+        };
+        if first.is_empty() {
+            return Ok(false);
+        }
+        if visibility.visible(&first, user, false).await?[0] {
+            return Ok(true);
+        }
+        query.limit = None;
+        let all = self.items.get_item_list(&query).await?;
+        Ok(visibility.visible(&all, user, false).await?.contains(&true))
     }
 
     async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
@@ -1787,6 +1805,86 @@ mod tests {
             )
             .contains(&"Playlists".to_owned()),
             "profile settings can still list the hidden view to re-enable it"
+        );
+    }
+
+    /// `HasVisibleChild` counts a child only when `IsVisible(user)` passes it,
+    /// and a private playlist has no administrator exception: an
+    /// administrator who neither owns nor shares the only playlist gets no
+    /// Playlists view, as Jellyfin 12.2 answers (issue #53). The owner does.
+    #[tokio::test]
+    async fn an_administrator_gets_no_playlists_view_for_others_private_playlists() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().expect("tempdir");
+        let metadata = tempfile::tempdir().expect("tempdir");
+        let (owner, admin) = (Uuid::from_u128(0x5401), Uuid::from_u128(0x5402));
+        crate::test_support::seed_named_user(&db, owner, "owner").await;
+        crate::test_support::seed_named_user(&db, admin, "admin").await;
+        crate::user_entity_ext::set_permission(
+            db.pool(),
+            &guid_to_db(admin),
+            ferrofin_db::enums::PermissionKind::IsAdministrator,
+            true,
+        )
+        .await
+        .expect("admin");
+        let folder = Uuid::from_u128(0x5403);
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let playlist = Uuid::from_u128(0x5404);
+        crate::test_support::seed_child_item(&db, playlist, BaseItemKind::Playlist, "Mine", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, playlist).await;
+        row.path = Some(data.path().join("playlists/Mine").display().to_string());
+        row.data = Some(
+            serde_json::json!({"OwnerUserId": owner, "OpenAccess": false, "Shares": []})
+                .to_string(),
+        );
+        crate::test_support::save_item(&db, &row).await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let manager = manager(&db)
+            .with_database(db.clone())
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.path())
+            .with_id_derivation(item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: Some("/config".to_owned()),
+            })
+            .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+                db.clone(),
+            )))
+            .with_visibility(visibility);
+        let lists_playlists = |user| {
+            let manager = &manager;
+            async move {
+                manager
+                    .get_user_views(user)
+                    .await
+                    .expect("views")
+                    .iter()
+                    .any(|v| v.name.as_deref() == Some("Playlists"))
+            }
+        };
+
+        assert!(!lists_playlists(admin).await, "an administrator non-member");
+        assert!(lists_playlists(owner).await, "the owner");
+
+        // The first child (by SortName) stays hidden; a later open one counts.
+        let open = Uuid::from_u128(0x5405);
+        crate::test_support::seed_child_item(&db, open, BaseItemKind::Playlist, "Zed", folder)
+            .await;
+        let mut row = crate::test_support::fetch_item(&db, open).await;
+        row.path = Some(data.path().join("playlists/Zed").display().to_string());
+        row.data = Some(serde_json::json!({"OwnerUserId": owner, "OpenAccess": true}).to_string());
+        crate::test_support::save_item(&db, &row).await;
+        assert!(
+            lists_playlists(admin).await,
+            "an open playlist lists the view"
         );
     }
 
