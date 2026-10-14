@@ -1,4 +1,4 @@
-//! Jellyfin 4910aafa1a parental-rating resources in manifest filename order.
+//! Jellyfin v12.2 (`ca0f16eb7c`) parental-rating resources in manifest filename order.
 
 pub(super) const TABLES: &[(&str, &str)] = &[
     ("0-PREFER", include_str!("ratings/0-prefer.json")),

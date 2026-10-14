@@ -21,6 +21,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+mod existing_database;
 pub mod listen;
 pub mod media_encoding;
 pub mod metrics_wiring;
@@ -284,10 +285,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let signals = Signals::install();
     loop {
         let started = std::time::Instant::now();
-        if !serve_once(&config, started, &mut metrics, &signals).await? {
-            break;
+        match serve_once(&config, started, &mut metrics, &signals).await {
+            Ok(true) => tracing::info!("restart requested — re-creating the host in-process"),
+            Ok(false) => break,
+            // The one place a failed boot or serve is logged, so it reaches the
+            // log file as well as the exit status `main` reports.
+            Err(error) => {
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "ferrofin-server stopped on an error"
+                );
+                shutdown_tracing();
+                return Err(error);
+            }
         }
-        tracing::info!("restart requested — re-creating the host in-process");
     }
     // Flush the OTLP batch queue now that the server has drained; a restart that
     // loses the last spans is a bug. No-op when trace export is disabled.
@@ -373,7 +384,6 @@ fn apply_scheduled_restore(
             // (which reads "the server answers again" as success) announce a
             // restore that did not happen.
             Err(failure) if failure.partially_applied => {
-                tracing::error!(error = %failure, "scheduled backup restore failed part-way");
                 return Err(anyhow::anyhow!(
                     "the scheduled backup restore failed part-way and the data directory may be \
                  partly restored: {failure}"
@@ -421,6 +431,11 @@ async fn serve_once(
     // here, before the database file is opened — Jellyfin's `RestoreBackupPath`
     // sequence. Synchronous on purpose: nothing may touch the tree meanwhile.
     let restore_failure = apply_scheduled_restore(config)?;
+    // A server that has been set up must not come up on a missing or empty
+    // database: opening it would create and migrate a new one, and the seeding
+    // below would give it a passwordless administrator. Checked after the
+    // restore, which may have just brought the database back.
+    existing_database::ensure_existing_database(config).await?;
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —

@@ -592,6 +592,10 @@ pub struct BaseItemDto {
     /// Gets or sets the current program.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_program: Option<Box<BaseItemDto>>,
+    /// Gets or sets the original language (Jellyfin 12.x; declared last, so it
+    /// serializes last). An empty string is still written, as C# omits only null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
 }
 
 impl IHasProviderIds for BaseItemDto {
@@ -636,6 +640,33 @@ mod tests {
         assert!(json.get("OriginalTitle").is_none());
         let back: BaseItemDto = serde_json::from_value(json).unwrap();
         assert_eq!(value, back);
+    }
+
+    /// `OriginalLanguage` (Jellyfin 12.x) is the last member, omitted only when
+    /// null, so an empty string is still sent; it round-trips.
+    #[test]
+    fn original_language_serializes_last_and_omits_only_none() {
+        let value = BaseItemDto {
+            name: Some("Seven Samurai".to_owned()),
+            original_language: Some("ja".to_owned()),
+            ..BaseItemDto::default()
+        };
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(text.ends_with(r#""OriginalLanguage":"ja"}"#), "{text}");
+        let back: BaseItemDto = serde_json::from_str(&text).unwrap();
+        assert_eq!(value, back);
+
+        let absent = serde_json::to_value(BaseItemDto::default()).unwrap();
+        assert!(absent.get("OriginalLanguage").is_none());
+
+        let empty = BaseItemDto {
+            original_language: Some(String::new()),
+            ..BaseItemDto::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["OriginalLanguage"],
+            ""
+        );
     }
 
     #[test]

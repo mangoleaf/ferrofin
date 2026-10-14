@@ -198,7 +198,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 /// It is the left-hand side of upstream's compatibility test
 /// `_applicationHost.ApplicationVersion < targetAbi`, so it decides which
 /// manifest versions a client is offered.
-const DEFAULT_APPLICATION_VERSION: &str = "10.11.8";
+const DEFAULT_APPLICATION_VERSION: &str = "12.2.0";
 
 /// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
 fn is_loopback_url(url: &str) -> bool {
@@ -772,7 +772,7 @@ fn abi_is_compatible(application_version: &str, target_abi: Option<&str>) -> boo
     // `typeof(ApplicationHost).Assembly.GetName().Version`, and an assembly
     // version always carries four components — `[assembly: AssemblyVersion("10.11.8")]`
     // (SharedVersion.cs, both trees) is `Version(10, 11, 8, 0)`, NOT
-    // `Version(10, 11, 8, -1)`. Parsing our "10.11.8" with the ABI's -1 rule
+    // `Version(10, 11, 8, -1)`. Parsing the application version with the ABI's -1 rule
     // would leave the server one notch below itself and silently hide every
     // plugin built for the exact release it is — measured against the 10.11.8
     // oracle on the live repo.jellyfin.org manifest: 9 versions with `targetAbi`

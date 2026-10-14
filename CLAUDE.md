@@ -64,7 +64,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
 | `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0 and 12.1 databases in place) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1 and 12.2 databases in place) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
@@ -134,8 +134,8 @@ macros** — they require a live `DATABASE_URL` at build/CI time, which we delib
 The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
-`__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0 and 12.1.0, including both
-12.1 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
+`__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
+12.1 and both 12.2 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -266,7 +266,7 @@ latency (screens and endpoints), time to first screen, memory, and API parity. R
 ```bash
 # needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
 # ffprobe and Python Pillow to build the test data
-docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7
+docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7 && docker pull jellyfin/jellyfin:12.2
 bench/testdata/build.sh                          # once: ~20 min, ~17 GB (gitignored)
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
 bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
@@ -300,13 +300,14 @@ never exists.
 
 ### Adoption has its own live check — `adoption/`
 `adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
-10.11.10, 10.11.11, 12.0.0 and 12.1.0 databases, with separate 12.1 fixtures upgraded from
-10.11.8 and 12.0.0. Supply fixtures and build them once with `adoption/build-fixtures.sh`;
-they are never committed. On fresh copies it checks generation, migrations, Jellyfin 12.1's
-normalised smoke summaries, file integrity and a repair-free second boot. All seven paths
-passed on 2026-09-16; the [test record](adoption/README.md#supported-and-tested-versions)
-identifies the image used. Run it for any change to the migration chain, the adoption gate
-or the boot repairs. The shell tests in CI exercise the harness without these live fixtures.
+10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
+fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them once with
+`adoption/build-fixtures.sh`; they are never committed.  On fresh copies it checks
+generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
+repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
+identifies which versions passed and the image used.  Run it for any change to the migration
+chain, the adoption gate or the boot repairs.  The shell tests in CI exercise the harness
+without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

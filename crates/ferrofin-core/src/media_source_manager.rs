@@ -291,6 +291,9 @@ impl FerrofinMediaSourceManager {
                     supports_direct_stream(source.path.as_deref(), source.protocol);
             }
             set_live_tv_key_properties(source);
+            // Unopened, so never probed: the tuner's own streams still carry
+            // the C# serialization-time getters (`DisplayTitle`, `VideoRange`).
+            derive_stream_getters(&mut source.media_streams);
         }
         Ok(sources)
     }
@@ -363,7 +366,11 @@ impl FerrofinMediaSourceManager {
         for source in &mut sources {
             // `AddMediaInfoWithProbe(stream, false, false, ct)`: no cache key
             // and no probe delay — the file already has bytes in it.
-            self.add_media_info_with_probe(source, None, false).await;
+            if !self.add_media_info_with_probe(source, None, false).await {
+                // A failed probe serves the source as built; its streams still
+                // carry the C# serialization-time getters.
+                derive_stream_getters(&mut source.media_streams);
+            }
         }
         Ok(sources)
     }
@@ -456,8 +463,19 @@ impl FerrofinMediaSourceManager {
             .then(|| crate::item_data::video_format(item.data.as_deref()));
 
         // Default audio stream index: the audio stream marked default, else the
-        // first audio stream (mirrors `MediaSourceInfo.DefaultAudioStreamIndex`
-        // resolution in `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndexes`).
+        // first audio stream — the user-agnostic fallback only.
+        //
+        // TODO(12.x parity, open work item): port the user-aware
+        // `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices`
+        // (v12.2 `MediaSourceManager.cs:493-604`). It reads the user's
+        // `AudioLanguagePreference` (including "OriginalLanguage", which picks
+        // the `IsOriginal` audio track or the item's inherited original
+        // language), `PlayDefaultAudioTrack`, `RememberAudioSelections` and the
+        // subtitle mode/preferences. `IsOriginal` is served but steers no
+        // default selection until this lands. Oracle:
+        // `MediaSourceManagerTests.SetDefaultAudioStreamIndex_Index_Correct`
+        // (`tests/Jellyfin.Server.Implementations.Tests/Library/MediaSourceManagerTests.cs:63-148`),
+        // to be transliterated into rstest cases.
         let default_audio_stream_index = streams
             .iter()
             .filter(|s| s.stream_type == MediaStreamType::Audio)
@@ -723,6 +741,8 @@ fn apply_probed_media_info(
         );
         for stream in &mut reduced {
             stream.index = -1;
+            // MediaSourceManager.cs:863-867 clears only `Language`; the probe's
+            // `LocalizedLanguage`/`LocalizedOriginal` stay, as upstream.
             stream.language = None;
         }
         streams = reduced;
@@ -766,6 +786,25 @@ fn apply_probed_media_info(
     source.analyze_duration_ms = Some(LIVE_STREAM_ANALYZE_DURATION_MS);
     // Forced: the probe's own total is for a fragment of an endless stream.
     source.infer_total_bitrate(true);
+
+    // After the reduce above cleared `Language`: a reduced original audio
+    // track reads "AAC - Stereo - Original", with no language part, as C#.
+    derive_stream_getters(&mut source.media_streams);
+}
+
+/// Materializes the `MediaStream` members C# computes in getters
+/// (`DisplayTitle`, `MediaStream.cs:265-331`; `VideoRange`/`VideoRangeType`/
+/// `AudioSpatialFormat`/`IsTextSubtitleStream`/`ReferenceFrameRate`) for
+/// streams that are served without passing through [`stream_to_dto`] — probe
+/// output and tuner info for unopened Live TV channels, recordings and opened
+/// live streams.
+/// Upstream evaluates the getters at serialization, so this runs last,
+/// against each stream's final state.
+fn derive_stream_getters(streams: &mut [MediaStream]) {
+    for stream in streams {
+        stream.display_title = stream.display_title();
+        stream.populate_computed_fields();
+    }
 }
 
 /// Whether a source can be direct-streamed from its path.
@@ -812,6 +851,7 @@ fn add_media_info(source: &mut MediaSourceInfo) {
 
     // Try to estimate this.
     source.infer_total_bitrate(false);
+    derive_stream_getters(&mut source.media_streams);
 }
 
 /// The width assumed for a live video stream whose probe reported none (C#
@@ -939,16 +979,27 @@ pub(crate) fn stream_to_dto(row: MediaStreamInfoEntity) -> MediaStream {
     stream
 }
 
-/// Port of the tail of `MediaStreamRepository.Map(MediaStreamInfo)`: the
-/// `Localized*` labels are derived on every read, never persisted. Audio and
-/// subtitle streams get `Default`/`External` (+ the language display name);
-/// subtitles add `Undefined`/`Forced`/`HearingImpaired`.
+/// Port of the read-time parts of `MediaStreamRepository.Map(MediaStreamInfo)`
+/// (`MediaStreamRepository.cs:115-124`, `:168-190`): the stored ISO 639-2/B
+/// language is rewritten to its /T code for every stream type, then the
+/// `Localized*` labels are derived — never persisted. Audio and subtitle
+/// streams get `Default`/`External` (+ the language display name); audio adds
+/// `Original`; subtitles add `Undefined`/`Forced`/`HearingImpaired`.
 /// Runs after `display_title` so the title is recomputed with the labels, as
 /// the C# getter evaluates them lazily.
 fn localize_stream(
     stream: &mut MediaStream,
     localization: &dyn ferrofin_traits::localization::LocalizationManager,
 ) {
+    // MediaStreamRepository.cs:115-124 — "choose the first as that is the
+    // ISO 639-2/T code we're needing".
+    if let Some(iso_t) = stream
+        .language
+        .as_deref()
+        .and_then(|language| localization.try_get_iso6392_t_from_b(language))
+    {
+        stream.language = Some(iso_t);
+    }
     if !matches!(
         stream.stream_type,
         MediaStreamType::Audio | MediaStreamType::Subtitle
@@ -958,10 +1009,13 @@ fn localize_stream(
     stream.localized_default = Some(localization.get_localized_string("Default"));
     stream.localized_external = Some(localization.get_localized_string("External"));
     if let Some(language) = stream.language.as_deref().filter(|l| !l.is_empty()) {
-        // Feeds `display_title()` only — `MediaStream::localized_language` is
-        // `skip_serializing`, because `LocalizedLanguage` (like
-        // `LocalizedOriginal`) is post-10.11.8 and absent from the contract.
+        // MediaStreamRepository.cs:173-176.
         stream.localized_language = localization.get_language_display_name(language);
+    }
+    if stream.stream_type == MediaStreamType::Audio {
+        // MediaStreamRepository.cs:178-181 — on every audio stream, whether or
+        // not it is flagged `IsOriginal`.
+        stream.localized_original = Some(localization.get_localized_string("Original"));
     }
     if stream.stream_type == MediaStreamType::Subtitle {
         stream.localized_undefined = Some(localization.get_localized_string("Undefined"));
@@ -1369,6 +1423,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             media_is_audio: false,
         };
         let mut source = self.encoder.get_media_info(&request_info).await?;
+        derive_stream_getters(&mut source.media_streams);
         let live_id = Uuid::new_v4().to_string();
         source.live_stream_id = Some(live_id.clone());
         source.requires_closing = true;
@@ -1580,6 +1635,172 @@ mod tests {
         };
         localize_stream(&mut video, &de);
         assert!(video.localized_default.is_none());
+    }
+
+    /// `MediaStreamRepository.cs:178-181` stamps `LocalizedOriginal` on every
+    /// audio stream (flagged `IsOriginal` or not) and on nothing else; the
+    /// audio display title then carries it after `External` (`MediaStream.cs:310-313`).
+    #[test]
+    fn read_back_stamps_localized_original_on_every_audio_stream() {
+        let en = crate::localization_manager::LocalizationManager::default();
+        let cs = crate::localization_manager::LocalizationManager::default().with_ui_culture("cs");
+        let original = |is_original| MediaStream {
+            stream_type: MediaStreamType::Audio,
+            codec: Some("aac".to_owned()),
+            language: Some("eng".to_owned()),
+            is_original,
+            ..Default::default()
+        };
+
+        let mut flagged = original(true);
+        localize_stream(&mut flagged, &en);
+        assert_eq!(flagged.localized_original.as_deref(), Some("Original"));
+        assert_eq!(
+            flagged.display_title.as_deref(),
+            Some("English - AAC - Original")
+        );
+
+        let mut flagged_cs = original(true);
+        localize_stream(&mut flagged_cs, &cs);
+        assert_eq!(flagged_cs.localized_original.as_deref(), Some("Originál"));
+        assert!(
+            flagged_cs
+                .display_title
+                .as_deref()
+                .is_some_and(|t| t.ends_with(" - Originál")),
+            "{:?}",
+            flagged_cs.display_title
+        );
+
+        let mut unflagged = original(false);
+        localize_stream(&mut unflagged, &en);
+        assert_eq!(unflagged.localized_original.as_deref(), Some("Original"));
+        assert_eq!(unflagged.display_title.as_deref(), Some("English - AAC"));
+
+        for stream_type in [MediaStreamType::Subtitle, MediaStreamType::Video] {
+            let mut other = MediaStream {
+                stream_type,
+                is_original: true,
+                ..Default::default()
+            };
+            localize_stream(&mut other, &en);
+            assert_eq!(other.localized_original, None, "{stream_type:?}");
+        }
+    }
+
+    /// `MediaStreamRepository.cs:115-124` rewrites a stored ISO 639-2/B code
+    /// to its /T form on read, for every stream type, before the display name
+    /// is looked up.
+    #[test]
+    fn read_back_rewrites_iso6392_b_languages_to_t() {
+        let en = crate::localization_manager::LocalizationManager::default();
+        let mut audio = MediaStream {
+            stream_type: MediaStreamType::Audio,
+            language: Some("ger".to_owned()),
+            ..Default::default()
+        };
+        localize_stream(&mut audio, &en);
+        assert_eq!(audio.language.as_deref(), Some("deu"));
+        assert_eq!(audio.localized_language.as_deref(), Some("German"));
+
+        let mut video = MediaStream {
+            stream_type: MediaStreamType::Video,
+            language: Some("fre".to_owned()),
+            ..Default::default()
+        };
+        localize_stream(&mut video, &en);
+        assert_eq!(video.language.as_deref(), Some("fra"));
+        assert_eq!(video.localized_language, None);
+
+        let mut english = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            language: Some("eng".to_owned()),
+            ..Default::default()
+        };
+        localize_stream(&mut english, &en);
+        assert_eq!(english.language.as_deref(), Some("eng"));
+    }
+
+    /// Probe output never passes through `stream_to_dto`, yet C# computes
+    /// `DisplayTitle` in a getter at serialization (`MediaStream.cs:265-331`).
+    /// On the cache-keyed (reduced) path `MediaSourceManager.cs:863-867` has
+    /// cleared `Language` by then, so an original audio track's title ends in
+    /// " - Original" with no language part, while its probe-stamped
+    /// `LocalizedLanguage` stays. Without a reduce the language is kept.
+    #[rstest::rstest]
+    #[case::reduced(true, "AAC - Stereo - Original", None)]
+    #[case::unreduced(false, "English - AAC - Stereo - Original", Some("eng"))]
+    fn probed_streams_carry_display_title_from_their_final_state(
+        #[case] reduce_streams: bool,
+        #[case] expected_title: &str,
+        #[case] expected_language: Option<&str>,
+    ) {
+        let probed = MediaSourceInfo {
+            media_streams: vec![
+                MediaStream {
+                    index: 0,
+                    stream_type: MediaStreamType::Video,
+                    codec: Some("h264".to_owned()),
+                    width: Some(1920),
+                    height: Some(1080),
+                    ..Default::default()
+                },
+                MediaStream {
+                    index: 1,
+                    stream_type: MediaStreamType::Audio,
+                    codec: Some("aac".to_owned()),
+                    channel_layout: Some("stereo".to_owned()),
+                    language: Some("eng".to_owned()),
+                    localized_language: Some("English".to_owned()),
+                    localized_original: Some("Original".to_owned()),
+                    is_original: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut source = MediaSourceInfo::default();
+        apply_probed_media_info(&mut source, &probed, reduce_streams);
+
+        let audio = source
+            .media_streams
+            .iter()
+            .find(|s| s.stream_type == MediaStreamType::Audio)
+            .unwrap();
+        assert_eq!(audio.language.as_deref(), expected_language);
+        assert_eq!(audio.localized_language.as_deref(), Some("English"));
+        assert_eq!(audio.display_title.as_deref(), Some(expected_title));
+        assert!(audio.audio_spatial_format.is_some());
+
+        let video = source
+            .media_streams
+            .iter()
+            .find(|s| s.stream_type == MediaStreamType::Video)
+            .unwrap();
+        assert!(video.display_title.is_some());
+        assert!(video.video_range.is_some() && video.video_range_type.is_some());
+    }
+
+    /// The tuner-info fallback (`add_media_info`) serves streams that were
+    /// never probed or persisted; their getter members are derived too.
+    #[test]
+    fn tuner_info_streams_carry_display_title() {
+        let mut source = MediaSourceInfo {
+            media_streams: vec![MediaStream {
+                index: -1,
+                stream_type: MediaStreamType::Audio,
+                codec: Some("ac3".to_owned()),
+                channels: Some(6),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        add_media_info(&mut source);
+        assert_eq!(
+            source.media_streams[0].display_title.as_deref(),
+            Some("Dolby Digital - 6 ch")
+        );
+        assert!(source.media_streams[0].audio_spatial_format.is_some());
     }
 
     /// Dashboard UICulture updates must affect an already-constructed service,

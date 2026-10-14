@@ -71,8 +71,9 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// (`RefreshCleanNamesAndValues`, `RefreshForcedSortNames`). Each partition is
 /// read with one keyset query and its rewrites committed as one transaction,
 /// which bounds both the memory a pass holds and the length of any single
-/// write lock.
-const REPAIR_PARTITION: i64 = 10_000;
+/// write lock. `adoption_repairs::harmonize_conflicting_user_data` reuses it
+/// as its partition size in conflict groups (upstream batches 500).
+pub(crate) const REPAIR_PARTITION: i64 = 10_000;
 
 /// One `Season` row as `recompute_season_keys` reads it:
 /// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
@@ -938,8 +939,8 @@ impl FerrofinItemPersistenceService {
 
     /// One-shot startup pass: recomputes `InheritedParentalRatingValue` /
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
-    /// — Jellyfin 12.0's `MigrateRatingLevels` routine
-    /// (`Jellyfin.Server/Migrations/Routines/20260302090000_MigrateRatingLevels.cs`),
+    /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
+    /// (`Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs`),
     /// recorded in `FerrofinMeta` so later boots skip it.
     ///
     /// In one transaction, for each DISTINCT `OfficialRating`: a null/empty
@@ -958,12 +959,15 @@ impl FerrofinItemPersistenceService {
         &self,
         localization: &dyn ferrofin_traits::localization::LocalizationManager,
     ) -> Result<u64, ServiceError> {
-        // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
-        // whole-value lookup first, unrated parts skipped, case-insensitive
-        // tables), so the pass runs once more under a new key.
-        // Earlier Ferrofin builds loaded only the US table. Re-run once with
-        // the complete upstream dataset so existing non-US rows are filtered.
-        const META_KEY: &str = "rating_levels_all_countries";
+        // Jellyfin re-dates `MigrateRatingLevels` whenever its scoring changes,
+        // so every database recomputes once more; this key follows it. 12.2
+        // (`20260915120000`) brought new and corrected rating tables (ar, au,
+        // de, fr, id, it, no, tw, 0-prefer), a leading `-` read as a minimum
+        // age (`-12` → 12, not −12) and a guard that keeps a `/`-list from
+        // being split as one country-prefixed rating. Earlier keys:
+        // `rating_levels_v121` (12.1) and `rating_levels_all_countries` (the
+        // first pass with every country's table loaded).
+        const META_KEY: &str = "rating_levels_v122";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -10086,7 +10090,7 @@ mod tests {
         assert_eq!(left, 0);
     }
 
-    /// The `rating_levels_v12` repair (Jellyfin 12.0 `MigrateRatingLevels`):
+    /// The rating-level repair (Jellyfin `MigrateRatingLevels`):
     /// every row's inherited rating columns are recomputed from its OWN
     /// `OfficialRating` through `GetRatingScore` — a bare age, a US table
     /// entry with a sub-score, a "Rated R" spelling — and cleared when the
@@ -10099,10 +10103,6 @@ mod tests {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let localization = crate::localization_manager::LocalizationManager::new("US");
-        service
-            .mark_repair_done("rating_levels_v121")
-            .await
-            .unwrap();
         let cases: [RatingCase; 7] = [
             (0x7A01, Some("12"), Some(12), None),
             (0x7A02, Some("TV-MA"), Some(17), Some(1)),
@@ -10160,6 +10160,106 @@ mod tests {
             0,
             "the repair runs once per database"
         );
+    }
+
+    /// Seeds one `BaseItems` row per `(OfficialRating, Score, SubScore)` with
+    /// those stored inherited-rating columns, returning the ids in order.
+    async fn seed_rated_rows(
+        db: &ferrofin_db::Database,
+        rows: &[(&str, Option<i64>, Option<i64>)],
+        first_id: u128,
+    ) -> Vec<Uuid> {
+        use crate::test_support::{fetch_item, save_item, seed_named_item};
+        let mut ids = Vec::with_capacity(rows.len());
+        for (offset, (rating, score, sub_score)) in (0u128..).zip(rows) {
+            let id = Uuid::from_u128(first_id + offset);
+            seed_named_item(db, id, BaseItemKind::Movie, "Film").await;
+            let mut row = fetch_item(db, id).await;
+            row.official_rating = Some((*rating).to_owned());
+            row.inherited_parental_rating_value = *score;
+            row.inherited_parental_rating_sub_value = *sub_score;
+            save_item(db, &row).await;
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The 12.2 key is new: a database whose ratings were last recomputed by
+    /// the all-countries pass (`rating_levels_all_countries`, rc7 tables and
+    /// scoring) recomputes once more, and then not again.
+    #[tokio::test]
+    async fn repair_rating_levels_reruns_on_a_database_marked_by_the_all_countries_pass() {
+        use crate::test_support::fetch_item;
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        service
+            .mark_repair_done("rating_levels_all_countries")
+            .await
+            .expect("mark the previous pass");
+        // What the rc7 scoring stored for a French minimum age.
+        let ids = seed_rated_rows(&db, &[("-12", Some(-12), None)], 0x7B01).await;
+
+        assert!(
+            service
+                .repair_rating_levels(&localization)
+                .await
+                .expect("repair")
+                >= 1
+        );
+        let row = fetch_item(&db, ids[0]).await;
+        assert_eq!(
+            (
+                row.inherited_parental_rating_value,
+                row.inherited_parental_rating_sub_value
+            ),
+            (Some(12), None)
+        );
+        assert_eq!(
+            service
+                .repair_rating_levels(&localization)
+                .await
+                .expect("second run"),
+            0
+        );
+    }
+
+    /// A database Jellyfin 12.2 already migrated keeps every score its own
+    /// `MigrateRatingLevels` stored (US server; the fallback walks US first,
+    /// then the tables in file-name order). Before the 12.2 port, `-12` was
+    /// rewritten to −12 and `SAM 13` (missing from rc7's `ar.json`) to NULL.
+    #[tokio::test]
+    async fn adopted_jellyfin_12_2_rating_scores_survive_the_repair() {
+        use crate::test_support::fetch_item;
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        let stored: [(&str, Option<i64>, Option<i64>); 6] = [
+            ("12A", Some(12), Some(0)),   // gb
+            ("FSK 16", Some(16), None),   // de
+            ("-12", Some(12), None),      // a bare minimum age
+            ("MA15+", Some(15), Some(3)), // au
+            ("SAM 13", Some(13), None),   // ar, new in 12.2
+            ("PG-13", Some(13), Some(0)), // us
+        ];
+        let ids = seed_rated_rows(&db, &stored, 0x7C01).await;
+
+        service
+            .repair_rating_levels(&localization)
+            .await
+            .expect("repair");
+
+        for (id, (rating, score, sub_score)) in ids.into_iter().zip(stored) {
+            let row = fetch_item(&db, id).await;
+            assert_eq!(
+                (
+                    row.inherited_parental_rating_value,
+                    row.inherited_parental_rating_sub_value
+                ),
+                (score, sub_score),
+                "{rating}"
+            );
+        }
     }
 
     /// `series_key_scope`: the language falls through row → library → server,

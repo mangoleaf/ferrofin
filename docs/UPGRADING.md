@@ -8,6 +8,40 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — a set-up server no longer starts without its database
+
+This applies if setup has been completed (`IsStartupWizardCompleted` is `true` in
+`config/system.json`, or in Jellyfin's `config/system.xml` for a configuration directory
+not yet adopted) and the database Ferrofin would open is missing, is an empty file, or
+records no migrations.
+
+Until now such a server started anyway: it created an empty database and seeded a new
+`admin` — with no password unless `FERROFIN_ADMIN_PASSWORD` is set — and every user, library
+and watch history was gone. A deployment whose configuration directory was persisted but
+whose database was not (a volume that did not mount, a wrong data directory) fell into
+this quietly. Ferrofin now refuses to start, as Jellyfin 12.2 does, and exits with:
+
+```
+This server has been set up before (IsStartupWizardCompleted is true in <config>/system.json),
+but the database does not exist (<data>/ferrofin.db). Ferrofin will not start an existing
+server with an empty database. …
+```
+
+Pick one of the three ways out it names:
+
+- **Restore the database** to the path it names — the usual fix when a mount or the data
+  directory is wrong. A backup scheduled with `POST /Backup/Restore` still applies on the
+  next start.
+- **Start over, keeping this server's settings:** set `IsStartupWizardCompleted` to
+  `false` in every file the message names (both `system.json` and `system.xml` on an
+  adopted install). The next start runs the setup wizard on an empty database; users,
+  watch history and everything else stored in the database do not come back.
+- **Set up a new server** with empty configuration and data directories (`--data-dir` /
+  `FERROFIN_DATA_DIR` / `data_dir`, and `FERROFIN_CONFIG_DIR` / `config_dir`).
+
+A fresh install, a first boot in a new container and the adoption of a Jellyfin
+directory that has its database are unaffected.
+
 ## Unreleased — Intro Skipper analyses your library again, once
 
 This applies if Intro Skipper is enabled (Dashboard → Plugins), or if you are adopting a
@@ -749,10 +783,10 @@ Behaviour that changed with the shape:
 - Localized user views (e.g. a Live TV view created under a translated name) are
   consolidated onto their name-independent id once, with channels, ancestors and
   display preferences moved along.
-- **Adopting a Jellyfin database** now accepts 12.0.0 and 12.1.0 as well as 10.11.8–10.11.11
-  (exact migration sets, still one-way; a 12.x database baselines `0030` and `0032`, whose
-  shape it already has). All six releases passed live adoption tests on 2026-09-16,
-  including both 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0. See the
+- **Adopting a Jellyfin database** now accepts 12.0.0, 12.1.0 and 12.2.0 as well as
+  10.11.8–10.11.11 (exact migration sets, still one-way; a 12.x database baselines `0030`
+  and `0032`, whose shape it already has). All six 10.11–12.1 releases passed live adoption
+  tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
   [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
   as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every

@@ -5,10 +5,13 @@
 //! - `GET /Items/Filters`  — the legacy flat-string facets ([`QueryFiltersLegacy`]:
 //!   genres, tags, official ratings, years) aggregated over a parent's items.
 //! - `GET /Items/Filters2` — the richer facets ([`QueryFilters`]: genre
-//!   name/id pairs) for a query. Its `Tags` array is **always empty**, exactly as
-//!   in Jellyfin: `FilterController.GetQueryFilters` assigns only `filters.Genres`
-//!   and leaves `Tags` at the `QueryFilters` constructor's `Array.Empty<string>()`.
-//!   Only the legacy `/Items/Filters` facet set carries tags.
+//!   name/id pairs, and since Jellyfin 12 the audio and subtitle stream
+//!   languages as `{Name, Value}` pairs for movie and TV type sets). Its `Tags`
+//!   array is still always empty, as `FilterController.GetQueryFilters` left it
+//!   through 12.0. TODO(12.1 parity): v12.1+ fills it with
+//!   `_libraryManager.GetTagNames(tagQuery)` (v12.2 `FilterController.cs:240`,
+//!   upstream ca06ccfa13) — port it with the same parent scope as the genre
+//!   query. Only the legacy `/Items/Filters` facet set carries tags today.
 //!
 //! Both endpoints scope to an optional parent and honor the `includeItemTypes`
 //! restriction (a lone `Trailer`/`Program` type skips the parent lookup, exactly
@@ -19,8 +22,10 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_model::data::{BaseItemKind, MediaType};
-use ferrofin_model::dto::NameGuidPair;
+use ferrofin_model::dto::{NameGuidPair, NameValuePair};
+use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::querying::{QueryFilters, QueryFiltersLegacy};
+use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
 
@@ -165,11 +170,80 @@ fn is_music_type_set(types: &[BaseItemKind]) -> bool {
         )
 }
 
-/// `GET /Items/Filters2` — the richer genre filter facets.
+/// Whether the type set gets the audio/subtitle language facets: it names a
+/// movie or TV kind (v12.2 `FilterController.cs:242-245`).
+fn has_language_facets(types: &[BaseItemKind]) -> bool {
+    types.iter().any(|kind| {
+        matches!(
+            kind,
+            BaseItemKind::Movie
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::Episode
+        )
+    })
+}
+
+/// The item kinds the stream-language query runs over: the requested set, with
+/// `Episode` appended when it names `Series` or `Season` but not `Episode` —
+/// streams hang off episodes, never shows or seasons (v12.2
+/// `FilterController.cs:212-217`, `[.. includeItemTypes, BaseItemKind.Episode]`).
+fn stream_language_types(types: &[BaseItemKind]) -> Vec<BaseItemKind> {
+    let mut stream_types = types.to_vec();
+    if (types.contains(&BaseItemKind::Series) || types.contains(&BaseItemKind::Season))
+        && !types.contains(&BaseItemKind::Episode)
+    {
+        stream_types.push(BaseItemKind::Episode);
+    }
+    stream_types
+}
+
+/// The facet pairs for a list of stream-language codes (v12.2
+/// `FilterController.cs:246-271`): `Name` is `"{DisplayName} ({code})"` for a
+/// code `FindLanguageInfo` knows — the raw `iso6392.txt` name, untruncated —
+/// and the bare code otherwise; `Value` is the code. Ordered by `Name` with
+/// `OrderBy`'s `Comparer<string>.Default`, i.e. the request's `CurrentCulture`
+/// (a stable, linguistic sort, not an ordinal one).
+fn language_pairs(
+    localization: &dyn LocalizationManager,
+    languages: Vec<String>,
+) -> Vec<NameValuePair> {
+    let mut pairs: Vec<NameValuePair> = languages
+        .into_iter()
+        .map(|code| {
+            let name = match localization.find_language_info(&code) {
+                Some(culture) => format!("{} ({code})", culture.display_name),
+                None => code.clone(),
+            };
+            NameValuePair::new(name, code)
+        })
+        .collect();
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    pairs.sort_by(|a, b| {
+        let (a, b) = (
+            a.name.as_deref().unwrap_or_default(),
+            b.name.as_deref().unwrap_or_default(),
+        );
+        comparer
+            .as_ref()
+            .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+    });
+    pairs
+}
+
+/// `GET /Items/Filters2` — the genre and stream-language filter facets.
 ///
-/// Port of `FilterController.GetQueryFilters`. The genre facet routes to the
-/// music-genre aggregate for a music-only type set. `Tags` is left empty — the
-/// C# controller assigns only `filters.Genres`.
+/// Port of `FilterController.GetQueryFilters` (v12.2). The genre facet routes
+/// to the music-genre aggregate for a music-only type set. `Tags` is left
+/// empty — see the module doc.
+///
+/// The audio and subtitle language facets (Jellyfin 12+) are filled only for
+/// a type set naming `Movie`, `Series`, `Season` or `Episode`
+/// (`FilterController.cs:242-272`), from a second query that shares the genre
+/// query's user, live-TV flags and parent scope (`:161-178`, `:197-209`) but
+/// includes owned items — a language may exist only on an alternate version —
+/// and widens a show/season set to its episodes (`:212-217`).
 ///
 /// A `parentId` always becomes an **ancestor** scope. Jellyfin picks between two
 /// branches — `genreQuery.AncestorIds = [parent]` when
@@ -197,6 +271,8 @@ async fn get_query_filters(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let include_item_types: Vec<BaseItemKind> =
         parse_csv_enums_lenient(query.include_item_types.as_deref());
+    let language_facets = has_language_facets(&include_item_types);
+    let stream_types = stream_language_types(&include_item_types);
 
     // Trailer/Program skip the parent; otherwise the parent scopes the aggregate
     // (as an ancestor, regardless of `recursive` — see the doc comment).
@@ -255,6 +331,36 @@ async fn get_query_filters(
             })
         })
         .collect();
+
+    if language_facets {
+        let stream_query = InternalItemsQuery {
+            // "It's possible that different languages are only available on
+            // alternative versions. To fetch them all, owned items are included."
+            include_owned_items: true,
+            include_item_types: stream_types,
+            ..base
+        };
+        let mut languages = state
+            .library
+            .get_media_stream_languages_by_type(
+                &[MediaStreamType::Audio, MediaStreamType::Subtitle],
+                &stream_query,
+            )
+            .await?;
+        let localization = state.localization.as_ref();
+        filters.audio_languages = language_pairs(
+            localization,
+            languages
+                .remove(&MediaStreamType::Audio)
+                .unwrap_or_default(),
+        );
+        filters.subtitle_languages = language_pairs(
+            localization,
+            languages
+                .remove(&MediaStreamType::Subtitle)
+                .unwrap_or_default(),
+        );
+    }
 
     Ok(Json(filters))
 }

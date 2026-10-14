@@ -286,7 +286,7 @@ impl Database {
     /// Counts library items grouped by their stored (C#) `Type` name.
     ///
     /// Feeds the `ferrofin_library_items{type=…}` metric gauge. Runs on the read
-    /// pool over the `FerrofinIX_BaseItems_Type_CleanName` index; the placeholder seed
+    /// pool over the `IX_BaseItems_Type_CleanName` index; the placeholder seed
     /// row (`Type = 'PLACEHOLDER'`) is included as-is (the metric wiring maps the
     /// stored name to its last `.`-segment, so callers filter as they see fit).
     ///
@@ -1083,29 +1083,81 @@ const JELLYFIN_12_1_ADDITIVE_MIGRATIONS: [&str; 3] = [
     "20260911120000_StripEmbeddedLinkedChildren",
 ];
 
-/// 12.1 re-dated `MigrateRatingLevels`, so a database upgraded 12.0 → 12.1
-/// carries this id and one that went 10.11 → 12.1 never sees it.
-const JELLYFIN_12_0_RATING_LEVELS_MIGRATION: [&str; 1] = ["20260302090000_MigrateRatingLevels"];
+/// The 10.11-era code routines 12.0 retired, which a 12.x database may or may not
+/// carry. Jellyfin records a routine's id only while the routine exists in its code
+/// base, and never deletes a history row: a database upgraded from 10.11 keeps both
+/// ids, while a fresh 12.0, 12.1 or 12.2 install never records them (captured from
+/// the portable 12.0/12.1/12.2 tarballs booted on empty directories: 100, 102 and
+/// 105 ids, each its generation's set without these two). 12.0 removed
+/// `RemoveDuplicatePlaylistChildren` and re-dated `MigrateRatingLevels`.
+const JELLYFIN_12_0_OPTIONAL_MIGRATIONS: [&str; 2] = [
+    "20250420190000_RemoveDuplicatePlaylistChildren",
+    "20250420220000_MigrateRatingLevels",
+];
+
+/// The ids a 12.1 database may or may not carry: the retired routines of
+/// [`JELLYFIN_12_0_OPTIONAL_MIGRATIONS`], and 12.0's `MigrateRatingLevels`,
+/// which 12.1 re-dated — a database upgraded 12.0 → 12.1 carries it, one that
+/// went 10.11 → 12.1 or was installed fresh on 12.1 never sees it.
+const JELLYFIN_12_1_OPTIONAL_MIGRATIONS: [&str; 3] = [
+    "20250420190000_RemoveDuplicatePlaylistChildren",
+    "20250420220000_MigrateRatingLevels",
+    "20260302090000_MigrateRatingLevels",
+];
+
+/// The ids Jellyfin 12.2 records on top of [`JELLYFIN_12_0_MIGRATIONS`]: 12.1's two
+/// surviving routines plus 12.2's four (`HarmonizeConflictingUserData`,
+/// `FixNullEncoderPreset`, the re-dated `MigrateRatingLevels`, and the
+/// `MakeOwnerIdIndexesPartial` schema migration that `0040` ports). Derived from the
+/// v12.2 C# and confirmed by a fresh `jellyfin_12.2` install (2026-10-12), which
+/// records these six on top of 12.0's set, less 12.0's re-dated `MigrateRatingLevels`
+/// (optional here); the 107/108/109 counts on the
+/// 10.11, 12.0 and 12.1 upgrade routes are confirmed by the adoption fixtures.
+const JELLYFIN_12_2_ADDITIVE_MIGRATIONS: [&str; 6] = [
+    "20260908120000_RepairAlternateVersionLinks",
+    "20260911120000_StripEmbeddedLinkedChildren",
+    "20260912120000_HarmonizeConflictingUserData",
+    "20260915104305_FixNullEncoderPreset",
+    "20260915120000_MigrateRatingLevels",
+    "20261002210711_MakeOwnerIdIndexesPartial",
+];
+
+/// The ids a 12.2 database may or may not carry: the retired routines of
+/// [`JELLYFIN_12_0_OPTIONAL_MIGRATIONS`], and the older `MigrateRatingLevels` ids —
+/// 12.2 re-dated the routine again, so an install that passed through 12.0 keeps
+/// `20260302…` and one that passed through 12.1 keeps `20260910…`; one upgraded
+/// straight from 10.11, or installed fresh on 12.2, has neither.
+const JELLYFIN_12_2_OPTIONAL_MIGRATIONS: [&str; 4] = [
+    "20250420190000_RemoveDuplicatePlaylistChildren",
+    "20250420220000_MigrateRatingLevels",
+    "20260302090000_MigrateRatingLevels",
+    "20260910120000_MigrateRatingLevels",
+];
 
 /// A Jellyfin schema generation Ferrofin adopts in place.
 ///
 /// Adoption is gated on the **exact** `__EFMigrationsHistory` id set a real
-/// server of that release leaves behind — anything newer, older or partial is
+/// server of that release leaves behind, once its `optional_ids` (re-dated or
+/// retired routines a given install may or may not have recorded) are set
+/// aside — anything newer, older or partial is
 /// refused rather than half-adopted. `baselined_versions` are the Ferrofin
 /// migrations whose *shape* the database already has, recorded as applied
 /// without executing; every other migration runs.
 #[derive(Debug, Clone, Copy)]
 pub struct JellyfinGeneration {
     /// The release name, as shown in logs and errors (`"10.11.8"`, `"10.11.11"`,
-    /// `"12.0.0"`, `"12.1.0"`).
+    /// `"12.0.0"`, `"12.1.0"`, `"12.2.0"`).
     pub name: &'static str,
     /// The EF migration-id set of that release (with [`Self::additional_ids`]).
     pub migration_ids: &'static [&'static str],
     /// Ids a point release added on top of `migration_ids` (10.11.10/11 over
-    /// 10.11.8, 12.1 over 12.0); empty for a release captured whole.
+    /// 10.11.8, 12.1 and 12.2 over 12.0); empty for a release captured whole.
     pub additional_ids: &'static [&'static str],
-    /// Ids that may or may not be present (a routine a later release re-dated:
-    /// an upgraded install still records the old id, a fresh one never does).
+    /// Ids that may or may not be present. Jellyfin records a code routine's id
+    /// only while that routine is in its code base and never deletes a history
+    /// row, so an install upgraded through an older release keeps ids a fresh
+    /// install of this one never gets: routines this release (or an earlier one
+    /// in its line) retired, and the old ids of routines it re-dated.
     pub optional_ids: &'static [&'static str],
     /// Ferrofin migrations baselined (recorded, never run) for that generation.
     pub baselined_versions: &'static [i64],
@@ -1114,9 +1166,14 @@ pub struct JellyfinGeneration {
 /// The generations Ferrofin adopts. `0001`–`0007` are the 10.11.8 shape every
 /// generation already has; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
-/// shape) for 12.0 and 12.1. `0031`, `0033` and `0034` are never baselined:
-/// they are data-only or Ferrofin-side convergence and must run on every path.
-pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 4] = [
+/// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
+/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041` and `0042` are
+/// never baselined: they are data-only or Ferrofin-side convergence and must run
+/// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
+/// matches both an upgraded install and a fresh one (see
+/// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
+/// index it lacks.
+pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
     JellyfinGeneration {
         name: "10.11.8",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
@@ -1135,15 +1192,22 @@ pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 4] = [
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &[],
-        optional_ids: &[],
+        optional_ids: &JELLYFIN_12_0_OPTIONAL_MIGRATIONS,
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32],
     },
     JellyfinGeneration {
         name: "12.1.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &JELLYFIN_12_1_ADDITIVE_MIGRATIONS,
-        optional_ids: &JELLYFIN_12_0_RATING_LEVELS_MIGRATION,
+        optional_ids: &JELLYFIN_12_1_OPTIONAL_MIGRATIONS,
         baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32],
+    },
+    JellyfinGeneration {
+        name: "12.2.0",
+        migration_ids: &JELLYFIN_12_0_MIGRATIONS,
+        additional_ids: &JELLYFIN_12_2_ADDITIVE_MIGRATIONS,
+        optional_ids: &JELLYFIN_12_2_OPTIONAL_MIGRATIONS,
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 30, 32, 40],
     },
 ];
 
@@ -1220,7 +1284,8 @@ fn unsupported_generation(applied: &[String]) -> crate::DbError {
 /// Ferrofin-native database or one adopted before this bookkeeping existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdoptionState {
-    /// The generation name (`"10.11.8"`, `"10.11.11"`, `"12.0.0"`, `"12.1.0"`).
+    /// The generation name (`"10.11.8"`, `"10.11.11"`, `"12.0.0"`, `"12.1.0"`,
+    /// `"12.2.0"`).
     pub generation: String,
     /// Whether the playlist/collection membership import from `Data` JSON has run.
     pub membership_import_done: bool,
@@ -1404,6 +1469,77 @@ async fn backup_before_rebuild(
         "database snapshot taken before a schema-rebuild migration"
     );
     Ok(())
+}
+
+/// What a database file records about the migrations applied to it, as read
+/// by [`inspect_migration_history`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationHistory {
+    /// The file does not exist.
+    Missing,
+    /// The file has neither Ferrofin's `_sqlx_migrations` nor Jellyfin's
+    /// `__EFMigrationsHistory` table — an empty (0-byte) file included.
+    NoHistory,
+    /// A history table exists but records no migration.
+    Empty,
+    /// At least one applied migration is recorded.
+    Recorded,
+}
+
+/// Reads the migration history of the database file at `path` without
+/// creating, adopting or migrating it.
+///
+/// The existence check comes first because opening a missing SQLite database
+/// creates an empty file. A file that exists is opened without creating or
+/// migrating it and without changing its journal mode, and only queried — but
+/// SQLite may still checkpoint a WAL database's `-wal` file into it on close.
+/// Either history table counts: `_sqlx_migrations` for a database Ferrofin
+/// has opened, `__EFMigrationsHistory` for a Jellyfin database not yet adopted.
+///
+/// # Errors
+///
+/// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the existence check
+/// fails or the file cannot be opened or read as a SQLite database.
+pub async fn inspect_migration_history(path: &std::path::Path) -> Result<MigrationHistory> {
+    use sqlx::ConnectOptions as _;
+    if !path.try_exists().map_err(sqlx::Error::Io)? {
+        return Ok(MigrationHistory::Missing);
+    }
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .connect()
+        .await?;
+    let history = read_migration_history(&mut conn).await;
+    sqlx::Connection::close(conn).await?;
+    history
+}
+
+/// [`inspect_migration_history`] over an open connection.
+async fn read_migration_history(conn: &mut sqlx::SqliteConnection) -> Result<MigrationHistory> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('_sqlx_migrations', '__EFMigrationsHistory')",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if tables.is_empty() {
+        return Ok(MigrationHistory::NoHistory);
+    }
+    for table in &tables {
+        let count_query = if table == "_sqlx_migrations" {
+            r#"SELECT COUNT(*) FROM "_sqlx_migrations""#
+        } else {
+            r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#
+        };
+        let applied: i64 = sqlx::query_scalar(count_query)
+            .fetch_one(&mut *conn)
+            .await?;
+        if applied > 0 {
+            return Ok(MigrationHistory::Recorded);
+        }
+    }
+    Ok(MigrationHistory::Empty)
 }
 
 /// How many migrations `_sqlx_migrations` records as applied (`0` when the
@@ -1644,6 +1780,112 @@ mod tests {
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
         );
+    }
+
+    /// Runs `sql` against a database file created at `path`.
+    async fn create_with(path: &std::path::Path, sql: &'static str) {
+        use sqlx::ConnectOptions as _;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .connect()
+            .await
+            .expect("create");
+        sqlx::raw_sql(sql).execute(&mut conn).await.expect("sql");
+        sqlx::Connection::close(conn).await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_missing_database_is_reported_and_not_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::Missing
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("list").count(),
+            0,
+            "inspecting must not create the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_has_no_migration_history_and_stays_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        std::fs::write(&path, []).expect("empty file");
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::NoHistory
+        );
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::unrelated_tables("CREATE TABLE Users (Id TEXT);", super::MigrationHistory::NoHistory)]
+    #[case::empty_ef_history(
+        r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);"#,
+        super::MigrationHistory::Empty
+    )]
+    #[case::empty_sqlx_history(
+        "CREATE TABLE _sqlx_migrations (version BIGINT);",
+        super::MigrationHistory::Empty
+    )]
+    #[case::recorded_ef_history(
+        r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);
+           INSERT INTO "__EFMigrationsHistory" VALUES ('20250000000000_Initial', '9.0.0');"#,
+        super::MigrationHistory::Recorded
+    )]
+    #[case::empty_sqlx_beside_recorded_ef(
+        r#"CREATE TABLE _sqlx_migrations (version BIGINT);
+           CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT);
+           INSERT INTO "__EFMigrationsHistory" VALUES ('20250000000000_Initial', '9.0.0');"#,
+        super::MigrationHistory::Recorded
+    )]
+    #[tokio::test]
+    async fn migration_history_is_read_from_either_table(
+        #[case] sql: &'static str,
+        #[case] expected: super::MigrationHistory,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        create_with(&path, sql).await;
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn a_migrated_database_has_recorded_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        db.close().await;
+        assert_eq!(
+            super::inspect_migration_history(&path)
+                .await
+                .expect("inspect"),
+            super::MigrationHistory::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_a_database_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        std::fs::write(&path, b"this is not a sqlite database file at all").expect("write");
+        assert!(super::inspect_migration_history(&path).await.is_err());
     }
 
     #[tokio::test]
@@ -2375,6 +2617,10 @@ mod tests {
     const SCHEMA_10_11_8: &str = include_str!("../tests/data/jellyfin-10.11.8-schema.sql");
     /// The committed 12.0 schema fixture.
     const SCHEMA_12_0: &str = include_str!("../tests/data/jellyfin-12.0-schema.sql");
+    /// The committed 12.2 schema fixture (12.0's plus the partial `OwnerId` pair).
+    const SCHEMA_12_2: &str = include_str!("../tests/data/jellyfin-12.2-schema.sql");
+    /// 12.0's `MigrateRatingLevels` id, which 12.1 and 12.2 re-dated.
+    const RATING_LEVELS_12_0: &str = "20260302090000_MigrateRatingLevels";
 
     /// Creates a file-backed database shaped exactly like a real Jellyfin one:
     /// a committed schema fixture plus the EF migration rows.
@@ -2443,12 +2689,33 @@ mod tests {
         };
         assert!(by_name("12.0.0").baselined_versions.contains(&32));
         assert!(by_name("12.1.0").baselined_versions.contains(&32));
+        assert!(by_name("12.2.0").baselined_versions.contains(&32));
         assert!(!by_name("10.11.8").baselined_versions.contains(&32));
         assert!(!by_name("10.11.11").baselined_versions.contains(&32));
         // `0030` is baselined exactly where Jellyfin already owns the column.
         assert!(!by_name("10.11.8").baselined_versions.contains(&30));
         assert!(by_name("10.11.11").baselined_versions.contains(&30));
         assert!(by_name("12.0.0").baselined_versions.contains(&30));
+        assert!(by_name("12.2.0").baselined_versions.contains(&30));
+        // Retention (`0035`), intro skipper (`0036`–`0038`), the duplicate-index
+        // drop (`0039`), the fresh-install convergence (`0041`) and the orphan
+        // clean-up (`0042`) run on every path.
+        for generation in &JELLYFIN_GENERATIONS {
+            for version in [35, 36, 37, 38, 39, 41, 42] {
+                assert!(
+                    !generation.baselined_versions.contains(&version),
+                    "{}: {version:04} must run on every path",
+                    generation.name
+                );
+            }
+            // `0040` (12.2's partial `OwnerId` pair) is the 12.2 shape only.
+            assert_eq!(
+                generation.baselined_versions.contains(&40),
+                generation.name == "12.2.0",
+                "{}: 0040 is baselined for 12.2.0 alone",
+                generation.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -2795,7 +3062,7 @@ mod tests {
         let mut ids: Vec<&str> = JELLYFIN_12_0_MIGRATIONS
             .iter()
             .copied()
-            .filter(|id| upgraded_from_12_0 || !JELLYFIN_12_0_RATING_LEVELS_MIGRATION.contains(id))
+            .filter(|id| upgraded_from_12_0 || *id != RATING_LEVELS_12_0)
             .chain(JELLYFIN_12_1_ADDITIVE_MIGRATIONS)
             .collect();
         ids.sort_unstable();
@@ -2850,6 +3117,525 @@ mod tests {
             "{text}"
         );
         assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    /// 12.2 records four new ids on top of 12.1's two surviving routines and
+    /// re-dates `MigrateRatingLevels` again, so each upgrade route leaves a
+    /// different count: 10.11 → 12.2 carries neither older rating id (107),
+    /// 12.0 → 12.2 keeps `20260302…` (108), 12.1-from-10.11 → 12.2 keeps
+    /// `20260910…` (108), and 12.1-from-12.0 → 12.2 keeps both (109). All four
+    /// are the 12.2 generation, and `0040` is baselined: the database already has
+    /// the partial `OwnerId` pair.
+    #[rstest::rstest]
+    #[case::from_10_11(false, false, 107)]
+    #[case::from_12_0(true, false, 108)]
+    #[case::from_12_1_of_10_11(false, true, 108)]
+    #[case::from_12_1_of_12_0(true, true, 109)]
+    #[tokio::test]
+    async fn adopts_a_jellyfin_12_2_database_on_every_upgrade_route(
+        #[case] passed_through_12_0: bool,
+        #[case] passed_through_12_1: bool,
+        #[case] expected_rows: usize,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids: Vec<&str> = JELLYFIN_12_0_MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|id| passed_through_12_0 || *id != RATING_LEVELS_12_0)
+            .chain(JELLYFIN_12_2_ADDITIVE_MIGRATIONS)
+            .collect();
+        if passed_through_12_1 {
+            ids.push("20260910120000_MigrateRatingLevels");
+        }
+        ids.sort_unstable();
+        assert_eq!(ids.len(), expected_rows);
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_2, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("12.2 adoption succeeds");
+        assert_eq!(
+            db.adoption_state()
+                .await
+                .expect("state")
+                .map(|s| s.generation),
+            Some("12.2.0".to_owned())
+        );
+        let versions = recorded_versions(&db).await;
+        for baselined in [30, 32, 40] {
+            assert!(versions.contains(&baselined), "{baselined:04} recorded");
+        }
+        assert!(
+            !path.with_extension("db.pre-0032").exists(),
+            "no rebuild ran"
+        );
+        let owner_index: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'IX_BaseItems_OwnerId'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("IX_BaseItems_OwnerId");
+        assert!(
+            owner_index.ends_with(r#"WHERE "OwnerId" IS NOT NULL"#),
+            "{owner_index}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_12_1_set_with_only_part_of_12_2() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // 12.1 (from 12.0) plus three of 12.2's four new ids: one id short of
+        // 12.2, three unknown to 12.1. (Two of four would tie the two
+        // generations, and a tie reports the older one.) Refused either way.
+        let mut ids: Vec<&str> = JELLYFIN_12_0_MIGRATIONS.to_vec();
+        ids.extend(JELLYFIN_12_1_ADDITIVE_MIGRATIONS);
+        ids.extend(&JELLYFIN_12_2_ADDITIVE_MIGRATIONS[2..5]);
+        ids.sort_unstable();
+        seed_jellyfin_fixture_with(&path, SCHEMA_12_0, &ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let err = Database::connect_sized(&url, Some(2))
+            .await
+            .expect_err("a partial 12.2 history is refused");
+        let text = err.to_string();
+        assert!(text.contains("closest is 12.2.0"), "{text}");
+        assert!(
+            text.contains("20261002210711_MakeOwnerIdIndexesPartial"),
+            "{text}"
+        );
+        assert!(!path.with_extension("db.pre-ferrofin").exists());
+    }
+
+    /// The `__EFMigrationsHistory` of a fresh Jellyfin 12.0 install (100 ids):
+    /// the portable `jellyfin_12.0-amd64` tarball booted once on empty directories
+    /// (2026-10-12).
+    const FRESH_12_0: [&str; 100] = [
+        "20200514181226_AddActivityLog",
+        "20200613202153_AddUsers",
+        "20200728005145_AddDisplayPreferences",
+        "20200905220533_FixDisplayPreferencesIndex",
+        "20201004171403_AddMaxActiveSessions",
+        "20201204223655_AddCustomDisplayPreferences",
+        "20210320181425_AddIndexesAndCollations",
+        "20210407110544_NullableCustomPrefValue",
+        "20210814002109_AddDevices",
+        "20221022080052_AddIndexActivityLogsDateCreated",
+        "20230526173516_RemoveEasyPassword",
+        "20230626233818_AddTrickplayInfos",
+        "20230923170422_UserCastReceiver",
+        "20240729140605_AddMediaSegments",
+        "20240928082930_MarkSegmentProviderIdNonNullable",
+        "20241020103111_LibraryDbMigration",
+        "20241111131257_AddedCustomDataKey",
+        "20241111135439_AddedCustomDataKeyKey",
+        "20241112152323_FixAncestorIdConfig",
+        "20241112232041_FixMediaStreams",
+        "20241112234144_FixMediaStreams2",
+        "20241113133548_EnforceUniqueItemValue",
+        "20250202021306_FixedCollation",
+        "20250204092455_MakeStartEndDateNullable",
+        "20250214031148_ChannelIdGuid",
+        "20250326065026_AddInheritedParentalRatingSubValue",
+        "20250327101120_AddKeyframeData",
+        "20250327171413_AddHdr10PlusFlag",
+        "20250331182844_FixAttachmentMigration",
+        "20250401142247_FixAncestors",
+        "20250405075612_FixItemValuesIndices",
+        "20250420000000_CreateNetworkConfiguration",
+        "20250420010000_MigrateNetworkConfiguration",
+        "20250420020000_MigrateMusicBrainzTimeout",
+        "20250420030000_MigrateEncodingOptions",
+        "20250420040000_RenameEnableGroupingIntoCollections",
+        "20250420050000_DisableTranscodingThrottling",
+        "20250420060000_CreateUserLoggingConfigFile",
+        "20250420070000_MigrateActivityLogDb",
+        "20250420080000_RemoveDuplicateExtras",
+        "20250420090000_AddDefaultPluginRepository",
+        "20250420100000_MigrateUserDb",
+        "20250420110000_ReaddDefaultPluginRepository",
+        "20250420120000_MigrateDisplayPreferencesDb",
+        "20250420130000_RemoveDownloadImagesInAdvance",
+        "20250420140000_MigrateAuthenticationDb",
+        "20250420150000_FixPlaylistOwner",
+        "20250420160000_AddDefaultCastReceivers",
+        "20250420170000_UpdateDefaultPluginRepository",
+        "20250420180000_FixAudioData",
+        "20250420193000_MigrateLibraryDbCompatibilityCheck",
+        "20250420200000_MigrateLibraryDb",
+        "20250420210000_MoveExtractedFiles",
+        "20250420230000_MoveTrickplayFiles",
+        "20250420230000_RefreshInternalDateModified",
+        "20250421000000_MigrateKeyframeData",
+        "20250609115616_DetachUserDataInsteadOfDelete",
+        "20250618010000_MigrateLibraryUserData",
+        "20250620180000_FixDates",
+        "20250622170802_BaseItemImageInfoDateModifiedNullable",
+        "20250714044826_ResetJournalMode",
+        "20250730215000_ReseedFolderFlag",
+        "20250913211637_AddProperParentChildRelationBaseItemWithCascade",
+        "20250925203415_ExtendPeopleMapKey",
+        "20251009200000_CleanMusicArtist",
+        "20260113102337_AddLinkedChildrenTable",
+        "20260113120000_MigrateLinkedChildren",
+        "20260113203012_ChangeOwnerIdToGuid",
+        "20260113230000_CleanupOrphanedExtras",
+        "20260113233000_AddForeignKeyToOwnerId",
+        "20260113233500_DropExtraIdsColumn",
+        "20260115120000_FixIncorrectOwnerIdRelationships",
+        "20260116114245_AddLatestItemsDateCreatedIndexes",
+        "20260118182305_AddIndicesToImageInfo",
+        "20260130232147_AddBaseItemNameIndex",
+        "20260206200000_FixLibrarySubtitleDownloadLanguages",
+        "20260206224832_IndexOptimizations",
+        "20260215201634_ChangePrimaryVersionIdToGuid",
+        "20260302090000_MigrateRatingLevels",
+        "20260308123920_AddTypeCleanNameIndex",
+        "20260504075755_AddPartialIndexForItemCounts",
+        "20260508120000_MergeDuplicateMusicArtists",
+        "20260508130000_MergeDuplicatePeople",
+        "20260522092303_AddNormalizedUsername",
+        "20260522092304_UpdateNormalizedUsername",
+        "20260524120336_AddUniqueNormalizedUsernameIndex",
+        "20260525010000_CleanupOrphanedExternalData",
+        "20260531160000_DisableLegacyAuthorization",
+        "20260610120000_RefreshCleanNamesAndValues",
+        "20260722120000_RefreshForcedSortNames",
+        "20260723111547_AllowDuplicatePlaylistChildren",
+        "20260724185102_AddPrimaryVersionIdIndex",
+        "20260728170000_AddPeopleNameLowerIndex",
+        "20260728182152_AddPeopleItemMapCoveringIndex",
+        "20260729120000_RestorePlaylistChildrenFromMetadata",
+        "20260812050902_AddMediaStreamFilterIndex",
+        "20260815063607_RemoveOrphanedUserPermissionsAndPreferences",
+        "20260821120000_RecomputeSeriesPresentationKey",
+        "20260825200000_ConsolidateLocalizedUserViews",
+        "20260831100000_EnableLocalSimilarityProviders",
+    ];
+
+    /// The `__EFMigrationsHistory` of a fresh Jellyfin 12.1 install (102 ids):
+    /// the portable `jellyfin_12.1-amd64` tarball booted once on empty directories
+    /// (2026-10-12).
+    const FRESH_12_1: [&str; 102] = [
+        "20200514181226_AddActivityLog",
+        "20200613202153_AddUsers",
+        "20200728005145_AddDisplayPreferences",
+        "20200905220533_FixDisplayPreferencesIndex",
+        "20201004171403_AddMaxActiveSessions",
+        "20201204223655_AddCustomDisplayPreferences",
+        "20210320181425_AddIndexesAndCollations",
+        "20210407110544_NullableCustomPrefValue",
+        "20210814002109_AddDevices",
+        "20221022080052_AddIndexActivityLogsDateCreated",
+        "20230526173516_RemoveEasyPassword",
+        "20230626233818_AddTrickplayInfos",
+        "20230923170422_UserCastReceiver",
+        "20240729140605_AddMediaSegments",
+        "20240928082930_MarkSegmentProviderIdNonNullable",
+        "20241020103111_LibraryDbMigration",
+        "20241111131257_AddedCustomDataKey",
+        "20241111135439_AddedCustomDataKeyKey",
+        "20241112152323_FixAncestorIdConfig",
+        "20241112232041_FixMediaStreams",
+        "20241112234144_FixMediaStreams2",
+        "20241113133548_EnforceUniqueItemValue",
+        "20250202021306_FixedCollation",
+        "20250204092455_MakeStartEndDateNullable",
+        "20250214031148_ChannelIdGuid",
+        "20250326065026_AddInheritedParentalRatingSubValue",
+        "20250327101120_AddKeyframeData",
+        "20250327171413_AddHdr10PlusFlag",
+        "20250331182844_FixAttachmentMigration",
+        "20250401142247_FixAncestors",
+        "20250405075612_FixItemValuesIndices",
+        "20250420000000_CreateNetworkConfiguration",
+        "20250420010000_MigrateNetworkConfiguration",
+        "20250420020000_MigrateMusicBrainzTimeout",
+        "20250420030000_MigrateEncodingOptions",
+        "20250420040000_RenameEnableGroupingIntoCollections",
+        "20250420050000_DisableTranscodingThrottling",
+        "20250420060000_CreateUserLoggingConfigFile",
+        "20250420070000_MigrateActivityLogDb",
+        "20250420080000_RemoveDuplicateExtras",
+        "20250420090000_AddDefaultPluginRepository",
+        "20250420100000_MigrateUserDb",
+        "20250420110000_ReaddDefaultPluginRepository",
+        "20250420120000_MigrateDisplayPreferencesDb",
+        "20250420130000_RemoveDownloadImagesInAdvance",
+        "20250420140000_MigrateAuthenticationDb",
+        "20250420150000_FixPlaylistOwner",
+        "20250420160000_AddDefaultCastReceivers",
+        "20250420170000_UpdateDefaultPluginRepository",
+        "20250420180000_FixAudioData",
+        "20250420193000_MigrateLibraryDbCompatibilityCheck",
+        "20250420200000_MigrateLibraryDb",
+        "20250420210000_MoveExtractedFiles",
+        "20250420230000_MoveTrickplayFiles",
+        "20250420230000_RefreshInternalDateModified",
+        "20250421000000_MigrateKeyframeData",
+        "20250609115616_DetachUserDataInsteadOfDelete",
+        "20250618010000_MigrateLibraryUserData",
+        "20250620180000_FixDates",
+        "20250622170802_BaseItemImageInfoDateModifiedNullable",
+        "20250714044826_ResetJournalMode",
+        "20250730215000_ReseedFolderFlag",
+        "20250913211637_AddProperParentChildRelationBaseItemWithCascade",
+        "20250925203415_ExtendPeopleMapKey",
+        "20251009200000_CleanMusicArtist",
+        "20260113102337_AddLinkedChildrenTable",
+        "20260113120000_MigrateLinkedChildren",
+        "20260113203012_ChangeOwnerIdToGuid",
+        "20260113230000_CleanupOrphanedExtras",
+        "20260113233000_AddForeignKeyToOwnerId",
+        "20260113233500_DropExtraIdsColumn",
+        "20260115120000_FixIncorrectOwnerIdRelationships",
+        "20260116114245_AddLatestItemsDateCreatedIndexes",
+        "20260118182305_AddIndicesToImageInfo",
+        "20260130232147_AddBaseItemNameIndex",
+        "20260206200000_FixLibrarySubtitleDownloadLanguages",
+        "20260206224832_IndexOptimizations",
+        "20260215201634_ChangePrimaryVersionIdToGuid",
+        "20260308123920_AddTypeCleanNameIndex",
+        "20260504075755_AddPartialIndexForItemCounts",
+        "20260508120000_MergeDuplicateMusicArtists",
+        "20260508130000_MergeDuplicatePeople",
+        "20260522092303_AddNormalizedUsername",
+        "20260522092304_UpdateNormalizedUsername",
+        "20260524120336_AddUniqueNormalizedUsernameIndex",
+        "20260525010000_CleanupOrphanedExternalData",
+        "20260531160000_DisableLegacyAuthorization",
+        "20260610120000_RefreshCleanNamesAndValues",
+        "20260722120000_RefreshForcedSortNames",
+        "20260723111547_AllowDuplicatePlaylistChildren",
+        "20260724185102_AddPrimaryVersionIdIndex",
+        "20260728170000_AddPeopleNameLowerIndex",
+        "20260728182152_AddPeopleItemMapCoveringIndex",
+        "20260729120000_RestorePlaylistChildrenFromMetadata",
+        "20260812050902_AddMediaStreamFilterIndex",
+        "20260815063607_RemoveOrphanedUserPermissionsAndPreferences",
+        "20260821120000_RecomputeSeriesPresentationKey",
+        "20260825200000_ConsolidateLocalizedUserViews",
+        "20260831100000_EnableLocalSimilarityProviders",
+        "20260908120000_RepairAlternateVersionLinks",
+        "20260910120000_MigrateRatingLevels",
+        "20260911120000_StripEmbeddedLinkedChildren",
+    ];
+
+    /// The `__EFMigrationsHistory` of a fresh Jellyfin 12.2 install (105 ids):
+    /// the portable `jellyfin_12.2-amd64` tarball booted once on empty directories
+    /// (2026-10-12).
+    const FRESH_12_2: [&str; 105] = [
+        "20200514181226_AddActivityLog",
+        "20200613202153_AddUsers",
+        "20200728005145_AddDisplayPreferences",
+        "20200905220533_FixDisplayPreferencesIndex",
+        "20201004171403_AddMaxActiveSessions",
+        "20201204223655_AddCustomDisplayPreferences",
+        "20210320181425_AddIndexesAndCollations",
+        "20210407110544_NullableCustomPrefValue",
+        "20210814002109_AddDevices",
+        "20221022080052_AddIndexActivityLogsDateCreated",
+        "20230526173516_RemoveEasyPassword",
+        "20230626233818_AddTrickplayInfos",
+        "20230923170422_UserCastReceiver",
+        "20240729140605_AddMediaSegments",
+        "20240928082930_MarkSegmentProviderIdNonNullable",
+        "20241020103111_LibraryDbMigration",
+        "20241111131257_AddedCustomDataKey",
+        "20241111135439_AddedCustomDataKeyKey",
+        "20241112152323_FixAncestorIdConfig",
+        "20241112232041_FixMediaStreams",
+        "20241112234144_FixMediaStreams2",
+        "20241113133548_EnforceUniqueItemValue",
+        "20250202021306_FixedCollation",
+        "20250204092455_MakeStartEndDateNullable",
+        "20250214031148_ChannelIdGuid",
+        "20250326065026_AddInheritedParentalRatingSubValue",
+        "20250327101120_AddKeyframeData",
+        "20250327171413_AddHdr10PlusFlag",
+        "20250331182844_FixAttachmentMigration",
+        "20250401142247_FixAncestors",
+        "20250405075612_FixItemValuesIndices",
+        "20250420000000_CreateNetworkConfiguration",
+        "20250420010000_MigrateNetworkConfiguration",
+        "20250420020000_MigrateMusicBrainzTimeout",
+        "20250420030000_MigrateEncodingOptions",
+        "20250420040000_RenameEnableGroupingIntoCollections",
+        "20250420050000_DisableTranscodingThrottling",
+        "20250420060000_CreateUserLoggingConfigFile",
+        "20250420070000_MigrateActivityLogDb",
+        "20250420080000_RemoveDuplicateExtras",
+        "20250420090000_AddDefaultPluginRepository",
+        "20250420100000_MigrateUserDb",
+        "20250420110000_ReaddDefaultPluginRepository",
+        "20250420120000_MigrateDisplayPreferencesDb",
+        "20250420130000_RemoveDownloadImagesInAdvance",
+        "20250420140000_MigrateAuthenticationDb",
+        "20250420150000_FixPlaylistOwner",
+        "20250420160000_AddDefaultCastReceivers",
+        "20250420170000_UpdateDefaultPluginRepository",
+        "20250420180000_FixAudioData",
+        "20250420193000_MigrateLibraryDbCompatibilityCheck",
+        "20250420200000_MigrateLibraryDb",
+        "20250420210000_MoveExtractedFiles",
+        "20250420230000_MoveTrickplayFiles",
+        "20250420230000_RefreshInternalDateModified",
+        "20250421000000_MigrateKeyframeData",
+        "20250609115616_DetachUserDataInsteadOfDelete",
+        "20250618010000_MigrateLibraryUserData",
+        "20250620180000_FixDates",
+        "20250622170802_BaseItemImageInfoDateModifiedNullable",
+        "20250714044826_ResetJournalMode",
+        "20250730215000_ReseedFolderFlag",
+        "20250913211637_AddProperParentChildRelationBaseItemWithCascade",
+        "20250925203415_ExtendPeopleMapKey",
+        "20251009200000_CleanMusicArtist",
+        "20260113102337_AddLinkedChildrenTable",
+        "20260113120000_MigrateLinkedChildren",
+        "20260113203012_ChangeOwnerIdToGuid",
+        "20260113230000_CleanupOrphanedExtras",
+        "20260113233000_AddForeignKeyToOwnerId",
+        "20260113233500_DropExtraIdsColumn",
+        "20260115120000_FixIncorrectOwnerIdRelationships",
+        "20260116114245_AddLatestItemsDateCreatedIndexes",
+        "20260118182305_AddIndicesToImageInfo",
+        "20260130232147_AddBaseItemNameIndex",
+        "20260206200000_FixLibrarySubtitleDownloadLanguages",
+        "20260206224832_IndexOptimizations",
+        "20260215201634_ChangePrimaryVersionIdToGuid",
+        "20260308123920_AddTypeCleanNameIndex",
+        "20260504075755_AddPartialIndexForItemCounts",
+        "20260508120000_MergeDuplicateMusicArtists",
+        "20260508130000_MergeDuplicatePeople",
+        "20260522092303_AddNormalizedUsername",
+        "20260522092304_UpdateNormalizedUsername",
+        "20260524120336_AddUniqueNormalizedUsernameIndex",
+        "20260525010000_CleanupOrphanedExternalData",
+        "20260531160000_DisableLegacyAuthorization",
+        "20260610120000_RefreshCleanNamesAndValues",
+        "20260722120000_RefreshForcedSortNames",
+        "20260723111547_AllowDuplicatePlaylistChildren",
+        "20260724185102_AddPrimaryVersionIdIndex",
+        "20260728170000_AddPeopleNameLowerIndex",
+        "20260728182152_AddPeopleItemMapCoveringIndex",
+        "20260729120000_RestorePlaylistChildrenFromMetadata",
+        "20260812050902_AddMediaStreamFilterIndex",
+        "20260815063607_RemoveOrphanedUserPermissionsAndPreferences",
+        "20260821120000_RecomputeSeriesPresentationKey",
+        "20260825200000_ConsolidateLocalizedUserViews",
+        "20260831100000_EnableLocalSimilarityProviders",
+        "20260908120000_RepairAlternateVersionLinks",
+        "20260911120000_StripEmbeddedLinkedChildren",
+        "20260912120000_HarmonizeConflictingUserData",
+        "20260915104305_FixNullEncoderPreset",
+        "20260915120000_MigrateRatingLevels",
+        "20261002210711_MakeOwnerIdIndexesPartial",
+    ];
+
+    /// The one statement a fresh 12.x install lacks next to the schema pins.
+    const CUSTOM_PREFS_USER_INDEX: &str = "CREATE INDEX \"IX_CustomItemDisplayPreferences_UserId\" \
+         ON \"CustomItemDisplayPreferences\"(\n  \"UserId\"\n);";
+
+    /// `schema` in the shape a fresh Jellyfin install has: without
+    /// `IX_CustomItemDisplayPreferences_UserId`, which
+    /// `20210320181425_AddIndexesAndCollations` drops.
+    fn fresh_install_schema(schema: &str) -> String {
+        assert!(
+            schema.contains(CUSTOM_PREFS_USER_INDEX),
+            "the pin carries the index"
+        );
+        schema.replace(CUSTOM_PREFS_USER_INDEX, "")
+    }
+
+    /// A fresh 12.x install records only the routines its code base still has, so
+    /// it lacks the retired 10.11-era ids every upgraded database carries, and its
+    /// schema lacks `IX_CustomItemDisplayPreferences_UserId`. It is still its own
+    /// generation, and `0041` gives it the index.
+    #[rstest::rstest]
+    #[case::fresh_12_0("12.0.0", SCHEMA_12_0, &FRESH_12_0)]
+    #[case::fresh_12_1("12.1.0", SCHEMA_12_0, &FRESH_12_1)]
+    #[case::fresh_12_2("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[tokio::test]
+    async fn adopts_a_fresh_jellyfin_12_x_install(
+        #[case] generation: &str,
+        #[case] schema: &str,
+        #[case] ids: &[&str],
+    ) {
+        // The captured truth is exactly the generation's required set.
+        let expected = JELLYFIN_GENERATIONS
+            .iter()
+            .find(|g| g.name == generation)
+            .expect("generation")
+            .ids();
+        assert_eq!(
+            ids,
+            expected.as_slice(),
+            "{generation}: fresh set = required set"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture_with(&path, &fresh_install_schema(schema), ids).await;
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("fresh-install adoption succeeds");
+        assert_eq!(
+            db.adoption_state()
+                .await
+                .expect("state")
+                .map(|s| s.generation),
+            Some(generation.to_owned())
+        );
+        assert!(
+            recorded_versions(&db).await.contains(&41),
+            "0041 ran (it is never baselined)"
+        );
+        let index: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' \
+             AND name = 'IX_CustomItemDisplayPreferences_UserId'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("0041 created IX_CustomItemDisplayPreferences_UserId");
+        assert_eq!(
+            format!("{index};"),
+            CUSTOM_PREFS_USER_INDEX,
+            "byte-identical to the schema pin"
+        );
+    }
+
+    /// Every id set a generation accepts — its required set plus any subset of its
+    /// optional ids — matches that generation and no other, so a 12.0-fresh set can
+    /// never adopt as 12.1, nor a 12.1 one as 12.2.
+    #[test]
+    fn no_id_set_matches_two_generations() {
+        for owner in &JELLYFIN_GENERATIONS {
+            let optional: Vec<&str> = owner.optional_ids.to_vec();
+            for mask in 0..1_u32 << optional.len() {
+                let mut applied: Vec<String> = owner.ids().into_iter().map(str::to_owned).collect();
+                applied.extend(
+                    optional
+                        .iter()
+                        .enumerate()
+                        .filter(|(bit, _)| mask & (1 << bit) != 0)
+                        .map(|(_, id)| (*id).to_owned()),
+                );
+                applied.sort_unstable();
+                for other in &JELLYFIN_GENERATIONS {
+                    assert_eq!(
+                        other.matches(&applied),
+                        other.name == owner.name,
+                        "{} set (optional mask {mask:#b}) vs {}",
+                        owner.name,
+                        other.name
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

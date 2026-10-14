@@ -43,6 +43,8 @@ pub mod refresh_plan;
 pub mod season;
 pub mod similarity;
 pub mod studios;
+#[cfg(test)]
+mod test_localization;
 pub mod tmdb;
 pub mod tvdb;
 pub mod xbmc;

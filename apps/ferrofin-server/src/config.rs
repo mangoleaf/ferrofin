@@ -749,15 +749,23 @@ impl Config {
         if ferrofin.exists() {
             return ferrofin;
         }
-        for candidate in [
-            self.data_dir.join("jellyfin.db"),
-            self.data_dir.join("data").join("jellyfin.db"),
-        ] {
+        for candidate in self.jellyfin_database_paths() {
             if candidate.exists() {
                 return candidate;
             }
         }
         ferrofin
+    }
+
+    /// Where [`Config::database_path`] looks for a Jellyfin database to adopt
+    /// when no `ferrofin.db` exists, in order: `jellyfin.db` at the data dir's
+    /// root, then Jellyfin's own layout `data/jellyfin.db`.
+    #[must_use]
+    pub fn jellyfin_database_paths(&self) -> [PathBuf; 2] {
+        [
+            self.data_dir.join("jellyfin.db"),
+            self.data_dir.join("data").join("jellyfin.db"),
+        ]
     }
 
     /// TheTVDB's cache duration ([`tvdb_cache_hours`](Self::tvdb_cache_hours)):

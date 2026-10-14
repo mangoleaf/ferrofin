@@ -22,7 +22,7 @@ use ferrofin_core::item_type_lookup::{
 };
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
-    LibraryScanner,
+    LibraryScanner, LocalizationManager,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -731,6 +731,7 @@ async fn an_adopted_group_repaired_at_boot_scans_quietly() {
         &IdDerivation::LegacyLowercase,
         None,
         None,
+        f.store.as_ref(),
     )
     .await
     .unwrap();
@@ -758,6 +759,106 @@ async fn an_adopted_group_repaired_at_boot_scans_quietly() {
     assert!(
         !part_now.is_in_mixed_folder,
         "the part took its primary's folder state"
+    );
+}
+
+/// The synthetic adoption fixture's Jellyfin 10.11.8 group: two version
+/// files, the alternate a `Video` under its own id — its own name, the
+/// rating the primary had when 10.11 last copied it (`G`), no pointer, no
+/// parent — and the primary since rated `MA15+` (scored, as the boot's
+/// rating repair leaves it). Jellyfin 12.x deletes the alternate, re-creates
+/// it under the `Movie` id and saves the primary, which copies its rating
+/// over (`Video.cs:560-575,704-726`): after the boot repair the alternate
+/// holds `MA15+` and its score, and its own name; the first scan and the
+/// next write nothing.
+#[tokio::test]
+async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
+    const PRIMARY: &str = "Twin Horizon/Twin Horizon - 1080p.mkv";
+    const ALTERNATE: &str = "Twin Horizon/Twin Horizon - 720p.mkv";
+    let f = Fixture::movies(&[PRIMARY, ALTERNATE]).await;
+    f.store
+        .set_localization(Arc::new(LocalizationManager::new("US")));
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(PRIMARY).await;
+    let planned = f.row(ALTERNATE).await;
+    // `MA15+` scores 15, sub-score 3.
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "OfficialRating" = 'MA15+',
+               "InheritedParentalRatingValue" = 15, "InheritedParentalRatingSubValue" = 3
+           WHERE "Id" = ?1"#,
+    )
+    .bind(&primary.id)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    let adopted = guid_to_db(f.id(BaseItemKind::Video, ALTERNATE));
+    f.restore_as(ALTERNATE, |row| {
+        row.id.clone_from(&adopted);
+        row.type_ = stored_type_name(BaseItemKind::Video).unwrap().to_owned();
+        // 10.11's own name for it, and the sort key the save derives from it.
+        row.name = Some("Twin Horizon - 720p".to_owned());
+        row.sort_name = None;
+        row.official_rating = Some("G".to_owned());
+        row.inherited_parental_rating_value = None;
+        row.inherited_parental_rating_sub_value = None;
+        row.primary_version_id = None;
+        row.presentation_unique_key =
+            Some(Uuid::parse_str(&adopted).unwrap().as_simple().to_string());
+        row.parent_id = None;
+        row.top_parent_id = None;
+    })
+    .await;
+    // 10.11 keeps the version under its primary in `Data` only; the boot's
+    // membership import links it as 12.0's migration does.
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, 2)"#,
+    )
+    .bind(&primary.id)
+    .bind(&adopted)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+
+    let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
+        &f.db,
+        &IdDerivation::LegacyLowercase,
+        None,
+        None,
+        f.store.as_ref(),
+    )
+    .await
+    .unwrap();
+    assert_eq!((rehomed.rekeyed, rehomed.versions), (1, 1));
+    let alternate = f.row(ALTERNATE).await;
+    assert_eq!(alternate.id, planned.id);
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&primary.id));
+    let rating = |row: &BaseItemEntity| {
+        (
+            row.official_rating.clone(),
+            row.inherited_parental_rating_value,
+            row.inherited_parental_rating_sub_value,
+        )
+    };
+    assert_eq!(
+        rating(&alternate),
+        (Some("MA15+".to_owned()), Some(15), Some(3))
+    );
+    assert_eq!(alternate.name.as_deref(), Some("Twin Horizon - 720p"));
+
+    count_item_writes(&f.db).await;
+    for scan in ["first", "second"] {
+        let outcome = f.scanner.scan_all().await.unwrap();
+        assert_eq!((outcome.created, outcome.updated), (0, 0), "{scan} scan");
+        assert_eq!(item_writes(&f.db).await, 0, "{scan} scan");
+    }
+    assert_eq!(
+        rating(&f.row(ALTERNATE).await),
+        (Some("MA15+".to_owned()), Some(15), Some(3))
     );
 }
 

@@ -148,6 +148,80 @@ async fn probed_contract_routes_never_404() {
     }
 }
 
+/// Every operation the newer vendored contract (Jellyfin 12.1) adds over the
+/// 10.11.8 pin is served too: the server reports a 12.x version, so a client may
+/// call it. Each one is probed on the live router with its path parameters
+/// filled in, and must not `404`.
+#[tokio::test]
+async fn newer_contract_operations_never_404() {
+    let raw = include_str!("../../../contracts/jellyfin-openapi-12.1.0.json");
+    let spec: serde_json::Value = serde_json::from_str(raw).expect("spec is valid JSON");
+    let pinned = spec_routes();
+    let router = create_router(fake_state());
+    let mut added = 0;
+    for (path, item) in spec["paths"].as_object().expect("paths") {
+        for method in item.as_object().expect("path item").keys() {
+            let verb = matches!(
+                method.as_str(),
+                "get" | "post" | "put" | "delete" | "patch" | "head" | "options" | "trace"
+            );
+            if !verb || pinned.contains(&(method.clone(), path.clone())) {
+                continue;
+            }
+            assert!(
+                matches!(method.as_str(), "get" | "post" | "delete" | "head"),
+                "12.1 uses HTTP method {method:?} the router does not handle"
+            );
+            added += 1;
+            let uri: String = path
+                .split('/')
+                .map(|seg| {
+                    if seg.starts_with('{') {
+                        "00000000-0000-0000-0000-0000000000a1"
+                    } else {
+                        seg
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.to_uppercase().as_str())
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !matches!(
+                    response.status(),
+                    StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                ),
+                "12.1 operation {method} {path} is not routed: {}",
+                response.status()
+            );
+        }
+    }
+    assert!(
+        added > 0,
+        "the 12.1 spec adds GET /Items/{{itemId}}/Collections"
+    );
+    // The probe can tell: an unrouted path still 404s through the auth layers.
+    let unrouted = router
+        .oneshot(
+            Request::builder()
+                .uri("/Items/00000000-0000-0000-0000-0000000000a1/NoSuchRoute")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unrouted.status(), StatusCode::NOT_FOUND);
+}
+
 /// `REAL_ROUTES` must have no duplicate `(method, path)` rows.
 ///
 /// Duplicates are harmless to the router (which mounts real handlers by

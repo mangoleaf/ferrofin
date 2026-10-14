@@ -42,7 +42,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | Variable | Default | Purpose |
 |---|---|---|
 | `FERROFIN_ADMIN_USER` | `admin` | Username of the admin seeded on first boot. |
-| `FERROFIN_ADMIN_PASSWORD` | generated & logged | Admin password. Set it for a headless install; otherwise Ferrofin generates one and **logs it once — record it**. |
+| `FERROFIN_ADMIN_PASSWORD` | none (passwordless) | Admin password. Set it for a headless install. Unset, the admin is seeded **without a password** (as in Jellyfin) and signs in with an empty one until the setup wizard at `/web` sets it — finish the wizard before exposing the server. |
 
 ## ffmpeg
 

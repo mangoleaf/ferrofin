@@ -10,13 +10,13 @@ setup() {
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"
   cd "$TMP" || exit 1
-  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT
+  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT ADOPTION_ORACLE ADOPTION_MEDIA_MOUNTS ORACLE_VERSION
 }
 
 # A smoke output in the real format: "status  metric  path".
 smoke() { # smoke <file> <episode-count> [playlists-view-listed]
   cat > "$1" <<EOS
-200  12.1.0 Jellyfin Server                        /System/Info/Public
+200  12.2.0 Jellyfin Server                        /System/Info/Public
 200  synthetic-admin admin=true                              /Users/Me
 200  Movies,${3:+Playlists,}TV                     /Users/dddddddddddddddddddddddddddddddd/Views
 200  $2                                            /Items?UserId=dddddddddddddddddddddddddddddddd&Recursive=true&IncludeItemTypes=Episode&Limit=0
@@ -56,8 +56,8 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
 # --- boot log ----------------------------------------------------------------
 
 @test "check_boot_log: a clean boot of the expected generation says nothing" {
-  boot_log boot.log 12.1.0
-  run adoption_check_boot_log boot.log 12.1.0
+  boot_log boot.log 12.2.0
+  run adoption_check_boot_log boot.log 12.2.0
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
@@ -82,6 +82,16 @@ boot_log() { # boot_log <file> <generation> [extra-line…]
   smoke oracle.txt 120 yes; smoke same.txt 120 yes; smoke fewer.txt 119 yes
   run adoption_compare_smoke oracle.txt same.txt
   [ -z "$output" ]
+  ORACLE_VERSION=12.2
+  run adoption_compare_smoke oracle.txt fewer.txt
+  [ "$output" = "smoke differs from Jellyfin 12.2 (diff oracle.txt fewer.txt)" ]
+}
+
+@test "compare_smoke: the message names the oracle release, 12.1 when none is set" {
+  smoke oracle.txt 120; smoke fewer.txt 119
+  run adoption_compare_smoke oracle.txt fewer.txt
+  [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
+  ORACLE_VERSION=12.1
   run adoption_compare_smoke oracle.txt fewer.txt
   [ "$output" = "smoke differs from Jellyfin 12.1 (diff oracle.txt fewer.txt)" ]
 }
@@ -226,11 +236,11 @@ EOS
   fake_docker; mkdir fixtures
   run "$ADOPTION/run.sh" --fixtures fixtures --image any
   [ "$status" -eq 2 ]
-  [[ "$output" == *"oracle/smoke-jellyfin-12.1.txt missing"* ]]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
 }
 
 @test "run.sh: a missing fixture is skipped, named, and does not fail the run" {
-  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 1 ]
@@ -241,6 +251,45 @@ EOS
   for f in jellyfin-10.11.8 jellyfin-10.11.9 jellyfin-10.11.10 jellyfin-10.11.11 jellyfin-12.0 jellyfin-12.1-from-10 jellyfin-12.1-from-12; do
     grep -q "|$f|" "$ADOPTION/run.sh"
   done
+  for f in jellyfin-12.2-from-10 jellyfin-12.2-from-12 jellyfin-12.2-from-121; do
+    grep -q "\"12.2.0|$f|[0-9]*\"" "$ADOPTION/run.sh"
+  done
+  # ten paths, each on its own port
+  run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
+  [ -z "$output" ]
+  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 10 ]
+}
+
+@test "run.sh: the oracle is Jellyfin 12.2 unless --oracle or ADOPTION_ORACLE picks 12.1" {
+  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.1
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == SKIP*jellyfin-12.0*"fixture missing" ]]
+  ADOPTION_ORACLE=12.1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 0 ]
+  # the flag wins over the environment
+  ADOPTION_ORACLE=12.1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.2
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
+}
+
+@test "run.sh: an unknown oracle release is refused" {
+  run "$ADOPTION/run.sh" --fixtures fixtures --oracle 12.0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--oracle must be 12.1 or 12.2, not '12.0'"* ]]
+}
+
+@test "run.sh: a media-mounts file named in ADOPTION_MEDIA_MOUNTS must exist" {
+  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  ADOPTION_MEDIA_MOUNTS=$TMP/nowhere.sh run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"no $TMP/nowhere.sh"* ]]
+  printf 'MEDIA=(-v /x:/y:ro)\n' > mounts.sh
+  ADOPTION_MEDIA_MOUNTS=$TMP/mounts.sh run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 0 ]
 }
 
 # --- build-fixtures.sh preconditions ----------------------------------------------------
@@ -260,6 +309,39 @@ EOS
   [[ "$output" == *"has 3 EF migration ids, a 10.11.8 database has 68"* ]]
 }
 
+@test "build-fixtures.sh: each 12.2 fixture boots Jellyfin 12.2 on its contract parent" {
+  grep -q ' jellyfin-12.2-from-10:jellyfin-10.11.8:[0-9]*:107 ' "$ADOPTION/build-fixtures.sh"
+  grep -q ' jellyfin-12.2-from-12:jellyfin-12.0:[0-9]*:108 ' "$ADOPTION/build-fixtures.sh"
+  grep -q ' jellyfin-12.2-from-121:jellyfin-12.1-from-12:[0-9]*:109;' "$ADOPTION/build-fixtures.sh"
+  grep -q '^build_oracle 12.1 jellyfin-12.1-from-12 ' "$ADOPTION/build-fixtures.sh"
+  grep -q '^build_oracle 12.2 jellyfin-12.2-from-121 ' "$ADOPTION/build-fixtures.sh"
+}
+
+@test "build-fixtures.sh: with every fixture built it only dumps the 12.2 schema and diffs the other routes" {
+  mkdir -p bin; printf '#!/usr/bin/env bash\necho "unexpected docker $*" >&2; exit 99\n' > bin/docker; chmod +x bin/docker
+  PATH="$TMP/bin:$PATH"
+  mkdir -p fixtures/jellyfin-10.11.8/data fixtures/oracle
+  sqlite3 fixtures/jellyfin-10.11.8/data/jellyfin.db "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 68) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
+  for f in 10.11.9 10.11.10 10.11.11 12.0 12.1-from-10 12.1-from-12; do mkdir "fixtures/jellyfin-$f"; done
+  for f in 12.2-from-10 12.2-from-12 12.2-from-121; do
+    mkdir -p "fixtures/jellyfin-$f/data"
+    sqlite3 "fixtures/jellyfin-$f/data/jellyfin.db" 'CREATE TABLE t(a); CREATE INDEX i ON t(a) WHERE a IS NOT NULL;
+      INSERT INTO t VALUES (1); ANALYZE; CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES;'
+  done
+  sqlite3 fixtures/jellyfin-12.2-from-12/data/jellyfin.db 'CREATE INDEX extra ON t(a);'
+  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"jellyfin-12.2-schema.sql: 3 CREATE statements"* ]]
+  [[ "$output" == *"jellyfin-12.2-from-10: same schema"* ]]
+  [[ "$output" == *"jellyfin-12.2-from-12: schema DIFFERS"* ]]
+  [[ "$output" != *"unexpected docker"* ]]
+  grep -q 'WHERE a IS NOT NULL' fixtures/jellyfin-12.2-schema.sql
+  run grep -cE 'sqlite_stat1|sqlite_sequence' fixtures/jellyfin-12.2-schema.sql
+  [ "$output" = 0 ]
+}
+
 @test "metadata: populated fields survive adoption, HTTP presentation and a completed scan" {
   run python3 -m unittest discover -s "$ADOPTION/tests" -p test_metadata.py
   [ "$status" -eq 0 ]
@@ -273,7 +355,7 @@ EOS
 @test "run.sh: an unreadable metadata baseline fails before starting a container" {
   fake_docker
   mkdir -p fixtures/oracle fixtures/jellyfin-12.0/data
-  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   printf 'not a database\n' > fixtures/jellyfin-12.0/data/jellyfin.db
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 1 ]

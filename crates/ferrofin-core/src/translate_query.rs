@@ -14,12 +14,16 @@
 //! ranges, `ItemValues` joins (genres, tags, studios, artists, album-artists,
 //! genre/studio ids), `UserData` predicates (favorite / played / liked /
 //! resumable — the last with v12's Series/Season descendant roll-up), and the
-//! ordering table are ported directly. The remaining folder-descendant
-//! `EXISTS` roll-ups (the played filter's, the resolution and subtitle
-//! roll-ups) are open work items, each named at its predicate with the
-//! v12 reference; they take the `AncestorIds` walk `push_folders_with_leaf`
-//! already spells. Everything ported matches the C# predicate exactly for
-//! non-folder items.
+//! ordering table are ported directly, as are 12.1's stream-language filters
+//! (`AudioLanguages` / `SubtitleLanguages`) and `HasSubtitles` with v12's
+//! alternate-version and folder roll-up
+//! (`push_item_version_or_folder_matching`), and the resolution filters
+//! (`IsHD` / `Is4K`, `Min`/`Max` `Width`/`Height`) with v12's
+//! `VersionsMatchingDimension` and, for `IsHD` / `Is4K`, the folder
+//! descendant roll-up. The played filter's folder-descendant `EXISTS` roll-up
+//! is an open work item, named at its predicate with the v12 reference; it
+//! takes the `AncestorIds` walk `push_folders_with_leaf` already spells.
+//! Everything ported matches the C# predicate exactly for non-folder items.
 //!
 //! `Guid` columns are stored as UPPERCASE hyphenated `TEXT` and datetimes as
 //! `YYYY-MM-DD HH:MM:SS.fffffff` (Jellyfin's canonical storage formats), so
@@ -28,7 +32,7 @@
 
 use ferrofin_util::string_extensions::lower_invariant;
 
-use ferrofin_db::enums::ItemValueType;
+use ferrofin_db::enums::{ItemValueType, LinkedChildType, MediaStreamTypeEntity};
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
@@ -636,23 +640,11 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     } else {
         append_parental_restrictions(qb, filter, "bi");
     }
-    // --- resolution (own-row form; the folder-descendant roll-up is an open
-    // work item, see `append_resolution_predicate`) ---
+    // --- resolution: the best any version offers, folders on descendants ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
         append_resolution_predicate(qb, filter);
     }
-    if let Some(w) = filter.min_width {
-        qb.push(r#" AND bi."Width" >= "#).push_bind(i64::from(w));
-    }
-    if let Some(h) = filter.min_height {
-        qb.push(r#" AND bi."Height" >= "#).push_bind(i64::from(h));
-    }
-    if let Some(w) = filter.max_width {
-        qb.push(r#" AND bi."Width" <= "#).push_bind(i64::from(w));
-    }
-    if let Some(h) = filter.max_height {
-        qb.push(r#" AND bi."Height" <= "#).push_bind(i64::from(h));
-    }
+    append_dimension_bounds(qb, filter);
 
     if let Some(locked) = filter.is_locked {
         qb.push(r#" AND bi."IsLocked" = "#).push_bind(locked);
@@ -853,6 +845,7 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
 
     append_user_data_predicates(qb, filter);
     append_media_attribute_predicates(qb, filter);
+    append_stream_language_predicates(qb, filter);
     append_item_value_predicates(qb, filter, &tags, &exclude_tags);
     append_people_predicates(qb, filter);
 
@@ -1049,48 +1042,182 @@ fn append_linked_descendant_predicate(
     .push(")");
 }
 
-/// Appends the `IsHD` / `Is4K` own-resolution predicate — the non-folder branch
-/// of the C# resolution filter. v12 (`TranslateQuery.cs`, `IsHD`/`Is4K` with
-/// `VersionsMatchingDimension` and the folder-descendant `EXISTS` roll-up) also
-/// keeps a folder whose leaf descendant, or an alternate version, satisfies the
-/// bound; that half is an open work item: port it with the played/resumable
-/// descendant helpers (`push_folders_with_leaf`) once a browse needs it.
-fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    let standard_def = filter.is_hd == Some(false);
-    let high_def = filter.is_hd == Some(true);
-    let ultra_hd = filter.is_4k == Some(true);
+/// Pushes v12 `VersionsMatchingDimension` (`TranslateQuery.cs:73-79`): the
+/// `PrimaryVersionId` of every alternate version satisfying `bound`, which
+/// `push_bound` appends over the alternate's `BaseItems` row aliased `v`.
+/// Anchored on the partial `PrimaryVersionId` index, so it reads only the few
+/// items that are second files. `PrimaryVersionId IS NOT NULL` also keeps a
+/// `NOT IN` over it free of SQL's NULL trap.
+fn push_versions_matching_dimension(
+    qb: &mut QueryBuilder<Sqlite>,
+    push_bound: impl FnOnce(&mut QueryBuilder<Sqlite>),
+) {
+    qb.push(
+        r#"SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND "#,
+    );
+    push_bound(qb);
+}
 
-    qb.push(r#" AND (bi."Width" > 0 AND ("#);
-    let mut first = true;
-    let mut push_clause = |qb: &mut QueryBuilder<Sqlite>, clause: &str| {
-        if !first {
-            qb.push(" OR ");
+/// Appends `MinWidth` / `MinHeight` / `MaxWidth` / `MaxHeight`
+/// (v12 `TranslateQuery.cs:169-196`). An item's resolution is the best its
+/// version group offers: a lower bound is met when the item or any alternate
+/// version meets it, an upper bound only when the item does and no alternate
+/// version breaches it.
+fn append_dimension_bounds(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    for (column, bound) in [("Width", filter.min_width), ("Height", filter.min_height)] {
+        let Some(bound) = bound.map(i64::from) else {
+            continue;
+        };
+        qb.push(format!(r#" AND (bi."{column}" >= "#))
+            .push_bind(bound)
+            .push(r#" OR bi."Id" IN ("#);
+        push_versions_matching_dimension(qb, |qb| {
+            qb.push(format!(r#"v."{column}" >= "#)).push_bind(bound);
+        });
+        qb.push("))");
+    }
+    for (column, bound) in [("Width", filter.max_width), ("Height", filter.max_height)] {
+        let Some(bound) = bound.map(i64::from) else {
+            continue;
+        };
+        qb.push(format!(r#" AND (bi."{column}" <= "#))
+            .push_bind(bound)
+            .push(r#" AND bi."Id" NOT IN ("#);
+        push_versions_matching_dimension(qb, |qb| {
+            qb.push(format!(r#"v."{column}" > "#)).push_bind(bound);
+        });
+        qb.push("))");
+    }
+}
+
+/// The `IsHD` / `Is4K` buckets a query selects (v12 `includeSD` /
+/// `includeHD` / `include4K`).
+#[derive(Debug, Clone, Copy)]
+struct ResolutionBuckets {
+    /// `IsHD = false`.
+    standard_def: bool,
+    /// `IsHD = true`.
+    high_def: bool,
+    /// `Is4K = true`.
+    ultra_hd: bool,
+}
+
+/// One `IsHD` / `Is4K` bucket, for placing an alternate version in it.
+#[derive(Debug, Clone, Copy)]
+enum Resolution {
+    /// Known width below HD.
+    Standard,
+    /// HD width or wider.
+    High,
+    /// 4K width or height.
+    Ultra,
+}
+
+impl Resolution {
+    /// v12's `VersionsMatchingDimension` bound for this bucket, over an
+    /// alternate aliased `v` (`TranslateQuery.cs:121-123`).
+    fn version_bound(self) -> String {
+        match self {
+            Self::Standard => format!(r#"v."Width" > 0 AND v."Width" < {HD_WIDTH}"#),
+            Self::High => format!(r#"v."Width" >= {HD_WIDTH}"#),
+            Self::Ultra => format!(r#"(v."Width" >= {UHD_WIDTH} OR v."Height" >= {UHD_HEIGHT})"#),
         }
-        qb.push(clause);
-        first = false;
+    }
+}
+
+/// Pushes `{id} IN` (or `NOT IN`) the primaries with an alternate version in
+/// `bucket`.
+fn push_versions_in_bucket(
+    qb: &mut QueryBuilder<Sqlite>,
+    id: &str,
+    negated: bool,
+    bucket: Resolution,
+) {
+    let op = if negated { "NOT IN" } else { "IN" };
+    qb.push(format!(" {id} {op} ("));
+    push_versions_matching_dimension(qb, |qb| {
+        qb.push(bucket.version_bound());
+    });
+    qb.push(")");
+}
+
+/// Pushes the selected buckets, OR-ed, for the row aliased `row` whose id is
+/// the expression `id` — one bucket per v12 arm (`TranslateQuery.cs:131-142`):
+///
+/// - SD: the row (`Width` known and below HD) or an alternate is SD, and no
+///   alternate is HD or 4K;
+/// - HD: the row or an alternate is HD-wide, the row itself is not 4K, and no
+///   alternate is 4K;
+/// - 4K: the row or an alternate is 4K.
+///
+/// The HD arm's "not itself 4K" is a `CASE … THEN 0 ELSE 1`, the form EF
+/// lowers it to: an unprobed row (NULL dimensions) reads as not 4K rather
+/// than as an unknown that drops the row.
+fn push_resolution_buckets(
+    qb: &mut QueryBuilder<Sqlite>,
+    buckets: ResolutionBuckets,
+    row: &str,
+    id: &str,
+) {
+    use Resolution::{High, Standard, Ultra};
+    let row_is_4k = format!(r#"{row}."Width" >= {UHD_WIDTH} OR {row}."Height" >= {UHD_HEIGHT}"#);
+    let mut separator = "(";
+    if buckets.standard_def {
+        qb.push(format!(
+            r#"{separator}((({row}."Width" > 0 AND {row}."Width" < {HD_WIDTH}) OR"#
+        ));
+        push_versions_in_bucket(qb, id, false, Standard);
+        qb.push(") AND");
+        push_versions_in_bucket(qb, id, true, High);
+        qb.push(" AND");
+        push_versions_in_bucket(qb, id, true, Ultra);
+        qb.push(")");
+        separator = " OR ";
+    }
+    if buckets.high_def {
+        qb.push(format!(r#"{separator}(({row}."Width" >= {HD_WIDTH} OR"#));
+        push_versions_in_bucket(qb, id, false, High);
+        qb.push(format!(") AND CASE WHEN {row_is_4k} THEN 0 ELSE 1 END AND"));
+        push_versions_in_bucket(qb, id, true, Ultra);
+        qb.push(")");
+        separator = " OR ";
+    }
+    if buckets.ultra_hd {
+        qb.push(format!("{separator}({row_is_4k} OR"));
+        push_versions_in_bucket(qb, id, false, Ultra);
+        qb.push(")");
+    }
+    qb.push(")");
+}
+
+/// Appends the `IsHD` / `Is4K` resolution filter (v12
+/// `TranslateQuery.cs:95-167`). A non-folder is bucketed on the best its
+/// version group offers ([`push_resolution_buckets`]); a folder matches when
+/// any closure descendant (`Children`, the `AncestorIds` rows naming it) or
+/// any directly linked child (`LinkedChildren`, every link type, as upstream)
+/// falls in a selected bucket, bucketed exactly as a top-level item. Selecting
+/// no bucket (`Is4K = false` alone) matches nothing, as upstream.
+fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let buckets = ResolutionBuckets {
+        standard_def: filter.is_hd == Some(false),
+        high_def: filter.is_hd == Some(true),
+        ultra_hd: filter.is_4k == Some(true),
     };
-    if standard_def {
-        push_clause(qb, &format!(r#"bi."Width" < {HD_WIDTH}"#));
+    if !(buckets.standard_def || buckets.high_def || buckets.ultra_hd) {
+        qb.push(" AND 0");
+        return;
     }
-    if high_def {
-        push_clause(
-            qb,
-            &format!(
-                r#"(bi."Width" >= {HD_WIDTH} AND NOT (bi."Width" >= {UHD_WIDTH} OR bi."Height" >= {UHD_HEIGHT}))"#
-            ),
-        );
-    }
-    if ultra_hd {
-        push_clause(
-            qb,
-            &format!(r#"(bi."Width" >= {UHD_WIDTH} OR bi."Height" >= {UHD_HEIGHT})"#),
-        );
-    }
-    if first {
-        // No sub-clause selected (e.g. IsHD only false-but-nothing): match nothing.
-        qb.push("0");
-    }
-    qb.push("))");
+    qb.push(r#" AND ((bi."IsFolder" = 0 AND "#);
+    push_resolution_buckets(qb, buckets, "bi", r#"bi."Id""#);
+    qb.push(
+        r#") OR (bi."IsFolder" = 1 AND (EXISTS (SELECT 1 FROM "AncestorIds" a JOIN "BaseItems" c ON c."Id" = a."ItemId" WHERE a."ParentItemId" = bi."Id" AND "#,
+    );
+    push_resolution_buckets(qb, buckets, "c", r#"a."ItemId""#);
+    qb.push(
+        r#") OR EXISTS (SELECT 1 FROM "LinkedChildren" lc JOIN "BaseItems" c ON c."Id" = lc."ChildId" WHERE lc."ParentId" = bi."Id" AND "#,
+    );
+    push_resolution_buckets(qb, buckets, "c", r#"lc."ChildId""#);
+    qb.push("))))");
 }
 
 /// Appends `IncludeItemTypes` / `ExcludeItemTypes` as `Type` in/not-in lists.
@@ -1355,24 +1482,24 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
 /// presence (trailer / theme song / theme video / special feature), video
 /// types, and 3D.
 ///
-/// Ports of C# `TranslateQuery`'s `HasSubtitles` (`MediaStreams.Any(Subtitle)`),
-/// the `ExtraIds`-backed extra filters, and the `Data`-substring `VideoType` /
-/// `Video3DFormat` matches. The folder roll-up branch (v12
-/// `WhereItemOrDescendantMatches`: a series "has subtitles" when any episode
-/// does) is an open work item, to port with `push_folders_with_leaf`'s walk.
+/// Ports of C# `TranslateQuery`'s `HasSubtitles`, the `ExtraIds`-backed extra
+/// filters, and the `Data`-substring `VideoType` / `Video3DFormat` matches.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    // Subtitle presence: an `EXISTS` over the item's stream rows
-    // (`StreamType` 2 = Subtitle).
+    // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
+    // `HasSubtitles`): an item matches on its own subtitle streams or an
+    // alternate version's, a folder on a matching item anywhere below it.
+    // Upstream's negated form is the exact complement of the positive one
+    // (`!IsFolder && !own && !versions || IsFolder && !folders`), and every
+    // column and id the roll-up reads is NOT NULL, so `NOT (…)` is that
+    // complement in SQL too.
     if let Some(want) = filter.has_subtitles {
-        qb.push(if want {
-            " AND EXISTS "
-        } else {
-            " AND NOT EXISTS "
-        })
-        .push(
-            r#"(SELECT 1 FROM "MediaStreamInfos" ms
-                WHERE ms."ItemId" = bi."Id" AND ms."StreamType" = 2)"#,
-        );
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_item_version_or_folder_matching(qb, &|qb, alias| {
+            qb.push(format!(
+                r#"{alias}."StreamType" = {}"#,
+                i32::from(MediaStreamTypeEntity::Subtitle)
+            ));
+        });
     }
 
     // Image presence: an `EXISTS` over the item's image rows whose `ImageType`
@@ -1447,6 +1574,154 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
             qb.push(r#" AND (bi."Data" IS NULL OR bi."Data" NOT LIKE '%Video3DFormat%')"#);
         }
     }
+}
+
+/// The language code standing for "undetermined": a list carrying it also
+/// matches a stream with no language at all (v12 DescendantQueryHelper.cs:285,
+/// `// und = undetermined`). Compared ordinally, so only the lower-case code
+/// turns the empty-language arm on.
+const UNDETERMINED_LANGUAGE: &str = "und";
+
+/// Appends 12.1's stream-language filters — `SubtitleLanguages`, then
+/// `AudioLanguages` — each as its own `AND`-ed predicate (v12
+/// `BaseItemRepository.TranslateQuery.cs:920-944`): an item matches when one
+/// of its own streams of that type, or one of an alternate version's, is in
+/// any listed language; a folder matches when such an item sits anywhere
+/// below it (see [`push_item_version_or_folder_matching`]).
+///
+/// The lists are matched exactly as stored — no `NormalizeLanguage` (unlike
+/// the single-language `HasNo*TrackWithLanguage` filters) and no case folding,
+/// so the `StreamType`/`Language` index serves the `IN`. Empty lists push
+/// nothing: the statement is byte-identical to one without the filters.
+fn append_stream_language_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    for (languages, stream_type) in [
+        (&filter.subtitle_languages, MediaStreamTypeEntity::Subtitle),
+        (&filter.audio_languages, MediaStreamTypeEntity::Audio),
+    ] {
+        if languages.is_empty() {
+            continue;
+        }
+        qb.push(" AND ");
+        push_item_version_or_folder_matching(qb, &|qb, alias| {
+            push_stream_match(qb, alias, stream_type, languages);
+        });
+    }
+}
+
+/// Pushes the stream rows a v12 `HasMediaStreamType(type, languages)` criteria
+/// selects, over the `MediaStreamInfos` row aliased `alias` — the shared
+/// definition at v12 `DescendantQueryHelper.cs:280-294`:
+/// `StreamType == type && (languages.Contains(Language) ||
+/// (languages.Contains("und") && string.IsNullOrEmpty(Language)))`.
+///
+/// Internal and external streams both count (`IsExternal = null`).
+fn push_stream_match(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    stream_type: MediaStreamTypeEntity,
+    languages: &[String],
+) {
+    qb.push(format!(
+        r#"{alias}."StreamType" = {} AND ("#,
+        i32::from(stream_type)
+    ));
+    push_in_list(qb, &format!(r#"{alias}."Language""#), languages);
+    if languages.iter().any(|l| l == UNDETERMINED_LANGUAGE) {
+        qb.push(format!(
+            r#" OR {alias}."Language" IS NULL OR {alias}."Language" = ''"#
+        ));
+    }
+    qb.push(")");
+}
+
+/// Pushes v12's item-or-version-or-folder roll-up for a media criteria
+/// (`BaseItemRepository.TranslateQuery.cs:920-944`):
+///
+/// ```text
+/// (!IsFolder && (own media matches || Id in PrimaryVersionIdsMatching))
+///   || (IsFolder && Id in FolderIdsMatching)
+/// ```
+///
+/// `matches` pushes the criteria over a `MediaStreamInfos` alias. The
+/// non-folder arm reads the item's own streams, then the primaries whose
+/// alternate version matches ([`push_primary_versions_matching`]). The
+/// folder arm is `DescendantQueryHelper.GetFolderIdsMatching`
+/// (`DescendantQueryHelper.cs:177-217`): every closure ancestor of a matching
+/// item or of a primary reported for it, every container that links to one of
+/// those at any depth (`ResolveLinkParents`, `:323-374`, whose frontier loop is
+/// the recursive `link_parents` CTE — `UNION` stops a cyclic link on the
+/// resolved set exactly as the loop does), those containers' ancestors, and
+/// one more closure hop over both chains, which reaches the `UserRootFolder`.
+/// Alternate-version links (`LocalAlternateVersion` / `LinkedAlternateVersion`)
+/// are second files, not children, so they are never walked.
+///
+/// Both sub-selects are uncorrelated, so SQLite evaluates each once per
+/// statement, and only when a row reaches its arm. `hierarchy` is made
+/// `DISTINCT` (a set either way): every matching item contributes each of its
+/// ancestors, and the link walk and the last closure hop then seek once per
+/// folder rather than once per item — on the 20k-item bench library,
+/// `audioLanguages=und` resolves its folders in 32 ms instead of 75.
+/// `HasSubtitles` takes the same shape; so will the other v12 media criteria
+/// (the `HasNo*TrackWithLanguage` filters, `HasChapterImages`), whose
+/// predicates `TranslateQuery` does not translate yet.
+fn push_item_version_or_folder_matching(
+    qb: &mut QueryBuilder<Sqlite>,
+    matches: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
+) {
+    let container_link = format!(
+        r#"lc."ChildType" NOT IN ({}, {})"#,
+        i32::from(LinkedChildType::LocalAlternateVersion),
+        i32::from(LinkedChildType::LinkedAlternateVersion)
+    );
+    qb.push(
+        r#"((bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = bi."Id" AND "#,
+    );
+    matches(qb, "ms");
+    qb.push(r#") OR bi."Id" IN ("#);
+    push_primary_versions_matching(qb, matches);
+    qb.push(
+        r#"))) OR (bi."IsFolder" = 1 AND bi."Id" IN (WITH RECURSIVE matched("Id") AS (SELECT ms."ItemId" FROM "MediaStreamInfos" ms WHERE "#,
+    );
+    matches(qb, "ms");
+    qb.push(" UNION ");
+    push_primary_versions_matching(qb, matches);
+    qb.push(format!(
+        r#"), hierarchy("Id") AS (
+            SELECT DISTINCT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM matched)
+        ), link_parents("Id") AS (
+            SELECT lc."ParentId" FROM "LinkedChildren" lc
+            WHERE {container_link} AND (lc."ChildId" IN (SELECT "Id" FROM matched) OR lc."ChildId" IN (SELECT "Id" FROM hierarchy))
+            UNION
+            SELECT lc."ParentId" FROM link_parents f
+            JOIN "LinkedChildren" lc ON lc."ChildId" = f."Id" WHERE {container_link}
+            UNION
+            SELECT lc."ParentId" FROM link_parents f
+            JOIN "AncestorIds" a ON a."ItemId" = f."Id"
+            JOIN "LinkedChildren" lc ON lc."ChildId" = a."ParentItemId" WHERE {container_link}
+        ), link_ancestors("Id") AS (
+            SELECT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM link_parents)
+        ) SELECT "Id" FROM hierarchy
+        UNION SELECT "Id" FROM link_parents
+        UNION SELECT "Id" FROM link_ancestors
+        UNION SELECT a."ParentItemId" FROM "AncestorIds" a
+            WHERE a."ItemId" IN (SELECT "Id" FROM hierarchy) OR a."ItemId" IN (SELECT "Id" FROM link_ancestors))))"#
+    ));
+}
+
+/// Pushes v12 `DescendantQueryHelper.GetPrimaryVersionIdsMatching`
+/// (`DescendantQueryHelper.cs:231-253`): the `PrimaryVersionId` of every
+/// alternate version whose own streams match. Anchored on the alternates, so
+/// the partial `IX_BaseItems_PrimaryVersionId` keeps it to the few items that
+/// are second files, each costing one seek into the stream index.
+fn push_primary_versions_matching(
+    qb: &mut QueryBuilder<Sqlite>,
+    matches: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
+) {
+    qb.push(
+        r#"SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = v."Id" AND "#,
+    );
+    matches(qb, "ms");
+    qb.push(")");
 }
 
 /// Appends the `UserData`-backed predicates (favorite / favorite-or-liked / liked
@@ -1665,7 +1940,7 @@ fn push_resumable_predicate(
         // in no version group at all have no sibling that could eliminate
         // them, so short-circuit the scan for those." (`:586-602`)
         //
-        // The short-circuit is `FerrofinIX_BaseItems_PrimaryVersionId`'s one
+        // The short-circuit is `IX_BaseItems_PrimaryVersionId`'s one
         // job — partial on `PrimaryVersionId IS NOT NULL`, exactly as v12's
         // (`BaseItemConfiguration.cs:64-68`), so it can serve nothing else.
         // `IS` is EF's `==` on two nullable dates (both NULL ties); `>` is
@@ -2367,7 +2642,7 @@ fn push_order_expression(
             // candidate rows × the user's ~5.4k rows). Two arms: the item's
             // own row on `IX_UserData_ItemId_UserId_LastPlayedDate`, and its
             // alternates' rows — `alt` first, on the partial
-            // `FerrofinIX_BaseItems_PrimaryVersionId`, then the same index
+            // `IX_BaseItems_PrimaryVersionId`, then the same index
             // by the alternate's id. `CROSS JOIN` pins that order: left to
             // itself the planner re-drives the arm from `IX_UserData_UserId`
             // and walks the user's rows per candidate again (300 ms).

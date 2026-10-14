@@ -1486,6 +1486,57 @@ async fn get_items_forwards_the_image_types_filter() {
     assert_eq!(query.image_types, [ImageType::Backdrop]);
 }
 
+/// `GET /Items` forwards 12.1's `audioLanguages` / `subtitleLanguages` and
+/// applies `GetItems`' media-stream rules (v12 ItemsController.cs:452-487);
+/// the obsolete `GET /Users/{userId}/Items` passes `[]` for both lists
+/// (ItemsController.cs:896-897), so it never filters by stream language.
+/// The repeated, differently-cased `AUDIOLANGUAGES` key pins Ferrofin's own
+/// leniency: the query normalizer joins repeated keys before the comma split,
+/// so every piece binds, where upstream's multi-value arm
+/// (CommaDelimitedCollectionModelBinder.cs:34-38) binds `["eng,ger", "fre"]`
+/// (see `query_parse::parse_csv_strings`).
+#[tokio::test]
+async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops_them() {
+    let filters = "recursive=true&audioLanguages=eng,ger&AUDIOLANGUAGES=fre\
+                   &subtitleLanguages=spa&hasSubtitles=true";
+    let run = |uri: String| async move {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5E),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    };
+
+    let query = run(format!("/Items?{filters}")).await;
+    assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
+    assert_eq!(query.subtitle_languages, ["spa"]);
+    // A subtitle language implies subtitles exist.
+    assert_eq!(query.has_subtitles, None);
+    assert!(query.include_owned_items);
+
+    let query = run(format!("/Users/{USER_ID}/Items?{filters}")).await;
+    assert!(query.audio_languages.is_empty());
+    assert!(query.subtitle_languages.is_empty());
+    assert_eq!(query.has_subtitles, Some(true));
+    // `hasSubtitles` alone still reads media streams.
+    assert!(query.include_owned_items);
+}
+
 /// A `GET /Items` with an unknown enum token is a `400`.
 #[tokio::test]
 async fn get_items_unknown_enum_token_is_dropped() {

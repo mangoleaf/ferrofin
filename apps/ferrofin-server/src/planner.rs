@@ -925,18 +925,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                 && request
                     .playback_permissions
                     .is_some_and(|p| !p.video_transcoding));
-        // Upstream only invokes TryStreamCopy for a VideoRequest. Audio-only
-        // requests retain their requested codec; negotiation enforces that flag.
-        let copy_audio = !is_audio
-            && (audio_stream.as_ref().is_some_and(|a| {
-                self.encoding_helper
-                    .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
-                    .0
-            }) || request
-                .playback_permissions
-                .is_some_and(|p| !p.audio_transcoding));
-
-        // Resolve the effective output codecs from the copy decision.
+        // Resolve the effective output video codec from the copy decision.
+        // `TryStreamCopy` writes it to the state before the audio decision,
+        // which reads it (`preventHlsAudioCopy`).
         let output_video_codec = video_stream.as_ref().map(|_| {
             if copy_video {
                 "copy".to_owned()
@@ -944,6 +935,30 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                 requested_video_codec.clone()
             }
         });
+        probe_state
+            .output_video_codec
+            .clone_from(&output_video_codec);
+        // The `HlsAudioSeekStrategy` veto: an HLS job re-encoding its video
+        // re-encodes copyable audio too when the administrator chose
+        // `TranscodeAudio`.
+        let prevent_hls_audio_copy =
+            ferrofin_mediaencoding::encoding_helper::helper::prevent_hls_audio_copy(
+                &probe_state,
+                &options,
+            );
+        // Upstream only invokes TryStreamCopy for a VideoRequest. Audio-only
+        // requests retain their requested codec; negotiation enforces that flag.
+        let copy_audio = !is_audio
+            && ((!prevent_hls_audio_copy
+                && audio_stream.as_ref().is_some_and(|a| {
+                    self.encoding_helper
+                        .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
+                        .0
+                }))
+                || request
+                    .playback_permissions
+                    .is_some_and(|p| !p.audio_transcoding));
+
         // Upstream's `OutputAudioCodec` is never null (it is the requested
         // codec, `"copy"` after `TryStreamCopy`), even for a source with no
         // audio stream — the master playlist's `AudioCodec` rewrite compares
@@ -981,9 +996,6 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             )
         };
 
-        probe_state
-            .output_video_codec
-            .clone_from(&output_video_codec);
         probe_state
             .output_audio_codec
             .clone_from(&output_audio_codec);
@@ -1752,6 +1764,17 @@ impl FerrofinStreamStatePlanner {
             let audio_encoder = self.encoding_helper.audio_encoder(state);
             push_split(&mut args, "-c:a");
             args.push(audio_encoder.clone());
+            let source_container = state.input_container.as_deref().unwrap_or_default();
+            if let Some(bsf) =
+                ferrofin_mediaencoding::encoding_helper::bitstream::audio_bit_stream_arguments(
+                    state,
+                    segment_container,
+                    source_container,
+                    caps.ffmpeg_version(),
+                )
+            {
+                push_split(&mut args, &bsf);
+            }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
                 if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
                     state.output_audio_bitrate,
@@ -1762,7 +1785,15 @@ impl FerrofinStreamStatePlanner {
                     push_split(&mut args, "-b:a");
                     args.push(bitrate.to_string());
                 }
-                if let Some(channels) = state.output_audio_channels {
+                // Suppress `-ac` when the downmix algorithm filter is active:
+                // the `pan=stereo|…` filter already sets the output to stereo,
+                // and an explicit `-ac 2` would conflict. Port of the
+                // `useDownMixAlgorithm` guard in `GetDynamicHlsAudioArgs`.
+                if let Some(channels) = state.output_audio_channels
+                    && !ferrofin_mediaencoding::encoding_helper::downmix::uses_downmix_algorithm(
+                        state, options,
+                    )
+                {
                     push_split(&mut args, "-ac");
                     args.push(channels.to_string());
                 }
@@ -1791,8 +1822,8 @@ impl FerrofinStreamStatePlanner {
                     push_split(&mut args, "-ar");
                     args.push("48000".to_owned());
                 }
-                // Downmix volume boost (GetAudioFilterParam): a >stereo →
-                // stereo downmix is roughly half as loud, so boost it back.
+                // Downmix filters (GetAudioFilterParam): algorithm pan=
+                // filter (if configured) + volume boost for >stereo → stereo.
                 if let Some(af) =
                     ferrofin_mediaencoding::encoding_helper::helper::audio_filter_param(
                         state, options,
@@ -2146,6 +2177,7 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 mod tests {
     use super::*;
 
+    use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
     use std::collections::HashMap;
@@ -5856,5 +5888,120 @@ mod tests {
             plan.arguments
         );
         assert!(!plan.arguments.iter().any(|arg| arg == "-noaccurate_seek"));
+    }
+
+    /// `HlsAudioSeekStrategy` (`EncodingHelper.TryStreamCopy`'s
+    /// `preventHlsAudioCopy`): with `TranscodeAudio`, an HLS job that
+    /// re-encodes its video re-encodes copyable audio too; a remux (compatible,
+    /// or forced because the user may not transcode video), a progressive
+    /// stream, the default strategy and a user without the audio-transcoding
+    /// permission all keep the copy.
+    #[rstest::rstest]
+    #[case::hls_transcode_audio(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        false
+    )]
+    #[case::event_transcode_audio(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Event,
+        true,
+        true,
+        false
+    )]
+    #[case::hls_default_strategy(
+        "hevc",
+        HlsAudioSeekStrategy::TrimCopiedAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        true
+    )]
+    #[case::hls_video_remux(
+        "h264",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        true
+    )]
+    #[case::forced_video_remux(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        false,
+        true,
+        true
+    )]
+    #[case::progressive(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Progressive,
+        true,
+        true,
+        true
+    )]
+    #[case::no_audio_transcoding_permission(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        false,
+        true
+    )]
+    #[tokio::test]
+    async fn hls_audio_seek_strategy_decides_the_audio_copy(
+        #[case] source_video_codec: &str,
+        #[case] strategy: HlsAudioSeekStrategy,
+        #[case] kind: PlaylistKind,
+        #[case] video_transcoding: bool,
+        #[case] audio_transcoding: bool,
+        #[case] expect_copy: bool,
+    ) {
+        use ferrofin_traits::library::PlaybackPermissions;
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream(source_video_codec), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            EncodingOptions {
+                hls_audio_seek_strategy: strategy,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        req.playback_permissions = Some(PlaybackPermissions {
+            video_transcoding,
+            audio_transcoding,
+            remuxing: true,
+        });
+        if kind == PlaylistKind::Progressive {
+            req.output_container = Some("mkv".to_owned());
+        }
+        let plan = p.plan(&req, false, Some(0), kind).await.unwrap();
+        assert_eq!(
+            plan.is_remuxing_video,
+            source_video_codec == "h264" || !video_transcoding,
+            "{:?}",
+            plan.arguments
+        );
+        let expected = if expect_copy { "copy" } else { "aac" };
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some(expected));
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", expected]),
+            "{:?}",
+            plan.arguments
+        );
     }
 }
