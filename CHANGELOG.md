@@ -17,20 +17,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Pin id-list queries to the primary key: 12.0 drops
   `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without the `+"Type"` pin the
   planner scanned every row of the type (`detail:similar` 4.9 → 7.8 ms p50)
-- Adopt Jellyfin 12.0 and 12.1 databases in place alongside 10.11.8–10.11.11 (exact migration
-  sets per generation, 12.1's re-dated rating routine optional; `0030` is baselined where the
-  database already owns `NormalizedUsername`; an atomic adoption record drives the one-shot
-  membership import)
+- Adopt Jellyfin 12.0, 12.1 and 12.2 databases in place alongside 10.11.8–10.11.11 (exact
+  migration sets per generation, 12.1/12.2 re-dated routines optional; `0030` is baselined
+  where the database already owns `NormalizedUsername`; an atomic adoption record drives the
+  one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
 - `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
-  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0) through an image on fresh fixture copies and diffs the
-  answers against Jellyfin 12.1's own; fixtures are derived from one supplied 10.11.8 snapshot
-- All seven live fixture paths passed on 2026-09-16, including both 12.1 upgrade routes;
-  see the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
+  fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
+  from one supplied 10.11.8 snapshot
+- All seven 10.11–12.1 live fixture paths passed on 2026-09-16, including both 12.1 upgrade
+  routes; 12.2 paths passed the synthetic suite on 2026-10-13.
+  See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
-  repaired count is zero, with five regression tests; all 36 shell tests passed.
+  repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
 - Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
@@ -113,6 +115,27 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carries the choice over from `metadata.xml`, including an install adopted by an
   earlier version (on its first boot of this one). Existing items otherwise keep their
   stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- Honour `HlsAudioSeekStrategy` (Dashboard → Playback → Transcoding): when set to
+  "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
+  forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
+  some clients produce on partial-GOP audio. As upstream, the default is off
+- Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
+  embedded-subtitle extraction that exceeds the configured timeout is killed and its
+  partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
+  the default is 30 minutes
+- Port `TrimCopiedAudio` noise bitstream filter: when a video is being transcoded but the
+  audio is direct-copied, ffmpeg 5.0+ trims the leading audio silence to match the
+  requested seek point, eliminating the A/V desync on mid-file seeks into remuxed HLS. The
+  `noise=drop='lt(…)'` BSF and `aac_adtstoasc` are combined into a single `-bsf:a` argument
+- Port subtitle extraction failure handling and ASS font fix-up from upstream
+  `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
+  abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
+  the headers appended on write so libass renders them correctly
+- Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
+  pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
+  7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
+  the algorithm's filter is active, `-ac 2` is suppressed (the `pan=` filter sets the
+  channel count)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
