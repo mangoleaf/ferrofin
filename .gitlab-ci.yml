@@ -317,6 +317,9 @@ lint:
     # limit: `--all-targets` links every test binary, 16 concurrent rust-lld's
     # OOM-kill the job mid-link (same rationale as the GitHub workflow).
     CARGO_PROFILE_DEV_DEBUG: "0"
+    # Cap parallel rustc/linker processes: the workspace has enough crates that
+    # unrestricted parallelism peaks above 12Gi during the link phase.
+    CARGO_BUILD_JOBS: "4"
     # Build+run the real WASM example guest (ferrofin-wasm's end-to-end test)
     # so the WIT contract can't drift silently.
     FERROFIN_WASM_GUEST_TESTS: "1"
