@@ -1639,12 +1639,8 @@ mod tests {
         cache: tempfile::TempDir,
     }
 
-    /// The season the harness episodes are children of, with ancestor
-    /// rows so `ancestor_ids` queries find the episodes.
-    async fn seed_season(
-        persistence: &ferrofin_core::FerrofinItemPersistenceService,
-        episodes: &[(Uuid, &str, f64)],
-    ) {
+    /// The season the harness episodes are children of.
+    async fn seed_season(persistence: &ferrofin_core::FerrofinItemPersistenceService) {
         let season = BaseItemEntity {
             id: guid_to_db(SEASON),
             type_: ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Season)
@@ -1659,6 +1655,13 @@ mod tests {
             .save_items(&[season])
             .await
             .expect("seed season");
+    }
+
+    /// Ancestor rows so `ancestor_ids` queries find the episodes.
+    async fn seed_ancestors(
+        persistence: &ferrofin_core::FerrofinItemPersistenceService,
+        episodes: &[(Uuid, &str, f64)],
+    ) {
         for &(ep_id, _, _) in episodes {
             persistence
                 .set_ancestors(ep_id, &[SEASON])
@@ -1730,8 +1733,9 @@ mod tests {
                 ..BaseItemEntity::default()
             })
             .collect();
+        seed_season(&persistence).await;
         persistence.save_items(&rows).await.expect("seed episodes");
-        seed_season(&persistence, episodes).await;
+        seed_ancestors(&persistence, episodes).await;
 
         let segments: Arc<dyn MediaSegmentManager> = Arc::new(
             ferrofin_core::FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),
