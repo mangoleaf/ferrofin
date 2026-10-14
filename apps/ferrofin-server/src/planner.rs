@@ -5851,8 +5851,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.state.output_audio_codec.as_deref(),
-            Some(format!("/audio/{}/stream", request.item_id).as_str()),
-            "native inference reads the literal bare URL rather than the Container query"
+            Some("aac"),
+            "extensionless URL falls back to aac rather than passing the URL as a codec"
         );
         request.audio_codec = Some("mp3".to_owned());
         let plan = planner

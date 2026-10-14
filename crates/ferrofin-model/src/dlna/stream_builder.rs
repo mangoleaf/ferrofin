@@ -2704,3 +2704,25 @@ const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
 // Ordering import retained for clarity of intent in comparators.
 #[allow(dead_code)]
 const _ORDERING: Option<Ordering> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::is_manifest_container;
+
+    #[test]
+    fn manifest_containers_detected() {
+        assert!(is_manifest_container(Some("hls")));
+        assert!(is_manifest_container(Some("HLS")));
+        assert!(is_manifest_container(Some("applehttp")));
+        assert!(is_manifest_container(Some("dash")));
+        assert!(is_manifest_container(Some("mp4,hls")));
+    }
+
+    #[test]
+    fn non_manifest_containers_not_flagged() {
+        assert!(!is_manifest_container(Some("mp4")));
+        assert!(!is_manifest_container(Some("mkv")));
+        assert!(!is_manifest_container(Some("ts")));
+        assert!(!is_manifest_container(None));
+    }
+}

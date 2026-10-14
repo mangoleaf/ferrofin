@@ -380,26 +380,28 @@ fn clear_non_positive_f32(value: &mut Option<f32>) {
 }
 
 /// The share decision `M3UTunerHost.GetChannelStream` makes from the stream
-/// URL's file extension: `Some(true)`/`Some(false)` when the URL carries one,
-/// `None` when it does not (upstream then falls back to a `HEAD` probe of the
-/// `Content-Type`).
-#[must_use]
-pub fn extension_can_share(url: &str) -> Option<bool> {
-    // `Path.GetExtension(new UriBuilder(path).Path)` — only the URL's PATH is
-    // examined, so neither the query string, the fragment, nor the host's own
-    // dots (`http://tuner.example.com`) ever supply the extension.
+/// Extracts the file extension from a URL, ignoring query/fragment and authority dots.
+fn url_extension(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let path = match path.split_once("://") {
-        // Everything from the first `/` after the authority; a URL with no path
-        // at all is `/`, which has no extension.
         Some((_, rest)) => rest.find('/').map_or("/", |at| &rest[at..]),
         None => path,
     };
     let last_segment = path.rsplit('/').next().unwrap_or("");
     let (_, extension) = last_segment.rsplit_once('.')?;
     if extension.is_empty() {
-        return None;
+        None
+    } else {
+        Some(extension)
     }
+}
+
+/// URL's file extension: `Some(true)`/`Some(false)` when the URL carries one,
+/// `None` when it does not (upstream then falls back to a `HEAD` probe of the
+/// `Content-Type`).
+#[must_use]
+pub fn extension_can_share(url: &str) -> Option<bool> {
+    let extension = url_extension(url)?;
     Some(
         EXTENSIONS_CAN_SHARE_HTTP_STREAM
             .iter()
@@ -410,19 +412,12 @@ pub fn extension_can_share(url: &str) -> Option<bool> {
 /// Whether a channel path points at an HLS or DASH manifest rather than a byte stream.
 fn is_manifest_path(path: &str) -> bool {
     const MANIFEST_EXTENSIONS: &[&str] = &["m3u8", "m3u", "mpd"];
-    // Use the URL path (without query string) for extension matching.
-    let url_path = path.split(['?', '#']).next().unwrap_or(path);
-    let url_path = match url_path.split_once("://") {
-        Some((_, rest)) => rest.find('/').map_or("/", |at| &rest[at..]),
-        None => url_path,
-    };
-    let last_segment = url_path.rsplit('/').next().unwrap_or("");
-    let Some((_, extension)) = last_segment.rsplit_once('.') else {
+    let Some(ext) = url_extension(path) else {
         return false;
     };
     MANIFEST_EXTENSIONS
         .iter()
-        .any(|m| extension.eq_ignore_ascii_case(m))
+        .any(|m| ext.eq_ignore_ascii_case(m))
 }
 
 /// Whether a `HEAD` `Content-Type` allows sharing the tuner's HTTP stream.

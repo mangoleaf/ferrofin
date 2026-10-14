@@ -2956,6 +2956,7 @@ mod tests {
     #[case("m3u8", "aac")]
     #[case("mpd", "aac")]
     #[case("hls", "aac")]
+    #[case("wtv", "aac")]
     #[case("", "aac")]
     fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
         assert_eq!(infer_audio_codec(container), expected);
