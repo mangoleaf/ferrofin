@@ -594,8 +594,7 @@ async fn extract_all_deletes_outputs_on_ffmpeg_failure() {
         .lock()
         .unwrap()
         .insert("/cache/guid-fail/1.srt".to_owned(), b"partial".to_vec());
-    let encoder =
-        SubtitleEncoder::new(SubtitleEditParser::new(), ArcFailable(shared.clone()));
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcFailable(shared.clone()));
 
     encoder.extract_all_extractable_subtitles(&source).await;
 

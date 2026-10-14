@@ -1785,7 +1785,15 @@ impl FerrofinStreamStatePlanner {
                     push_split(&mut args, "-b:a");
                     args.push(bitrate.to_string());
                 }
-                if let Some(channels) = state.output_audio_channels {
+                // Suppress `-ac` when the downmix algorithm filter is active:
+                // the `pan=stereo|…` filter already sets the output to stereo,
+                // and an explicit `-ac 2` would conflict. Port of the
+                // `useDownMixAlgorithm` guard in `GetDynamicHlsAudioArgs`.
+                if let Some(channels) = state.output_audio_channels
+                    && !ferrofin_mediaencoding::encoding_helper::downmix::uses_downmix_algorithm(
+                        state, options,
+                    )
+                {
                     push_split(&mut args, "-ac");
                     args.push(channels.to_string());
                 }
@@ -1814,8 +1822,8 @@ impl FerrofinStreamStatePlanner {
                     push_split(&mut args, "-ar");
                     args.push("48000".to_owned());
                 }
-                // Downmix volume boost (GetAudioFilterParam): a >stereo →
-                // stereo downmix is roughly half as loud, so boost it back.
+                // Downmix filters (GetAudioFilterParam): algorithm pan=
+                // filter (if configured) + volume boost for >stereo → stereo.
                 if let Some(af) =
                     ferrofin_mediaencoding::encoding_helper::helper::audio_filter_param(
                         state, options,

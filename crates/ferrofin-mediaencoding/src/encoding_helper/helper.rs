@@ -1253,14 +1253,16 @@ pub fn prevent_hls_audio_copy(state: &EncodingJobInfo, encoding_options: &Encodi
 
 /// The `-af` audio filter value for a re-encoded audio stream, if any.
 ///
-/// Port of `GetAudioFilterParam`'s downmix branch: when downmixing a
-/// more-than-stereo source to 2 channels, boost the volume by the configured
-/// `DownMixAudioBoost` (default `2` — a plain downmix roughly halves perceived
-/// loudness, so Jellyfin doubles it back). The `DownMixStereoAlgorithm` filter
-/// table is not consulted: the default algorithm `None` maps to no filter
-/// string upstream, and Ferrofin doesn't yet expose the setting. The `asetpts`
+/// Port of `GetAudioFilterParam`: when downmixing a more-than-stereo source to
+/// 2 channels, first applies the configured `DownMixStereoAlgorithm` filter
+/// (a `pan=stereo|…` expression from the upstream filter table), then boosts
+/// the volume by `DownMixAudioBoost` (default `2` — a plain downmix roughly
+/// halves perceived loudness, so Jellyfin doubles it back). The `asetpts`
 /// branch is skipped — it only fires when timestamps are *not* copied, and
 /// segmented (HLS) transcodes always copy them.
+///
+/// Returns the comma-separated filter chain (e.g.
+/// `"pan=stereo|…,volume=2"`), or `None` when no filters are needed.
 #[must_use]
 pub fn audio_filter_param(
     state: &EncodingJobInfo,
@@ -1271,10 +1273,39 @@ pub fn audio_filter_param(
             .audio_stream
             .as_ref()
             .is_some_and(|s| s.channels.is_some_and(|c| c > 2));
-    if downmixing_to_stereo && (encoding_options.down_mix_audio_boost - 1.0).abs() > f64::EPSILON {
-        return Some(format!("volume={}", encoding_options.down_mix_audio_boost));
+    if !downmixing_to_stereo {
+        return None;
     }
-    None
+
+    let mut filters: Vec<&str> = Vec::new();
+    let mut volume_buf = String::new();
+
+    // Algorithm filter (pan=stereo|…) comes first — it sets the output layout.
+    if let Some(audio) = state.audio_stream.as_ref() {
+        let layout = super::downmix::infer_channel_layout(audio);
+        if let Some(f) = super::downmix::algorithm_filter_string(
+            encoding_options.down_mix_stereo_algorithm,
+            layout,
+        ) {
+            filters.push(f);
+        }
+    }
+
+    // Volume boost after the downmix (skip when exactly 1.0).
+    if (encoding_options.down_mix_audio_boost - 1.0).abs() > f64::EPSILON {
+        use std::fmt::Write;
+        let _ = write!(
+            volume_buf,
+            "volume={}",
+            encoding_options.down_mix_audio_boost
+        );
+        filters.push(&volume_buf);
+    }
+
+    if filters.is_empty() {
+        return None;
+    }
+    Some(filters.join(","))
 }
 
 /// Whether a re-encoded video stream needs an explicit 8-bit down-convert.
@@ -2631,6 +2662,59 @@ mod tests {
         let mut stereo_state = job(&[audio_stream("aac", 0)]);
         stereo_state.output_audio_channels = Some(2);
         assert_eq!(super::audio_filter_param(&stereo_state, &opts), None);
+    }
+
+    #[test]
+    fn audio_filter_param_with_algorithm_prepends_pan_filter() {
+        use ferrofin_model::entities::DownMixStereoAlgorithms;
+
+        // 5.1 → stereo with Dave750: pan filter + volume boost.
+        let mut surround = audio_stream("ac3", 0);
+        surround.channels = Some(6);
+        surround.channel_layout = Some("5.1".to_owned());
+        let mut state = job(&[surround]);
+        state.output_audio_channels = Some(2);
+
+        let opts = EncodingOptions {
+            down_mix_stereo_algorithm: DownMixStereoAlgorithms::Dave750,
+            ..EncodingOptions::default()
+        };
+        let result = super::audio_filter_param(&state, &opts).unwrap();
+        // Algorithm filter comes first, then volume boost.
+        assert!(result.starts_with("pan=stereo|"), "{result}");
+        assert!(result.ends_with(",volume=2"), "{result}");
+
+        // With boost=1, only the algorithm filter.
+        let opts_no_boost = EncodingOptions {
+            down_mix_stereo_algorithm: DownMixStereoAlgorithms::Dave750,
+            down_mix_audio_boost: 1.0,
+            ..EncodingOptions::default()
+        };
+        let result = super::audio_filter_param(&state, &opts_no_boost).unwrap();
+        assert!(result.starts_with("pan=stereo|"), "{result}");
+        assert!(!result.contains("volume="), "{result}");
+    }
+
+    #[test]
+    fn audio_filter_param_algorithm_no_match_still_boosts() {
+        use ferrofin_model::entities::DownMixStereoAlgorithms;
+
+        // Dave750 with a layout it doesn't cover (e.g. "3.0") → no pan filter,
+        // but volume boost still fires.
+        let mut surround = audio_stream("ac3", 0);
+        surround.channels = Some(3);
+        surround.channel_layout = Some("3.0".to_owned());
+        let mut state = job(&[surround]);
+        state.output_audio_channels = Some(2);
+
+        let opts = EncodingOptions {
+            down_mix_stereo_algorithm: DownMixStereoAlgorithms::Dave750,
+            ..EncodingOptions::default()
+        };
+        assert_eq!(
+            super::audio_filter_param(&state, &opts).as_deref(),
+            Some("volume=2")
+        );
     }
 
     #[test]
