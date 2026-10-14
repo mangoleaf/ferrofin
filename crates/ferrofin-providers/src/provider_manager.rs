@@ -3773,7 +3773,7 @@ impl LocalProviderManager {
                 // `TmdbPersonImageProvider`: the person's profile by Tmdb id,
                 // else the first name-search hit.
                 let language = crate::tmdb::normalize_language(
-                    Some(&self.preferred_metadata_language(entity).await),
+                    Some(&request_language),
                     Some(&self.preferred_metadata_country_code(entity).await),
                 );
                 let id = match (stored_tmdb_id, name) {
@@ -3787,7 +3787,10 @@ impl LocalProviderManager {
                     (None, None) => None,
                 };
                 match id {
-                    Some(id) => tmdb.person_images(id, language.as_deref()).await,
+                    Some(id) => {
+                        tmdb.person_images(id, language.as_deref(), Some(&request_language))
+                            .await
+                    }
                     None => Vec::new(),
                 }
             }
