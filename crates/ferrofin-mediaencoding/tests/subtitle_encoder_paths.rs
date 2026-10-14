@@ -80,6 +80,30 @@ impl SubtitleIo for RecordingIo {
             .lock()
             .unwrap()
             .push((args.to_owned(), output_paths.to_vec()));
+        // Simulate file creation so post-extraction checks see non-empty outputs.
+        let mut files = self.files.lock().unwrap();
+        for path in output_paths {
+            files
+                .entry(path.clone())
+                .or_insert_with(|| b"extracted".to_vec());
+        }
+        Ok(())
+    }
+
+    fn file_size(&self, path: &str) -> Option<u64> {
+        self.files.lock().unwrap().get(path).map(|v| v.len() as u64)
+    }
+
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        self.files.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), content.to_vec());
         Ok(())
     }
 }
@@ -288,6 +312,15 @@ impl SubtitleIo for ArcIo {
     async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
         self.0.extract(args, output_paths).await
     }
+    fn file_size(&self, path: &str) -> Option<u64> {
+        self.0.file_size(path)
+    }
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        self.0.delete_file(path)
+    }
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        self.0.write_file(path, content)
+    }
 }
 
 // -- convert_subtitles: writer selection + windowing -----------------------
@@ -390,4 +423,286 @@ fn filter_events_rebase_clamps_to_zero() {
     // start 800ms - 1000ms clamps to 0; end 1500-1000 = 500ms.
     assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 0);
     assert_eq!(s.paragraphs[0].end_time.total_milliseconds(), 500);
+}
+
+// -- extract_all_extractable_subtitles: failure handling --------------------
+
+/// A variant of `RecordingIo` that can be configured to fail or produce
+/// empty outputs, for exercising the post-extraction validation paths.
+#[derive(Default)]
+struct FailableIo {
+    inner: RecordingIo,
+    /// When `true`, `extract` returns `Err`.
+    extract_fails: bool,
+    /// Output paths that should be created as empty (zero-byte) files.
+    empty_outputs: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl SubtitleIo for FailableIo {
+    async fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.inner.read_file(path).await
+    }
+    async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.inner.http_get(url).await
+    }
+    fn path_protocol(&self, path: &str) -> MediaProtocol {
+        self.inner.path_protocol(path)
+    }
+    fn subtitle_cache_path(
+        &self,
+        media_source_id: &str,
+        subtitle_stream_index: i32,
+        output_extension: &str,
+    ) -> Option<String> {
+        self.inner
+            .subtitle_cache_path(media_source_id, subtitle_stream_index, output_extension)
+    }
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+        if self.extract_fails {
+            // Record the call but return an error.
+            self.inner
+                .extract_calls
+                .lock()
+                .unwrap()
+                .push((args.to_owned(), output_paths.to_vec()));
+            return Err("ffmpeg exited with -1".to_owned());
+        }
+        // Succeed, but override specified outputs to be empty.
+        self.inner.extract(args, output_paths).await?;
+        let empties = self.empty_outputs.lock().unwrap();
+        let mut files = self.inner.files.lock().unwrap();
+        for path in empties.iter() {
+            files.insert(path.clone(), Vec::new());
+        }
+        Ok(())
+    }
+    fn file_exists(&self, path: &str) -> bool {
+        self.inner.file_exists(path)
+    }
+    fn file_size(&self, path: &str) -> Option<u64> {
+        self.inner.file_size(path)
+    }
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        self.inner.delete_file(path)
+    }
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        self.inner.write_file(path, content)
+    }
+}
+
+/// Wraps an `Arc<FailableIo>` so the encoder can own an `I: SubtitleIo`
+/// while the test retains a handle to inspect recorded state.
+struct ArcFailable(std::sync::Arc<FailableIo>);
+
+#[async_trait]
+impl SubtitleIo for ArcFailable {
+    async fn read_file(&self, p: &str) -> Result<Vec<u8>, String> {
+        self.0.read_file(p).await
+    }
+    async fn http_get(&self, u: &str) -> Result<Vec<u8>, String> {
+        self.0.http_get(u).await
+    }
+    fn path_protocol(&self, p: &str) -> MediaProtocol {
+        self.0.path_protocol(p)
+    }
+    fn subtitle_cache_path(&self, id: &str, idx: i32, ext: &str) -> Option<String> {
+        self.0.subtitle_cache_path(id, idx, ext)
+    }
+    async fn extract(&self, a: &str, o: &[String]) -> Result<(), String> {
+        self.0.extract(a, o).await
+    }
+    fn file_exists(&self, p: &str) -> bool {
+        self.0.file_exists(p)
+    }
+    fn file_size(&self, p: &str) -> Option<u64> {
+        self.0.file_size(p)
+    }
+    fn delete_file(&self, p: &str) -> Result<(), String> {
+        self.0.delete_file(p)
+    }
+    fn write_file(&self, p: &str, c: &[u8]) -> Result<(), String> {
+        self.0.write_file(p, c)
+    }
+}
+
+/// Wraps an `Arc<RecordingIo>` whose `extract` writes the supplied
+/// `content` instead of a placeholder, for testing the ASS font fix-up.
+struct ContentIo {
+    inner: std::sync::Arc<RecordingIo>,
+    content: Vec<u8>,
+}
+
+#[async_trait]
+impl SubtitleIo for ContentIo {
+    async fn read_file(&self, p: &str) -> Result<Vec<u8>, String> {
+        self.inner.read_file(p).await
+    }
+    async fn http_get(&self, u: &str) -> Result<Vec<u8>, String> {
+        self.inner.http_get(u).await
+    }
+    fn path_protocol(&self, p: &str) -> MediaProtocol {
+        self.inner.path_protocol(p)
+    }
+    fn subtitle_cache_path(&self, id: &str, idx: i32, ext: &str) -> Option<String> {
+        self.inner.subtitle_cache_path(id, idx, ext)
+    }
+    async fn extract(&self, a: &str, output_paths: &[String]) -> Result<(), String> {
+        self.inner
+            .extract_calls
+            .lock()
+            .unwrap()
+            .push((a.to_owned(), output_paths.to_vec()));
+        let mut files = self.inner.files.lock().unwrap();
+        for path in output_paths {
+            files.insert(path.clone(), self.content.clone());
+        }
+        Ok(())
+    }
+    fn file_exists(&self, p: &str) -> bool {
+        self.inner.file_exists(p)
+    }
+    fn file_size(&self, p: &str) -> Option<u64> {
+        self.inner.file_size(p)
+    }
+    fn delete_file(&self, p: &str) -> Result<(), String> {
+        self.inner.delete_file(p)
+    }
+    fn write_file(&self, p: &str, c: &[u8]) -> Result<(), String> {
+        self.inner.write_file(p, c)
+    }
+}
+
+#[tokio::test]
+async fn extract_all_deletes_outputs_on_ffmpeg_failure() {
+    let ass = sub_stream(0, "ass", None, false);
+    let srt = sub_stream(1, "subrip", None, false);
+    let source = source_with("guid-fail", "/media/movie.mkv", vec![ass, srt]);
+    let shared = std::sync::Arc::new(FailableIo {
+        extract_fails: true,
+        ..FailableIo::default()
+    });
+    shared
+        .inner
+        .files
+        .lock()
+        .unwrap()
+        .insert("/cache/guid-fail/0.ass".to_owned(), b"partial".to_vec());
+    shared
+        .inner
+        .files
+        .lock()
+        .unwrap()
+        .insert("/cache/guid-fail/1.srt".to_owned(), b"partial".to_vec());
+    let encoder =
+        SubtitleEncoder::new(SubtitleEditParser::new(), ArcFailable(shared.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let files = shared.inner.files.lock().unwrap();
+    assert!(
+        !files.contains_key("/cache/guid-fail/0.ass"),
+        "failed .ass output should be deleted"
+    );
+    assert!(
+        !files.contains_key("/cache/guid-fail/1.srt"),
+        "failed .srt output should be deleted"
+    );
+}
+
+#[tokio::test]
+async fn extract_all_deletes_empty_outputs_on_success() {
+    // When ffmpeg exits 0 but produces an empty output, that output is deleted
+    // while the non-empty one survives.
+    let ass = sub_stream(0, "ass", None, false);
+    let srt = sub_stream(1, "subrip", None, false);
+    let source = source_with("guid-empty", "/media/movie.mkv", vec![ass, srt]);
+    let io = FailableIo {
+        empty_outputs: Mutex::new(vec!["/cache/guid-empty/1.srt".to_owned()]),
+        ..FailableIo::default()
+    };
+    let recorder = std::sync::Arc::new(io);
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcFailable(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let files = recorder.inner.files.lock().unwrap();
+    // The non-empty .ass output survives.
+    assert!(
+        files.contains_key("/cache/guid-empty/0.ass"),
+        "non-empty output should survive"
+    );
+    // The empty .srt output was deleted.
+    assert!(
+        !files.contains_key("/cache/guid-empty/1.srt"),
+        "empty output should be deleted"
+    );
+}
+
+#[tokio::test]
+async fn extract_all_applies_ass_font_fixup() {
+    // An extracted .ass file with `,Arial,` gets the font replaced.
+    let ass = sub_stream(0, "ass", None, false);
+    let source = source_with("guid-font", "/media/movie.mkv", vec![ass]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let io = ContentIo {
+        inner: recorder.clone(),
+        content: b"[Script Info]\nStyle: Default,Arial,20".to_vec(),
+    };
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let files = recorder.files.lock().unwrap();
+    let content = files
+        .get("/cache/guid-font/0.ass")
+        .expect("ass file should exist");
+    let text = std::str::from_utf8(content).unwrap();
+    assert!(
+        text.contains(",Arial Unicode MS,"),
+        "Arial should be replaced with Arial Unicode MS"
+    );
+    assert!(!text.contains(",Arial,"), "plain Arial should not remain");
+}
+
+#[tokio::test]
+async fn extract_all_skips_font_fixup_for_srt() {
+    // An extracted .srt file should NOT get the ASS font fix-up.
+    let srt = sub_stream(0, "subrip", None, false);
+    let source = source_with("guid-srt", "/media/movie.mkv", vec![srt]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let files = recorder.files.lock().unwrap();
+    let content = files
+        .get("/cache/guid-srt/0.srt")
+        .expect("srt file should exist");
+    // The content should be the default "extracted" placeholder, not modified.
+    assert_eq!(content, b"extracted");
+}
+
+#[tokio::test]
+async fn extract_all_no_fixup_when_no_arial_reference() {
+    // An .ass file without `,Arial,` should not be rewritten.
+    let ass = sub_stream(0, "ass", None, false);
+    let source = source_with("guid-nofont", "/media/movie.mkv", vec![ass]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let io = ContentIo {
+        inner: recorder.clone(),
+        content: b"[Script Info]\nStyle: Default,Noto Sans,20".to_vec(),
+    };
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let files = recorder.files.lock().unwrap();
+    let content = files
+        .get("/cache/guid-nofont/0.ass")
+        .expect("ass file should exist");
+    let text = std::str::from_utf8(content).unwrap();
+    // No rewrite should have occurred — original content preserved.
+    assert!(text.contains("Noto Sans"));
+    assert!(!text.contains("Arial Unicode MS"));
 }

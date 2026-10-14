@@ -157,6 +157,44 @@ pub trait SubtitleIo: Send + Sync {
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
     }
+
+    /// Returns the size in bytes of the file at `path`, or `None` if the file
+    /// does not exist or its metadata cannot be read.
+    ///
+    /// Used after extraction to verify that ffmpeg produced a non-empty output.
+    fn file_size(&self, path: &str) -> Option<u64> {
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// Removes the file at `path`. Returns `Ok` on success or if the file does
+    /// not exist; returns `Err` with a message on other I/O failures.
+    ///
+    /// Port of the `_fileSystem.DeleteFile` calls in `ExtractSubtitlesForFile`
+    /// that clean up missing/empty outputs so a zero-byte cache file does not
+    /// prevent retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the file exists but cannot be deleted.
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("delete {path}: {e}")),
+        }
+    }
+
+    /// Writes `content` to the file at `path`, creating or truncating it.
+    ///
+    /// Used by the ASS font fix-up to rewrite a successfully extracted subtitle
+    /// with `Arial Unicode MS` in place of `Arial`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the write fails.
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        std::fs::write(path, content).map_err(|e| format!("write {path}: {e}"))
+    }
 }
 
 /// Resolved information about a readable subtitle file.
@@ -531,8 +569,66 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             return;
         }
 
-        let _ = self.io.extract(&args, &output_paths).await;
+        let result = self.io.extract(&args, &output_paths).await;
+        self.validate_extraction(&source_path, &output_paths, result)
+            .await;
+
         drop(held);
+    }
+
+    /// Validates and cleans up the outputs of a subtitle extraction.
+    ///
+    /// Port of `SubtitleEncoder.ExtractSubtitlesForFile`: on ffmpeg failure,
+    /// every output is deleted; on success, each output is checked individually
+    /// — missing/empty ones are deleted, successful `.ass` outputs get the
+    /// [`set_ass_font`](Self::set_ass_font) fix-up.
+    async fn validate_extraction(
+        &self,
+        source_path: &str,
+        output_paths: &[String],
+        result: Result<(), String>,
+    ) {
+        match result {
+            Err(error) => {
+                // Extraction failed — delete all outputs so zero-byte cache
+                // files don't prevent retry on the next request. Port of
+                // upstream's `exitCode == -1` branch.
+                for path in output_paths {
+                    tracing::warn!(path = %path, "deleting extracted subtitle due to failure");
+                    if let Err(e) = self.io.delete_file(path) {
+                        tracing::error!(error = %e, path = %path, "error deleting extracted subtitle");
+                    }
+                }
+                tracing::error!(path = %source_path, %error, "ffmpeg subtitle extraction failed");
+            }
+            Ok(()) => {
+                // Check each output individually — ffmpeg may exit 0 yet
+                // still fail to produce some outputs.
+                for path in output_paths {
+                    match self.io.file_size(path) {
+                        Some(size) if size > 0 => {
+                            if ends_with_ignore_ascii_case(path, ".ass") {
+                                self.set_ass_font(path).await;
+                            }
+                            tracing::info!(
+                                input = %source_path, output = %path,
+                                "ffmpeg subtitle extraction completed"
+                            );
+                        }
+                        _ => {
+                            tracing::error!(
+                                input = %source_path, output = %path,
+                                "ffmpeg subtitle extraction failed"
+                            );
+                            tracing::warn!(path = %path, "deleting extracted subtitle due to failure");
+                            if let Err(e) = self.io.delete_file(path) {
+                                tracing::error!(error = %e, path = %path, "error deleting extracted subtitle");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Converts an unsupported text subtitle to SRT via ffmpeg, once per path.
@@ -572,7 +668,43 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let args = format!("-y{encoding_param} -i \"{input_path}\" -c:s srt \"{output_path}\"");
         self.io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
-            .await
+            .await?;
+
+        // Verify the output was written and is non-empty (port of upstream's
+        // per-output check in `ExtractSubtitlesForFile`, also reached via
+        // `ExtractTextSubtitleInternal`).
+        match self.io.file_size(output_path) {
+            Some(size) if size > 0 => Ok(()),
+            _ => {
+                let _ = self.io.delete_file(output_path);
+                Err(format!(
+                    "ffmpeg subtitle conversion produced no output for {output_path}"
+                ))
+            }
+        }
+    }
+
+    /// Replaces `,Arial,` with `,Arial Unicode MS,` in a successfully extracted
+    /// `.ass` subtitle file.
+    ///
+    /// Port of `SubtitleEncoder.SetAssFont` (lines 932-966): ffmpeg-extracted
+    /// `.ass` files may reference `Arial`, which lacks glyphs for CJK and many
+    /// Unicode symbols. `Arial Unicode MS` is a wide-coverage fallback that
+    /// renders them correctly.
+    async fn set_ass_font(&self, path: &str) {
+        let Ok(bytes) = self.io.read_file(path).await else {
+            tracing::warn!(path = %path, "could not read .ass file for font fix-up");
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return;
+        };
+        if let Some(replaced) = set_ass_font_text(text) {
+            tracing::info!(path = %path, "setting ASS font within extracted subtitle");
+            if let Err(e) = self.io.write_file(path, replaced.as_bytes()) {
+                tracing::warn!(error = %e, path = %path, "could not write ASS font fix-up");
+            }
+        }
     }
 
     /// Resolves the subtitle-cache path for a media source, stream, extension.
@@ -864,6 +996,16 @@ fn path_extension(path: &str) -> Option<String> {
         .map(|(_, ext)| ext.to_ascii_lowercase())
 }
 
+/// Replaces `,Arial,` with `,Arial Unicode MS,` in ASS subtitle text.
+///
+/// Port of the text replacement in `SubtitleEncoder.SetAssFont`: returns
+/// `Some(replaced)` when a substitution was made, `None` when the text is
+/// unchanged (so the caller can skip the write).
+fn set_ass_font_text(text: &str) -> Option<String> {
+    let replaced = text.replace(",Arial,", ",Arial Unicode MS,");
+    (replaced != *text).then_some(replaced)
+}
+
 /// Case-insensitive `str::ends_with`.
 fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
     haystack.len() >= suffix.len()
@@ -914,5 +1056,35 @@ mod tests {
             Some(Duration::from_mins(71_582))
         );
         assert_eq!(subtitle_extraction_timeout(longest + 1), None);
+    }
+
+    #[test]
+    fn set_ass_font_text_replaces_arial() {
+        let input = "Style: Default,Arial,20,&Hffffff";
+        let result = super::set_ass_font_text(input);
+        assert_eq!(
+            result.as_deref(),
+            Some("Style: Default,Arial Unicode MS,20,&Hffffff")
+        );
+    }
+
+    #[test]
+    fn set_ass_font_text_replaces_all_occurrences() {
+        let input = "Style: Default,Arial,20\nStyle: Italic,Arial,16";
+        let result = super::set_ass_font_text(input).unwrap();
+        assert_eq!(result.matches(",Arial Unicode MS,").count(), 2);
+        assert_eq!(result.matches(",Arial,").count(), 0);
+    }
+
+    #[test]
+    fn set_ass_font_text_unchanged_returns_none() {
+        assert!(super::set_ass_font_text("Style: Default,Noto Sans,20").is_none());
+    }
+
+    #[test]
+    fn set_ass_font_text_no_false_positive_on_partial_match() {
+        // `,ArialBlack,` should NOT be replaced (only exact `,Arial,`).
+        let input = "Style: Default,ArialBlack,20";
+        assert!(super::set_ass_font_text(input).is_none());
     }
 }
