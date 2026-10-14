@@ -76,6 +76,10 @@ struct SearchHit {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    original_title: Option<String>,
+    #[serde(default)]
+    original_name: Option<String>,
+    #[serde(default)]
     overview: Option<String>,
     #[serde(default)]
     release_date: Option<String>,
@@ -105,6 +109,7 @@ fn search_hit_from(hit: SearchHit, cfg: &crate::plugin_config::TmdbConfig) -> Tm
     TmdbSearchHit {
         tmdb_id: hit.id,
         name: hit.title.or(hit.name),
+        original_name: non_empty(hit.original_title.or(hit.original_name)),
         year: year_from(date.as_deref()),
         premiere_date: date,
         poster_url: non_empty(hit.poster_path)
@@ -120,6 +125,8 @@ pub struct TmdbSearchHit {
     pub tmdb_id: i64,
     /// The candidate's title/name.
     pub name: Option<String>,
+    /// The original-language title/name.
+    pub original_name: Option<String>,
     /// The release / first-air year.
     pub year: Option<i32>,
     /// The raw release / first-air date (`YYYY-MM-DD`), kept so the Identify
@@ -131,6 +138,83 @@ pub struct TmdbSearchHit {
     pub poster_url: Option<String>,
     /// The plot overview.
     pub overview: Option<String>,
+}
+
+/// `TmdbUtils.CleanName`: replaces everything that is not a letter, number or
+/// combining mark (keeping the interpunct `·`) with a space — TMDB expects a
+/// space-separated list of words.
+#[must_use]
+pub fn clean_name(name: &str) -> String {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[^\pL\pN\pM·]+").unwrap());
+    RE.replace_all(name, " ").trim().to_owned()
+}
+
+/// `TmdbUtils.NormalizeTitle`: like [`clean_name`] but the interpunct is a
+/// separator too (so "WALL-E" and "WALL·E" compare equal), and the result is
+/// lowercased for ordinal comparison.
+fn normalize_title(title: &str) -> String {
+    use std::sync::LazyLock;
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[^\pL\pN\pM]+").unwrap());
+    RE.replace_all(title, " ").trim().to_lowercase()
+}
+
+/// `TmdbUtils.FindBestMatch`: scores each search result by title match + year
+/// proximity and returns the best one. Ties keep the earlier (more relevant)
+/// result from TMDB's own ordering.
+#[must_use]
+pub fn find_best_match<'a>(results: &'a [TmdbSearchHit], name: &str, year: Option<i32>) -> Option<&'a TmdbSearchHit> {
+    if results.is_empty() {
+        return None;
+    }
+    let normalized = normalize_title(name);
+    if normalized.is_empty() {
+        return results.first();
+    }
+    let year = year.unwrap_or(0);
+    let mut best = &results[0];
+    let mut best_score = 0i32;
+    for result in results {
+        let title_score = i32::max(
+            score_title(&normalized, result.name.as_deref()),
+            score_title(&normalized, result.original_name.as_deref()),
+        );
+        let year_score = score_year(year, result.year);
+        let score = title_score + year_score;
+        if score > best_score {
+            best_score = score;
+            best = result;
+        }
+    }
+    Some(best)
+}
+
+fn score_title(normalized_name: &str, title: Option<&str>) -> i32 {
+    let Some(title) = title else { return 0 };
+    let normalized_title = normalize_title(title);
+    if normalized_name == normalized_title {
+        return 8; // TitleExactScore
+    }
+    if normalized_title.len() > normalized_name.len()
+        && normalized_title.as_bytes().get(normalized_name.len()) == Some(&b' ')
+        && normalized_title.starts_with(normalized_name)
+    {
+        return 4; // TitlePrefixScore
+    }
+    0
+}
+
+fn score_year(year: i32, result_year: Option<i32>) -> i32 {
+    if year <= 0 {
+        return 0;
+    }
+    match result_year {
+        Some(ry) if (ry - year).abs() == 0 => 2, // YearExactScore
+        Some(ry) if (ry - year).abs() == 1 => 1, // YearAdjacentScore
+        _ => 0,
+    }
 }
 
 /// One image offered by TMDB for an item (the "Choose Image" flow).
@@ -3098,5 +3182,88 @@ mod tests {
         assert_eq!(ep2.name, None);
         assert_eq!(ep2.overview, None);
         assert_eq!(ep2.still_url, None);
+    }
+
+    // ---- clean_name / find_best_match (TmdbUtils ports) ----
+
+    #[test]
+    fn clean_name_strips_punctuation() {
+        assert_eq!(super::clean_name("Show: The Subtitle"), "Show The Subtitle");
+        assert_eq!(super::clean_name("WALL·E"), "WALL·E");
+        assert_eq!(super::clean_name("[HEVC] Show (2026)"), "HEVC Show 2026");
+        assert_eq!(super::clean_name("  hello  "), "hello");
+    }
+
+    fn hit(name: &str, year: Option<i32>) -> TmdbSearchHit {
+        TmdbSearchHit {
+            tmdb_id: 0,
+            name: Some(name.to_owned()),
+            original_name: None,
+            year,
+            premiere_date: None,
+            poster_url: None,
+            overview: None,
+        }
+    }
+
+    #[test]
+    fn find_best_match_prefers_exact_title_and_year() {
+        let mut a = hit("Mulan", Some(1998));
+        a.tmdb_id = 1;
+        let mut b = hit("Mulan", Some(2020));
+        b.tmdb_id = 2;
+        let results = vec![a, b];
+        let best = super::find_best_match(&results, "Mulan", Some(2020)).unwrap();
+        assert_eq!(best.tmdb_id, 2);
+    }
+
+    #[test]
+    fn find_best_match_title_outranks_year() {
+        let mut wrong_title = hit("Something Else", Some(2026));
+        wrong_title.tmdb_id = 1;
+        let mut right_title = hit("The Show", Some(2024));
+        right_title.tmdb_id = 2;
+        let results = vec![wrong_title, right_title];
+        let best = super::find_best_match(&results, "The Show", Some(2026)).unwrap();
+        assert_eq!(best.tmdb_id, 2);
+    }
+
+    #[test]
+    fn find_best_match_adjacent_year_scores() {
+        let mut a = hit("Show", Some(2025));
+        a.tmdb_id = 1;
+        let mut b = hit("Show", Some(2020));
+        b.tmdb_id = 2;
+        let results = vec![b, a];
+        let best = super::find_best_match(&results, "Show", Some(2026)).unwrap();
+        assert_eq!(best.tmdb_id, 1);
+    }
+
+    #[test]
+    fn find_best_match_falls_back_to_first_on_no_match() {
+        let mut a = hit("Unrelated", Some(1990));
+        a.tmdb_id = 1;
+        let mut b = hit("Also Unrelated", Some(1995));
+        b.tmdb_id = 2;
+        let results = vec![a, b];
+        let best = super::find_best_match(&results, "My Show", Some(2026)).unwrap();
+        assert_eq!(best.tmdb_id, 1);
+    }
+
+    #[test]
+    fn find_best_match_uses_original_name() {
+        let mut a = hit("Wrong", Some(2026));
+        a.tmdb_id = 1;
+        let mut b = hit("Also Wrong", Some(2026));
+        b.tmdb_id = 2;
+        b.original_name = Some("The Real Title".to_owned());
+        let results = vec![a, b];
+        let best = super::find_best_match(&results, "The Real Title", Some(2026)).unwrap();
+        assert_eq!(best.tmdb_id, 2);
+    }
+
+    #[test]
+    fn find_best_match_empty_returns_none() {
+        assert!(super::find_best_match(&[], "Show", Some(2026)).is_none());
     }
 }

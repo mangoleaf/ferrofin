@@ -9558,7 +9558,10 @@ impl LibraryScanner {
                 // pinned an id in an NFO must not be re-matched by fuzzy title.
                 match (own_imdb.as_deref(), name) {
                     (Some(imdb), _) => omdb.item(imdb).await,
-                    (None, Some(name)) => omdb.find_by_title(kind, name, year).await,
+                    (None, Some(name)) => {
+                        let cleaned = ferrofin_providers::tmdb::clean_name(name);
+                        omdb.find_by_title(kind, &cleaned, year).await
+                    }
                     (None, None) => None,
                 }
             }
@@ -9656,10 +9659,10 @@ impl LibraryScanner {
             id
         } else {
             let name = lookup.name(row)?;
-            tmdb.search(kind, name.as_str(), year, lookup.tmdb_language().as_deref())
-                .await
-                .into_iter()
-                .next()
+            let cleaned = ferrofin_providers::tmdb::clean_name(&name);
+            let results = tmdb.search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
+                .await;
+            ferrofin_providers::tmdb::find_best_match(&results, &name, year)
                 .map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
@@ -10060,10 +10063,11 @@ impl LibraryScanner {
                     // (`TvdbSeriesProvider.cs:73-77,422-437`) — a lone Tmdb
                     // id is not one it resolves by.
                     let name = lookup.name(row)?;
+                    let cleaned = ferrofin_providers::tmdb::clean_name(&name);
                     let year = lookup.year(row);
                     let language = lookup.metadata_language(FetcherPolicy::default());
                     let names = self.three_letter_language_names(&language);
-                    tvdb.search(&name, year, &language, &names)
+                    tvdb.search(&cleaned, year, &language, &names)
                         .await
                         .into_iter()
                         .next()?
