@@ -271,8 +271,12 @@ fn url_host(url: &str) -> Option<&str> {
 /// container, fallback bitrate, user agent).
 #[must_use]
 pub fn create_media_source_info(path: &str, tuner: &TunerHostInfo) -> MediaSourceInfo {
-    let supports_direct_play = !tuner.enable_stream_looping && tuner.tuner_count == 0;
+    let mut supports_direct_play = !tuner.enable_stream_looping && tuner.tuner_count == 0;
     let supports_direct_stream = !tuner.enable_stream_looping;
+
+    if is_manifest_path(path) {
+        supports_direct_play = false;
+    }
     let protocol = path_protocol(path);
     let is_remote = url_host(path).is_none_or(|host| !is_in_local_network(host));
 
@@ -401,6 +405,24 @@ pub fn extension_can_share(url: &str) -> Option<bool> {
             .iter()
             .any(|e| e.eq_ignore_ascii_case(extension)),
     )
+}
+
+/// Whether a channel path points at an HLS or DASH manifest rather than a byte stream.
+fn is_manifest_path(path: &str) -> bool {
+    const MANIFEST_EXTENSIONS: &[&str] = &["m3u8", "m3u", "mpd"];
+    // Use the URL path (without query string) for extension matching.
+    let url_path = path.split(['?', '#']).next().unwrap_or(path);
+    let url_path = match url_path.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("/", |at| &rest[at..]),
+        None => url_path,
+    };
+    let last_segment = url_path.rsplit('/').next().unwrap_or("");
+    let Some((_, extension)) = last_segment.rsplit_once('.') else {
+        return false;
+    };
+    MANIFEST_EXTENSIONS
+        .iter()
+        .any(|m| extension.eq_ignore_ascii_case(m))
 }
 
 /// Whether a `HEAD` `Content-Type` allows sharing the tuner's HTTP stream.
@@ -648,10 +670,12 @@ impl Drop for SharingGuard {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        LiveStreamHandle, LiveStreamKind, TunerStreamBody, TunerStreamSource, extension_can_share,
-        mime_type_can_share, open_shared_http_stream,
+        LiveStreamHandle, LiveStreamKind, TunerStreamBody, TunerStreamSource,
+        create_media_source_info, extension_can_share, is_manifest_path, mime_type_can_share,
+        open_shared_http_stream,
     };
     use async_trait::async_trait;
+    use ferrofin_model::live_tv::TunerHostInfo;
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::error::ServiceError;
     use std::collections::HashMap;
@@ -741,6 +765,32 @@ pub(crate) mod tests {
         // Nor does the host's own dots, on a URL with no path.
         assert_eq!(extension_can_share("http://tuner.example.com"), None);
         assert_eq!(extension_can_share("http://tuner.example.com/"), None);
+    }
+
+    #[test]
+    fn manifest_paths_are_detected() {
+        assert!(is_manifest_path("http://tuner/live.m3u8"));
+        assert!(is_manifest_path("http://tuner/live.M3U8?token=x"));
+        assert!(is_manifest_path("http://tuner/live.m3u"));
+        assert!(is_manifest_path("http://tuner/live.mpd"));
+        assert!(!is_manifest_path("http://tuner/live.ts"));
+        assert!(!is_manifest_path("http://tuner/live"));
+        assert!(!is_manifest_path("http://tuner/live.mkv"));
+    }
+
+    #[test]
+    fn manifest_channel_disables_direct_play() {
+        let tuner = TunerHostInfo {
+            enable_stream_looping: false,
+            tuner_count: 0,
+            ..TunerHostInfo::default()
+        };
+        let source = create_media_source_info("http://tuner/live.m3u8", &tuner);
+        assert!(!source.supports_direct_play);
+        assert!(source.supports_direct_stream);
+
+        let ts_source = create_media_source_info("http://tuner/live.ts", &tuner);
+        assert!(ts_source.supports_direct_play);
     }
 
     #[test]

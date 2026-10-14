@@ -56,11 +56,17 @@ pub fn infer_audio_codec(container: &str) -> String {
         return "aac".to_owned();
     }
     let lower = container.to_ascii_lowercase();
+    #[allow(clippy::match_same_arms)]
     match lower.as_str() {
         "ogg" | "oga" | "ogv" | "webm" | "webma" => "opus".to_owned(),
         "m4a" | "m4b" | "mp4" | "mov" | "mkv" | "mka" => "aac".to_owned(),
         "ts" | "avi" | "flv" | "f4v" | "swf" => "mp3".to_owned(),
-        _ => lower,
+        // Containers whose name IS the codec they carry.
+        "aac" | "ac3" | "alac" | "dts" | "eac3" | "flac" | "mp2" | "mp3" | "opus" | "truehd"
+        | "vorbis" => lower,
+        // Anything else (manifests like m3u8/mpd in particular) is not an
+        // audio codec — never hand it to ffmpeg as an encoder.
+        _ => "aac".to_owned(),
     }
 }
 
@@ -2809,5 +2815,22 @@ mod tests {
             helper(vec![available]).can_encode_to_audio_codec(codec),
             expected
         );
+    }
+
+    #[rstest]
+    #[case("ogg", "opus")]
+    #[case("webm", "opus")]
+    #[case("mp4", "aac")]
+    #[case("mkv", "aac")]
+    #[case("ts", "mp3")]
+    #[case("flac", "flac")]
+    #[case("ac3", "ac3")]
+    #[case("aac", "aac")]
+    #[case("m3u8", "aac")]
+    #[case("mpd", "aac")]
+    #[case("hls", "aac")]
+    #[case("", "aac")]
+    fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
+        assert_eq!(infer_audio_codec(container), expected);
     }
 }

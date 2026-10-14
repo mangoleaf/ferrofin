@@ -526,6 +526,10 @@ impl<'a> StreamBuilder<'a> {
             is_eligible_for_direct_play = false;
         }
 
+        if is_manifest_container(item.container.as_deref()) {
+            is_eligible_for_direct_play = false;
+        }
+
         if bitrate_limit_exceeded {
             transcode_reasons = TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT;
         }
@@ -2683,6 +2687,14 @@ fn format_f64(v: f64) -> String {
 
 fn format_level(v: f64) -> String {
     format_f64(v)
+}
+
+/// A manifest (HLS/DASH) container is not a byte stream and cannot be direct-played.
+fn is_manifest_container(container: Option<&str>) -> bool {
+    const MANIFESTS: &[&str] = &["hls", "applehttp", "dash"];
+    let Some(c) = container else { return false };
+    c.split(',')
+        .any(|part| MANIFESTS.iter().any(|m| part.eq_ignore_ascii_case(m)))
 }
 
 // Keep the range-name helper referenced so it is not flagged unused.
