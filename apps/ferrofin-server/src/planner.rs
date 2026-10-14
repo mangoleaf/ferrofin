@@ -5298,6 +5298,9 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        // The fixture is 8-bit, as ffprobe reports it, so no bit-depth
+        // compensation (`GetBitDepthCompensatedBitrate`) applies.
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
