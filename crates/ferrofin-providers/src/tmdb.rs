@@ -288,6 +288,8 @@ struct ImageEntry {
     vote_count: Option<i32>,
     #[serde(default)]
     iso_639_1: Option<String>,
+    #[serde(default)]
+    iso_3166_1: Option<String>,
 }
 
 /// One season's metadata + artwork from `/tv/{id}/season/{n}` with its
@@ -1004,6 +1006,36 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
 
+/// Determines the language code to report for a TMDB image.
+///
+/// Port of `TmdbUtils.GetImageLanguage`: the region (`iso_3166_1`) is appended
+/// only when it contradicts the requested region, so a `pt-PT` image for a
+/// `pt-BR` request returns `"pt-PT"` while an `en-US` image for an `en-US`
+/// request returns the plain request code.
+fn get_image_language(
+    image_language: Option<&str>,
+    image_region: Option<&str>,
+    request_language: Option<&str>,
+) -> Option<String> {
+    let lang = image_language.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("xx"))?;
+
+    let Some(request) = request_language.filter(|r| !r.is_empty()) else {
+        return Some(lang.to_owned());
+    };
+
+    let parts: Vec<&str> = request.split('-').collect();
+    if parts.len() != 2 || !parts[0].eq_ignore_ascii_case(lang) {
+        return Some(lang.to_owned());
+    }
+
+    match image_region.filter(|r| !r.is_empty()) {
+        Some(region) if !region.eq_ignore_ascii_case(parts[1]) => {
+            Some(format!("{}-{}", lang, region.to_uppercase()))
+        }
+        _ => Some(request.to_owned()),
+    }
+}
+
 /// Normalizes a metadata language for TMDB's `language` parameter — a port of
 /// `MediaBrowser.Providers.Plugins.Tmdb.TmdbUtils.NormalizeLanguage`.
 ///
@@ -1129,6 +1161,8 @@ struct CollectionImage {
     height: Option<i32>,
     #[serde(default)]
     iso_639_1: Option<String>,
+    #[serde(default)]
+    iso_3166_1: Option<String>,
     #[serde(default)]
     vote_average: Option<f64>,
     #[serde(default)]
@@ -1556,7 +1590,11 @@ impl TmdbClient {
     /// The collection image provider deliberately fetches all languages and
     /// returns the appended poster/backdrop lists, rather than the metadata
     /// endpoint's single default poster. Locale ranking is applied afterward.
-    pub async fn collection_images(&self, tmdb_id: i64) -> Vec<TmdbImage> {
+    pub async fn collection_images(
+        &self,
+        tmdb_id: i64,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         let cfg = self.settings().await;
         let Some(parsed) = self.collection_response(tmdb_id, None, None, &cfg).await else {
             return Vec::new();
@@ -1575,7 +1613,11 @@ impl TmdbClient {
                     height: if scaled { None } else { image.height },
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: non_empty(image.iso_639_1),
+                    language: get_image_language(
+                        image.iso_639_1.as_deref(),
+                        image.iso_3166_1.as_deref(),
+                        request_language,
+                    ),
                 })
             })
         };
@@ -1702,7 +1744,12 @@ impl TmdbClient {
     /// and logo (Logo) images TMDB has for a title (the "Choose Image" flow),
     /// via `/movie|tv/{id}/images` — the set `TmdbMovieImageProvider` /
     /// `TmdbSeriesImageProvider.GetImages` return. Empty on any error.
-    pub async fn all_images(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<TmdbImage> {
+    pub async fn all_images(
+        &self,
+        kind: TmdbKind,
+        tmdb_id: i64,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1733,7 +1780,11 @@ impl TmdbClient {
         let map = |entries: Vec<ImageEntry>, image_type: ImageType| {
             entries.into_iter().filter_map(move |e| {
                 let path = e.file_path.filter(|p| !p.is_empty())?;
-                let language = e.iso_639_1.filter(|l| !l.is_empty());
+                let language = get_image_language(
+                    e.iso_639_1.as_deref(),
+                    e.iso_3166_1.as_deref(),
+                    request_language,
+                );
                 // A backdrop with a language carries text — C#
                 // `ConvertToRemoteImageInfo` returns those as `Thumb`.
                 let image_type = if image_type == ImageType::Backdrop && language.is_some() {
@@ -1766,7 +1817,7 @@ impl TmdbClient {
         id: i64,
         language: &str,
     ) -> Vec<RemoteImage> {
-        ordered_download_images(self.all_images(kind, id).await, language)
+        ordered_download_images(self.all_images(kind, id, Some(language)).await, language)
     }
 
     /// Every poster TMDB has for one season — `GET
@@ -1777,11 +1828,19 @@ impl TmdbClient {
     /// standalone season id, which is also why Ferrofin advertises no
     /// per-season `Tmdb` external-id field. Empty on any transport or decode
     /// failure — a "Choose Image" dialog with no candidates, never an error.
-    pub async fn season_images(&self, series_tmdb_id: i64, season_number: i32) -> Vec<TmdbImage> {
-        self.tv_images(format!(
-            "{}/tv/{series_tmdb_id}/season/{season_number}/images",
-            self.base_url
-        ))
+    pub async fn season_images(
+        &self,
+        series_tmdb_id: i64,
+        season_number: i32,
+        request_language: Option<&str>,
+    ) -> Vec<TmdbImage> {
+        self.tv_images(
+            format!(
+                "{}/tv/{series_tmdb_id}/season/{season_number}/images",
+                self.base_url
+            ),
+            request_language,
+        )
         .await
     }
 
@@ -1793,11 +1852,15 @@ impl TmdbClient {
         series_tmdb_id: i64,
         season_number: i32,
         episode_number: i32,
+        request_language: Option<&str>,
     ) -> Vec<TmdbImage> {
-        self.tv_images(format!(
-            "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
-            self.base_url
-        ))
+        self.tv_images(
+            format!(
+                "{}/tv/{series_tmdb_id}/season/{season_number}/episode/{episode_number}/images",
+                self.base_url
+            ),
+            request_language,
+        )
         .await
     }
 
@@ -1805,7 +1868,7 @@ impl TmdbClient {
     /// [`episode_images`](Self::episode_images): fetch one TMDB `images`
     /// document and take its posters and stills, both as `Primary`
     /// (C# `ConvertPostersToRemoteImageInfo` / `ConvertStillsToRemoteImageInfo`).
-    async fn tv_images(&self, url: String) -> Vec<TmdbImage> {
+    async fn tv_images(&self, url: String, request_language: Option<&str>) -> Vec<TmdbImage> {
         // The TMDb settings page governs the key, the adult filter, the
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
@@ -1841,7 +1904,11 @@ impl TmdbClient {
                     height: e.height,
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language: e.iso_639_1.filter(|l| !l.is_empty()),
+                    language: get_image_language(
+                        e.iso_639_1.as_deref(),
+                        e.iso_3166_1.as_deref(),
+                        request_language,
+                    ),
                 })
             })
             .collect()
@@ -2235,7 +2302,11 @@ impl TmdbClient {
                     height: if scaled { None } else { image.height },
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: non_empty(image.iso_639_1),
+                    language: get_image_language(
+                        image.iso_639_1.as_deref(),
+                        image.iso_3166_1.as_deref(),
+                        language,
+                    ),
                 })
             })
             .collect()
@@ -2404,6 +2475,8 @@ struct PersonProfileImage {
     #[serde(default)]
     iso_639_1: Option<String>,
     #[serde(default)]
+    iso_3166_1: Option<String>,
+    #[serde(default)]
     vote_average: Option<f64>,
     #[serde(default)]
     vote_count: Option<i32>,
@@ -2448,6 +2521,32 @@ fn year_from(date: Option<&str>) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case(Some("pt"), Some("BR"), Some("pt-BR"), Some("pt-BR"))]
+    #[case(Some("pt"), Some("PT"), Some("pt-BR"), Some("pt-PT"))]
+    #[case(Some("en"), Some("GB"), Some("en-US"), Some("en-GB"))]
+    #[case(Some("en"), Some("US"), Some("en-US"), Some("en-US"))]
+    #[case(Some("en"), None, Some("en-US"), Some("en-US"))]
+    #[case(Some("en"), Some("US"), Some("en"), Some("en"))]
+    #[case(Some("pt"), Some("PT"), Some("pt"), Some("pt"))]
+    #[case(Some("en"), Some("US"), Some("pt-BR"), Some("en"))]
+    #[case(Some("de"), Some("DE"), Some("en-US"), Some("de"))]
+    #[case(Some("xx"), Some("US"), Some("en-US"), None)]
+    #[case(Some(""), Some("US"), Some("en-US"), None)]
+    #[case(None, None, Some("en-US"), None)]
+    #[case(Some("en"), None, None, Some("en"))]
+    fn image_language_region(
+        #[case] image_language: Option<&str>,
+        #[case] image_region: Option<&str>,
+        #[case] request_language: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            get_image_language(image_language, image_region, request_language),
+            expected.map(str::to_owned),
+        );
+    }
 
     /// A `200` whose body does not decode is a provider failure, not a
     /// miss: the scan must not stamp a refresh that only looked empty.
@@ -2532,7 +2631,7 @@ mod tests {
                 serde_json::to_vec(&config).unwrap(),
             ));
             let profiles = client.person_images(1, Some("fr-CA")).await;
-            let collections = client.collection_images(1).await;
+            let collections = client.collection_images(1, Some("fr-CA")).await;
             assert_eq!(profiles.len(), 1);
             assert_eq!(collections.len(), 2);
             let expected = if size.eq_ignore_ascii_case("original") {
@@ -2587,7 +2686,7 @@ mod tests {
         let client = TmdbClient::new().with_base_url(&format!("http://{address}"));
         assert!(client.collection(1, Some("fr-CA")).await.is_some());
         assert!(client.collection(1, None).await.is_some());
-        assert_eq!(client.collection_images(1).await.len(), 1);
+        assert_eq!(client.collection_images(1, Some("fr-CA")).await.len(), 1);
         assert_eq!(client.person_images(1, Some("fr-CA")).await.len(), 1);
         assert!(client.person_details_for_language(1, None).await.is_some());
         assert_eq!(client.person_images(1, None).await.len(), 1);
