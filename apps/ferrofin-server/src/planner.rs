@@ -4664,16 +4664,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
