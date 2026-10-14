@@ -81,6 +81,31 @@ impl Writer {
     }
 }
 
+/// The longest delay, in milliseconds, .NET's `CancellationTokenSource.CancelAfter`
+/// accepts: `Timer.MaxSupportedTimeout`, documented as `UInt32.MaxValue - 1`.
+/// A longer delay makes it throw `ArgumentOutOfRangeException`.
+const DOTNET_MAX_TIMER_DELAY_MS: u32 = u32::MAX - 1;
+
+/// How long one subtitle extraction ffmpeg run may take before it is killed,
+/// from `EncodingOptions.SubtitleExtractionTimeoutMinutes`.
+///
+/// Port of `waitSource.CancelAfter(TimeSpan.FromMinutes(timeoutMinutes))` in
+/// `SubtitleEncoder.RunSubtitleExtractionProcess`, which reads the setting on
+/// every run. Zero is a zero wait: upstream cancels at once, so ffmpeg is
+/// killed and the extraction fails.
+///
+/// Deliberate divergence: a negative value, or one longer than
+/// [`DOTNET_MAX_TIMER_DELAY_MS`] (71,582 minutes), makes upstream's
+/// `CancelAfter` throw after ffmpeg has already started, so the extraction
+/// fails and the orphaned ffmpeg keeps running. `None` here reports such a
+/// value as invalid, so the caller fails the extraction without starting
+/// ffmpeg.
+#[must_use]
+pub fn subtitle_extraction_timeout(minutes: i32) -> Option<std::time::Duration> {
+    let timeout = std::time::Duration::from_mins(u64::try_from(minutes).ok()?);
+    (timeout.as_millis() <= u128::from(DOTNET_MAX_TIMER_DELAY_MS)).then_some(timeout)
+}
+
 /// The un-mockable I/O the encoder depends on (files, HTTP, ffmpeg).
 ///
 /// Everything the pure `SubtitleEncoder` logic cannot do without touching the
@@ -131,6 +156,44 @@ pub trait SubtitleIo: Send + Sync {
     /// request) instead of hitting the cache.
     fn file_exists(&self, path: &str) -> bool {
         std::path::Path::new(path).is_file()
+    }
+
+    /// Returns the size in bytes of the file at `path`, or `None` if the file
+    /// does not exist or its metadata cannot be read.
+    ///
+    /// Used after extraction to verify that ffmpeg produced a non-empty output.
+    fn file_size(&self, path: &str) -> Option<u64> {
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// Removes the file at `path`. Returns `Ok` on success or if the file does
+    /// not exist; returns `Err` with a message on other I/O failures.
+    ///
+    /// Port of the `_fileSystem.DeleteFile` calls in `ExtractSubtitlesForFile`
+    /// that clean up missing/empty outputs so a zero-byte cache file does not
+    /// prevent retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the file exists but cannot be deleted.
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("delete {path}: {e}")),
+        }
+    }
+
+    /// Writes `content` to the file at `path`, creating or truncating it.
+    ///
+    /// Used by the ASS font fix-up to rewrite a successfully extracted subtitle
+    /// with `Arial Unicode MS` in place of `Arial`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message if the write fails.
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        std::fs::write(path, content).map_err(|e| format!("write {path}: {e}"))
     }
 }
 
@@ -506,8 +569,66 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             return;
         }
 
-        let _ = self.io.extract(&args, &output_paths).await;
+        let result = self.io.extract(&args, &output_paths).await;
+        self.validate_extraction(&source_path, &output_paths, result)
+            .await;
+
         drop(held);
+    }
+
+    /// Validates and cleans up the outputs of a subtitle extraction.
+    ///
+    /// Port of `SubtitleEncoder.ExtractSubtitlesForFile`: on ffmpeg failure,
+    /// every output is deleted; on success, each output is checked individually
+    /// — missing/empty ones are deleted, successful `.ass` outputs get the
+    /// [`set_ass_font`](Self::set_ass_font) fix-up.
+    async fn validate_extraction(
+        &self,
+        source_path: &str,
+        output_paths: &[String],
+        result: Result<(), String>,
+    ) {
+        match result {
+            Err(error) => {
+                // Extraction failed — delete all outputs so zero-byte cache
+                // files don't prevent retry on the next request. Port of
+                // upstream's `exitCode == -1` branch.
+                for path in output_paths {
+                    tracing::warn!(path = %path, "deleting extracted subtitle due to failure");
+                    if let Err(e) = self.io.delete_file(path) {
+                        tracing::error!(error = %e, path = %path, "error deleting extracted subtitle");
+                    }
+                }
+                tracing::error!(path = %source_path, %error, "ffmpeg subtitle extraction failed");
+            }
+            Ok(()) => {
+                // Check each output individually — ffmpeg may exit 0 yet
+                // still fail to produce some outputs.
+                for path in output_paths {
+                    match self.io.file_size(path) {
+                        Some(size) if size > 0 => {
+                            if ends_with_ignore_ascii_case(path, ".ass") {
+                                self.set_ass_font(path).await;
+                            }
+                            tracing::info!(
+                                input = %source_path, output = %path,
+                                "ffmpeg subtitle extraction completed"
+                            );
+                        }
+                        _ => {
+                            tracing::error!(
+                                input = %source_path, output = %path,
+                                "ffmpeg subtitle extraction failed"
+                            );
+                            tracing::warn!(path = %path, "deleting extracted subtitle due to failure");
+                            if let Err(e) = self.io.delete_file(path) {
+                                tracing::error!(error = %e, path = %path, "error deleting extracted subtitle");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Converts an unsupported text subtitle to SRT via ffmpeg, once per path.
@@ -547,7 +668,43 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let args = format!("-y{encoding_param} -i \"{input_path}\" -c:s srt \"{output_path}\"");
         self.io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
-            .await
+            .await?;
+
+        // Verify the output was written and is non-empty (port of upstream's
+        // per-output check in `ExtractSubtitlesForFile`, also reached via
+        // `ExtractTextSubtitleInternal`).
+        match self.io.file_size(output_path) {
+            Some(size) if size > 0 => Ok(()),
+            _ => {
+                let _ = self.io.delete_file(output_path);
+                Err(format!(
+                    "ffmpeg subtitle conversion produced no output for {output_path}"
+                ))
+            }
+        }
+    }
+
+    /// Replaces `,Arial,` with `,Arial Unicode MS,` in a successfully extracted
+    /// `.ass` subtitle file.
+    ///
+    /// Port of `SubtitleEncoder.SetAssFont` (lines 932-966): ffmpeg-extracted
+    /// `.ass` files may reference `Arial`, which lacks glyphs for CJK and many
+    /// Unicode symbols. `Arial Unicode MS` is a wide-coverage fallback that
+    /// renders them correctly.
+    async fn set_ass_font(&self, path: &str) {
+        let Ok(bytes) = self.io.read_file(path).await else {
+            tracing::warn!(path = %path, "could not read .ass file for font fix-up");
+            return;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return;
+        };
+        if let Some(replaced) = set_ass_font_text(text) {
+            tracing::info!(path = %path, "setting ASS font within extracted subtitle");
+            if let Err(e) = self.io.write_file(path, replaced.as_bytes()) {
+                tracing::warn!(error = %e, path = %path, "could not write ASS font fix-up");
+            }
+        }
     }
 
     /// Resolves the subtitle-cache path for a media source, stream, extension.
@@ -839,6 +996,16 @@ fn path_extension(path: &str) -> Option<String> {
         .map(|(_, ext)| ext.to_ascii_lowercase())
 }
 
+/// Replaces `,Arial,` with `,Arial Unicode MS,` in ASS subtitle text.
+///
+/// Port of the text replacement in `SubtitleEncoder.SetAssFont`: returns
+/// `Some(replaced)` when a substitution was made, `None` when the text is
+/// unchanged (so the caller can skip the write).
+fn set_ass_font_text(text: &str) -> Option<String> {
+    let replaced = text.replace(",Arial,", ",Arial Unicode MS,");
+    (replaced != *text).then_some(replaced)
+}
+
 /// Case-insensitive `str::ends_with`.
 fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
     haystack.len() >= suffix.len()
@@ -848,4 +1015,76 @@ fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
 /// Case-insensitive `str::starts_with`.
 fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
     haystack.len() >= prefix.len() && haystack[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use rstest::rstest;
+
+    use super::{DOTNET_MAX_TIMER_DELAY_MS, subtitle_extraction_timeout};
+
+    /// `TimeSpan.FromMinutes(SubtitleExtractionTimeoutMinutes)`: the stock 30,
+    /// any other minute count, and zero (an immediate timeout) are durations;
+    /// a negative count, or one past the longest .NET timer delay, is rejected
+    /// rather than handed to the wait.
+    #[rstest]
+    #[case::stock_default(30, Some(Duration::from_mins(30)))]
+    #[case::one_minute(1, Some(Duration::from_mins(1)))]
+    #[case::zero_is_immediate(0, Some(Duration::ZERO))]
+    #[case::negative_is_invalid(-1, None)]
+    #[case::most_negative_is_invalid(i32::MIN, None)]
+    #[case::largest_is_invalid(i32::MAX, None)]
+    fn subtitle_extraction_timeout_is_whole_minutes(
+        #[case] minutes: i32,
+        #[case] expected: Option<Duration>,
+    ) {
+        assert_eq!(subtitle_extraction_timeout(minutes), expected);
+    }
+
+    /// The upper bound is the last whole minute within .NET's
+    /// `Timer.MaxSupportedTimeout` (`UInt32.MaxValue - 1` ms = 71,582 minutes);
+    /// one minute more is refused, as upstream's `CancelAfter` would throw.
+    #[test]
+    fn subtitle_extraction_timeout_stops_at_the_dotnet_timer_limit() {
+        let ms_per_minute = Duration::from_mins(1).as_millis();
+        let longest = i32::try_from(u128::from(DOTNET_MAX_TIMER_DELAY_MS) / ms_per_minute).unwrap();
+        assert_eq!(longest, 71_582);
+        assert_eq!(
+            subtitle_extraction_timeout(longest),
+            Some(Duration::from_mins(71_582))
+        );
+        assert_eq!(subtitle_extraction_timeout(longest + 1), None);
+    }
+
+    #[test]
+    fn set_ass_font_text_replaces_arial() {
+        let input = "Style: Default,Arial,20,&Hffffff";
+        let result = super::set_ass_font_text(input);
+        assert_eq!(
+            result.as_deref(),
+            Some("Style: Default,Arial Unicode MS,20,&Hffffff")
+        );
+    }
+
+    #[test]
+    fn set_ass_font_text_replaces_all_occurrences() {
+        let input = "Style: Default,Arial,20\nStyle: Italic,Arial,16";
+        let result = super::set_ass_font_text(input).unwrap();
+        assert_eq!(result.matches(",Arial Unicode MS,").count(), 2);
+        assert_eq!(result.matches(",Arial,").count(), 0);
+    }
+
+    #[test]
+    fn set_ass_font_text_unchanged_returns_none() {
+        assert!(super::set_ass_font_text("Style: Default,Noto Sans,20").is_none());
+    }
+
+    #[test]
+    fn set_ass_font_text_no_false_positive_on_partial_match() {
+        // `,ArialBlack,` should NOT be replaced (only exact `,Arial,`).
+        let input = "Style: Default,ArialBlack,20";
+        assert!(super::set_ass_font_text(input).is_none());
+    }
 }

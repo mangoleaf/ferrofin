@@ -81,8 +81,32 @@ impl SubtitleIo for FakeIo {
         ))
     }
 
-    async fn extract(&self, args: &str, _output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
         self.extract_args.lock().unwrap().push(args.to_owned());
+        // Simulate file creation so post-extraction checks see non-empty outputs.
+        let mut files = self.files.lock().unwrap();
+        for path in output_paths {
+            files
+                .entry(path.clone())
+                .or_insert_with(|| b"extracted".to_vec());
+        }
+        Ok(())
+    }
+
+    fn file_size(&self, path: &str) -> Option<u64> {
+        self.files.lock().unwrap().get(path).map(|v| v.len() as u64)
+    }
+
+    fn delete_file(&self, path: &str) -> Result<(), String> {
+        self.files.lock().unwrap().remove(path);
+        Ok(())
+    }
+
+    fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), content.to_vec());
         Ok(())
     }
 }

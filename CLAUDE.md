@@ -64,7 +64,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
 | `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0 and 12.1 databases in place) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1 and 12.2 databases in place) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
@@ -134,8 +134,8 @@ macros** — they require a live `DATABASE_URL` at build/CI time, which we delib
 The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whose
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
-`__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0 and 12.1.0, including both
-12.1 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
+`__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
+12.1 and both 12.2 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -236,7 +236,16 @@ integration tests are gated behind an env var and skip if ffmpeg is absent:
 ```bash
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
+FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
 ```
+
+The last one checks that chapter images, trickplay and Intro Skipper analysis are never
+redone for an unchanged file: library scans, the three scheduled tasks, every choice of
+jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate redo) on a
+library, a series and an episode, and a restart, with extraction both during the scan and
+by the tasks. Intro Skipper's automatic timer is off there (its scheduled task drives the
+same engine). It needs an ffmpeg with libx264, and CI does not run it (CI never sets
+`FERROFIN_FFMPEG_TESTS`): run it by hand for changes to those paths.
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
@@ -299,13 +308,14 @@ never exists.
 
 ### Adoption has its own live check — `adoption/`
 `adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
-10.11.10, 10.11.11, 12.0.0 and 12.1.0 databases, with separate 12.1 fixtures upgraded from
-10.11.8 and 12.0.0. Supply fixtures and build them once with `adoption/build-fixtures.sh`;
-they are never committed. On fresh copies it checks generation, migrations, Jellyfin 12.1's
-normalised smoke summaries, file integrity and a repair-free second boot. All seven paths
-passed on 2026-09-16; the [test record](adoption/README.md#supported-and-tested-versions)
-identifies the image used. Run it for any change to the migration chain, the adoption gate
-or the boot repairs. The shell tests in CI exercise the harness without these live fixtures.
+10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
+fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them once with
+`adoption/build-fixtures.sh`; they are never committed.  On fresh copies it checks
+generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
+repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
+identifies which versions passed and the image used.  Run it for any change to the migration
+chain, the adoption gate or the boot repairs.  The shell tests in CI exercise the harness
+without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

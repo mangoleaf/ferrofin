@@ -21,6 +21,7 @@
 //! transliterate hand-derived expectations from the C# logic.
 
 pub mod bitstream;
+pub mod downmix;
 pub mod helper;
 pub mod hw;
 pub mod transcode_state;

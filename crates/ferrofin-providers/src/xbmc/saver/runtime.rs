@@ -8,7 +8,6 @@ use quick_xml::{Reader, events::Event};
 #[derive(Clone, Copy)]
 pub(crate) struct DocumentExtras<'a> {
     pub item: &'a NfoBaseItem,
-    pub original_language: Option<&'a str>,
     pub images: &'a [ItemImageInfo],
     pub image_substitutions: &'a [ferrofin_model::configuration::PathSubstitution],
     pub streams: &'a [MediaStreamInfoEntity],
@@ -25,9 +24,6 @@ pub(crate) fn complete_document(
         buf: String::new(),
         depth: 1,
     };
-    if let Some(language) = extras.original_language.filter(|value| !value.is_empty()) {
-        writer.element("originallanguage", language);
-    }
     if extras.save_images {
         add_images(&mut writer, extras.images, extras.image_substitutions)?;
     }
@@ -366,11 +362,41 @@ mod tests {
     use super::*;
     use crate::container_types::MetadataResult;
 
+    /// `BaseNfoSaver.cs:501-504`: `<originallanguage>` follows `<originaltitle>`
+    /// directly, and a null-or-whitespace value writes no element.
+    #[test]
+    fn original_language_follows_original_title_and_skips_whitespace() {
+        let save = |language: &str| {
+            let result = MetadataResult {
+                item: NfoBaseItem {
+                    kind: NfoItemKind::Movie,
+                    name: Some("Title".into()),
+                    original_title: Some("Le Titre".into()),
+                    original_language: Some(language.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            super::super::save_movie(&result, &crate::xbmc::config::NfoConfiguration::default())
+        };
+        let xml = save("fr");
+        let title_end =
+            xml.find("</originaltitle>").expect("originaltitle") + "</originaltitle>".len();
+        assert!(
+            xml[title_end..]
+                .trim_start()
+                .starts_with("<originallanguage>fr</originallanguage>"),
+            "{xml}"
+        );
+        assert!(!save(" ").contains("originallanguage"));
+    }
+
     #[test]
     fn custom_nested_tags_survive_but_removed_owned_fields_do_not() {
         let mut item = NfoBaseItem {
             kind: NfoItemKind::Movie,
             name: Some("New & better".into()),
+            original_language: Some("fr".into()),
             ..Default::default()
         };
         item.set_provider_id("CustomProvider", "updated");
@@ -383,7 +409,6 @@ mod tests {
             super::super::save_movie(&result, &crate::xbmc::config::NfoConfiguration::default()),
             DocumentExtras {
                 item: &result.item,
-                original_language: Some("fr"),
                 images: &[],
                 image_substitutions: &[],
                 streams: &[],
@@ -406,7 +431,6 @@ mod tests {
             super::super::save_movie(&result, &crate::xbmc::config::NfoConfiguration::default()),
             DocumentExtras {
                 item: &result.item,
-                original_language: Some("fr"),
                 images: &[],
                 image_substitutions: &[],
                 streams: &[],

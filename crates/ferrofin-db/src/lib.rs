@@ -22,6 +22,7 @@ pub mod store;
 
 pub use database::{
     AdoptionState, Database, ImageParentRow, JELLYFIN_GENERATIONS, JellyfinGeneration,
+    MigrationHistory, inspect_migration_history,
 };
 
 /// How many ids one `IN (…)` query binds at a time: stays far below SQLite's

@@ -69,6 +69,8 @@ tracing-opentelemetry.workspace = true
 # manpage test: renders contrib/debian/ferrofin-server.1 from the clap `Cli`.
 clap_mangen.workspace = true
 tempfile.workspace = true
+# `[Theory]`/`[InlineData]` transliterations.
+rstest.workspace = true
 # restart integration test: drives the real `run()` over loopback HTTP.
 reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

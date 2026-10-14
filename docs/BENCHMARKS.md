@@ -89,6 +89,14 @@ They are not pooled with these runs, and differences from them are not regressio
 
 
 
+- **[2] `detail:item`, [5] `playback:playbackinfo`** — `MediaStreams[].IsOriginal` and
+  `LocalizedOriginal` are absent. These are 12.0 additions: Jellyfin **10.11.8 is missing
+  them on the same rows**, and Ferrofin targeted 10.11.8 when these numbers were taken.
+  Ferrofin now serves both fields (and `LocalizedLanguage`) as Jellyfin 12 does; the
+  numbers above are historical.
+- **[1], [3], [4], [6]–[12]** — 10.11.8 only, for the same reason (fields and counts that
+  changed in 12.0).
+
 ## CPU observations
 
 Each cell is the median of the three per-run observations, followed by its minimum–maximum range. These are diagnostic measurements: whole-workload CPU savings percentages are withheld because response and request-selection validation differs. Failed screens would remain in the completed-screen denominator; none failed in these runs.

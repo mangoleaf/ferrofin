@@ -301,6 +301,8 @@ async fn step_public_system_info(router: &axum::Router) {
         public.get("ServerName").is_some() || public.get("Id").is_some(),
         "public info carries server identity: {public}"
     );
+    // Clients gate on this (jellyfin-sdk-kotlin rejects anything below 12.0.0).
+    assert_eq!(public["Version"], "12.2.0", "reported Jellyfin version");
 }
 
 /// The authenticated user's id plus the access token echoed in the response.

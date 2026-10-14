@@ -8,11 +8,14 @@
 //!
 //! The controller carries Jellyfin's full ~90-parameter item query; the
 //! persistable subset shared with `GET /Items` is honored here (the remainder is
-//! applied by the persistence layer where portable, exactly as for `/Items`).
+//! applied by the persistence layer where portable, exactly as for `/Items`),
+//! including 12.1's `audioLanguages` / `subtitleLanguages` stream filters and
+//! the media-stream rules `GetItems` applies to them.
 
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy;
@@ -23,8 +26,10 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::items::resolve_user;
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::items::{apply_media_stream_filter_rules, resolve_user};
+use crate::handlers::query_parse::{
+    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// The paging/search/sort/filter subset of `GET /Trailers` this port honors.
@@ -95,6 +100,12 @@ struct TrailersQuery {
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
     enable_total_record_count: Option<bool>,
+    /// Comma-delimited audio-stream languages (12.1 `audioLanguages`).
+    #[serde(default)]
+    audio_languages: Option<String>,
+    /// Comma-delimited subtitle-stream languages (12.1 `subtitleLanguages`).
+    #[serde(default)]
+    subtitle_languages: Option<String>,
 }
 
 /// Builds the `order_by` list from parallel `sort_by`/`sort_order` lists.
@@ -119,6 +130,56 @@ fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemS
         .collect()
 }
 
+/// Maps the trailer query onto an [`InternalItemsQuery`] pinned to the
+/// `Trailer` kind, applying `GetItems`' controller rules in upstream order.
+///
+/// The user row moves into the query and is borrowed back out for the DTO
+/// projection — `resolve_user` already cloned it off the auth context, and a
+/// second full copy of every string on it buys nothing.
+fn trailers_query_options(
+    query: &TrailersQuery,
+    user: UserEntity,
+) -> Result<InternalItemsQuery, ApiError> {
+    let mut internal = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Trailer],
+        start_index: query.start_index,
+        limit: query.limit,
+        recursive: query.recursive.unwrap_or(false),
+        search_term: query.search_term.clone(),
+        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
+        genres: parse_pipe_strings(query.genres.as_deref()),
+        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
+        item_ids: parse_csv_uuids(query.ids.as_deref())?,
+        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
+        is_favorite: query.is_favorite,
+        is_played: query.is_played,
+        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
+        audio_languages: parse_csv_strings(query.audio_languages.as_deref()),
+        subtitle_languages: parse_csv_strings(query.subtitle_languages.as_deref()),
+        ..InternalItemsQuery::default()
+    };
+    // `GetItems` applies its media-stream rules before `ApplyFilters`
+    // (v12 ItemsController.cs:462-489).
+    apply_media_stream_filter_rules(&mut internal);
+    if let Some(parent) = query.parent_id {
+        internal.parent_id = parent;
+    }
+    // `TrailersController.GetTrailers` hands its arguments straight to
+    // `ItemsController.GetItems`, so the same two parameters drive
+    // `IsVirtualItem` here.
+    crate::handlers::query_parse::apply_location_types(
+        &mut internal.is_virtual_item,
+        query.location_types.as_deref(),
+        query.exclude_location_types.as_deref(),
+    );
+    let filters = parse_csv_enums_lenient(query.filters.as_deref());
+    internal
+        .apply_filters(&filters)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(internal)
+}
+
 /// `GET /Trailers` — the obsolete trailer browse.
 ///
 /// Port of `TrailersController.GetTrailers` (delegates to `GetItems` pinned to
@@ -136,42 +197,7 @@ async fn get_trailers(
     Query(query): Query<TrailersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-
-    // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
-    let mut internal = InternalItemsQuery {
-        user: Some(user),
-        include_item_types: vec![BaseItemKind::Trailer],
-        start_index: query.start_index,
-        limit: query.limit,
-        recursive: query.recursive.unwrap_or(false),
-        search_term: query.search_term.clone(),
-        order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
-        genres: parse_pipe_strings(query.genres.as_deref()),
-        genre_ids: parse_csv_uuids(query.genre_ids.as_deref())?,
-        item_ids: parse_csv_uuids(query.ids.as_deref())?,
-        exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
-        is_favorite: query.is_favorite,
-        is_played: query.is_played,
-        enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
-        ..InternalItemsQuery::default()
-    };
-    if let Some(parent) = query.parent_id {
-        internal.parent_id = parent;
-    }
-    // `TrailersController.GetTrailers` hands its arguments straight to
-    // `ItemsController.GetItems`, so the same two parameters drive
-    // `IsVirtualItem` here.
-    crate::handlers::query_parse::apply_location_types(
-        &mut internal.is_virtual_item,
-        query.location_types.as_deref(),
-        query.exclude_location_types.as_deref(),
-    );
-    let filters = parse_csv_enums_lenient(query.filters.as_deref());
-    internal
-        .apply_filters(&filters)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let internal = trailers_query_options(&query, user)?;
 
     let result = state.library.query_items(&internal).await?;
     let options = DtoOptions::with_all_fields(false);
@@ -201,5 +227,40 @@ crate::query::query_parameters! {
         "excludeItemIds" => ',',
         "locationTypes" => ',',
         "excludeLocationTypes" => ',',
+        "audioLanguages" => ',',
+        "subtitleLanguages" => ',',
     } => [("get", "/Trailers")];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `audioLanguages` / `subtitleLanguages` reach the trailer query and
+    /// `GetItems`' media-stream rules run (v12 TrailersController.cs:209-210;
+    /// ItemsController.cs:462-487). The repeated `audioLanguages` key pins
+    /// Ferrofin's own leniency, not upstream's binding: the shared query
+    /// normalizer joins repeated keys before the comma split, so every piece
+    /// binds, where upstream binds `["eng,ger", "fre"]` (see
+    /// `parse_csv_strings`).
+    #[test]
+    fn trailers_bind_the_stream_language_filters() {
+        let bind = |q: &str| {
+            let Query(query) = Query::<TrailersQuery>::try_from_uri(
+                &format!("/Trailers?{q}").parse().expect("uri"),
+            )
+            .expect(q);
+            trailers_query_options(&query, crate::test_support::sample_user()).expect("maps")
+        };
+        let internal = bind("audioLanguages=eng,ger&audioLanguages=fre&subtitleLanguages=spa");
+        assert_eq!(internal.include_item_types, [BaseItemKind::Trailer]);
+        assert_eq!(internal.audio_languages, ["eng", "ger", "fre"]);
+        assert_eq!(internal.subtitle_languages, ["spa"]);
+        assert!(internal.include_owned_items);
+
+        let internal = bind("recursive=true");
+        assert!(internal.audio_languages.is_empty());
+        assert!(internal.subtitle_languages.is_empty());
+        assert!(!internal.include_owned_items);
+    }
 }

@@ -71,8 +71,9 @@ use crate::translate_query::PLACEHOLDER_ID;
 /// (`RefreshCleanNamesAndValues`, `RefreshForcedSortNames`). Each partition is
 /// read with one keyset query and its rewrites committed as one transaction,
 /// which bounds both the memory a pass holds and the length of any single
-/// write lock.
-const REPAIR_PARTITION: i64 = 10_000;
+/// write lock. `adoption_repairs::harmonize_conflicting_user_data` reuses it
+/// as its partition size in conflict groups (upstream batches 500).
+pub(crate) const REPAIR_PARTITION: i64 = 10_000;
 
 /// One `Season` row as `recompute_season_keys` reads it:
 /// `(Id, SeriesId, IndexNumber, PresentationUniqueKey)`.
@@ -938,8 +939,8 @@ impl FerrofinItemPersistenceService {
 
     /// One-shot startup pass: recomputes `InheritedParentalRatingValue` /
     /// `InheritedParentalRatingSubValue` from every row's OWN `OfficialRating`
-    /// — Jellyfin 12.0's `MigrateRatingLevels` routine
-    /// (`Jellyfin.Server/Migrations/Routines/20260302090000_MigrateRatingLevels.cs`),
+    /// — Jellyfin's `MigrateRatingLevels` routine, as 12.2 re-dated it
+    /// (`Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs`),
     /// recorded in `FerrofinMeta` so later boots skip it.
     ///
     /// In one transaction, for each DISTINCT `OfficialRating`: a null/empty
@@ -958,12 +959,15 @@ impl FerrofinItemPersistenceService {
         &self,
         localization: &dyn ferrofin_traits::localization::LocalizationManager,
     ) -> Result<u64, ServiceError> {
-        // 12.1 re-dated `MigrateRatingLevels` (its `GetRatingScore` changed:
-        // whole-value lookup first, unrated parts skipped, case-insensitive
-        // tables), so the pass runs once more under a new key.
-        // Earlier Ferrofin builds loaded only the US table. Re-run once with
-        // the complete upstream dataset so existing non-US rows are filtered.
-        const META_KEY: &str = "rating_levels_all_countries";
+        // Jellyfin re-dates `MigrateRatingLevels` whenever its scoring changes,
+        // so every database recomputes once more; this key follows it. 12.2
+        // (`20260915120000`) brought new and corrected rating tables (ar, au,
+        // de, fr, id, it, no, tw, 0-prefer), a leading `-` read as a minimum
+        // age (`-12` → 12, not −12) and a guard that keeps a `/`-list from
+        // being split as one country-prefixed rating. Earlier keys:
+        // `rating_levels_v121` (12.1) and `rating_levels_all_countries` (the
+        // first pass with every country's table loaded).
+        const META_KEY: &str = "rating_levels_v122";
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
@@ -1211,9 +1215,54 @@ impl FerrofinItemPersistenceService {
             query = query.bind(crate::item_data::date_modified_follows_save(item));
         }
         query.execute(self.db.writer()).await.map_err(db_err)?;
+        if scan {
+            self.push_name_to_children(item).await?;
+        }
+        Ok(())
+    }
+
+    /// `BeforeSaveInternal` names an episode or a season after its parents
+    /// (`FindSeriesName()`, `FindSeasonName()`), and upstream's library scan
+    /// saves every child, so a renamed series' children take its name on the
+    /// next scan. A Ferrofin scan leaves unchanged children alone (the scan
+    /// names the ones it refreshes, `sync_series_name`/`sync_season_name`),
+    /// so a saved series (season) writes its STORED name — a locked one's
+    /// included — onto its seasons and episodes (episodes) here, stamping
+    /// `DateLastSaved` so clients see the change. Like upstream's
+    /// `BeforeSaveInternal`, a child's own lock does not keep a custom
+    /// series (season) name.
+    async fn push_name_to_children(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
+        let sql = match crate::item_type_lookup::kind_from_type_name(&item.type_) {
+            Some(BaseItemKind::Series) => CHILD_SERIES_NAME_SQL,
+            Some(BaseItemKind::Season) => CHILD_SEASON_NAME_SQL,
+            _ => return Ok(()),
+        };
+        sqlx::query(sql)
+            .bind(datetime_to_db(chrono::Utc::now()))
+            .bind(&item.id)
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 }
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a series:
+/// its seasons and episodes (the only rows with a `SeriesId`), through
+/// `IX_BaseItems_SeriesId`.
+const CHILD_SERIES_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeriesName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeriesId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeriesName" IS NOT parent."Name""#;
+
+/// [`FerrofinItemPersistenceService::push_name_to_children`] for a season:
+/// its episodes, through `IX_BaseItems_SeasonId`.
+const CHILD_SEASON_NAME_SQL: &str = r#"UPDATE "BaseItems" SET "SeasonName" = parent."Name", "DateLastSaved" = ?1
+    FROM "BaseItems" AS parent
+    WHERE parent."Id" = ?2 AND "BaseItems"."SeasonId" = ?2
+      AND nullif(parent."Name", '') IS NOT NULL
+      AND "BaseItems"."SeasonName" IS NOT parent."Name""#;
 
 /// One `BaseItems` column value as [`FerrofinItemPersistenceService`] binds
 /// it: dates already in [`datetime_to_db`]'s text form, so two values compare
@@ -2786,13 +2835,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 query = query.bind(guid_to_db(*parent));
             }
             let parse = |id: Option<String>| id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-            for (id, parent, owner, path, extra_type) in
+            for (id, parent, season, owner, path, extra_type) in
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 if let Ok(id) = Uuid::parse_str(&id) {
                     out.push(ItemChildLink {
                         id,
                         parent_id: parse(parent),
+                        season_id: parse(season),
                         owner_id: parse(owner),
                         extra_type,
                         path,
@@ -5578,10 +5628,11 @@ pub(crate) fn local_group_paths_sql(n: usize) -> String {
     )
 }
 
-/// One row of [`child_links_sql`]: `Id`, `ParentId`, `OwnerId`, `Path`,
-/// `ExtraType`.
+/// One row of [`child_links_sql`]: `Id`, `ParentId`, `SeasonId`,
+/// `OwnerId`, `Path`, `ExtraType`.
 type ChildLinkRow = (
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -5591,8 +5642,8 @@ type ChildLinkRow = (
 pub(crate) fn child_links_sql(n: usize) -> String {
     let ids = numbered_placeholders(n);
     format!(
-        r#"SELECT "Id", "ParentId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
-            WHERE "ParentId" IN ({ids}) OR "OwnerId" IN ({ids})"#
+        r#"SELECT "Id", "ParentId", "SeasonId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
+            WHERE "ParentId" IN ({ids}) OR "SeasonId" IN ({ids}) OR "OwnerId" IN ({ids})"#
     )
 }
 
@@ -8949,6 +9000,95 @@ mod tests {
         );
     }
 
+    /// A saved series (season) pushes its stored name onto children the scan
+    /// does not save; a locked parent's stored name wins over the incoming
+    /// one. Editor saves push nothing (the editor has its own cascade).
+    #[tokio::test]
+    async fn a_saved_parent_pushes_its_stored_name_to_its_children() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_db::store::guid_to_db;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (series, season, episode) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let row = |id: Uuid, kind: &str, name: &str| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: format!("MediaBrowser.Controller.Entities.TV.{kind}"),
+            name: Some(name.to_owned()),
+            series_id: (kind != "Series").then(|| guid_to_db(series)),
+            season_id: (kind == "Episode").then(|| guid_to_db(season)),
+            series_name: (kind != "Series").then(|| "Show 2026".to_owned()),
+            season_name: (kind == "Episode").then(|| "Season 1".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        svc.save_items(&[
+            row(series, "Series", "Show 2026"),
+            row(season, "Season", "Season 1"),
+            row(episode, "Episode", "Pilot"),
+        ])
+        .await
+        .expect("seed");
+        let names = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+                    r#"SELECT "SeriesName", "SeasonName", "DateLastSaved" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+            }
+        };
+        let saved_before = names(episode).await.2;
+
+        // An editor save of the series pushes nothing.
+        svc.save_items(&[row(series, "Series", "Edited")])
+            .await
+            .expect("editor save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show 2026"));
+
+        // A provider renames the series: its season and episode follow.
+        svc.save_scanned_items(&[row(series, "Series", "Show")])
+            .await
+            .expect("rename");
+        assert_eq!(names(season).await.0.as_deref(), Some("Show"));
+        let (series_name, _, saved) = names(episode).await;
+        assert_eq!(series_name.as_deref(), Some("Show"));
+        assert_ne!(
+            saved, saved_before,
+            "the pushed rename stamps DateLastSaved"
+        );
+
+        // A renamed season pushes onto its episodes.
+        svc.save_scanned_items(&[row(season, "Season", "Specials")])
+            .await
+            .expect("season rename");
+        assert_eq!(names(episode).await.1.as_deref(), Some("Specials"));
+
+        // A locked series keeps its stored name, and pushes that one.
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(series))
+            .execute(db.writer())
+            .await
+            .expect("lock");
+        svc.save_scanned_items(&[row(series, "Series", "Incoming")])
+            .await
+            .expect("locked save");
+        assert_eq!(names(episode).await.0.as_deref(), Some("Show"));
+
+        // Both pushes stay on their parent-id index.
+        for (sql, index) in [
+            (super::CHILD_SERIES_NAME_SQL, "IX_BaseItems_SeriesId"),
+            (super::CHILD_SEASON_NAME_SQL, "IX_BaseItems_SeasonId"),
+        ] {
+            let plan = query_plan(&db, sql, 2).await;
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+
     // One test for the whole scan statement: its guards are derived from one
     // text substitution, so they are asserted together.
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
@@ -9950,7 +10090,7 @@ mod tests {
         assert_eq!(left, 0);
     }
 
-    /// The `rating_levels_v12` repair (Jellyfin 12.0 `MigrateRatingLevels`):
+    /// The rating-level repair (Jellyfin `MigrateRatingLevels`):
     /// every row's inherited rating columns are recomputed from its OWN
     /// `OfficialRating` through `GetRatingScore` — a bare age, a US table
     /// entry with a sub-score, a "Rated R" spelling — and cleared when the
@@ -9963,10 +10103,6 @@ mod tests {
         let db = test_db().await;
         let service = FerrofinItemPersistenceService::new(db.clone());
         let localization = crate::localization_manager::LocalizationManager::new("US");
-        service
-            .mark_repair_done("rating_levels_v121")
-            .await
-            .unwrap();
         let cases: [RatingCase; 7] = [
             (0x7A01, Some("12"), Some(12), None),
             (0x7A02, Some("TV-MA"), Some(17), Some(1)),
@@ -10024,6 +10160,106 @@ mod tests {
             0,
             "the repair runs once per database"
         );
+    }
+
+    /// Seeds one `BaseItems` row per `(OfficialRating, Score, SubScore)` with
+    /// those stored inherited-rating columns, returning the ids in order.
+    async fn seed_rated_rows(
+        db: &ferrofin_db::Database,
+        rows: &[(&str, Option<i64>, Option<i64>)],
+        first_id: u128,
+    ) -> Vec<Uuid> {
+        use crate::test_support::{fetch_item, save_item, seed_named_item};
+        let mut ids = Vec::with_capacity(rows.len());
+        for (offset, (rating, score, sub_score)) in (0u128..).zip(rows) {
+            let id = Uuid::from_u128(first_id + offset);
+            seed_named_item(db, id, BaseItemKind::Movie, "Film").await;
+            let mut row = fetch_item(db, id).await;
+            row.official_rating = Some((*rating).to_owned());
+            row.inherited_parental_rating_value = *score;
+            row.inherited_parental_rating_sub_value = *sub_score;
+            save_item(db, &row).await;
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The 12.2 key is new: a database whose ratings were last recomputed by
+    /// the all-countries pass (`rating_levels_all_countries`, rc7 tables and
+    /// scoring) recomputes once more, and then not again.
+    #[tokio::test]
+    async fn repair_rating_levels_reruns_on_a_database_marked_by_the_all_countries_pass() {
+        use crate::test_support::fetch_item;
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        service
+            .mark_repair_done("rating_levels_all_countries")
+            .await
+            .expect("mark the previous pass");
+        // What the rc7 scoring stored for a French minimum age.
+        let ids = seed_rated_rows(&db, &[("-12", Some(-12), None)], 0x7B01).await;
+
+        assert!(
+            service
+                .repair_rating_levels(&localization)
+                .await
+                .expect("repair")
+                >= 1
+        );
+        let row = fetch_item(&db, ids[0]).await;
+        assert_eq!(
+            (
+                row.inherited_parental_rating_value,
+                row.inherited_parental_rating_sub_value
+            ),
+            (Some(12), None)
+        );
+        assert_eq!(
+            service
+                .repair_rating_levels(&localization)
+                .await
+                .expect("second run"),
+            0
+        );
+    }
+
+    /// A database Jellyfin 12.2 already migrated keeps every score its own
+    /// `MigrateRatingLevels` stored (US server; the fallback walks US first,
+    /// then the tables in file-name order). Before the 12.2 port, `-12` was
+    /// rewritten to −12 and `SAM 13` (missing from rc7's `ar.json`) to NULL.
+    #[tokio::test]
+    async fn adopted_jellyfin_12_2_rating_scores_survive_the_repair() {
+        use crate::test_support::fetch_item;
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let localization = crate::localization_manager::LocalizationManager::new("US");
+        let stored: [(&str, Option<i64>, Option<i64>); 6] = [
+            ("12A", Some(12), Some(0)),   // gb
+            ("FSK 16", Some(16), None),   // de
+            ("-12", Some(12), None),      // a bare minimum age
+            ("MA15+", Some(15), Some(3)), // au
+            ("SAM 13", Some(13), None),   // ar, new in 12.2
+            ("PG-13", Some(13), Some(0)), // us
+        ];
+        let ids = seed_rated_rows(&db, &stored, 0x7C01).await;
+
+        service
+            .repair_rating_levels(&localization)
+            .await
+            .expect("repair");
+
+        for (id, (rating, score, sub_score)) in ids.into_iter().zip(stored) {
+            let row = fetch_item(&db, id).await;
+            assert_eq!(
+                (
+                    row.inherited_parental_rating_value,
+                    row.inherited_parental_rating_sub_value
+                ),
+                (score, sub_score),
+                "{rating}"
+            );
+        }
     }
 
     /// `series_key_scope`: the language falls through row → library → server,
@@ -10912,10 +11148,14 @@ mod tests {
                     .any(|s| s.contains("IX_BaseItems_ParentId") && s.contains("ParentId=?"))
                     && seeks
                         .iter()
+                        .any(|s| s.contains("IX_BaseItems_SeasonId") && s.contains("SeasonId=?"))
+                    && seeks
+                        .iter()
                         .any(|s| s.contains("IX_BaseItems_OwnerId") && s.contains("OwnerId=?"))
                     && seeks.iter().all(|s| s.contains("IX_BaseItems_ParentId")
+                        || s.contains("IX_BaseItems_SeasonId")
                         || s.contains("IX_BaseItems_OwnerId")),
-                "the children by ParentId and OwnerId (n={n}), got: {plan:?}"
+                "the children by ParentId, SeasonId and OwnerId (n={n}), got: {plan:?}"
             );
         }
     }

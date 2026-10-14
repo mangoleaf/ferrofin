@@ -29,6 +29,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 /// fails on a loaded runner.
 const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
 
+/// How long a set-up server gets to refuse a boot without its database. The
+/// refusal comes before the database, ffmpeg or the listener are touched, so
+/// it is quick; the bound only turns a regression that serves instead into a
+/// failure rather than a test that never ends.
+const REFUSAL_DEADLINE: Duration = Duration::from_mins(1);
+
 /// A port nobody is listening on right now (bind 0, read, release).
 ///
 /// A probe, not a reservation: the listener closes before the server binds, so
@@ -108,6 +114,15 @@ async fn spawn_server(
                 return (server, base, name);
             }
             if server.is_finished() {
+                // Only a lost port is worth another try; any other exit (a
+                // refused boot, a panic) is the failure to report.
+                let outcome = server.join();
+                let port_taken = matches!(&outcome, Ok(Err(error)) if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+                }));
+                assert!(port_taken, "the server exited before serving: {outcome:?}");
                 lost_the_port = true;
                 break;
             }
@@ -439,6 +454,99 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         "the restored database predates the user: {users}"
     );
 
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
+/// Jellyfin 12.2's start-over guard: a server that has been set up refuses to
+/// start once its database is gone — instead of creating an empty one and
+/// seeding a new administrator — and creates nothing; a scheduled restore that
+/// brings the database back starts it again, users and passwords intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_set_up_server_refuses_a_missing_database_until_a_restore_brings_it_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let make_config = |port| Config {
+        server_name: "ferrofin-start-over".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    };
+    // Seeding the configured administrator marks setup as completed.
+    let (server, base, _) = spawn_server(&client, make_config).await;
+    let tok = token(&client, &base).await;
+    let admin_id = get_json(&client, &base, "/Users/Me", &tok).await["Id"].clone();
+    assert!(admin_id.is_string(), "{admin_id}");
+    let (st, manifest) = post_json(
+        &client,
+        &base,
+        "/Backup/Create",
+        &tok,
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(st, 200, "{manifest}");
+    let archive = std::path::PathBuf::from(manifest["Path"].as_str().expect("archive path"));
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+
+    let database = make_config(0).database_path();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = database.clone().into_os_string();
+        path.push(suffix);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("remove {}: {e}", path.to_string_lossy()),
+        }
+    }
+
+    let config = make_config(free_port());
+    let refused = tokio::time::timeout(
+        REFUSAL_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Runtime::new()
+                .expect("server runtime")
+                .block_on(ferrofin_server::run(config))
+        }),
+    )
+    .await
+    .expect("a set-up server without its database must refuse to start, not serve")
+    .expect("server thread did not panic")
+    .expect_err("a set-up server must not start without its database");
+    let message = format!("{refused:#}");
+    assert!(message.contains("the database does not exist"), "{message}");
+    assert!(message.contains("IsStartupWizardCompleted"), "{message}");
+    assert!(!database.exists(), "the refused start created a database");
+
+    // `POST /Backup/Restore`'s marker, as the endpoint writes it.
+    std::fs::write(
+        archive.with_file_name("restore-pending"),
+        archive
+            .file_name()
+            .expect("archive name")
+            .as_encoded_bytes(),
+    )
+    .expect("schedule the restore");
+    let (server, base, _) = spawn_server(&client, make_config).await;
+    let tok = token(&client, &base).await;
+    assert_eq!(
+        get_json(&client, &base, "/Users/Me", &tok).await["Id"],
+        admin_id,
+        "the restored database's administrator, not a newly seeded one"
+    );
     assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
     tokio::task::spawn_blocking(move || server.join())
         .await

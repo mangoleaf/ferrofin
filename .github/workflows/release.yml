@@ -30,7 +30,10 @@ permissions: {} # each job grants only what it needs
 jobs:
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # main, or a release/* branch that freezes a release's scope while main moves on.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
     runs-on: ubuntu-latest
     permissions:
       contents: read # the tag push uses RELEASE_TOKEN, not GITHUB_TOKEN

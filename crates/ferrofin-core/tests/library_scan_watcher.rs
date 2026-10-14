@@ -622,6 +622,50 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
     assert!(series_requests(&fx.tmdb.take()).is_empty());
 }
 
+/// A provider names the series (TMDb answers "Show" for the folder "Flat"):
+/// the same scan saves its seasons and episodes with that name
+/// (`BeforeSaveInternal`: `SeriesName = FindSeriesName()`), and the next
+/// scan finds nothing to change.
+#[tokio::test(flavor = "multi_thread")]
+async fn children_carry_the_provider_series_name_and_a_rescan_changes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    touch(&media.join("Flat"), "Flat S01E01.mkv");
+    touch(&media.join("Flat"), "Flat S02E01.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let names: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Type", "Name", "SeriesName" FROM "BaseItems"
+           WHERE "TopParentId" IS NOT NULL AND "TopParentId" <> '' ORDER BY "Type""#,
+    )
+    .fetch_all(fx.db.pool())
+    .await
+    .expect("names");
+    let series = names
+        .iter()
+        .find(|(kind, ..)| kind.ends_with("TV.Series"))
+        .and_then(|(_, name, _)| name.clone())
+        .expect("series");
+    assert_eq!(series, "Show", "the provider named the series");
+    let children: Vec<_> = names
+        .iter()
+        .filter(|(kind, ..)| kind.ends_with("TV.Season") || kind.ends_with("TV.Episode"))
+        .collect();
+    assert_eq!(children.len(), 4, "{names:?}");
+    for (kind, _, series_name) in children {
+        assert_eq!(series_name.as_deref(), Some("Show"), "{kind}");
+    }
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        (rescan.created, rescan.updated, rescan.removed),
+        (0, 0, 0),
+        "{rescan:?}"
+    );
+}
+
 /// A flat series — episodes in the series folder, no season folders. A new
 /// loose episode of a new season number gets its virtual season, created
 /// with it: the row a library scan would plan (same id, parent and
@@ -664,8 +708,8 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(new_season.len(), 1);
     assert_eq!(
         after[&id(BaseItemKind::Episode, &episode)].2.as_deref(),
-        Some(new_season[0].as_str()),
-        "the episode's parent is its virtual season, stored"
+        Some(id(BaseItemKind::Series, &series).as_str()),
+        "the episode's parent is its series"
     );
     assert_eq!(
         new_season[0],
@@ -690,7 +734,7 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(seasons(&rows), seasons(&after));
     assert_eq!(
         rows[&id(BaseItemKind::Episode, &second)].2.as_deref(),
-        Some(new_season[0].as_str())
+        Some(id(BaseItemKind::Series, &series).as_str()),
     );
 }
 

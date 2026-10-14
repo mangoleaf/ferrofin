@@ -24,11 +24,12 @@ adoption_check_boot_log() {
   if grep -Eq '"level":"ERROR"' "$log"; then echo "ERROR in boot log"; fi
 }
 
-# adoption_compare_smoke <oracle> <smoke>: a reason when the normalised answers differ.
+# adoption_compare_smoke <oracle> <smoke>: a reason when the normalised answers differ, naming
+# the oracle's release (ORACLE_VERSION, which run.sh sets from --oracle).
 adoption_compare_smoke() {
   local oracle=$1 smoke=$2
   diff -q <(adoption_normalise "$oracle") <(adoption_normalise "$smoke") >/dev/null \
-    || echo "smoke differs from Jellyfin 12.1 (diff $oracle $smoke)"
+    || echo "smoke differs from Jellyfin ${ORACLE_VERSION:-12.1} (diff $oracle $smoke)"
 }
 
 # adoption_check_db <jellyfin.db>: integrity_check and foreign_key_check on the adopted file.

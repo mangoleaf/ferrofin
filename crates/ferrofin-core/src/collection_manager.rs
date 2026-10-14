@@ -347,18 +347,25 @@ impl CollectionManager for FerrofinCollectionManager {
 
     async fn get_collections_containing_item(
         &self,
-        _user_id: Uuid,
+        user: &ferrofin_db::entities::users::UserEntity,
         item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Parents of `item_id` that are box sets (per-user visibility filtering
-        // is a deferred parental-control concern).
+        // C#: the manual-link parents of type BoxSet, each resolved through
+        // `GetItemById<BoxSet>(parentId, user)` — hidden ones drop out.
+        if item_id.is_nil() {
+            return Ok(Vec::new());
+        }
         let parent_ids = self
             .linked_children
             .get_manual_linked_parent_ids(item_id, Some(BaseItemKind::BoxSet))
             .await?;
         let mut out = Vec::new();
         for parent_id in parent_ids {
-            if let Some(row) = self.library_manager.get_item_by_id(parent_id).await? {
+            if let Some(row) = self
+                .library_manager
+                .get_item_by_id_for_user(parent_id, Some(user))
+                .await?
+            {
                 out.push(row);
             }
         }
@@ -1393,7 +1400,37 @@ mod tests {
         seed_item(&db, movie_a, BaseItemKind::Movie).await;
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
 
-        let mgr = collection_manager_over(&db);
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let items = item_repository_over(db.clone());
+        let library = Arc::new(
+            crate::library_manager::FerrofinLibraryManager::new(
+                items.clone(),
+                Arc::new(crate::item_count_service::FerrofinItemCountService::new(
+                    db.clone(),
+                )),
+                Arc::new(
+                    crate::item_persistence_service::FerrofinItemPersistenceService::new(
+                        db.clone(),
+                    ),
+                ),
+                Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
+                    db.clone(),
+                )),
+            )
+            .with_visibility(Arc::new(crate::item_visibility::ItemVisibility::new(
+                db.clone(),
+                items,
+                Arc::new(crate::LocalizationManager::new("US")),
+                data_dir.path().to_string_lossy().into_owned(),
+            ))),
+        );
+        let mgr = FerrofinCollectionManager::new(
+            db.clone(),
+            library,
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        );
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
 
         let options = CollectionCreationOptions {
             name: "Favourites".to_owned(),
@@ -1409,17 +1446,38 @@ mod tests {
             .expect("add");
 
         let containing = mgr
-            .get_collections_containing_item(Uuid::new_v4(), movie_b)
+            .get_collections_containing_item(&user, movie_b)
             .await
             .expect("containing");
         assert_eq!(containing.len(), 1);
         assert_eq!(containing[0].id, created.id);
+        assert!(
+            mgr.get_collections_containing_item(&user, Uuid::nil())
+                .await
+                .expect("nil")
+                .is_empty()
+        );
+
+        // C# resolves each set through `GetItemById<BoxSet>(id, user)`: a set
+        // above the user's parental limit drops out.
+        let mut rated = crate::test_support::fetch_item(&db, collection_id).await;
+        rated.official_rating = Some("R".to_owned());
+        crate::test_support::save_item(&db, &rated).await;
+        let mut limited = user.clone();
+        limited.max_parental_rating_score = Some(12);
+        assert!(
+            mgr.get_collections_containing_item(&limited, movie_b)
+                .await
+                .expect("limited")
+                .is_empty(),
+            "a set the user may not see is not listed"
+        );
 
         mgr.remove_from_collection(collection_id, &[movie_b])
             .await
             .expect("remove");
         let containing = mgr
-            .get_collections_containing_item(Uuid::new_v4(), movie_b)
+            .get_collections_containing_item(&user, movie_b)
             .await
             .expect("containing2");
         assert!(containing.is_empty());

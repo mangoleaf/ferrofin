@@ -93,6 +93,9 @@ struct ArtworkCache {
         HashMap<Uuid, Vec<ferrofin_db::entities::base_items::AttachmentStreamInfoEntity>>,
     /// Final season names for episode `BeforeSaveInternal`, read once per pass.
     season_names: HashMap<String, Option<String>>,
+    /// Final series names for season and episode `BeforeSaveInternal`, read
+    /// once per pass.
+    series_names: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
     /// Lookup locales already resolved by this pass's metadata providers.
@@ -2416,10 +2419,11 @@ fn collapse_roots(mut roots: Vec<String>) -> Vec<String> {
 /// Deleting a row takes its `ParentId` descendants with it (the foreign key
 /// cascades), so a stale row whose child is kept — planned, under a folder
 /// that failed to list or an unavailable location, or kept because its file
-/// is still on disk — must stay: a virtual season whose loose episodes sit
-/// in a folder that failed to list is not removed with them unknown, as
+/// is still on disk — must stay. A kept episode also holds its season
+/// (`SeasonId`): a virtual season's episodes are stored under the series, and
 /// upstream removes a virtual season only when it has no episode left
-/// (`SeriesMetadataService.cs:172-207`). An extra (`OwnerId`) holds its owner
+/// (`SeriesMetadataService.cs:172-207`), so one whose loose episodes sit in a
+/// folder that failed to list is not removed with them unknown. An extra (`OwnerId`) holds its owner
 /// only while this scan planned it (`live`: its stored row may still name the
 /// old owner — an undecodable one is rewritten by its file facts only) or it
 /// is unknown itself (under a folder that did not list): otherwise
@@ -2440,11 +2444,12 @@ fn hold_back_kept_children(
             .filter(|child| !stale.contains(&child.id))
             .flat_map(|child| {
                 let parent = child.parent_id.filter(|p| stale.contains(p));
+                let season = child.season_id.filter(|s| stale.contains(s));
                 let owner = child.owner_id.filter(|o| {
                     stale.contains(o)
                         && (live.contains(&child.id) || !listed(child.path.as_deref()))
                 });
-                parent.into_iter().chain(owner)
+                parent.into_iter().chain(season).chain(owner)
             })
             .collect();
         let before = held;
@@ -2959,7 +2964,7 @@ impl PlanCtx<'_> {
     /// virtual season, the one kind planned without a path — is kept as
     /// well: [`plan_loose_episodes`](LibraryScanner::plan_loose_episodes)
     /// groups only the loose episodes the scope keeps, so each virtual
-    /// season it emits is the parent of a kept episode, exactly as the full
+    /// season it emits is the season of a kept episode, exactly as the full
     /// plan emits it.
     fn emit(&self, out: &mut Vec<Planned>, item: Planned) {
         let kept = match (self.scope.roots, item.entity.path.as_deref()) {
@@ -6021,6 +6026,7 @@ impl LibraryScanner {
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
         cache.season_names.retain(|id, _| !keys.contains(id));
+        cache.series_names.retain(|id, _| !keys.contains(id));
         cache.locale_parents.retain(|id, _| !keys.contains(id));
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         let albums: Vec<Uuid> = touched
@@ -6586,6 +6592,7 @@ impl LibraryScanner {
         if embedded_title.is_none() {
             settle_extra_name(&mut entity, &item.entity, locked_fields);
         }
+        self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
         self.apply_parental_rating_score(&mut entity).await?;
         let chosen_ids_differ = identified.is_some_and(|result| {
@@ -9291,9 +9298,43 @@ impl LibraryScanner {
         fold.result
     }
 
+    /// `Episode/SeasonMetadataService.BeforeSaveInternal`: `SeriesName =
+    /// FindSeriesName()` — the finalized parent series' name (including locked
+    /// edits and preserved case) when the series exists, else the child's
+    /// own. A series' rename reaches the children this scan does not refresh
+    /// through the save (`push_name_to_children` in the persistence service).
+    async fn sync_series_name(
+        &self,
+        row: &mut BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Result<(), ServiceError> {
+        match item_type_lookup::kind_from_type_name(&row.type_) {
+            Some(BaseItemKind::Series) => {
+                cache.series_names.insert(row.id.clone(), row.name.clone());
+            }
+            Some(BaseItemKind::Season | BaseItemKind::Episode) => {
+                if let Some(key) = row.series_id.as_ref() {
+                    if !cache.series_names.contains_key(key)
+                        && let Some(items) = &self.item_repository
+                        && let Some(id) = parse_id(key)
+                        && let Some(series) = items.retrieve_item(id).await?
+                    {
+                        cache.series_names.insert(key.clone(), series.name);
+                    }
+                    if let Some(name) = cache.series_names.get(key) {
+                        row.series_name.clone_from(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// `EpisodeMetadataService.BeforeSaveInternal` takes the finalized parent
-    /// season's name, including locked edits and preserved case. A season-only
-    /// refresh does not rewrite its episodes until they are refreshed as well.
+    /// season's name, including locked edits and preserved case. A season's
+    /// rename reaches the episodes this scan does not refresh through the
+    /// save (`push_name_to_children` in the persistence service).
     async fn sync_season_name(
         &self,
         row: &mut BaseItemEntity,
@@ -10020,7 +10061,13 @@ impl LibraryScanner {
                     // id is not one it resolves by.
                     let name = lookup.name(row)?;
                     let year = lookup.year(row);
-                    pick_series_hit(tvdb.search(&name, year).await, year)?.tvdb_id
+                    let language = lookup.metadata_language(FetcherPolicy::default());
+                    let names = self.three_letter_language_names(&language);
+                    tvdb.search(&name, year, &language, &names)
+                        .await
+                        .into_iter()
+                        .next()?
+                        .tvdb_id
                 };
                 let country =
                     self.three_letter_country(&lookup.metadata_country(FetcherPolicy::default()));
@@ -10092,10 +10139,24 @@ impl LibraryScanner {
                 // `TvdbEpisodeProvider` names no `ResultLanguage`.
                 let mut answer = RemoteAnswer::for_row(row, None);
                 apply_tvdb_episode(&mut answer.item, &ep, display_order.is_empty());
-                // Cast & Crew on an episode page is the EPISODE's credits, not
-                // the series': TVDB's episode record, a list even when it
-                // credits nobody (`TvdbEpisodeProvider.cs:225`).
-                answer.people = Some(tvdb_people(&ep.people));
+                // TVDB's per-episode record credits only guest stars and
+                // crew (directors/writers); the series' regular actors live
+                // on the series record. TMDB per-episode credits include
+                // regulars, so when TMDB runs first the fold already has
+                // actors. But when this TVDB answer is the only source —
+                // the series has no TMDB id, or TMDB returned nothing — the
+                // episode page would show no actors at all. Merge the
+                // cached series' actors in ahead of the episode credits,
+                // deduplicating anyone the episode already credits.
+                let series_people = cache
+                    .series_tvdb
+                    .get(&series_id)
+                    .map(|d| d.people.as_slice())
+                    .unwrap_or_default();
+                answer.people = Some(merge_series_cast(
+                    tvdb_people(&ep.people),
+                    series_people,
+                ));
                 // `TvdbEpisodeProvider` sets the episode's Tvdb id and the
                 // IMDb id its remote ids carry.
                 answer
@@ -14109,9 +14170,11 @@ impl LibraryScanner {
     }
 
     /// Groups season-folder-less episodes into **virtual** `Season`s by their
-    /// filename-detected season number, emitting one `Season` per distinct number
-    /// and each episode parented to it. A file with no detectable season number
-    /// falls into a single "Season Unknown" grouping.
+    /// filename-detected season number, emitting one `Season` per distinct number;
+    /// each episode stays parented to the series, the folder it is in, and names
+    /// its season by `SeasonId` and as an ancestor ([`EpisodeHome::parent`]). A
+    /// file with no detectable season number falls into a single "Season
+    /// Unknown" grouping.
     // The C# planner's parameter list, plus the scanner receiver.
     #[allow(clippy::too_many_arguments)]
     fn plan_loose_episodes(
@@ -14201,6 +14264,7 @@ impl LibraryScanner {
                 series_name,
                 series_key,
                 season_name: Some(&season_name),
+                virtual_season: true,
             };
             self.plan_episode_file(path, home, ctx, out);
         }
@@ -14260,6 +14324,7 @@ impl LibraryScanner {
                     series_name,
                     series_key,
                     season_name,
+                    virtual_season: false,
                 };
                 self.plan_episode_file(&entry.path, home, ctx, out);
             } else if !ctx.tv_library.get() {
@@ -15504,20 +15569,6 @@ fn album_name_consensus(tracks: &[BaseItemEntity]) -> Option<String> {
     names.all(|n| n == first).then_some(first)
 }
 
-/// Picks the TVDB series candidate for a folder-derived `year`.
-///
-/// TVDB's `year` query parameter only biases the ranking — it does not filter —
-/// so a same-titled remake can outrank the year the folder actually names
-/// ("Doctor Who (1963)" matching the 2005 series). An exact year match wins;
-/// otherwise the API's own ordering stands.
-fn pick_series_hit(
-    hits: Vec<ferrofin_providers::TvdbSearchHit>,
-    year: Option<i32>,
-) -> Option<ferrofin_providers::TvdbSearchHit> {
-    year.and_then(|y| hits.iter().find(|h| h.year == Some(y)).cloned())
-        .or_else(|| hits.into_iter().next())
-}
-
 /// The item kinds a library's tile collage samples — port of
 /// `DtoExtensions.GetBaseItemKindsForCollectionType`, which
 /// `CollectionFolderImageProvider` uses to pick the rows whose Primary images
@@ -16424,13 +16475,22 @@ struct EpisodeHome<'a> {
     series_key: &'a str,
     /// The season's name.
     season_name: Option<&'a str>,
+    /// Whether the season is virtual: grouped from files in the series folder
+    /// (`SeriesMetadataService.CreateSeasonsAsync`), not the folder they are in.
+    virtual_season: bool,
 }
 
 impl EpisodeHome<'_> {
-    /// What an episode here hangs off — its season, else the series — and its
-    /// ancestors.
+    /// What an episode here hangs off and its ancestors. Upstream's `ParentId`
+    /// is the folder the file was found in: a season folder, or the series
+    /// for an episode of a virtual season, which `CreateSeasonsAsync` only
+    /// links by `SeasonId`. Either way the season is an ancestor
+    /// (`Episode.GetAncestorIds()` adds `SeasonId`).
     fn parent(self) -> (Uuid, Vec<Uuid>) {
         match self.season {
+            Some((season_id, _)) if self.virtual_season => {
+                (self.series_id, vec![self.cf, self.series_id, season_id])
+            }
             Some((season_id, _)) => (season_id, vec![self.cf, self.series_id, season_id]),
             None => (self.series_id, vec![self.cf, self.series_id]),
         }
@@ -17447,6 +17507,8 @@ impl ResolverGuesses {
         replace_all_metadata: bool,
     ) -> Self {
         entity.sort_name = None;
+        let is_series =
+            item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Series);
         let name = entity.name.take();
         let production_year = entity.production_year.take();
         let index_number = entity.index_number.take();
@@ -17460,12 +17522,27 @@ impl ResolverGuesses {
                 stored.or(path)
             }
         };
+        let name = stored
+            .and_then(|s| s.name.clone())
+            .filter(|n| !n.is_empty())
+            .or(name);
+        // `Series.BeforeMetadataRefresh` runs before the lookup info is read,
+        // on the first refresh too: a series without a year takes the one in
+        // its name ("Show 2026", from a `Show.2026` folder), so the fetchers
+        // search with it and a new row is saved with it.
+        let production_year = stored
+            .and_then(|s| s.production_year)
+            .or(production_year)
+            .or_else(|| {
+                is_series
+                    .then_some(name.as_deref())
+                    .flatten()
+                    .and_then(|name| video_resolver::clean_date_time(name, &PATH_NAMING).year)
+                    .map(i64::from)
+            });
         Self {
-            name: stored
-                .and_then(|s| s.name.clone())
-                .filter(|n| !n.is_empty())
-                .or(name),
-            production_year: stored.and_then(|s| s.production_year).or(production_year),
+            name,
+            production_year,
             index_number: number(stored.and_then(|s| s.index_number), index_number),
             parent_index_number: number(
                 stored.and_then(|s| s.parent_index_number),
@@ -18525,8 +18602,13 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&d.original_title);
     }
+    // `movie.OriginalLanguage = movieResult.OriginalLanguage` runs the
+    // `BaseItem.OriginalLanguage` setter (`BaseItem.cs:228-232`).
     if entity.original_language.is_none() {
-        entity.original_language.clone_from(&d.original_language);
+        entity.original_language = d
+            .original_language
+            .as_deref()
+            .map(crate::localization_manager::normalize_original_language);
     }
     merge_multi_value(&mut entity.tags, &d.tags);
     merge_multi_value(&mut entity.production_locations, &d.production_locations);
@@ -18787,8 +18869,14 @@ fn apply_omdb(
     if english {
         apply_episode_title(entity, item.title.as_deref());
     }
+    // `item.OriginalLanguage = result.Language?.Split(',')…FirstOrDefault()`
+    // (`OmdbProvider.cs:428`) through the setter: OMDb's `"English"` is
+    // stored as `"en"`.
     if entity.original_language.is_none() {
-        entity.original_language = item.original_language();
+        entity.original_language = item
+            .original_language()
+            .as_deref()
+            .map(crate::localization_manager::normalize_original_language);
     }
     fill_provider_data(
         entity,
@@ -19205,6 +19293,30 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
         .into_iter()
         .filter(|i| seen.insert(i.image_type))
         .collect()
+}
+
+/// Merges a series' regular actors into an episode's own TVDB credits.
+///
+/// TVDB's per-episode record only carries guest stars and crew; the series
+/// regulars live on the series record. Series actors (in TVDB billing order)
+/// come first, then the episode's own credits. A regular already credited on
+/// the episode keeps the episode's entry (its role is the more specific one).
+fn merge_series_cast(
+    episode_people: Vec<PeopleEntity>,
+    series_people: &[ferrofin_providers::TvdbPerson],
+) -> Vec<PeopleEntity> {
+    let credited: std::collections::HashSet<String> = episode_people
+        .iter()
+        .map(|p| p.name.to_lowercase())
+        .collect();
+    let mut people: Vec<PeopleEntity> = tvdb_people(series_people)
+        .into_iter()
+        .filter(|p| {
+            p.person_type.as_deref() == Some("Actor") && !credited.contains(&p.name.to_lowercase())
+        })
+        .collect();
+    people.extend(episode_people);
+    people
 }
 
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
@@ -20220,7 +20332,11 @@ mod tests {
         let mut empty = BaseItemEntity::default();
         super::apply_omdb(&mut empty, &omdb, false, false);
         assert!(empty.name.is_none(), "OMDb titles are English-only");
-        assert_eq!(empty.original_language.as_deref(), Some("English"));
+        assert_eq!(
+            empty.original_language.as_deref(),
+            Some("en"),
+            "the setter normalises OMDb's English name"
+        );
         assert_eq!(
             crate::item_data::parse_data(empty.data.as_deref())["HomePageUrl"],
             "https://other.org"
@@ -24710,6 +24826,52 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
+    #[test]
+    fn merge_series_cast_prepends_regulars_and_dedupes() {
+        use ferrofin_providers::TvdbPerson;
+        let ep_people = super::tvdb_people(&[
+            TvdbPerson {
+                name: "Guest Star".into(),
+                person_type: "GuestStar".into(),
+                role: Some("Villain".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Bill Burr".into(),
+                person_type: "Actor".into(),
+                role: Some("Frank (voice)".into()),
+                image_url: None,
+            },
+        ]);
+        let series_people = vec![
+            TvdbPerson {
+                name: "Bill Burr".into(),
+                person_type: "Actor".into(),
+                role: Some("Frank Murphy".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Laura Dern".into(),
+                person_type: "Actor".into(),
+                role: Some("Sue Murphy".into()),
+                image_url: None,
+            },
+            TvdbPerson {
+                name: "Series Writer".into(),
+                person_type: "Writer".into(),
+                role: None,
+                image_url: None,
+            },
+        ];
+        let merged = super::merge_series_cast(ep_people, &series_people);
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Laura Dern", "Guest Star", "Bill Burr"]);
+        let bill = merged.iter().find(|p| p.name == "Bill Burr").unwrap();
+        assert_eq!(bill.role.as_deref(), Some("Frank (voice)"));
+        let alone = super::merge_series_cast(super::tvdb_people(&series_people[..1]), &[]);
+        assert_eq!(alone.len(), 1);
+    }
+
     /// A TVDB stand-in's body for an episode lookup: the series' episode
     /// list and the episode record, crediting `characters` (a JSON array).
     fn tvdb_episode_body(characters: &str) -> &'static str {
@@ -26586,6 +26748,33 @@ mod tests {
             ),
             ..BaseItemEntity::default()
         }
+    }
+
+    /// A series' lookup year comes from its name before any fetcher runs,
+    /// new or stored, unless it already has one.
+    #[rstest::rstest]
+    #[case::new_series(false, None, Some("Show 2026"), None, Some(2026))]
+    #[case::stored_without_year(true, None, Some("Show 2026"), None, Some(2026))]
+    #[case::stored_year_kept(true, Some(2020), Some("Show 2026"), None, Some(2020))]
+    #[case::resolver_year_kept(false, None, Some("Show 2026"), Some(2024), Some(2024))]
+    #[case::no_year_in_name(false, None, Some("Show"), None, None)]
+    fn a_series_looks_up_with_the_year_in_its_name(
+        #[case] is_stored: bool,
+        #[case] stored_year: Option<i64>,
+        #[case] name: Option<&str>,
+        #[case] resolver_year: Option<i64>,
+        #[case] expected: Option<i64>,
+    ) {
+        let stored = is_stored.then(|| stored_row("TV.Series", "/tv/Show.2026", name, stored_year));
+        let mut scanned = stored_row("TV.Series", "/tv/Show.2026", name, resolver_year);
+        let guesses = super::ResolverGuesses::take(&mut scanned, stored.as_ref(), false);
+        assert_eq!(
+            guesses.year(&scanned),
+            expected.and_then(|y| i32::try_from(y).ok())
+        );
+        let mut new_row = BaseItemEntity::default();
+        guesses.fill(&mut new_row);
+        assert_eq!(new_row.production_year, expected);
     }
 
     /// `BeforeMetadataRefresh`'s name and year rules, kind by kind: an
@@ -33511,20 +33700,28 @@ mod tests {
         let link = |n: u128, parent: Option<u128>, owner: Option<u128>, path: &str| ItemChildLink {
             id: id(n),
             parent_id: parent.map(id),
+            season_id: None,
             owner_id: owner.map(id),
             extra_type: owner.map(|_| 1),
             path: (!path.is_empty()).then(|| path.to_owned()),
         };
         let listed = |path: Option<&str>| path.is_none_or(|p| !p.starts_with("/unlisted"));
-        // Series 1 → virtual season 2 → episode 3 (kept); series 4 →
-        // virtual season 5 → episode 6 (stale); movie 7 with a stale extra
+        // Series 1 → virtual season 2, episode 3 (kept) under the series in
+        // season 2; series 4 → virtual season 5, episode 6 (stale) in it;
+        // movie 7 with a stale extra
         // 8, movie 9 with a kept extra 10 on disk, movie 11 with an extra 12
         // under a folder that did not list.
         let children = vec![
             link(2, Some(1), None, ""),
-            link(3, Some(2), None, "/tv/Flat/Batch2/e.mkv"),
+            ItemChildLink {
+                season_id: Some(id(2)),
+                ..link(3, Some(1), None, "/tv/Flat/Batch2/e.mkv")
+            },
             link(5, Some(4), None, ""),
-            link(6, Some(5), None, "/tv/Gone/e.mkv"),
+            ItemChildLink {
+                season_id: Some(id(5)),
+                ..link(6, Some(4), None, "/tv/Gone/e.mkv")
+            },
             link(8, None, Some(7), "/movies/A/trailers/t.mkv"),
             link(10, None, Some(9), "/movies/B/trailers/t.mkv"),
             link(12, None, Some(11), "/unlisted/C/trailers/t.mkv"),
@@ -34215,7 +34412,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(ep.0, season.0, "episode parents to the virtual season");
+        assert_eq!(ep.0, series_id, "episode parents to the series");
         assert_eq!(ep.1, Some(2));
         assert_eq!(ep.2.as_deref(), Some(season.0.as_str()), "SeasonId set");
         assert_eq!(ep.3.as_deref(), Some(series_id.as_str()), "SeriesId set");
@@ -34627,36 +34824,6 @@ mod tests {
         assert!(data_of("Avatar (2009)").contains(r#""VideoType":"BluRay""#));
         assert!(data_of("Alien (1979)").contains(r#""VideoType":"Dvd""#));
         assert!(data_of("Heat (1995)").contains(r#""VideoType":"VideoFile""#));
-    }
-
-    #[test]
-    fn series_match_prefers_the_folder_year() {
-        use ferrofin_providers::TvdbSearchHit;
-        let hit = |name: &str, year: i32| TvdbSearchHit {
-            tvdb_id: i64::from(year),
-            name: name.to_owned(),
-            year: Some(year),
-            image_url: None,
-            overview: None,
-        };
-        // TVDB ranks the 2005 revival first; the folder says 1963.
-        let hits = vec![hit("Doctor Who", 2005), hit("Doctor Who", 1963)];
-        assert_eq!(
-            super::pick_series_hit(hits.clone(), Some(1963))
-                .unwrap()
-                .year,
-            Some(1963)
-        );
-        // No year, or no candidate matching it → the API's own ordering stands.
-        assert_eq!(
-            super::pick_series_hit(hits.clone(), None).unwrap().year,
-            Some(2005)
-        );
-        assert_eq!(
-            super::pick_series_hit(hits, Some(1999)).unwrap().year,
-            Some(2005)
-        );
-        assert!(super::pick_series_hit(Vec::new(), Some(1963)).is_none());
     }
 
     /// `Set3DFormat` (`BaseVideoResolver.cs:201-250`) maps the 3D format

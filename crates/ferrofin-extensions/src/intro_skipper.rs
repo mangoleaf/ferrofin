@@ -863,10 +863,12 @@ impl DetectSegmentsTask {
             tracing::debug!(%item_id, "intro skipper: episode without a season; intros shown");
             return false;
         };
+        // By ancestry, not `ParentId`: an episode of a virtual season is
+        // stored under its series, with the season among its ancestors.
         let query = ferrofin_traits::options::InternalItemsQuery {
-            parent_id: season_id,
+            ancestor_ids: vec![season_id],
             include_item_types: vec![ferrofin_model::data::BaseItemKind::Episode],
-            recursive: false,
+            recursive: true,
             is_virtual_item: Some(false),
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::IndexNumber,
@@ -1637,7 +1639,7 @@ mod tests {
         cache: tempfile::TempDir,
     }
 
-    /// The season the harness episodes are children of (`ParentId` is a key).
+    /// The season the harness episodes are children of.
     async fn seed_season(persistence: &ferrofin_core::FerrofinItemPersistenceService) {
         let season = BaseItemEntity {
             id: guid_to_db(SEASON),
@@ -1653,6 +1655,19 @@ mod tests {
             .save_items(&[season])
             .await
             .expect("seed season");
+    }
+
+    /// Ancestor rows so `ancestor_ids` queries find the episodes.
+    async fn seed_ancestors(
+        persistence: &ferrofin_core::FerrofinItemPersistenceService,
+        episodes: &[(Uuid, &str, f64)],
+    ) {
+        for &(ep_id, _, _) in episodes {
+            persistence
+                .set_ancestors(ep_id, &[SEASON])
+                .await
+                .expect("seed ancestors");
+        }
     }
 
     /// Builds the task over an in-memory database seeded with `episodes`
@@ -1720,6 +1735,7 @@ mod tests {
             .collect();
         seed_season(&persistence).await;
         persistence.save_items(&rows).await.expect("seed episodes");
+        seed_ancestors(&persistence, episodes).await;
 
         let segments: Arc<dyn MediaSegmentManager> = Arc::new(
             ferrofin_core::FerrofinMediaSegmentManager::new(db.clone(), Arc::clone(&library)),

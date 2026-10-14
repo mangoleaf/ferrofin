@@ -53,9 +53,23 @@ pub trait LocalizationManager: Send + Sync {
     /// the same fallbacks (C# `GetLocalizedString(phrase, culture)`).
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String;
 
+    /// The culture matching a language token by display name, name, two-letter
+    /// code or any three-letter code, ignoring ASCII case; `None` for an empty
+    /// or unknown token (C# `FindLanguageInfo`). Unlike
+    /// [`Self::get_language_display_name`], the culture's `display_name` is the
+    /// raw `iso6392.txt` English name, never truncated at `;`/`,`.
+    fn find_language_info(&self, language: &str) -> Option<CultureDto>;
+
     /// The display name of a language code (`"eng"` → `"English"`), `None`
     /// when unknown (C# `GetLanguageDisplayName`).
     fn get_language_display_name(&self, language: &str) -> Option<String>;
+
+    /// The ISO 639-2/T code for an ISO 639-2/B code (`"ger"` → `"deu"`),
+    /// `None` when the code has no distinct /T form (C# `TryGetISO6392TFromB`).
+    /// The default knows no mappings, for lightweight manager substitutes.
+    fn try_get_iso6392_t_from_b(&self, _iso_b: &str) -> Option<String> {
+        None
+    }
 
     /// Resolves a rating string to a score, honouring the given country code
     /// (C# `GetRatingScore`).
@@ -67,3 +81,21 @@ pub trait LocalizationManager: Send + Sync {
 }
 
 fn _assert_object_safe_localization_manager(_: &dyn LocalizationManager) {}
+
+/// The `BaseItem.OriginalLanguage` setter (`BaseItem.cs:228-232`):
+/// `LocalizationManager?.FindLanguageInfo(value)?.TwoLetterISOLanguageName ??
+/// value`. A known token (`"English"`, `"fra"`) becomes the culture's
+/// two-letter code; an unknown token, or no manager (`None`, as C#'s `?.`),
+/// keeps the value as-is.
+#[must_use]
+pub fn normalize_original_language(
+    localization: Option<&dyn LocalizationManager>,
+    value: &str,
+) -> String {
+    localization
+        .and_then(|manager| manager.find_language_info(value))
+        .map_or_else(
+            || value.to_owned(),
+            |culture| culture.two_letter_iso_language_name,
+        )
+}

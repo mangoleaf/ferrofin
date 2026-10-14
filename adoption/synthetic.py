@@ -3,6 +3,11 @@
 
 All media and accounts are invented. Jellyfin creates the source state through its
 API; each supported release supplies its own expected responses before adoption.
+A few states no API produces (non-US ratings, conflicting user data, a dangling parent
+chain) are written into the stopped 10.11.8 fixture and inherited by every later one,
+except that the 12.0 lineage (12.0, 12.1-from-12, 12.2-from-12, 12.2-from-121) starts
+without the dangling chain, which Jellyfin 12.0 cannot migrate (NO_ORPHAN_CLEANUP);
+for those, Jellyfin 12.2's own result is the expectation on every path.
 """
 
 import argparse
@@ -16,7 +21,7 @@ import subprocess
 import sys
 
 from metadata import CheckError
-from synthetic_fixture import Api, USERS, seed
+from synthetic_fixture import Api, USERS, drop_dangling_chain, seed, seed_database
 from synthetic_media import generate
 
 
@@ -28,7 +33,23 @@ VERSIONS = (
     ("jellyfin-12.0", "12.0", "jellyfin-10.11.8"),
     ("jellyfin-12.1-from-10", "12.1", "jellyfin-10.11.8"),
     ("jellyfin-12.1-from-12", "12.1", "jellyfin-12.0"),
+    ("jellyfin-12.2-from-10", "12.2", "jellyfin-10.11.8"),
+    ("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0"),
+    ("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12"),
 )
+# Releases whose own migration cannot start on the seeded dangling chain; their copy
+# drops it first, and every fixture built from them inherits that (drop_dangling_chain).
+NO_ORPHAN_CLEANUP = {"12.0"}
+
+
+def carries_chain(name):
+    """Whether fixture `name` was built without passing through a NO_ORPHAN_CLEANUP release."""
+    parents = {fixture: (version, parent) for fixture, version, parent in VERSIONS}
+    while name:
+        version, name = parents[name]
+        if version in NO_ORPHAN_CLEANUP:
+            return False
+    return True
 
 
 def recipe():
@@ -86,6 +107,10 @@ def build(root, only, port):
             shutil.copytree(root / parent, config)
         else:
             config.mkdir()
+        if version in NO_ORPHAN_CLEANUP and (config / "synthetic.json").exists():
+            # Idempotent, so an interrupted build that resumes here drops it again.
+            drop_dangling_chain(config / "data/jellyfin.db",
+                                json.loads((config / "synthetic.json").read_text())["seeds"])
         with server("jellyfin/jellyfin:" + version, config, root / "media", "synthetic-builder", port) as api:
             if (config / "synthetic.json").exists():
                 manifest = json.loads((config / "synthetic.json").read_text())
@@ -103,6 +128,23 @@ def build(root, only, port):
             baseline = snapshot(api, manifest)
             validate(baseline, manifest)
             save(config / "preservation.json", baseline)
+        if not parent:
+            # States no API produces, written with the server stopped. The 10.11.8
+            # baseline above predates them; every later fixture inherits them.
+            manifest["seeds"] = seed_database(config / "data/jellyfin.db", manifest)
+            save(config / "synthetic.json", manifest)
+        # What this release left of the seeds: its own boot and scan act on them first.
+        from preservation import seed_state, validate_oracle, validate_seed_state
+        state = seed_state(config / "data/jellyfin.db", manifest["seeds"])
+        validate_seed_state(state, manifest["seeds"], version)
+        if version == "12.2":
+            validate_oracle(config / "data/jellyfin.db", manifest)
+            # The chain's expectation (gone, history on the placeholder) is what real
+            # 12.2 must have done wherever it saw the chain.
+            if carries_chain(name) and (state["orphans"] or state["history"] != "placeholder"):
+                raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
+                                 f"history {state['history']}; the run's expectation is wrong")
+        save(config / "seeds.json", state)
         save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
         print(name + " built and validated", flush=True)
 

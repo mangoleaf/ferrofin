@@ -208,8 +208,14 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s1.codec.as_deref(), Some("aac"));
     assert_eq!(s1.channels, Some(7));
     assert!(s1.is_default);
+    assert!(!s1.is_original);
     assert_eq!(s1.language.as_deref(), Some("eng"));
     assert_eq!(s1.title.as_deref(), Some("Surround 6.1"));
+    // ProbeResultNormalizer.cs:734 stamps `LocalizedOriginal` on every audio
+    // stream (the passthrough echoes the key); `GetLanguageDisplayName` on the
+    // upstream mock yields null, as `PassthroughLocalization` does.
+    assert_eq!(s1.localized_original.as_deref(), Some("Original"));
+    assert_eq!(s1.localized_language, None);
 
     let s2 = &res.media_source.media_streams[2];
     assert_eq!(s2.stream_type, MediaStreamType::Audio);
@@ -225,6 +231,9 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s3.codec.as_deref(), Some("DVDSUB"));
     assert_eq!(s3.title, None);
     assert!(!s3.is_hearing_impaired);
+    // Subtitles never get `LocalizedOriginal` (ProbeResultNormalizer.cs:774-786).
+    assert_eq!(s3.localized_original, None);
+    assert_eq!(s3.localized_language, None);
 
     let s4 = &res.media_source.media_streams[4];
     assert_eq!(s4.language.as_deref(), Some("eng"));

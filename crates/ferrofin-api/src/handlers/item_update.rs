@@ -86,7 +86,7 @@ pub(crate) async fn update_item(
     // 418`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
     // so an unlocked edit survives a rescan that runs no provider.
-    apply_update(&mut item, &request);
+    apply_update(&mut item, &request, &*state.localization);
     state
         .library
         .update_items(std::slice::from_ref(&item), None)
@@ -174,6 +174,8 @@ pub(crate) struct UpdateItemRequest {
     forced_sort_name: Option<String>,
     #[serde(default)]
     original_title: Option<String>,
+    #[serde(default)]
+    original_language: Option<String>,
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     critic_rating: Option<f32>,
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
@@ -264,10 +266,25 @@ fn opt_metadata_fields<'de, D: serde::Deserializer<'de>>(
 /// Applies the editable fields of `request` onto `item`. Mirrors the scalar and
 /// collection assignments of C# `ItemUpdateController.UpdateItem`; the
 /// series/season/album child cascades are [`cascade_to_children`].
-fn apply_update(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
+fn apply_update(
+    item: &mut BaseItemEntity,
+    request: &UpdateItemRequest,
+    localization: &dyn ferrofin_traits::localization::LocalizationManager,
+) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
     item.original_title = non_empty(request.original_title.as_deref());
+    // `item.OriginalLanguage = string.IsNullOrWhiteSpace(request.OriginalLanguage)
+    // ? null : request.OriginalLanguage` (`ItemUpdateController.cs:245`): the
+    // value is NOT trimmed, an absent member clears it, and the assignment
+    // runs the `BaseItem.OriginalLanguage` setter (`"fra"` is stored `"fr"`).
+    item.original_language = request
+        .original_language
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            ferrofin_traits::localization::normalize_original_language(Some(localization), value)
+        });
     item.critic_rating = request.critic_rating.map(f64::from);
     item.community_rating = request.community_rating.map(f64::from);
     item.index_number = request.index_number.map(i64::from);
@@ -485,6 +502,27 @@ async fn children_of(
         .await?)
 }
 
+/// A season's episodes for the cascade. Upstream walks `season.Children`,
+/// its `ParentId` children, which misses the episodes of a virtual season:
+/// they are stored under the series (`CreateSeasonsAsync` links them by
+/// `SeasonId` only). ACCEPTED DIVERGENCE (don't-port-bugs): they are reached
+/// here by ancestry, so a season's rating and tag edits reach every episode
+/// it lists.
+async fn season_episodes_of(
+    state: &AppState,
+    season: Uuid,
+) -> Result<Vec<BaseItemEntity>, ApiError> {
+    Ok(state
+        .library
+        .get_item_list(&InternalItemsQuery {
+            ancestor_ids: vec![season],
+            include_item_types: vec![BaseItemKind::Episode],
+            recursive: true,
+            ..InternalItemsQuery::default()
+        })
+        .await?)
+}
+
 /// The rating and tag half of the cascade on one child, skipping a field in
 /// the child's own `LockedFields` (`ItemUpdateController.cs:321-381`):
 /// `OfficialRating` unless locked, `CustomRating` always, the tag edit
@@ -538,16 +576,14 @@ async fn cascade_to_children(
         Some(BaseItemKind::Series) => {
             children_of(state, item_id, Some(BaseItemKind::Season)).await?
         }
-        Some(BaseItemKind::Season) => {
-            children_of(state, item_id, Some(BaseItemKind::Episode)).await?
-        }
+        Some(BaseItemKind::Season) => season_episodes_of(state, item_id).await?,
         _ => children_of(state, item_id, None).await?,
     };
     if kind == Some(BaseItemKind::Series) {
         let mut episodes = Vec::new();
         for season in &children {
             if let Ok(season_id) = Uuid::parse_str(&season.id) {
-                episodes.extend(children_of(state, season_id, Some(BaseItemKind::Episode)).await?);
+                episodes.extend(season_episodes_of(state, season_id).await?);
             }
         }
         children.extend(episodes);

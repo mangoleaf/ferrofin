@@ -13,7 +13,7 @@ pub use dtos::{
     CodecType, InternalMediaInfoResult, MediaChapter, MediaFormatInfo, MediaFrameInfo,
     MediaFrameSideDataInfo, MediaStreamInfo, MediaStreamInfoSideData,
 };
-pub use localization::{LocalizationManager, PassthroughLocalization};
+pub use localization::{LocalizationManager, PassthroughLocalization, TraitLocalization};
 pub use probe_result_normalizer::{
     ProbeResultNormalizer, get_estimated_audio_bitrate, get_frame_rate, is_near_square_pixel_sar,
 };

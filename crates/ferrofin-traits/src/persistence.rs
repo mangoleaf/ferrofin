@@ -2197,6 +2197,9 @@ pub struct ItemChildLink {
     pub id: Uuid,
     /// Its `ParentId`.
     pub parent_id: Option<Uuid>,
+    /// Its `SeasonId`: an episode of a virtual season is stored under its
+    /// series and names the season only here.
+    pub season_id: Option<Uuid>,
     /// Its `OwnerId` (an extra's owner, or the primary of a stacked part or
     /// a local alternate version).
     pub owner_id: Option<Uuid>,

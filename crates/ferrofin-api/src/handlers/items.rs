@@ -34,7 +34,9 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids, parse_pipe_strings};
+use crate::handlers::query_parse::{
+    parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_pipe_strings,
+};
 use crate::state::AppState;
 
 /// Resolves a user-addressed item before returning data or performing a side effect.
@@ -407,6 +409,14 @@ struct ItemsQuery {
     /// include. Empty ⇒ every type, as upstream.
     #[serde(default)]
     enable_image_types: Option<String>,
+    /// Comma-delimited audio-stream languages (12.1 `audioLanguages`): keep an
+    /// item with an audio stream in any of them — see
+    /// [`parse_csv_strings`] for the binding.
+    #[serde(default)]
+    audio_languages: Option<String>,
+    /// Comma-delimited subtitle-stream languages (12.1 `subtitleLanguages`).
+    #[serde(default)]
+    subtitle_languages: Option<String>,
 }
 
 impl ItemsQuery {
@@ -502,6 +512,7 @@ async fn get_items(
     {
         internal.collapse_box_set_items = Some(false);
     }
+    apply_media_stream_filter_rules(&mut internal);
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
     // no `isVirtualItem` query parameter to set it directly.
@@ -638,8 +649,40 @@ fn items_query_options(
         name_less_than: http_name_boundary(query.name_less_than.as_deref()),
         person: query.person.clone(),
         enable_total_record_count: query.enable_total_record_count.unwrap_or(true),
+        audio_languages: parse_csv_strings(query.audio_languages.as_deref()),
+        subtitle_languages: parse_csv_strings(query.subtitle_languages.as_deref()),
         ..InternalItemsQuery::default()
     })
+}
+
+/// The media-stream filter rules `ItemsController.GetItems` applies before
+/// `ApplyFilters` (v12 ItemsController.cs:462-487).
+///
+/// A specific subtitle language already implies subtitles exist, so
+/// `hasSubtitles=true` is dropped beside it; `hasSubtitles=false` contradicts
+/// it, so the language list is dropped instead. Every filter that reads
+/// media streams then sets `IncludeOwnedItems`, "to include alternative and
+/// linked versions" — the alternate versions and owned non-extras a general
+/// query hides stay in, and the `PresentationUniqueKey` grouping folds them
+/// back onto their primary.
+pub(crate) fn apply_media_stream_filter_rules(internal: &mut InternalItemsQuery) {
+    if !internal.subtitle_languages.is_empty() {
+        match internal.has_subtitles {
+            Some(true) => internal.has_subtitles = None,
+            Some(false) => internal.subtitle_languages.clear(),
+            None => {}
+        }
+    }
+    if internal.has_subtitles.is_some()
+        || !internal.subtitle_languages.is_empty()
+        || !internal.audio_languages.is_empty()
+        || internal.is_3d.is_some()
+        || internal.is_hd.is_some()
+        || internal.is_4k.is_some()
+        || !internal.video_types.is_empty()
+    {
+        internal.include_owned_items = true;
+    }
 }
 
 /// Query parameters for `GET /Items/{itemId}`.
@@ -1640,6 +1683,11 @@ async fn get_items_for_user(
     Query(mut query): Query<ItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
+    // The obsolete route passes `audioLanguages: []` and
+    // `subtitleLanguages: []` to `GetItems` (v12 ItemsController.cs:896-897):
+    // it never filters by stream language.
+    query.audio_languages = None;
+    query.subtitle_languages = None;
     get_items(state, auth, Query(query)).await
 }
 
@@ -1715,6 +1763,8 @@ crate::query::query_parameters! {
         "locationTypes" => ',',
         "excludeLocationTypes" => ',',
         "enableImageTypes" => ',',
+        "audioLanguages" => ',',
+        "subtitleLanguages" => ',',
     } => [("get", "/Items")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
@@ -1797,8 +1847,6 @@ mod tests {
     const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
         "albums",
         "artists",
-        // 12.1.0 only.
-        "audioLanguages",
         "hasOfficialRating",
         "isKids",
         "isMissing",
@@ -1817,14 +1865,12 @@ mod tests {
         "personTypes",
         "seriesStatus",
         "studios",
-        // 12.1.0 only.
-        "subtitleLanguages",
     ];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
-    /// route gate's pin, and 12.1.0, the latest Jellyfin, which adds
-    /// `audioLanguages` and `subtitleLanguages` — is bound by [`ItemsQuery`] or
-    /// listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
+    /// route gate's pin, and 12.1.0, the latest Jellyfin (whose additions,
+    /// `audioLanguages` and `subtitleLanguages`, are bound) — is bound by
+    /// [`ItemsQuery`] or listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
     /// without a word, so a missing field is a filter the client asked for and
     /// never got: `albumArtistIds` was one, and every artist page listed every
     /// album in the library.
@@ -1864,6 +1910,95 @@ mod tests {
             "left: the contract parameters ItemsQuery drops; right: the open-port list. \
              A newly dropped parameter must be bound, not listed; a bound one must leave the list"
         );
+    }
+
+    /// `audioLanguages` / `subtitleLanguages` bind as comma-delimited string
+    /// collections (v12 ItemsController.cs:258-259, 452-453); a repeated key
+    /// keeps every value through the declared collection.
+    #[test]
+    fn items_query_binds_the_stream_language_filters() {
+        let bind = |q: &str| {
+            let Query(query) =
+                Query::<ItemsQuery>::try_from_uri(&format!("/Items?{q}").parse().expect("uri"))
+                    .expect(q);
+            items_query_options(&query, crate::test_support::sample_user()).expect("maps")
+        };
+        let internal = bind("audioLanguages=eng,ger&subtitleLanguages=fre");
+        assert_eq!(internal.audio_languages, ["eng", "ger"]);
+        assert_eq!(internal.subtitle_languages, ["fre"]);
+        let internal = bind("audioLanguages=eng&AudioLanguages=ger");
+        assert_eq!(internal.audio_languages, ["eng", "ger"]);
+        assert!(internal.subtitle_languages.is_empty());
+    }
+
+    /// v12 ItemsController.cs:462-474: a language list beside `hasSubtitles`.
+    #[test]
+    fn subtitle_languages_and_has_subtitles_resolve_like_get_items() {
+        let mut both = InternalItemsQuery {
+            subtitle_languages: vec!["ger".to_owned()],
+            has_subtitles: Some(true),
+            ..InternalItemsQuery::default()
+        };
+        apply_media_stream_filter_rules(&mut both);
+        assert_eq!(both.has_subtitles, None);
+        assert_eq!(both.subtitle_languages, ["ger"]);
+        assert!(both.include_owned_items);
+
+        let mut contradicting = InternalItemsQuery {
+            subtitle_languages: vec!["ger".to_owned()],
+            has_subtitles: Some(false),
+            ..InternalItemsQuery::default()
+        };
+        apply_media_stream_filter_rules(&mut contradicting);
+        assert_eq!(contradicting.has_subtitles, Some(false));
+        assert!(contradicting.subtitle_languages.is_empty());
+        assert!(contradicting.include_owned_items);
+    }
+
+    /// v12 ItemsController.cs:476-487: every media-stream filter includes the
+    /// alternate and linked versions; nothing else does.
+    #[test]
+    fn media_stream_filters_include_owned_items() {
+        let includes_owned = |mut query: InternalItemsQuery| {
+            apply_media_stream_filter_rules(&mut query);
+            query.include_owned_items
+        };
+        let base = InternalItemsQuery::default;
+        assert!(includes_owned(InternalItemsQuery {
+            audio_languages: vec!["eng".to_owned()],
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            subtitle_languages: vec!["eng".to_owned()],
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            has_subtitles: Some(false),
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            is_3d: Some(false),
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            is_hd: Some(true),
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            is_4k: Some(true),
+            ..base()
+        }));
+        assert!(includes_owned(InternalItemsQuery {
+            video_types: vec![ferrofin_model::entities::VideoType::BluRay],
+            ..base()
+        }));
+        let mut plain = InternalItemsQuery {
+            is_favorite: Some(true),
+            recursive: true,
+            ..InternalItemsQuery::default()
+        };
+        apply_media_stream_filter_rules(&mut plain);
+        assert!(!plain.include_owned_items);
     }
 
     /// `[FromQuery] bool? isLocked` → `IsLocked = isLocked`
