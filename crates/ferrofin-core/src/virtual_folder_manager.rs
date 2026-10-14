@@ -893,6 +893,20 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             }
             let library_id = self.collection_folder_id(&path);
             let locations = self.resolve_locations(&path).await?;
+            let primary_image_item_id = match (library_id, self.items.as_ref()) {
+                (Some(id), Some(repo)) => {
+                    let images = repo.get_image_infos(id).await.unwrap_or_default();
+                    if images
+                        .iter()
+                        .any(|i| i.image_type == ferrofin_model::entities::ImageType::Primary)
+                    {
+                        Some(id.simple().to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
             folders.push(VirtualFolderInfo {
                 name,
                 locations,
@@ -901,6 +915,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
                 // dashboard matches it against `RefreshProgress.ItemId` as a string.
                 item_id: library_id.map(|id| id.simple().to_string()),
+                primary_image_item_id,
                 ..VirtualFolderInfo::default()
             });
         }
