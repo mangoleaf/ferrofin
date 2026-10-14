@@ -2,8 +2,7 @@ name: CI
 
 on:
   push:
-    # release/** too: the Release workflow tags only a commit with a green CI push run.
-    branches: [main, "release/**"]
+    branches: [main]
   pull_request:
 
 permissions: {} # each job grants only what it needs
