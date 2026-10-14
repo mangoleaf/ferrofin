@@ -339,8 +339,15 @@ fn add_common_nodes(
         writer.element("originaltitle", original);
     }
 
-    // NfoBaseItem has no separate OriginalLanguage field; skipped (parser has no
-    // target for it either).
+    // `BaseNfoSaver.cs:501-504`: right after `<originaltitle>`, when not
+    // null or whitespace.
+    if let Some(language) = item
+        .original_language
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        writer.element("originallanguage", language);
+    }
 
     // Directors, then writers, then credits (writers again), each distinct
     // (case-insensitive) and sorted ascending.

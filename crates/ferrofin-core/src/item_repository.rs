@@ -1684,7 +1684,7 @@ impl FerrofinItemRepository {
         // returned by `/Genres` beside the real genre, and `/Genres` and
         // `/MusicGenres`, which query the same `ItemValueType`, stop being
         // distinguishable. It is also the leading column of
-        // `FerrofinIX_BaseItems_Type_CleanName`, so constraining it keeps this
+        // `IX_BaseItems_Type_CleanName`, so constraining it keeps this
         // an index seek instead of a scan of every item.
         qb.push(r#" FROM "BaseItems" AS bi WHERE bi."Type" = "#)
             .push_bind(return_type.to_owned());
@@ -1883,7 +1883,7 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
     } = scope;
     // `+`: a plan pin, like the one on `TopParentId` below. Unpinned, the
     // planner drives the semijoin from every content row of the kind
-    // (`FerrofinIX_BaseItems_Type_…`, `Type=?`) and probes the value per
+    // (`IX_BaseItems_Type_…`, `Type=?`) and probes the value per
     // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
     // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
     if inner == InnerScope::Page && !content_type_names.is_empty() {
@@ -3411,25 +3411,10 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         stream_type: MediaStreamType,
     ) -> Result<Vec<String>, ServiceError> {
-        // Restrict the item set with the filter, then collect distinct stream
-        // languages of the requested type ("und" for missing), matching C#.
-        let ids = self.fetch_ids(filter).await?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let stream_disc = i64::from(media_stream_type_disc(stream_type));
-        let mut sql = String::from(
-            r#"SELECT DISTINCT CASE WHEN ms."Language" IS NULL OR ms."Language" = ''
-                 THEN 'und' ELSE ms."Language" END
-               FROM "MediaStreamInfos" ms WHERE ms."StreamType" = ? AND ms."ItemId" IN ("#,
-        );
-        sql.push_str(&placeholders(ids.len()));
-        sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(stream_disc);
-        for id in &ids {
-            query = query.bind(guid_to_db(*id));
-        }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        let mut by_type = self
+            .get_media_stream_languages_by_type(filter, &[stream_type])
+            .await?;
+        Ok(by_type.remove(&stream_type).unwrap_or_default())
     }
 
     async fn get_media_stream_languages_by_type(
@@ -3439,35 +3424,29 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<std::collections::HashMap<MediaStreamType, Vec<String>>, ServiceError> {
         let mut out: std::collections::HashMap<MediaStreamType, Vec<String>> =
             stream_types.iter().map(|&t| (t, Vec::new())).collect();
-        // Resolve the item set once (the fetch_ids + IN was previously run per
-        // type — audio and subtitle each re-materialized the same ids).
-        let ids = self.fetch_ids(filter).await?;
-        if ids.is_empty() || stream_types.is_empty() {
+        if stream_types.is_empty() {
             return Ok(out);
         }
-        // Map disc -> type so the grouped rows sort back into per-type lists.
+        // `BaseItemRepository.GetMediaStreamLanguages` (v12.2 `ByName.cs:87-116`)
+        // runs a fresh `InternalItemsQuery(filter.User)` carrying only the scope
+        // and kind fields, after `LibraryManager` applied `AddUserToQuery` and
+        // `SetTopParentOrAncestorIds` (`LibraryManager.cs:4221-4230`) — which is
+        // what `resolve_views` does here, with the user's restrictions.
+        let narrowed = stream_language_query(filter);
+        let scoped = self.resolve_views(&narrowed).await?;
+        let filter = scoped.as_ref().unwrap_or(&narrowed);
+        // Map disc -> type so the rows sort back into per-type lists.
         let by_disc: std::collections::HashMap<i64, MediaStreamType> = stream_types
             .iter()
             .map(|&t| (i64::from(media_stream_type_disc(t)), t))
             .collect();
-        let mut sql = String::from(
-            r#"SELECT DISTINCT ms."StreamType",
-                 CASE WHEN ms."Language" IS NULL OR ms."Language" = '' THEN 'und'
-                      ELSE ms."Language" END
-               FROM "MediaStreamInfos" ms WHERE ms."StreamType" IN ("#,
-        );
-        sql.push_str(&placeholders(by_disc.len()));
-        sql.push_str(r#") AND ms."ItemId" IN ("#);
-        sql.push_str(&placeholders(ids.len()));
-        sql.push(')');
-        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql));
-        for disc in by_disc.keys() {
-            query = query.bind(*disc);
-        }
-        for id in &ids {
-            query = query.bind(guid_to_db(*id));
-        }
-        for (disc, lang) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+        let mut qb = stream_languages_statement(filter, by_disc.keys().copied());
+        let rows: Vec<(i64, String)> = qb
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        for (disc, lang) in rows {
             if let Some(t) = by_disc.get(&disc) {
                 out.entry(*t).or_default().push(lang);
             }
@@ -3583,6 +3562,71 @@ impl ItemRepository for FerrofinItemRepository {
             access,
         })
     }
+}
+
+/// The distinct `(StreamType, Language)` pairs of the streams of `discs` on the
+/// items `filter` matches (v12.2 `BaseItemRepository.ByName.cs:110-115`).
+///
+/// Upstream runs only `TranslateQuery` — no PresentationUniqueKey grouping,
+/// ordering or paging — so the filter is this statement's own sub-select rather
+/// than `build_query`'s grouped id list: grouping keeps one version per title and
+/// would drop the languages only an alternate version carries, which is what
+/// `IncludeOwnedItems` asks for. A null or empty language is `und` (C#
+/// `string.IsNullOrEmpty`, so whitespace is kept as is); the DISTINCT is SQLite's
+/// BINARY comparison, as EF's `Distinct()` is.
+fn stream_languages_statement(
+    filter: &InternalItemsQuery,
+    discs: impl IntoIterator<Item = i64>,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT DISTINCT ms."StreamType",
+             CASE WHEN ms."Language" IS NULL OR ms."Language" = '' THEN 'und'
+                  ELSE ms."Language" END
+           FROM "MediaStreamInfos" AS ms WHERE ms."StreamType" IN ("#,
+    );
+    {
+        let mut separated = qb.separated(", ");
+        for disc in discs {
+            separated.push_bind(disc);
+        }
+    }
+    qb.push(r#") AND ms."ItemId" IN (SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" <> "#);
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(")");
+    qb
+}
+
+/// The query `BaseItemRepository.GetMediaStreamLanguages` actually runs: a fresh
+/// `InternalItemsQuery(filter.User)` (so the user's parental and tag restrictions
+/// apply) carrying only `IncludeOwnedItems`, the item-kind and media-type sets,
+/// the ancestor/item/top-parent/parent scope and the live-TV `Is*` flags
+/// (v12.2 `BaseItemRepository.ByName.cs:92-108`). Everything else a caller set
+/// is dropped, as upstream drops it.
+fn stream_language_query(filter: &InternalItemsQuery) -> InternalItemsQuery {
+    let mut query = InternalItemsQuery::default();
+    if let Some(user) = &filter.user {
+        query.set_user(user.clone());
+    }
+    query.include_owned_items = filter.include_owned_items;
+    query
+        .exclude_item_types
+        .clone_from(&filter.exclude_item_types);
+    query
+        .include_item_types
+        .clone_from(&filter.include_item_types);
+    query.media_types.clone_from(&filter.media_types);
+    query.ancestor_ids.clone_from(&filter.ancestor_ids);
+    query.item_ids.clone_from(&filter.item_ids);
+    query.top_parent_ids.clone_from(&filter.top_parent_ids);
+    query.parent_id = filter.parent_id;
+    query.is_airing = filter.is_airing;
+    query.is_movie = filter.is_movie;
+    query.is_sports = filter.is_sports;
+    query.is_kids = filter.is_kids;
+    query.is_news = filter.is_news;
+    query.is_series = filter.is_series;
+    query
 }
 
 impl FerrofinItemRepository {
@@ -3727,7 +3771,7 @@ struct FlaggedRow {
 /// The statement [`rows_by_primary_flagged`] runs over `n` primary ids: the
 /// rows pointing at them (never the placeholder row, never one pointing at
 /// itself), each with whether a row points at IT — an `EXISTS` the partial
-/// `FerrofinIX_BaseItems_PrimaryVersionId` answers by one seek per row.
+/// `IX_BaseItems_PrimaryVersionId` answers by one seek per row.
 pub(crate) fn rows_by_primary_flagged_sql(n: usize) -> String {
     format!(
         r#"SELECT b.*, EXISTS (SELECT 1 FROM "BaseItems" x
@@ -7025,7 +7069,7 @@ mod tests {
         langs.sort();
         assert_eq!(langs, vec!["eng".to_owned(), "und".to_owned()]);
 
-        // No matching items → empty (early return before the stream query).
+        // No matching items → empty.
         let none = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Book],
             ..Default::default()
@@ -7037,6 +7081,263 @@ mod tests {
                 .expect("empty langs")
                 .is_empty()
         );
+    }
+
+    /// Stores one stream row (`StreamType` discriminant, `Language`).
+    async fn insert_stream(
+        db: &Database,
+        item: Uuid,
+        index: i64,
+        stream_type: MediaStreamType,
+        language: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "IsDefault", "IsExternal", "IsForced",
+                "StreamType", "Language")
+               VALUES (?1, ?2, 0, 0, 0, ?3, ?4)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(i64::from(media_stream_type_disc(stream_type)))
+        .bind(language)
+        .execute(db.writer())
+        .await
+        .expect("insert stream");
+    }
+
+    const LANG_MOVIES: Uuid = Uuid::from_u128(0xB101);
+    const LANG_OTHER: Uuid = Uuid::from_u128(0xB102);
+    const LANG_PRIMARY: Uuid = Uuid::from_u128(0xB103);
+    const LANG_ALTERNATE: Uuid = Uuid::from_u128(0xB104);
+    const LANG_ELSEWHERE: Uuid = Uuid::from_u128(0xB105);
+    const LANG_USER: Uuid = Uuid::from_u128(0xB106);
+
+    /// Two libraries. In the first, a movie merged with an alternate version
+    /// the way the scanner stores versions (shared `PresentationUniqueKey`,
+    /// the alternate's `PrimaryVersionId` naming the primary): the primary is
+    /// English, the alternate French. The second library holds a Japanese movie.
+    /// Upstream's `_versionedMovie` / `_alternateVersion` fixture
+    /// (`BaseItemRepositoryStreamFilterTests.cs:33-36`).
+    async fn versioned_language_library(db: &Database) -> UserEntity {
+        seed_named_item(db, LANG_MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(db, LANG_OTHER, BaseItemKind::CollectionFolder, "Other").await;
+        for (id, name, library) in [
+            (LANG_PRIMARY, "Merged", LANG_MOVIES),
+            (LANG_ALTERNATE, "Merged", LANG_MOVIES),
+            (LANG_ELSEWHERE, "Elsewhere", LANG_OTHER),
+        ] {
+            seed_top_parented_item(db, id, BaseItemKind::Movie, name, library).await;
+        }
+        for id in [LANG_PRIMARY, LANG_ALTERNATE] {
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'merged' WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("presentation key");
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(LANG_PRIMARY))
+            .bind(guid_to_db(LANG_ALTERNATE))
+            .execute(db.writer())
+            .await
+            .expect("primary version");
+        insert_stream(db, LANG_PRIMARY, 0, MediaStreamType::Audio, Some("eng")).await;
+        insert_stream(db, LANG_ALTERNATE, 0, MediaStreamType::Audio, Some("fre")).await;
+        insert_stream(db, LANG_ELSEWHERE, 0, MediaStreamType::Audio, Some("jpn")).await;
+        seed_user_with_defaults(db, LANG_USER).await
+    }
+
+    /// `GET /Items/Filters2`'s movie stream query for `user`.
+    fn movie_stream_query(user: UserEntity, include_owned_items: bool) -> InternalItemsQuery {
+        let mut query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            include_owned_items,
+            ..InternalItemsQuery::default()
+        };
+        query.set_user(user);
+        query
+    }
+
+    async fn sorted_audio(
+        repository: &FerrofinItemRepository,
+        query: &InternalItemsQuery,
+    ) -> Vec<String> {
+        let mut languages = repository
+            .get_media_stream_languages(query, MediaStreamType::Audio)
+            .await
+            .expect("languages");
+        languages.sort();
+        languages
+    }
+
+    /// Both requested types come back from one call, and a requested type with
+    /// no streams still has its (empty) entry.
+    #[tokio::test]
+    async fn media_stream_languages_by_type_answers_every_requested_type() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0xB201);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        insert_stream(&db, item, 0, MediaStreamType::Audio, Some("eng")).await;
+        insert_stream(&db, item, 1, MediaStreamType::Subtitle, Some("fra")).await;
+        insert_stream(&db, item, 2, MediaStreamType::Subtitle, None).await;
+
+        let mut by_type = repository
+            .get_media_stream_languages_by_type(
+                &InternalItemsQuery::default(),
+                &[
+                    MediaStreamType::Audio,
+                    MediaStreamType::Subtitle,
+                    MediaStreamType::Lyric,
+                ],
+            )
+            .await
+            .expect("languages");
+        let mut subtitles = by_type
+            .remove(&MediaStreamType::Subtitle)
+            .expect("subtitles");
+        subtitles.sort();
+        assert_eq!(
+            by_type.remove(&MediaStreamType::Audio),
+            Some(vec!["eng".to_owned()])
+        );
+        assert_eq!(subtitles, ["fra", "und"]);
+        assert_eq!(by_type.remove(&MediaStreamType::Lyric), Some(Vec::new()));
+        assert!(by_type.is_empty());
+    }
+
+    /// The grouping regression: with a user set, the `build_query` id list
+    /// grouped the version pair by `PresentationUniqueKey` and kept only the
+    /// primary, so the alternate's French never reached the facet. Upstream
+    /// runs `TranslateQuery` alone and `IncludeOwnedItems` admits the alternate.
+    #[tokio::test]
+    async fn media_stream_languages_include_an_alternate_versions_language() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = versioned_language_library(&db).await;
+        assert_eq!(
+            sorted_audio(&repository, &movie_stream_query(user, true)).await,
+            ["eng", "fre", "jpn"]
+        );
+    }
+
+    /// Without `IncludeOwnedItems` the alternate version stays hidden behind
+    /// its primary (`ApplyAlternateVersionFiltering`): the flag is what admits it.
+    #[tokio::test]
+    async fn media_stream_languages_hide_the_alternate_without_owned_items() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = versioned_language_library(&db).await;
+        assert_eq!(
+            sorted_audio(&repository, &movie_stream_query(user, false)).await,
+            ["eng", "jpn"]
+        );
+    }
+
+    /// `AddUserToQuery`: a library the user cannot see contributes nothing.
+    #[tokio::test]
+    async fn media_stream_languages_skip_a_library_the_user_cannot_see() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = versioned_language_library(&db).await;
+        set_folder_preference(
+            &db,
+            LANG_USER,
+            PreferenceKind::BlockedMediaFolders,
+            &[LANG_OTHER],
+        )
+        .await;
+        assert_eq!(
+            sorted_audio(&repository, &movie_stream_query(user, true)).await,
+            ["eng", "fre"]
+        );
+    }
+
+    /// Only fields upstream copies into its fresh query count: a caller's
+    /// `IsVirtualItem` / `Years` / paging do not narrow the facet.
+    #[tokio::test]
+    async fn media_stream_languages_ignore_fields_upstream_does_not_copy() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = versioned_language_library(&db).await;
+        let query = InternalItemsQuery {
+            years: vec![1900],
+            is_virtual_item: Some(true),
+            limit: Some(1),
+            ..movie_stream_query(user, true)
+        };
+        assert_eq!(
+            sorted_audio(&repository, &query).await,
+            ["eng", "fre", "jpn"]
+        );
+    }
+
+    /// C# `string.IsNullOrEmpty`: only NULL and `""` become `und`; whitespace
+    /// is a language of its own. The DISTINCT is BINARY, so case variants stay
+    /// apart.
+    #[tokio::test]
+    async fn media_stream_languages_map_only_null_and_empty_to_und() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0xB301);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        for (index, language) in [
+            (0, Some(" ")),
+            (1, Some("ENG")),
+            (2, Some("eng")),
+            (3, Some("")),
+            (4, None),
+            (5, Some("eng")),
+        ] {
+            insert_stream(&db, item, index, MediaStreamType::Audio, language).await;
+        }
+        assert_eq!(
+            sorted_audio(&repository, &InternalItemsQuery::default()).await,
+            [" ", "ENG", "eng", "und"]
+        );
+    }
+
+    /// The facet statement reaches `MediaStreamInfos` through an index seek,
+    /// never a full scan of the stream table, and `BaseItems` through the
+    /// user-scoped top-parent index.
+    #[tokio::test]
+    async fn media_stream_languages_plan_seeks_the_stream_index() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let repository = repo(&db);
+        let user = versioned_language_library(&db).await;
+        let narrowed = stream_language_query(&movie_stream_query(user, true));
+        let resolved = repository.resolve_views(&narrowed).await.expect("resolve");
+        let filter = resolved.as_ref().unwrap_or(&narrowed);
+        assert!(!filter.top_parent_ids.is_empty(), "user scope applied");
+        let discs = [MediaStreamType::Audio, MediaStreamType::Subtitle]
+            .map(|t| i64::from(media_stream_type_disc(t)));
+        let mut builder = stream_languages_statement(filter, discs);
+        let mut query = builder.build();
+        let args = query.take_arguments().unwrap().unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        // The stream probe is the covering `(StreamType, ItemId, Language, …)`
+        // index, seeking each matched id; the item set is an index seek too.
+        assert!(
+            plan.contains(
+                "SEARCH ms USING COVERING INDEX \
+                 IX_MediaStreamInfos_StreamType_ItemId_Language_IsExternal"
+            ),
+            "{plan}"
+        );
+        assert!(plan.contains("SEARCH bi USING"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
     }
 
     #[tokio::test]

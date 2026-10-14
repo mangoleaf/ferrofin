@@ -1,45 +1,53 @@
 #!/usr/bin/env bash
-# adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME]
+# adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
 #
-# Adopts every Jellyfin release Ferrofin claims to support (10.11.8, 10.11.9, 10.11.10, 10.11.11,
-# 12.0, 12.1 via both upgrade routes), through one image, on a FRESH
-# copy of each pristine fixture under DIR, and checks each one the same way:
+# Adopts every Jellyfin release Ferrofin claims to support, 10 paths: 10.11.8, 10.11.9, 10.11.10,
+# 10.11.11, 12.0, 12.1 via both upgrade routes and 12.2 via all three (from 10.11, 12.0, 12.1),
+# through one image, on a FRESH copy of each pristine fixture under DIR, and checks each one
+# the same way:
 #   1. the boot log names the expected generation, applies every migration, logs no ERROR;
-#   2. smoke.sh answers match Jellyfin 12.1's own answers on the same library
-#      (DIR/oracle/smoke-jellyfin-12.1.txt), ignoring lines that legitimately differ
-#      (server version, task/plugin lists, /Devices, folder order, activity-log count,
-#      image byte size);
+#   2. smoke.sh answers match the oracle release's own answers on the same library
+#      (DIR/oracle/smoke-jellyfin-<oracle>.txt; --oracle or ADOPTION_ORACLE, default 12.2),
+#      ignoring lines that legitimately differ (server version, task/plugin lists, /Devices,
+#      folder order, activity-log count, image byte size);
 #   3. PRAGMA integrity_check / foreign_key_check are clean on the adopted file;
 #   4. a second boot runs no repair and changes no answer;
 #   5. populated metadata survives both boots and an explicit library scan (DB + HTTP).
 #   6. watch history survives each stage for every user (DB + HTTP).
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are NOT in the repository — see adoption/README.md for what DIR
-# must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot.
+# must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot. Media
+# mounts come from DIR/media-mounts.sh, or from the file ADOPTION_MEDIA_MOUNTS names.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
+ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
-  -h|--help) sed -n 2,18p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  --oracle) ORACLE_VERSION=$2; shift 2;;
+  -h|--help) sed -n 2,20p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
 WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work}
 for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
-ORACLE=$FIXTURES/oracle/smoke-jellyfin-12.1.txt
+ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
-MEDIA=()
-# shellcheck disable=SC1091 # user-supplied, outside the repository
-[ ! -f "$FIXTURES/media-mounts.sh" ] || . "$FIXTURES/media-mounts.sh"
+MEDIA=(); MOUNTS=${ADOPTION_MEDIA_MOUNTS:-$FIXTURES/media-mounts.sh}
+[ -z "${ADOPTION_MEDIA_MOUNTS:-}" ] || [ -f "$MOUNTS" ] || { echo "run: no $MOUNTS" >&2; exit 2; }
+# shellcheck disable=SC1090,SC1091 # user-supplied, outside the repository
+[ ! -f "$MOUNTS" ] || . "$MOUNTS"
 # name|fixture directory|host port
 # The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
-# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids).
+# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids). Every row
+# is an upgraded database; fresh-install 12.x databases adopt too, covered by the Rust gate
+# tests only.
 FIXTURE_TABLE=(
   "10.11.8|jellyfin-10.11.8|18099"
   "10.11.8|jellyfin-10.11.9|18089"
@@ -48,6 +56,9 @@ FIXTURE_TABLE=(
   "12.0.0|jellyfin-12.0|18097"
   "12.1.0|jellyfin-12.1-from-10|18093"
   "12.1.0|jellyfin-12.1-from-12|18092"
+  "12.2.0|jellyfin-12.2-from-10|18091"
+  "12.2.0|jellyfin-12.2-from-12|18090"
+  "12.2.0|jellyfin-12.2-from-121|18083"
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
 settle() { local port=$1 auth=$2 busy; for _ in $(seq 1 60); do busy=$(curl -sf "http://127.0.0.1:$port/ScheduledTasks" -H "$auth" 2>/dev/null | jq -r '[.[]|select(.State!="Idle")]|length' 2>/dev/null); [ "${busy:-1}" = 0 ] && break; sleep 2; done; sleep 5; }

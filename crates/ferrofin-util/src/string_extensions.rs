@@ -253,6 +253,22 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
         .eq(right.chars().map(to_upper_invariant))
 }
 
+/// `StringComparer.OrdinalIgnoreCase.Compare(a, b)`: the same simple invariant
+/// uppercase mapping as [`equals_ordinal_ignore_case`], then an ordinal
+/// comparison of UTF-16 code units (so a supplementary-plane character sorts by
+/// its surrogate pair, as in .NET, not by its scalar value).
+#[must_use]
+pub fn compare_ordinal_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    let utf16 = |text: &str| -> Vec<u16> {
+        text.chars()
+            .map(to_upper_invariant)
+            .collect::<String>()
+            .encode_utf16()
+            .collect()
+    };
+    utf16(left).cmp(&utf16(right))
+}
+
 /// .NET invariant uppercase for a string, using ICU's simple mappings.
 #[must_use]
 pub fn upper_invariant(text: &str) -> String {
@@ -514,6 +530,18 @@ mod tests {
         assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
         assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
+    }
+
+    #[test]
+    fn compare_ordinal_ignore_case_matches_dotnet() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(compare_ordinal_ignore_case("alien", "ALIEN"), Equal);
+        assert_eq!(compare_ordinal_ignore_case("alien", "Blade"), Less);
+        // Uppercased first: `_` (0x5F) sorts after `A` (0x41) but before `a`.
+        assert_eq!(compare_ordinal_ignore_case("_x", "ax"), Greater);
+        assert_eq!(compare_ordinal_ignore_case("", "a"), Less);
+        // UTF-16 order: a surrogate (0xD83C…) sorts below U+FF21 `Ａ`.
+        assert_eq!(compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"), Less);
     }
 
     /// `ToUpperInvariant` is the simple mapping: one char in, one char out.

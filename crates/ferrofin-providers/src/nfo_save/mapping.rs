@@ -1,6 +1,7 @@
 //! Map a persisted item back onto the shared NFO serialization model.
 use crate::xbmc::item::NfoBaseItem;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_traits::localization::{LocalizationManager, normalize_original_language};
 
 fn split(value: Option<&str>) -> Vec<String> {
     value
@@ -12,7 +13,10 @@ fn split(value: Option<&str>) -> Vec<String> {
 }
 
 #[allow(clippy::cast_possible_truncation)] // Ratings are single precision in the NFO model.
-pub(super) fn item(row: &BaseItemEntity) -> Option<NfoBaseItem> {
+pub(super) fn item(
+    row: &BaseItemEntity,
+    localization: Option<&dyn LocalizationManager>,
+) -> Option<NfoBaseItem> {
     let data: serde_json::Value = row
         .data
         .as_deref()
@@ -28,6 +32,13 @@ pub(super) fn item(row: &BaseItemEntity) -> Option<NfoBaseItem> {
         kind: super::policy::kind(row)?,
         name: row.name.clone(),
         original_title: row.original_title.clone(),
+        // `BaseNfoSaver.cs:501-504` writes `item.OriginalLanguage`, which the
+        // mapper's assignment (`BaseItemMapper.cs:105`) already ran through the
+        // `BaseItem.cs:228-232` setter — the same value the DTO serves.
+        original_language: row
+            .original_language
+            .as_deref()
+            .map(|value| normalize_original_language(localization, value)),
         sort_name: row.sort_name.clone(),
         forced_sort_name: row.forced_sort_name.clone(),
         overview: row.overview.clone(),
@@ -91,7 +102,7 @@ mod tests {
     #[test]
     fn persisted_fields_and_kind_specific_data_reach_the_serializer() {
         let row=BaseItemEntity {type_:"MediaBrowser.Controller.Entities.TV.Episode".into(), name:Some("Episode".into()), original_title:Some("Original".into()), genres:Some("Drama|Comedy|".into()), artists:Some("One|Two".into()),is_locked:true,index_number:Some(2),parent_index_number:Some(1),data:Some(r#"{"IndexNumberEnd":3,"AirsBeforeSeasonNumber":2,"AirsBeforeEpisodeNumber":1,"RemoteTrailers":[{"Url":"https://example/trailer"}],"Video3DFormat":"HalfSideBySide"}"#.into()),..Default::default()};
-        let item = item(&row).unwrap();
+        let item = item(&row, None).unwrap();
         assert_eq!(item.kind, crate::xbmc::item::NfoItemKind::Episode);
         assert_eq!(item.genres, ["Drama", "Comedy"]);
         assert_eq!(item.artists, ["One", "Two"]);
@@ -101,5 +112,29 @@ mod tests {
         assert_eq!(item.airs_before_episode_number, Some(1));
         assert_eq!(item.remote_trailers, ["https://example/trailer"]);
         assert!(item.is_locked);
+    }
+
+    /// The saved `<originallanguage>` is the setter-normalised value: a legacy
+    /// `"English"` row is written as `en`, an unknown token is kept, and with
+    /// no culture table (C#'s `LocalizationManager?.`) the value is unchanged.
+    #[rstest::rstest]
+    #[case(Some("English"), Some("en"))]
+    #[case(Some("fra"), Some("fr"))]
+    #[case(Some("Klingon"), Some("Klingon"))]
+    #[case(None, None)]
+    fn original_language_runs_the_setter(
+        #[case] stored: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let row = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            original_language: stored.map(str::to_owned),
+            ..Default::default()
+        };
+        let localization = crate::test_localization::EnglishAndFrench;
+        let saved = item(&row, Some(&localization)).unwrap();
+        assert_eq!(saved.original_language.as_deref(), expected);
+        let raw = item(&row, None).unwrap();
+        assert_eq!(raw.original_language.as_deref(), stored);
     }
 }

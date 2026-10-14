@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
 use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
@@ -82,10 +83,11 @@ pub trait CollectionManager: Send + Sync {
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError>;
 
-    /// Gets the collections accessible to a user that contain the given item.
+    /// Gets the collections visible to `user` that manually link the given item
+    /// (`ICollectionManager.GetCollectionsContainingItem`); callers sort.
     async fn get_collections_containing_item(
         &self,
-        user_id: Uuid,
+        user: &UserEntity,
         item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 

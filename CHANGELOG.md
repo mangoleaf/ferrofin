@@ -17,22 +17,72 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Pin id-list queries to the primary key: 12.0 drops
   `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without the `+"Type"` pin the
   planner scanned every row of the type (`detail:similar` 4.9 → 7.8 ms p50)
-- Adopt Jellyfin 12.0 and 12.1 databases in place alongside 10.11.8–10.11.11 (exact migration
-  sets per generation, 12.1's re-dated rating routine optional; `0030` is baselined where the
-  database already owns `NormalizedUsername`; an atomic adoption record drives the one-shot
-  membership import)
+- Adopt Jellyfin 12.0, 12.1 and 12.2 databases in place alongside 10.11.8–10.11.11 (exact
+  migration sets per generation, 12.1/12.2 re-dated routines optional; `0030` is baselined
+  where the database already owns `NormalizedUsername`; an atomic adoption record drives the
+  one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
 - `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
-  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0) through an image on fresh fixture copies and diffs the
-  answers against Jellyfin 12.1's own; fixtures are derived from one supplied 10.11.8 snapshot
-- All seven live fixture paths passed on 2026-09-16, including both 12.1 upgrade routes;
-  see the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
+  fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
+  from one supplied 10.11.8 snapshot
+- All seven 10.11–12.1 live fixture paths passed on 2026-09-16, including both 12.1 upgrade
+  routes; 12.2 paths passed the synthetic suite on 2026-10-13.
+  See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
-  repaired count is zero, with five regression tests; all 36 shell tests passed.
+  repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Bundle jellyfin-web 12.2 (was 12.0) in the image: admins get a user picker on the Quick
+  Connect page, "Still watching?" is off by default, the client sends `Accept-Language`,
+  the save-subtitles-with-media option shows for movie, TV and mixed libraries, and
+  embedded VobSub subtitles render again
+- Report Jellyfin version 12.2.0 (was 10.11.8) in `/System/Info`, built-in plugin versions
+  and the plugin catalog's `targetAbi` filter; jellyfin-sdk-kotlin treats servers below
+  12.0.0 as unsupported. The route gate stays on the 10.11.8 contract
+- Serve `GET /Items/{itemId}/Collections` (Jellyfin 12.1's `GetItemCollections`): the
+  collections the user can see that include the item, sorted and paged as upstream.
+  jellyfin-web's item page calls it and hid its Collections section on the old `404`.
+  `contract_superset` now probes every 12.1 operation the 10.11.8 contract lacks
+- Honour Jellyfin 12.1's `audioLanguages` and `subtitleLanguages` filters on `GET /Items`
+  and `GET /Trailers`: an item matches when its own streams or an alternate version's
+  carry a listed language (exact, case-sensitive codes; `und` also matches a stream with
+  no language), and a folder or collection matches when such an item sits below it. As
+  upstream, every media-stream filter (these two, `hasSubtitles`, `isHd`, `is4K`, `is3D`,
+  `videoTypes`) now keeps alternate versions in the query, and the legacy
+  `GET /Users/{userId}/Items` ignores both lists
+- Publish Jellyfin 12's `AudioLanguages` and `SubtitleLanguages` facets on
+  `GET /Items/Filters2` for movie and TV type sets: each distinct stream language as
+  `{Name: "English (eng)", Value: "eng"}`, alternate versions included, show and season
+  sets widened to their episodes, sorted by name in the request culture. ISO 639-2-only
+  codes (`und`, `mul`, `zxx`, …) now resolve as in Jellyfin 12, so `/Localization/Cultures`
+  and the metadata editor's language list carry all 496 languages (was 194). Clients see
+  this in subtitle menus: a subtitle track tagged `und` is now titled "Undetermined" (was
+  "Und"), and `mul`, `zxx` and `mis` tracks read "Multiple languages", "No linguistic
+  content" and "Uncoded languages". External subtitle files named with these codes
+  (`movie.und.srt`, `movie.mul.srt`) now have them read as the track language.
+  `GET /Items/Filters` is unchanged
+- Serve Jellyfin 12's `MediaStream.IsOriginal` (ffprobe's `original` disposition, always
+  written), `LocalizedLanguage` and `LocalizedOriginal` (on every audio stream). An
+  original audio track's `DisplayTitle` ends in " - Original" (localized). As upstream, a
+  stored ISO 639-2/B language is sent as its /T code (`ger` → `deu`, `fre` → `fra`), a
+  video track with a title appends its tags with " - " (`Main - 1080p - H264 - SDR`, was
+  `Main 1080p H264 SDR`), and Live TV channel, recording and opened live streams carry the same
+  localized labels as library items, plus the `DisplayTitle` they previously lacked
+- Send Jellyfin 12's `BaseItemDto.OriginalLanguage` on every item that has one, with no
+  `Fields` request needed and no series inheritance, and accept it in the metadata editor
+  (`POST /Items/{itemId}`; blank clears it, as does an edit that omits it). As upstream, a
+  known language is stored and served as its two-letter code: OMDb's "English" becomes
+  `en`, an edited `fra` becomes `fr`, and rows already stored as "English" are sent as
+  `en`. The NFO `<originallanguage>` element now follows `<originaltitle>` and is skipped
+  when blank
+- `hasSubtitles`, `isHd`, `is4K` and `minWidth`/`minHeight`/`maxWidth`/`maxHeight` judge a
+  merged item by its whole version group, as Jellyfin 12 does: a movie whose subtitles or
+  4K file live only on its second version matches, listed under the primary, and an SD
+  primary with a better version no longer counts as SD. `hasSubtitles`, `isHd` and `is4K`
+  also match a series, library or collection by the items below it
 - Port Jellyfin 12.0's data routines: linked-children move, orphaned extras, OwnerId
   relationships, version links, `GetCleanValue`, forced sort names, localized user-view
   consolidation
@@ -65,6 +115,36 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carries the choice over from `metadata.xml`, including an install adopted by an
   earlier version (on its first boot of this one). Existing items otherwise keep their
   stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- Honour `HlsAudioSeekStrategy` (Dashboard → Playback → Transcoding): when set to
+  "Prevent audio copy on HLS seek", a seek into a stream that was direct-copying audio
+  forces re-encoding so the audio starts at a keyframe boundary, eliminating the pop/click
+  some clients produce on partial-GOP audio. As upstream, the default is off
+- Honour `SubtitleExtractionTimeoutMinutes` (Dashboard → Playback → Transcoding): an
+  embedded-subtitle extraction that exceeds the configured timeout is killed and its
+  partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
+  the default is 30 minutes
+- Port `TrimCopiedAudio` noise bitstream filter: when a video is being transcoded but the
+  audio is direct-copied, ffmpeg 5.0+ trims the leading audio silence to match the
+  requested seek point, eliminating the A/V desync on mid-file seeks into remuxed HLS. The
+  `noise=drop='lt(…)'` BSF and `aac_adtstoasc` are combined into a single `-bsf:a` argument
+- Port subtitle extraction failure handling and ASS font fix-up from upstream
+  `MediaEncoder`: extraction failures are logged at WARN with the ffmpeg output and do not
+  abort the transcode; ASS subtitles with missing `[Fonts]` or `[Graphics]` sections get
+  the headers appended on write so libass renders them correctly
+- Port `DownMixStereoAlgorithm` filter table: the 15-entry `(algorithm, channel_layout) →
+  pan=stereo|…` lookup for Dave750, NightmodeDialogue, Rfc7845 and Ac4 algorithms, with
+  7.1 → 5.1 pre-downmix chains and channel-layout inference from stream metadata. When
+  the algorithm's filter is active, `-ac 2` is suppressed (the `pan=` filter sets the
+  channel count)
+
+### Security
+- A server whose setup was completed no longer starts when its database is missing, empty or
+  has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
+  a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
+  could reach the server signed in as an administrator with an empty password (a lost mount, a
+  wrong data directory or a deleted file was enough). The refusal names three ways out: restore
+  the database, set `IsStartupWizardCompleted` to false in `system.json` to start over, or
+  start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Bug Fixes
 - A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
@@ -80,6 +160,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   are listed as separate movies once the library is browsable again, and a plain
   subfolder of a movie library shows as an empty folder. See
   [docs/UPGRADING.md](docs/UPGRADING.md)
+- A movie's alternate version on a database adopted from Jellyfin 10.11 takes its primary's
+  official rating (scored), overview, community rating, genres, year, images and provider ids
+  when it is re-homed at boot, as Jellyfin 12's first scan gives it; it kept what 10.11 last
+  copied, so a rating changed since then stayed on the primary alone. A boot that fails or stops
+  before that copy makes it on the next boot
 
 ## [1.0.0] - 2026-09-05
 

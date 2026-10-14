@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use ferrofin_db::Database;
+use ferrofin_db::entities::playback::UserDataEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
@@ -27,8 +28,8 @@ use crate::db_error::db_err;
 use crate::item_data::{import_membership, parse_data, read_linked_children};
 use crate::item_folders::{MovedFolders, move_item_folders};
 use crate::item_persistence_service::{
-    FerrofinItemPersistenceService, RekeyKind, alternate_version_child_type, detach_user_data,
-    move_user_data, rekey_rows, user_weights,
+    FerrofinItemPersistenceService, REPAIR_PARTITION, RekeyKind, alternate_version_child_type,
+    detach_user_data, move_user_data, rekey_rows, user_weights,
 };
 use crate::item_type_lookup::{
     IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
@@ -91,6 +92,10 @@ pub async fn run_all(db: &Database) -> Result<(), ServiceError> {
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
     }
+    // After the merges, which fold rows of one item under several keys (as
+    // upstream's 20260508 merges run before its 20260912 harmonize); it logs
+    // its own summary, which needs the group count too.
+    harmonize_conflicting_user_data(db).await?;
     let stripped = strip_embedded_linked_children(db).await?;
     if stripped > 0 {
         tracing::info!(
@@ -904,21 +909,37 @@ struct GroupRow {
 /// and its stacked parts, and the scan that then re-creates them
 /// (`LibraryManager.ResolveAlternateVersion`, `LibraryManager.cs:865-922`;
 /// `Video.RefreshMetadataForOwnedVideo`, `Video.cs:670-691`). Ferrofin keeps
-/// the rows — their user data, images, streams and provider ids — and gives
-/// them the shape the scan would store, so an adopted database's first scan
-/// writes nothing for them (owner decision D9c):
+/// the rows — their user data and streams, and their images and provider
+/// ids through the move (a local version then takes its primary's, below) —
+/// and gives them the shape the scan would store, so an adopted database's
+/// first scan writes nothing for them (owner decision D9c):
 ///
 /// - a local version — a row at a path in a movie's, music video's,
 ///   video's or episode's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
 ///   the primary's folder — of another type moves to the id the primary's
 ///   type derives for its path (the scan's re-key, with what is keyed by its
-///   id and its folders; a 10.11 `Video` keeps its refresh stamp and
-///   provider ids — it is the same title, [`RekeyKind::Represented`]); then
+///   id and its folders; a 10.11 `Video` keeps its refresh stamp, and its
+///   provider ids until its primary's copy replaces them — it is the same
+///   title, [`RekeyKind::Represented`]); then
 ///   it takes the primary as `OwnerId` and `PrimaryVersionId`, the
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
 ///   as a local version (`ChildType` 2). Its name stands: the scan never
 ///   renames an owned version (`settle_extra_name`).
+///
+///   Upstream's scan then finds the primary's version links short of its
+///   `LocalAlternateVersions` — the deleted row took its link along — and
+///   saves the primary (`Video.RefreshedOwnedItems`, `Video.cs:560-575`),
+///   whose save gives every local version its images, overview, year,
+///   premiere date, community and official rating, genres and provider ids
+///   (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`). So each primary
+///   whose version this repair moved, or had to link, gives its versions
+///   that copy here ([`ItemPersistenceService::copy_metadata_to_owned_videos`]
+///   on `persistence`, which scores the ratings it copies), as the scan
+///   does for a version it moves. The moves and links commit before the
+///   copy, so the primaries owed one are recorded (`FerrofinMeta`, before a
+///   move and with a link) until it is made: a copy that fails, or a boot
+///   that stops before it, is made by the next boot.
 /// - a stacked part — a row at a path in a video's `AdditionalParts` — of
 ///   another type moves to its `Video` id as the scan's re-key does
 ///   ([`RekeyKind::Changed`]); then it takes the video as `OwnerId`, and the
@@ -939,7 +960,8 @@ struct GroupRow {
 /// 12.x shape are left alone. Runs once per database (`FerrofinMeta`),
 /// after [`run_all`] — it needs the item-id derivation and the folder roots
 /// the composition root resolves (`art_root` is the item art root,
-/// `{metadata}/library`).
+/// `{metadata}/library`), and the persistence service the server saves
+/// items through (`persistence`, with its localization attached).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -948,16 +970,27 @@ pub async fn rehome_local_versions(
     derivation: &IdDerivation,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
+    persistence: &dyn ItemPersistenceService,
 ) -> Result<RehomedVersions, ServiceError> {
     const KEY: &str = "rehome_local_versions_v12";
     if !once(db, KEY).await? {
         return Ok(RehomedVersions::default());
     }
+    // Primaries an earlier boot moved or linked versions of without copying
+    // to them: the copy is still owed.
+    let mut copies = pending_copies(db).await?;
     let versions = version_pairs(db).await?;
     let parts = part_pairs(db).await?;
     if !needs_work(db, derivation, &versions, None).await?
         && !needs_work(db, derivation, &parts, Some(BaseItemKind::Video)).await?
     {
+        if !copies.is_empty() {
+            copy_to_versions(db, persistence, &copies).await?;
+            tracing::info!(
+                owners = copies.len(),
+                "copied primaries' metadata to the local versions an earlier boot re-homed"
+            );
+        }
         done(db, KEY).await?;
         return Ok(RehomedVersions::default());
     }
@@ -978,22 +1011,116 @@ pub async fn rehome_local_versions(
         path_manager,
     };
     let mut out = RehomedVersions::default();
+    // The primaries whose saves upstream's scan makes. One whose version is
+    // about to move is owed its copy from before the move commits, so a
+    // boot that stops between the move and the copy makes it on the next.
+    let owed = copies.len();
+    for pair in &versions {
+        if rekey_target(derivation, pair, None).is_some() {
+            copies.insert(uuid_of(&pair.owner.id)?);
+        }
+    }
+    if copies.len() != owed {
+        db.meta_set(COPY_KEY, &encode_copies(&copies))
+            .await
+            .map_err(meta_err)?;
+    }
     // Local versions first: a version's own stack is owned by its new id.
     let (versions, rekeyed, versions_moved) =
         rekey_to_owner_kind(db, derivation, &folders, versions, None).await?;
     out.rekeyed += rekeyed;
-    out.versions = place_owned(db, &versions, true).await?;
+    out.versions = place_owned(db, &versions, Some(&mut copies)).await?;
+    copy_to_versions(db, persistence, &copies).await?;
     let parts = part_pairs(db).await?;
     let (parts, rekeyed, parts_moved) =
         rekey_to_owner_kind(db, derivation, &folders, parts, Some(BaseItemKind::Video)).await?;
     out.rekeyed += rekeyed;
-    out.parts = place_owned(db, &parts, false).await?;
+    out.parts = place_owned(db, &parts, None).await?;
     // A failed move leaves its row for the scan; the repair runs again on
     // the next boot.
     if versions_moved && parts_moved {
         done(db, KEY).await?;
     }
     Ok(out)
+}
+
+/// The `FerrofinMeta` key holding the primaries [`rehome_local_versions`]
+/// owes a copy to their local versions (comma-separated ids). The moves and
+/// links the copy follows commit before it, so it stays until the copy is
+/// made.
+const COPY_KEY: &str = "rehome_local_versions_v12_copies";
+
+/// The primaries an earlier [`rehome_local_versions`] still owes a copy
+/// ([`COPY_KEY`]).
+async fn pending_copies(db: &Database) -> Result<BTreeSet<Uuid>, ServiceError> {
+    let Some(value) = db.meta_get(COPY_KEY).await.map_err(meta_err)? else {
+        return Ok(BTreeSet::new());
+    };
+    value
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            Uuid::parse_str(id).map_err(|err| {
+                ServiceError::Backend(format!("FerrofinMeta {COPY_KEY} holds {id:?}: {err}"))
+            })
+        })
+        .collect()
+}
+
+/// `owners` as [`COPY_KEY`] stores them.
+fn encode_copies(owners: &BTreeSet<Uuid>) -> String {
+    owners
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Writes `owners` as [`COPY_KEY`] on `conn`, inside its caller's
+/// transaction.
+async fn store_copies(
+    conn: &mut sqlx::SqliteConnection,
+    owners: &BTreeSet<Uuid>,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, ?2)
+           ON CONFLICT("Key") DO UPDATE SET "Value" = excluded."Value""#,
+    )
+    .bind(COPY_KEY)
+    .bind(encode_copies(owners))
+    .execute(conn)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Gives the local versions of each of `owners` what its save copies to
+/// them ([`ItemPersistenceService::copy_metadata_to_owned_videos`]), then
+/// clears [`COPY_KEY`]. A copy that fails leaves the key, so the next boot
+/// makes it.
+async fn copy_to_versions(
+    db: &Database,
+    persistence: &dyn ItemPersistenceService,
+    owners: &BTreeSet<Uuid>,
+) -> Result<(), ServiceError> {
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Uuid> = owners.iter().copied().collect();
+    persistence
+        .copy_metadata_to_owned_videos(&ids, true, false)
+        .await?;
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(COPY_KEY)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// A stored id, parsed.
+fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(id).map_err(|err| ServiceError::Backend(err.to_string()))
 }
 
 /// [`rehome_local_versions`] and its log line, for the composition root.
@@ -1005,8 +1132,10 @@ pub async fn run_rehome_local_versions(
     derivation: &IdDerivation,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
+    persistence: &dyn ItemPersistenceService,
 ) -> Result<(), ServiceError> {
-    let rehomed = rehome_local_versions(db, derivation, art_root, path_manager).await?;
+    let rehomed =
+        rehome_local_versions(db, derivation, art_root, path_manager, persistence).await?;
     if rehomed != RehomedVersions::default() {
         tracing::info!(
             rekeyed = rehomed.rekeyed,
@@ -1605,16 +1734,20 @@ fn simple_key(id: &str) -> Result<String, ServiceError> {
 }
 
 /// Gives each pair's child its owner's shape ([`place_differs`]), in one
-/// transaction; a local version (`versions`) is linked under its owner (a
-/// linked one re-typed, as local beats linked). Returns the number of
-/// children changed.
+/// transaction. Local versions come with `copies`, the primaries owed a
+/// copy to their versions: each version is linked under its owner (a linked
+/// one re-typed, as local beats linked), and an owner a link is written
+/// under joins `copies`, stored ([`COPY_KEY`]) in the same transaction —
+/// upstream's scan saves it. Returns the number of children changed.
 async fn place_owned(
     db: &Database,
     pairs: &[OwnedPair],
-    versions: bool,
+    mut copies: Option<&mut BTreeSet<Uuid>>,
 ) -> Result<usize, ServiceError> {
+    let versions = copies.is_some();
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     let mut changed = 0usize;
+    let mut owed = false;
     for pair in pairs {
         if !place_differs(&mut tx, pair, versions).await? {
             continue;
@@ -1663,10 +1796,17 @@ async fn place_owned(
             .await
             .map_err(db_err)?;
         }
-        if versions {
-            link_local_version(&mut tx, &owner.id, &child.id).await?;
+        if let Some(copies) = copies.as_deref_mut()
+            && link_local_version(&mut tx, &owner.id, &child.id).await?
+        {
+            owed |= copies.insert(uuid_of(&owner.id)?);
         }
         changed += 1;
+    }
+    if let Some(copies) = copies
+        && owed
+    {
+        store_copies(&mut tx, copies).await?;
     }
     tx.commit().await.map_err(db_err)?;
     Ok(changed)
@@ -1986,9 +2126,226 @@ async fn merge_peoples_rows(db: &Database) -> Result<usize, ServiceError> {
     Ok(deleted)
 }
 
+/// The `FerrofinMeta` key of [`harmonize_conflicting_user_data`].
+const HARMONIZE_KEY: &str = "user_data_harmonized_v122";
+
+/// The extension of the snapshot [`harmonize_conflicting_user_data`] takes:
+/// `jellyfin.db` → `jellyfin.db.pre-harmonize`.
+const HARMONIZE_SNAPSHOT_EXTENSION: &str = "db.pre-harmonize";
+
+/// The next page of `(ItemId, UserId)` groups whose `UserData` rows disagree,
+/// after the keyset `(?2, ?3)`, at most `?4` of them — upstream's `GroupBy`
+/// (`20260912120000_HarmonizeConflictingUserData.cs:45-56`). `MIN`/`MAX`
+/// skip NULLs as EF's translation does, and `IS NOT` is EF's null-aware `!=`
+/// on the nullable date. The placeholder item (`?1`) is detached history,
+/// the retention mirror, and never a conflict. Its id has no hex letters, so
+/// the comparison holds however a database cases its GUIDs; the group keys
+/// are bound back exactly as stored.
+///
+/// Upstream compares the dates as `DateTime`s; here they are text, written
+/// two ways for one instant: EF trims trailing fraction zeros
+/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), Ferrofin's
+/// `datetime_to_db` always writes seven digits (`… 09.5330000`). So each
+/// date is padded to the seven-digit form first — exact to the tick (100 ns),
+/// which `julianday` (milliseconds) is not, and ordered like the instant.
+/// A database Ferrofin has run on holds both forms, and a group that only
+/// differs in that way is no conflict.
+const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
+   WHERE "ItemId" <> ?1
+     AND ("ItemId" > ?2 OR ("ItemId" = ?2 AND "UserId" > ?3))
+   GROUP BY "ItemId", "UserId"
+   HAVING COUNT(*) > 1
+      AND (MIN("PlaybackPositionTicks") <> MAX("PlaybackPositionTicks")
+        OR MIN("PlayCount") <> MAX("PlayCount")
+        OR MIN("Played") <> MAX("Played")
+        OR MIN("IsFavorite") <> MAX("IsFavorite")
+        OR MIN(CASE WHEN instr("LastPlayedDate", '.') = 0 THEN "LastPlayedDate" || '.0000000'
+                    ELSE substr("LastPlayedDate" || '0000000', 1, 27) END)
+           IS NOT
+           MAX(CASE WHEN instr("LastPlayedDate", '.') = 0 THEN "LastPlayedDate" || '.0000000'
+                    ELSE substr("LastPlayedDate" || '0000000', 1, 27) END))
+   ORDER BY "ItemId", "UserId"
+   LIMIT ?4"#;
+
+/// The port of Jellyfin 12.2's `HarmonizeConflictingUserData`
+/// (`Jellyfin.Server/Migrations/Routines/20260912120000_HarmonizeConflictingUserData.cs:40-129`):
+/// when one item holds several `UserData` rows for a user (one per
+/// `CustomDataKey`, often fossils of earlier incarnations of the same item)
+/// and they disagree, every row takes the values of the most recent play.
+///
+/// - The winner is the row with the latest `LastPlayedDate` (NULL last), then
+///   the highest `PlayCount`, then the highest `PlaybackPositionTicks`
+///   (upstream's order, `:98-102`), then — Ferrofin's tiebreak, where upstream
+///   keeps whichever row the database returned first — the lowest
+///   `CustomDataKey`.
+/// - The other rows of the group get exactly its `AudioStreamIndex`,
+///   `IsFavorite`, `LastPlayedDate`, `Likes`, `PlaybackPositionTicks`,
+///   `PlayCount`, `Played`, `Rating` and `SubtitleStreamIndex` (`:108-119`).
+///   The date is copied as the winner's stored text, not re-formatted, so a
+///   harmonized group agrees byte for byte. `CustomDataKey` and
+///   `RetentionDate` stay.
+/// - Rows on the placeholder item are detached history (the retention
+///   mirror) and are never touched, nor are the `FerrofinUserDataRetention*`
+///   snapshot tables: retention recovers from both.
+///
+/// With no conflict it only marks itself done. Otherwise a file-backed
+/// database is first copied once to `<db>.pre-harmonize` (owner decision D5;
+/// upstream backs up before the routine unconditionally). The groups are then
+/// harmonized in keyset order, [`REPAIR_PARTITION`] groups per write
+/// transaction (upstream: 500 per `SaveChanges`). The `FerrofinMeta` key is
+/// set only after the last partition, so a boot that dies mid-way finishes on
+/// the next one; the groups already harmonized no longer conflict and drop
+/// out of the query.
+///
+/// This is a one-time pass, like upstream's routine. The scanner's and the
+/// runtime's folds (`rekey_items`, `merge_one`) resolve history per key and
+/// can leave an item's keys disagreeing again later — and so can the boot
+/// repairs that re-key items after [`run_all`] (`run_rehome_local_versions`
+/// and `run_rekey_virtual_seasons`, called from
+/// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
+/// Keeping keys in agreement at save time is a separate work item (parity
+/// review A6).
+///
+/// Returns the number of rows updated, and logs one summary when it
+/// changed something.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query, the snapshot or the marker write
+/// fails.
+pub async fn harmonize_conflicting_user_data(db: &Database) -> Result<usize, ServiceError> {
+    harmonize_in_partitions(db, REPAIR_PARTITION).await
+}
+
+/// [`harmonize_conflicting_user_data`] with `partition` groups per
+/// transaction.
+async fn harmonize_in_partitions(db: &Database, partition: i64) -> Result<usize, ServiceError> {
+    if !once(db, HARMONIZE_KEY).await? {
+        return Ok(0);
+    }
+    let mut groups = conflicting_groups(db, ("", ""), partition).await?;
+    if groups.is_empty() {
+        done(db, HARMONIZE_KEY).await?;
+        return Ok(0);
+    }
+    if let Some(backup) = db
+        .snapshot_once(HARMONIZE_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before harmonizing conflicting user data"
+        );
+    }
+    let page = usize::try_from(partition).unwrap_or(usize::MAX);
+    let (mut rows, mut harmonized) = (0usize, 0usize);
+    loop {
+        rows += harmonize_groups(db, &groups).await?;
+        harmonized += groups.len();
+        tracing::debug!(
+            groups = harmonized,
+            rows,
+            "harmonized a partition of conflicting user data"
+        );
+        let (Some((item, user)), true) = (groups.last(), groups.len() == page) else {
+            break;
+        };
+        groups = conflicting_groups(db, (item, user), partition).await?;
+        if groups.is_empty() {
+            break;
+        }
+    }
+    done(db, HARMONIZE_KEY).await?;
+    tracing::info!(
+        rows,
+        groups = harmonized,
+        "repaired conflicting user data so every row of an item agrees"
+    );
+    Ok(rows)
+}
+
+/// The next `limit` conflicting groups after `after` ([`CONFLICTING_GROUPS`]).
+async fn conflicting_groups(
+    db: &Database,
+    after: (&str, &str),
+    limit: i64,
+) -> Result<Vec<(String, String)>, ServiceError> {
+    sqlx::query_as(CONFLICTING_GROUPS)
+        .bind(PLACEHOLDER_ID)
+        .bind(after.0)
+        .bind(after.1)
+        .bind(limit)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// Harmonizes one partition of groups in one write transaction. Returns the
+/// rows updated: every row of a group but its winner.
+async fn harmonize_groups(
+    db: &Database,
+    groups: &[(String, String)],
+) -> Result<usize, ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut updated = 0u64;
+    for (item, user) in groups {
+        let rows: Vec<UserDataEntity> =
+            sqlx::query_as(r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#)
+                .bind(item)
+                .bind(user)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let Some(winner) = rows.iter().max_by(|a, b| winner_order(a, b)) else {
+            continue;
+        };
+        // The date as the winner stores it: a re-format would change EF's
+        // trimmed text and leave the group differing as text.
+        updated += sqlx::query(
+            r#"UPDATE "UserData" SET
+                 "AudioStreamIndex" = ?1, "IsFavorite" = ?2,
+                 "LastPlayedDate" = (
+                   SELECT w."LastPlayedDate" FROM "UserData" w
+                   WHERE w."ItemId" = ?9 AND w."UserId" = ?10 AND w."CustomDataKey" = ?11),
+                 "Likes" = ?3, "PlaybackPositionTicks" = ?4, "PlayCount" = ?5,
+                 "Played" = ?6, "Rating" = ?7, "SubtitleStreamIndex" = ?8
+               WHERE "ItemId" = ?9 AND "UserId" = ?10 AND "CustomDataKey" <> ?11"#,
+        )
+        .bind(winner.audio_stream_index)
+        .bind(winner.is_favorite)
+        .bind(winner.likes)
+        .bind(winner.playback_position_ticks)
+        .bind(winner.play_count)
+        .bind(winner.played)
+        .bind(winner.rating)
+        .bind(winner.subtitle_stream_index)
+        .bind(item)
+        .bind(user)
+        .bind(&winner.custom_data_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(usize::try_from(updated).unwrap_or(usize::MAX))
+}
+
+/// The harmonize winner rule as an ordering, greatest wins: `LastPlayedDate`
+/// (a NULL date is the least), then `PlayCount`, then
+/// `PlaybackPositionTicks`, then the *lower* `CustomDataKey` — unique within
+/// a group, so exactly one row wins.
+fn winner_order(a: &UserDataEntity, b: &UserDataEntity) -> std::cmp::Ordering {
+    a.last_played_date
+        .cmp(&b.last_played_date)
+        .then(a.play_count.cmp(&b.play_count))
+        .then(a.playback_position_ticks.cmp(&b.playback_position_ticks))
+        .then_with(|| b.custom_data_key.cmp(&a.custom_data_key))
+}
+
 #[cfg(test)]
 mod tests {
-    use ferrofin_db::store::guid_to_db;
+    use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
     use ferrofin_model::data::BaseItemKind;
     use uuid::Uuid;
 
@@ -2204,6 +2561,11 @@ mod tests {
         program_data_path: None,
     };
 
+    /// The persistence service [`rehome_local_versions`] copies through.
+    fn store(db: &Database) -> FerrofinItemPersistenceService {
+        FerrofinItemPersistenceService::new(db.clone())
+    }
+
     /// A movies library's group and a home-video stack, both stored as a
     /// group's primary and its owned rows, under one library folder.
     struct Group {
@@ -2262,9 +2624,13 @@ mod tests {
         }
     }
 
+    /// The Tmdb id of [`seed_10_11_rows`]'s primary.
+    const PRIMARY_TMDB: &str = "101332";
+
     /// The bench's 10.11 rows of [`seed_group`]'s groups: the local version
-    /// (played, with a provider id), the part, and an older scan's `Movie`
-    /// part. Returns their ids.
+    /// (played, with the provider id 10.11 last copied from its primary,
+    /// which the primary has since changed), the part, and an older scan's
+    /// `Movie` part. Returns their ids.
     async fn seed_10_11_rows(db: &Database, g: &Group) -> [Uuid; 3] {
         let adopted = derive_item_id_with(&DERIVATION, BaseItemKind::Video, ALTERNATE).unwrap();
         let part = derive_item_id_with(&DERIVATION, BaseItemKind::Video, PART).unwrap();
@@ -2286,7 +2652,8 @@ mod tests {
             .await;
         }
         link(db, g.primary, adopted, LOCAL_ALTERNATE_VERSION, 0).await;
-        seed_provider_id(db, adopted, "Tmdb", "101332").await;
+        seed_provider_id(db, g.primary, "Tmdb", PRIMARY_TMDB).await;
+        seed_provider_id(db, adopted, "Tmdb", "75780").await;
         let user = Uuid::from_u128(0x99);
         seed_user(db, user).await;
         seed_user_data(db, user, adopted, true, None).await;
@@ -2299,17 +2666,18 @@ mod tests {
     /// own id — linked under it as `MigrateLinkedChildren` imports it; a
     /// stack's part is a `Video` it owns with no parent and its own folder
     /// state, and an older scan's part a `Movie` of its own. The repair
-    /// moves the version to its `Movie` id with its user data, provider ids
-    /// and refresh stamp, the older part to its `Video` id as the scan's
-    /// re-key does (refresh stamp cleared), gives all their owner's place,
-    /// and leaves the result alone on a second run, even with its once-key
-    /// cleared.
+    /// moves the version to its `Movie` id with its user data and refresh
+    /// stamp — its stale provider id replaced by its primary's, as the
+    /// primary's save copies — the older part to its `Video` id as the
+    /// scan's re-key does (refresh stamp cleared), gives all their owner's
+    /// place, and leaves the result alone on a second run, even with its
+    /// once-key cleared.
     #[tokio::test]
     async fn local_versions_and_parts_take_their_owners_shape() {
         let db = test_db().await;
         let g = seed_group(&db).await;
         let [adopted, part, older] = seed_10_11_rows(&db, &g).await;
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -2340,17 +2708,22 @@ mod tests {
             ancestors(&db, &guid_to_db(alternate)).await,
             vec![guid_to_db(g.library)]
         );
-        let kept: (i64, i64) = sqlx::query_as(
-            r#"SELECT (SELECT COUNT(*) FROM "BaseItemProviders" WHERE "ItemId" = ?1),
-                      (SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1
-                         AND "CustomDataKey" = ?2)"#,
+        let played: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "Played" = 1
+                 AND "CustomDataKey" = ?2"#,
         )
         .bind(guid_to_db(alternate))
         .bind(alternate.to_string())
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(kept, (1, 1), "provider ids and user data stay with it");
+        assert_eq!(played, 1, "its user data moves with it");
+        assert_eq!(
+            provider_ids(&db, alternate).await,
+            vec![("Tmdb".to_owned(), PRIMARY_TMDB.to_owned())],
+            "its provider ids are its primary's, copied by the primary's save"
+        );
+        assert_eq!(pending_copies(&db).await.unwrap(), BTreeSet::new());
         assert_eq!(
             links(&db).await,
             vec![(primary.clone(), guid_to_db(alternate), 2, 0)]
@@ -2383,7 +2756,7 @@ mod tests {
         }
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -2393,11 +2766,307 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default(),
             "the repaired shape is the 12.x one"
+        );
+    }
+
+    /// `OfficialRating`, `InheritedParentalRatingValue`/`SubValue`, `Name`,
+    /// `Overview`, `CommunityRating`, `Genres` and `ProductionYear` of `id`.
+    type Copied = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<f64>,
+        Option<String>,
+        Option<i64>,
+    );
+
+    async fn copied(db: &Database, id: Uuid) -> Copied {
+        sqlx::query_as(
+            r#"SELECT "OfficialRating", "InheritedParentalRatingValue",
+                      "InheritedParentalRatingSubValue", "Name", "Overview",
+                      "CommunityRating", "Genres", "ProductionYear"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_one(db.pool())
+        .await
+        .expect("copied columns")
+    }
+
+    async fn provider_ids(db: &Database, id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as(
+            r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders"
+               WHERE "ItemId" = ?1 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(id))
+        .fetch_all(db.pool())
+        .await
+        .expect("provider ids")
+    }
+
+    /// The synthetic fixture's Jellyfin 10.11.8 group: two version files,
+    /// the alternate a `Video` under its own id with its own name and an
+    /// older rating than the primary's (`G`, where the primary was since
+    /// rated `MA15+`), pointing at nothing. Jellyfin 12.x deletes that row
+    /// and its scan re-creates it under the `Movie` id and saves the primary,
+    /// whose save copies its metadata to it (`Video.cs:560-575,704-726`):
+    /// so the repair that moves it instead gives it the primary's rating
+    /// (scored), overview, community rating, genres, year and provider ids.
+    /// Its name is its own, as the version's.
+    #[tokio::test]
+    async fn a_moved_version_takes_what_its_primarys_save_copies() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let [adopted, ..] = seed_10_11_rows(&db, &g).await;
+        set_columns(
+            &db,
+            g.primary,
+            r#""OfficialRating" = ?2, "Overview" = ?3, "CommunityRating" = 7.5,
+               "Genres" = 'Adventure', "ProductionYear" = 2014"#,
+            &[
+                Some("MA15+".to_owned()),
+                Some("An invented adoption fixture.".to_owned()),
+            ],
+        )
+        .await;
+        set_columns(
+            &db,
+            adopted,
+            r#""Name" = ?2, "OfficialRating" = 'G'"#,
+            &[Some("Bridge (2014) - 1080p".to_owned())],
+        )
+        .await;
+        seed_provider_id(&db, g.primary, "Tmdb", "990000005").await;
+        let store = store(&db);
+        store.set_localization(std::sync::Arc::new(
+            crate::localization_manager::LocalizationManager::new("US"),
+        ));
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store)
+            .await
+            .unwrap();
+
+        assert_eq!((rehomed.rekeyed, rehomed.versions), (2, 1));
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        assert_eq!(
+            copied(&db, alternate).await,
+            (
+                Some("MA15+".to_owned()),
+                Some(15),
+                Some(3),
+                Some("Bridge (2014) - 1080p".to_owned()),
+                Some("An invented adoption fixture.".to_owned()),
+                Some(7.5),
+                Some("Adventure".to_owned()),
+                Some(2014),
+            )
+        );
+        assert_eq!(
+            provider_ids(&db, alternate).await,
+            vec![("Tmdb".to_owned(), "990000005".to_owned())]
+        );
+    }
+
+    /// A version stored under its `Movie` id but not linked under its
+    /// primary: upstream's scan finds the primary's version links short and
+    /// saves it, copying to its versions — so the repair that links it
+    /// copies. One already linked (the 12.x shape) is left as it is, its own
+    /// rating kept: upstream saves no primary for it.
+    #[rstest::rstest]
+    #[case::unlinked(false, "PG-13")]
+    #[case::linked(true, "G")]
+    #[tokio::test]
+    async fn a_version_linked_by_the_repair_takes_its_primarys_rating(
+        #[case] already_linked: bool,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let alternate = seed_placed_version(&db, &g).await;
+        if already_linked {
+            link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
+        }
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+
+        assert_eq!(rehomed.versions, usize::from(!already_linked));
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some(expected));
+    }
+
+    /// [`seed_group`]'s local version stored under its `Movie` id in its
+    /// primary's place but not linked under it, rated `G` where the primary
+    /// is rated `PG-13`. Returns its id.
+    async fn seed_placed_version(db: &Database, g: &Group) -> Uuid {
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        seed_item(db, alternate, BaseItemKind::Movie).await;
+        set_path(db, alternate, ALTERNATE).await;
+        set_columns(
+            db,
+            alternate,
+            r#""OwnerId" = ?2, "PrimaryVersionId" = ?2, "PresentationUniqueKey" = ?3,
+               "ParentId" = ?4, "TopParentId" = ?4, "IsInMixedFolder" = 0,
+               "OfficialRating" = 'G'"#,
+            &[
+                Some(guid_to_db(g.primary)),
+                Some(g.primary.as_simple().to_string()),
+                Some(guid_to_db(g.library)),
+            ],
+        )
+        .await;
+        add_ancestor(db, alternate, g.library).await;
+        set_columns(db, g.primary, r#""OfficialRating" = 'PG-13'"#, &[]).await;
+        alternate
+    }
+
+    /// A persistence service whose copy fails, as a storage failure would;
+    /// nothing else of it is used.
+    struct FailingCopy;
+
+    fn unused<T>() -> Result<T, ServiceError> {
+        Err(ServiceError::Backend("not used by the repair".to_owned()))
+    }
+
+    #[async_trait::async_trait]
+    impl ItemPersistenceService for FailingCopy {
+        async fn delete_items(&self, _: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            unused()
+        }
+        async fn deletion_closure(
+            &self,
+            _: &[Uuid],
+        ) -> Result<Vec<ferrofin_db::entities::base_items::BaseItemEntity>, ServiceError> {
+            unused()
+        }
+        async fn save_items(
+            &self,
+            _: &[ferrofin_db::entities::base_items::BaseItemEntity],
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn set_primary_version_id(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn copy_metadata_to_owned_videos(
+            &self,
+            _: &[Uuid],
+            _: bool,
+            _: bool,
+        ) -> Result<usize, ServiceError> {
+            Err(ServiceError::Backend("disk I/O error".to_owned()))
+        }
+        async fn set_parent_id(&self, _: Uuid, _: Uuid) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn set_collection_type(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn save_item_values(&self, _: Uuid, _: &[(i32, String)]) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn item_exists(&self, _: Uuid) -> Result<bool, ServiceError> {
+            unused()
+        }
+        async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn save_images(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn reattach_user_data(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            unused()
+        }
+        async fn update_inherited_values(&self) -> Result<(), ServiceError> {
+            unused()
+        }
+    }
+
+    /// The moves and links commit before the copy: when the copy fails the
+    /// boot stops with the version moved but not yet given its primary's
+    /// rating, the primary still owed its copy and the repair not marked
+    /// done. The next boot, finding the version in place, makes the copy,
+    /// then clears what was owed and marks the repair done.
+    #[tokio::test]
+    async fn a_failed_copy_is_made_on_the_next_boot() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let [adopted, ..] = seed_10_11_rows(&db, &g).await;
+        set_columns(&db, g.primary, r#""OfficialRating" = 'PG-13'"#, &[]).await;
+        set_columns(&db, adopted, r#""OfficialRating" = 'G'"#, &[]).await;
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+
+        assert!(
+            rehome_local_versions(&db, &DERIVATION, None, None, &FailingCopy)
+                .await
+                .is_err()
+        );
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("G"));
+        assert_eq!(
+            pending_copies(&db).await.unwrap(),
+            BTreeSet::from([g.primary])
+        );
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
+        assert_eq!(pending_copies(&db).await.unwrap(), BTreeSet::new());
+        assert!(db.meta_get(COPY_KEY).await.unwrap().is_none());
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A boot that stopped after a version's link committed but before its
+    /// primary's copy leaves nothing to move or link — only the copy owed.
+    /// The next boot makes it before marking the repair done.
+    #[tokio::test]
+    async fn a_copy_owed_by_a_stopped_boot_is_made_with_nothing_left_to_move() {
+        let db = test_db().await;
+        let g = seed_group(&db).await;
+        let alternate = seed_placed_version(&db, &g).await;
+        link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
+        db.meta_set(COPY_KEY, &g.primary.to_string()).await.unwrap();
+
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            .await
+            .unwrap();
+
+        assert_eq!(rehomed, RehomedVersions::default());
+        assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
+        assert!(db.meta_get(COPY_KEY).await.unwrap().is_none());
+        assert!(
+            db.meta_get("rehome_local_versions_v12")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -2452,7 +3121,7 @@ mod tests {
         )
         .await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -2558,7 +3227,7 @@ mod tests {
         }
         fail_moves(&db).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
             .await
             .unwrap();
         assert_eq!(rehomed.rekeyed, 0);
@@ -2576,7 +3245,7 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
             .await
             .unwrap();
         // The version and the older scan's `Movie` part.
@@ -2617,7 +3286,7 @@ mod tests {
         seed_user(&db, user).await;
         seed_user_data(&db, user, target, true, None).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!((rehomed.rekeyed, rehomed.versions), (1, 1));
@@ -2691,7 +3360,7 @@ mod tests {
         .await;
         link(&db, primary, as_movie, LINKED_ALTERNATE_VERSION, 0).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -2735,7 +3404,7 @@ mod tests {
             }
         };
         let quiet = open("quiet.db").await;
-        rehome_local_versions(&quiet, &DERIVATION, None, None)
+        rehome_local_versions(&quiet, &DERIVATION, None, None, &store(&quiet))
             .await
             .unwrap();
         assert!(!tmp.path().join("quiet.db.pre-rehome").exists());
@@ -2743,7 +3412,7 @@ mod tests {
         let db = open("jellyfin.db").await;
         let g = seed_group(&db).await;
         seed_10_11_rows(&db, &g).await;
-        rehome_local_versions(&db, &DERIVATION, None, None)
+        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
             .await
             .unwrap();
         assert!(tmp.path().join("jellyfin.db.pre-rehome").is_file());
@@ -2802,7 +3471,7 @@ mod tests {
         );
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None)
+            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -3359,5 +4028,540 @@ mod tests {
             .expect("count");
         assert_eq!(left, 1);
         assert_eq!(merge_duplicate_people(&db).await.expect("again"), 0);
+    }
+
+    /// The user every harmonize test plays as (upstream's `_userId`).
+    const HARMONIZE_USER: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+
+    /// One `UserData` row of a harmonize test — upstream's `Row` helper
+    /// (`HarmonizeConflictingUserDataTests.cs:113-127`) plus the columns
+    /// it leaves at their defaults.
+    #[derive(Clone, Copy, Default)]
+    struct Play<'a> {
+        key: &'a str,
+        last_played: Option<(i32, u32, u32)>,
+        count: i32,
+        position: i64,
+        played: bool,
+        favorite: bool,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+        likes: Option<bool>,
+        rating: Option<f64>,
+        retention: Option<(i32, u32, u32)>,
+    }
+
+    fn day((y, m, d): (i32, u32, u32)) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    /// Inserts `play` for [`HARMONIZE_USER`] on the item stored as `item`.
+    async fn insert_play(db: &Database, item: &str, play: Play<'_>) {
+        insert_play_as(db, item, HARMONIZE_USER, play).await;
+    }
+
+    /// Inserts `play` for `user` on the item stored as `item`.
+    async fn insert_play_as(db: &Database, item: &str, user: Uuid, play: Play<'_>) {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite",
+                "LastPlayedDate", "Likes", "PlayCount", "PlaybackPositionTicks", "Played",
+                "Rating", "RetentionDate", "SubtitleStreamIndex")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+        )
+        .bind(item)
+        .bind(guid_to_db(user))
+        .bind(play.key)
+        .bind(play.audio)
+        .bind(play.favorite)
+        .bind(opt_datetime_to_db(play.last_played.map(day)))
+        .bind(play.likes)
+        .bind(play.count)
+        .bind(play.position)
+        .bind(play.played)
+        .bind(play.rating)
+        .bind(opt_datetime_to_db(play.retention.map(day)))
+        .bind(play.subtitle)
+        .execute(db.writer())
+        .await
+        .expect("insert user data");
+    }
+
+    /// The rows stored on `item`, by `CustomDataKey`.
+    async fn plays(db: &Database, item: &str) -> Vec<UserDataEntity> {
+        sqlx::query_as(r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 ORDER BY "CustomDataKey""#)
+            .bind(item)
+            .fetch_all(db.pool())
+            .await
+            .expect("user data")
+    }
+
+    /// Overwrites the stored `LastPlayedDate` text of `item`'s `key` row — a
+    /// date as another writer formats it.
+    async fn set_date_text(db: &Database, item: &str, key: &str, text: &str) {
+        sqlx::query(
+            r#"UPDATE "UserData" SET "LastPlayedDate" = ?3
+               WHERE "ItemId" = ?1 AND "CustomDataKey" = ?2"#,
+        )
+        .bind(item)
+        .bind(key)
+        .bind(text)
+        .execute(db.writer())
+        .await
+        .expect("date text");
+    }
+
+    /// The stored `LastPlayedDate` texts of `item`'s rows, by key.
+    async fn date_texts(db: &Database, item: &str) -> Vec<Option<String>> {
+        sqlx::query_scalar(
+            r#"SELECT "LastPlayedDate" FROM "UserData" WHERE "ItemId" = ?1
+               ORDER BY "CustomDataKey""#,
+        )
+        .bind(item)
+        .fetch_all(db.pool())
+        .await
+        .expect("date texts")
+    }
+
+    /// A migrated file-backed database `name` in `dir`.
+    async fn open_file_db(dir: &std::path::Path, name: &str) -> Database {
+        let url = format!("sqlite://{}", dir.join(name).display());
+        let db = Database::connect(&url).await.unwrap();
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// A user and one stored item per id, the ids as stored.
+    async fn seed_harmonize(db: &Database, items: &[Uuid]) -> Vec<String> {
+        seed_user(db, HARMONIZE_USER).await;
+        let mut stored = Vec::with_capacity(items.len());
+        for &item in items {
+            seed_item(db, item, BaseItemKind::Folder).await;
+            stored.push(guid_to_db(item));
+        }
+        stored
+    }
+
+    /// Upstream's two rows of one item from two eras of itself.
+    const RECENT: Play<'static> = Play {
+        key: "497698",
+        last_played: Some((2023, 8, 14)),
+        count: 9,
+        position: 0,
+        played: true,
+        favorite: false,
+        audio: None,
+        subtitle: None,
+        likes: None,
+        rating: None,
+        retention: None,
+    };
+    const FOSSIL: Play<'static> = Play {
+        key: "tt3480822",
+        last_played: Some((2021, 12, 31)),
+        count: 7,
+        position: 490,
+        played: false,
+        ..RECENT
+    };
+
+    /// `Perform_ConflictingRows_CollapsesToMostRecentPlay`: both rows of the
+    /// conflicting item end as the most recent play; an item whose rows
+    /// already agree is untouched.
+    #[tokio::test]
+    async fn harmonize_collapses_conflicting_rows_to_the_most_recent_play() {
+        let db = test_db().await;
+        let ids = seed_harmonize(
+            &db,
+            &[
+                Uuid::from_u128(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa),
+                Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
+            ],
+        )
+        .await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        let agreed = Play {
+            key: "121",
+            last_played: Some((2022, 1, 1)),
+            count: 2,
+            position: 77,
+            ..RECENT
+        };
+        insert_play(&db, &ids[1], agreed).await;
+        insert_play(
+            &db,
+            &ids[1],
+            Play {
+                key: "tt0167261",
+                ..agreed
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        let rows = plays(&db, &ids[0]).await;
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(row.played);
+            assert_eq!(row.playback_position_ticks, 0);
+            assert_eq!(row.play_count, 9);
+        }
+        assert!(
+            plays(&db, &ids[1])
+                .await
+                .iter()
+                .all(|row| row.playback_position_ticks == 77)
+        );
+    }
+
+    /// `Perform_DetachedRows_AreLeftAlone`: rows on the placeholder item
+    /// belong to no item, so they keep their state for the next item that
+    /// claims one of their keys — and so does the retention snapshot beside
+    /// them.
+    #[tokio::test]
+    async fn harmonize_leaves_detached_rows_and_retention_snapshots_alone() {
+        // No hex letters: the placeholder compares equal however a database
+        // cases its GUIDs.
+        assert!(!PLACEHOLDER_ID.bytes().any(|b| b.is_ascii_alphabetic()));
+        let db = test_db().await;
+        seed_harmonize(&db, &[]).await;
+        insert_play(&db, PLACEHOLDER_ID, RECENT).await;
+        insert_play(&db, PLACEHOLDER_ID, FOSSIL).await;
+        let snapshot = r#"SELECT "ItemId", "CustomDataKey", "PlayCount",
+                 "PlaybackPositionTicks", "Played", "LastPlayedDate"
+               FROM "FerrofinUserDataRetentionSnapshots""#;
+        sqlx::query(
+            r#"INSERT INTO "FerrofinUserDataRetentionSnapshots"
+               ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "LastPlayedDate",
+                "PlayCount", "PlaybackPositionTicks", "Played", "RetentionDate")
+               VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', ?1, 'tt3480822', 0,
+                       '2021-12-31 00:00:00.0000000', 7, 490, 0,
+                       '2026-01-01 00:00:00.0000000')"#,
+        )
+        .bind(guid_to_db(HARMONIZE_USER))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let before: Vec<(String, String, i64, i64, bool, String)> =
+            sqlx::query_as(snapshot).fetch_all(db.pool()).await.unwrap();
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 0);
+
+        let rows = plays(&db, PLACEHOLDER_ID).await;
+        assert_eq!(rows[0].playback_position_ticks, 0);
+        assert_eq!(rows[1].playback_position_ticks, 490);
+        let after: Vec<(String, String, i64, i64, bool, String)> =
+            sqlx::query_as(snapshot).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(after, before);
+    }
+
+    /// The repair runs once (from [`run_all`] here): a second call writes
+    /// nothing, even over a conflict that appeared since — the scan's folds
+    /// are not this pass's business.
+    #[tokio::test]
+    async fn harmonize_runs_once() {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa), Uuid::from_u128(0xbbbb)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        run_all(&db).await.unwrap();
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
+        assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
+
+        insert_play(&db, &ids[1], RECENT).await;
+        insert_play(&db, &ids[1], FOSSIL).await;
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 0);
+        let untouched = plays(&db, &ids[1]).await;
+        assert_eq!((untouched[0].play_count, untouched[1].play_count), (9, 7));
+    }
+
+    /// With date, count and position equal, the lower `CustomDataKey` wins —
+    /// Ferrofin's tiebreak, so the result never depends on row order.
+    #[rstest::rstest]
+    #[case::lower_key_favorite(true, false, true)]
+    #[case::lower_key_not_favorite(false, true, false)]
+    #[tokio::test]
+    async fn harmonize_ties_go_to_the_lower_custom_data_key(
+        #[case] lower: bool,
+        #[case] higher: bool,
+        #[case] expected: bool,
+    ) {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: "tt3480822",
+                favorite: higher,
+                ..RECENT
+            },
+        )
+        .await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                favorite: lower,
+                ..RECENT
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        assert!(
+            plays(&db, &ids[0])
+                .await
+                .iter()
+                .all(|row| row.is_favorite == expected)
+        );
+    }
+
+    /// A dated play beats an undated one however often that was played; the
+    /// losers take exactly the nine played-state columns and keep their key
+    /// and `RetentionDate`.
+    #[tokio::test]
+    async fn harmonize_copies_the_nine_columns_of_the_dated_winner() {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        let winner = Play {
+            key: "tt0167261",
+            last_played: Some((2020, 5, 1)),
+            count: 1,
+            position: 300,
+            played: false,
+            favorite: true,
+            audio: Some(2),
+            subtitle: Some(3),
+            likes: Some(true),
+            rating: Some(8.0),
+            retention: None,
+        };
+        insert_play(&db, &ids[0], winner).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: "121",
+                count: 50,
+                played: true,
+                retention: Some((2026, 1, 1)),
+                ..Play::default()
+            },
+        )
+        .await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        let rows = plays(&db, &ids[0]).await;
+        let kept = UserDataEntity {
+            item_id: ids[0].clone(),
+            user_id: guid_to_db(HARMONIZE_USER),
+            custom_data_key: "tt0167261".to_owned(),
+            audio_stream_index: Some(2),
+            is_favorite: true,
+            last_played_date: Some(day((2020, 5, 1))),
+            likes: Some(true),
+            play_count: 1,
+            playback_position_ticks: 300,
+            played: false,
+            rating: Some(8.0),
+            retention_date: None,
+            subtitle_stream_index: Some(3),
+        };
+        assert_eq!(rows[1], kept, "the winner keeps its own values");
+        let expected = UserDataEntity {
+            custom_data_key: "121".to_owned(),
+            retention_date: Some(day((2026, 1, 1))),
+            ..kept
+        };
+        assert_eq!(rows[0], expected);
+    }
+
+    /// The winner's date is copied as stored: EF's trimmed text stays
+    /// trimmed on every row, so the group agrees byte for byte and no longer
+    /// conflicts (a resumed pass would otherwise count it again).
+    #[rstest::rstest]
+    #[case::whole_seconds("2023-08-14 00:00:00")]
+    #[case::trimmed_fraction("2023-08-14 17:35:09.533")]
+    #[tokio::test]
+    async fn harmonize_copies_the_winners_stored_date_text(#[case] text: &str) {
+        let db = test_db().await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        set_date_text(&db, &ids[0], RECENT.key, text).await;
+
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+
+        assert_eq!(
+            date_texts(&db, &ids[0]).await,
+            [Some(text.to_owned()), Some(text.to_owned())]
+        );
+        assert!(
+            conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// One instant written two ways — EF trims fraction zeros, Ferrofin
+    /// writes seven digits — is no conflict: nothing is written (not even
+    /// the other columns, which differ) and no snapshot is taken. Exact to
+    /// the tick: dates one tick apart do conflict.
+    #[rstest::rstest]
+    #[case::trimmed_fraction("2026-05-14 17:35:09.533", "2026-05-14 17:35:09.5330000", false)]
+    #[case::whole_seconds("2023-08-14 00:00:00", "2023-08-14 00:00:00.0000000", false)]
+    #[case::same_text("2026-08-08 19:14:59.4740651", "2026-08-08 19:14:59.4740651", false)]
+    #[case::one_tick_apart("2026-08-08 19:14:59.474065", "2026-08-08 19:14:59.4740651", true)]
+    #[tokio::test]
+    async fn harmonize_compares_dates_by_instant_not_by_text(
+        #[case] ef: &str,
+        #[case] ferrofin: &str,
+        #[case] conflict: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = open_file_db(tmp.path(), "jellyfin.db").await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(
+            &db,
+            &ids[0],
+            Play {
+                key: FOSSIL.key,
+                likes: Some(true),
+                ..RECENT
+            },
+        )
+        .await;
+        set_date_text(&db, &ids[0], RECENT.key, ef).await;
+        set_date_text(&db, &ids[0], FOSSIL.key, ferrofin).await;
+        let before = plays(&db, &ids[0]).await;
+
+        let written = harmonize_conflicting_user_data(&db).await.unwrap();
+
+        assert_eq!(written, usize::from(conflict));
+        assert_eq!(
+            tmp.path().join("jellyfin.db.pre-harmonize").exists(),
+            conflict
+        );
+        if !conflict {
+            assert_eq!(plays(&db, &ids[0]).await, before);
+        }
+    }
+
+    /// Partitions commit one by one and the marker waits for the last: a
+    /// pass that dies mid-way leaves the harmonized groups harmonized and
+    /// the rest for the next boot, which finishes them. With one group per
+    /// partition, a page boundary falls between two users of one item (the
+    /// keyset's `"ItemId" = ?2 AND "UserId" > ?3` branch).
+    #[tokio::test]
+    async fn harmonize_resumes_after_a_failed_partition() {
+        let db = test_db().await;
+        let ids = seed_harmonize(
+            &db,
+            &[
+                Uuid::from_u128(0x1000),
+                Uuid::from_u128(0x2000),
+                Uuid::from_u128(0x3000),
+            ],
+        )
+        .await;
+        let second = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        crate::test_support::seed_named_user(&db, second, "second").await;
+        for id in &ids {
+            insert_play(&db, id, RECENT).await;
+            insert_play(&db, id, FOSSIL).await;
+        }
+        insert_play_as(&db, &ids[0], second, RECENT).await;
+        insert_play_as(&db, &ids[0], second, FOSSIL).await;
+        let fossils = || async {
+            sqlx::query_as::<_, (String, String)>(
+                r#"SELECT "ItemId", "UserId" FROM "UserData" WHERE "PlayCount" = 7
+                   ORDER BY "ItemId", "UserId""#,
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(fossils().await.len(), 4);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"CREATE TRIGGER "fail_last" BEFORE UPDATE ON "UserData"
+               WHEN OLD."ItemId" = '{}' BEGIN SELECT RAISE(ABORT, 'boom'); END"#,
+            ids[2]
+        )))
+        .execute(db.writer())
+        .await
+        .unwrap();
+
+        assert!(harmonize_in_partitions(&db, 1).await.is_err());
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_none());
+        // Both users of the first item and the second item were harmonized;
+        // only the failed partition's group is left.
+        assert_eq!(
+            fossils().await,
+            [(ids[2].clone(), guid_to_db(HARMONIZE_USER))]
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_last""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(harmonize_in_partitions(&db, 1).await.unwrap(), 1);
+        assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
+        assert!(fossils().await.is_empty());
+    }
+
+    /// A file-backed database is copied to `<db>.pre-harmonize` before a
+    /// conflict is harmonized — the copy still holds the fossil's state —
+    /// and not at all when there is none.
+    #[tokio::test]
+    async fn harmonize_snapshots_only_when_rows_conflict() {
+        use sqlx::Connection;
+        let tmp = tempfile::tempdir().unwrap();
+        let quiet = open_file_db(tmp.path(), "quiet.db").await;
+        let ids = seed_harmonize(&quiet, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&quiet, &ids[0], RECENT).await;
+        insert_play(
+            &quiet,
+            &ids[0],
+            Play {
+                key: "tt3480822",
+                ..RECENT
+            },
+        )
+        .await;
+        assert_eq!(harmonize_conflicting_user_data(&quiet).await.unwrap(), 0);
+        assert!(!tmp.path().join("quiet.db.pre-harmonize").exists());
+
+        let db = open_file_db(tmp.path(), "jellyfin.db").await;
+        let ids = seed_harmonize(&db, &[Uuid::from_u128(0xaaaa)]).await;
+        insert_play(&db, &ids[0], RECENT).await;
+        insert_play(&db, &ids[0], FOSSIL).await;
+        assert_eq!(harmonize_conflicting_user_data(&db).await.unwrap(), 1);
+        let backup = tmp.path().join("jellyfin.db.pre-harmonize");
+        assert!(backup.is_file());
+        let mut snapshot = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&backup)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+        let fossil: i64 = sqlx::query_scalar(
+            r#"SELECT "PlayCount" FROM "UserData" WHERE "ItemId" = ?1 AND "CustomDataKey" = ?2"#,
+        )
+        .bind(&ids[0])
+        .bind(FOSSIL.key)
+        .fetch_one(&mut snapshot)
+        .await
+        .unwrap();
+        assert_eq!(fossil, 7, "the snapshot predates the writes");
+        assert_eq!(plays(&db, &ids[0]).await[1].play_count, 9);
     }
 }

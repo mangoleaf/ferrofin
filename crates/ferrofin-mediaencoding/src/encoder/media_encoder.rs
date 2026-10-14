@@ -30,7 +30,9 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use super::encoding_utils::get_input_argument;
 use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::probing::dtos::InternalMediaInfoResult;
-use crate::probing::localization::PassthroughLocalization;
+use crate::probing::localization::{
+    LocalizationManager as ProbeLocalization, PassthroughLocalization, TraitLocalization,
+};
 use crate::probing::probe_result_normalizer::ProbeResultNormalizer;
 
 /// The number of 100-nanosecond ticks in one second (`TimeSpan.TicksPerSecond`).
@@ -79,7 +81,7 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     chapter_image_resolution: Option<Arc<dyn Fn() -> ImageResolution + Send + Sync>>,
     config: MediaEncoderConfig,
     paths: RwLock<Paths>,
-    normalizer: ProbeResultNormalizer<PassthroughLocalization>,
+    normalizer: ProbeResultNormalizer<Box<dyn ProbeLocalization + Send + Sync>>,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
@@ -102,6 +104,19 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         self
     }
 
+    /// Stamps probe output with the server's real localized labels and
+    /// language display names, as Jellyfin's production normalizer does
+    /// (`ProbeResultNormalizer` takes the live `ILocalizationManager`). Without
+    /// it the encoder keeps [`PassthroughLocalization`].
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.normalizer = ProbeResultNormalizer::new(Box::new(TraitLocalization(localization)));
+        self
+    }
+
     /// Creates an encoder using `transcoder` for process invocation and the
     /// given `ffmpeg`/`ffprobe` paths and `config`.
     pub fn new(
@@ -121,7 +136,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 ffmpeg: ffmpeg_path.into(),
                 ffprobe: ffprobe_path.into(),
             }),
-            normalizer: ProbeResultNormalizer::new(PassthroughLocalization),
+            normalizer: ProbeResultNormalizer::new(Box::new(PassthroughLocalization)),
         }
     }
 
@@ -1580,5 +1595,118 @@ mod tests {
             image_resolution_parameter(ImageResolution::Unrecognized(-1)),
             ""
         );
+    }
+
+    /// A [`Transcoder`] fake whose ffprobe run reports two audio tracks.
+    struct TwoAudioProbeTranscoder;
+
+    #[async_trait]
+    impl Transcoder for TwoAudioProbeTranscoder {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            _arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            let output = r#"{"streams":[
+                {"index":0,"codec_type":"audio","codec_name":"aac",
+                 "disposition":{"original":1},"tags":{"language":"eng"}},
+                {"index":1,"codec_type":"audio","codec_name":"aac",
+                 "tags":{"language":"xyz"}}
+            ],"format":{"format_name":"matroska"}}"#;
+            Ok(ProcessOutput {
+                output: output.to_owned(),
+                success: true,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    /// The server localization seam, knowing only `eng`.
+    struct EnglishOnly;
+
+    impl ferrofin_traits::localization::LocalizationManager for EnglishOnly {
+        fn get_cultures(&self) -> Vec<ferrofin_model::globalization::CultureDto> {
+            Vec::new()
+        }
+        fn get_countries(&self) -> Vec<ferrofin_model::globalization::CountryInfo> {
+            Vec::new()
+        }
+        fn get_parental_ratings(&self) -> Vec<ferrofin_model::entities_media::ParentalRating> {
+            Vec::new()
+        }
+        fn get_localization_options(
+            &self,
+        ) -> Vec<ferrofin_model::globalization::LocalizationOption> {
+            Vec::new()
+        }
+        fn get_localized_string(&self, phrase: &str) -> String {
+            format!("localized {phrase}")
+        }
+        fn get_server_localized_string(&self, phrase: &str) -> String {
+            phrase.to_owned()
+        }
+        fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
+            phrase.to_owned()
+        }
+        fn find_language_info(
+            &self,
+            _language: &str,
+        ) -> Option<ferrofin_model::globalization::CultureDto> {
+            None
+        }
+        fn get_language_display_name(&self, language: &str) -> Option<String> {
+            (language == "eng").then(|| "English".to_owned())
+        }
+        fn get_rating_score(
+            &self,
+            _rating: &str,
+            _country_code: Option<&str>,
+        ) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+            None
+        }
+    }
+
+    // Jellyfin's production `ProbeResultNormalizer` holds the live
+    // `ILocalizationManager` (ProbeResultNormalizer.cs:729-738): an unknown
+    // language display name stays null, and every audio stream gets
+    // `LocalizedOriginal`.
+    #[tokio::test]
+    async fn with_localization_stamps_real_labels_on_probe_output() {
+        let enc = MediaEncoderImpl::new(
+            Arc::new(TwoAudioProbeTranscoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        )
+        .with_localization(Arc::new(EnglishOnly));
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/media/film.mkv".to_owned()),
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let source = enc.get_media_info(&request).await.expect("probe parses");
+        let streams = &source.media_streams;
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].localized_language.as_deref(), Some("English"));
+        assert_eq!(
+            streams[0].localized_original.as_deref(),
+            Some("localized Original")
+        );
+        assert!(streams[0].is_original);
+        assert_eq!(streams[1].localized_language, None);
+        assert_eq!(
+            streams[1].localized_original.as_deref(),
+            Some("localized Original")
+        );
+        assert!(!streams[1].is_original);
     }
 }

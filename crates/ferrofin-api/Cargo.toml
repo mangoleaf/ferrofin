@@ -86,3 +86,5 @@ tracing-subscriber.workspace = true
 # decompressed bytes are byte-identical to the uncompressed response.
 flate2.workspace = true
 brotli.workspace = true
+# Upstream xUnit `[Theory]/[InlineData]` cases transliterate to `#[case]`.
+rstest.workspace = true

@@ -929,10 +929,14 @@ where
 /// open to anonymous callers.
 ///
 /// Only this one flag is touched, and only in the one direction: Jellyfin's XML
-/// says the wizard was completed while our JSON says it was not. Ferrofin never
-/// clears the flag, so that combination has no innocent explanation. Every
-/// other setting is left as the operator has it — a late, wholesale re-import
-/// would overwrite choices they made after adopting.
+/// says the wizard was completed while our JSON says it was not. Ferrofin itself
+/// only ever sets the flag; an administrator can clear it (`POST
+/// /System/Configuration`, or by editing `system.json` to start over after the
+/// database was lost), and on an install that still has a `system.xml` saying
+/// `true` this repair sets it again — which is why starting over means clearing
+/// it in both files, as [`startup_wizard_completed_files`] and the start-over
+/// refusal name them. Every other setting is left as the operator has it — a
+/// late, wholesale re-import would overwrite choices they made after adopting.
 async fn repair_lost_startup_flag(
     config_dir: &std::path::Path,
     config_file: &std::path::Path,
@@ -962,12 +966,7 @@ async fn repair_lost_startup_flag(
         Ok(xml) => xml,
         Err(e) => return unverified(&e.to_string()),
     };
-    match config_import::import_over(
-        &default_server_configuration(),
-        &xml,
-        "ServerConfiguration",
-        config_import::SYSTEM_XML_DENY,
-    ) {
+    match import_system_xml(&xml) {
         Ok(jellyfin) if jellyfin.is_startup_wizard_completed => {}
         // Jellyfin agrees the wizard was never completed: nothing to repair.
         Ok(_) => return,
@@ -984,6 +983,67 @@ async fn repair_lost_startup_flag(
     if let Err(e) = write_config(config_file, config).await {
         tracing::error!(error = %e, "could not persist the restored completed-setup flag");
     }
+}
+
+/// The configuration files under `config_dir` that record the startup wizard as
+/// completed — read before the database is opened, without writing anything.
+///
+/// An empty list means setup has not been completed. Otherwise it names every
+/// file [`FerrofinServerConfigurationManager::load`] would take the completed
+/// flag from: `system.json` when it says so, and Jellyfin's `system.xml` when
+/// it says so — the import source while `system.json` does not exist yet, and
+/// the source [`repair_lost_startup_flag`] restores the flag from when
+/// `system.json` says the wizard is incomplete. Resetting the flag means
+/// setting it to false in all of them; one left true sets it again.
+///
+/// The failure modes follow `load`: an unreadable `system.json`, or an
+/// unreadable `system.xml` that is about to be imported, is an error (the
+/// server would not start on it anyway), while an unreadable `system.xml` next
+/// to an existing `system.json` is not consulted, as the repair skips it too.
+///
+/// # Errors
+///
+/// Returns [`ServiceError`] if `system.json` exists but cannot be read or
+/// parsed, or if it is absent and `system.xml` exists but cannot be imported.
+pub fn startup_wizard_completed_files(
+    config_dir: &std::path::Path,
+) -> Result<Vec<PathBuf>, ServiceError> {
+    let json_path = config_dir.join(FerrofinServerConfigurationManager::CONFIG_FILE_NAME);
+    let xml_path = config_dir.join("system.xml");
+    let mut completed = Vec::new();
+    if json_path.exists() {
+        let bytes =
+            std::fs::read(&json_path).map_err(|e| io_err("read configuration", &json_path, &e))?;
+        let config = serde_json::from_slice::<ServerConfiguration>(&bytes)
+            .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?;
+        if config.is_startup_wizard_completed {
+            completed.push(json_path);
+        }
+        let jellyfin_completed = std::fs::read_to_string(&xml_path)
+            .ok()
+            .and_then(|xml| import_system_xml(&xml).ok())
+            .is_some_and(|jellyfin| jellyfin.is_startup_wizard_completed);
+        if jellyfin_completed {
+            completed.push(xml_path);
+        }
+    } else if xml_path.exists() {
+        let xml = std::fs::read_to_string(&xml_path)
+            .map_err(|e| io_err("read the jellyfin configuration", &xml_path, &e))?;
+        if import_system_xml(&xml)?.is_startup_wizard_completed {
+            completed.push(xml_path);
+        }
+    }
+    Ok(completed)
+}
+
+/// Imports Jellyfin's `system.xml` document over Ferrofin's defaults.
+fn import_system_xml(xml: &str) -> Result<ServerConfiguration, ServiceError> {
+    config_import::import_over(
+        &default_server_configuration(),
+        xml,
+        "ServerConfiguration",
+        config_import::SYSTEM_XML_DENY,
+    )
 }
 
 /// Serializes and writes a configuration to `path` (creating the parent dir).
@@ -2226,5 +2286,101 @@ mod tests {
         std::fs::create_dir(&manager.branding_file).unwrap();
         assert!(manager.update_branding(&branding).await.is_err());
         assert_eq!(updates.lock().unwrap().len(), 2);
+    }
+
+    /// Writes a `system.json` recording `completed` into `dir`.
+    fn write_system_json(dir: &std::path::Path, completed: bool) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        let mut config = default_server_configuration();
+        config.is_startup_wizard_completed = completed;
+        std::fs::write(
+            dir.join("system.json"),
+            serde_json::to_vec(&config).expect("serialize"),
+        )
+        .expect("system.json");
+    }
+
+    const INCOMPLETE_SYSTEM_XML: &str = "<ServerConfiguration>\
+         <IsStartupWizardCompleted>false</IsStartupWizardCompleted>\
+         </ServerConfiguration>";
+
+    #[test]
+    fn no_configuration_means_setup_was_never_completed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let files = startup_wizard_completed_files(&tmp.path().join("config")).expect("read");
+        assert!(files.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::completed(true)]
+    #[case::not_completed(false)]
+    fn system_json_records_the_flag(#[case] completed: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        write_system_json(&dir, completed);
+        let files = startup_wizard_completed_files(&dir).expect("read");
+        let expected = if completed {
+            vec![dir.join("system.json")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(files, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::completed(COMPLETED_SYSTEM_XML, true)]
+    #[case::not_completed(INCOMPLETE_SYSTEM_XML, false)]
+    fn a_jellyfin_config_not_yet_imported_records_the_flag(
+        #[case] xml: &str,
+        #[case] completed: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), xml).expect("system.xml");
+        let files = startup_wizard_completed_files(&dir).expect("read");
+        assert_eq!(files.is_empty(), !completed);
+        assert!(
+            !dir.join("system.json").exists(),
+            "reading the flag must not import"
+        );
+    }
+
+    /// `load`'s repair turns a `false` in `system.json` back into `true` when
+    /// Jellyfin's XML says setup was completed, so the XML counts too — and
+    /// starting over means resetting both files.
+    #[test]
+    fn jellyfin_xml_beside_system_json_counts_as_the_repair_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        write_system_json(&dir, false);
+        std::fs::write(dir.join("system.xml"), COMPLETED_SYSTEM_XML).expect("system.xml");
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.xml")]
+        );
+        write_system_json(&dir, true);
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.json"), dir.join("system.xml")]
+        );
+        // An unreadable XML beside an existing system.json is skipped, as the
+        // repair skips it.
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("xml");
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.json")]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_configuration_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("xml");
+        assert!(startup_wizard_completed_files(&dir).is_err());
+        std::fs::write(dir.join("system.json"), b"{ not json").expect("json");
+        assert!(startup_wizard_completed_files(&dir).is_err());
     }
 }

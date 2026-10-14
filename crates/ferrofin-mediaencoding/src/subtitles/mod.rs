@@ -24,7 +24,10 @@ pub mod srt;
 pub mod ssa;
 pub mod vtt;
 
-pub use encoder::{NoopSubtitleIo, SubtitleEncoder, SubtitleInfo, SubtitleIo, SubtitleStream};
+pub use encoder::{
+    NoopSubtitleIo, SubtitleEncoder, SubtitleInfo, SubtitleIo, SubtitleStream,
+    subtitle_extraction_timeout,
+};
 pub use model::{Paragraph, Subtitle, TimeCode};
 pub use parser::{SubtitleEditParser, SubtitleParser};
 pub use service::SubtitleEncoderImpl;

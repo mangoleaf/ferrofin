@@ -95,13 +95,14 @@ fn num_cpus_for_analysis() -> usize {
 const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`). This is the version the vendored OpenAPI contract targets — i.e.
-/// "Ferrofin speaks Jellyfin 10.11.8's API" — NOT Ferrofin's own crate version
-/// (`CARGO_PKG_VERSION`, used only for build/log lines). Clients gate on it:
-/// jellyfin-web's SDK refuses any server below `MINIMUM_VERSION = 10.10.0` with an
-/// "Update Required" screen, so reporting Ferrofin's `0.1.0` locks the web client out.
-/// Keep this in sync with `contracts/jellyfin-openapi-*.json`.
-const JELLYFIN_API_VERSION: &str = "10.11.8";
+/// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
+/// (12.2.0; handlers are verified against `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
+/// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
+/// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
+/// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
+/// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
+const JELLYFIN_API_VERSION: &str = "12.2.0";
 
 /// The host a Live TV live stream's buffered file is served from.
 ///
@@ -682,15 +683,17 @@ pub async fn build_app_state(
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
     // or stacked part takes the shape 12.x's scanner stores, so the first
-    // scan writes nothing for it. It needs the id derivation and the folders
-    // named after an item, so it runs here rather than with the others in
-    // `open_database`; nothing has scanned yet.
+    // scan writes nothing for it. It needs the id derivation, the folders
+    // named after an item and the localization that scores the ratings a
+    // primary copies to its versions, so it runs here rather than with the
+    // others in `open_database`; nothing has scanned yet.
     let metadata_library_now = metadata_library.resolve();
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
         &id_derivation,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
+        item_persistence_service.as_ref(),
     )
     .await
     .context("failed to re-home local alternate versions")?;
@@ -728,6 +731,7 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        .with_localization(Arc::clone(&localization))
         .with_chapter_image_resolution({
             let config_mgr = Arc::clone(&config_mgr);
             move || config_mgr.snapshot_shared().chapter_image_resolution
@@ -901,10 +905,10 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
-    // One-shot (Jellyfin 12.0 `MigrateRatingLevels`): recompute every row's
-    // inherited parental-rating columns from its OWN `OfficialRating` through
-    // `GetRatingScore`, so a rating string a 10.11/11.x build scored
-    // differently (or not at all) reads back under 12.0's tables.
+    // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
+    // every row's inherited parental-rating columns from its OWN
+    // `OfficialRating` through `GetRatingScore`, so a rating string an older
+    // build scored differently (or not at all) reads back under 12.2's tables.
     match item_persistence_impl
         .repair_rating_levels(localization.as_ref())
         .await
@@ -983,7 +987,8 @@ pub async fn build_app_state(
             Arc::clone(&virtual_folders),
             Arc::clone(&config_trait),
         )
-        .with_users(Arc::clone(&users), Arc::clone(&user_data)),
+        .with_users(Arc::clone(&users), Arc::clone(&user_data))
+        .with_localization(Arc::clone(&localization)),
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;

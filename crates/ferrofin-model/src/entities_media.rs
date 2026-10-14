@@ -573,20 +573,17 @@ pub struct MediaStream {
     /// The localized "hearing impaired" label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_hearing_impaired: Option<String>,
-    /// The localized language name.
-    ///
-    /// NEVER put on the wire. `LocalizedLanguage` is a post-10.11.8 addition
-    /// (upstream master `MediaStreamRepository.cs:175`); it is absent from
-    /// `contracts/jellyfin-openapi-10.11.8.json`'s `MediaStream`, whose
-    /// `additionalProperties` is `false`, so serializing it makes every body
-    /// carrying a language-tagged stream schema-invalid.
-    ///
-    /// The field stays because [`MediaStream::display_title`] uses it as the
-    /// pre-expanded `eng -> English` form; v10.11.8's `MediaStream.DisplayTitle`
-    /// getter (`MediaStream.cs:270-296`) does that same expansion inline via
-    /// `CultureInfo`, so the resulting `DisplayTitle` matches upstream.
-    #[serde(skip_serializing)]
+    /// The localized language display name (`MediaStreamRepository.Map` via
+    /// `GetLanguageDisplayName`, Jellyfin 12.0); `None` when the code is
+    /// unknown, and then omitted from JSON. [`MediaStream::display_title`] uses
+    /// it in place of the raw `Language` code (`MediaStream.cs:276-280`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_language: Option<String>,
+    /// The localized "original" label (Jellyfin 12.0 `LocalizedOriginal`; set
+    /// on every audio stream by `MediaStreamRepository.Map` and the probe,
+    /// whether or not [`Self::is_original`] is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localized_original: Option<String>,
     /// The NAL length size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nal_length_size: Option<String>,
@@ -629,11 +626,10 @@ pub struct MediaStream {
     pub is_forced: bool,
     /// A value indicating whether this instance is for the hearing impaired.
     pub is_hearing_impaired: bool,
-    /// Whether the stream is in the title's original language (ffprobe's
-    /// `disposition.original`; Jellyfin 12.0 `IsOriginal`). Carried from the
-    /// probe to the `MediaStreamInfos` row only — the vendored 10.11.8 contract
-    /// has no such property, so it is never serialized.
-    #[serde(skip)]
+    /// Whether the stream is in the title's original language (Jellyfin 12.0
+    /// `IsOriginal`): set from ffprobe's `disposition.original`, persisted in
+    /// `MediaStreamInfos.IsOriginal`, and always serialized (non-nullable in
+    /// the 12.1 spec).
     pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -853,7 +849,17 @@ impl MediaStream {
                     attributes.push(localized_or(self.localized_external.as_ref(), "External"));
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " - "))
+                // MediaStream.cs:310-313 — after External, audio only.
+                if self.is_original {
+                    attributes.push(localized_or(self.localized_original.as_ref(), "Original"));
+                }
+
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " - ",
+                ))
             }
             MediaStreamType::Video => {
                 let mut attributes: Vec<String> = Vec::new();
@@ -875,7 +881,14 @@ impl MediaStream {
                     }
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " "))
+                // MediaStream.cs:358-373: a Title gets its missing tags appended
+                // with " - " (:366); without one the tags join with a space (:373).
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " ",
+                ))
             }
             MediaStreamType::Subtitle => {
                 let mut attributes: Vec<String> = Vec::new();
@@ -910,7 +923,12 @@ impl MediaStream {
                     attributes.push(localized_or(self.localized_external.as_ref(), "External"));
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " - "))
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " - ",
+                ))
             }
             _ => None,
         }
@@ -1153,20 +1171,27 @@ fn video_range_to_string(range: VideoRange) -> String {
     range.json_name().into_owned()
 }
 
-/// Joins `attributes` with `separator`; if a `title` is present, appends only
-/// the attributes not already contained (case-insensitively) in the title.
-fn join_with_title(title: Option<&str>, attributes: &[String], separator: &str) -> String {
+/// Builds a `DisplayTitle` from its attributes. With a `title`, appends each
+/// attribute the title does not already contain (case-insensitively), each
+/// preceded by `title_separator`; without one, joins the attributes with
+/// `join_separator`.
+fn join_with_title(
+    title: Option<&str>,
+    attributes: &[String],
+    title_separator: &str,
+    join_separator: &str,
+) -> String {
     if let Some(title) = non_empty(title) {
         let mut result = String::from(title);
         for tag in attributes {
             if !contains_ignore_ascii_case(title, tag) {
-                result.push_str(separator);
+                result.push_str(title_separator);
                 result.push_str(tag);
             }
         }
         result
     } else {
-        attributes.join(separator)
+        attributes.join(join_separator)
     }
 }
 

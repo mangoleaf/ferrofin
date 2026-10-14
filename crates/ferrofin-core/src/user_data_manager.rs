@@ -364,7 +364,7 @@ impl FerrofinUserDataManager {
     ) -> Result<(), ServiceError> {
         use crate::video_versions::{DbVersionReader, VersionRowReader as _, VersionRows};
         // The cheap guard: a version, or a video some row names as its
-        // primary (`FerrofinIX_BaseItems_PrimaryVersionId`).
+        // primary (`IX_BaseItems_PrimaryVersionId`).
         let has_versions: Option<bool> = sqlx::query_scalar(
             r#"SELECT b."PrimaryVersionId" IS NOT NULL
                       OR EXISTS (SELECT 1 FROM "BaseItems" x
