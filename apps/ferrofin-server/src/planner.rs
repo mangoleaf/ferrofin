@@ -1764,6 +1764,17 @@ impl FerrofinStreamStatePlanner {
             let audio_encoder = self.encoding_helper.audio_encoder(state);
             push_split(&mut args, "-c:a");
             args.push(audio_encoder.clone());
+            let source_container = state.input_container.as_deref().unwrap_or_default();
+            if let Some(bsf) =
+                ferrofin_mediaencoding::encoding_helper::bitstream::audio_bit_stream_arguments(
+                    state,
+                    segment_container,
+                    source_container,
+                    caps.ffmpeg_version(),
+                )
+            {
+                push_split(&mut args, &bsf);
+            }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
                 if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
                     state.output_audio_bitrate,
