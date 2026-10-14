@@ -9660,10 +9660,10 @@ impl LibraryScanner {
         } else {
             let name = lookup.name(row)?;
             let cleaned = ferrofin_providers::tmdb::clean_name(&name);
-            let results = tmdb.search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
+            let results = tmdb
+                .search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
                 .await;
-            ferrofin_providers::tmdb::find_best_match(&results, &name, year)
-                .map(|h| h.tmdb_id)?
+            ferrofin_providers::tmdb::find_best_match(&results, &name, year).map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
         // Cached however the id was resolved — a pinned series id serves its
@@ -10157,10 +10157,7 @@ impl LibraryScanner {
                     .get(&series_id)
                     .map(|d| d.people.as_slice())
                     .unwrap_or_default();
-                answer.people = Some(merge_series_cast(
-                    tvdb_people(&ep.people),
-                    series_people,
-                ));
+                answer.people = Some(merge_series_cast(tvdb_people(&ep.people), series_people));
                 // `TvdbEpisodeProvider` sets the episode's Tvdb id and the
                 // IMDb id its remote ids carry.
                 answer

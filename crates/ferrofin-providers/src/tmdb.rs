@@ -165,7 +165,11 @@ fn normalize_title(title: &str) -> String {
 /// proximity and returns the best one. Ties keep the earlier (more relevant)
 /// result from TMDB's own ordering.
 #[must_use]
-pub fn find_best_match<'a>(results: &'a [TmdbSearchHit], name: &str, year: Option<i32>) -> Option<&'a TmdbSearchHit> {
+pub fn find_best_match<'a>(
+    results: &'a [TmdbSearchHit],
+    name: &str,
+    year: Option<i32>,
+) -> Option<&'a TmdbSearchHit> {
     if results.is_empty() {
         return None;
     }
