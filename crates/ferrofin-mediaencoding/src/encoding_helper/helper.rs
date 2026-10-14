@@ -2000,10 +2000,11 @@ mod tests {
             stream_type: MediaStreamType::Video,
             ..MediaStream::default()
         };
-        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1; then
-        // capped to request 10M → 4_000_000.
+        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1;
+        // bit_depth is None → compensation factor 1.5 (source ≤ 4M);
+        // 4M × 1.5 = 6M, capped to request 10M → 6_000_000.
         let value = helper(vec![]).video_bitrate_param_value(&request, Some(&stream), "h264");
-        assert_eq!(value, 4_000_000);
+        assert_eq!(value, 6_000_000);
     }
 
     // ----- audio_bitrate_param -----------------------------------------------
