@@ -5276,8 +5276,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -5289,6 +5291,7 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
